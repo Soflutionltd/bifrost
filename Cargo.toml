@@ -117,6 +117,9 @@ cast_possible_wrap = "deny"
 # Safety: no debug/placeholder code
 dbg_macro = "deny"
 todo = "deny"
+# The validated string newtypes in imap and smtp publish `TryFrom<&str>` beside
+# `TryFrom<String>`; replacing the former with `FromStr` would remove API.
+try_from_instead_of_from_str = "allow"
 
 [profile.bench]
 debug = true

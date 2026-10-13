@@ -84,7 +84,9 @@ fn batch(items: Vec<InventoryEntry>, coverage: InventoryCoverageReport) -> Inven
     )
 }
 
-#[tokio::test]
+// Paused time: the waived retry below waits out the engine's real retry
+// backoff, which is otherwise five seconds of wall clock per sweep.
+#[tokio::test(start_paused = true)]
 async fn a_barrier_stops_the_whole_scope_walk_through_the_real_orchestrator() {
     let account_id = AccountId("barrier-scope".to_owned());
     let scope = CursorScope::Account;
