@@ -371,6 +371,36 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn project_hold_label_lifecycle_makes_no_wire_calls() {
+        use futures::FutureExt;
+        let (client, script) = scripted_client(Vec::new());
+        let client = Arc::new(client.with_quota_project("123".into()));
+        let wall = std::time::SystemTime::UNIX_EPOCH;
+        client
+            .account_net()
+            .shared_hold("gmail-project|123")
+            .record(
+                bifrost_net::HoldDeadline::new(
+                    wall + Duration::from_secs(10_000),
+                    wall,
+                    tokio::time::Instant::now(),
+                ),
+                bifrost_net::HoldKind::QuotaExhausted,
+            );
+        let shutdown = CancellationToken::new();
+        let mut lifecycle = scope_lifecycle_stream(client, shutdown.clone());
+        let mut next = Box::pin(lifecycle.next());
+        assert!(next.as_mut().now_or_never().is_none());
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(500)).await;
+            assert!(next.as_mut().now_or_never().is_none());
+        }
+        assert!(script.requests().is_empty());
+        shutdown.cancel();
+        assert!(next.await.is_none());
+    }
+
     fn ok_json(value: serde_json::Value) -> Canned {
         Canned::Response {
             status: StatusCode::OK,

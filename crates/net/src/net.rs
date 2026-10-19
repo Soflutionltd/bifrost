@@ -67,9 +67,16 @@ pub(crate) struct NetInner {
     pub(crate) next_registration_id: AtomicU64,
     /// Keyed concurrency scopes shared only by accounts on this Net.
     concurrency_limits: Mutex<HashMap<String, WeakLimit>>,
+    holds: Arc<crate::hold::HoldRegistry>,
 }
 
 impl Net {
+    /// Open a provider hold shared by every account on this transport.
+    #[must_use]
+    pub fn shared_hold(&self, key: impl Into<String>) -> crate::SharedHold {
+        crate::SharedHold::new(Arc::clone(&self.inner.holds), key.into())
+    }
+
     /// Construct a `Net` from a `NetConfig`. Builds the shared
     /// `reqwest::Client` with the requested pool, HTTP/2 keepalive,
     /// TCP keepalive and trust-store settings. Request timeouts,
@@ -173,6 +180,7 @@ impl Net {
                 account_hosts: Mutex::new(HashMap::new()),
                 next_registration_id: AtomicU64::new(1),
                 concurrency_limits: Mutex::new(HashMap::new()),
+                holds: Arc::default(),
             }),
         })
     }
@@ -463,6 +471,12 @@ impl Drop for AccountNetInner {
 }
 
 impl AccountNet {
+    /// Open a provider hold in the parent transport's registry.
+    #[must_use]
+    pub fn shared_hold(&self, key: impl Into<String>) -> crate::SharedHold {
+        self.net().shared_hold(key)
+    }
+
     pub(crate) fn rate_scope_for(&self, host: &str) -> &str {
         self.inner.rate_scopes.get(host).map_or("", String::as_str)
     }
@@ -564,6 +578,7 @@ impl AccountNet {
         }
 
         let InternalStreaming {
+            evidence,
             status,
             headers,
             body,
@@ -579,35 +594,44 @@ impl AccountNet {
         // `Content-Range`. Anything else means the server gave us
         // bytes that do not match the requested offset; assembling
         // them into the caller's blob would corrupt it silently.
-        if let Some(want) = want_range.as_deref() {
-            if status != reqwest::StatusCode::PARTIAL_CONTENT {
-                return Err(Error::RangeNotHonored {
-                    kind: RangeFailureKind::ResponseNotPartial,
-                    message: format!(
-                        "expected 206 Partial Content for Range request {want}, got {status}"
-                    ),
-                });
+        let validated = (|| {
+            if let Some(want) = want_range.as_deref() {
+                if status != reqwest::StatusCode::PARTIAL_CONTENT {
+                    return Err(Error::RangeNotHonored {
+                        kind: RangeFailureKind::ResponseNotPartial,
+                        message: format!(
+                            "expected 206 Partial Content for Range request {want}, got {status}"
+                        ),
+                    });
+                }
+                let Some(got_hv) = headers.get(reqwest::header::CONTENT_RANGE) else {
+                    return Err(Error::RangeNotHonored {
+                        kind: RangeFailureKind::MissingContentRange,
+                        message: format!(
+                            "206 response for Range request {want} omitted Content-Range header"
+                        ),
+                    });
+                };
+                let got = got_hv.to_str().unwrap_or("");
+                if !content_range_matches(want, got) {
+                    return Err(Error::RangeNotHonored {
+                        kind: RangeFailureKind::ContentRangeMismatch,
+                        message: format!("content-range mismatch: requested {want}, got {got}"),
+                    });
+                }
             }
-            let Some(got_hv) = headers.get(reqwest::header::CONTENT_RANGE) else {
-                return Err(Error::RangeNotHonored {
-                    kind: RangeFailureKind::MissingContentRange,
-                    message: format!(
-                        "206 response for Range request {want} omitted Content-Range header"
-                    ),
-                });
-            };
-            let got = got_hv.to_str().unwrap_or("");
-            if !content_range_matches(want, got) {
-                return Err(Error::RangeNotHonored {
-                    kind: RangeFailureKind::ContentRangeMismatch,
-                    message: format!("content-range mismatch: requested {want}, got {got}"),
-                });
-            }
-        }
 
+            Ok(())
+        })();
+        if let Err(error) = validated {
+            return Err(evidence.finish(error));
+        }
         // Wrap the body in a metering + bandwidth-cap adapter.
         let metered = wrap_metered(body, self.clone(), deadline, bytes_in);
-        Ok(crate::request::hold_permit(metered, permit))
+        Ok(crate::request::hold_permit(
+            evidence.wrap_stream(metered),
+            permit,
+        ))
     }
 
     /// Per-account meter handle.

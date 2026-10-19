@@ -14,6 +14,78 @@ role of folders: one `CursorScope::Account` cursor per account, a
 `changes_stream` paging `users.history.list`, and mutations routing
 through `messages.batchModify` / `batchDelete`.
 
+## Gmail project quota holds
+
+`GoogleAccountFactory::with_quota_project(id)` configures the canonical
+quota-consuming Cloud project identity and rejects empty or whitespace-only
+input. Use the project NUMBER everywhere, consistently across factories.
+This is a grouping identity only: no billing or quota-project header is sent.
+The budget identity and net gate key are both `gmail-project|ID`.
+
+Error contexts explicitly distinguish Gmail, Calendar, People and Drive.
+Only the Gmail surface can select the project budget. On Gmail,
+`dailyLimitExceeded` means the project's daily API limit and remains
+`Server(QuotaExhausted)`. `rateLimitExceeded` remains `Server(RateLimited)`;
+Google's documentation disagrees on user versus project scope, so the client
+conservatively treats that reason as project-wide. `userRateLimitExceeded`,
+a concurrent-request 429 (even with a `rateLimitExceeded` reason), and
+undocumented `quotaExceeded` remain account-scoped and never stamp the
+project budget. Without a configured
+project, throttling retains `ThrottleScope::Account` and has no project gate.
+Calendar and People daily or rate errors never stamp or record it. Requests
+select their API surface using the most specific configured URL path root,
+including when redirected bases share an origin or nest under the Gmail base;
+Gmail quota costs and concurrency use that same selection. Google rejects
+cross-surface redirects with a terminal net `Error::RedirectRejected` before dispatching the
+target; same-surface redirects continue through net's normal policy. A
+request-level net redirect guard keeps the initial gate, observer, quota cost
+and concurrency attribution valid for the whole redirect walk. This applies
+to typed and raw builders, including the raw Drive session-creation POST;
+pre-authenticated Drive chunk uploads and cancellation use the same guarded
+builder funnel and disable redirects. Session creation accepts a `Location`
+only on the HTTPS `www.googleapis.com/upload/drive/v3/files` surface (the exact
+path or descendants, port 443, without userinfo). Chunk PUT and cancellation
+validate that surface again before dispatch. A successful session-creation
+response cannot authorize sending to Gmail, Calendar, People or another host. Thus Calendar/People cannot redirect into a held Gmail API, and
+Gmail cannot record Calendar/People errors into its project hold.
+
+The client observes each error response before net's retry decision and
+resolves its deadline once. `Retry-After` retains both delta-seconds and
+HTTP-date syntax; a delta is converted to an absolute time at observation.
+A provider hint wins. Without one, a daily limit waits until the next civil
+date's midnight in `America/Los_Angeles`, using jiff zoned arithmetic and a
+bundled timezone database. This is neither a fixed UTC offset nor an addition
+of 24 hours: transition days can be 23 or 25 hours. A project rate limit without
+a hint uses a one-second stamped fallback. The response carries the resolved
+deadline as `ServerCause`'s `RetryHint::At`, and net records the paired
+monotonic deadline using its shared hold's maximum semantics.
+
+Every Gmail request funnel attaches that gate: typed requests, raw builders,
+`users.watch`, and `users.stop`. Label lifecycle polling and the watch renewer
+therefore make no wire calls while held, including when a request was already
+waiting for admission when another account recorded the hold. A local refusal
+uses the hold's winning kind, stamps the same budget, retains prior attempt
+evidence, and reports `RetryHint::After` from the remaining monotonic duration.
+If a prior non-idempotent attempt was acknowledged, including a mutation that
+returned a redirect, the refusal carries effective `InFlight` evidence and
+reconciles through `ThrottledMidFlight`; it does not replay the mutation.
+It never renews the deadline. Dropping all account handles and reopening on the
+same Net does not erase the hold. Different project identities are independent.
+
+`GoogleAccount::throttle_keys` declares the project budget for
+`CursorScope::Account`, nonempty generic `ObjectId` work, and label memberships.
+Those generic object hydration and mutation paths route only to Gmail;
+Calendar and People have separate typed `EventId` and `ContactId` APIs.
+Other cursor scopes and membership kinds declare no Gmail project budget.
+The declaration and the stamped error therefore name the same engine bucket,
+including across accounts on one project.
+
+Holds are in memory only. Raising the provider quota early does not clear an
+already recorded deadline; it expires naturally. Recovery under a daily hold
+can end with "recovery wait budget exhausted" before midnight. That is intended:
+the recovery lane is bounded, and exhaustion does not authorize another wire
+attempt through an active project gate.
+
 ## Module layout
 
 Public modules:
@@ -79,7 +151,9 @@ Internal modules:
   is `Protocol(MissingField)`; a `Location` that is present but not
   visible-ASCII text, or not an absolute http or https URL with a host, is
   `Protocol(ParseFailed)`, since accepting it would send every chunk PUT and
-  the cancel to a bogus URL; a present 308 `Range` that does not parse
+  the cancel to a bogus URL. An absolute URL outside the HTTPS Drive upload
+  surface is `Protocol(ContractViolation)` and is refused before any chunk or
+  cancellation is sent; a present 308 `Range` that does not parse
   is `Protocol(ParseFailed)`; a 308 claiming bytes never sent, fewer bytes
   than it already reported, or every byte without completing the upload is
   `Protocol(ContractViolation)`. A chunk that made no progress is legal
@@ -1368,7 +1442,7 @@ fetchable content. `blob_handles_for_message` remains as the
 ## Error translation
 
 `account/error.rs::into_account_error(error, ctx)` is the single
-boundary converting `crate::Error` (Net / Response / JsonDecode /
+boundary converting `crate::Error` (Net / ObservedNet / Response / JsonDecode /
 Base64 / Local) into an `AccountError`. `GmailErrorContext` carries
 the calling operation so `bifrost-types::recovery::derive` produces a
 precise `RecoveryClass`; the crate keeps no local classification
@@ -1379,9 +1453,9 @@ Mapping highlights:
 - Stable Gmail reason codes from `GmailErrorEnvelope.primary_reason()`
   route to typed `WireCause::Gmail(GmailSignal::*)` variants and
   the appropriate `AccountErrorKind` (e.g.
-  `quotaExceeded`/`rateLimitExceeded` -> `Server(RateLimited)` ->
-  `Retry::SameRequest, reason: RateLimited` with the documented
-  `throttle_scope`).
+  `dailyLimitExceeded`/`quotaExceeded` -> `Server(QuotaExhausted)`;
+  `rateLimitExceeded`/`userRateLimitExceeded` -> `Server(RateLimited)`).
+  Project attribution follows the surface and configured identity above.
 - Authentication failures (HTTP 401 or `authError`) ->
   `Authentication(ReauthorizationRequired)` -> `AuthLost`.
 - Authorization failures (HTTP 403 outside the quota path) ->
@@ -1412,10 +1486,11 @@ Mapping highlights:
   `ResourceKind`: `Draft`, `Identity`, `Vacation`,
   `PushSubscription` (for Pub/Sub watch). Blob 404 maps to the
   parent message's `NotFound(Message)`.
-- `Retry-After` is wrapped with `RetryHint::After(Duration)` on the
-  originating `ServerCause::{Unavailable, RateLimited, QuotaExhausted}`
-  and forwarded to `RetryAdvice::retry_hint`; no separate
-  `retry_not_before` side-channel.
+- Gmail-envelope `Retry-After` is resolved at response observation to
+  `RetryHint::At` on the originating
+  `ServerCause::{Unavailable, RateLimited, QuotaExhausted}` and forwarded to
+  `RetryAdvice::retry_hint`. Unrecognized bodies retain net's generic hint
+  handling. There is no separate `retry_not_before` side-channel.
 - Local failures (`GmailLocalError::*`) map by who is at fault, per the
   three disjoint blame families in `reference/error-model.md`:
   - `InvalidRequest` (caller input this crate cannot use, refused before

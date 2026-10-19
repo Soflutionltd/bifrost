@@ -76,6 +76,8 @@ impl GmailResource {
 /// entry point.
 #[derive(Clone, Debug)]
 pub(crate) struct GmailErrorContext {
+    pub(crate) surface: crate::quota::ApiSurface,
+    observed_headers: Option<crate::error::GmailResponseHeaders>,
     pub(crate) operation: AccountOperation,
     pub(crate) scope: Option<ErrorScope>,
     pub(crate) resource: Option<GmailResource>,
@@ -96,6 +98,8 @@ pub(crate) struct GmailErrorContext {
 impl GmailErrorContext {
     pub(crate) fn base(operation: AccountOperation) -> Self {
         Self {
+            surface: crate::quota::ApiSurface::Gmail,
+            observed_headers: None,
             operation,
             scope: None,
             resource: None,
@@ -292,6 +296,7 @@ impl GmailErrorContext {
 
     pub(crate) fn calendar_collection(operation: AccountOperation) -> Self {
         let mut ctx = Self::base(operation);
+        ctx.surface = crate::quota::ApiSurface::Calendar;
         ctx.scope = Some(ErrorScope::CalendarCollection);
         ctx.resource = Some(GmailResource::Calendar);
         ctx
@@ -299,6 +304,7 @@ impl GmailErrorContext {
 
     pub(crate) fn calendar_event(operation: AccountOperation, id: impl Into<String>) -> Self {
         let mut ctx = Self::base(operation);
+        ctx.surface = crate::quota::ApiSurface::Calendar;
         ctx.scope = Some(ErrorScope::Calendar {
             id: (id.into()).into(),
         });
@@ -308,6 +314,7 @@ impl GmailErrorContext {
 
     pub(crate) fn contact_collection(operation: AccountOperation) -> Self {
         let mut ctx = Self::base(operation);
+        ctx.surface = crate::quota::ApiSurface::People;
         ctx.scope = Some(ErrorScope::ContactCollection);
         ctx.resource = Some(GmailResource::Contact);
         ctx
@@ -315,6 +322,7 @@ impl GmailErrorContext {
 
     pub(crate) fn contact(operation: AccountOperation, id: impl Into<String>) -> Self {
         let mut ctx = Self::base(operation);
+        ctx.surface = crate::quota::ApiSurface::People;
         ctx.scope = Some(ErrorScope::Contact {
             id: (id.into()).into(),
         });
@@ -327,9 +335,13 @@ impl GmailErrorContext {
 /// the sole boundary; no other public path produces an `AccountError`
 /// in this crate.
 #[must_use]
-pub(crate) fn into_account_error(error: Error, ctx: GmailErrorContext) -> AccountError {
+pub(crate) fn into_account_error(error: Error, mut ctx: GmailErrorContext) -> AccountError {
     match error {
         Error::Net(net_error) => translate_net_error(net_error, &ctx),
+        Error::ObservedNet(observed) => {
+            ctx.observed_headers = Some(observed.headers);
+            translate_net_error(observed.error, &ctx)
+        }
         // `Error::Response` is a terminal HTTP response; the request was
         // acknowledged. `Error::JsonDecode` / `Error::Base64` happen
         // post-200 (decoding a successful response body), so they are
@@ -468,7 +480,8 @@ pub(crate) fn skipped_outcomes(ids: &[ObjectId]) -> Vec<ItemOutcome<MutationSucc
 ///
 /// The 403 can reach us in several shapes. `post_empty_json` converts a
 /// terminal HTTP error into `Error::Response` itself, but a 403 that
-/// surfaces from bifrost-net's retry loop stays as `Error::Net`: a plain
+/// surfaces from bifrost-net's retry loop retains its net error (with or
+/// without observation metadata): a plain
 /// `Status { code: 403, .. }`, or - when the final attempt was a
 /// rate-limit / budget-exhaustion - wrapped in `RateLimited` /
 /// `RetryBudgetExhausted` with the 403 preserved as `final_response`.
@@ -491,7 +504,7 @@ pub(crate) fn is_batch_delete_scope_failure(error: &Error) -> bool {
         // The bifrost-net shapes preserve only the raw body bytes; parse
         // the Gmail envelope out of them.
         _ => {
-            let Some((status, body)) = net_failure_parts(error) else {
+            let Some((status, body)) = response_parts(error) else {
                 return false;
             };
             if status != 403 {
@@ -511,13 +524,14 @@ pub(crate) fn is_batch_delete_scope_failure(error: &Error) -> bool {
     matches!(reason, Some("forbidden") | Some("insufficientPermissions"))
 }
 
-/// Extract `(status, body)` from the bifrost-net `Error::Net` shapes that
-/// preserve a terminal HTTP response. Returns `None` for transport-level
-/// failures (no HTTP response) and for `Error::Response` (handled by its
-/// own pre-parsed-envelope path).
-fn net_failure_parts(error: &Error) -> Option<(u16, &[u8])> {
-    let Error::Net(net) = error else {
-        return None;
+/// Terminal response evidence shared by mutation decisions and translation.
+/// Local hold refusals do not expose an earlier response as their own status.
+pub(crate) fn response_parts(error: &Error) -> Option<(u16, &[u8])> {
+    let net = match error {
+        Error::Response(response) => return Some((response.status, &response.body)),
+        Error::Net(net) => net,
+        Error::ObservedNet(observed) => &observed.error,
+        _ => return None,
     };
     match net {
         bifrost_net::Error::Status { code, body, .. } => Some((code.as_u16(), body.as_ref())),
@@ -597,6 +611,29 @@ fn terminates_mutation_stream(err: &AccountError) -> bool {
 }
 
 fn translate_net_error(net_error: bifrost_net::Error, ctx: &GmailErrorContext) -> AccountError {
+    if let bifrost_net::Error::LocalHold { ref key, .. } = net_error {
+        let budget = (ctx.surface == crate::quota::ApiSurface::Gmail)
+            .then(|| bifrost_types::ThrottleBudget::new(key.clone()));
+        let error = bifrost_net::into_account_error(
+            net_error,
+            bifrost_net::NetErrorContext {
+                provider: Some(Provider::Gmail),
+                protocol: Protocol::Gmail,
+                operation: ctx.operation,
+                scope: ctx.scope.clone(),
+            },
+        );
+        let mut builder = error.into_builder();
+        if let Some(budget) = budget {
+            builder = builder.throttle_budget(budget);
+        }
+        if let Some(idempotent) = ctx.idempotency_override {
+            builder = builder.idempotency_override(idempotent);
+        }
+        return builder
+            .try_build()
+            .expect("valid local hold classification");
+    }
     // For HTTP status responses the bifrost-net translator does generic
     // HTTP mapping. Gmail JSON reason codes are more precise, so we
     // peek at the body first.
@@ -655,7 +692,10 @@ fn refine_status_with_gmail_body(
     ctx: &GmailErrorContext,
 ) -> Option<AccountError> {
     let env = parse_envelope(body)?;
-    let resp_headers = crate::error::GmailResponseHeaders::from_headers(headers);
+    let resp_headers = ctx
+        .observed_headers
+        .clone()
+        .unwrap_or_else(|| crate::error::GmailResponseHeaders::from_headers(headers));
     let resp = GmailResponseError {
         service: crate::error::GmailService::GmailApi,
         status,
@@ -692,14 +732,19 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
             code: status.to_string(),
         });
 
-    // Retry hint is structural on `ServerCause` per Phase 5A. Wrap the
-    // parsed `Retry-After` Duration with `RetryHint::After` and inject
-    // it into the cause before classification picks the variant.
-    let retry_hint = resp
-        .headers
-        .retry_after
-        .filter(|_| is_retry_after_applicable(status, &signal))
-        .map(RetryHint::After);
+    let project = resp.headers.project.as_ref().filter(|_| {
+        ctx.surface == crate::quota::ApiSurface::Gmail
+            && crate::quota::project_kind(status, &resp.body).is_some()
+    });
+    let retry_hint = project
+        .map(|observation| RetryHint::At(observation.deadline.at))
+        .or_else(|| {
+            resp.headers
+                .retry_after
+                .and(resp.headers.retry_at)
+                .filter(|_| is_retry_after_applicable(status, &signal))
+                .map(RetryHint::At)
+        });
 
     let (kind, cause) = classify_response(status, &signal, ctx, retry_hint);
 
@@ -752,6 +797,10 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
         )));
     }
 
+    if let Some(project) = project {
+        builder = builder.throttle_budget(project.budget.clone());
+    }
+
     if let Some(throttle) = throttle_scope_for(status, &signal, ctx) {
         builder = builder.throttle_scope(throttle);
     }
@@ -790,7 +839,7 @@ fn classify_response(
                 }),
             );
         }
-        GmailSignal::QuotaExceeded => {
+        GmailSignal::QuotaExceeded | GmailSignal::DailyLimitExceeded => {
             return (
                 AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
                 Cause::Server(ServerCause::QuotaExhausted { retry_hint }),
@@ -878,12 +927,6 @@ fn classify_response(
                         Cause::Access(AccessCause::PolicyBlocked),
                     );
                 }
-                code if is_daily_limit_signal_code(code) => {
-                    return (
-                        AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-                        Cause::Server(ServerCause::QuotaExhausted { retry_hint }),
-                    );
-                }
                 "conditionNotMet" => {
                     return (
                         AccountErrorKind::ConcurrencyConflict,
@@ -962,13 +1005,6 @@ fn classify_by_status(
             }),
         ),
     }
-}
-
-/// `dailyLimitExceeded` lives under `GmailSignal::Unknown`
-/// (it's not in the typed signal enum). Classify the code in one place
-/// so both `classify_response` and `throttle_scope_for` agree.
-fn is_daily_limit_signal_code(code: &str) -> bool {
-    code == "dailyLimitExceeded"
 }
 
 /// pick the OAuth scope `needed` for an `InsufficientScope`
@@ -1095,6 +1131,7 @@ fn is_retry_after_applicable(status: u16, signal: &GmailSignal) -> bool {
             GmailSignal::RateLimitExceeded
                 | GmailSignal::UserRateLimitExceeded
                 | GmailSignal::QuotaExceeded
+                | GmailSignal::DailyLimitExceeded
                 | GmailSignal::BackendError
         )
 }
@@ -1110,8 +1147,8 @@ fn throttle_scope_for(
             GmailSignal::RateLimitExceeded
                 | GmailSignal::UserRateLimitExceeded
                 | GmailSignal::QuotaExceeded
-        )
-        || matches!(signal, GmailSignal::Unknown { code } if is_daily_limit_signal_code(code));
+                | GmailSignal::DailyLimitExceeded
+        );
     if is_throttle_status {
         ctx.throttle_scope.or(Some(ThrottleScope::Account))
     } else {
@@ -1390,6 +1427,7 @@ fn map_reason_to_signal(reason: &str) -> GmailSignal {
         "invalidCredentials" => GmailSignal::InvalidCredentials,
         "authError" => GmailSignal::AuthError,
         "quotaExceeded" => GmailSignal::QuotaExceeded,
+        "dailyLimitExceeded" => GmailSignal::DailyLimitExceeded,
         "rateLimitExceeded" => GmailSignal::RateLimitExceeded,
         "userRateLimitExceeded" => GmailSignal::UserRateLimitExceeded,
         "forbidden" => GmailSignal::Forbidden,
@@ -2222,7 +2260,8 @@ mod tests {
             reqwest::header::RETRY_AFTER,
             reqwest::header::HeaderValue::from_static("42"),
         );
-        let resp_headers = crate::error::GmailResponseHeaders::from_headers(&headers);
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let resp_headers = crate::error::GmailResponseHeaders::from_headers_at(&headers, now);
         let body = body_with_reason("rateLimitExceeded");
         let resp = GmailResponseError {
             service: crate::error::GmailService::GmailApi,
@@ -2238,10 +2277,7 @@ mod tests {
         let hint = advice
             .retry_hint
             .expect("retry hint flows from Retry-After");
-        assert_eq!(
-            hint.min_delay(std::time::SystemTime::now()),
-            std::time::Duration::from_secs(42)
-        );
+        assert_eq!(hint.min_delay(now), std::time::Duration::from_secs(42));
     }
 
     /// a 401 from Pub/Sub watch translates as terminal so

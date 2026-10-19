@@ -38,15 +38,6 @@ Filed 2026-10-19 while landing declared throttle keys and stamped budgets
   budgets instead, and nothing ever emitted `Provider`. They stay published
   for out-of-tree implementations; whether to retire them is a removal, so it
   waits for the owner.
-- **Gmail per-project quota is a cross-account budget nobody declares.**
-  `crates/google/src/account/error.rs` maps `rateLimitExceeded`,
-  `userRateLimitExceeded` and `quotaExceeded` all to `ThrottleScope::Account`.
-  If Google's project-level reasons mean the quota every account on one OAuth
-  client shares, they are a `ThrottleBudget` every Google account should
-  declare. Needs Google's reason semantics confirmed before it is a defect,
-  and the Google client has no OAuth client or quota-project identity to key
-  such a budget on (auth is an opaque `TokenSource`), so a consumer-supplied
-  project id would be needed.
 
 ## A9 (directory search) follow-ups
 

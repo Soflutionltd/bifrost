@@ -466,6 +466,58 @@ impl DavDispatch {
         outcome: Result<bifrost_net::Response, NetError>,
     ) -> Result<DavResponse, AccountError> {
         match outcome {
+            Err(error @ NetError::AttemptHistory { .. }) => {
+                // A replayable DAV request can use its terminal response as
+                // data (notably DELETE -> 404 means done). Unreplayable
+                // histories must reach the shared reconciliation classifier.
+                if request
+                    .idempotent
+                    .unwrap_or_else(|| request.method.is_idempotent())
+                {
+                    let response = match error.terminal() {
+                        NetError::Status {
+                            code,
+                            headers,
+                            body,
+                        } => Some((*code, headers, body)),
+                        NetError::RetryBudgetExhausted {
+                            final_response: Some(response),
+                            ..
+                        }
+                        | NetError::RateLimited {
+                            final_response: response,
+                            ..
+                        } => Some((response.status, &response.headers, &response.body)),
+                        _ => None,
+                    };
+                    if let Some((status, headers, body)) = response {
+                        return Ok(DavResponse {
+                            status,
+                            headers: headers.clone(),
+                            body: decode_body(body),
+                            url: request.url.clone(),
+                        });
+                    }
+                    if let NetError::ResponseTooLarge { limit } = error.terminal() {
+                        let limit = *limit;
+                        return Err(response_read_error_with_history(
+                            error,
+                            limit,
+                            operation,
+                            self.protocol,
+                        ));
+                    }
+                }
+                Err(into_account_error(
+                    error,
+                    NetErrorContext {
+                        provider: None,
+                        protocol: self.protocol.protocol(),
+                        operation,
+                        scope: None,
+                    },
+                ))
+            }
             Ok(response) => Ok(DavResponse {
                 status: response.status,
                 headers: response.headers,
@@ -929,6 +981,35 @@ impl std::fmt::Debug for DavDispatch {
 #[must_use]
 pub fn delete_target_already_gone(status: StatusCode) -> bool {
     status == StatusCode::NOT_FOUND || status == StatusCode::GONE
+}
+
+fn response_read_error_with_history(
+    error: NetError,
+    limit: usize,
+    operation: AccountOperation,
+    protocol: DavProtocol,
+) -> AccountError {
+    let mut builder = response_read_error(
+        operation,
+        format!("DAV response body exceeded the buffered ceiling ({limit} bytes)"),
+        protocol,
+    )
+    .into_builder();
+    let evidence = into_account_error(
+        error,
+        NetErrorContext {
+            provider: None,
+            protocol: protocol.protocol(),
+            operation,
+            scope: None,
+        },
+    );
+    for cause in evidence.chain().iter() {
+        builder = builder.push_cause(cause.clone());
+    }
+    builder
+        .try_build()
+        .expect("valid DAV body failure evidence")
 }
 
 #[cfg(test)]

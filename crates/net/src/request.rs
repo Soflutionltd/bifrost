@@ -270,6 +270,9 @@ pub struct RequestBuilder {
     inner: RequestBuilderInner,
 }
 
+type ErrorObserver = Arc<dyn Fn(&FinalResponse) + Send + Sync>;
+type RedirectGuard = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
 /// Backing state for the builder. Kept private so the request
 /// pipeline can replace the representation without touching call
 /// sites.
@@ -326,9 +329,43 @@ struct RequestBuilderInner {
     bytes_in: Option<RequestByteCounter>,
     /// Additional concurrency claims, composed with the account claim.
     concurrency: Vec<(ConcurrencyLimit, usize)>,
+    hold_gate: Option<String>,
+    error_observer: Option<ErrorObserver>,
+    redirect_guard: Option<RedirectGuard>,
 }
 
 impl RequestBuilder {
+    /// Reject a followed redirect unless the guard accepts its source and
+    /// resolved target URL. Runs before draining the redirect or admitting
+    /// the target hop; pass-through responses do not invoke it.
+    #[must_use]
+    pub fn redirect_guard(
+        mut self,
+        guard: impl Fn(&str, &str) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.inner.redirect_guard = Some(Arc::new(guard));
+        self
+    }
+
+    /// Refuse each wire attempt while this key is held on the parent Net.
+    #[must_use]
+    pub fn hold_gate(mut self, key: impl Into<String>) -> Self {
+        self.inner.hold_gate = Some(key.into());
+        self
+    }
+
+    /// Observe every status >= 400 before authentication or retry decisions.
+    /// The body is the existing capped diagnostic prefix, including any
+    /// truncation/read-failure marker. Redirects and successes are not observed.
+    #[must_use]
+    pub fn observe_errors(
+        mut self,
+        observer: impl Fn(&FinalResponse) + Send + Sync + 'static,
+    ) -> Self {
+        self.inner.error_observer = Some(Arc::new(observer));
+        self
+    }
+
     /// Construct a builder from an account-scoped transport, method,
     /// and URL. The account-scoped wrappers (`AccountNet::get` etc.)
     /// call this.
@@ -350,6 +387,9 @@ impl RequestBuilder {
                 pending_error: None,
                 bytes_in: None,
                 concurrency: Vec::new(),
+                hold_gate: None,
+                error_observer: None,
+                redirect_guard: None,
             },
         }
     }
@@ -576,6 +616,7 @@ impl RequestBuilder {
         // Held until the body is drained: this function returning, by any
         // path, is the end of the request.
         let _permit = internal.permit;
+        let mut evidence = Some(internal.evidence);
         // Drain the body into a single `Bytes`. The retry loop has
         // already validated status; everything from here is a
         // straight body read. Apply the bandwidth meter to the read
@@ -590,7 +631,7 @@ impl RequestBuilder {
         let mut accum: Vec<u8> = Vec::new();
         use futures::StreamExt;
         while let Some(chunk) = body_stream.next().await {
-            let chunk = chunk?;
+            let chunk = chunk.map_err(|error| evidence.take().unwrap_or_default().finish(error))?;
             // Checked before the extend, so the ceiling bounds what is
             // actually held rather than being noticed one chunk after
             // the allocation that mattered. The stream drops here, so a
@@ -598,7 +639,10 @@ impl RequestBuilder {
             if let Some(limit) = limit
                 && accum.len() + chunk.len() > limit
             {
-                return Err(Error::ResponseTooLarge { limit });
+                return Err(evidence
+                    .take()
+                    .unwrap_or_default()
+                    .finish(Error::ResponseTooLarge { limit }));
             }
             accum.extend_from_slice(&chunk);
         }
@@ -627,7 +671,7 @@ impl RequestBuilder {
         Ok(StreamingResponse {
             status: internal.status,
             headers: internal.headers,
-            body: hold_permit(metered, internal.permit),
+            body: hold_permit(internal.evidence.wrap_stream(metered), internal.permit),
             bytes_in: internal.bytes_in,
             bytes_out: internal.bytes_out,
         })
@@ -747,11 +791,41 @@ impl StreamingResponse {
     }
 }
 
+/// Carried through admission, redirects, retries, and final body consumption.
+/// One completion boundary owns attaching it to every error exit.
+#[derive(Default)]
+pub(crate) struct AttemptEvidence {
+    attempts: Vec<Error>,
+    may_have_committed: bool,
+}
+
+impl AttemptEvidence {
+    pub(crate) fn finish(self, source: Error) -> Error {
+        if self.attempts.is_empty() {
+            return source;
+        }
+        Error::AttemptHistory {
+            source: Box::new(source),
+            attempts: self.attempts,
+            may_have_committed: self.may_have_committed,
+        }
+    }
+
+    pub(crate) fn wrap_stream(self, body: ByteStream) -> ByteStream {
+        use futures::StreamExt;
+        let mut evidence = Some(self);
+        Box::pin(body.map(move |chunk| {
+            chunk.map_err(|error| evidence.take().unwrap_or_default().finish(error))
+        }))
+    }
+}
+
 /// Internal streaming response carrying the originating `AccountNet`
 /// so `send()` and `send_streaming()` can share one underlying call
 /// site without re-binding the body. `body` is unmetered here; the
 /// outer wrappers attach the meter at the point of public exposure.
 pub(crate) struct InternalStreaming {
+    pub(crate) evidence: AttemptEvidence,
     pub(crate) status: StatusCode,
     pub(crate) headers: HeaderMap,
     pub(crate) body: ByteStream,
@@ -873,6 +947,9 @@ pub(crate) async fn send_streaming_inner(
         pending_error,
         bytes_in: caller_bytes_in,
         concurrency,
+        hold_gate,
+        error_observer,
+        redirect_guard,
     } = builder.inner;
 
     // Surface any deferred error from a fluent setter (e.g. `json()`
@@ -957,451 +1034,451 @@ pub(crate) async fn send_streaming_inner(
         limit: redirect_limit,
     };
 
-    'outer: loop {
-        deadline.remaining()?;
-        let attempt = attempts.begin();
-        // Resolved per attempt rather than once, because a redirect hop
-        // can rewrite the method: RFC 7231 section 6.4 turns a 301/302/303 on a
-        // POST into a GET, and the GET that results is replayable even
-        // though the request the caller wrote was not.
-        let replayable = idempotent.unwrap_or_else(|| method.is_idempotent());
-        // Acquire a rate-limit slot. No-op if no host is configured.
-        // Surfaces `Error::CostExceedsBurst` if the caller asked for
-        // more units than the host's bucket can ever hold; that is a
-        // configuration bug, not a transient condition, so we do not
-        // burn retry budget on it.
-        let rate_generation = if let Some(ref h) = host {
-            deadline
-                .bound(account.net().governor().acquire_generation_scoped(
-                    h,
-                    &quota_scope,
+    let mut prior_attempts = Vec::new();
+    // HTTP acknowledgement does not prove a mutation was rejected. In
+    // particular a POST's 303 can follow a successful commit. Keep this
+    // across method rewrites so a held replacement GET cannot authorize
+    // replaying the original operation.
+    let mut may_have_committed = false;
+    let mut pending_response = None;
+    let outcome = async {
+        'outer: loop {
+            deadline.remaining()?;
+            let attempt = attempts.begin();
+            // Resolved per attempt rather than once, because a redirect hop
+            // can rewrite the method: RFC 7231 section 6.4 turns a 301/302/303 on a
+            // POST into a GET, and the GET that results is replayable even
+            // though the request the caller wrote was not.
+            let replayable = idempotent.unwrap_or_else(|| method.is_idempotent());
+            // Acquire a rate-limit slot. No-op if no host is configured.
+            // Surfaces `Error::CostExceedsBurst` if the caller asked for
+            // more units than the host's bucket can ever hold; that is a
+            // configuration bug, not a transient condition, so we do not
+            // burn retry budget on it.
+            let rate_generation = if let Some(ref h) = host {
+                deadline
+                    .bound(account.net().governor().acquire_generation_scoped(
+                        h,
+                        &quota_scope,
+                        cost_units,
+                    ))
+                    .await??
+            } else {
+                None
+            };
+            // Until the server acknowledges the request, cancellation or
+            // any early return must restore the debited slot. Once a
+            // response arrives the guard is disarmed because the server
+            // has consumed the attempt. Explicit retry and redirect paths
+            // below retain their existing refund rules.
+            let mut rate_debit = host.as_ref().map(|h| {
+                RateDebit::new(
+                    account.net().governor().clone(),
+                    h.clone(),
+                    quota_scope.clone(),
                     cost_units,
-                ))
-                .await??
-        } else {
-            None
-        };
-        // Until the server acknowledges the request, cancellation or
-        // any early return must restore the debited slot. Once a
-        // response arrives the guard is disarmed because the server
-        // has consumed the attempt. Explicit retry and redirect paths
-        // below retain their existing refund rules.
-        let mut rate_debit = host.as_ref().map(|h| {
-            RateDebit::new(
-                account.net().governor().clone(),
-                h.clone(),
-                quota_scope.clone(),
-                cost_units,
-                rate_generation,
-            )
-        });
+                    rate_generation,
+                )
+            });
 
-        // Mint a fresh `Authorization` from the token source. The
-        // token source itself handles single-flight refresh.
-        //
-        // Error classification: `auth.rs::arc_err_to_error` already
-        // sorts the underlying failure into the right typed variant -
-        // `AuthLost` for terminal auth failures (revoked refresh
-        // token, 401/403 from the token endpoint), `RefreshFailed`
-        // wrapping a transient `Network`/`Timeout` for everything
-        // else. We pass the variant through unchanged so callers can
-        // pattern-match for retry-vs-give-up decisions; collapsing
-        // every variant into `AuthLost` would discard that signal.
-        let token = if auth_for_next_hop {
-            let source = account
-                .token_source()
-                .ok_or_else(|| Error::InvalidRequest {
-                    field: "bearer_auth",
-                    detail: "bearer authentication requires an AccountSpec token source".to_owned(),
-                })?;
-            match deadline.bound(source.current()).await? {
-                Ok(t) => Some(t),
-                Err(e) => return Err(e),
-            }
-        } else {
-            None
-        };
-
-        // Record outbound body bytes against the per-account meter
-        // before we issue the request. Each retry is another wire
-        // transmission, so we count the body once per attempt. We do
-        // this even on 401-recovery retries because the failed
-        // attempt did put bytes on the wire. Header bytes are
-        // intentionally excluded - the meter is a payload sizing
-        // tool, not a TCP byte counter.
-        if let Some(ref b) = body {
-            let out_n = u64::try_from(b.len()).unwrap_or(u64::MAX);
-            account.meter().record_bytes_out(out_n);
-            bytes_out = bytes_out.saturating_add(out_n);
-        }
-
-        let header_clock = crate::upload::HeaderClock::new();
-        let request = build_reqwest(
-            account.net().client(),
-            &method,
-            &url,
-            &headers,
-            &body,
-            token.as_ref(),
-            deadline.remaining()?,
-            &account,
-            &header_clock,
-        );
-
-        let dispatched = account.net().dispatch().send(request);
-        let dispatched = async {
-            header_clock
-                .bound(dispatched, account.response_headers_timeout())
-                .await?
-        };
-        let dispatched = deadline
-            .bound_dispatch(dispatched)
-            .await
-            .and_then(std::convert::identity);
-        let response = match dispatched {
-            Ok(r) => {
-                if let Some(debit) = rate_debit.as_mut() {
-                    debit.disarm();
+            // Mint a fresh `Authorization` from the token source. The
+            // token source itself handles single-flight refresh.
+            //
+            // Error classification: `auth.rs::arc_err_to_error` already
+            // sorts the underlying failure into the right typed variant -
+            // `AuthLost` for terminal auth failures (revoked refresh
+            // token, 401/403 from the token endpoint), `RefreshFailed`
+            // wrapping a transient `Network`/`Timeout` for everything
+            // else. We pass the variant through unchanged so callers can
+            // pattern-match for retry-vs-give-up decisions; collapsing
+            // every variant into `AuthLost` would discard that signal.
+            let token = if auth_for_next_hop {
+                let source = account
+                    .token_source()
+                    .ok_or_else(|| Error::InvalidRequest {
+                        field: "bearer_auth",
+                        detail: "bearer authentication requires an AccountSpec token source"
+                            .to_owned(),
+                    })?;
+                match deadline.bound(source.current()).await? {
+                    Ok(t) => Some(t),
+                    Err(e) => return Err(e),
                 }
-                r
-            }
-            Err(e) => {
-                if policy.network_errors
-                    && attempts.can_retry()
-                    && transport_error_is_replayable(&e, replayable)
-                {
-                    let delay = backoff_for(&policy, attempt);
-                    deadline.sleep(delay).await?;
-                    continue;
-                }
-                return Err(e);
-            }
-        };
+            } else {
+                None
+            };
 
-        let status = response.status();
-
-        // 401 path. We allow exactly one forced-refresh + retry per
-        // request. If the refresh itself fails we surface AuthLost
-        // immediately - retrying the same stale token would just
-        // produce another 401. If the refresh succeeds and the
-        // server still returns 401, the credential is dead; surface
-        // AuthLost rather than `Error::Status { code: 401 }` so the
-        // protocol crate can map straight to the terminal-auth
-        // recovery class. We also refund the rate-limit slot so the
-        // retry does not double-debit the host bucket. The auth
-        // retry budget (`auth_retries`) is separate from the network
-        // retry budget (`attempt`): the retry loop's top
-        // `attempt = attempt + 1` increment is undone here so a 401
-        // recovery does not eat into the network attempts left.
-        if auth_for_next_hop && status == StatusCode::UNAUTHORIZED {
-            if !auth_budget.take() {
-                let final_response =
-                    final_response_from_response(response, &account, deadline, &bytes_in).await?;
-                return Err(Error::AuthLost {
-                    transmission_state: Some(TransmissionState::Acknowledged),
-                    final_response: Some(final_response),
+            if let Some(key) = hold_gate.as_ref()
+                && let Some(held) = account.shared_hold(key).current()
+            {
+                return Err(Error::LocalHold {
+                    key: key.clone(),
+                    held,
+                    attempts: std::mem::take(&mut prior_attempts),
+                    may_have_committed,
                 });
             }
-            let _ = read_capped_response_body(response, &account, deadline, &bytes_in).await?;
-            if let Some(debit) = rate_debit.as_ref() {
-                debit.refund_acknowledged();
+
+            // Record outbound body bytes against the per-account meter
+            // before we issue the request. Each retry is another wire
+            // transmission, so we count the body once per attempt. We do
+            // this even on 401-recovery retries because the failed
+            // attempt did put bytes on the wire. Header bytes are
+            // intentionally excluded - the meter is a payload sizing
+            // tool, not a TCP byte counter.
+            if let Some(ref b) = body {
+                let out_n = u64::try_from(b.len()).unwrap_or(u64::MAX);
+                account.meter().record_bytes_out(out_n);
+                bytes_out = bytes_out.saturating_add(out_n);
             }
-            let rejected_token = token.expect("authenticated request minted a token");
-            let refresh = account
-                .token_source()
-                .expect("bearer-authenticated request validated its token source")
-                .refresh_if_unchanged(rejected_token);
-            deadline.bound(refresh).await??;
-            // Discard this attempt from the network budget. The 401
-            // recovery is owned by `AuthBudget`; re-entering the loop
-            // then begins the replacement-token attempt at the same
-            // network-budget position.
-            attempts.discard_current();
-            continue 'outer;
-        }
 
-        // 2xx: return directly. 3xx: classify against the redirect
-        // policy. The classifier yields `PassThrough` for non-followed
-        // 3xx (304 Not Modified, 305, 306) so conditional-request
-        // flows (`If-None-Match` -> 304) and protocol-specific
-        // surfaces (Graph's 304 on `$delta`) keep working.
-        if status.is_success() {
-            let headers_out = response.headers().clone();
-            let stream = into_byte_stream(response, account.read_timeout());
-            return Ok(InternalStreaming {
-                status,
-                headers: headers_out,
-                body: stream,
-                account,
-                deadline,
-                bytes_out,
-                bytes_in,
-                permit,
-            });
-        }
+            let header_clock = crate::upload::HeaderClock::new();
+            let request = build_reqwest(
+                account.net().client(),
+                &method,
+                &url,
+                &headers,
+                &body,
+                token.as_ref(),
+                deadline.remaining()?,
+                &account,
+                &header_clock,
+            );
 
-        if status.is_redirection() {
-            let resp_headers = response.headers().clone();
-            // Do not refund the rate-limit slot at this point: a 3xx
-            // is a real server response. The refund happens only on
-            // the `RedirectAction::Follow` path below, where the
-            // next hop will issue a fresh request that should debit
-            // anew.
-            let active_policy: Option<&RedirectPolicy> = match &redirect_policy {
-                FollowRedirects::Disabled => None,
-                FollowRedirects::Enabled(p) => Some(p),
+            let dispatched = account.net().dispatch().send(request);
+            let dispatched = async {
+                header_clock
+                    .bound(dispatched, account.response_headers_timeout())
+                    .await?
             };
-            match active_policy {
-                None => {
-                    // Pass 3xx through to the caller exactly as the
-                    // original implementation did. Caller code
-                    // (conditional GET, 304 handling) reads the
-                    // status + headers.
-                    let stream = into_byte_stream(response, account.read_timeout());
-                    return Ok(InternalStreaming {
-                        status,
-                        headers: resp_headers,
-                        body: stream,
-                        account,
-                        deadline,
-                        bytes_out,
-                        bytes_in,
-                        permit,
+            let dispatched = deadline
+                .bound_dispatch(dispatched)
+                .await
+                .and_then(std::convert::identity);
+            let response = match dispatched {
+                Ok(r) => {
+                    may_have_committed |= !replayable;
+                    pending_response = Some(FinalResponse {
+                        status: r.status(),
+                        headers: r.headers().clone(),
+                        body: Bytes::new(),
+                    });
+                    if let Some(debit) = rate_debit.as_mut() {
+                        debit.disarm();
+                    }
+                    r
+                }
+                Err(e) => {
+                    if policy.network_errors
+                        && attempts.can_retry()
+                        && transport_error_is_replayable(&e, replayable)
+                    {
+                        let delay = backoff_for(&policy, attempt);
+                        prior_attempts.push(e);
+                        deadline.sleep(delay).await?;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+
+            let status = response.status();
+
+            if status.as_u16() >= 400 {
+                let evidence = final_response_from_response(
+                    response,
+                    &account,
+                    deadline,
+                    &bytes_in,
+                    error_observer.as_ref(),
+                )
+                .await?;
+                if auth_for_next_hop && status == StatusCode::UNAUTHORIZED {
+                    if !auth_budget.take() {
+                        pending_response = None;
+                        return Err(Error::AuthLost {
+                            transmission_state: Some(TransmissionState::Acknowledged),
+                            final_response: Some(evidence),
+                        });
+                    }
+                    prior_attempts.push(status_evidence(&evidence));
+                    pending_response = None;
+                    if let Some(debit) = rate_debit.as_ref() {
+                        debit.refund_acknowledged();
+                    }
+                    let rejected_token = token.expect("authenticated request minted a token");
+                    let refresh = account
+                        .token_source()
+                        .expect("bearer-authenticated request validated its token source")
+                        .refresh_if_unchanged(rejected_token);
+                    deadline.bound(refresh).await??;
+                    attempts.discard_current();
+                    continue 'outer;
+                }
+                if status == StatusCode::UNAUTHORIZED && auth_self_stripped && !auth_for_next_hop {
+                    pending_response = None;
+                    return Err(Error::UnauthenticatedRedirectHop {
+                        message: format!(
+                            "redirect hop to {url} answered 401 after the redirect walker stripped \
+                         Authorization on a cross-origin hop; the account credential was never \
+                         presented to this hop"
+                        ),
+                        final_response: evidence,
                     });
                 }
-                Some(policy) => {
-                    let response = response;
-                    let parsed_url =
-                        reqwest::Url::parse(&url).map_err(|e| Error::InvalidRequest {
-                            field: "url",
-                            detail: format!("could not re-parse request URL for redirect: {e}"),
-                        })?;
-                    match classify_redirect(policy, &method, &parsed_url, status, &resp_headers)? {
-                        RedirectAction::PassThrough => {
-                            // Hand the body up exactly as the
-                            // redirects-disabled arm above does. A
-                            // passed-through 3xx is a terminal response
-                            // from the caller's point of view, and the
-                            // caller - not this loop - decides whether
-                            // its body is interesting. 304/305/306
-                            // ordinarily carry nothing, and Drive's
-                            // header-only `308 Resume Incomplete` yields
-                            // an empty stream on its own; but a followed
-                            // status with no `Location` also lands here,
-                            // and that shape can carry a real explanatory
-                            // body. Discarding it made those bytes
-                            // invisible to the caller AND to the
-                            // request-local byte counter, which counts
-                            // only what a body reader actually reads.
-                            let stream = into_byte_stream(response, account.read_timeout());
-                            return Ok(InternalStreaming {
-                                status,
-                                headers: resp_headers,
-                                body: stream,
-                                account,
-                                deadline,
-                                bytes_out,
-                                bytes_in,
-                                permit,
+                if policy.statuses.contains(&status) || status.is_server_error() {
+                    let retry_after = parse_retry_after(evidence.headers.get(RETRY_AFTER))
+                        .map(|d| d.min(policy.honor_retry_after_cap));
+                    if let Some(ra) = retry_after {
+                        retry_after_history.push(ra);
+                    }
+                    if attempt >= policy.max_attempts {
+                        pending_response = None;
+                        if status == StatusCode::TOO_MANY_REQUESTS {
+                            return Err(Error::RateLimited {
+                                retry_after: retry_after_history.last().copied(),
+                                final_response: evidence,
                             });
                         }
-                        RedirectAction::Follow(step) => {
-                            let _ =
-                                read_capped_response_body(response, &account, deadline, &bytes_in)
-                                    .await?;
-                            redirects.follow()?;
-                            // The next hop will issue a fresh request
-                            // and debit anew, so refund the slot the
-                            // 3xx debited. Otherwise a 10-hop chain
-                            // would burn 10 units instead of one.
-                            if let Some(debit) = rate_debit.as_ref() {
-                                debit.refund_acknowledged();
+                        return Err(Error::RetryBudgetExhausted {
+                            final_response: Some(evidence),
+                            retry_after_history,
+                        });
+                    }
+                    let wait = retry_after.unwrap_or_else(|| backoff_for(&policy, attempt));
+                    prior_attempts.push(status_evidence(&evidence));
+                    pending_response = None;
+                    if let Some(debit) = rate_debit.as_ref() {
+                        debit.refund_acknowledged();
+                    }
+                    deadline.sleep(wait).await?;
+                    continue;
+                }
+                pending_response = None;
+                return Err(status_evidence(&evidence));
+            }
+
+            // 2xx: return directly. 3xx: classify against the redirect
+            // policy. The classifier yields `PassThrough` for non-followed
+            // 3xx (304 Not Modified, 305, 306) so conditional-request
+            // flows (`If-None-Match` -> 304) and protocol-specific
+            // surfaces (Graph's 304 on `$delta`) keep working.
+            if status.is_success() {
+                let headers_out = response.headers().clone();
+                let stream = into_byte_stream(response, account.read_timeout());
+                return Ok(InternalStreaming {
+                    evidence: AttemptEvidence::default(),
+                    status,
+                    headers: headers_out,
+                    body: stream,
+                    account,
+                    deadline,
+                    bytes_out,
+                    bytes_in,
+                    permit,
+                });
+            }
+
+            if status.is_redirection() {
+                let resp_headers = response.headers().clone();
+                // Do not refund the rate-limit slot at this point: a 3xx
+                // is a real server response. The refund happens only on
+                // the `RedirectAction::Follow` path below, where the
+                // next hop will issue a fresh request that should debit
+                // anew.
+                let active_policy: Option<&RedirectPolicy> = match &redirect_policy {
+                    FollowRedirects::Disabled => None,
+                    FollowRedirects::Enabled(p) => Some(p),
+                };
+                match active_policy {
+                    None => {
+                        // Pass 3xx through to the caller exactly as the
+                        // original implementation did. Caller code
+                        // (conditional GET, 304 handling) reads the
+                        // status + headers.
+                        let stream = into_byte_stream(response, account.read_timeout());
+                        return Ok(InternalStreaming {
+                            evidence: AttemptEvidence::default(),
+                            status,
+                            headers: resp_headers,
+                            body: stream,
+                            account,
+                            deadline,
+                            bytes_out,
+                            bytes_in,
+                            permit,
+                        });
+                    }
+                    Some(policy) => {
+                        let response = response;
+                        let parsed_url =
+                            reqwest::Url::parse(&url).map_err(|e| Error::InvalidRequest {
+                                field: "url",
+                                detail: format!("could not re-parse request URL for redirect: {e}"),
+                            })?;
+                        match classify_redirect(
+                            policy,
+                            &method,
+                            &parsed_url,
+                            status,
+                            &resp_headers,
+                        )? {
+                            RedirectAction::PassThrough => {
+                                // Hand the body up exactly as the
+                                // redirects-disabled arm above does. A
+                                // passed-through 3xx is a terminal response
+                                // from the caller's point of view, and the
+                                // caller - not this loop - decides whether
+                                // its body is interesting. 304/305/306
+                                // ordinarily carry nothing, and Drive's
+                                // header-only `308 Resume Incomplete` yields
+                                // an empty stream on its own; but a followed
+                                // status with no `Location` also lands here,
+                                // and that shape can carry a real explanatory
+                                // body. Discarding it made those bytes
+                                // invisible to the caller AND to the
+                                // request-local byte counter, which counts
+                                // only what a body reader actually reads.
+                                let stream = into_byte_stream(response, account.read_timeout());
+                                return Ok(InternalStreaming {
+                                    evidence: AttemptEvidence::default(),
+                                    status,
+                                    headers: resp_headers,
+                                    body: stream,
+                                    account,
+                                    deadline,
+                                    bytes_out,
+                                    bytes_in,
+                                    permit,
+                                });
                             }
-                            method = step.next_method;
-                            url = step.next_url;
-                            if !step.preserve_body {
-                                body = None;
-                                // RFC 7231 section 6.4 also drops content-
-                                // describing headers when the body is
-                                // dropped, otherwise the next hop
-                                // carries a content-type for a body
-                                // that no longer exists.
-                                strip_body_headers(&mut headers);
+                            RedirectAction::Follow(step) => {
+                                if redirect_guard
+                                    .as_ref()
+                                    .is_some_and(|guard| !guard(&url, &step.next_url))
+                                {
+                                    return Err(Error::RedirectRejected {
+                                        message: format!(
+                                            "request redirect guard rejected {url} -> {}",
+                                            step.next_url
+                                        ),
+                                    });
+                                }
+                                let evidence = final_response_from_response(
+                                    response, &account, deadline, &bytes_in, None,
+                                )
+                                .await?;
+                                prior_attempts.push(status_evidence(&evidence));
+                                pending_response = None;
+                                redirects.follow()?;
+                                // The next hop will issue a fresh request
+                                // and debit anew, so refund the slot the
+                                // 3xx debited. Otherwise a 10-hop chain
+                                // would burn 10 units instead of one.
+                                if let Some(debit) = rate_debit.as_ref() {
+                                    debit.refund_acknowledged();
+                                }
+                                method = step.next_method;
+                                url = step.next_url;
+                                if !step.preserve_body {
+                                    body = None;
+                                    // RFC 7231 section 6.4 also drops content-
+                                    // describing headers when the body is
+                                    // dropped, otherwise the next hop
+                                    // carries a content-type for a body
+                                    // that no longer exists.
+                                    strip_body_headers(&mut headers);
+                                }
+                                auth_for_next_hop = step.keep_auth && auth_for_next_hop;
+                                // Strip caller-set `Authorization` headers
+                                // too on cross-host hops, not just the
+                                // token-source-derived bearer. Otherwise
+                                // JMAP Basic-auth (or any caller that
+                                // builds its own Authorization header)
+                                // leaks credentials across a host
+                                // boundary even when the bearer-injection
+                                // path is suppressed.
+                                if !step.keep_auth {
+                                    headers.remove(AUTHORIZATION);
+                                    // Remember that the credential left the
+                                    // request by our own hand, not the
+                                    // caller's. A 401 further down the
+                                    // chain - including on a hop back to
+                                    // the original origin, which arrives
+                                    // unauthenticated because `keep_auth`
+                                    // ANDs monotonically - is then reported
+                                    // as a redirect fault rather than as a
+                                    // dead credential.
+                                    auth_self_stripped |= carrying_auth;
+                                    carrying_auth = false;
+                                }
+                                let prior_host = host.clone();
+                                host = host_from_url(&url);
+                                // A per-request `.cost(n)` is chosen in the
+                                // ORIGINAL host's quota units. Another
+                                // host's bucket meters something else
+                                // entirely (Graph counts requests, Gmail
+                                // counts quota units), so carrying the
+                                // number verbatim onto a cross-host hop
+                                // debits a bucket in units the caller never
+                                // spoke. Drop the override on a host change
+                                // and let the hop re-resolve the new host's
+                                // registered default, which is what the
+                                // no-override path already did per hop.
+                                cost = cost_override_for_hop(
+                                    prior_host.as_deref(),
+                                    host.as_deref(),
+                                    cost,
+                                );
+                                quota_scope = resolve_quota_scope(
+                                    &account,
+                                    host.as_deref(),
+                                    quota_scope_override.as_deref(),
+                                );
+                                cost_units = recompute_cost_units(
+                                    account.net().governor(),
+                                    host.as_deref(),
+                                    &quota_scope,
+                                    cost,
+                                );
+                                // Reset retry counter for the next hop:
+                                // a redirect is a fresh logical request,
+                                // its retries should not eat into the
+                                // budget of the prior hop.
+                                attempts = AttemptBudget::new(retry_attempt_limit);
+                                auth_budget = AuthBudget(false);
+                                continue 'outer;
                             }
-                            auth_for_next_hop = step.keep_auth && auth_for_next_hop;
-                            // Strip caller-set `Authorization` headers
-                            // too on cross-host hops, not just the
-                            // token-source-derived bearer. Otherwise
-                            // JMAP Basic-auth (or any caller that
-                            // builds its own Authorization header)
-                            // leaks credentials across a host
-                            // boundary even when the bearer-injection
-                            // path is suppressed.
-                            if !step.keep_auth {
-                                headers.remove(AUTHORIZATION);
-                                // Remember that the credential left the
-                                // request by our own hand, not the
-                                // caller's. A 401 further down the
-                                // chain - including on a hop back to
-                                // the original origin, which arrives
-                                // unauthenticated because `keep_auth`
-                                // ANDs monotonically - is then reported
-                                // as a redirect fault rather than as a
-                                // dead credential.
-                                auth_self_stripped |= carrying_auth;
-                                carrying_auth = false;
-                            }
-                            let prior_host = host.clone();
-                            host = host_from_url(&url);
-                            // A per-request `.cost(n)` is chosen in the
-                            // ORIGINAL host's quota units. Another
-                            // host's bucket meters something else
-                            // entirely (Graph counts requests, Gmail
-                            // counts quota units), so carrying the
-                            // number verbatim onto a cross-host hop
-                            // debits a bucket in units the caller never
-                            // spoke. Drop the override on a host change
-                            // and let the hop re-resolve the new host's
-                            // registered default, which is what the
-                            // no-override path already did per hop.
-                            cost =
-                                cost_override_for_hop(prior_host.as_deref(), host.as_deref(), cost);
-                            quota_scope = resolve_quota_scope(
-                                &account,
-                                host.as_deref(),
-                                quota_scope_override.as_deref(),
-                            );
-                            cost_units = recompute_cost_units(
-                                account.net().governor(),
-                                host.as_deref(),
-                                &quota_scope,
-                                cost,
-                            );
-                            // Reset retry counter for the next hop:
-                            // a redirect is a fresh logical request,
-                            // its retries should not eat into the
-                            // budget of the prior hop.
-                            attempts = AttemptBudget::new(retry_attempt_limit);
-                            auth_budget = AuthBudget(false);
-                            continue 'outer;
                         }
                     }
                 }
             }
-        }
 
-        // A 401 on a hop this transport disarmed itself. The 401
-        // recovery branch above did not fire (it is gated on
-        // `auth_for_next_hop`), and letting this fall to the terminal
-        // 4xx branch below would mint `Error::Status { 401 }`, which
-        // `into_account_error` reads as `ReauthorizationRequired` ->
-        // terminal `AuthLost`. The credential was never presented, so
-        // it proves nothing about the credential; carry the provenance
-        // instead.
-        if status == StatusCode::UNAUTHORIZED && auth_self_stripped && !auth_for_next_hop {
-            let final_response =
-                final_response_from_response(response, &account, deadline, &bytes_in).await?;
-            return Err(Error::UnauthenticatedRedirectHop {
-                message: format!(
-                    "redirect hop to {url} answered 401 after the redirect walker stripped \
-                     Authorization on a cross-origin hop; the account credential was never \
-                     presented to this hop"
-                ),
-                final_response,
-            });
-        }
-
-        // 4xx that the policy does not call retryable: terminal.
-        if status.is_client_error() && !policy.statuses.contains(&status) {
+            // Any remaining informational status is terminal at this layer.
             let headers_out = response.headers().clone();
-            // Drain through the timeout-aware capped reader, not
-            // `bytes()`. There is no client-level read timeout any
-            // more (it moved per-account when `NetConfig` split), so
-            // a server that sends 4xx headers and then stalls
-            // mid-body would block here forever - and google/graph
-            // accounts carry no total request deadline to rescue it.
-            // The capped reader also bounds memory, where `bytes()`
-            // buffered the whole body before the cap was applied.
             let body = read_capped_response_body(response, &account, deadline, &bytes_in).await?;
+            pending_response = None;
             return Err(Error::Status {
                 code: status,
                 body,
                 headers: headers_out,
             });
         }
-
-        // 5xx and configured-retryable statuses: retry path.
-        // `policy.statuses` is the *additive* set (typically just 429
-        // and the 5xx codes the default policy lists for clarity),
-        // and `is_server_error()` is applied unconditionally on top
-        // so 5xx is always retried. Callers that disable retries set
-        // `max_attempts = 1` and let the budget-exhausted branch
-        // below surface the failure on the first attempt; they do
-        // not remove specific codes.
-        if policy.statuses.contains(&status) || status.is_server_error() {
-            if attempt >= policy.max_attempts {
-                // Parse the final attempt's `Retry-After` and push it
-                // into the history before we surface the error. The
-                // previous code skipped the parse on exhaustion, so
-                // callers lost the server's last hint - the exact
-                // case where a planner wants to back off the longest.
-                let final_retry_after = parse_retry_after(response.headers().get(RETRY_AFTER))
-                    .map(|d| d.min(policy.honor_retry_after_cap));
-                if let Some(ra) = final_retry_after {
-                    retry_after_history.push(ra);
-                }
-                let final_response =
-                    final_response_from_response(response, &account, deadline, &bytes_in).await?;
-                if status == StatusCode::TOO_MANY_REQUESTS {
-                    let last = retry_after_history.last().copied();
-                    return Err(Error::RateLimited {
-                        retry_after: last,
-                        final_response,
-                    });
-                }
-                return Err(Error::RetryBudgetExhausted {
-                    final_response: Some(final_response),
-                    retry_after_history,
-                });
-            }
-            // `Retry-After` is capped by `policy.honor_retry_after_cap`,
-            // which is the sole source of truth for the cap. Earlier
-            // drafts also applied a hardcoded five-minute ceiling; that
-            // double-cap is gone so callers that want to honor an
-            // hour-long server hint can configure the policy and have
-            // it actually take effect.
-            let retry_after = parse_retry_after(response.headers().get(RETRY_AFTER))
-                .map(|d| d.min(policy.honor_retry_after_cap));
-            let wait = retry_after.unwrap_or_else(|| backoff_for(&policy, attempt));
-            if let Some(ra) = retry_after {
-                retry_after_history.push(ra);
-            }
-            // Discard the body so the underlying connection can be
-            // returned to the pool.
-            let _ = read_capped_response_body(response, &account, deadline, &bytes_in).await?;
-            // Refund the rate-limit slot on every retried failure: the
-            // server did not consume real work on a 5xx or 429, so
-            // burning a token across the retry would just starve other
-            // waiters on the same host. Previously only 429+
-            // `Retry-After` refunded; a plain 503 with no header burned
-            // tokens across all three attempts and stalled neighboring
-            // requests for the duration of the backoff.
-            if let Some(debit) = rate_debit.as_ref() {
-                debit.refund_acknowledged();
-            }
-            deadline.sleep(wait).await?;
-            continue;
+    }
+    .await;
+    if let Some(response) = pending_response {
+        prior_attempts.push(status_evidence(&response));
+    }
+    let evidence = AttemptEvidence {
+        attempts: prior_attempts,
+        may_have_committed,
+    };
+    match outcome {
+        Ok(mut response) => {
+            response.evidence = evidence;
+            Ok(response)
         }
-
-        // Anything else: surface as Status, no retry. Same reasoning
-        // as the terminal-4xx drain above.
-        let headers_out = response.headers().clone();
-        let body = read_capped_response_body(response, &account, deadline, &bytes_in).await?;
-        return Err(Error::Status {
-            code: status,
-            body,
-            headers: headers_out,
-        });
+        Err(error) => Err(evidence.finish(error)),
     }
 }
 
@@ -1555,15 +1632,26 @@ fn native_tls_error_in_source_chain(e: &reqwest::Error) -> bool {
     false
 }
 
+fn status_evidence(response: &FinalResponse) -> Error {
+    Error::Status {
+        code: response.status,
+        headers: response.headers.clone(),
+        body: response.body.clone(),
+    }
+}
+
 async fn final_response_from_response(
     response: reqwest::Response,
     account: &AccountNet,
     deadline: RequestDeadline,
     request_bytes: &RequestByteCounter,
+    observer: Option<&ErrorObserver>,
 ) -> Result<FinalResponse, Error> {
     let status = response.status();
     let headers = response.headers().clone();
-    let body = read_capped_response_body(response, account, deadline, request_bytes).await?;
+    let body =
+        read_capped_response_body_observed(response, account, deadline, request_bytes, observer)
+            .await?;
     Ok(FinalResponse {
         status,
         headers,
@@ -1587,7 +1675,29 @@ async fn read_capped_response_body(
     deadline: RequestDeadline,
     request_bytes: &RequestByteCounter,
 ) -> Result<Bytes, Error> {
+    read_capped_response_body_observed(response, account, deadline, request_bytes, None).await
+}
+
+async fn read_capped_response_body_observed(
+    response: reqwest::Response,
+    account: &AccountNet,
+    deadline: RequestDeadline,
+    request_bytes: &RequestByteCounter,
+    observer: Option<&ErrorObserver>,
+) -> Result<Bytes, Error> {
     use futures::StreamExt;
+
+    let status = response.status();
+    let headers = response.headers().clone();
+    let observe = |body: &Bytes| {
+        if let Some(observer) = observer {
+            observer(&FinalResponse {
+                status,
+                headers: headers.clone(),
+                body: body.clone(),
+            });
+        }
+    };
 
     let mut stream = wrap_delivery(
         into_byte_stream(response, account.read_timeout()),
@@ -1601,13 +1711,17 @@ async fn read_capped_response_body(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
-                deadline.check_body()?;
+                let total_error = deadline.check_body().err();
                 let marker = if matches!(error, Error::Timeout { .. }) {
                     STATUS_BODY_TIMEOUT_MARKER
                 } else {
                     STATUS_BODY_CONNECTION_MARKER
                 };
                 append_status_marker(&mut buf, marker);
+                if let Some(error) = total_error {
+                    observe(&crate::error::cap_status_body(Bytes::from(buf)));
+                    return Err(error);
+                }
                 break;
             }
         };
@@ -1622,7 +1736,9 @@ async fn read_capped_response_body(
             break;
         }
     }
-    Ok(crate::error::cap_status_body(Bytes::from(buf)))
+    let body = crate::error::cap_status_body(Bytes::from(buf));
+    observe(&body);
+    Ok(body)
 }
 
 fn append_status_marker(buf: &mut Vec<u8>, marker: &[u8]) {
@@ -2055,7 +2171,7 @@ mod tests {
         };
 
         assert!(
-            matches!(error, Error::ResponseTooLarge { limit: 1024 }),
+            matches!(error.terminal(), Error::ResponseTooLarge { limit: 1024 }),
             "unexpected error: {error:?}"
         );
     }
@@ -2155,7 +2271,7 @@ mod tests {
         };
 
         assert!(matches!(
-            error,
+            error.terminal(),
             Error::Timeout {
                 transmission_state: TransmissionState::InFlight
             }
@@ -2183,7 +2299,7 @@ mod tests {
             panic!("the total deadline must interrupt retry backoff");
         };
 
-        assert!(matches!(error, Error::Timeout { .. }));
+        assert!(matches!(error.terminal(), Error::Timeout { .. }));
         assert_eq!(started.elapsed(), Duration::from_secs(5));
         assert_eq!(script.requests().len(), 1);
     }
@@ -2209,7 +2325,7 @@ mod tests {
             .expect("the overall deadline interrupts the retry-body drain");
 
         assert!(matches!(
-            error,
+            error.terminal(),
             Error::Timeout {
                 transmission_state: TransmissionState::Acknowledged
             }
@@ -2247,7 +2363,7 @@ mod tests {
 
         assert!(
             matches!(
-                error,
+                error.terminal(),
                 Error::Timeout {
                     transmission_state: TransmissionState::Acknowledged
                 }
@@ -2327,7 +2443,7 @@ mod tests {
 
         assert!(
             matches!(
-                error,
+                error.terminal(),
                 Error::Timeout {
                     transmission_state: TransmissionState::Acknowledged
                 }
@@ -2365,7 +2481,7 @@ mod tests {
             panic!("a redirect must not reset the total deadline");
         };
 
-        assert!(matches!(error, Error::Timeout { .. }));
+        assert!(matches!(error.terminal(), Error::Timeout { .. }));
         assert_eq!(started.elapsed(), Duration::from_secs(5));
         assert_eq!(script.requests().len(), 3);
     }
@@ -2422,7 +2538,7 @@ mod tests {
         let Error::AuthLost {
             transmission_state: Some(TransmissionState::Acknowledged),
             final_response: Some(final_response),
-        } = error
+        } = error.terminal()
         else {
             panic!("expected acknowledged AuthLost");
         };
@@ -2555,7 +2671,10 @@ mod tests {
             Ok(_) => panic!("the widened counter must terminate after the configured maximum"),
         };
 
-        assert!(matches!(error, Error::RedirectLoop { hops: 256 }));
+        assert!(matches!(
+            error.terminal(),
+            Error::RedirectLoop { hops: 256 }
+        ));
         assert_eq!(script.requests().len(), 256);
     }
 
@@ -2593,14 +2712,14 @@ mod tests {
         let Error::RetryBudgetExhausted {
             final_response: Some(final_response),
             retry_after_history,
-        } = error
+        } = error.terminal()
         else {
             panic!("expected retry budget evidence");
         };
         assert_eq!(final_response.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(final_response.body, Bytes::from_static(b"final"));
         assert_eq!(
-            retry_after_history,
+            *retry_after_history,
             vec![Duration::from_secs(1), Duration::from_secs(2)]
         );
     }
@@ -3038,7 +3157,7 @@ mod tests {
             !requests[2].headers.contains_key(AUTHORIZATION),
             "the hop home arrives unauthenticated - the walker stripped it leaving the origin"
         );
-        let Error::UnauthenticatedRedirectHop { final_response, .. } = &error else {
+        let Error::UnauthenticatedRedirectHop { final_response, .. } = error.terminal() else {
             panic!("expected UnauthenticatedRedirectHop, got {error:?}");
         };
         assert_eq!(final_response.status, StatusCode::UNAUTHORIZED);
@@ -3082,7 +3201,7 @@ mod tests {
         };
 
         assert!(
-            matches!(error, Error::AuthLost { .. }),
+            matches!(error.terminal(), Error::AuthLost { .. }),
             "expected AuthLost, got {error:?}"
         );
     }
@@ -3320,7 +3439,7 @@ mod tests {
             .err()
             .expect("headers stall");
         assert!(matches!(
-            error,
+            error.terminal(),
             Error::Timeout {
                 transmission_state: TransmissionState::InFlight
             }
@@ -3433,10 +3552,16 @@ mod tests {
         );
         tokio::time::advance(Duration::from_secs(3)).await;
         assert!(matches!(
-            response.body.next().await.expect("deadline error"),
-            Err(Error::Timeout {
+            response
+                .body
+                .next()
+                .await
+                .expect("deadline error")
+                .unwrap_err()
+                .terminal(),
+            Error::Timeout {
                 transmission_state: TransmissionState::Acknowledged
-            })
+            }
         ));
         assert!(response.body.next().await.is_none());
     }

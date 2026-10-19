@@ -362,7 +362,7 @@ async fn a_mid_body_failure_arrives_after_the_delivered_chunks() {
         outcomes[0].as_ref().expect("first chunk delivered"),
         &bytes::Bytes::from_static(b"head")
     );
-    match outcomes[1].as_ref() {
+    match outcomes[1].as_ref().map_err(Error::terminal) {
         Err(Error::Network { .. }) => {}
         other => panic!("expected a mid-body Error::Network, got {other:?}"),
     }

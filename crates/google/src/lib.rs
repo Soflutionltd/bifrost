@@ -16,6 +16,7 @@ mod client;
 mod encoding;
 mod error;
 mod headers;
+mod quota;
 mod types;
 
 use error::{Error, Result};

@@ -446,9 +446,9 @@ async fn watch_actor(
         // days of dead push. The damper is cleared where the timer actually
         // fires, and on the paths that install a fresh lifecycle state.
         let delay = match &lifecycle {
-            WatchLifecycle::Watched { expiration, .. } => {
-                Some(retry_after.unwrap_or_else(|| renewal_delay(*expiration)))
-            }
+            WatchLifecycle::Watched { expiration, .. } => Some(
+                retry_after.unwrap_or_else(|| renewal_delay_at(*expiration, client.wall_now())),
+            ),
             _ => None,
         };
         tokio::select! {
@@ -809,11 +809,16 @@ fn parse_expiration(value: &str) -> Option<SystemTime> {
     UNIX_EPOCH.checked_add(Duration::from_millis(millis))
 }
 
+#[cfg(test)]
 fn renewal_delay(expiration: Option<SystemTime>) -> Duration {
+    renewal_delay_at(expiration, SystemTime::now())
+}
+
+fn renewal_delay_at(expiration: Option<SystemTime>, now: SystemTime) -> Duration {
     let Some(expiration) = expiration else {
         return DEFAULT_RENEW_AFTER;
     };
-    let Ok(until_expiration) = expiration.duration_since(SystemTime::now()) else {
+    let Ok(until_expiration) = expiration.duration_since(now) else {
         return MIN_RENEW_DELAY;
     };
     until_expiration
@@ -830,6 +835,57 @@ mod tests {
     use reqwest::StatusCode;
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn project_hold_watch_renewer_makes_no_wire_calls() {
+        let (client, script) = scripted_client([Canned::Response {
+            status: StatusCode::OK,
+            headers: Default::default(),
+            body: Bytes::from_static(br#"{"historyId":"1","expiration":"0"}"#),
+        }]);
+        let client = Arc::new(
+            client
+                .with_fixed_clock(UNIX_EPOCH + Duration::from_secs(1_000_000))
+                .with_quota_project("123".into()),
+        );
+        let shutdown = CancellationToken::new();
+        let control = Arc::new(PubSubControl::new(
+            Arc::clone(&client),
+            Some(PubSubConfig::new("projects/p/topics/t")),
+            shutdown.clone(),
+            "quota-hold@push.test",
+        ));
+        let mut health = control.health_tx.subscribe();
+        push_subscribe(Arc::clone(&control), vec![CursorScope::Account])
+            .await
+            .unwrap();
+        let wall = SystemTime::UNIX_EPOCH;
+        client
+            .account_net()
+            .shared_hold("gmail-project|123")
+            .record(
+                bifrost_net::HoldDeadline::new(
+                    wall + Duration::from_secs(10_000),
+                    wall,
+                    tokio::time::Instant::now(),
+                ),
+                bifrost_net::HoldKind::QuotaExhausted,
+            );
+        tokio::time::advance(MIN_RENEW_DELAY + Duration::from_secs(1)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(script.requests().len(), 1);
+        assert!(
+            std::iter::from_fn(|| health.try_recv().ok())
+                .any(|event| matches!(event, WatchEvent::Warning(_)))
+        );
+        shutdown.cancel();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(script.requests().len(), 1);
+    }
 
     fn encoded_handle() -> SubscriptionHandle {
         SubscriptionHandle(

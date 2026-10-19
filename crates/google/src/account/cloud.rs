@@ -54,14 +54,10 @@
 //! is refused as `Protocol(ContractViolation)` without echoing the `Location`.
 //! A redirected cancel is reported as an abandoned session.
 //!
-//! Byte accounting: these are the only Gmail-crate requests that do NOT go
-//! through `GmailClient::send_recorded`, so they are not enrolled in the
-//! per-batch `ByteTally` the sync and mutation streams publish. That
-//! under-reports nothing, because Drive uploads are a PIM call and feed no
-//! `bytes_in` field at all - they are not an engine batch. Recorded here so a
-//! byte-accounting audit does not re-file it as a metering hole; the general
-//! claim that every request-bearing lane is metered is about the batch-emitting
-//! producers, which this is not.
+//! Session creation, chunk PUTs and cancel DELETEs all use the guarded
+//! `GmailClient` builder funnel, including its API-surface attribution and
+//! inbound byte accounting. A session Location is accepted only on the HTTPS
+//! Drive upload surface; chunk and cancel also check it before dispatch.
 //!
 //! Audit boundary: the 2026-07 google bug sweep did NOT line-audit this
 //! module; it was skipped as already test-dense. A later auditor should read
@@ -183,7 +179,9 @@ async fn run(
 }
 
 fn ctx() -> GmailErrorContext {
-    GmailErrorContext::base(AccountOperation::HostAttachment)
+    let mut ctx = GmailErrorContext::base(AccountOperation::HostAttachment);
+    ctx.surface = crate::quota::ApiSurface::Drive;
+    ctx
 }
 
 async fn upload_and_link(
@@ -269,24 +267,27 @@ async fn upload_and_link(
 /// the session is already gone, which is the outcome we wanted. Anything else
 /// is reported as abandoned.
 async fn cancel_upload_session(client: &GmailClient, upload_url: &str) -> SessionDisposition {
+    if !reqwest::Url::parse(upload_url).is_ok_and(|url| is_drive_upload_url(&url)) {
+        return SessionDisposition::Abandoned;
+    }
     // Not followed, for the same reason as the chunk PUT: the session URI is
     // pre-authenticated and admitted only as itself.
-    let outcome = client
+    let request = client
         .account_net()
         .delete(upload_url)
         .without_bearer_auth()
         .follow_redirects(bifrost_net::FollowRedirects::Disabled)
         .retry(bifrost_net::RetryPolicy::disabled())
-        .timeout(GDRIVE_CANCEL_TIMEOUT)
-        .send()
-        .await;
+        .timeout(GDRIVE_CANCEL_TIMEOUT);
+    let outcome = client.execute_builder(request, "Drive API").await;
 
     match outcome {
         // An unfollowed 3xx is not Drive accepting the cancel.
         Ok(response) if response.status().is_redirection() => SessionDisposition::Abandoned,
         Ok(_) => SessionDisposition::Cancelled,
-        Err(bifrost_net::Error::Status { code, .. })
-            if matches!(code.as_u16(), 404 | 410 | 499) =>
+        Err(error)
+            if super::error::response_parts(&error)
+                .is_some_and(|(status, _)| matches!(status, 404 | 410 | 499)) =>
         {
             SessionDisposition::Cancelled
         }
@@ -298,8 +299,8 @@ async fn cancel_upload_session(client: &GmailClient, upload_url: &str) -> Sessio
 /// read from the `Location` response header.
 ///
 /// The typed `GmailClient::post` helper cannot set `X-Upload-Content-*`, so
-/// this uses the raw builder path; the AccountNet token source supplies the
-/// Bearer.
+/// this uses the raw builder funnel, including its API-surface redirect guard;
+/// the AccountNet token source supplies the Bearer.
 async fn create_upload_session(
     client: &GmailClient,
     meta: &CloudUploadMeta,
@@ -309,15 +310,13 @@ async fn create_upload_session(
         mime_type: &meta.mime,
     };
 
-    let response = client
+    let request = client
         .account_net()
         .post(SESSION_URL)
         .header("X-Upload-Content-Type", meta.mime.as_str())
         .header("X-Upload-Content-Length", &meta.size.to_string())
-        .json(&metadata)
-        .send()
-        .await
-        .map_err(Error::Net)?;
+        .json(&metadata);
+    let response = client.execute_builder(request, "Drive API").await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -353,7 +352,23 @@ async fn create_upload_session(
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none_or(str::is_empty) {
         return Err(unparseable("is not an http(s) URL with a host"));
     }
+    if !is_drive_upload_url(&url) {
+        return Err(Error::provider_response(
+            ProviderFault::ContractViolation,
+            "upload session Location is outside the Drive upload surface",
+        ));
+    }
     Ok(text.to_owned())
+}
+
+fn is_drive_upload_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("www.googleapis.com")
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && (url.path() == "/upload/drive/v3/files"
+            || url.path().starts_with("/upload/drive/v3/files/"))
 }
 
 /// Upload the payload in `chunk_size`-aligned chunks against the pre-authenticated
@@ -380,6 +395,12 @@ async fn upload_file_chunked(
     data: Bytes,
     chunk_size: usize,
 ) -> Result<String, Error> {
+    if !reqwest::Url::parse(upload_url).is_ok_and(|url| is_drive_upload_url(&url)) {
+        return Err(Error::provider_response(
+            ProviderFault::ContractViolation,
+            "upload session is outside the Drive upload surface",
+        ));
+    }
     // Both are guaranteed by the callers (the chunk size is a constant, and
     // `upload_and_link` refuses an empty payload before opening a session), so
     // reaching either is this crate's bug.
@@ -416,16 +437,14 @@ async fn upload_file_chunked(
         // and admitted only as itself, so a hop would carry the payload
         // somewhere nobody admitted. Drive's `308 Resume Incomplete` carries
         // no `Location` and still arrives here as a plain response.
-        let response = client
+        let request = client
             .account_net()
             .put(upload_url)
             .without_bearer_auth()
             .follow_redirects(bifrost_net::FollowRedirects::Disabled)
             .header("Content-Range", &content_range)
-            .body(chunk)
-            .send()
-            .await
-            .map_err(Error::Net)?;
+            .body(chunk);
+        let response = client.execute_builder(request, "Drive API").await?;
 
         let status = response.status().as_u16();
         if response.status().is_redirection() && response.headers.contains_key("location") {
@@ -591,11 +610,131 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn review_r1_drive_session_redirect_to_held_gmail_is_rejected() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("location", "https://gmail.test/profile".parse().unwrap());
+        let script = ScriptedDispatch::new([
+            Canned::Response {
+                status: reqwest::StatusCode::TEMPORARY_REDIRECT,
+                headers,
+                body: Bytes::new(),
+            },
+            session_created(),
+        ]);
+        let client = scripted_client(&script).with_quota_project("123".into());
+        let wall = std::time::SystemTime::UNIX_EPOCH;
+        client
+            .account_net()
+            .shared_hold("gmail-project|123")
+            .record(
+                bifrost_net::HoldDeadline::new(
+                    wall + Duration::from_secs(60),
+                    wall,
+                    tokio::time::Instant::now(),
+                ),
+                bifrost_net::HoldKind::QuotaExhausted,
+            );
+        let error = create_upload_session(&client, &upload_meta())
+            .await
+            .expect_err("cross-surface redirect rejected");
+        assert!(
+            matches!(
+                error,
+                Error::Net(ref net) if matches!(net.terminal(), bifrost_net::Error::RedirectRejected { .. })
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(script.requests().len(), 1);
+    }
+
+    fn final_review_held_client(script: &Arc<ScriptedDispatch>) -> GmailClient {
+        let client = scripted_client(script).with_quota_project("123".into());
+        let wall = std::time::SystemTime::UNIX_EPOCH;
+        client
+            .account_net()
+            .shared_hold("gmail-project|123")
+            .record(
+                bifrost_net::HoldDeadline::new(
+                    wall + Duration::from_secs(60),
+                    wall,
+                    tokio::time::Instant::now(),
+                ),
+                bifrost_net::HoldKind::QuotaExhausted,
+            );
+        client
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_review_successful_session_cannot_name_gmail() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("location", "https://gmail.test/session".parse().unwrap());
+        let script = ScriptedDispatch::new([
+            Canned::Response {
+                status: reqwest::StatusCode::OK,
+                headers,
+                body: Bytes::new(),
+            },
+            Canned::Response {
+                status: reqwest::StatusCode::OK,
+                headers: Default::default(),
+                body: Bytes::from_static(br#"{"id":"wrong"}"#),
+            },
+        ]);
+        let client = final_review_held_client(&script);
+        let result = create_upload_session(&client, &upload_meta()).await;
+        if let Ok(url) = &result {
+            let _ = upload_file_chunked(
+                &client,
+                url,
+                Bytes::from_static(b"payload"),
+                GDRIVE_CHUNK_SIZE,
+            )
+            .await;
+        }
+        assert_eq!(script.requests().len(), 1, "no Gmail wire call");
+        assert!(result.is_err(), "cross-surface session URL must be refused");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_review_chunk_rejects_non_drive_surface() {
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: reqwest::StatusCode::OK,
+            headers: Default::default(),
+            body: Bytes::from_static(br#"{"id":"wrong"}"#),
+        }]);
+        let client = final_review_held_client(&script);
+        let result = upload_file_chunked(
+            &client,
+            "https://gmail.test/session",
+            Bytes::from_static(b"payload"),
+            GDRIVE_CHUNK_SIZE,
+        )
+        .await;
+        assert!(
+            script.requests().is_empty(),
+            "held Gmail surface must not dispatch"
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_review_cancel_rejects_non_drive_surface() {
+        let script = ScriptedDispatch::new([cancel_accepted()]);
+        let client = final_review_held_client(&script);
+        let disposition = cancel_upload_session(&client, "https://gmail.test/session").await;
+        assert!(
+            script.requests().is_empty(),
+            "held Gmail surface must not dispatch"
+        );
+        assert_eq!(disposition, SessionDisposition::Abandoned);
+    }
+
     fn session_created() -> Canned {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "location",
-            "https://upload.test/session/abc"
+            "https://www.googleapis.com/upload/drive/v3/files/session/abc"
                 .parse()
                 .expect("valid URL"),
         );
@@ -761,7 +900,7 @@ mod tests {
 
         let result = upload_file_chunked(
             &client,
-            "https://upload.test/session",
+            "https://www.googleapis.com/upload/drive/v3/files/session",
             Bytes::from_static(b"payload"),
             GDRIVE_CHUNK_ALIGN,
         )
@@ -793,7 +932,7 @@ mod tests {
 
         let result = upload_file_chunked(
             &client,
-            "https://upload.test/session",
+            "https://www.googleapis.com/upload/drive/v3/files/session",
             Bytes::from_static(b"a payload longer than nine bytes"),
             GDRIVE_CHUNK_ALIGN,
         )
@@ -847,7 +986,7 @@ mod tests {
         );
         assert_eq!(
             requests[2].url.as_str(),
-            "https://upload.test/session/abc",
+            "https://www.googleapis.com/upload/drive/v3/files/session/abc",
             "the cancel targets the session URI, not the create endpoint"
         );
         assert_eq!(script.remaining(), 0, "the whole script was consumed");
@@ -1071,8 +1210,10 @@ mod tests {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "location",
-            reqwest::header::HeaderValue::from_bytes(b"https://upload.test/session/\xff")
-                .expect("obs-text is a legal header value"),
+            reqwest::header::HeaderValue::from_bytes(
+                b"https://www.googleapis.com/upload/drive/v3/files/session/\xff",
+            )
+            .expect("obs-text is a legal header value"),
         );
         let script = ScriptedDispatch::new([Canned::Response {
             status: reqwest::StatusCode::OK,
@@ -1174,7 +1315,7 @@ mod tests {
             assert_provider_fault(&error, bifrost_types::ProtocolErrorKind::ContractViolation);
             assert_eq!(requests.len(), 3, "session, the redirected PUT, cancel");
             assert_eq!(requests[2].method, reqwest::Method::DELETE);
-            assert_eq!(requests[2].url.host_str(), Some("upload.test"));
+            assert_eq!(requests[2].url.host_str(), Some("www.googleapis.com"));
             let consented = error.support_consented();
             assert!(
                 !consented
@@ -1335,7 +1476,7 @@ mod tests {
 
         let error = upload_file_chunked(
             &scripted_client(&script),
-            "https://upload.test/session",
+            "https://www.googleapis.com/upload/drive/v3/files/session",
             Bytes::from_static(b"a payload longer than nine bytes"),
             GDRIVE_CHUNK_ALIGN,
         )

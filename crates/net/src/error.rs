@@ -90,6 +90,29 @@ pub fn cap_status_body(body: Bytes) -> Bytes {
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum Error {
+    /// Local refusal before a wire attempt. Prior outcomes are retained in
+    /// order; an empty list is the only case with no dispatched attempt.
+    #[error("request refused by local hold {key}")]
+    LocalHold {
+        key: String,
+        held: crate::Held,
+        attempts: Vec<Error>,
+        /// A prior acknowledged non-idempotent attempt may have committed.
+        /// The logical operation must reconcile even if a later GET was held.
+        may_have_committed: bool,
+    },
+
+    /// A later stage failed after earlier wire attempts. The terminal error
+    /// describes that stage; earlier outcomes remain ordered and must be
+    /// considered before deciding whether the logical operation is replayable.
+    #[error("logical request failed after earlier attempts: {source}")]
+    AttemptHistory {
+        #[source]
+        source: Box<Error>,
+        attempts: Vec<Error>,
+        may_have_committed: bool,
+    },
+
     /// Connect, reset, DNS, TLS handshake, or other transport-level
     /// failure surfaced by the underlying HTTP stack. The source is
     /// boxed so the public surface does not leak the `hyper` /
@@ -314,6 +337,19 @@ pub enum Error {
         /// Hops walked before the loop was aborted.
         hops: u16,
     },
+}
+
+impl Error {
+    /// The error at the failing stage of a logical request. Earlier attempt
+    /// evidence remains on `AttemptHistory`; classification must use the whole
+    /// error rather than this diagnostic view.
+    #[must_use]
+    pub fn terminal(&self) -> &Self {
+        match self {
+            Self::AttemptHistory { source, .. } => source.terminal(),
+            error => error,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -2481,10 +2481,17 @@ mod tests {
         ])
         .await
         {
-            Err(GraphError::Net(bifrost_net::Error::AuthLost {
-                transmission_state,
-                final_response: Some(_),
-            })) => assert_eq!(transmission_state, Some(TransmissionState::Acknowledged)),
+            Err(GraphError::Net(error)) => {
+                let bifrost_net::Error::AuthLost {
+                    transmission_state,
+                    final_response: Some(_),
+                    ..
+                } = error.terminal()
+                else {
+                    panic!("a 401 surviving forced refresh retains AuthLost: {error:?}");
+                };
+                assert_eq!(*transmission_state, Some(TransmissionState::Acknowledged));
+            }
             _ => panic!("a 401 surviving the forced refresh is Error::AuthLost"),
         }
     }

@@ -35,6 +35,119 @@ pub struct NetErrorContext {
 #[must_use]
 pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
     match error {
+        Error::AttemptHistory {
+            source,
+            attempts,
+            may_have_committed,
+        } => {
+            let terminal = into_account_error(*source, ctx.clone());
+            let previous: Vec<_> = attempts
+                .into_iter()
+                .map(|error| into_account_error(error, ctx.clone()))
+                .collect();
+            let states: Vec<_> = previous
+                .iter()
+                .chain(std::iter::once(&terminal))
+                .flat_map(|error| error.chain().iter())
+                .filter_map(|cause| match cause {
+                    Cause::Attempt(a) => Some(a.transmission_state),
+                    _ => None,
+                })
+                .collect();
+            let terminal_state = terminal.chain().iter().find_map(|cause| match cause {
+                Cause::Attempt(a) => Some(a.transmission_state),
+                _ => None,
+            });
+            let inflight = may_have_committed || states.contains(&TransmissionState::InFlight);
+            let acknowledged = states.contains(&TransmissionState::Acknowledged);
+            // A later auth, policy, or admission failure cannot establish the
+            // outcome of an earlier mutation. PartialResponse is the existing
+            // reconcile-required lane for an incomplete logical exchange.
+            let reclassified =
+                inflight || (acknowledged && terminal_state == Some(TransmissionState::Unsent));
+            let mut builder = if reclassified {
+                partial_response(
+                    &ctx,
+                    "logical request failed after earlier attempts".into(),
+                    if inflight {
+                        TransmissionState::InFlight
+                    } else {
+                        TransmissionState::Acknowledged
+                    },
+                )
+                .into_builder()
+            } else {
+                let builder = terminal.clone().into_builder();
+                if acknowledged && terminal_state.is_none() {
+                    push_attempt(builder, TransmissionState::Acknowledged)
+                } else {
+                    builder
+                }
+            };
+            for error in &previous {
+                for cause in error.chain().iter() {
+                    builder = builder.push_cause(cause.clone());
+                }
+            }
+            if reclassified {
+                for cause in terminal.chain().iter() {
+                    builder = builder.push_cause(cause.clone());
+                }
+            }
+            finish(builder, &ctx)
+        }
+        Error::LocalHold {
+            held,
+            attempts,
+            may_have_committed,
+            ..
+        } => {
+            let hint = Some(RetryHint::After(held.deadline.remaining()));
+            let (kind, cause) = match held.kind {
+                crate::HoldKind::RateLimited => (
+                    ServerErrorKind::RateLimited,
+                    ServerCause::RateLimited { retry_hint: hint },
+                ),
+                crate::HoldKind::QuotaExhausted => (
+                    ServerErrorKind::QuotaExhausted,
+                    ServerCause::QuotaExhausted { retry_hint: hint },
+                ),
+            };
+            let diagnostics = format!("prior attempts: {attempts:?}");
+            let evidence: Vec<_> = attempts
+                .into_iter()
+                .map(|attempt| into_account_error(attempt, ctx.clone()))
+                .collect();
+            let states: Vec<_> = evidence
+                .iter()
+                .flat_map(|error| error.chain().iter())
+                .filter_map(|cause| match cause {
+                    Cause::Attempt(attempt) => Some(attempt.transmission_state),
+                    _ => None,
+                })
+                .collect();
+            let state = if may_have_committed || states.contains(&TransmissionState::InFlight) {
+                TransmissionState::InFlight
+            } else if states.contains(&TransmissionState::Acknowledged) {
+                TransmissionState::Acknowledged
+            } else {
+                TransmissionState::Unsent
+            };
+            let mut builder = push_attempt(
+                base_builder(&ctx, AccountErrorKind::Server(kind), Cause::Server(cause)),
+                state,
+            );
+            for error in evidence {
+                for cause in error.chain().iter() {
+                    builder = builder.push_cause(cause.clone());
+                }
+            }
+            builder = builder.text(DiagnosticText::support_only(diagnostics));
+            if let Some(scope) = throttle_scope(&ctx) {
+                builder = builder.throttle_scope(scope);
+            }
+            finish(builder, &ctx)
+        }
         Error::Network {
             message,
             transmission_state,
@@ -710,6 +823,7 @@ fn throttle_scope(ctx: &NetErrorContext) -> Option<ThrottleScope> {
 
 fn support_cause_from_source(error: &Error) -> Option<Cause> {
     match error {
+        Error::AttemptHistory { source, .. } => support_cause_from_source(source),
         Error::Network { message, .. } => Some(Cause::Transport(TransportCause::new(
             TransportKind::Network,
             maybe_support_text(message.clone()),
@@ -754,7 +868,8 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
             TransportKind::Network,
             Some(DiagnosticText::support_only("request cancelled")),
         ))),
-        Error::CostExceedsBurst { .. }
+        Error::LocalHold { .. }
+        | Error::CostExceedsBurst { .. }
         | Error::EncodeBody { .. }
         | Error::InvalidHeader { .. }
         | Error::InvalidRequest { .. }

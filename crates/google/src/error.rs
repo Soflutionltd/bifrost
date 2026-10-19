@@ -1,6 +1,6 @@
 use std::error::Error as StdError;
 use std::fmt::{self, Display, Formatter};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bifrost_types::AccountOperation;
 use bytes::Bytes;
@@ -44,15 +44,24 @@ impl Display for GmailService {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GmailResponseHeaders {
-    pub(crate) retry_after: Option<Duration>,
+    pub(crate) retry_after: Option<RetryAfter>,
+    pub(crate) retry_at: Option<SystemTime>,
+    pub(crate) project: Option<crate::quota::ProjectObservation>,
     pub(crate) request_id: Option<String>,
     pub(crate) trace_id: Option<String>,
 }
 
 impl GmailResponseHeaders {
     pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
+        Self::from_headers_at(headers, SystemTime::now())
+    }
+
+    pub(crate) fn from_headers_at(headers: &HeaderMap, now: SystemTime) -> Self {
+        let retry_after = parse_retry_after_value(headers.get(RETRY_AFTER));
         Self {
-            retry_after: parse_retry_after_value(headers.get(RETRY_AFTER)),
+            retry_at: retry_after.and_then(|hint| hint.resolve(now)),
+            retry_after,
+            project: None,
             request_id: first_header(
                 headers,
                 &["x-goog-request-id", "x-google-request-id", "x-request-id"],
@@ -62,14 +71,28 @@ impl GmailResponseHeaders {
     }
 }
 
-/// Parse `Retry-After` as either a delta-seconds integer or an HTTP date.
-/// HTTP-date parsing is deliberately not implemented; Gmail only emits
-/// delta-seconds in practice and `bifrost-net` covers the parser for
-/// retry-driven flows. This helper is for diagnostics-only retention.
-fn parse_retry_after_value(value: Option<&HeaderValue>) -> Option<Duration> {
+/// Retain the provider's syntax as well as its once-resolved deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetryAfter {
+    Delta(Duration),
+    At(SystemTime),
+}
+
+impl RetryAfter {
+    fn resolve(self, now: SystemTime) -> Option<SystemTime> {
+        match self {
+            Self::Delta(delta) => now.checked_add(delta),
+            Self::At(at) => Some(at),
+        }
+    }
+}
+
+fn parse_retry_after_value(value: Option<&HeaderValue>) -> Option<RetryAfter> {
     let raw = value?.to_str().ok()?.trim();
-    let seconds: u64 = raw.parse().ok()?;
-    Some(Duration::from_secs(seconds))
+    raw.parse::<u64>()
+        .ok()
+        .map(|seconds| RetryAfter::Delta(Duration::from_secs(seconds)))
+        .or_else(|| httpdate::parse_http_date(raw).ok().map(RetryAfter::At))
 }
 
 fn first_header(headers: &HeaderMap, names: &[&str]) -> Option<String> {
@@ -360,6 +383,8 @@ pub(crate) enum Error {
     /// history, and other forensic evidence rather than relying on a
     /// flattened string.
     Net(bifrost_net::Error),
+    /// Response-time metadata retained across net's internal retry decisions.
+    ObservedNet(Box<ObservedNetError>),
     /// Gmail returned an unsuccessful HTTP response.
     ///
     /// The raw body bytes are preserved (capped at
@@ -382,6 +407,12 @@ pub(crate) enum Error {
     /// A locally-detected error (unsupported operation, malformed
     /// caller input, cursor envelope mismatch, etc.).
     Local(GmailLocalError),
+}
+
+#[derive(Debug)]
+pub(crate) struct ObservedNetError {
+    pub(crate) error: bifrost_net::Error,
+    pub(crate) headers: GmailResponseHeaders,
 }
 
 impl Error {
@@ -469,6 +500,7 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Net(err) => write!(f, "net transport error: {err}"),
+            Self::ObservedNet(observed) => write!(f, "net transport error: {}", observed.error),
             Self::Response(resp) => {
                 write!(
                     f,
@@ -493,6 +525,7 @@ impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Net(err) => Some(err),
+            Self::ObservedNet(observed) => Some(&observed.error),
             Self::JsonDecode { source, .. } => Some(source),
             Self::Base64 { source, .. } => Some(source),
             Self::Response(_) | Self::Local(_) => None,
@@ -523,7 +556,7 @@ fn body_excerpt(body: Bytes) -> Bytes {
 /// Gmail wraps error responses under a top-level `error` object. This
 /// helper parses only the inner envelope; if the body is not Gmail-
 /// shaped JSON the caller falls back to HTTP status classification.
-fn parse_gmail_envelope(body: &[u8]) -> Option<GmailErrorEnvelope> {
+pub(crate) fn parse_gmail_envelope(body: &[u8]) -> Option<GmailErrorEnvelope> {
     #[derive(Deserialize)]
     struct Wrapper {
         error: GmailErrorEnvelope,

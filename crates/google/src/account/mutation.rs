@@ -591,8 +591,7 @@ async fn apply_label_patch_bisected(
 }
 
 fn is_not_found(error: &GmailError) -> bool {
-    matches!(error, GmailError::Response(response) if response.status == 404)
-        || matches!(error, GmailError::Net(bifrost_net::Error::Status { code, .. }) if *code == reqwest::StatusCode::NOT_FOUND)
+    account_error::response_parts(error).is_some_and(|(status, _)| status == 404)
 }
 
 fn label_patch_successes(

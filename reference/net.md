@@ -117,6 +117,94 @@ fresh wire request: governor debit + outbound metering + body send
 (`send_streaming`) share `send_streaming_inner`; the buffered path
 drains the body through the same metering reader.
 
+### Shared provider holds and error observation
+
+`Net::shared_hold(key)` and `AccountNet::shared_hold(key)` open a `SharedHold`
+against the same string-keyed registry on that Net. The registry owns its
+entries until their monotonic expiry; dropping every account and hold handle
+cannot erase an unexpired hold. Expired entries are pruned opportunistically.
+Handles look up the key again on every access, so an old handle still shares
+updates with one opened after pruning. Independent Nets have independent hold
+registries; Google factories use the shared default Net.
+
+`HoldDeadline` pairs a `tokio::time::Instant` for enforcement with a
+`SystemTime` for reporting, resolved together at response observation.
+`SharedHold::record(deadline, kind)` keeps the later deadline WITH its
+`HoldKind::{RateLimited, QuotaExhausted}`. Quota wins a monotonic-deadline tie;
+a shorter quota deadline cannot relabel a longer rate deadline, and a shorter
+rate deadline cannot weaken a longer quota hold.
+
+`RequestBuilder::hold_gate(key)` checks that registry immediately before every
+wire attempt, after concurrency admission, rate admission and token lookup or
+refresh. This includes net-internal retries and redirect hops. A held gate
+returns `Error::LocalHold { key, held, attempts, may_have_committed }` without dispatching or
+recording anything back into the hold. Already dispatched attempts finish.
+Rate admission is refunded by the existing debit guard on a local refusal.
+
+`attempts` retains the earlier outcomes in order, including transport state and
+response status, headers and capped diagnostic body. An initial refusal has no
+earlier attempts and translates with `Attempt(Unsent)`. A refusal between
+attempts preserves those causes and outcome diagnostics; the effective state
+is `InFlight` if any attempt remains uncertain OR an acknowledged
+non-idempotent attempt may have committed, otherwise `Acknowledged` if a
+response arrived, otherwise `Unsent`. The `may_have_committed` flag survives
+redirect method rewrites: a committed POST answered by 303 followed by a held
+GET reconciles as `ThrottledMidFlight` for a non-idempotent operation, rather
+than replaying the POST. The original acknowledged response remains in the
+secondary evidence. It never replaces earlier uncertainty
+with a synthetic unsent replacement attempt. Generic translation produces the
+hold's server kind and a `RetryHint::After` from the remaining monotonic
+duration; the protocol crate stamps its own budget identity.
+
+All other error exits after earlier wire attempts carry
+`Error::AttemptHistory { source, attempts, may_have_committed }`. A single
+completion boundary covers deadline checks, retry sleeps, rate admission,
+token lookup and refresh, cancellation errors, redirect classification and
+hop limits, and diagnostic drains. The evidence also travels with a successful
+response's body: buffering, ceiling checks, range validation and streaming
+failures preserve it. Earlier attempts are retained even without a hold gate.
+A response whose diagnostic drain fails still contributes its status and
+headers. `Error::terminal()` exposes the failing stage for diagnostics without
+removing the history; classification must consume the complete error.
+
+If a non-idempotent attempt may have committed, generic translation uses
+`Protocol(PartialResponse)` with an effective `Attempt(InFlight)` ahead of the
+physical attempt evidence. This is the existing reconcile-required lane for
+an incomplete logical exchange, including when the later failure is auth or
+redirect policy. It prevents replaying a committed POST after its redirected
+GET times out during token lookup, or when a quota retry wait exceeds the
+total deadline. Histories containing only unsent attempts keep the terminal
+classification. Ordinary acknowledged idempotent auth and policy failures
+also retain their terminal classification.
+Protocol consumers that read statuses as data must inspect `terminal()` while
+retaining the complete error for failure classification. DAV reconstitutes a
+terminal response from a replayable request (including DELETE followed by 404)
+and preserves its response-overflow classification with the history attached.
+Unreplayable DAV histories go through the shared reconciliation mapping. Graph's
+status reader also sees terminal evidence inside the envelope, so subscription
+cleanup and throttle-budget attribution retain their existing status handling.
+
+`RequestBuilder::redirect_guard(predicate)` optionally restricts followed
+redirects using their current and resolved target URLs. It runs after net's
+method/trust classification and before draining the redirect or admitting the
+target. Rejection retains `Error::RedirectRejected` as the terminal error inside the
+attempt-evidence envelope. It does not change
+success or pass-through streaming responses. Protocol crates can keep a
+request's gate, observer, cost and concurrency attribution on one API surface.
+
+`RequestBuilder::observe_errors(callback)` observes responses with status
+>= 400 before authentication recovery or retry decisions. It receives a
+`FinalResponse` containing the existing capped diagnostic prefix, including
+any truncation or read-failure marker, rather than an unlimited body. The same
+read supplies the eventual error evidence; the body is not drained twice.
+A total deadline expiring during the diagnostic drain still invokes the
+observer with the buffered prefix and timeout marker, then retains the original acknowledged timeout as the terminal error alongside
+its attempt evidence. Successes and 3xx responses are never observed,
+preserving redirect and pass-through streaming behavior. Headers are available
+before those bodies finish; the observer does not pre-drain their prefix.
+Protocol observers can record a provider hold before net attempts a retry. A response that cannot be classified from the
+capped prefix supplies no protocol-specific hold.
+
 ### Deadlines and the buffered ceiling
 
 `NetConfig::connect_timeout` bounds DNS, TCP, and TLS connection setup on the
@@ -1053,6 +1141,11 @@ Full trace propagation (reading trace_id from the current
 `Error` is `#[non_exhaustive]` and `thiserror`-derived. Notable
 variants:
 
+- `AttemptHistory { source, attempts, may_have_committed }` - terminal
+  stage failure together with earlier wire outcomes. The complete error feeds
+  classification; `terminal()` is a diagnostic view of the failing stage.
+- `LocalHold { key, held, attempts, may_have_committed }` - registry gate
+  refusal with the same accumulated transmission evidence.
 - `Network { message, transmission_state, source }` - transport-level
   failures (DNS, TCP reset, generic transport). `transmission_state`
   is `Unsent`, `InFlight`, or `Acknowledged`; acknowledged network
@@ -1216,6 +1309,7 @@ crates/net/src/
   account_error.rs // context-aware conversion to bifrost-types AccountError
   auth.rs         // TokenSource + OAuthRefresher state machine +
                   // StaticTokenSource
+  hold.rs         // retained shared hold registry + paired deadlines
   retry.rs        // RetryPolicy
   rate.rs         // RateLimitGovernor + HostBucket
   status_line.rs  // HTTP status-line parsing shared by the DAV crates

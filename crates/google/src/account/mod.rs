@@ -7,7 +7,7 @@ mod changes;
 mod cloud;
 mod contacts;
 mod cursor;
-mod error;
+pub(crate) mod error;
 mod filters;
 mod flags;
 mod inventory;
@@ -64,6 +64,27 @@ pub struct GoogleAccountFactory {
 }
 
 impl GoogleAccountFactory {
+    /// Group Gmail quota holds by the quota-consuming Cloud project.
+    /// Use the canonical project NUMBER consistently across every factory.
+    /// This identity does not send a billing or quota-project header.
+    ///
+    /// # Errors
+    /// Rejects an empty or whitespace-only identity.
+    pub fn with_quota_project(mut self, id: impl Into<String>) -> Result<Self, AccountError> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(error::into_account_error(
+                crate::Error::invalid_request(
+                    AccountOperation::Discover,
+                    "quota project must not be empty",
+                ),
+                error::GmailErrorContext::open(),
+            ));
+        }
+        self.client = Arc::new(self.client.with_quota_project(id));
+        Ok(self)
+    }
+
     fn from_client(client: GmailClient) -> Self {
         Self {
             client: Arc::new(client),
@@ -266,6 +287,29 @@ impl Drop for GoogleAccount {
 }
 
 impl Account for GoogleAccount {
+    fn throttle_keys(
+        &self,
+        _account: &AccountId,
+        work: bifrost_types::ThrottleWork<'_>,
+    ) -> Vec<bifrost_types::ThrottleKey> {
+        use bifrost_types::ThrottleWork;
+        // Generic object hydration and mutation on Google route only to
+        // Gmail. Calendar and People use their typed EventId/ContactId APIs.
+        let gmail = match work {
+            ThrottleWork::Scope(CursorScope::Account) => true,
+            ThrottleWork::Objects(ids) => !ids.is_empty(),
+            ThrottleWork::Membership(MembershipScope::Label(_)) => true,
+            _ => false,
+        };
+        self.client
+            .quota_project()
+            .filter(|_| gmail)
+            .cloned()
+            .map(bifrost_types::ThrottleKey::Budget)
+            .into_iter()
+            .collect()
+    }
+
     fn capabilities(&self) -> &AccountCapabilities {
         &self.capabilities
     }
@@ -969,6 +1013,141 @@ mod tests {
     use bifrost_net::{AccountSpec, NetConfig, RateLimit, RetryPolicy, StaticTokenSource};
 
     use super::*;
+
+    #[test]
+    fn project_hold_factory_rejects_empty_and_preserves_project_through_overrides() {
+        assert!(
+            GoogleAccountFactory::from_access_token("token")
+                .with_quota_project("")
+                .is_err()
+        );
+        assert!(
+            GoogleAccountFactory::from_access_token("token")
+                .with_quota_project(" ")
+                .is_err()
+        );
+        let factory = GoogleAccountFactory::from_access_token("token")
+            .with_quota_project("123")
+            .unwrap()
+            .with_people_api_base("https://people.test/v1")
+            .with_calendar_api_base("https://calendar.test/v3");
+        let client = factory.client.for_account(AccountId("factory".into()));
+        assert_eq!(
+            client.quota_project().unwrap().as_str(),
+            "gmail-project|123"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn project_hold_engine_keys_match_stamped_budget_across_accounts() {
+        use bifrost_net::test_support::canned;
+        use bifrost_types::{LabelId, ObjectType, ThrottleBudget, ThrottleKey, ThrottleWork};
+        let script = ScriptedDispatch::new([
+            canned(
+                reqwest::StatusCode::OK,
+                br#"{"emailAddress":"a@test","historyId":"1"}"#,
+            ),
+            canned(
+                reqwest::StatusCode::OK,
+                br#"{"emailAddress":"b@test","historyId":"1"}"#,
+            ),
+            canned(
+                reqwest::StatusCode::OK,
+                br#"{"emailAddress":"c@test","historyId":"1"}"#,
+            ),
+            canned(
+                reqwest::StatusCode::FORBIDDEN,
+                br#"{"error":{"errors":[{"reason":"dailyLimitExceeded"}]}}"#,
+            ),
+        ]);
+        let net = scripted_net(&script, NetConfig::default());
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let mut accounts = Vec::new();
+        for (id, project) in [("a", "123"), ("b", "123"), ("c", "456")] {
+            let mut spec = AccountSpec::new(Some(Arc::new(StaticTokenSource::new("token", None))));
+            spec.default_retry = RetryPolicy::disabled();
+            let client = GmailClient::with_account_net(
+                "https://gmail.test",
+                net.attach_account(AccountId(id.into()), spec),
+            )
+            .with_fixed_clock(now)
+            .with_quota_project(project.into());
+            accounts.push(GoogleAccount::open(Arc::new(client), None).await.unwrap());
+        }
+        let budget = ThrottleBudget::new("gmail-project|123");
+        let expected = vec![ThrottleKey::Budget(budget.clone())];
+        let account_id = AccountId("engine-id".into());
+        for account in &accounts[..2] {
+            assert_eq!(
+                account.throttle_keys(&account_id, ThrottleWork::Scope(&CursorScope::Account)),
+                expected
+            );
+            assert_eq!(
+                account.throttle_keys(
+                    &account_id,
+                    ThrottleWork::Objects(&[ObjectId("message".into())])
+                ),
+                expected
+            );
+            assert_eq!(
+                account.throttle_keys(
+                    &account_id,
+                    ThrottleWork::Membership(&MembershipScope::Label(LabelId("INBOX".into())))
+                ),
+                expected
+            );
+            for ty in [
+                ObjectType::CalendarEvent,
+                ObjectType::Event,
+                ObjectType::Contact,
+                ObjectType::ContactGroup,
+            ] {
+                assert!(
+                    account
+                        .throttle_keys(&account_id, ThrottleWork::Scope(&CursorScope::Type(ty)))
+                        .is_empty()
+                );
+            }
+            assert!(
+                account
+                    .throttle_keys(&account_id, ThrottleWork::Objects(&[]))
+                    .is_empty()
+            );
+            assert!(
+                account
+                    .throttle_keys(
+                        &account_id,
+                        ThrottleWork::Membership(&MembershipScope::Folder(
+                            bifrost_types::FolderId("folder".into())
+                        ))
+                    )
+                    .is_empty()
+            );
+        }
+        assert_ne!(
+            accounts[2].throttle_keys(&account_id, ThrottleWork::Scope(&CursorScope::Account)),
+            expected
+        );
+        let error = accounts[0]
+            .client
+            .get::<serde_json::Value>("/labels")
+            .await
+            .err()
+            .unwrap();
+        let error = error::into_account_error(error, error::GmailErrorContext::containers_list());
+        assert_eq!(error.throttle_budgets(), &[budget]);
+        let error = accounts[1]
+            .client
+            .get::<serde_json::Value>("/labels")
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            crate::Error::Net(bifrost_net::Error::LocalHold { .. })
+        ));
+        assert_eq!(script.requests().len(), 4);
+    }
 
     const TEST_HOST: &str = "gmail.test";
 

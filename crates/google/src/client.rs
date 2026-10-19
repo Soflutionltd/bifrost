@@ -67,6 +67,8 @@ pub(crate) struct GmailClient {
     /// is one `Arc` bump over the same connection state, so installing
     /// accounting never forks the client's configuration.
     tally: Option<ByteTally>,
+    quota_project: Option<bifrost_types::ThrottleBudget>,
+    wall_clock: Arc<dyn Fn() -> std::time::SystemTime + Send + Sync>,
 }
 
 struct ClientInner {
@@ -135,10 +137,35 @@ fn host_of(base: &str, fallback: &str) -> String {
 
 impl GmailClient {
     #[cfg(test)]
+    pub(crate) fn with_fixed_clock(&self, now: std::time::SystemTime) -> Self {
+        let mut client = self.clone();
+        client.wall_clock = Arc::new(move || now);
+        client
+    }
+
+    pub(crate) fn with_quota_project(&self, id: String) -> Self {
+        let mut client = self.clone();
+        client.quota_project = Some(bifrost_types::ThrottleBudget::new(format!(
+            "gmail-project|{id}"
+        )));
+        client
+    }
+
+    pub(crate) fn wall_now(&self) -> std::time::SystemTime {
+        (self.wall_clock)()
+    }
+
+    pub(crate) fn quota_project(&self) -> Option<&bifrost_types::ThrottleBudget> {
+        self.quota_project.as_ref()
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_account_net(api_base: impl Into<String>, net: AccountNet) -> Self {
         let token_source: Arc<dyn TokenSource> = Arc::new(StaticTokenSource::new("token", None));
         Self {
             tally: None,
+            quota_project: None,
+            wall_clock: Arc::new(std::time::SystemTime::now),
             inner: Arc::new(ClientInner {
                 gmail_limit: OnceLock::new(),
                 net: Some(net),
@@ -183,6 +210,8 @@ impl GmailClient {
         let parent_net = Net::shared_default();
         Self {
             tally: None,
+            quota_project: None,
+            wall_clock: Arc::new(std::time::SystemTime::now),
             inner: Arc::new(ClientInner {
                 gmail_limit: OnceLock::new(),
                 net: None,
@@ -203,6 +232,8 @@ impl GmailClient {
     pub(crate) fn with_people_base(&self, people_base: impl Into<String>) -> Self {
         Self {
             tally: None,
+            quota_project: self.quota_project.clone(),
+            wall_clock: Arc::clone(&self.wall_clock),
             inner: Arc::new(ClientInner {
                 gmail_limit: OnceLock::new(),
                 net: self.inner.net.clone(),
@@ -223,6 +254,8 @@ impl GmailClient {
     pub(crate) fn with_calendar_base(&self, calendar_base: impl Into<String>) -> Self {
         Self {
             tally: None,
+            quota_project: self.quota_project.clone(),
+            wall_clock: Arc::clone(&self.wall_clock),
             inner: Arc::new(ClientInner {
                 gmail_limit: OnceLock::new(),
                 net: self.inner.net.clone(),
@@ -252,6 +285,8 @@ impl GmailClient {
         );
         Self {
             tally: None,
+            quota_project: self.quota_project.clone(),
+            wall_clock: Arc::clone(&self.wall_clock),
             inner: Arc::new(ClientInner {
                 gmail_limit: OnceLock::new(),
                 net: Some(net),
@@ -408,7 +443,7 @@ impl GmailClient {
             builder = builder.json(b);
         }
 
-        self.send_recorded(builder).await
+        self.send_recorded(builder, self.surface_for_url(url)).await
     }
 
     fn gmail_data_limit(&self) -> bifrost_net::ConcurrencyLimit {
@@ -433,6 +468,9 @@ impl GmailClient {
     /// must apply this themselves, or their traffic is billed at the
     /// default and under-charges the shared per-user budget.
     pub(crate) fn gmail_quota_cost(&self, url: &str, method: &str) -> Option<u32> {
+        if self.surface_for_url(url) != crate::quota::ApiSurface::Gmail {
+            return None;
+        }
         let path = url.strip_prefix(self.api_base())?;
         Some(gmail_quota_cost(path, method))
     }
@@ -442,7 +480,7 @@ impl GmailClient {
         builder: RequestBuilder,
         service: &str,
     ) -> Result<Response> {
-        // Net errors are preserved verbatim through `Error::Net(_)` so
+        // Net errors retain their original shape alongside observation metadata so
         // the account-side translation boundary can inspect transmission
         // state, retry-after, and other forensic evidence. Service
         // attribution also identifies the raw Gmail data mutation path.
@@ -451,7 +489,32 @@ impl GmailClient {
         } else {
             builder
         };
-        self.send_recorded(builder).await
+        let surface = match service {
+            "Gmail API" => crate::quota::ApiSurface::Gmail,
+            "People API" => crate::quota::ApiSurface::People,
+            "Calendar API" => crate::quota::ApiSurface::Calendar,
+            _ => crate::quota::ApiSurface::Drive,
+        };
+        self.send_recorded(builder, surface).await
+    }
+
+    fn surface_for_url(&self, url: &str) -> crate::quota::ApiSurface {
+        use crate::quota::ApiSurface;
+        // Redirected test bases can share an origin or nest under another
+        // base. The most specific path root owns the request.
+        [
+            (self.api_base(), ApiSurface::Gmail),
+            (self.calendar_base(), ApiSurface::Calendar),
+            (self.people_base(), ApiSurface::People),
+        ]
+        .into_iter()
+        .filter(|(base, _)| {
+            url.strip_prefix(base).is_some_and(|tail| {
+                tail.is_empty() || tail.starts_with('/') || tail.starts_with('?')
+            })
+        })
+        .max_by_key(|(base, _)| base.len())
+        .map_or(ApiSurface::Drive, |(_, surface)| surface)
     }
 
     /// The single point every buffered Gmail/People/Calendar request
@@ -471,13 +534,67 @@ impl GmailClient {
     /// most quota. The Gmail `batchDelete` permission fallback is the
     /// sharpest case: its refused primary call is pure error-path
     /// traffic.
-    async fn send_recorded(&self, builder: RequestBuilder) -> Result<Response> {
+    async fn send_recorded(
+        &self,
+        mut builder: RequestBuilder,
+        surface: crate::quota::ApiSurface,
+    ) -> Result<Response> {
+        // The observer and gate describe one API surface. Preserve that
+        // attribution throughout net's redirect walk, including without a
+        // configured project. Same-surface redirects still use net's policy.
+        let redirect_client = self.clone();
+        builder = builder
+            .redirect_guard(move |_, target| redirect_client.surface_for_url(target) == surface);
+        let project = self
+            .quota_project
+            .as_ref()
+            .filter(|_| surface == crate::quota::ApiSurface::Gmail)
+            .cloned();
+        let gate = project
+            .as_ref()
+            .map(|budget| self.account_net().shared_hold(budget.as_str()));
+        if let Some(gate) = gate.as_ref() {
+            builder = builder.hold_gate(gate.key());
+        }
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&observed);
+        let wall_clock = Arc::clone(&self.wall_clock);
+        builder = builder.observe_errors(move |response| {
+            let wall_now = wall_clock();
+            let now = tokio::time::Instant::now();
+            let mut headers =
+                crate::error::GmailResponseHeaders::from_headers_at(&response.headers, wall_now);
+            if let (Some(budget), Some(gate), Some(kind)) = (
+                project.as_ref(),
+                gate.as_ref(),
+                crate::quota::project_kind(response.status.as_u16(), &response.body),
+            ) {
+                let deadline = crate::quota::resolve_deadline(kind, &headers, wall_now, now);
+                gate.record(deadline, kind);
+                headers.project = Some(crate::quota::ProjectObservation {
+                    budget: budget.clone(),
+                    deadline,
+                });
+            }
+            *sink.lock().expect("response observation poisoned") = Some(headers);
+        });
         let counter = bifrost_net::RequestByteCounter::new();
         let sent = builder.count_bytes_into(counter.clone()).send().await;
         if let Some(tally) = self.tally.as_ref() {
             tally.add(counter.bytes_in());
         }
-        sent.map_err(Error::from)
+        sent.map_err(|error| {
+            match observed
+                .lock()
+                .expect("response observation poisoned")
+                .take()
+            {
+                Some(headers) => {
+                    Error::ObservedNet(Box::new(crate::error::ObservedNetError { error, headers }))
+                }
+                None => Error::from(error),
+            }
+        })
     }
 
     /// A handle over the same client that reports every buffered
@@ -492,6 +609,8 @@ impl GmailClient {
             Self {
                 inner: Arc::clone(&self.inner),
                 tally: Some(tally.clone()),
+                quota_project: self.quota_project.clone(),
+                wall_clock: Arc::clone(&self.wall_clock),
             },
             tally,
         )

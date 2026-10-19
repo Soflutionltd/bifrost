@@ -161,22 +161,20 @@ impl GraphError {
         match self {
             Self::MailboxThrottled { source, .. } => source.response_status(),
             Self::Response(response) => Some(response.status),
-            Self::Net(bifrost_net::Error::Status { code, .. }) => Some(*code),
-            Self::Net(bifrost_net::Error::RateLimited { final_response, .. }) => {
-                Some(final_response.status)
-            }
-            Self::Net(
-                bifrost_net::Error::RetryBudgetExhausted {
+            Self::Net(error) => match error.terminal() {
+                bifrost_net::Error::Status { code, .. } => Some(*code),
+                bifrost_net::Error::RateLimited { final_response, .. }
+                | bifrost_net::Error::RetryBudgetExhausted {
                     final_response: Some(final_response),
                     ..
                 }
                 | bifrost_net::Error::AuthLost {
                     final_response: Some(final_response),
                     ..
-                },
-            ) => Some(final_response.status),
+                } => Some(final_response.status),
+                _ => None,
+            },
             Self::Configuration { .. }
-            | Self::Net(_)
             | Self::Json { .. }
             | Self::ProviderLinkRefused { .. }
             | Self::Internal { .. }

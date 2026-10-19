@@ -29,6 +29,7 @@ pub mod budget;
 pub mod concurrency;
 pub mod config;
 pub mod error;
+pub mod hold;
 mod metered_stream;
 pub mod net;
 pub mod rate;
@@ -65,6 +66,7 @@ pub use bifrost_types::{AccountFuture, AccountId, ByteRange, Priority, Transmiss
 pub use concurrency::ConcurrencyLimit;
 pub use config::{DEFAULT_MAX_BUFFERED_RESPONSE, NetConfig};
 pub use error::{Error, FinalResponse, MalformedRedirectKind, RangeFailureKind, STATUS_BODY_CAP};
+pub use hold::{Held, HoldDeadline, HoldKind, SharedHold};
 pub use http::Method;
 pub use metered_stream::MeteredStream;
 pub use net::{AccountNet, AccountSpec, Net};
