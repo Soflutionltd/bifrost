@@ -555,6 +555,18 @@ Each `Email/get` answer is reconciled against the ids the batch submitted (`hydr
 
 ### The WebSocket request door
 
+The WebSocket transport wraps its established TCP/TLS stream in
+`bifrost_net::MeteredStream` and passes it to tokio-websockets `connect_on`.
+Both directions share the JMAP transport's `AccountNet` budget with HTTP under
+the same registry account id. Admission happens below framing: frame headers,
+control frames, message payloads and the HTTP upgrade exchange are included;
+TLS records are excluded. Large sends reach the underlying stream in bounded,
+paced writes rather than one prepaid message burst. The read path charges each
+byte once before the library assembles messages; parsing, correlation routing
+and push delivery add no admission. Library and TLS buffering below this
+boundary remain outside the plaintext smoothing guarantee described in
+`reference/net.md`.
+
 `send_ws` puts an RFC 8887 `Request` frame on the socket and returns the `requestId` it assigned. Three properties that door needs, and now has:
 
 - The id counter is on the `Client`, not on the per-connection `WsStream`, so ids do not restart at 0 on reconnect. A per-connection counter meant a late response from the dropped connection carried an id the new connection was about to reuse - correlation that is actively worse than none.

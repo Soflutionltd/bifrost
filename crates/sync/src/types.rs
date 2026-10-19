@@ -270,6 +270,8 @@ impl Default for MutationConfig {
 /// backfill, mutation) at their next iteration without re-spawning.
 /// Workers load with `current.load_full()`.
 pub(crate) struct AccountSlot {
+    /// Strong owner across replacement opens, released with the slot.
+    pub bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
     pub scheduler: Scheduler,
     pub factory: Arc<dyn AccountFactory>,
     pub current: Arc<ArcSwap<Arc<dyn Account>>>,

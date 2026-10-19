@@ -8,6 +8,7 @@ use super::*;
 /// `handle_account_error`, the engine-directive arm, and the reopen
 /// loop don't carry seven-positional argument lists.
 pub(crate) struct RecoveryContext<'a> {
+    pub bandwidth_budget: Option<&'a bifrost_net::BandwidthBudget>,
     pub factory: &'a Arc<dyn AccountFactory>,
     pub current: &'a Arc<ArcSwap<Arc<dyn Account>>>,
     pub cursors: &'a Arc<CursorRegistry>,
@@ -1202,6 +1203,9 @@ pub(super) async fn open_replacement(
     if ctx.shutdown.is_cancelled() {
         return Err(ReplacementOpen::Detached);
     }
+    if let Some(budget) = ctx.bandwidth_budget {
+        ctx.control.apply_bandwidth_budget(budget);
+    }
     match ctx.factory.open(ctx.account_id.clone()).await {
         Ok(next) => {
             // Owned by the guard from this synchronous step on, so nothing
@@ -1260,7 +1264,8 @@ pub(super) async fn reattach_account(
     } = replacement;
     let next = Arc::clone(&guard.account);
     next.set_priority(ctx.control.priority_snapshot());
-    next.set_bandwidth_cap(ctx.control.bandwidth_cap_snapshot());
+    ctx.control
+        .apply_bandwidth_cap(|cap| next.set_bandwidth_cap(cap));
 
     let result = async {
         let discovered = discover_scopes_from(next.as_ref()).await?;

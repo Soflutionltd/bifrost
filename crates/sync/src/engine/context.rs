@@ -18,6 +18,7 @@ use super::*;
 /// Slot-wide handles shared by the workers `attach` spawns.
 #[derive(Clone)]
 pub(super) struct SlotContext {
+    pub bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
     pub factory: Arc<dyn AccountFactory>,
     /// The currently-open protocol handle. Workers load through the
     /// `ArcSwap` on every hot-path use so a reopen is observed
@@ -116,6 +117,7 @@ impl SlotContext {
     /// it, so it has to outlive the dispatch on the caller's stack.
     pub(super) fn recovery<'a>(&'a self, writer: &'a WriterHandle) -> RecoveryContext<'a> {
         RecoveryContext {
+            bandwidth_budget: self.bandwidth_budget.as_ref(),
             factory: &self.factory,
             current: &self.current,
             cursors: &self.cursors,

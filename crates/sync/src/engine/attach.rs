@@ -48,6 +48,13 @@ impl SyncEngine {
         account_id: AccountId,
         factory: Arc<dyn AccountFactory>,
     ) -> Result<SyncControl, Error> {
+        // Acquire before open so every protocol leg sees the slot policy while
+        // opening. A failed open releases this strong owner by RAII.
+        let bandwidth_budget = self.bandwidth_registry.as_ref().map(|registry| {
+            let budget = registry.budget(account_id.clone());
+            budget.set_cap(None);
+            budget
+        });
         let OpenedAccount {
             account: opened,
             skipped_scopes,
@@ -58,7 +65,13 @@ impl SyncEngine {
         log_open_skips(&account_id, &skipped_scopes, "attach");
         let cleanup = Arc::clone(&opened);
         let result = self
-            .attach_opened(account_id, factory, opened, skipped_scopes)
+            .attach_opened(
+                account_id,
+                factory,
+                opened,
+                skipped_scopes,
+                bandwidth_budget,
+            )
             .await;
         if result.is_err()
             && let Err(error) = cleanup.close().await
@@ -78,6 +91,7 @@ impl SyncEngine {
         factory: Arc<dyn AccountFactory>,
         opened: Arc<dyn Account>,
         skipped_scopes: Vec<SkippedScope>,
+        bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
     ) -> Result<SyncControl, Error> {
         // The open-time skip lane, kept live for the slot's lifetime:
         // reopen replaces it with the replacement open's answer, and
@@ -269,6 +283,7 @@ impl SyncEngine {
         // changes to the currently-open protocol handle. Reopen also
         // reapplies the snapshots to the replacement handle.
         {
+            let control_budget = bandwidth_budget.clone();
             let control_account = Arc::clone(&current);
             let control_shutdown = shutdown.clone();
             let mut priority_view = priority_rx.clone();
@@ -302,9 +317,13 @@ impl SyncEngine {
                                 if changed.is_err() {
                                     return;
                                 }
-                                let cap = *bandwidth_view.borrow();
+                                let cap = bandwidth_view.borrow();
+                                if let Some(budget) = &control_budget {
+                                    // Keep the watch read locked through the policy write.
+                                    budget.set_cap(*cap);
+                                }
                                 let account = control_account.load_full();
-                                account.as_ref().as_ref().set_bandwidth_cap(cap);
+                                account.as_ref().as_ref().set_bandwidth_cap(*cap);
                             }
                         }
                     }
@@ -486,6 +505,7 @@ impl SyncEngine {
         // The slot-wide handle bundle every spawned worker below shares.
         // Cheap to clone; see `SlotContext`.
         let ctx = SlotContext {
+            bandwidth_budget: bandwidth_budget.clone(),
             factory: Arc::clone(&factory),
             current: Arc::clone(&current),
             cursors: Arc::clone(&cursors),
@@ -649,6 +669,7 @@ impl SyncEngine {
             changes_tx: changes_tx.clone(),
         };
         let slot = Arc::new(AccountSlot {
+            bandwidth_budget,
             scheduler: self.scheduler.clone(),
             factory,
             current,

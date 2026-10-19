@@ -48,6 +48,12 @@ visible to spawned tasks immediately: every iteration calls
 - `config(EngineConfig)` - replaces the whole config.
 - `checkpoints(Arc<DynCheckpointStore>)` - consumer-provided
   store; defaults to `InMemoryCheckpointStore` when omitted.
+- `with_bandwidth_registry(Arc<bifrost_net::BandwidthRegistry>)` on the
+  builder or engine configures slot-owned payload budgets. Configure it before
+  attaching accounts, using ONE registry across every Net and the IMAP factory.
+  Each account has independent inbound and outbound budgets shared across its
+  protocol legs. Without a registry, cap forwarding behaves as before. The
+  payload smoothing bound is defined in `reference/net.md`.
 - `with_bandwidth_meter(Arc<bifrost_net::BandwidthMeter>)` -
   wires the meter; when unset, `Control::bandwidth_observed`
   returns 0 for every account.
@@ -75,7 +81,17 @@ engine.shutdown().await?; // explicit cleanup; preferred over Drop
    strand the slot. `detach` holds the same guard for its whole
    teardown (see below), so an attach racing a detach of the same id is
    refused rather than admitted into that window.
-2. `factory.open(account_id).await` -> `OpenedAccount { account,
+2. When a bandwidth registry is configured, acquire a strong account budget
+   BEFORE opening, and set its cap to `None`, matching the initial control
+   channel. A failed open releases this owner by RAII. The budget moves into
+   `AccountSlot` on success and stays alive across replacement opens until
+   detach releases the slot. The ControlApplier writes cap changes directly to
+   this budget as well as forwarding to the current Account, so changes during
+   a slow replacement open take effect immediately. Replacement opens reuse
+   the same budget and its current cap and schedules. Applying the cap to a
+   replacement account holds the control snapshot through its setter, so a
+   concurrent control change cannot be overwritten by a saved cap.
+   `factory.open(account_id).await` -> `OpenedAccount { account,
    skipped_scopes }`. The engine threads its own `AccountId` through
    so the protocol crate can register against `bifrost-net` /
    `MeterSink` / trace correlation under the same key the engine knows

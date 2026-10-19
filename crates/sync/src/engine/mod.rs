@@ -107,6 +107,7 @@ pub struct SyncEngine {
     /// present, `attach` spawns a periodic bandwidth-feed task per
     /// account so `Control::bandwidth_observed` returns a real reading.
     bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
+    bandwidth_registry: Option<Arc<bifrost_net::BandwidthRegistry>>,
     /// Per-account ack senders; consumers call `ack_checkpoint` to
     /// durably persist a cursor for a specific scope.
     ack_senders: DashMap<AccountId, mpsc::Sender<WriterRequest>>,
@@ -150,6 +151,7 @@ pub struct SyncEngineBuilder {
     config: EngineConfig,
     checkpoints: Option<Arc<DynCheckpointStore>>,
     bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
+    bandwidth_registry: Option<Arc<bifrost_net::BandwidthRegistry>>,
 }
 
 impl SyncEngineBuilder {
@@ -159,6 +161,7 @@ impl SyncEngineBuilder {
             config: EngineConfig::default(),
             checkpoints: None,
             bandwidth_meter: None,
+            bandwidth_registry: None,
         }
     }
 
@@ -189,6 +192,16 @@ impl SyncEngineBuilder {
         self
     }
 
+    /// Share account payload budgets with every Net and protocol factory.
+    #[must_use]
+    pub fn with_bandwidth_registry(
+        mut self,
+        registry: Arc<bifrost_net::BandwidthRegistry>,
+    ) -> Self {
+        self.bandwidth_registry = Some(registry);
+        self
+    }
+
     pub fn build(self) -> Result<SyncEngine, Error> {
         self.config.budget.validate()?;
         let checkpoints = self
@@ -210,6 +223,7 @@ impl SyncEngineBuilder {
             scheduler,
             root_cancel: CancellationToken::new(),
             bandwidth_meter: self.bandwidth_meter,
+            bandwidth_registry: self.bandwidth_registry,
             ack_senders: DashMap::new(),
             lifecycle_inflight: Arc::new(AsyncMutex::new(std::collections::HashSet::new())),
             throttles: Arc::new(std::sync::Mutex::new(crate::recovery::ThrottleBucket::new())),
@@ -266,6 +280,16 @@ fn scope_local_establish_failure(error: &AccountError) -> bool {
 }
 
 impl SyncEngine {
+    /// Share account payload budgets with every Net and protocol factory.
+    #[must_use]
+    pub fn with_bandwidth_registry(
+        mut self,
+        registry: Arc<bifrost_net::BandwidthRegistry>,
+    ) -> Self {
+        self.bandwidth_registry = Some(registry);
+        self
+    }
+
     #[must_use]
     pub fn builder() -> SyncEngineBuilder {
         SyncEngineBuilder::new()
@@ -978,6 +1002,7 @@ impl SyncEngine {
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         let writer = WriterHandle::new(writer_tx);
         let ctx = RecoveryContext {
+            bandwidth_budget: slot.bandwidth_budget.as_ref(),
             factory: &slot.factory,
             current: &slot.current,
             cursors: &slot.cursors,

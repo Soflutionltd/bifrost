@@ -409,6 +409,17 @@ impl SyncControl {
         self.inner.bandwidth_observed.store(bps, Ordering::Relaxed);
     }
 
+    /// Apply the latest policy while holding the control snapshot stable.
+    pub(crate) fn apply_bandwidth_budget(&self, budget: &bifrost_net::BandwidthBudget) {
+        budget.set_cap(*self.inner.bandwidth_cap.borrow());
+    }
+
+    /// Keep control updates ordered with a replacement account's setter.
+    pub(crate) fn apply_bandwidth_cap(&self, setter: impl FnOnce(Option<u64>)) {
+        let cap = self.inner.bandwidth_cap.borrow();
+        setter(*cap);
+    }
+
     /// Read the configured cap. `None` when no cap is set.
     #[must_use]
     pub fn bandwidth_cap_snapshot(&self) -> Option<u64> {
@@ -678,6 +689,35 @@ mod tests {
             priority,
             bandwidth,
         )
+    }
+
+    #[test]
+    fn replacement_bandwidth_application_serializes_control_changes() {
+        let control = control();
+        control.bandwidth_cap(Some(7));
+        let budget = bifrost_net::BandwidthBudget::new(Some(7));
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let changing = control.clone();
+        let changed_budget = budget.clone();
+        let worker = std::thread::spawn(move || {
+            start_rx.recv().expect("start change");
+            changing.bandwidth_cap(Some(11));
+            changing.apply_bandwidth_budget(&changed_budget);
+            done_tx.send(()).expect("change done");
+        });
+        control.apply_bandwidth_cap(|cap| {
+            start_tx.send(()).expect("start worker");
+            // A concurrent update must wait until the setter has finished.
+            let changed = done_rx.recv_timeout(std::time::Duration::from_millis(100));
+            budget.set_cap(cap);
+            assert!(
+                changed.is_err(),
+                "control changed during replacement setter"
+            );
+        });
+        worker.join().expect("control worker");
+        assert_eq!(budget.cap(), Some(11));
     }
 
     fn checkpoint(state: &[u8]) -> Checkpoint {

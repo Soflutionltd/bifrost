@@ -159,22 +159,22 @@ PUBLISHED SURFACE fence apply.
   filed rather than fixed. Same shape applies to `pim`'s upload paths, but
   those are outbound and the tally is inbound-only.
 
-## Bandwidth cap: what it means across the workspace
+## Bandwidth budget follow-ups
 
-Surfaced 2026-10-19 by a survey made while redesigning SMTP outbound
-admission. Not verified line by line; confirm against the code before
-working any of them.
+The shared per-account budget landed 2026-10-19 (contract on
+`Account::set_bandwidth_cap`, mechanism in `reference/net.md`). What the
+reviews left:
 
-- **The `Account::set_bandwidth_cap` contract is undefined.** The doc in
-  `crates/types/src/account.rs` says only "apply the engine's current
-  bandwidth cap"; it does not say per direction, per connection, or
-  combined across protocols. Every implementation happens to keep separate
-  in and out budgets. This is a ruling for the owner, and every item below
-  depends on it.
-- **IMAP and SMTP still keep their own token buckets.** `bifrost-net` now
-  has the shared `BandwidthBudget` and `BandwidthRegistry`
-  (`crates/net/src/budget.rs`); `bifrost-imap` (`connection/wire.rs`) and
-  `bifrost-smtp` (`client/metering.rs`) have not migrated onto it yet.
+- **The submission budget test does not drive SMTP I/O.** The IMAP
+  submission tests spend the account budget directly, so removing
+  `bandwidth_metering` from `SubmissionTransport::build` would still pass.
+  Driving the built transport hermetically needs an in-memory test seam in
+  `crates/smtp` (its transport internals are private and its executor is
+  sealed); a P3 from the transport-legs review.
+- **Graph's `set_bandwidth_cap` is a silent no-op without an attached
+  `AccountNet`**, and nothing re-applies the cap when one is installed
+  later. With the budget now living in the registry the window is narrow,
+  but it is unverified.
 - **Net bandwidth test gaps (P3s from the net budget review).** The
   refused-stream test calls the classifier directly and never drives the
   retry loop, so a retry that dropped or emptied the body would pass; the
@@ -185,30 +185,6 @@ working any of them.
   different admission delays can pair outcomes and snapshots out of order;
   `BandwidthRegistry` scans every entry on each new identity, quadratic
   over many simultaneously live ids.
-- **The cap multiplies per IMAP connection.** Every pool dial and the
-  bootstrap connection build their own `WireMetering` from the account's
-  atomic, so a pool of N connections runs at about N times the cap, and a
-  redial starts with a full bucket.
-- **IMAP and SMTP share the cap value, not the budget.** An IMAP-shaped
-  account can fetch at the cap and send at the cap at once. The comment in
-  `crates/imap/src/account/submission.rs` claiming a send cannot burst past
-  a cap the fetch path is honouring claims more than the code does.
-- **The cap never reaches an IMAP account's CardDAV and CalDAV
-  sub-accounts.** `ImapAccount::set_bandwidth_cap` stores only the IMAP
-  atomic; `set_priority` does not forward either, and the DAV sub-accounts
-  keep their own `AccountNet`. A stale "until IMAP byte-metering is wired"
-  comment sits next to it.
-- **SMTP's INBOUND cap is still per connection.** Outbound now goes
-  through shared admission (`OutboundSchedule` in
-  `crates/smtp/src/transport/smtp/client/metering.rs`); inbound keeps the
-  charge-after-read `ByteBucket` with a per-stream `throttle_in`, so a fresh
-  connection's first read is ungated whatever the shared balance owes.
-  Left out of the outbound change on purpose: SMTP replies are small, and
-  a read cannot be admitted before the peer decides how much arrives.
-  Whether it is worth closing is a ruling, not a defect fix.
-- **`AsyncLmtpTransportBuilder` has no `bandwidth_metering`.** Its
-  connections can carry metering, but the public builder offers no way to
-  configure it.
 
 ## Notes
 

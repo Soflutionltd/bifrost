@@ -196,7 +196,7 @@ pub(crate) enum WebSocketMessage {
 }
 
 pub(crate) struct WsStream {
-    tx: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    tx: SplitSink<WebSocketStream<bifrost_net::MeteredStream<MaybeTlsStream<TcpStream>>>, Message>,
 }
 
 /// Callers waiting for a WebSocket response, keyed by the RFC 8887
@@ -428,7 +428,7 @@ impl Client {
             }
         };
 
-        let mut builder = ClientBuilder::from_uri(uri)
+        let builder = ClientBuilder::from_uri(uri.clone())
             .add_header(header::AUTHORIZATION, auth_value)
             .map_err(crate::Error::WebSocketHandshake)?
             .add_header(
@@ -436,15 +436,34 @@ impl Client {
                 HeaderValue::from_static("jmap"),
             )
             .map_err(crate::Error::WebSocketHandshake)?;
-        if let Some(ref connector) = connector {
-            builder = builder.connector(connector);
-        }
-
-        // Pre-handshake error: no bytes from the JMAP request itself
-        // have crossed the side-effect boundary. Classification is
-        // `Transport(Network) + Attempt(Unsent)`, not `Protocol(_)`.
+        let host = uri
+            .host()
+            .ok_or_else(|| crate::Error::MalformedSessionUrl {
+                property: URL_PROPERTY,
+                detail: format!("missing host: {url}"),
+            })?
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let port = uri
+            .port_u16()
+            .unwrap_or(if scheme.as_deref() == Some("wss") {
+                443
+            } else {
+                80
+            });
+        let tcp = TcpStream::connect((host, port))
+            .await
+            .map_err(|e| crate::Error::WebSocketHandshake(e.into()))?;
+        let stream = connector
+            .unwrap_or(Connector::Plain)
+            .wrap(host, tcp)
+            .await
+            .map_err(crate::Error::WebSocketHandshake)?;
+        // Admission covers plaintext upgrade bytes and frame headers as well
+        // as message payloads, before the framing library buffers them.
+        let stream = bifrost_net::MeteredStream::new(stream, self.transport().bandwidth_budget());
         let (stream, response) = builder
-            .connect()
+            .connect_on(stream)
             .await
             .map_err(crate::Error::WebSocketHandshake)?;
         validate_ws_subprotocol(&response)?;
@@ -470,7 +489,7 @@ impl Client {
         let client = self.clone();
         let pending = Arc::clone(&self.ws_pending);
         Ok(Box::pin(frame_stream(
-            rx,
+            Box::pin(rx),
             pending,
             generation,
             move |session_state| {
@@ -1615,5 +1634,67 @@ mod tests {
         };
         assert_eq!(alert.alert_id, "al1");
         assert_eq!(alert.recurrence_id, None);
+    }
+}
+
+#[cfg(test)]
+mod bandwidth_tests {
+    use super::*;
+    use bifrost_net::{BandwidthBudget, BandwidthDirection, MeteredStream};
+    use futures::FutureExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use tokio::time::{Duration, Instant};
+
+    #[tokio::test(start_paused = true)]
+    async fn large_websocket_send_reaches_peer_in_paced_slices() {
+        let budget = BandwidthBudget::new(Some(16));
+        let (stream, mut peer) = duplex(1024);
+        let mut ws = ClientBuilder::new().take_over(MeteredStream::new(stream, budget));
+        let start = Instant::now();
+        let mut send = Box::pin(ws.send(Message::text("x".repeat(64))));
+        assert!(
+            (&mut send).now_or_never().is_none(),
+            "a 70-byte frame at 16 B/s cannot go out in one burst"
+        );
+        send.await.unwrap();
+        // A masked 64-byte client frame has six header bytes. However the
+        // library splits header and payload into writes, seventy bytes at
+        // 16 B/s with one second of burst credit finish at 70/16 - 1 s.
+        assert_eq!(start.elapsed(), Duration::from_millis(3375));
+        let mut buf = [0; 128];
+        let mut received = 0;
+        while received < 70 {
+            received += peer.read(&mut buf[received..]).await.unwrap();
+        }
+        assert_eq!(received, 70);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_frames_are_admitted_once_including_headers() {
+        let payload = br#"{"@type":"StateChange","changed":{}}"#;
+        let mut frame = vec![0x81, u8::try_from(payload.len()).unwrap()];
+        frame.extend_from_slice(payload);
+        let len = frame.len();
+        let budget = BandwidthBudget::new(Some(u64::try_from(len).unwrap()));
+        let (stream, mut peer) = duplex(1024);
+        peer.write_all(&frame).await.unwrap();
+        peer.write_all(&frame).await.unwrap();
+        let ws = ClientBuilder::new().take_over(MeteredStream::new(stream, budget.clone()));
+        let pending = Arc::new(PendingRequests::new());
+        let mut decoded = Box::pin(frame_stream(ws, pending, 0, |_| {}));
+        let start = Instant::now();
+        for _ in 0..2 {
+            assert!(matches!(
+                decoded.next().await.unwrap().unwrap(),
+                WebSocketMessage::PushNotification(_)
+            ));
+        }
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        // Exactly two full frames were charged, with no message-level debit.
+        let next = budget.reserve(BandwidthDirection::Inbound, len);
+        assert_eq!(
+            next.ready_at().duration_since(start),
+            Duration::from_secs(2)
+        );
     }
 }

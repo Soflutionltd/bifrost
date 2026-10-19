@@ -73,6 +73,11 @@ impl ReqwestTransport {
         self.net.set_priority(priority);
     }
 
+    #[cfg(feature = "websockets")]
+    pub(crate) fn bandwidth_budget(&self) -> bifrost_net::BandwidthBudget {
+        self.net.bandwidth_budget().clone()
+    }
+
     pub(crate) fn set_bandwidth_cap(&self, bps: Option<u64>) {
         self.net.set_bandwidth_cap(bps);
     }

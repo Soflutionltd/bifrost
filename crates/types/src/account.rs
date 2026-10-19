@@ -204,11 +204,18 @@ pub trait Account: Send + Sync {
     /// scheduler.
     fn set_priority(&self, priority: Priority);
 
-    /// Apply the engine's current bandwidth cap to this account.
+    /// Apply a payload-byte cap in bytes per second, independently per direction.
     ///
-    /// Implementations that own a `bifrost_net::AccountNet` should
-    /// forward this to `AccountNet::set_bandwidth_cap`. `None` means
-    /// unlimited.
+    /// Each direction has ONE budget shared by every connection, stream,
+    /// request and protocol leg of the account, including composed sub-accounts
+    /// (for example IMAP with SMTP submission, ManageSieve, CardDAV and CalDAV).
+    /// The consumer must wire one `bifrost_net::BandwidthRegistry` into every
+    /// `Net`, the engine and the IMAP factory for that sharing to hold.
+    /// Implementations owning an `AccountNet` forward to its cap setter.
+    ///
+    /// This governs payload bytes above TLS, not wire rate. `None` is unlimited;
+    /// `Some(0)` is a 1 B/s trickle. See `reference/net.md` for the smoothing
+    /// bound and the allowance for outstanding admissions and lower buffering.
     fn set_bandwidth_cap(&self, bps: Option<u64>);
 
     /// The throttle keys `work` consumes, so the engine can hold it while a
