@@ -573,41 +573,50 @@ existing bucket. Per-host attach counts are incremented on every
 
 ## Concurrency limit (`ConcurrencyLimit`)
 
-The rate-limit governor meters request RATE; nothing else bounds how many
-requests are in flight at once. A fan-out call site in a protocol crate caps
-only its own `buffer_unordered` width, with no view of the account's other
-traffic - those per-site caps remain, and this is the shared bound they cannot
-provide. A server-advertised limit is a property of the account's whole
-traffic and needs one shared count. `ConcurrencyLimit` is that count: a
-cloneable handle, so its scope is the caller's. `AccountSpec::concurrency_limit`
-gates every request of an account, the same handle in several specs bounds them
-together (a process-wide bound is one handle everywhere), and
-`RequestBuilder::concurrency_limit` gates one request with a limit of its own,
-in place of the account's.
+The rate-limit governor meters request RATE; `ConcurrencyLimit` bounds admitted
+request demand. Its cloneable handle chooses the scope: one account, several
+accounts, or selected requests. `AccountSpec::concurrency_limit` contributes a
+weight-1 claim to every request. `RequestBuilder::concurrency_limit` ADDS a
+weight-1 claim, and `concurrency_claim(limit, weight)` adds weighted demand.
+Claims on the same identity are summed with checked arithmetic before any
+acquisition; overflow returns local `Error::InvalidRequest`. Zero demand is a
+caller bug, debug-asserted and otherwise raised to one. Distinct limits are
+acquired in increasing process-unique identity order to avoid lock-order cycles.
+Cancellation or deadline expiry drops all claims acquired so far.
 
-A gated request takes ONE slot for the whole logical request: before its first
-wire attempt, held across retries and redirect hops, released when its response
-body ends. Holding through a retry sleep can only keep the count below the
-server's view of open requests, never above it. The wait is bounded by the
-request's total deadline like every other wait, and expires as
-`Timeout { Unsent }`. `send` releases on return; `send_streaming` and
-`download_stream` tie the slot to the body, released when the stream ends,
-yields an error, or is dropped unfinished - so a caller holding a streamed body
-open while awaiting another request on the same limit deadlocks once the limit
-is reached. Admission is FIFO (tokio's semaphore is fair).
+Each limit has one mutex protecting capacity, admitted demand, and a FIFO
+waiter queue. Only the head is considered, deliberately blocking cheap followers
+behind expensive heads. A head fits if its demand is within available capacity;
+an oversized head can instead run exclusively when admitted demand is zero.
+Admitted demand never exceeds capacity except for one exclusive oversized claim
+or while previously admitted work drains after a shrink. The exclusive claim is
+recorded at its full demand, so growing cannot expose fictitious capacity.
+Growing and releasing pump the queue; shrinking revokes nothing and needs no
+debt. A zero capacity is raised to one with a warning.
 
-`set_limit` resizes in flight. Growing admits waiters at once; shrinking never
-revokes a held slot - the excess becomes debt that finishing requests pay
-instead of returning their permit, so the count converges to the new bound.
-Debt is also paid by any permit that reaches an acquirer while it is owed,
-because a permit tokio granted to a waiter cancelled before its first poll
-returns to the semaphore without passing through the release path. A
-limit of zero is raised to one with a warning, since it would park every gated
-request until its deadline.
+Admission is FIFO, but granted waiters may resume in any order. A granted future
+that is neither polled nor dropped reserves capacity. Cancelling a queued future
+removes it; cancelling an unpolled grant releases its full demand. Transfer to
+an owned guard happens synchronously under the mutex. Wakers are collected
+under the mutex and woken or dropped after unlocking.
 
-JMAP is the in-tree consumer: `ReqwestTransport` gates its API POSTs (and only
-those - RFC 8620 limits uploads and downloads separately) by the session's
-`maxConcurrentRequests`, set from every session the client installs.
+Claims are acquired once before the first wire attempt and held across retries
+and redirect hops until the response body ends. The request's total deadline
+bounds admission and expires as `Timeout { Unsent }`. `send` releases on return;
+`send_streaming` and `download_stream` carry the owned guard collection in the
+body stream until it ends, fails or is dropped. Keeping a streamed body open
+while awaiting more work on the same limit can deadlock.
+
+`AccountNet::shared_concurrency_limit(key, limit)` accesses a registry on its
+owning `Net`, shared across that Net's accounts, never process-global. Entries
+are weak: the same live key returns the same handle, and after every handle and
+claim drops the key gets a fresh identity. Dead entries are pruned on insert.
+A live entry keeps its existing capacity when a lookup asks for another value,
+with a warning naming the key and both capacities; resize only via `set_limit`.
+
+JMAP gates its API POSTs by the session's `maxConcurrentRequests` using one
+per-request weight-1 claim and no account claim, so its behavior is unchanged.
+Uploads and downloads remain separately scoped per RFC 8620.
 
 ## Bandwidth meter
 

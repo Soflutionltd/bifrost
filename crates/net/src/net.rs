@@ -19,7 +19,7 @@ use reqwest::header::RANGE;
 
 use crate::auth::{DEFAULT_TOKEN_MAX_AGE, OAuthRefresher, TokenSource};
 use crate::bandwidth::{AccountMeter, BandwidthMeter};
-use crate::concurrency::ConcurrencyLimit;
+use crate::concurrency::{ConcurrencyLimit, WeakLimit};
 use crate::config::NetConfig;
 use crate::error::{Error, RangeFailureKind};
 use crate::rate::{RateKey, RateLimit, RateLimitGovernor};
@@ -63,6 +63,8 @@ pub(crate) struct NetInner {
     /// attachment even when the same AccountId is reopened before an
     /// older handle drops.
     pub(crate) next_registration_id: AtomicU64,
+    /// Keyed concurrency scopes shared only by accounts on this Net.
+    concurrency_limits: Mutex<HashMap<String, WeakLimit>>,
 }
 
 impl Net {
@@ -144,6 +146,7 @@ impl Net {
                 meter: BandwidthMeter::new(),
                 account_hosts: Mutex::new(HashMap::new()),
                 next_registration_id: AtomicU64::new(1),
+                concurrency_limits: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -402,8 +405,7 @@ pub(crate) struct AccountNetInner {
     pub(crate) read_timeout: Option<Duration>,
     /// Buffered response ceiling for this account.
     pub(crate) max_buffered_response: Option<usize>,
-    /// Concurrency bound every request of this account holds a slot of,
-    /// unless the request names its own.
+    /// Weight-1 claim composed with every request concurrency claim.
     pub(crate) concurrency_limit: Option<ConcurrencyLimit>,
     /// User-Agent header inserted unless the request supplied one.
     pub(crate) user_agent: String,
@@ -692,6 +694,38 @@ impl AccountNet {
         self.inner.max_buffered_response
     }
 
+    /// Return the live limit for `key` on this account's owning Net.
+    /// Existing limits keep their capacity even if `limit` differs; resize
+    /// explicitly with `ConcurrencyLimit::set_limit`. Entries are weak, so a
+    /// key gets a fresh limit after all its handles and claims are dropped.
+    #[must_use]
+    pub fn shared_concurrency_limit(
+        &self,
+        key: impl Into<String>,
+        limit: usize,
+    ) -> ConcurrencyLimit {
+        let key = key.into();
+        let mut registry = self
+            .inner
+            .net
+            .inner
+            .concurrency_limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = registry.get(&key).and_then(WeakLimit::upgrade) {
+            let current = existing.limit();
+            if current != limit {
+                tracing::warn!(key = %key, existing_limit = current, requested_limit = limit,
+                    "shared concurrency limit already exists; use set_limit to resize");
+            }
+            return existing;
+        }
+        registry.retain(|_, entry| entry.upgrade().is_some());
+        let handle = ConcurrencyLimit::new(limit);
+        registry.insert(key, handle.downgrade());
+        handle
+    }
+
     pub(crate) fn concurrency_limit(&self) -> Option<&ConcurrencyLimit> {
         self.inner.concurrency_limit.as_ref()
     }
@@ -837,8 +871,8 @@ pub struct AccountSpec {
     pub max_buffered_response: Option<usize>,
     /// Bound on this account's simultaneously in-flight requests. `None`
     /// leaves them unbounded. Pass the same handle to several accounts to
-    /// bound them together; a request can name a different one with
-    /// `RequestBuilder::concurrency_limit`.
+    /// bound them together. Request claims add to this weight-1 claim,
+    /// including when they name the same limit.
     pub concurrency_limit: Option<ConcurrencyLimit>,
     /// User-Agent header used for requests from this account.
     pub user_agent: String,

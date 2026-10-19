@@ -312,9 +312,8 @@ struct RequestBuilderInner {
     /// only on the success path, but the bytes came off the wire either
     /// way.
     bytes_in: Option<RequestByteCounter>,
-    /// Concurrency bound this request holds a slot of. `None` uses the
-    /// account's `AccountSpec::concurrency_limit`.
-    concurrency: Option<ConcurrencyLimit>,
+    /// Additional concurrency claims, composed with the account claim.
+    concurrency: Vec<(ConcurrencyLimit, usize)>,
 }
 
 impl RequestBuilder {
@@ -338,13 +337,13 @@ impl RequestBuilder {
                 bearer_auth: true,
                 pending_error: None,
                 bytes_in: None,
-                concurrency: None,
+                concurrency: Vec::new(),
             },
         }
     }
 
-    /// Hold a slot of `limit` while this request is in flight, in place of
-    /// the account's `AccountSpec::concurrency_limit`.
+    /// Add a weight-1 claim on `limit`, in addition to the account claim
+    /// and every other request claim. Repeated limits have their weights summed.
     ///
     /// The slot is taken before the first wire attempt and held across
     /// retries and redirect hops until the response body ends. For
@@ -353,8 +352,18 @@ impl RequestBuilder {
     /// holding a streamed body open while awaiting another request on the
     /// same limit.
     #[must_use]
-    pub fn concurrency_limit(mut self, limit: ConcurrencyLimit) -> Self {
-        self.inner.concurrency = Some(limit);
+    pub fn concurrency_limit(self, limit: ConcurrencyLimit) -> Self {
+        self.concurrency_claim(limit, 1)
+    }
+
+    /// Add weighted demand on `limit`, composed with all other claims.
+    /// Zero weight is a caller bug: debug builds assert, otherwise it is one.
+    /// Claims on the same limit are summed before acquisition; overflow is a
+    /// local `InvalidRequest` error. Distinct limits are acquired in id order.
+    #[must_use]
+    pub fn concurrency_claim(mut self, limit: ConcurrencyLimit, weight: usize) -> Self {
+        debug_assert!(weight != 0, "zero concurrency demand");
+        self.inner.concurrency.push((limit, weight.max(1)));
         self
     }
 
@@ -741,17 +750,17 @@ pub(crate) struct InternalStreaming {
     pub(crate) deadline: RequestDeadline,
     pub(crate) bytes_out: u64,
     pub(crate) bytes_in: RequestByteCounter,
-    /// The request's concurrency slot, if it is gated. Whoever exposes the
-    /// body owns releasing it at the body's end.
-    pub(crate) permit: Option<ConcurrencyPermit>,
+    /// The request's owned concurrency claims. Whoever exposes the body
+    /// owns releasing all of them at the body's end.
+    pub(crate) permit: Vec<ConcurrencyPermit>,
 }
 
-/// Tie a concurrency slot to a body stream: released when the stream ends or
+/// Tie concurrency claims to a body stream: released when the stream ends or
 /// yields an error, or when it is dropped unfinished. Releasing at the end
 /// rather than only on drop matters because a caller may keep a drained
 /// stream alive.
-pub(crate) fn hold_permit(body: ByteStream, permit: Option<ConcurrencyPermit>) -> ByteStream {
-    if permit.is_none() {
+pub(crate) fn hold_permit(body: ByteStream, permit: Vec<ConcurrencyPermit>) -> ByteStream {
+    if permit.is_empty() {
         return body;
     }
     Box::pin(PermitStream { body, permit })
@@ -759,7 +768,7 @@ pub(crate) fn hold_permit(body: ByteStream, permit: Option<ConcurrencyPermit>) -
 
 struct PermitStream {
     body: ByteStream,
-    permit: Option<ConcurrencyPermit>,
+    permit: Vec<ConcurrencyPermit>,
 }
 
 impl futures::Stream for PermitStream {
@@ -771,10 +780,45 @@ impl futures::Stream for PermitStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         let polled = self.body.as_mut().poll_next(cx);
         if matches!(polled, std::task::Poll::Ready(None | Some(Err(_)))) {
-            self.permit = None;
+            self.permit.clear();
         }
         polled
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_claims(
+    account: Option<&ConcurrencyLimit>,
+    mut claims: Vec<(ConcurrencyLimit, usize)>,
+) -> Result<Vec<(ConcurrencyLimit, usize)>, Error> {
+    if let Some(limit) = account {
+        claims.push((limit.clone(), 1));
+    }
+    claims.sort_unstable_by_key(|(limit, _)| limit.id());
+    let mut normalized: Vec<(ConcurrencyLimit, usize)> = Vec::new();
+    for (limit, demand) in claims {
+        if let Some((last, total)) = normalized.last_mut()
+            && last.id() == limit.id()
+        {
+            *total = total
+                .checked_add(demand)
+                .ok_or_else(|| Error::InvalidRequest {
+                    field: "concurrency_claim",
+                    detail: "summed concurrency demand exceeds usize".to_owned(),
+                })?;
+        } else {
+            normalized.push((limit, demand));
+        }
+    }
+    Ok(normalized)
+}
+
+async fn acquire_claims(claims: Vec<(ConcurrencyLimit, usize)>) -> Vec<ConcurrencyPermit> {
+    let mut permits = Vec::with_capacity(claims.len());
+    for (limit, demand) in claims {
+        permits.push(limit.acquire_weighted(demand).await);
+    }
+    permits
 }
 
 /// Drive a request to a streamable response, running the retry loop
@@ -832,14 +876,12 @@ pub(crate) async fn send_streaming_inner(
     let redirect_policy = redirect_override.unwrap_or_else(|| account.follow_redirects().clone());
     let deadline =
         RequestDeadline::from_timeout(timeout.unwrap_or_else(|| account.request_timeout()));
-    // One slot for the whole logical request, taken before the first attempt
+    // Claims for the whole logical request, taken before the first attempt
     // and bounded by the same total deadline as every other wait, so an
     // expiry here is `Timeout { Unsent }`. Held across retries and redirect
     // hops: see `ConcurrencyLimit`.
-    let permit = match concurrency.as_ref().or(account.concurrency_limit()) {
-        Some(limit) => Some(deadline.bound(limit.acquire()).await?),
-        None => None,
-    };
+    let claims = normalize_claims(account.concurrency_limit(), concurrency)?;
+    let permit = deadline.bound(acquire_claims(claims)).await?;
     if !headers.contains_key(reqwest::header::USER_AGENT) {
         let value = reqwest::header::HeaderValue::from_str(account.user_agent()).map_err(|e| {
             Error::InvalidRequest {
