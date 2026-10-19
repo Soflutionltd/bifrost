@@ -58,16 +58,6 @@ Filed 2026-10-19 while landing declared throttle keys and stamped budgets
   never waited on the account-wide hold either, so this predates declared
   keys; it is now the one engine lane outside the wait-site set in
   `reference/sync.md`. Found by the close-out review.
-- **Two Graph concurrency tests pair shared-mailbox claims with primary
-  URLs.** In `crates/graph/src/client.rs`, the per-mailbox admission test
-  sends `/me/messages` through the shared client and expects the shared
-  limit, and the batch-weight test gives every subrequest `/me/messages`
-  while claiming some against the shared mailbox. Both pin grouping and
-  capping but not that a claim matches the mailbox the wire request
-  addresses; the mixed-owner hydration test pins that only for hydration.
-  Use `/users/{owner}` URLs and drive a production shared-mailbox operation
-  (P3 from the concurrency close-out review).
-
 ## A9 (directory search) follow-ups
 
 - **a9-1 (carddav)** RFC 6352 directory-gateway leg. `directory_search`

@@ -1966,6 +1966,8 @@ mod tests {
         let limit = net.shared_concurrency_limit(primary.concurrency_key(&net), 4);
         let other = net.shared_concurrency_limit(shared.concurrency_key(&net), 4);
         let url = primary.api_url("/me/messages").expect("url");
+        let shared_path = format!("{}/messages", shared.api_path_prefix());
+        let shared_url = shared.api_url(&shared_path).expect("shared url");
         let mut active = Vec::new();
         for _ in 0..4 {
             let mut request = Box::pin(primary.get::<serde_json::Value>(Resource::Outlook, &url));
@@ -1977,9 +1979,22 @@ mod tests {
         let mut fifth = Box::pin(primary.get::<serde_json::Value>(Resource::Outlook, &url));
         drive_pending(fifth.as_mut()).await;
         assert_eq!(primary.wire_attempts(), 4);
-        let mut foreign = Box::pin(shared.get::<serde_json::Value>(Resource::Outlook, &url));
+        let mut foreign = Box::pin(shared.get::<serde_json::Value>(Resource::Outlook, &shared_url));
         drive_pending(foreign.as_mut()).await;
         assert_eq!(other.in_flight(), 1);
+        let requests = primary.take_rest_requests();
+        // The request log includes the fifth primary call while its claim waits.
+        assert_eq!(requests.len(), 6);
+        assert!(
+            requests[..5]
+                .iter()
+                .all(|request| request.url.ends_with("/me/messages"))
+        );
+        assert!(
+            requests[5]
+                .url
+                .ends_with("/users/shared%40contoso.com/messages")
+        );
         let mut unmetered = Box::pin(primary.get::<serde_json::Value>(Resource::Unmetered, &url));
         drive_pending(unmetered.as_mut()).await;
         assert_eq!(primary.wire_attempts(), 6);
@@ -2153,6 +2168,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_mailbox_hydration_uses_its_limit_while_pending() {
+        use bifrost_types::{Account, HydrationProjection, ObjectId};
+
+        let primary = GraphClient::new("token");
+        primary.set_primary_address(Some("me@contoso.com".into()));
+        primary.script_aux_pending(1);
+        let shared = primary.for_shared_mailbox("shared@contoso.com");
+        let net = primary.attached_net().expect("scripted net");
+        let primary_limit = net.shared_concurrency_limit(primary.concurrency_key(&net), 4);
+        let shared_limit = net.shared_concurrency_limit(shared.concurrency_key(&net), 4);
+        let account = crate::account::GraphAccount::new_for_tests_with_shared(
+            primary.clone(),
+            crate::account::PushMode::GraphSubscriptions,
+            &["shared@contoso.com".into()],
+        );
+        let id = ObjectId("shared@contoso.com\u{1f}AAMkshared".into());
+
+        let mut request = Box::pin(Account::message_hydrate(
+            &account,
+            id,
+            HydrationProjection::Headers,
+        ));
+        drive_pending(request.as_mut()).await;
+
+        assert_eq!(
+            (shared_limit.in_flight(), primary_limit.in_flight()),
+            (1, 0)
+        );
+        let requests = primary.take_rest_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .url
+                .contains("/users/shared%40contoso.com/messages/AAMkshared")
+        );
+
+        drop(request);
+        assert_eq!(
+            (shared_limit.in_flight(), primary_limit.in_flight()),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test]
     async fn batches_claim_capped_weights_after_merging_mailbox_aliases() {
         let primary = GraphClient::new("token");
         primary.script_aux_pending(3);
@@ -2162,7 +2221,7 @@ mod tests {
         let net = primary.attached_net().expect("scripted net");
         let limit = net.shared_concurrency_limit(primary.concurrency_key(&net), 4);
         let other = net.shared_concurrency_limit(shared.concurrency_key(&net), 4);
-        for (clients, expected) in [
+        for (clients, expected, expected_urls) in [
             (
                 vec![
                     primary.clone(),
@@ -2172,8 +2231,15 @@ mod tests {
                     shared.clone(),
                 ],
                 (3, 2),
+                vec![
+                    "/me/messages",
+                    "/me/messages",
+                    "/me/messages",
+                    "/users/shared%40contoso.com/messages",
+                    "/users/shared%40contoso.com/messages",
+                ],
             ),
-            (vec![primary.clone(); 6], (4, 0)),
+            (vec![primary.clone(); 6], (4, 0), vec!["/me/messages"; 6]),
             (
                 vec![
                     primary.clone(),
@@ -2184,16 +2250,24 @@ mod tests {
                     alias,
                 ],
                 (4, 0),
+                vec![
+                    "/me/messages",
+                    "/me/messages",
+                    "/me/messages",
+                    "/users/ME%40CONTOSO.COM/messages",
+                    "/users/ME%40CONTOSO.COM/messages",
+                    "/users/ME%40CONTOSO.COM/messages",
+                ],
             ),
         ] {
             let batch = crate::types::BatchRequest {
                 requests: clients
                     .iter()
                     .enumerate()
-                    .map(|(index, _)| crate::types::BatchRequestItem {
+                    .map(|(index, client)| crate::types::BatchRequestItem {
                         id: index.to_string(),
                         method: "GET".into(),
-                        url: "/me/messages".into(),
+                        url: format!("{}/messages", client.api_path_prefix()),
                         body: None,
                         headers: None,
                     })
@@ -2202,6 +2276,16 @@ mod tests {
             let mut request = Box::pin(primary.post_batch(Resource::Batch(clients), &batch));
             drive_pending(request.as_mut()).await;
             assert_eq!((limit.in_flight(), other.in_flight()), expected);
+            let recorded = primary.take_rest_requests();
+            assert_eq!(recorded.len(), 1);
+            let body = recorded[0].body.as_ref().expect("batch body");
+            let urls: Vec<_> = body["requests"]
+                .as_array()
+                .expect("batch items")
+                .iter()
+                .map(|item| item["url"].as_str().expect("subrequest url"))
+                .collect();
+            assert_eq!(urls, expected_urls);
             drop(request);
             assert_eq!((limit.in_flight(), other.in_flight()), (0, 0));
         }
