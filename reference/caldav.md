@@ -159,11 +159,12 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   redirect); a first-hop refusal in `auth_headers`, where nothing has been
   sent, carries none. The stamp moves no recovery class. Pinned by
   `a_redirect_the_walk_will_not_follow_is_the_providers_contract_fault` and
-  `a_refused_redirect_says_the_first_hop_was_answered` in dav-core. The walk's
-  closing check that the final response came from an admitted origin is a
-  `debug_assert`, not a refusal: every URL the walk sends to has already passed
-  the credential gate, and as a runtime check it would run after the request
-  had gone out.
+  `a_refused_redirect_says_the_first_hop_was_answered` in dav-core. The walk
+  also gates its FIRST hop before sending, refusing an unadmitted origin as a
+  local `Request(Malformed)` with no attempt: `DavRequest::new` and
+  `send_raw_request` are public, so a caller can hand over a URL that never
+  passed `auth_headers`. Checking only the final response, as the walk once
+  did, ran after the request had already gone out.
 - `parse.rs` - XML response parsers for calendar discovery, event
   listing, multiget hydration, and nested href properties. Calendar
   collection metadata and href-valued discovery properties are staged per

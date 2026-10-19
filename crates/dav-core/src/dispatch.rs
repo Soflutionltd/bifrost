@@ -524,6 +524,24 @@ impl DavDispatch {
         // through a type Default hid the coupling (changing the default
         // silently changed DAV behavior).
         let max_hops = usize::from(bifrost_net::DEFAULT_MAX_HOPS);
+        // The first hop is gated here, before anything is sent, exactly as
+        // every later hop is gated below. Every in-workspace caller already
+        // credentials its URL through `auth_headers`, the same gate, but
+        // `DavRequest::new` and this method are public, so an external caller
+        // can hand over a URL nobody checked. Checking only the final answer
+        // protected nothing - the request had already gone out - and as a
+        // debug assertion it panicked a downstream debug build while
+        // returning the response silently in release.
+        if !self.is_trusted_url(&request.url) {
+            return Err(local_error(
+                operation,
+                format!(
+                    "refusing to send a DAV request to an untrusted URL: {}",
+                    request.url
+                ),
+                self.protocol,
+            ));
+        }
         let mut request = request;
         let mut hops = 0usize;
         loop {
@@ -548,25 +566,6 @@ impl DavDispatch {
                 _ => None,
             };
             let Some(location) = location else {
-                // Cannot fire, which is why it is an assertion rather than a
-                // refusal. `response.url` is the URL of the request just sent,
-                // and every URL the walk sends to has passed the credential
-                // gate: each hop past the first is checked against
-                // `is_trusted_url` below before it goes out, and the first is
-                // the caller's, which every caller credentials through
-                // `auth_headers` - the same gate - for that same URL. The
-                // admitted set only ever grows, so nothing can untrust a URL
-                // between the check and the answer. As a runtime check it was
-                // also too late to protect anything: a request to an untrusted
-                // origin would already have been SENT by the time its answer
-                // was inspected here. What it can still catch is a caller that
-                // builds a request without gating its URL, and that is a bug in
-                // this workspace, which a debug build should surface loudly.
-                debug_assert!(
-                    self.is_trusted_url(&response.url),
-                    "DAV request reached an origin the credential gate never admitted: {}",
-                    response.url
-                );
                 return Ok(response);
             };
             let next = Url::parse(&response.url)
@@ -1038,6 +1037,30 @@ mod tests {
         assert_eq!(
             unparseable.resolve_url("cal/one.ics"),
             "not a url/dav/cal/one.ics"
+        );
+    }
+
+    /// A first hop to an origin discovery never admitted is refused before
+    /// anything is sent. `DavRequest::new` is public, so an external caller
+    /// can skip `auth_headers`; the empty script panics if the walk sends.
+    #[tokio::test]
+    async fn an_untrusted_first_hop_is_refused_before_sending() {
+        let script = dav_script_empty();
+        let dispatch = scripted_dispatch(scripted_dav_net(&script));
+
+        let error = dispatch
+            .send_raw_request(
+                DavRequest::new(Method::GET, "https://elsewhere.example.test/cal/"),
+                AccountOperation::EventGet,
+            )
+            .await
+            .expect_err("an untrusted first hop must be refused");
+
+        assert!(transcripts(&script).is_empty(), "nothing may be sent");
+        assert!(
+            matches!(error.kind(), AccountErrorKind::Request(_)),
+            "a local refusal, not a wire failure: {:?}",
+            error.kind()
         );
     }
 

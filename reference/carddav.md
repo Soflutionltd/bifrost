@@ -124,8 +124,8 @@ narrowed the predicate.
   `Attempt(Acknowledged)`, not the `Request(Malformed)` it used to be. The
   refused hop to an unadmitted origin stays a local `Request(Malformed)`, now
   stamped with an `Acknowledged` attempt because the previous hop was answered;
-  `reference/caldav.md` carries the detail, including why the walk's closing
-  origin check is a `debug_assert`.
+  `reference/caldav.md` carries the detail, including the walk's first-hop
+  origin refusal.
 - `parse.rs` - XML response parsers for addressbook discovery,
   contact listing, multiget hydration, depth-0 `getctag`, and nested href
   properties. Addressbook/listing/multiget and href-valued discovery

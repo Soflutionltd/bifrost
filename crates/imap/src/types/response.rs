@@ -553,7 +553,10 @@ pub struct MoveResult {
     /// The response code from the tagged OK when it carries one, otherwise
     /// the code from the first untagged `OK [COPYUID ...]`. Under QRESYNC
     /// the tagged OK typically carries `HIGHESTMODSEQ` (RFC 7162), in which
-    /// case the COPYUID is only in [`copy_uid`](Self::copy_uid).
+    /// case the COPYUID is only in [`copy_uid`](Self::copy_uid). On the
+    /// COPY + UID EXPUNGE fallback for a server without MOVE, the UID
+    /// EXPUNGE's tagged OK plays the MOVE's role, falling back to the
+    /// COPY's code when the EXPUNGE carried none.
     pub code: Option<ResponseCode>,
     /// The `COPYUID` response code (RFC 4315 Section 3, RFC 6851 Section
     /// 4.3): the tagged OK's code when that is COPYUID, otherwise the first

@@ -343,7 +343,18 @@ pub(crate) fn subscribe<T: PushTransport>(
             // subscribe, so a WebSocket endpoint slow to answer during reopen
             // could exhaust `restart_account`'s attempts and pause the
             // account, HTTP sync included.
-            Err(crate::Error::WebSocketNotConnected) => {}
+            //
+            // A dead sink (`WebSocketSend`) is the same deferred success. In
+            // tokio-websockets every send error leaves the stream closed for
+            // good: `start_send` fails only with `AlreadyClosed`, and a
+            // failed flush sets `CloseAcknowledged`, which nothing resets to
+            // `Active`. The writer's failure does not wake the reader, but
+            // its keepalive ping then fails and it reconnects, re-applying
+            // the committed `enabled` set under the same guard ordering as
+            // above. The cost is that push for this subscription can start up
+            // to one keepalive interval late. Re-verify this if
+            // tokio-websockets is bumped.
+            Err(crate::Error::WebSocketNotConnected | crate::Error::WebSocketSend(_)) => {}
             Err(err) => return Err(push_set_error(err)),
         }
         subscriptions_guard.insert(handle.clone(), data_types);
@@ -1192,63 +1203,47 @@ mod tests {
         crate::Error::NotParsable("scripted".to_string())
     }
 
-    fn transmission_state(error: &AccountError) -> Option<bifrost_types::TransmissionState> {
-        error.chain().iter().find_map(|cause| match cause {
-            bifrost_types::Cause::Attempt(attempt) => Some(attempt.transmission_state),
-            _ => None,
-        })
-    }
-
-    /// A subscribe whose frame hit a dead sink was acknowledged by nobody.
-    /// It used to surface as `Protocol(PartialResponse)` stamped
-    /// `Acknowledged`, which for the non-idempotent `PushSubscribe` derived
-    /// a `PartialCompletionSignal` reconcile with no target to read back.
-    /// It is a network failure, `Unsent` when the library refused the frame
-    /// and `InFlight` when the flush failed, and replayable either way: the
-    /// frame carries the whole desired set, so sending it twice is sending
-    /// it once. Nothing is committed.
+    /// A subscribe whose frame hit a dead sink is a deferred success, like
+    /// one before the first connect. Failing it let a WebSocket that died
+    /// during the engine's reopen abort the reopen and pause the account.
+    /// The dead stream never revives, so the reader's keepalive fails, it
+    /// reconnects, and the re-enable applies the committed set.
     #[tokio::test]
-    async fn a_subscribe_on_a_dead_sink_is_a_replayable_network_failure() {
-        use bifrost_types::{
-            AccountErrorKind, RecoveryClass, RetryDisposition, TransmissionState,
-            TransportErrorKind,
-        };
-
-        for (error, expected) in [
-            (
-                sink_refused as fn() -> crate::Error,
-                TransmissionState::Unsent,
-            ),
-            (sink_failed_mid_flush, TransmissionState::InFlight),
-        ] {
+    async fn a_subscribe_on_a_dead_sink_commits_and_the_next_connection_applies_it() {
+        for error in [sink_refused as fn() -> crate::Error, sink_failed_mid_flush] {
             let subscriptions = Arc::new(Mutex::new(HashMap::new()));
             let enabled = Arc::new(Mutex::new(HashSet::new()));
-            let failure = subscribe(
+            let push_state = Arc::new(Mutex::new(None));
+            let handle = SubscriptionHandle("dead".to_string());
+            subscribe(
                 FailingPushSetTransport { error },
                 PushCapability::InProcess,
-                SubscriptionHandle("dead".to_string()),
+                handle.clone(),
                 vec![CursorScope::Type(ObjectType::Email)],
                 Arc::clone(&subscriptions),
                 Arc::clone(&enabled),
-                Arc::new(Mutex::new(None)),
+                Arc::clone(&push_state),
             )
             .await
-            .expect_err("nothing was applied");
+            .expect("a dead sink defers the subscription to the next connection");
+            assert!(subscriptions.lock().await.contains_key(&handle));
 
+            let applied = Arc::new(StdMutex::new(Vec::new()));
+            reenable_current_push_set(
+                &RecordingPushTransport {
+                    fail: false,
+                    applied: Arc::clone(&applied),
+                },
+                &enabled,
+                &push_state,
+            )
+            .await
+            .expect("re-enable succeeds");
             assert_eq!(
-                failure.kind(),
-                &AccountErrorKind::Transport(TransportErrorKind::Network),
-                "{expected:?}"
+                applied.lock().expect("apply log").clone(),
+                vec![([DataType::Email].into_iter().collect::<DataTypeSet>(), None)],
+                "the next connection applies the committed subscription"
             );
-            assert_eq!(transmission_state(&failure), Some(expected));
-            match failure.recovery() {
-                RecoveryClass::Retry(advice) => {
-                    assert_eq!(advice.disposition, RetryDisposition::SameRequest);
-                }
-                other => panic!("{expected:?}: expected a replay, got {other:?}"),
-            }
-            assert!(subscriptions.lock().await.is_empty());
-            assert!(enabled.lock().await.is_empty());
         }
     }
 
