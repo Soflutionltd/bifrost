@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bifrost_net::{
     AccountId, AccountNet, AccountSpec, Net, RateLimit, RequestBuilder, Response,
@@ -38,6 +38,11 @@ impl ByteTally {
 }
 
 const GMAIL_API_BASE: &str = "https://www.googleapis.com/gmail/v1/users/me";
+// Local data-request policy, equal to inventory's HYDRATE_BATCH_SIZE, not a
+// discovered Gmail ceiling. Gmail's unpublished per-user concurrency limit is
+// shared with other clients, so this cannot guarantee staying below it.
+// It prevents concurrent walks and scopes from multiplying the per-walk width.
+pub(crate) const GMAIL_DATA_CONCURRENCY: usize = 32;
 const PEOPLE_API_BASE: &str = "https://people.googleapis.com/v1";
 const CALENDAR_API_BASE: &str = "https://www.googleapis.com/calendar/v3";
 // Gmail meters per-user traffic in QUOTA UNITS, not requests: the
@@ -65,6 +70,7 @@ pub(crate) struct GmailClient {
 }
 
 struct ClientInner {
+    gmail_limit: OnceLock<bifrost_net::ConcurrencyLimit>,
     net: Option<AccountNet>,
     parent_net: Net,
     api_base: String,
@@ -134,6 +140,7 @@ impl GmailClient {
         Self {
             tally: None,
             inner: Arc::new(ClientInner {
+                gmail_limit: OnceLock::new(),
                 net: Some(net),
                 parent_net: Net::shared_default(),
                 api_base: api_base.into().trim_end_matches('/').to_string(),
@@ -177,6 +184,7 @@ impl GmailClient {
         Self {
             tally: None,
             inner: Arc::new(ClientInner {
+                gmail_limit: OnceLock::new(),
                 net: None,
                 parent_net,
                 api_base: api_base.into().trim_end_matches('/').to_string(),
@@ -196,6 +204,7 @@ impl GmailClient {
         Self {
             tally: None,
             inner: Arc::new(ClientInner {
+                gmail_limit: OnceLock::new(),
                 net: self.inner.net.clone(),
                 parent_net: self.inner.parent_net.clone(),
                 api_base: self.inner.api_base.clone(),
@@ -215,6 +224,7 @@ impl GmailClient {
         Self {
             tally: None,
             inner: Arc::new(ClientInner {
+                gmail_limit: OnceLock::new(),
                 net: self.inner.net.clone(),
                 parent_net: self.inner.parent_net.clone(),
                 api_base: self.inner.api_base.clone(),
@@ -243,6 +253,7 @@ impl GmailClient {
         Self {
             tally: None,
             inner: Arc::new(ClientInner {
+                gmail_limit: OnceLock::new(),
                 net: Some(net),
                 parent_net: self.inner.parent_net.clone(),
                 api_base: self.inner.api_base.clone(),
@@ -379,6 +390,14 @@ impl GmailClient {
 
         if let Some(cost) = self.gmail_quota_cost(url, method) {
             builder = builder.cost(cost);
+            let path = url
+                .strip_prefix(self.api_base())
+                .expect("Gmail base matched");
+            if method != "POST" || !matches!(path, "/watch" | "/stop") {
+                builder = builder.concurrency_limit(self.gmail_data_limit());
+            }
+            // Watch renewal and stop are independent of the Gmail concurrency
+            // queue. Rate admission, token refresh and retries still apply.
         }
 
         // `json` sets `Content-Type: application/json` itself, so the
@@ -390,6 +409,21 @@ impl GmailClient {
         }
 
         self.send_recorded(builder).await
+    }
+
+    fn gmail_data_limit(&self) -> bifrost_net::ConcurrencyLimit {
+        self.inner
+            .gmail_limit
+            .get_or_init(|| {
+                let origin = reqwest::Url::parse(self.api_base()).map_or_else(
+                    |_| self.api_base().to_string(),
+                    |url| url.origin().ascii_serialization(),
+                );
+                let key = format!("gmail:{:?}", (&self.account_net().account().0, origin));
+                self.account_net()
+                    .shared_concurrency_limit(key, GMAIL_DATA_CONCURRENCY)
+            })
+            .clone()
     }
 
     /// Quota units this URL costs, when it resolves against the Gmail
@@ -406,12 +440,17 @@ impl GmailClient {
     pub(crate) async fn execute_builder(
         &self,
         builder: RequestBuilder,
-        _service: &str,
+        service: &str,
     ) -> Result<Response> {
         // Net errors are preserved verbatim through `Error::Net(_)` so
         // the account-side translation boundary can inspect transmission
         // state, retry-after, and other forensic evidence. Service
-        // string is unused now that we no longer flatten errors here.
+        // attribution also identifies the raw Gmail data mutation path.
+        let builder = if service == "Gmail API" {
+            builder.concurrency_limit(self.gmail_data_limit())
+        } else {
+            builder
+        };
         self.send_recorded(builder).await
     }
 
@@ -626,6 +665,128 @@ mod tests {
     use reqwest::StatusCode;
 
     use super::*;
+
+    fn concurrency_client(script: &Arc<ScriptedDispatch>) -> GmailClient {
+        let net = bifrost_net::test_support::scripted_account(
+            script,
+            bifrost_net::NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            bifrost_net::RetryPolicy::disabled(),
+        );
+        GmailClient::with_account_net("https://gmail.test", net)
+    }
+
+    // A reserved concurrency claim is not yet a recorded wire request:
+    // admission, rate and token futures precede polling ScriptedDispatch.
+    // Drive those stages with a bounded poll/yield loop before inspecting
+    // counts. The operation must stay pending on a claim or canned response.
+    async fn drive_pending<F: std::future::Future>(mut request: std::pin::Pin<&mut F>) {
+        for _ in 0..64 {
+            assert!(futures::FutureExt::now_or_never(request.as_mut()).is_none());
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn saturate_gmail(
+        client: &GmailClient,
+    ) -> Vec<futures::future::BoxFuture<'static, Result<Response>>> {
+        let mut requests = Vec::new();
+        for _ in 0..GMAIL_DATA_CONCURRENCY {
+            let client = client.clone();
+            let mut request: futures::future::BoxFuture<'static, Result<Response>> =
+                Box::pin(async move {
+                    client
+                        .execute("https://gmail.test/messages/m", "GET", None::<&()>)
+                        .await
+                });
+            drive_pending(std::pin::Pin::new(&mut request)).await;
+            requests.push(request);
+        }
+        requests
+    }
+
+    #[tokio::test]
+    async fn the_33rd_gmail_data_request_waits_including_raw_mutations() {
+        let script = ScriptedDispatch::new((0..34).map(|_| Canned::Pending));
+        let client = concurrency_client(&script);
+        let mut held = saturate_gmail(&client).await;
+        assert_eq!(script.requests().len(), 32);
+        let mut typed = Box::pin(client.execute("https://gmail.test/profile", "GET", None::<&()>));
+        drive_pending(std::pin::Pin::new(&mut typed)).await;
+        let mut raw = Box::pin(
+            client.execute_builder(
+                client
+                    .account_net()
+                    .post("https://gmail.test/messages/batchModify"),
+                "Gmail API",
+            ),
+        );
+        drive_pending(std::pin::Pin::new(&mut raw)).await;
+        assert_eq!(script.requests().len(), 32, "both data funnels must queue");
+        held.pop();
+        drive_pending(std::pin::Pin::new(&mut typed)).await;
+        assert_eq!(
+            script.requests().len(),
+            33,
+            "release admits the next request"
+        );
+        drop(typed);
+        drive_pending(std::pin::Pin::new(&mut raw)).await;
+        assert_eq!(script.requests().len(), 34, "raw mutations also resume");
+    }
+
+    #[tokio::test]
+    async fn other_google_services_bypass_a_saturated_gmail_queue() {
+        let script = ScriptedDispatch::new((0..36).map(|_| Canned::Pending));
+        let client = concurrency_client(&script);
+        let _held = saturate_gmail(&client).await;
+        let mut data = Box::pin(client.get::<serde_json::Value>("/profile"));
+        drive_pending(std::pin::Pin::new(&mut data)).await;
+        assert_eq!(
+            script.requests().len(),
+            32,
+            "Gmail must actually be saturated"
+        );
+        let calendar_url = format!("{}/users/me/calendarList", client.calendar_base());
+        let people_url = format!("{}/people/me/connections", client.people_base());
+        let mut calendar = Box::pin(client.get::<serde_json::Value>(&calendar_url));
+        let mut people = Box::pin(client.get::<serde_json::Value>(&people_url));
+        let mut drive =
+            Box::pin(client.get::<serde_json::Value>("https://www.googleapis.com/drive/v3/files"));
+        drive_pending(std::pin::Pin::new(&mut calendar)).await;
+        drive_pending(std::pin::Pin::new(&mut people)).await;
+        drive_pending(std::pin::Pin::new(&mut drive)).await;
+        assert_eq!(
+            script.requests().len(),
+            35,
+            "other services must reach transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_and_stop_bypass_a_saturated_gmail_queue() {
+        let script = ScriptedDispatch::new((0..35).map(|_| Canned::Pending));
+        let client = concurrency_client(&script);
+        let _held = saturate_gmail(&client).await;
+        let mut data = Box::pin(client.get::<serde_json::Value>("/profile"));
+        drive_pending(std::pin::Pin::new(&mut data)).await;
+        assert_eq!(
+            script.requests().len(),
+            32,
+            "Gmail must actually be saturated"
+        );
+        let body = serde_json::json!({"topicName": "projects/test/topics/mail"});
+        let mut watch = Box::pin(client.post::<serde_json::Value, _>("/watch", &body));
+        let mut stop = Box::pin(client.post_no_content("/stop", &()));
+        drive_pending(std::pin::Pin::new(&mut watch)).await;
+        drive_pending(std::pin::Pin::new(&mut stop)).await;
+        assert_eq!(
+            script.requests().len(),
+            34,
+            "control requests must reach transport"
+        );
+    }
 
     #[test]
     fn gmail_method_costs_match_the_published_quota_table() {

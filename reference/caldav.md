@@ -954,8 +954,10 @@ that bites if the home fallback is reintroduced at the call site.
 
 Multi-leg calendar multiget and text-search REPORTs are dispatched
 concurrently, bounded to `MULTIGET_LEG_CONCURRENCY` in-flight legs. The bound
-lives at this call site because the multiget chunk count is input-sized and
-`bifrost-net` carries no concurrency governor; dispatch is ordered, so the
+is a per-call local policy bounding one input-sized fan-out. No account-wide
+DAV bound exists: no server advertises one and nothing needs one yet.
+`bifrost-net::ConcurrencyLimit` is available if one is ever wanted. Dispatch
+is ordered, so the
 merged report and the surviving degraded error do not depend on completion
 order. Offset continuations still re-run search so each page reflects a
 fresh server observation and carries that observation's failure lanes.

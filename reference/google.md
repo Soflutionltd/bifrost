@@ -172,6 +172,27 @@ account-level default resolves unambiguously. A base that fails to parse falls
 back to the production host, so a malformed override meters the real host rather
 than nothing.
 
+### Gmail data concurrency
+
+`GMAIL_DATA_CONCURRENCY` is an explicit local policy of 32, equal to the
+hydration fan-out width (`HYDRATE_BATCH_SIZE`), not a discovered Gmail ceiling.
+Gmail enforces an unpublished per-user concurrent request limit shared across
+all clients of that user; no local bound can guarantee staying under it.
+This bound prevents concurrent walks and scopes from multiplying the per-walk
+width. `FullWithBlobs` issues two requests per hydration future, so even one
+walk previously peaked near 64 data requests.
+
+Each Gmail data request adds a weight-1 `RequestBuilder::concurrency_limit`
+claim. `AccountNet::shared_concurrency_limit` supplies the handle from its
+per-Net registry, keyed by `gmail:` plus the debug-formatted tuple of engine
+account id and Gmail API base origin (scheme, host and effective port).
+The client retains the handle, so overlapping clients for that key share it.
+Typed requests and raw-builder Gmail mutations are covered. `users.watch`
+renewal and `users.stop` are independent of this concurrency queue; rate
+admission, token refresh and retries still apply. Calendar, People and Drive
+remain ungated: they share the account transport, have narrow fan-outs, and
+advertise no concurrency limit. There is no account-wide concurrency claim.
+
 ### Per-batch byte accounting
 
 `GmailClient` carries an optional `ByteTally`. `metered()` hands back a handle
@@ -189,7 +210,7 @@ error-path traffic.
 
 This matters because one batch is routinely many requests: an inventory batch
 covers a `users.messages.list` page plus up to 32 concurrent
-`users.messages.get` calls, and a mutation batch covers `batchModify` plus any
+hydration futures, whose requests share the Gmail data bound, and a mutation batch covers `batchModify` plus any
 label refresh and per-id TRASH fallback. The two remaining zero-valued sites are
 genuinely synthetic - `discover_cursor_scopes` returns a constant, and a
 `discover_memberships` cache hit performs no request - and say so at the call
@@ -792,7 +813,8 @@ dispatch per `Projection` is:
   `HydratedObjectKind::RawMime`.
 - Any other variant falls back to `format=metadata`.
 
-A hydration batch is issued CONCURRENTLY at width 32 (`buffer_unordered`),
+A hydration batch runs up to 32 hydration futures (`buffer_unordered`),
+with their data requests sharing the account's Gmail bound of 32,
 matching the fan-out `inventory_stream` already used, and each future carries
 its own id alongside its result so a per-item failure still names the object it
 could not represent. The label vocabulary is resolved once per batch and

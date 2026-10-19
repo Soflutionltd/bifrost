@@ -140,17 +140,6 @@ confirm against the code before working any of them.
   names a downstream consumer. Coordinate with those two repos; there is nothing
   to do here until they are ready.
 
-### Cross-crate shaping questions
-
-- **Concurrency limit: only JMAP is wired.** `bifrost_net::ConcurrencyLimit`
-  landed 2026-10-03 and JMAP gates its API requests by the session's
-  `maxConcurrentRequests`. The other overlapping-request sites still bound
-  only their own fan-out width: the two google inventory
-  `buffer_unordered(HYDRATE_BATCH_SIZE)` fanouts and the caldav/carddav client
-  fanouts, and no in-tree code sets `AccountSpec::concurrency_limit`. Those
-  providers advertise no limit of their own, so wiring them means choosing a
-  bound, which is a product decision per provider.
-
 ## Open items folded in from the third bug-hunt wave (2026-09-04)
 
 The deferred tail of the 2026-09-04 hunt. The same category labels and the

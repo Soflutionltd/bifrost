@@ -532,8 +532,10 @@ being the one that bites if the home fallback is reintroduced at the call site.
 
 Multi-leg addressbook multiget and the eight property-specific text-search
 REPORTs are dispatched concurrently, bounded to `MULTIGET_LEG_CONCURRENCY`
-in-flight legs and dispatched in order, for the reasons given in
-`reference/caldav.md`. Offset continuations still re-run search
+in-flight legs and dispatched in order. This is a per-call local policy for
+one input-sized fan-out. No account-wide DAV bound exists because no server
+advertises one and nothing needs one yet; bifrost-net's `ConcurrencyLimit`
+is available if one is ever wanted. Offset continuations still re-run search
 so each page reflects a fresh server observation and carries that observation's
 failure lanes.
 

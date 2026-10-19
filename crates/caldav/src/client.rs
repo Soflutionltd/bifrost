@@ -27,9 +27,10 @@ const MULTIGET_BATCH_SIZE: usize = 50;
 ///
 /// The chunk count is driven by the caller's uri list, so an unbounded
 /// `join_all` over it lets one large collection launch hundreds of
-/// simultaneous REPORTs at a server that never agreed to that. `bifrost-net`
-/// has no concurrency governor, so the bound belongs here, at the call site
-/// that knows the fan-out is input-sized. Ordered (`buffered`, not
+/// simultaneous REPORTs at a server that never agreed to that. This per-call
+/// local policy bounds one input-sized fan-out. No account-wide DAV bound is
+/// needed yet, and no server advertises one; bifrost-net's `ConcurrencyLimit`
+/// is available if one is wanted. Ordered (`buffered`, not
 /// `buffer_unordered`) so the merged report and the surviving degraded error
 /// stay deterministic regardless of completion order.
 const MULTIGET_LEG_CONCURRENCY: usize = 4;
@@ -2903,8 +2904,8 @@ mod tests {
     ///
     /// The chunk count is input-sized, so an unbounded dispatch lets one large
     /// calendar open hundreds of simultaneous REPORTs against a server that
-    /// never agreed to that, and `bifrost-net` has no concurrency governor to
-    /// catch it downstream.
+    /// never agreed to that. This per-call policy bounds that input-sized
+    /// fan-out; no account-wide DAV bound is configured.
     ///
     /// The probe now sits at the wire rather than above the transport: the
     /// yielding script raises its in-flight count for each dispatch that is

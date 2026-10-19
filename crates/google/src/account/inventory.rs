@@ -1153,6 +1153,71 @@ mod tests {
         );
     }
 
+    // A reserved concurrency claim is not yet a recorded wire request:
+    // admission, rate and token futures precede polling ScriptedDispatch.
+    // Drive those stages with a bounded poll/yield loop before inspecting
+    // counts. The operation must stay pending on a claim or canned response.
+    async fn drive_pending<F: std::future::Future>(mut request: std::pin::Pin<&mut F>) {
+        for _ in 0..64 {
+            assert!(futures::FutureExt::now_or_never(request.as_mut()).is_none());
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_hydration_walks_share_one_gmail_data_bound() {
+        let mut steps = vec![ok_json(json!({ "labels": [] }))];
+        steps.extend((0..HYDRATE_BATCH_SIZE + 1).map(|_| Canned::Pending));
+        let script = ScriptedDispatch::new(steps);
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            RetryPolicy::disabled(),
+        );
+        // Separate clients model overlapping opens on the same Net/account,
+        // rather than relying on clones sharing a client-local handle.
+        let first = Arc::new(GmailClient::with_account_net(
+            "https://gmail.test",
+            net.clone(),
+        ));
+        let second = Arc::new(GmailClient::with_account_net("https://gmail.test", net));
+        let walk = |client| {
+            get_stream(
+                client,
+                Arc::new(super::super::scopes::ScopeCacheState::new(
+                    super::super::scopes::ScopeSnapshot::empty(),
+                )),
+                Box::pin(stream::iter(
+                    (0..HYDRATE_BATCH_SIZE).map(|index| ObjectId(format!("m{index}"))),
+                )),
+                Projection::Metadata,
+            )
+        };
+        let mut first = walk(first);
+        let mut second = walk(second);
+        let mut first_next = first.next();
+        let mut second_next = second.next();
+        drive_pending(std::pin::Pin::new(&mut first_next)).await;
+        assert_eq!(script.requests().len(), HYDRATE_BATCH_SIZE + 1);
+        drive_pending(std::pin::Pin::new(&mut second_next)).await;
+        assert_eq!(
+            script.requests().len(),
+            HYDRATE_BATCH_SIZE + 1,
+            "the second walk's label refresh must share the saturated bound"
+        );
+        drop(first_next);
+        drop(first);
+        drive_pending(std::pin::Pin::new(&mut second_next)).await;
+        assert_eq!(
+            script.requests().len(),
+            HYDRATE_BATCH_SIZE + 2,
+            "dropping the first walk admits the second walk"
+        );
+        assert_eq!(crate::client::GMAIL_DATA_CONCURRENCY, HYDRATE_BATCH_SIZE);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn get_stream_starts_a_full_hydration_batch_concurrently_and_cancels_promptly() {
         let mut steps = vec![ok_json(json!({ "labels": [] }))];

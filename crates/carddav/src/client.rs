@@ -23,9 +23,10 @@ const MULTIGET_BATCH_SIZE: usize = 50;
 ///
 /// The chunk count is driven by the caller's uri list, so an unbounded
 /// `join_all` over it lets one large collection launch hundreds of
-/// simultaneous REPORTs at a server that never agreed to that. `bifrost-net`
-/// has no concurrency governor, so the bound belongs here, at the call site
-/// that knows the fan-out is input-sized. Ordered (`buffered`, not
+/// simultaneous REPORTs at a server that never agreed to that. This per-call
+/// local policy bounds one input-sized fan-out. No account-wide DAV bound is
+/// needed yet, and no server advertises one; bifrost-net's `ConcurrencyLimit`
+/// is available if one is wanted. Ordered (`buffered`, not
 /// `buffer_unordered`) so the merged report and the surviving degraded error
 /// stay deterministic regardless of completion order.
 const MULTIGET_LEG_CONCURRENCY: usize = 4;
