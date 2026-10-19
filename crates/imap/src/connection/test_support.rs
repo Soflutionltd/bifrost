@@ -69,7 +69,14 @@ pub(crate) fn detached(
 /// the session directly in the Authenticated state (RFC 3501 Section 3.2),
 /// which is what most command-level transcripts need.
 pub(crate) async fn driver_pair(greeting: &[u8]) -> (ImapConnection, tokio::io::DuplexStream) {
-    driver_pair_with_capacity(greeting, 1 << 16).await
+    driver_pair_metered(greeting, bifrost_net::BandwidthBudget::default()).await
+}
+
+pub(crate) async fn driver_pair_metered(
+    greeting: &[u8],
+    budget: bifrost_net::BandwidthBudget,
+) -> (ImapConnection, tokio::io::DuplexStream) {
+    driver_pair_with_capacity_and_budget(greeting, 1 << 16, budget).await
 }
 
 /// [`driver_pair`] over a duplex that buffers at most `capacity` octets in
@@ -78,12 +85,29 @@ pub(crate) async fn driver_pair_with_capacity(
     greeting: &[u8],
     capacity: usize,
 ) -> (ImapConnection, tokio::io::DuplexStream) {
+    driver_pair_with_capacity_and_budget(
+        greeting,
+        capacity,
+        bifrost_net::BandwidthBudget::default(),
+    )
+    .await
+}
+
+async fn driver_pair_with_capacity_and_budget(
+    greeting: &[u8],
+    capacity: usize,
+    budget: bifrost_net::BandwidthBudget,
+) -> (ImapConnection, tokio::io::DuplexStream) {
     let (client, mut server) = tokio::io::duplex(capacity);
 
     server.write_all(greeting).await.unwrap();
     server.flush().await.unwrap();
 
-    let mut wire_reader = wire::WireReader::new(ImapStream::Memory(stream::Tracked::new(client)));
+    let mut wire_reader = wire::WireReader::new_metered(
+        ImapStream::Memory(stream::Tracked::new(client)),
+        None,
+        Some(budget),
+    );
     let mut proto_state = state::ProtocolState::new();
     let tag_gen = tag::TagGenerator::new();
 

@@ -121,8 +121,9 @@ impl CalDavAccount {
     pub(crate) async fn open(
         account_id: AccountId,
         config: CalDavConfig,
+        net: Option<Arc<bifrost_net::Net>>,
     ) -> Result<Self, AccountError> {
-        let client = CalDavClient::new(account_id, &config);
+        let client = CalDavClient::new_on_net(account_id, &config, net.as_deref());
         Self::open_with_client(client, rsvp_email_from_config(&config)).await
     }
 

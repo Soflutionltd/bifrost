@@ -94,6 +94,23 @@ impl DavDispatch {
         Self::around(net, base_url, credentials, protocol)
     }
 
+    /// Attach through a supplied transport, resolving its budget before discovery.
+    #[must_use]
+    pub fn on_net(
+        net: &Net,
+        account_id: AccountId,
+        base_url: &str,
+        credentials: DavCredentials,
+        protocol: DavProtocol,
+    ) -> Self {
+        Self::around(
+            net.attach_account(account_id, dav_account_spec()),
+            base_url,
+            credentials,
+            protocol,
+        )
+    }
+
     /// Build over a caller-supplied `AccountNet`.
     ///
     /// Two callers: an account composed into an IMAP-shaped account, which hands

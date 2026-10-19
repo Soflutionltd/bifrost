@@ -21,6 +21,8 @@ pub use self::tls::{CertificateStore, Tls, TlsParameters, TlsParametersBuilder, 
 mod async_connection;
 #[cfg(feature = "tokio")]
 mod async_net;
+#[cfg(all(test, feature = "tokio"))]
+pub(crate) use async_net::AsyncNetworkStream;
 mod connection;
 mod core;
 pub(crate) mod metering;
@@ -28,8 +30,7 @@ mod net;
 mod tls;
 
 pub(crate) use self::metering::WireMetering;
-// pub: consumers need the "no cap" sentinel to write into the shared
-// atomic they hand to `bandwidth_metering`.
+// Retain the legacy unlimited sentinel at its published path.
 pub use self::metering::UNLIMITED_BANDWIDTH;
 
 /// Total bytes cap on an SMTP response (Postfix `smtp_response_limit`).

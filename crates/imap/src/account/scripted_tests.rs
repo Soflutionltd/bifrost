@@ -2396,38 +2396,19 @@ async fn a_uid_the_operand_cannot_carry_never_reaches_the_fetch() {
     let _server = script.await.unwrap();
 }
 
-/// The engine's bandwidth knob writes the SHARED atomic every pooled dial
-/// reads, and `None` means unlimited while `Some(0)` is clamped to 1 B/s.
-///
-/// The clamp is the load-bearing half: `0` in the token bucket is a divisor
-/// that would stall the transport forever, and `None` and `Some(0)` are the
-/// two spellings a caller is most likely to confuse.
+/// The account knob retunes the budget held by every protocol leg.
 #[tokio::test]
-async fn the_bandwidth_cap_knob_writes_the_shared_atomic_and_clamps_zero() {
-    use std::sync::atomic::Ordering;
-
+async fn the_bandwidth_cap_knob_updates_the_budget_and_clamps_zero() {
     use bifrost_types::Account;
-
     let (conn, _server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
     let account = scripted_account(conn, 1);
-    let shared = Arc::clone(&account.bandwidth_cap);
-
-    account.set_bandwidth_cap(Some(4_096));
-    assert_eq!(shared.load(Ordering::Acquire), 4_096);
-
+    let shared = account.bandwidth_budget.clone();
+    account.set_bandwidth_cap(Some(4096));
+    assert_eq!(shared.cap(), Some(4096));
     account.set_bandwidth_cap(None);
-    assert_eq!(
-        shared.load(Ordering::Acquire),
-        u64::MAX,
-        "None is unlimited, not zero",
-    );
-
+    assert_eq!(shared.cap(), None);
     account.set_bandwidth_cap(Some(0));
-    assert_eq!(
-        shared.load(Ordering::Acquire),
-        1,
-        "Some(0) clamps to 1 B/s rather than stalling the transport",
-    );
+    assert_eq!(shared.cap(), Some(1));
 }
 
 /// IMAP emits no scope-lifecycle events, but the stream must stay OPEN:

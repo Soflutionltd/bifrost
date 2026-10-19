@@ -9,8 +9,6 @@ use std::{
 
 use bifrost_types::error::{AccountError, BatchItem, BatchOutcome};
 
-use std::sync::atomic::AtomicU64;
-
 use bifrost_net::MeterSinkHandle;
 
 use super::PoolConfig;
@@ -789,26 +787,15 @@ impl AsyncSmtpTransportBuilder {
         self
     }
 
-    /// Meter this transport's socket bytes, and optionally cap its
-    /// throughput.
-    ///
-    /// `sink` receives every byte read and written; `bandwidth_cap` is a
-    /// live bytes-per-second ceiling read fresh on each transfer, so a
-    /// consumer can retune or lift it without reconnecting.
-    /// `UNLIMITED_BANDWIDTH` (`u64::MAX`) in the atomic means no cap -
-    /// the same encoding `bifrost-imap` uses, so one value can drive
-    /// both halves of an IMAP-shaped account.
-    ///
-    /// Without this, an account that sets a bandwidth cap has it honoured
-    /// on its other protocols and silently ignored on submission, which
-    /// is the upstream-heavy path a cap usually exists to protect.
+    /// Record plaintext bytes and share bandwidth admission across connections.
+    /// Retune the supplied budget without reconnecting; `None` uses an unlimited budget.
     #[must_use]
     pub fn bandwidth_metering(
         mut self,
         sink: Option<MeterSinkHandle>,
-        bandwidth_cap: Option<Arc<AtomicU64>>,
+        budget: Option<bifrost_net::BandwidthBudget>,
     ) -> Self {
-        self.info.metering = WireMetering::new(sink, bandwidth_cap);
+        self.info.metering = WireMetering::new(sink, budget);
         self
     }
 
@@ -966,6 +953,18 @@ impl AsyncLmtpTransportBuilder {
     /// configured timeout is used as given, whatever its size.
     pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
         self.info.timeout = timeout;
+        self
+    }
+
+    /// Record plaintext bytes and share bandwidth admission across LMTP connections.
+    /// Retune the supplied budget without reconnecting; `None` uses an unlimited budget.
+    #[must_use]
+    pub fn bandwidth_metering(
+        mut self,
+        sink: Option<MeterSinkHandle>,
+        budget: Option<bifrost_net::BandwidthBudget>,
+    ) -> Self {
+        self.info.metering = WireMetering::new(sink, budget);
         self
     }
 
@@ -1599,8 +1598,34 @@ mod tests {
             );
         }
 
-        /// The complement: an unmetered transport is the default, and must
-        /// stay free of any accounting overhead or behaviour change.
+        #[tokio::test(start_paused = true)]
+        async fn async_lmtp_builder_applies_bandwidth_metering() {
+            use crate::transport::smtp::client::AsyncNetworkStream;
+            use crate::transport::smtp::test_support::SlowSinkPeer;
+            use tokio::io::AsyncWriteExt;
+
+            let sink = Arc::new(CountingSink::default());
+            let erased: Arc<dyn bifrost_net::MeterSink> = Arc::<CountingSink>::clone(&sink);
+            let handle =
+                bifrost_net::MeterSinkHandle::new(erased, bifrost_net::AccountId("lmtp".into()));
+            let budget = bifrost_net::BandwidthBudget::new(Some(10));
+            let builder = AsyncLmtpTransport::<TokioExecutor>::builder_dangerous("lmtp.invalid")
+                .bandwidth_metering(Some(handle), Some(budget.clone()));
+            // Use the exact configuration the builder hands to its connector.
+            let mut stream = AsyncNetworkStream::from_raw_stream_for_test(Box::new(
+                SlowSinkPeer::new(usize::MAX, std::time::Duration::ZERO),
+            ));
+            stream.set_metering(builder.info.metering.clone());
+            let started = tokio::time::Instant::now();
+            assert_eq!(stream.write(&[0; 20]).await.unwrap(), 10);
+            assert_eq!(stream.write(&[0; 20]).await.unwrap(), 10);
+            assert_eq!(started.elapsed(), std::time::Duration::from_secs(1));
+            assert_eq!(sink.bytes_out.load(Ordering::Relaxed), 20);
+            budget.set_cap(None);
+            assert_eq!(stream.write(&[0; 20]).await.unwrap(), 20);
+        }
+
+        /// The default configuration has no sink and an unlimited budget.
         #[tokio::test(crate = "tokio")]
         async fn an_unmetered_transport_is_the_default() {
             let info = SmtpInfo::new("transcript.invalid", Protocol::Smtp);

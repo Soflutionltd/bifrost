@@ -121,15 +121,23 @@ impl CalDavConfig {
 
 /// Factory for opening standalone CalDAV accounts through the shared
 /// `Account` API.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CalDavAccountFactory {
     config: CalDavConfig,
+    net: Option<Arc<bifrost_net::Net>>,
 }
 
 impl CalDavAccountFactory {
     #[must_use]
     pub fn new(config: CalDavConfig) -> Self {
-        Self { config }
+        Self { config, net: None }
+    }
+
+    /// Attach through this transport before discovery, sharing its registry.
+    #[must_use]
+    pub fn with_net(mut self, net: Arc<bifrost_net::Net>) -> Self {
+        self.net = Some(net);
+        self
     }
 
     #[must_use]
@@ -138,11 +146,21 @@ impl CalDavAccountFactory {
     }
 }
 
+impl std::fmt::Debug for CalDavAccountFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CalDavAccountFactory")
+            .field("config", &self.config)
+            .field("net", &self.net.as_ref().map(|_| "<injected>"))
+            .finish()
+    }
+}
+
 impl AccountFactory for CalDavAccountFactory {
     fn open(&self, account_id: AccountId) -> AccountFuture<Result<OpenedAccount, AccountError>> {
         let config = self.config.clone();
+        let net = self.net.clone();
         Box::pin(async move {
-            let account = account::CalDavAccount::open(account_id, config).await?;
+            let account = account::CalDavAccount::open(account_id, config, net).await?;
             // Empty by construction: discovery mints one folder cursor scope
             // per calendar collection, so there is no collection the sync
             // lanes leave behind and nothing for the skip lane to report.

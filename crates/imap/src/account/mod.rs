@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -78,7 +78,6 @@ const STREAM_CAPACITY: usize = 64;
 const BATCH_ITEMS: usize = 128;
 /// Maximum decoded target ids retained before a get or mutation stream flushes.
 const TARGET_BUFFER_ITEMS: usize = 256;
-const UNLIMITED_BANDWIDTH: u64 = u64::MAX;
 
 /// Open IMAP account handle. The handle owns the connection pool.
 #[derive(Clone)]
@@ -97,7 +96,7 @@ pub(crate) struct ImapAccountInner {
     pub(crate) shutdown: CancellationToken,
     pub(crate) closed: AtomicBool,
     pub(crate) priority: AtomicU8,
-    pub(crate) bandwidth_cap: Arc<AtomicU64>,
+    pub(crate) bandwidth_budget: bifrost_net::BandwidthBudget,
     pub(crate) push: push::PushState,
     pub(crate) contacts: Option<Arc<dyn Account>>,
     pub(crate) calendars: Option<Arc<dyn Account>>,
@@ -121,7 +120,7 @@ pub(crate) struct ImapAccountParts {
     pub(crate) qresync_enabled: bool,
     pub(crate) qresync_negotiation_warning: Option<String>,
     pub(crate) supports_notify: bool,
-    pub(crate) bandwidth_cap: Arc<AtomicU64>,
+    pub(crate) bandwidth_budget: bifrost_net::BandwidthBudget,
     pub(crate) contacts: Option<Arc<dyn Account>>,
     pub(crate) calendars: Option<Arc<dyn Account>>,
     /// Collision-free ownership index for composed DAV folder scopes.
@@ -150,7 +149,7 @@ impl ImapAccount {
                 shutdown: CancellationToken::new(),
                 closed: AtomicBool::new(false),
                 priority: AtomicU8::new(Priority::Normal as u8),
-                bandwidth_cap: parts.bandwidth_cap,
+                bandwidth_budget: parts.bandwidth_budget,
                 push,
                 contacts: parts.contacts,
                 calendars: parts.calendars,
@@ -367,20 +366,9 @@ impl Account for ImapAccount {
         self.priority.store(priority as u8, Ordering::Release);
     }
 
-    // Account: records the engine bandwidth cap until IMAP byte-metering is wired.
+    // Account: every protocol leg admits against this shared budget.
     fn set_bandwidth_cap(&self, bps: Option<u64>) {
-        let raw = match bps {
-            None => UNLIMITED_BANDWIDTH,
-            Some(0) => {
-                tracing::warn!(
-                    target: "bifrost_imap::bandwidth",
-                    "set_bandwidth_cap(Some(0)) clamped to 1 B/s; use None for unlimited",
-                );
-                1
-            }
-            Some(n) => n,
-        };
-        self.bandwidth_cap.store(raw, Ordering::Release);
+        self.bandwidth_budget.set_cap(bps);
     }
 
     // Account: names the per-mailbox throttle keys engine work consumes; direct users pace themselves.
@@ -1697,7 +1685,6 @@ mod guarded_stream_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
     use futures::StreamExt as _;
@@ -1721,7 +1708,7 @@ mod guarded_stream_tests {
             primed,
             data_cap,
             None,
-            Arc::new(AtomicU64::new(0)),
+            bifrost_net::BandwidthBudget::default(),
         ))
     }
 

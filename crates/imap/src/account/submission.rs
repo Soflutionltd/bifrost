@@ -159,6 +159,7 @@ impl SmtpSubmissionConfig {
 /// default `from` and the MAIL FROM reverse path.
 pub(crate) struct SubmissionTransport {
     transport: AsyncSmtpTransport<TokioExecutor>,
+    pub(crate) budget: bifrost_net::BandwidthBudget,
     default_from: bifrost_types::Address,
     save_to_sent_default: bool,
 }
@@ -179,7 +180,7 @@ impl SubmissionTransport {
         cfg: &SmtpSubmissionConfig,
         imap_credentials: &Credentials,
         meter: Option<bifrost_net::MeterSinkHandle>,
-        bandwidth_cap: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        bandwidth_budget: bifrost_net::BandwidthBudget,
     ) -> Result<Self, crate::Error> {
         let credentials = resolve_credentials(cfg, imap_credentials);
         let port = cfg.port.unwrap_or_else(|| cfg.tls.default_port());
@@ -203,13 +204,11 @@ impl SubmissionTransport {
             }
         };
 
-        // Same meter handle and same cap atomic the IMAP connections use,
-        // so one `set_bandwidth_cap` governs both halves of the account
-        // and a send cannot burst past a cap the fetch path is honouring.
+        // Submission and IMAP share one account budget in each direction.
         builder = builder
             .port(port)
             .credentials(credentials)
-            .bandwidth_metering(meter, Some(bandwidth_cap));
+            .bandwidth_metering(meter, Some(bandwidth_budget.clone()));
         if let Some(timeout) = cfg.timeout {
             builder = builder.timeout(Some(timeout));
         }
@@ -219,6 +218,7 @@ impl SubmissionTransport {
 
         Ok(Self {
             transport: builder.build(),
+            budget: bandwidth_budget,
             default_from: cfg.default_from.clone(),
             save_to_sent_default: cfg.save_to_sent_default,
         })
@@ -369,6 +369,116 @@ mod tests {
     use super::*;
     use bifrost_net::StaticTokenSource;
     use bifrost_smtp::transport::smtp::extension::{FutureReleaseParameter, MailParameter};
+
+    #[tokio::test]
+    async fn submission_budget_tracks_account_cap_updates() {
+        use super::super::test_support::scripted_account_parts;
+        use crate::connection::test_support::{driver_pair, preauth_greeting};
+        use bifrost_types::Account;
+        let (conn, peer) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+        drop(peer);
+        let config = SmtpSubmissionConfig::new(
+            "smtp.invalid",
+            SubmissionTls::Plaintext,
+            bifrost_types::Address::bare("user@example.com"),
+        );
+        let budget = bifrost_net::BandwidthBudget::default();
+        let submission = SubmissionTransport::build(
+            &config,
+            &Credentials::password("user", "pass"),
+            None,
+            budget.clone(),
+        )
+        .unwrap();
+        let mut parts = scripted_account_parts(conn, 1);
+        parts.bandwidth_budget = budget.clone();
+        parts.submission = Some(Arc::new(submission));
+        let account = super::super::ImapAccount::new(parts);
+        for (requested, expected) in [(Some(17), Some(17)), (Some(0), Some(1)), (None, None)] {
+            account.set_bandwidth_cap(requested);
+            assert_eq!(budget.cap(), expected);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bandwidth_submission_and_imap_use_the_live_account_budget_in_both_directions() {
+        use crate::account::test_support::scripted_account_parts;
+        use crate::connection::test_support::{
+            driver_pair_metered, preauth_greeting, read_line, respond, select_inbox, tag_of,
+        };
+        use bifrost_net::{BandwidthBudget, BandwidthDirection};
+        use bifrost_types::Account;
+        use futures::FutureExt;
+        use tokio::time::{Duration, Instant};
+        let budget = BandwidthBudget::default();
+        let (conn, mut peer) =
+            driver_pair_metered(&preauth_greeting("IMAP4rev1"), budget.clone()).await;
+        select_inbox(&conn, &mut peer).await;
+        let config = SmtpSubmissionConfig::new(
+            "smtp.invalid",
+            SubmissionTls::Plaintext,
+            bifrost_types::Address::bare("user@example.com"),
+        );
+        let submission = Arc::new(
+            SubmissionTransport::build(
+                &config,
+                &Credentials::password("user", "pass"),
+                None,
+                budget.clone(),
+            )
+            .unwrap(),
+        );
+        let mut parts = scripted_account_parts(conn, 1);
+        parts.bandwidth_budget = budget;
+        parts.submission = Some(Arc::clone(&submission));
+        let account = super::super::ImapAccount::new(parts);
+        account.set_bandwidth_cap(Some(64));
+        // Spend the exact handle handed to SMTP's bandwidth_metering builder.
+        for direction in [BandwidthDirection::Inbound, BandwidthDirection::Outbound] {
+            submission.budget.admit(direction, 64).await.finish(64);
+        }
+        let pooled = account.pool.checkout_any().await.unwrap();
+        let start = Instant::now();
+        let script = async {
+            let command = read_line(&mut peer).await;
+            let tag = tag_of(&command);
+            assert!(command.contains("UID FETCH"));
+            // Check outbound independently: inbound waiting must not hide an
+            // uncapped command write behind the response's one-second slot.
+            assert_eq!(
+                start.elapsed(),
+                Duration::from_nanos(u64::try_from(command.len()).unwrap() * 1_000_000_000 / 64)
+            );
+            respond(
+                &mut peer,
+                &format!("* 1 FETCH (UID 1 BODY[] {{4}}\r\ndata)\r\n{tag} OK done\r\n"),
+            )
+            .await;
+        };
+        let set = crate::types::SequenceSet::new("1").unwrap();
+        let attrs = [
+            crate::types::FetchAttr::Uid,
+            crate::types::FetchAttr::BodySection {
+                peek: true,
+                section: None,
+                partial: None,
+            },
+        ];
+        let (result, ()) = tokio::join!(
+            pooled
+                .connection()
+                .uid_fetch(&set, &attrs, Duration::from_secs(10)),
+            script
+        );
+        assert_eq!(result.unwrap().len(), 1);
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        let mut pending = Box::pin(submission.budget.admit(BandwidthDirection::Inbound, 64));
+        assert!((&mut pending).now_or_never().is_none());
+        let wake = Instant::now();
+        account.set_bandwidth_cap(None);
+        pending.await.finish(64);
+        assert_eq!(wake.elapsed(), Duration::ZERO);
+    }
 
     #[test]
     fn scheduled_send_builds_holduntil_mail_parameter() {

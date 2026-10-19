@@ -6,13 +6,12 @@
 //! itself is only called by the connection constructor and the stream
 //! upgrade handler.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::time::Instant;
 
-use bifrost_net::MeterSinkHandle;
+use bifrost_net::{BandwidthBudget, BandwidthDirection, MeterSinkHandle, Reservation};
 use bytes::BytesMut;
 use tracing::{trace, warn};
 
@@ -32,6 +31,8 @@ pub(crate) struct WireReader {
     stream: ImapStream,
     buf: BytesMut,
     metering: WireMetering,
+    compress_read: Option<(Reservation, usize)>,
+    compress_boundary: bool,
 }
 
 impl WireReader {
@@ -45,18 +46,22 @@ impl WireReader {
             stream,
             buf: BytesMut::with_capacity(8 * 1024),
             metering: WireMetering::disabled(),
+            compress_read: None,
+            compress_boundary: false,
         }
     }
 
     pub(super) fn new_metered(
         stream: ImapStream,
         sink: Option<MeterSinkHandle>,
-        bandwidth_cap: Option<Arc<AtomicU64>>,
+        bandwidth_budget: Option<BandwidthBudget>,
     ) -> Self {
         Self {
             stream,
             buf: BytesMut::with_capacity(8 * 1024),
-            metering: WireMetering::new(sink, bandwidth_cap),
+            metering: WireMetering::new(sink, bandwidth_budget),
+            compress_read: None,
+            compress_boundary: false,
         }
     }
 
@@ -65,11 +70,38 @@ impl WireReader {
             stream,
             buf: BytesMut::with_capacity(8 * 1024),
             metering,
+            compress_read: None,
+            compress_boundary: false,
         }
     }
 
     pub(super) fn metering(&self) -> WireMetering {
         self.metering.clone()
+    }
+
+    pub(super) fn set_peer_timeout(&mut self, timeout: Option<Duration>) {
+        self.metering.peer_timeout = timeout.map(PeerBudget::new);
+    }
+
+    pub(in crate::connection) fn peer_budget(&self) -> Option<PeerBudget> {
+        self.metering.peer_timeout.clone()
+    }
+
+    pub(in crate::connection) fn begin_compress_boundary(&mut self) {
+        self.compress_boundary = true;
+    }
+
+    pub(in crate::connection) fn finish_compress_boundary(&mut self, suffix: usize) {
+        self.finish_compress_read(suffix);
+        self.compress_boundary = false;
+    }
+
+    fn finish_compress_read(&mut self, suffix: usize) {
+        if let Some((grant, read)) = self.compress_read.take() {
+            let plaintext = read.saturating_sub(suffix);
+            grant.finish(plaintext);
+            self.metering.record_in(plaintext);
+        }
     }
 
     /// Read and parse a single IMAP response from the wire.
@@ -92,11 +124,10 @@ impl WireReader {
                 return Ok(resp);
             }
             // Need more data from the wire.
-            let n = self.stream.read_buf(&mut self.buf).await?;
+            let n = self.read_admitted().await?;
             if n == 0 {
                 return Err(Error::closed());
             }
-            self.metering.record_in(n).await;
         }
     }
 
@@ -110,12 +141,33 @@ impl WireReader {
             if let Some(resp) = self.try_parse_greeting_inner()? {
                 return Ok(resp);
             }
-            let n = self.stream.read_buf(&mut self.buf).await?;
+            let n = self.read_admitted().await?;
             if n == 0 {
                 return Err(Error::closed());
             }
-            self.metering.record_in(n).await;
         }
+    }
+
+    /// Admission precedes peer I/O. A pending IDLE read pre-spends its slot
+    /// without holding a lock or an exclusive turn on the account budget.
+    async fn read_admitted(&mut self) -> Result<usize, Error> {
+        self.finish_compress_read(0);
+        let grant = self
+            .metering
+            .budget
+            .admit(BandwidthDirection::Inbound, 8192)
+            .await;
+        let read = self.stream.read_buf_limited(&mut self.buf, grant.granted());
+        let n = peer_io(self.metering.peer_timeout.clone(), read).await?;
+        if self.compress_boundary {
+            // The last read can contain compressed bytes after the tagged OK.
+            // Keep its grant until the upgrade identifies that uncharged suffix.
+            self.compress_read = Some((grant, n));
+        } else {
+            grant.finish(n);
+            self.metering.record_in(n);
+        }
+        Ok(n)
     }
 
     /// Write raw bytes to the wire and flush.
@@ -141,12 +193,38 @@ impl WireReader {
             if chunk.is_empty() {
                 continue;
             }
-            self.metering.throttle_out(chunk.len()).await;
-            self.stream.write_all(chunk).await?;
-            self.metering.record_out(chunk.len());
+            let mut remaining = chunk;
+            while !remaining.is_empty() {
+                let n = self.write_admitted(remaining).await?;
+                remaining = &remaining[n..];
+            }
         }
-        self.stream.flush().await?;
+        peer_io(self.metering.peer_timeout.clone(), self.stream.flush()).await?;
         Ok(())
+    }
+
+    async fn write_admitted(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        let grant = self
+            .metering
+            .budget
+            .admit(BandwidthDirection::Outbound, bytes.len())
+            .await;
+        // On error or cancellation the offered grant stays spent.
+        let n = peer_io(
+            self.metering.peer_timeout.clone(),
+            self.stream.write(&bytes[..grant.granted()]),
+        )
+        .await?;
+        grant.finish(n);
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "IMAP write made no progress",
+            )
+            .into());
+        }
+        self.metering.record_out(n);
+        Ok(n)
     }
 
     /// Octets the socket beneath this reader has accepted since the
@@ -287,12 +365,56 @@ impl WireReader {
     }
 }
 
+/// One cumulative peer wait allowance, shared across stream upgrades.
+#[derive(Clone)]
+pub(in crate::connection) struct PeerBudget(Arc<Mutex<Duration>>);
+
+impl PeerBudget {
+    fn new(timeout: Duration) -> Self {
+        Self(Arc::new(Mutex::new(timeout)))
+    }
+}
+
+struct PeerCharge {
+    budget: PeerBudget,
+    started: Instant,
+}
+
+impl Drop for PeerCharge {
+    fn drop(&mut self) {
+        let mut remaining = self.budget.0.lock().expect("peer budget lock poisoned");
+        *remaining = remaining.saturating_sub(self.started.elapsed());
+    }
+}
+
+pub(in crate::connection) async fn peer_io<T>(
+    budget: Option<PeerBudget>,
+    io: impl std::future::Future<Output = std::io::Result<T>>,
+) -> Result<T, Error> {
+    let Some(budget) = budget else {
+        return io.await.map_err(Error::from);
+    };
+    let remaining = *budget.0.lock().expect("peer budget lock poisoned");
+    if remaining.is_zero() {
+        return Err(Error::Timeout { attempt: None });
+    }
+    // Admission has already completed. The guard also spends peer wait time
+    // when the I/O future is cancelled, so cancellation cannot reset the clock.
+    let _charge = PeerCharge {
+        budget,
+        started: Instant::now(),
+    };
+    tokio::time::timeout(remaining, io)
+        .await
+        .map_err(|_| Error::Timeout { attempt: None })?
+        .map_err(Error::from)
+}
+
 #[derive(Clone)]
 pub(super) struct WireMetering {
     sink: Option<MeterSinkHandle>,
-    bandwidth_cap: Option<Arc<AtomicU64>>,
-    in_bucket: ByteBucket,
-    out_bucket: ByteBucket,
+    budget: BandwidthBudget,
+    peer_timeout: Option<PeerBudget>,
 }
 
 impl WireMetering {
@@ -301,32 +423,17 @@ impl WireMetering {
         Self::new(None, None)
     }
 
-    fn new(sink: Option<MeterSinkHandle>, bandwidth_cap: Option<Arc<AtomicU64>>) -> Self {
-        let initial_cap = bandwidth_cap
-            .as_ref()
-            .and_then(|cap| bandwidth_cap_from_raw(cap.load(Ordering::Relaxed)));
+    fn new(sink: Option<MeterSinkHandle>, budget: Option<BandwidthBudget>) -> Self {
         Self {
             sink,
-            bandwidth_cap,
-            in_bucket: ByteBucket::new(initial_cap),
-            out_bucket: ByteBucket::new(initial_cap),
+            budget: budget.unwrap_or_default(),
+            peer_timeout: None,
         }
     }
 
-    async fn record_in(&self, n: usize) {
-        let n = u64::try_from(n).unwrap_or(u64::MAX);
+    fn record_in(&self, n: usize) {
         if let Some(sink) = &self.sink {
-            sink.record_bytes_in(n);
-        }
-        if self.bandwidth_cap.is_some() {
-            self.in_bucket.consume(n, self.cap_now()).await;
-        }
-    }
-
-    async fn throttle_out(&self, n: usize) {
-        if self.bandwidth_cap.is_some() {
-            let n = u64::try_from(n).unwrap_or(u64::MAX);
-            self.out_bucket.consume(n, self.cap_now()).await;
+            sink.record_bytes_in(u64::try_from(n).unwrap_or(u64::MAX));
         }
     }
 
@@ -334,95 +441,6 @@ impl WireMetering {
         if let Some(sink) = &self.sink {
             sink.record_bytes_out(u64::try_from(n).unwrap_or(u64::MAX));
         }
-    }
-
-    fn cap_now(&self) -> Option<u64> {
-        self.bandwidth_cap
-            .as_ref()
-            .and_then(|cap| bandwidth_cap_from_raw(cap.load(Ordering::Relaxed)))
-    }
-}
-
-fn bandwidth_cap_from_raw(raw: u64) -> Option<u64> {
-    (raw != u64::MAX).then_some(raw.max(1))
-}
-
-#[derive(Clone)]
-struct ByteBucket {
-    state: Arc<Mutex<ByteBucketState>>,
-}
-
-struct ByteBucketState {
-    tokens: f64,
-    last_refill: Instant,
-}
-
-impl ByteBucket {
-    fn new(cap: Option<u64>) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(ByteBucketState {
-                tokens: cap.map_or(0.0, |cap| cap as f64),
-                last_refill: Instant::now(),
-            })),
-        }
-    }
-
-    async fn consume(&self, n: u64, cap: Option<u64>) {
-        let Some(cap) = cap else { return };
-        if cap == 0 || n == 0 {
-            return;
-        }
-        let cap_f = cap as f64;
-        let want = n as f64;
-        if n > cap {
-            // A transfer larger than one second of budget owes `want / cap`
-            // seconds in total. Sleep the whole debt  -  in bounded slices so
-            // no single timer is pathological  -  rather than clamping the
-            // total: a clamp would silently let a low cap be exceeded (a
-            // 1 B/s cap with 16 KiB reads would behave like ~273 B/s).
-            let mut secs = want / cap_f;
-            while secs > 0.0 {
-                let slice = secs.min(60.0);
-                tokio::time::sleep(Duration::from_secs_f64(slice)).await;
-                secs -= slice;
-            }
-            self.reset_after_large_transfer();
-            return;
-        }
-        while let Some(wait) = self.consume_or_wait(want, cap_f) {
-            tokio::time::sleep(wait).await;
-        }
-    }
-
-    /// This is synchronous by design: keeping the lock acquisition and token
-    /// calculation out of `consume` makes it structurally impossible for the
-    /// mutex guard to cross that async function's sleep.
-    fn consume_or_wait(&self, want: f64, cap: f64) -> Option<Duration> {
-        let mut state = self.lock_state();
-        let now = Instant::now();
-        let elapsed = now.duration_since(state.last_refill).as_secs_f64();
-        state.tokens = (state.tokens + elapsed * cap).min(cap);
-        state.last_refill = now;
-        if state.tokens >= want {
-            state.tokens -= want;
-            None
-        } else {
-            let deficit = want - state.tokens;
-            Some(Duration::from_secs_f64((deficit / cap).min(60.0)))
-        }
-    }
-
-    fn reset_after_large_transfer(&self) {
-        let mut state = self.lock_state();
-        state.tokens = 0.0;
-        state.last_refill = Instant::now();
-    }
-
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, ByteBucketState> {
-        self.state.lock().unwrap_or_else(|poisoned| {
-            warn!("byte bucket lock poisoned; recovering metering state");
-            poisoned.into_inner()
-        })
     }
 }
 

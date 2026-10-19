@@ -681,13 +681,13 @@ pub(crate) fn scripted_account_parts(
             crate::types::AuthPolicy::default(),
         )
     });
-    let bandwidth_cap = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let bandwidth_budget = bifrost_net::BandwidthBudget::default();
     let pool = Arc::new(super::Pool::new(
         Arc::clone(&config),
         conn,
         pool_cap,
         None,
-        Arc::clone(&bandwidth_cap),
+        bandwidth_budget.clone(),
     ));
     super::ImapAccountParts {
         config,
@@ -697,7 +697,7 @@ pub(crate) fn scripted_account_parts(
         qresync_enabled: false,
         qresync_negotiation_warning: None,
         supports_notify: false,
-        bandwidth_cap,
+        bandwidth_budget,
         contacts: None,
         calendars: None,
         dav_scopes: Default::default(),

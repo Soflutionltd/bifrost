@@ -128,6 +128,17 @@ impl BandwidthBudget {
             .cap
     }
 
+    /// Current policy epoch, advanced whenever the cap crosses unlimited.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .expect("bandwidth lock poisoned")
+            .policy
+            .epoch
+    }
+
     /// Change future admission pricing. Issued finite slots never move.
     /// Crossing unlimited invalidates queued grants and wakes their waiters.
     /// Setting the current cap is a no-op.
@@ -472,6 +483,29 @@ mod tests {
         assert_eq!(queued.granted(), 100);
         assert_eq!(queued.epoch(), epoch);
         assert!(queued.offer());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn current_epoch_tracks_unlimited_transitions_without_reserving() {
+        let budget = BandwidthBudget::new(Some(10));
+        let queued = budget.reserve(Inbound, 10);
+        assert_eq!(budget.epoch(), queued.epoch());
+        assert_eq!(budget.epoch(), 0);
+        budget.set_cap(Some(1));
+        assert_eq!(budget.epoch(), 0);
+        budget.set_cap(Some(1));
+        assert_eq!(budget.epoch(), 0);
+        let next = budget.reserve(Inbound, 1);
+        assert_eq!(next.id(), queued.id() + 1);
+        assert_eq!(next.ready_at(), Instant::now() + Duration::from_secs(1));
+        budget.set_cap(None);
+        assert_eq!(budget.epoch(), 1);
+        budget.set_cap(None);
+        assert_eq!(budget.epoch(), 1);
+        budget.set_cap(Some(1));
+        assert_eq!(budget.epoch(), 2);
+        assert_ne!(budget.epoch(), queued.epoch());
+        assert_eq!(budget.reserve(Inbound, 1).epoch(), budget.epoch());
     }
 
     #[tokio::test(start_paused = true)]

@@ -120,36 +120,54 @@ impl ImapAccountConfig {
     }
 }
 
+/// IMAP account factory sharing HTTP pools, host governors and account budgets.
+///
+/// Uses `Net::shared_default()` unless a transport is supplied with `with_net`.
+/// Every account leg resolves its budget from that transport's registry.
 pub struct ImapAccountFactory {
     cfg: Arc<ImapAccountConfig>,
+    net: Option<bifrost_net::Net>,
 }
 
 impl ImapAccountFactory {
     pub fn new(config: ImapAccountConfig) -> Self {
         Self {
             cfg: Arc::new(config),
+            net: None,
         }
     }
-}
 
-impl AccountFactory for ImapAccountFactory {
-    fn open(&self, account_id: AccountId) -> AccountFuture<Result<OpenedAccount, AccountError>> {
+    /// Reuse this transport for composed DAV and its registry for every leg.
+    /// Clones across opens retain the HTTP pool and per-host rate governor.
+    #[must_use]
+    pub fn with_net(mut self, net: bifrost_net::Net) -> Self {
+        self.net = Some(net);
+        self
+    }
+
+    fn resolve_net(&self, default: impl FnOnce() -> bifrost_net::Net) -> bifrost_net::Net {
+        self.net.clone().unwrap_or_else(default)
+    }
+
+    // Both seams replace external I/O in tests; selection and account open
+    // still run through the production path, including DAV discovery.
+    fn open_using(
+        &self,
+        account_id: AccountId,
+        default: impl FnOnce() -> bifrost_net::Net,
+        connect: impl FnOnce(
+            Arc<ImapAccountConfig>,
+            Option<bifrost_net::MeterSinkHandle>,
+            bifrost_net::BandwidthBudget,
+        ) -> AccountFuture<Result<crate::ImapConnection, crate::Error>>,
+    ) -> AccountFuture<Result<OpenedAccount, AccountError>> {
         let cfg = Arc::clone(&self.cfg);
+        let net = Arc::new(self.resolve_net(default));
+        let bandwidth_budget = net.bandwidth_registry().budget(account_id.clone());
+        let meter = meter_handle(&cfg, account_id.clone());
+        let connected = connect(Arc::clone(&cfg), meter.clone(), bandwidth_budget.clone());
         Box::pin(async move {
-            let bandwidth_cap = Arc::new(std::sync::atomic::AtomicU64::new(
-                super::UNLIMITED_BANDWIDTH,
-            ));
-            let meter = meter_handle(&cfg, account_id.clone());
-            let (conn, _auth) = cfg
-                .imap
-                .connect_authenticated_metered(
-                    &cfg.credentials,
-                    &cfg.auth_policy,
-                    meter.clone(),
-                    Some(Arc::clone(&bandwidth_cap)),
-                )
-                .await
-                .map_err(discover_err)?;
+            let conn = connected.await.map_err(discover_err)?;
 
             let mut profile = conn.server_profile();
             let server_id = read_server_id(&conn, &cfg, &profile)
@@ -185,15 +203,15 @@ impl AccountFactory for ImapAccountFactory {
             // the degradation and skipped-scope lanes stay deterministic - the
             // futures may finish in either order, the reporting may not.
             let (contacts, calendars) = futures::future::join(
-                open_carddav(&cfg, account_id.clone()),
-                open_caldav(&cfg, account_id.clone()),
+                open_carddav(&cfg, account_id.clone(), Arc::clone(&net)),
+                open_caldav(&cfg, account_id.clone(), Arc::clone(&net)),
             )
             .await;
             let contacts = contacts.into_attached(&mut dav_degraded, &mut skipped_scopes);
             let calendars = calendars.into_attached(&mut dav_degraded, &mut skipped_scopes);
             let contact_cursor_folders = dav_cursor_folders(contacts.as_ref()).await;
             let calendar_cursor_folders = dav_cursor_folders(calendars.as_ref()).await;
-            let submission = open_submission(&cfg, meter.clone(), Arc::clone(&bandwidth_cap))?;
+            let submission = open_submission(&cfg, meter.clone(), bandwidth_budget.clone())?;
             let caps = capabilities::build_capabilities(
                 &profile,
                 &folders,
@@ -224,7 +242,7 @@ impl AccountFactory for ImapAccountFactory {
                 conn,
                 data_cap,
                 meter,
-                Arc::clone(&bandwidth_cap),
+                bandwidth_budget.clone(),
             ));
             let account = ImapAccount::new(ImapAccountParts {
                 config: cfg,
@@ -234,7 +252,7 @@ impl AccountFactory for ImapAccountFactory {
                 qresync_enabled: qresync.enabled,
                 qresync_negotiation_warning: qresync.warning,
                 supports_notify: profile.supports_notify(),
-                bandwidth_cap,
+                bandwidth_budget,
                 contacts,
                 calendars,
                 dav_scopes,
@@ -246,6 +264,28 @@ impl AccountFactory for ImapAccountFactory {
                 skipped_scopes,
             })
         })
+    }
+}
+
+impl AccountFactory for ImapAccountFactory {
+    fn open(&self, account_id: AccountId) -> AccountFuture<Result<OpenedAccount, AccountError>> {
+        self.open_using(
+            account_id,
+            bifrost_net::Net::shared_default,
+            |cfg, meter, budget| {
+                Box::pin(async move {
+                    cfg.imap
+                        .connect_authenticated_metered(
+                            &cfg.credentials,
+                            &cfg.auth_policy,
+                            meter,
+                            Some(budget),
+                        )
+                        .await
+                        .map(|(conn, _auth)| conn)
+                })
+            },
+        )
     }
 }
 
@@ -392,12 +432,19 @@ fn classify_dav_open(
     }
 }
 
-async fn open_carddav(cfg: &ImapAccountConfig, account_id: AccountId) -> DavAttach {
+async fn open_carddav(
+    cfg: &ImapAccountConfig,
+    account_id: AccountId,
+    net: Arc<bifrost_net::Net>,
+) -> DavAttach {
     let Some(config) = cfg.carddav.clone() else {
         return DavAttach::None;
     };
     classify_dav_open(
-        CardDavAccountFactory::new(config).open(account_id).await,
+        CardDavAccountFactory::new(config)
+            .with_net(net)
+            .open(account_id)
+            .await,
         "CardDAV",
         bifrost_types::ErrorScope::ContactCollection,
     )
@@ -406,26 +453,30 @@ async fn open_carddav(cfg: &ImapAccountConfig, account_id: AccountId) -> DavAtta
 fn open_submission(
     cfg: &ImapAccountConfig,
     meter: Option<bifrost_net::MeterSinkHandle>,
-    bandwidth_cap: Arc<std::sync::atomic::AtomicU64>,
+    bandwidth_budget: bifrost_net::BandwidthBudget,
 ) -> Result<Option<Arc<SubmissionTransport>>, AccountError> {
     let Some(config) = &cfg.submission else {
         return Ok(None);
     };
-    // The submission transport shares the account's meter and cap atomic,
-    // so `set_bandwidth_cap` governs sends as well as fetches. Without
-    // this the cap is honoured on IMAP traffic and silently ignored on
-    // the upstream-heavy send path.
-    let transport = SubmissionTransport::build(config, &cfg.credentials, meter, bandwidth_cap)
+    // SMTP pools and every other account leg share this live budget.
+    let transport = SubmissionTransport::build(config, &cfg.credentials, meter, bandwidth_budget)
         .map_err(discover_err)?;
     Ok(Some(Arc::new(transport)))
 }
 
-async fn open_caldav(cfg: &ImapAccountConfig, account_id: AccountId) -> DavAttach {
+async fn open_caldav(
+    cfg: &ImapAccountConfig,
+    account_id: AccountId,
+    net: Arc<bifrost_net::Net>,
+) -> DavAttach {
     let Some(config) = cfg.caldav.clone() else {
         return DavAttach::None;
     };
     classify_dav_open(
-        CalDavAccountFactory::new(config).open(account_id).await,
+        CalDavAccountFactory::new(config)
+            .with_net(net)
+            .open(account_id)
+            .await,
         "CalDAV",
         bifrost_types::ErrorScope::CalendarCollection,
     )
@@ -763,6 +814,167 @@ pub(crate) async fn list_folders(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bandwidth_config(calendar: bool) -> ImapAccountConfig {
+        let mut cfg = ImapAccountConfig::new(
+            ImapConfig::plaintext("imap.invalid"),
+            Credentials::password("user", "pass"),
+            AuthPolicy::default(),
+        );
+        if calendar {
+            cfg.caldav = Some(CalDavConfig::new(
+                "https://dav.invalid",
+                bifrost_caldav::CalDavCredentials::Basic {
+                    username: "user".into(),
+                    password: "pass".into(),
+                },
+            ));
+        } else {
+            cfg.carddav = Some(CardDavConfig::new(
+                "https://dav.invalid",
+                bifrost_carddav::CardDavCredentials::Basic {
+                    username: "user".into(),
+                    password: "pass".into(),
+                },
+            ));
+        }
+        cfg
+    }
+
+    #[test]
+    fn bandwidth_factory_default_is_the_process_shared_net() {
+        let factory = ImapAccountFactory::new(bandwidth_config(false));
+        let first = factory.resolve_net(bifrost_net::Net::shared_default);
+        let next = factory.resolve_net(bifrost_net::Net::shared_default);
+        let shared = bifrost_net::Net::shared_default();
+        assert!(std::ptr::eq(first.governor(), shared.governor()));
+        assert!(std::ptr::eq(first.governor(), next.governor()));
+        assert!(Arc::ptr_eq(
+            first.bandwidth_registry(),
+            shared.bandwidth_registry()
+        ));
+        assert!(Arc::ptr_eq(
+            first.bandwidth_registry(),
+            next.bandwidth_registry()
+        ));
+    }
+
+    async fn bandwidth_connection(
+        budget: bifrost_net::BandwidthBudget,
+    ) -> Result<crate::ImapConnection, crate::Error> {
+        use crate::connection::test_support::{
+            driver_pair_metered, preauth_greeting, read_line, respond, tag_of,
+        };
+        let (conn, mut peer) = driver_pair_metered(&preauth_greeting("IMAP4rev1"), budget).await;
+        tokio::spawn(async move {
+            let command = read_line(&mut peer).await;
+            assert!(command.contains(" LIST "));
+            respond(
+                &mut peer,
+                &format!(
+                    "* LIST () \"/\" \"INBOX\"\r\n{} OK listed\r\n",
+                    tag_of(&command)
+                ),
+            )
+            .await;
+            let command = read_line(&mut peer).await;
+            assert!(command.contains("EXAMINE") || command.contains("SELECT"));
+            respond(&mut peer, &format!("* FLAGS (\\Seen)\r\n* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] valid\r\n{} OK selected\r\n", tag_of(&command))).await;
+            let command = read_line(&mut peer).await;
+            assert!(command.contains("UID FETCH"));
+            respond(
+                &mut peer,
+                &format!(
+                    "* 1 FETCH (UID 1 BODY[] {{4}}\r\ndata)\r\n{} OK fetched\r\n",
+                    tag_of(&command)
+                ),
+            )
+            .await;
+        });
+        Ok(conn)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bandwidth_factory_opens_reuse_net_and_share_dav_with_fetch() {
+        use bifrost_net::test_support::{ScriptedDispatch, canned, scripted_net};
+        use bifrost_net::{BandwidthDirection, NetConfig};
+        use futures::StreamExt;
+        use tokio::time::{Duration, Instant};
+        for injected in [false, true] {
+            for calendar in [false, true] {
+                let script = ScriptedDispatch::new(
+                    (0..2).map(|_| canned(401_u16.try_into().unwrap(), &[b'x'; 4096])),
+                );
+                let net = scripted_net(&script, NetConfig::default());
+                let factory = ImapAccountFactory::new(bandwidth_config(calendar));
+                let factory = if injected {
+                    factory.with_net(net.clone())
+                } else {
+                    factory
+                };
+                let id = AccountId(format!("composed-{injected}-{calendar}"));
+                let budget = net.bandwidth_registry().budget(id.clone());
+                budget.set_cap(Some(4096));
+                let mut accounts = Vec::new();
+                for incarnation in 0..2 {
+                    let selected = factory.resolve_net(|| net.clone());
+                    assert!(std::ptr::eq(selected.governor(), net.governor()));
+                    // Substitute the default provider only to keep HTTP scripted.
+                    // The separate default test pins the real shared singleton.
+                    let opened = factory
+                        .open_using(
+                            id.clone(),
+                            || {
+                                assert!(
+                                    !injected,
+                                    "injected opens must not resolve a new default Net"
+                                );
+                                net.clone()
+                            },
+                            |_, _, budget| Box::pin(bandwidth_connection(budget)),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(script.requests().len(), incarnation + 1);
+                    assert_eq!(opened.skipped_scopes.len(), 1);
+                    opened.account.set_bandwidth_cap(Some(4096));
+                    assert_eq!(budget.cap(), Some(4096));
+                    let start = Instant::now();
+                    let folder = crate::types::MailboxName::new("INBOX").unwrap();
+                    let mut fetch = opened
+                        .account
+                        .open_raw_rfc822(super::super::encode_object_id(&folder, 1, 1));
+                    let mut body = Vec::new();
+                    let mut done = false;
+                    while let Some(event) = fetch.next().await {
+                        match event {
+                            bifrost_types::SyncEvent::Batch(batch) => {
+                                for bytes in batch.items {
+                                    body.extend_from_slice(&bytes);
+                                }
+                            }
+                            bifrost_types::SyncEvent::Done(_) => done = true,
+                            other => panic!("unexpected fetch event: {other:?}"),
+                        }
+                    }
+                    assert!(done);
+                    assert_eq!(body, b"data");
+                    assert!(
+                        start.elapsed() >= Duration::from_secs(1),
+                        "DAV's full spent slot must delay IMAP fetch by a second"
+                    );
+                    let next = budget.reserve(BandwidthDirection::Inbound, 4096);
+                    assert!(
+                        next.ready_at() > Instant::now(),
+                        "FETCH must charge the same budget"
+                    );
+                    drop(next);
+                    accounts.push(opened);
+                }
+                assert_eq!(script.remaining(), 0);
+            }
+        }
+    }
 
     #[test]
     fn mailbox_owner_for_strips_delimiter() {

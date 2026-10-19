@@ -25,58 +25,6 @@ fn try_parse_literal_marker(buf: &[u8], crlf_pos: usize) -> Option<usize> {
 }
 
 #[test]
-fn byte_bucket_consume_future_is_send() {
-    fn assert_send<T: Send>(_: T) {}
-
-    assert_send(super::ByteBucket::new(Some(1)).consume(1, Some(1)));
-}
-
-/// A transfer bigger than one second of budget owes its whole duration.
-/// The 60 s value bounds a single timer, not the total: a 1 B/s cap fed a
-/// 16 KiB read must take 16384 virtual seconds, not 60.
-#[tokio::test(start_paused = true)]
-async fn byte_bucket_charges_the_full_budget_for_a_large_transfer() {
-    let bucket = super::ByteBucket::new(Some(1));
-    let start = tokio::time::Instant::now();
-
-    bucket.consume(16_384, Some(1)).await;
-
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed >= std::time::Duration::from_secs(16_384),
-        "a low cap must not be silently exceeded: slept only {elapsed:?}"
-    );
-    assert!(
-        elapsed < std::time::Duration::from_secs(16_386),
-        "the debt is want/cap, nothing more: slept {elapsed:?}"
-    );
-}
-
-/// Within one second of budget the bucket meters by deficit: a fresh bucket
-/// spends its full initial allowance without sleeping, and the next read
-/// waits exactly for the tokens it lacks.
-#[tokio::test(start_paused = true)]
-async fn byte_bucket_meters_the_deficit_under_a_paused_clock() {
-    let bucket = super::ByteBucket::new(Some(1024));
-    let start = tokio::time::Instant::now();
-
-    bucket.consume(1024, Some(1024)).await;
-    assert_eq!(
-        start.elapsed(),
-        std::time::Duration::ZERO,
-        "a full bucket answers without sleeping"
-    );
-
-    bucket.consume(512, Some(1024)).await;
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed >= std::time::Duration::from_millis(500)
-            && elapsed < std::time::Duration::from_millis(600),
-        "512 missing tokens at 1024 B/s are half a second: slept {elapsed:?}"
-    );
-}
-
-#[test]
 fn framing_no_crlf_is_incomplete() {
     assert!(!buffer_may_contain_complete_response(b""));
     assert!(!buffer_may_contain_complete_response(b"* 3 EXIST"));
@@ -474,4 +422,230 @@ async fn keepalive_and_peer_certificate_are_unavailable_on_memory_streams() {
         std::time::Duration::from_secs(1),
     );
     assert!(reader.set_keepalive(&ka).is_err());
+}
+
+fn bandwidth_reader(budget: bifrost_net::BandwidthBudget) -> (WireReader, tokio::io::DuplexStream) {
+    let (client, peer) = tokio::io::duplex(64);
+    (
+        WireReader::new_metered(
+            ImapStream::Memory(super::super::stream::Tracked::new(client)),
+            None,
+            Some(budget),
+        ),
+        peer,
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn bandwidth_reads_are_bounded_and_redial_keeps_the_schedule() {
+    use tokio::time::{Duration, Instant};
+    let budget = bifrost_net::BandwidthBudget::new(Some(4));
+    let (mut reader, mut peer) = bandwidth_reader(budget.clone());
+    peer.write_all(b"abcdefgh").await.unwrap();
+    assert_eq!(reader.read_admitted().await.unwrap(), 4);
+    assert_eq!(&reader.buf[..], b"abcd");
+    drop(reader);
+    let (mut redial, mut peer) = bandwidth_reader(budget);
+    peer.write_all(b"ijklmnop").await.unwrap();
+    let start = Instant::now();
+    assert_eq!(redial.read_admitted().await.unwrap(), 4);
+    assert_eq!(start.elapsed(), Duration::from_secs(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn bandwidth_pending_idle_read_does_not_hold_a_turn() {
+    use futures::FutureExt;
+    use tokio::time::{Duration, Instant};
+    let budget = bifrost_net::BandwidthBudget::new(Some(4));
+    let (mut idle, _silent_peer) = bandwidth_reader(budget.clone());
+    let mut pending = Box::pin(idle.read_one(false));
+    assert!((&mut pending).now_or_never().is_none());
+    let (mut active, mut peer) = bandwidth_reader(budget);
+    peer.write_all(b"abcd").await.unwrap();
+    let start = Instant::now();
+    assert_eq!(active.read_admitted().await.unwrap(), 4);
+    assert_eq!(start.elapsed(), Duration::from_secs(1));
+    assert!((&mut pending).now_or_never().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn bandwidth_peer_timeout_starts_after_admission() {
+    use tokio::time::{Duration, Instant};
+    let budget = bifrost_net::BandwidthBudget::new(Some(4));
+    budget
+        .admit(bifrost_net::BandwidthDirection::Inbound, 4)
+        .await
+        .finish(4);
+    let (mut reader, mut peer) = bandwidth_reader(budget);
+    reader.set_peer_timeout(Some(Duration::from_millis(10)));
+    peer.write_all(b"abcd").await.unwrap();
+    let start = Instant::now();
+    assert_eq!(reader.read_admitted().await.unwrap(), 4);
+    assert_eq!(start.elapsed(), Duration::from_secs(1));
+    assert!(matches!(
+        reader.read_admitted().await,
+        Err(Error::Timeout { .. })
+    ));
+    assert_eq!(start.elapsed(), Duration::from_millis(2010));
+}
+
+#[tokio::test(start_paused = true)]
+async fn bandwidth_short_writes_refund_only_the_tail() {
+    use bifrost_net::{BandwidthBudget, BandwidthDirection};
+    use futures::FutureExt;
+    use tokio::io::AsyncReadExt;
+    use tokio::time::{Duration, Instant};
+    for tail in [true, false] {
+        let budget = BandwidthBudget::new(Some(4));
+        let (mut client, mut peer) = tokio::io::duplex(1);
+        client.write_all(b"x").await.unwrap();
+        let mut reader = WireReader::new_metered(
+            ImapStream::Memory(super::super::stream::Tracked::new(client)),
+            None,
+            Some(budget.clone()),
+        );
+        let mut write = Box::pin(reader.write_admitted(b"abcd"));
+        assert!((&mut write).now_or_never().is_none());
+        let later = (!tail).then(|| budget.reserve(BandwidthDirection::Outbound, 4));
+        let mut byte = [0];
+        peer.read_exact(&mut byte).await.unwrap();
+        assert_eq!(write.await.unwrap(), 1);
+        let grant = budget.reserve(BandwidthDirection::Outbound, 4);
+        assert_eq!(
+            grant.ready_at().duration_since(Instant::now()),
+            if tail {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_secs(2)
+            }
+        );
+        peer.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte, [b'a']);
+        drop(grant);
+        drop(later);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn bandwidth_cancelled_offered_read_keeps_its_charge() {
+    use bifrost_net::{BandwidthBudget, BandwidthDirection};
+    use futures::FutureExt;
+    use tokio::time::{Duration, Instant};
+    let budget = BandwidthBudget::new(Some(4));
+    let (mut reader, _peer) = bandwidth_reader(budget.clone());
+    let mut read = Box::pin(reader.read_admitted());
+    assert!((&mut read).now_or_never().is_none());
+    drop(read);
+    let next = budget.reserve(BandwidthDirection::Inbound, 4);
+    assert_eq!(
+        next.ready_at().duration_since(Instant::now()),
+        Duration::from_secs(1)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn bandwidth_compress_preserves_the_budget_and_bounds_inflation() {
+    use super::super::stream::Tracked;
+    use super::super::{CompressedStream, InnerStream};
+    use tokio::time::{Duration, Instant};
+    let budget = bifrost_net::BandwidthBudget::new(Some(4));
+    let (mut reader, mut peer) = bandwidth_reader(budget);
+    peer.write_all(b"abcd").await.unwrap();
+    assert_eq!(reader.read_admitted().await.unwrap(), 4);
+    reader.take_buffer();
+    let metering = reader.metering();
+    let old = reader.into_stream();
+    let ImapStream::Memory(client) = old else {
+        panic!("memory stream")
+    };
+    let mut reader = WireReader::with_metering(
+        ImapStream::Compressed(CompressedStream::new(InnerStream::Memory(client))),
+        metering,
+    );
+    let mut peer = ImapStream::Compressed(CompressedStream::new(InnerStream::Memory(
+        Tracked::new(peer),
+    )));
+    peer.write_all(b"abcdefgh").await.unwrap();
+    let start = Instant::now();
+    assert_eq!(reader.read_admitted().await.unwrap(), 4);
+    assert_eq!(&reader.buf[..], b"abcd");
+    assert_eq!(reader.read_admitted().await.unwrap(), 4);
+    assert_eq!(&reader.buf[..], b"abcdefgh");
+    assert_eq!(start.elapsed(), Duration::from_secs(2));
+}
+
+#[tokio::test(start_paused = true)]
+async fn bandwidth_idle_session_allows_a_sibling_command_before_done() {
+    use crate::connection::test_support::{
+        driver_pair_metered, preauth_greeting, read_line, respond, tag_of,
+    };
+    use tokio::time::{Duration, Instant};
+    use tokio_util::sync::CancellationToken;
+    let budget = bifrost_net::BandwidthBudget::default();
+    let (idle_conn, mut idle_peer) =
+        driver_pair_metered(&preauth_greeting("IMAP4rev1 IDLE"), budget.clone()).await;
+    let (active_conn, mut active_peer) =
+        driver_pair_metered(&preauth_greeting("IMAP4rev1"), budget.clone()).await;
+    budget.set_cap(Some(64));
+    let cancel = CancellationToken::new();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let active = async {
+        start_rx.await.unwrap();
+        let start = Instant::now();
+        let result = active_conn.noop(Duration::from_secs(5)).await;
+        finished_tx.send(()).unwrap();
+        result.unwrap();
+        assert!(!start.elapsed().is_zero());
+        assert!(start.elapsed() < Duration::from_secs(2));
+    };
+    let script = async {
+        let command = read_line(&mut idle_peer).await;
+        assert!(command.contains(" IDLE"));
+        let idle_tag = tag_of(&command).to_owned();
+        respond(&mut idle_peer, "+ idling\r\n").await;
+        // Let the IDLE driver enter its silent, admitted peer read before
+        // issuing work on the other connection. Only virtual time advances.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        start_tx.send(()).unwrap();
+        let command = read_line(&mut active_peer).await;
+        respond(
+            &mut active_peer,
+            &format!("{} OK done\r\n", tag_of(&command)),
+        )
+        .await;
+        finished_rx.await.unwrap();
+        cancel.cancel();
+        assert_eq!(read_line(&mut idle_peer).await, "DONE\r\n");
+        respond(&mut idle_peer, &format!("{idle_tag} OK done\r\n")).await;
+    };
+    let (idle, (), ()) = tokio::join!(
+        idle_conn.idle(
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+            cancel.clone()
+        ),
+        active,
+        script
+    );
+    idle.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn bandwidth_cancelled_peer_io_keeps_its_spent_time() {
+    use tokio::time::{Duration, Instant};
+    let (mut reader, _peer) = bandwidth_reader(bifrost_net::BandwidthBudget::default());
+    reader.set_peer_timeout(Some(Duration::from_millis(100)));
+    let start = Instant::now();
+    let result =
+        super::super::lifecycle::setup_timeout(Duration::from_millis(30), reader.read_one(false))
+            .await;
+    assert!(matches!(result, Err(Error::Timeout { .. })));
+    assert_eq!(start.elapsed(), Duration::from_millis(30));
+    assert!(matches!(
+        reader.read_one(false).await,
+        Err(Error::Timeout { .. })
+    ));
+    assert_eq!(start.elapsed(), Duration::from_millis(100));
 }

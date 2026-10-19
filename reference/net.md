@@ -762,6 +762,22 @@ policy again. Installation and epoch validation use the same mutex. Setting an
 unchanged cap is a no-op, including its watch notification. All admission times
 use the Tokio clock.
 
+`MeteredStream<S>` wraps an `AsyncRead + AsyncWrite + Unpin` stream with a
+shared budget. Its read and write lanes each retain at most one admission
+future or offered reservation across Pending. Inner I/O receives at most the
+grant; success finishes with the actual byte count, including zero at EOF or
+a zero write. Short success refunds only the current tail. Errors and dropping
+an offered operation conservatively retain its charge. Flush and shutdown
+pass through. Uncapped admission returns immediately through the budget's
+existing fast path, without a timer wait.
+
+The boundary is above S: wrapping TLS meters plaintext, including framing
+above the wrapper. The JMAP WebSocket adapter therefore includes frame headers
+and the HTTP upgrade exchange, unlike HTTP body admission. No observation sink
+is attached by this adapter. It installs no peer timeout. Admission precedes
+polling inner I/O, so a timer implemented inside S starts after admission;
+a caller's timeout around the entire adapter includes admission waiting.
+
 `BandwidthRegistry` is an injected Arc-shared AccountId-to-Weak map. Lookup and
 insert share one lock. Inserts prune dead entries, and final budget teardown
 removes its own entry only if the pointer still matches, preserving any
@@ -1204,6 +1220,7 @@ crates/net/src/
   rate.rs         // RateLimitGovernor + HostBucket
   status_line.rs  // HTTP status-line parsing shared by the DAV crates
   test_support.rs // scripted wire dispatcher (feature "test-support")
+  metered_stream.rs // MeteredStream byte-stream admission
   budget.rs       // BandwidthBudget + BandwidthRegistry + Reservation
   upload.rs       // exact-sized outbound Body + admission-aware header clock
   bandwidth.rs    // BandwidthMeter + AccountMeter + MeterSink +

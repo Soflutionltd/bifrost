@@ -29,6 +29,7 @@ pub mod budget;
 pub mod concurrency;
 pub mod config;
 pub mod error;
+mod metered_stream;
 pub mod net;
 pub mod rate;
 pub mod redirect;
@@ -65,6 +66,7 @@ pub use concurrency::ConcurrencyLimit;
 pub use config::{DEFAULT_MAX_BUFFERED_RESPONSE, NetConfig};
 pub use error::{Error, FinalResponse, MalformedRedirectKind, RangeFailureKind, STATUS_BODY_CAP};
 pub use http::Method;
+pub use metered_stream::MeteredStream;
 pub use net::{AccountNet, AccountSpec, Net};
 pub use rate::{RateGeneration, RateLimit, RateLimitGovernor, RequestCost};
 pub use redirect::{

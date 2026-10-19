@@ -5,8 +5,6 @@ use std::{fmt::Debug, time::Duration};
 
 use bifrost_types::error::{AccountError, BatchItem, BatchOutcome};
 
-use std::sync::atomic::AtomicU64;
-
 use bifrost_net::MeterSinkHandle;
 
 use super::PoolConfig;
@@ -648,9 +646,9 @@ impl SmtpTransportBuilder {
     pub fn bandwidth_metering(
         mut self,
         sink: Option<MeterSinkHandle>,
-        bandwidth_cap: Option<Arc<AtomicU64>>,
+        budget: Option<bifrost_net::BandwidthBudget>,
     ) -> Self {
-        self.info.metering = WireMetering::new(sink, bandwidth_cap);
+        self.info.metering = WireMetering::new(sink, budget);
         self
     }
 
@@ -820,9 +818,9 @@ impl LmtpTransportBuilder {
     pub fn bandwidth_metering(
         mut self,
         sink: Option<MeterSinkHandle>,
-        bandwidth_cap: Option<Arc<AtomicU64>>,
+        budget: Option<bifrost_net::BandwidthBudget>,
     ) -> Self {
-        self.info.metering = WireMetering::new(sink, bandwidth_cap);
+        self.info.metering = WireMetering::new(sink, budget);
         self
     }
 

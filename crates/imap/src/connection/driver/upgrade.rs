@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use tracing::debug;
 
 use crate::error::Error;
@@ -121,15 +119,19 @@ pub(in crate::connection) async fn run_starttls_upgrade(
     // or the future is cancelled, wire_reader stays wrapping Poisoned
     // forever and the connection is dead (I9).
     let connector = tokio_native_tls::TlsConnector::from(tls_connector);
-    let tls_stream = match connector.connect(&server_name, tcp).await {
+    let peer_budget = wire_reader.peer_budget();
+    let handshake = super::super::wire::peer_io(peer_budget, async {
+        connector
+            .connect(&server_name, tcp)
+            .await
+            .map_err(std::io::Error::other)
+    });
+    let tls_stream = match handshake.await {
         Ok(s) => s,
-        Err(e) => {
+        Err(error) => {
             // TLS handshake failed; connection is dead (Poisoned stays).
             state.apply_infrastructure_failure();
-            return Err(Error::Io {
-                source: Arc::new(std::io::Error::other(e)),
-                attempt: None,
-            });
+            return Err(error);
         }
     };
 
@@ -181,10 +183,11 @@ async fn run_compress_upgrade(
     tag_gen: &mut super::super::tag::TagGenerator,
     event_sink: &mut event_sink::DriverEventSink,
 ) -> Result<(), Error> {
-    // Step 1: Send COMPRESS command, await tagged OK (RFC 4978 Section4).
+    // Defer the final inbound grant until the plaintext boundary is known.
+    wire_reader.begin_compress_boundary();
     let consumer =
         DriverConsumer::Regular(Box::new(TaggedOkConsumer::default()) as Box<dyn ConsumerErased>);
-    super::run_one_command(
+    let result = super::run_one_command(
         wire_reader,
         state,
         tag_gen,
@@ -192,13 +195,15 @@ async fn run_compress_upgrade(
         Command::Compress,
         consumer,
     )
-    .await?;
+    .await;
+    if let Err(error) = result {
+        wire_reader.finish_compress_boundary(0);
+        return Err(error);
+    }
 
-    // Step 2: Take remaining buffer bytes. They are compressed data
-    // that must be preserved in the new CompressedStream's raw read
-    // buffer (RFC 4978 Section3: server begins compressing immediately
-    // after the CRLF ending the tagged OK).
+    // The suffix is compressed framing, below the new admission boundary.
     let remaining = wire_reader.take_buffer();
+    wire_reader.finish_compress_boundary(remaining.len());
 
     // Step 3: Atomic swap with Poisoned sentinel.
     let metering = wire_reader.metering();
@@ -233,13 +238,7 @@ async fn run_compress_upgrade(
             ));
         }
         #[cfg(test)]
-        ImapStream::Memory(_) => {
-            state.apply_infrastructure_failure();
-            return Err(Error::internal_mid_exchange(
-                "COMPRESS=DEFLATE not supported on in-memory test streams",
-                bifrost_types::TransmissionState::Acknowledged,
-            ));
-        }
+        ImapStream::Memory(memory) => InnerStream::Memory(memory),
     };
 
     // Step 5: Build the CompressedStream and install.
@@ -308,4 +307,98 @@ pub(super) async fn logout_best_effort(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod bandwidth_review_tests {
+    use super::*;
+    use crate::connection::{
+        state::ProtocolState, stream::Tracked, tag::TagGenerator, wire::WireReader,
+    };
+    use bifrost_net::{BandwidthBudget, BandwidthDirection, MeterSink, MeterSinkHandle};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct Counter(AtomicU64);
+    impl MeterSink for Counter {
+        fn record_bytes_in(&self, _: &bifrost_types::AccountId, n: u64) {
+            self.0.fetch_add(n, Ordering::Relaxed);
+        }
+        fn record_bytes_out(&self, _: &bifrost_types::AccountId, _: u64) {}
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bandwidth_compress_coalesced_suffix_is_charged_only_as_plaintext() {
+        let budget = BandwidthBudget::new(Some(1024));
+        let counter = std::sync::Arc::new(Counter::default());
+        let sink = MeterSinkHandle::new(
+            std::sync::Arc::<Counter>::clone(&counter),
+            bifrost_types::AccountId("compress".into()),
+        );
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let mut reader = WireReader::new_metered(
+            ImapStream::Memory(Tracked::new(client)),
+            Some(sink),
+            Some(budget.clone()),
+        );
+        let mut state = ProtocolState::new();
+        let (_, crate::types::Response::Greeting(greeting)) = crate::codec::decode::parse_greeting(
+            b"* PREAUTH [CAPABILITY IMAP4rev1 COMPRESS=DEFLATE] ready\r\n",
+        )
+        .unwrap() else {
+            panic!("greeting")
+        };
+        state.apply_greeting(&greeting).unwrap();
+        let mut tags = TagGenerator::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut events = event_sink::DriverEventSink::new(tx, None);
+        let plaintext = b"* 1 EXISTS\r\n";
+        let mut compressor = flate2::Compress::new(flate2::Compression::default(), false);
+        let mut compressed = [0; 128];
+        compressor
+            .compress(plaintext, &mut compressed, flate2::FlushCompress::Sync)
+            .unwrap();
+        let compressed_len = usize::try_from(compressor.total_out()).unwrap();
+        let start = Instant::now();
+        let script = async {
+            let command = crate::connection::test_support::read_line(&mut peer).await;
+            let ok = format!(
+                "{} OK compressed\r\n",
+                crate::connection::test_support::tag_of(&command)
+            );
+            let mut coalesced = ok.as_bytes().to_vec();
+            coalesced.extend_from_slice(&compressed[..compressed_len]);
+            // One duplex write makes the tagged OK and suffix available in
+            // the same admitted read, whose grant is larger than both.
+            peer.write_all(&coalesced).await.unwrap();
+            ok.len()
+        };
+        let (result, ok_len) = tokio::join!(
+            run_compress_upgrade(&mut reader, &mut state, &mut tags, &mut events),
+            script
+        );
+        result.unwrap();
+        assert_eq!(
+            counter.0.load(Ordering::Relaxed),
+            u64::try_from(ok_len).unwrap()
+        );
+        reader.read_one(false).await.unwrap();
+        assert_eq!(
+            counter.0.load(Ordering::Relaxed),
+            u64::try_from(ok_len + plaintext.len()).unwrap()
+        );
+        let next = budget.reserve(BandwidthDirection::Inbound, 1024);
+        let charged = next.ready_at().duration_since(start);
+        let expected = Duration::from_nanos(
+            u64::try_from((ok_len + plaintext.len()) * 1_000_000_000)
+                .unwrap()
+                .div_ceil(1024),
+        );
+        assert!(
+            charged.abs_diff(expected) <= Duration::from_nanos(2),
+            "charged {charged:?}, expected {expected:?}"
+        );
+    }
 }

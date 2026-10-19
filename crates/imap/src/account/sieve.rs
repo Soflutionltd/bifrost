@@ -264,6 +264,7 @@ async fn open_client(
         &config,
         &account.config.credentials,
         &account.config.auth_policy,
+        account.bandwidth_budget.clone(),
     )
     .await
     .map_err(to_acct_err(op))
@@ -306,6 +307,7 @@ impl ManageSieveClient {
         config: &ManageSieveConfig,
         credentials: &Credentials,
         policy: &AuthPolicy,
+        budget: bifrost_net::BandwidthBudget,
     ) -> Result<Self, Error> {
         validate_tls_server_name(&config.host)?;
         let tcp = tokio::time::timeout(
@@ -314,11 +316,12 @@ impl ManageSieveClient {
         )
         .await
         .map_err(|_| Error::Timeout { attempt: None })??;
-        let mut stream = if config.tls_mode.uses_implicit_tls() {
-            SieveStream::Tls(Box::new(tls_connect(config, tcp).await?))
+        let transport = if config.tls_mode.uses_implicit_tls() {
+            SieveTransport::Tls(Box::new(tls_connect(config, tcp).await?))
         } else {
-            SieveStream::Plain(tcp)
+            SieveTransport::Plain(tcp)
         };
+        let mut stream = SieveStream { transport, budget };
         let mut capabilities = read_response(&mut stream, config.command_timeout)
             .await?
             .ensure_ok()?
@@ -333,11 +336,13 @@ impl ManageSieveClient {
             read_response(&mut stream, config.command_timeout)
                 .await?
                 .ensure_ok()?;
-            stream = match stream {
-                SieveStream::Plain(tcp) => {
-                    SieveStream::Tls(Box::new(tls_connect(config, tcp).await?))
+            stream.transport = match stream.transport {
+                SieveTransport::Plain(tcp) => {
+                    SieveTransport::Tls(Box::new(tls_connect(config, tcp).await?))
                 }
-                SieveStream::Tls(_) => {
+                #[cfg(test)]
+                SieveTransport::Memory(_) => unreachable!("memory streams cannot negotiate TLS"),
+                SieveTransport::Tls(_) => {
                     return Err(Error::Internal("STARTTLS on TLS stream".into()));
                 }
             };
@@ -598,12 +603,19 @@ fn validate_tls_server_name(host: &str) -> Result<(), Error> {
     Ok(())
 }
 
-enum SieveStream {
+struct SieveStream {
+    transport: SieveTransport,
+    budget: bifrost_net::BandwidthBudget,
+}
+
+enum SieveTransport {
     Plain(TcpStream),
+    #[cfg(test)]
+    Memory(tokio::io::DuplexStream),
     Tls(Box<tokio_native_tls::TlsStream<TcpStream>>),
 }
 
-impl AsyncRead for SieveStream {
+impl AsyncRead for SieveTransport {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -612,11 +624,13 @@ impl AsyncRead for SieveStream {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
             Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(test)]
+            Self::Memory(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
 
-impl AsyncWrite for SieveStream {
+impl AsyncWrite for SieveTransport {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -625,6 +639,8 @@ impl AsyncWrite for SieveStream {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
             Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(test)]
+            Self::Memory(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
@@ -632,6 +648,8 @@ impl AsyncWrite for SieveStream {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
             Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(test)]
+            Self::Memory(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
@@ -639,6 +657,8 @@ impl AsyncWrite for SieveStream {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
             Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(test)]
+            Self::Memory(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -648,6 +668,7 @@ async fn write_command(
     timeout: Duration,
     bytes: &[u8],
 ) -> Result<(), Error> {
+    let mut stream = bifrost_net::MeteredStream::new(&mut stream.transport, stream.budget.clone());
     tokio::time::timeout(timeout, async {
         stream.write_all(bytes).await?;
         stream.flush().await
@@ -676,38 +697,105 @@ async fn read_response(
     }
 }
 
+// This adapter sits below admission, so its timer exists only while peer I/O
+// is pending. A cap wait cannot consume the peer's response timeout.
+struct PeerReadTimeout<S> {
+    inner: S,
+    remaining: Duration,
+    pending_since: Option<tokio::time::Instant>,
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PeerReadTimeout<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        use std::future::Future;
+        if let Some(started) = self.pending_since.take() {
+            self.remaining = self.remaining.saturating_sub(started.elapsed());
+        }
+        if self.remaining.is_zero() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "ManageSieve peer read timed out",
+            )));
+        }
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(result) => {
+                self.timer = None;
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                let timeout = self.remaining;
+                self.pending_since = Some(tokio::time::Instant::now());
+                let timer = self
+                    .timer
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
+                if timer.as_mut().poll(cx).is_ready() {
+                    Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "ManageSieve peer read timed out",
+                    )))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
+fn metered_reader(
+    stream: &mut SieveStream,
+    timeout: Duration,
+) -> bifrost_net::MeteredStream<PeerReadTimeout<&mut SieveTransport>> {
+    bifrost_net::MeteredStream::new(
+        PeerReadTimeout {
+            inner: &mut stream.transport,
+            remaining: timeout,
+            pending_since: None,
+            timer: None,
+        },
+        stream.budget.clone(),
+    )
+}
+
+fn peer_read_error(error: std::io::Error) -> Error {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        Error::Timeout { attempt: None }
+    } else {
+        Error::from(error)
+    }
+}
+
 async fn read_line(stream: &mut SieveStream, timeout: Duration) -> Result<String, Error> {
-    tokio::time::timeout(timeout, async {
-        let mut buf = Vec::new();
-        let mut byte = [0_u8; 1];
-        loop {
-            stream.read_exact(&mut byte).await?;
-            buf.push(byte[0]);
-            if byte[0] == b'\n' {
-                break;
-            }
-            if buf.len() > 64 * 1024 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ManageSieve response line exceeded 64KiB",
-                ));
-            }
+    let mut stream = metered_reader(stream, timeout);
+    let mut buf = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        stream
+            .read_exact(&mut byte)
+            .await
+            .map_err(peer_read_error)?;
+        buf.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
         }
-        Ok(buf)
-    })
-    .await
-    .map_err(|_| Error::Timeout { attempt: None })?
-    .map_err(Error::from)
-    .and_then(|mut buf| {
-        if buf.ends_with(b"\n") {
-            buf.pop();
+        if buf.len() > 64 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ManageSieve response line exceeded 64KiB",
+            )
+            .into());
         }
-        if buf.ends_with(b"\r") {
-            buf.pop();
-        }
-        String::from_utf8(buf)
-            .map_err(|error| Error::Parse(format!("ManageSieve response is not UTF-8: {error}")))
-    })
+    }
+    buf.pop();
+    if buf.ends_with(b"\r") {
+        buf.pop();
+    }
+    String::from_utf8(buf)
+        .map_err(|error| Error::Parse(format!("ManageSieve response is not UTF-8: {error}")))
 }
 
 async fn read_exact_len(
@@ -715,14 +803,10 @@ async fn read_exact_len(
     timeout: Duration,
     len: usize,
 ) -> Result<Vec<u8>, Error> {
-    tokio::time::timeout(timeout, async {
-        let mut buf = vec![0_u8; len];
-        stream.read_exact(&mut buf).await?;
-        Ok::<Vec<u8>, std::io::Error>(buf)
-    })
-    .await
-    .map_err(|_| Error::Timeout { attempt: None })?
-    .map_err(Error::from)
+    let mut stream = metered_reader(stream, timeout);
+    let mut buf = vec![0_u8; len];
+    stream.read_exact(&mut buf).await.map_err(peer_read_error)?;
+    Ok(buf)
 }
 
 struct SieveResponse {
@@ -1021,6 +1105,82 @@ fn literal_command(command: &str, name: Option<&str>, body: &str) -> Result<Vec<
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn bandwidth_sieve_charges_the_account_and_excludes_admission_from_peer_timeout() {
+        use bifrost_net::{BandwidthBudget, BandwidthDirection};
+        use tokio::time::Instant;
+        let budget = BandwidthBudget::new(Some(4));
+        budget.admit(BandwidthDirection::Inbound, 4).await.finish(4);
+        let (client, mut peer) = tokio::io::duplex(64);
+        let mut stream = SieveStream {
+            transport: SieveTransport::Memory(client),
+            budget: budget.clone(),
+        };
+        peer.write_all(b"OK\r\n").await.unwrap();
+        let start = Instant::now();
+        assert_eq!(
+            read_line(&mut stream, Duration::from_millis(10))
+                .await
+                .unwrap(),
+            "OK"
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        let next = budget.reserve(BandwidthDirection::Inbound, 4);
+        assert_eq!(
+            next.ready_at().duration_since(Instant::now()),
+            Duration::from_secs(1)
+        );
+        write_command(&mut stream, Duration::from_secs(5), b"NOOP\r\n")
+            .await
+            .unwrap();
+        assert_eq!(start.elapsed(), Duration::from_millis(1500));
+        let next = budget.reserve(BandwidthDirection::Outbound, 4);
+        assert_eq!(
+            next.ready_at().duration_since(Instant::now()),
+            Duration::from_secs(1)
+        );
+    }
+
+    async fn sieve_trickle_case(literal: bool) {
+        use tokio::time::Instant;
+        let (client, mut peer) = tokio::io::duplex(64);
+        let mut stream = SieveStream {
+            transport: SieveTransport::Memory(client),
+            budget: bifrost_net::BandwidthBudget::default(),
+        };
+        let writer = tokio::spawn(async move {
+            for byte in b"OK\r\n" {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                if peer.write_all(&[*byte]).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let start = Instant::now();
+        let result = if literal {
+            read_exact_len(&mut stream, Duration::from_millis(100), 4)
+                .await
+                .map(|_| ())
+        } else {
+            read_line(&mut stream, Duration::from_millis(100))
+                .await
+                .map(|_| ())
+        };
+        assert!(matches!(result, Err(Error::Timeout { .. })));
+        assert_eq!(start.elapsed(), Duration::from_millis(100));
+        writer.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bandwidth_sieve_trickled_line_spends_one_peer_budget() {
+        sieve_trickle_case(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bandwidth_sieve_trickled_literal_spends_one_peer_budget() {
+        sieve_trickle_case(true).await;
+    }
+
     use super::*;
 
     fn no_status(line: &str) -> (Option<SieveResponseCode>, String) {

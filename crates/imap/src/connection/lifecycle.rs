@@ -58,7 +58,7 @@ impl ImapConnection {
         tls_connector: native_tls::TlsConnector,
         timeout: Duration,
         meter_sink: Option<bifrost_net::MeterSinkHandle>,
-        bandwidth_cap: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+        bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
     ) -> Result<Self, Error> {
         use super::dispatch::CapabilityConsumer;
         use super::driver;
@@ -102,7 +102,8 @@ impl ImapConnection {
         // The WireReader and ProtocolState live on the stack here. After
         // the greeting and capability fetch they are moved into the
         // driver task, which owns them for the rest of the connection.
-        let mut wire_reader = wire::WireReader::new_metered(stream, meter_sink, bandwidth_cap);
+        let mut wire_reader = wire::WireReader::new_metered(stream, meter_sink, bandwidth_budget);
+        wire_reader.set_peer_timeout(Some(timeout));
         let mut proto_state = state::ProtocolState::new();
         let mut tag_gen = tag::TagGenerator::new();
 
@@ -113,11 +114,8 @@ impl ImapConnection {
         // This MUST happen before wrapping events_tx in DriverEventSink
         // so we can send a greeting ALERT on the raw channel (emit() is
         // pub(in crate::connection::driver) and inaccessible from here).
-        let greeting = tokio::time::timeout(timeout, wire_reader.read_greeting())
+        let greeting = setup_timeout(timeout, wire_reader.read_greeting())
             .await
-            .map_err(|_| Error::Timeout {
-                attempt: Some(unsent),
-            })?
             .map_err(|e| e.with_attempt(TransmissionState::Unsent))?;
 
         let Response::Greeting(g) = &greeting else {
@@ -146,7 +144,8 @@ impl ImapConnection {
             let consumer = driver::DriverConsumer::Regular(
                 Box::new(CapabilityConsumer::default()) as Box<dyn driver::ConsumerErased>
             );
-            let result = tokio::time::timeout(
+            wire_reader.set_peer_timeout(Some(timeout));
+            let result = setup_timeout(
                 timeout,
                 driver::run_one_command(
                     &mut wire_reader,
@@ -157,10 +156,7 @@ impl ImapConnection {
                     consumer,
                 ),
             )
-            .await
-            .map_err(|_| Error::Timeout {
-                attempt: Some(unsent),
-            })??;
+            .await?;
 
             // Downcast the erased output back to Vec<Capability>.
             // CapabilityConsumer::Output is Vec<Capability>, so the downcast
@@ -194,7 +190,8 @@ impl ImapConnection {
 
             validate_tls_server_name(host)?;
 
-            tokio::time::timeout(
+            wire_reader.set_peer_timeout(Some(timeout));
+            setup_timeout(
                 timeout,
                 driver::run_starttls_upgrade(
                     &mut wire_reader,
@@ -205,11 +202,10 @@ impl ImapConnection {
                     host.to_owned(),
                 ),
             )
-            .await
-            .map_err(|_| Error::Timeout {
-                attempt: Some(unsent),
-            })??;
+            .await?;
         }
+
+        wire_reader.set_peer_timeout(None);
 
         // --- Spawn the driver task ---
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
@@ -395,5 +391,183 @@ impl ImapConnection {
         self.tls_active
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+}
+
+/// An absolute setup exchange deadline, including admission and unsolicited
+/// responses. Peer I/O independently spends the reader's cumulative allowance.
+pub(super) async fn setup_timeout<T>(
+    timeout: Duration,
+    exchange: impl std::future::Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    tokio::time::timeout_at(deadline, exchange)
+        .await
+        .map_err(|_| Error::Timeout { attempt: None })?
+}
+
+#[cfg(test)]
+mod bandwidth_review_tests {
+    use super::*;
+    use bifrost_net::{BandwidthBudget, BandwidthDirection};
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::Instant;
+
+    async fn setup_deadline_case(phase: usize) {
+        let budget = BandwidthBudget::new(Some(4));
+        budget
+            .admit(
+                if phase == 0 {
+                    BandwidthDirection::Inbound
+                } else {
+                    BandwidthDirection::Outbound
+                },
+                4,
+            )
+            .await
+            .finish(4);
+        let (client, mut peer) = tokio::io::duplex(128);
+        if phase == 0 {
+            peer.write_all(b"* OK hello\r\n").await.unwrap();
+        }
+        let mut reader = wire::WireReader::new_metered(
+            ImapStream::Memory(stream::Tracked::new(client)),
+            None,
+            Some(budget),
+        );
+        let mut state = state::ProtocolState::new();
+        let (_, Response::Greeting(greeting)) =
+            crate::codec::decode::parse_greeting(b"* OK [CAPABILITY IMAP4rev1 STARTTLS] hello\r\n")
+                .unwrap()
+        else {
+            panic!("greeting")
+        };
+        state.apply_greeting(&greeting).unwrap();
+        let mut tags = tag::TagGenerator::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut events = driver::event_sink::DriverEventSink::new(tx, None);
+        let timeout = Duration::from_millis(100);
+        reader.set_peer_timeout(Some(timeout));
+        let start = Instant::now();
+        let result = setup_timeout(timeout, async {
+            match phase {
+                0 => reader.read_greeting().await.map(|_| ()),
+                1 => driver::run_one_command(
+                    &mut reader,
+                    &mut state,
+                    &mut tags,
+                    &mut events,
+                    Command::Capability,
+                    driver::DriverConsumer::Regular(Box::new(
+                        dispatch::CapabilityConsumer::default(),
+                    )),
+                )
+                .await
+                .map(|_| ()),
+                _ => {
+                    driver::run_starttls_upgrade(
+                        &mut reader,
+                        &mut state,
+                        &mut tags,
+                        &mut events,
+                        build_default_tls_connector().unwrap(),
+                        "imap.invalid".into(),
+                    )
+                    .await
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(result, Err(Error::Timeout { .. })),
+            "phase {phase}: {result:?}"
+        );
+        assert_eq!(start.elapsed(), timeout, "phase {phase}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bandwidth_setup_greeting_deadline_includes_admission() {
+        setup_deadline_case(0).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bandwidth_setup_capability_deadline_includes_admission() {
+        setup_deadline_case(1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bandwidth_setup_starttls_deadline_includes_admission() {
+        setup_deadline_case(2).await;
+    }
+
+    async fn setup_peer_case(capability: bool) {
+        let (client, mut peer) = tokio::io::duplex(256);
+        let mut reader = wire::WireReader::new(ImapStream::Memory(stream::Tracked::new(client)));
+        reader.set_peer_timeout(Some(Duration::from_millis(100)));
+        let mut state = state::ProtocolState::new();
+        let (_, Response::Greeting(greeting)) =
+            crate::codec::decode::parse_greeting(b"* OK [CAPABILITY IMAP4rev1 STARTTLS] hello\r\n")
+                .unwrap()
+        else {
+            panic!("greeting")
+        };
+        state.apply_greeting(&greeting).unwrap();
+        let mut tags = tag::TagGenerator::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut events = driver::event_sink::DriverEventSink::new(tx, None);
+        let writer = tokio::spawn(async move {
+            if capability {
+                let command = test_support::read_line(&mut peer).await;
+                for _ in 0..4 {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    if peer.write_all(b"* OK still waiting\r\n").await.is_err() {
+                        return;
+                    }
+                }
+                let _ = peer
+                    .write_all(format!("{} OK done\r\n", test_support::tag_of(&command)).as_bytes())
+                    .await;
+            } else {
+                for byte in b"* OK hello\r\n" {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    if peer.write_all(&[*byte]).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        let start = Instant::now();
+        let result = setup_timeout(Duration::from_secs(1), async {
+            if capability {
+                driver::run_one_command(
+                    &mut reader,
+                    &mut state,
+                    &mut tags,
+                    &mut events,
+                    Command::Capability,
+                    driver::DriverConsumer::Regular(Box::new(
+                        dispatch::CapabilityConsumer::default(),
+                    )),
+                )
+                .await
+                .map(|_| ())
+            } else {
+                reader.read_greeting().await.map(|_| ())
+            }
+        })
+        .await;
+        assert!(matches!(result, Err(Error::Timeout { .. })));
+        assert_eq!(start.elapsed(), Duration::from_millis(100));
+        writer.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bandwidth_setup_trickled_greeting_spends_one_peer_budget() {
+        setup_peer_case(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bandwidth_setup_unsolicited_capability_spends_one_peer_budget() {
+        setup_peer_case(true).await;
     }
 }

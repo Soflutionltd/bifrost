@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use flate2::{Compress, Decompress, FlushCompress, FlushDecompress, Status};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -195,10 +195,15 @@ impl CompressedStream {
     // The u64->usize casts on total_in/total_out deltas are safe: each delta
     // is bounded by the buffer size (at most INFLATE_BUF_SIZE = 16 KiB).
     #[allow(clippy::cast_possible_truncation)]
-    async fn read_buf(&mut self, buf: &mut BytesMut) -> std::io::Result<usize> {
+    async fn read_buf_limited(
+        &mut self,
+        buf: &mut BytesMut,
+        limit: usize,
+    ) -> std::io::Result<usize> {
         loop {
-            // Try to inflate any data already in the raw buffer.
-            if !self.raw_read_buf.is_empty() {
+            // Inflate even with empty input: a bounded output offer can leave
+            // decoded bytes inside the inflater after it consumes all input.
+            {
                 let before_in = self.decompress.total_in();
                 let before_out = self.decompress.total_out();
 
@@ -206,7 +211,7 @@ impl CompressedStream {
                     .decompress
                     .decompress(
                         &self.raw_read_buf,
-                        &mut self.inflate_buf,
+                        &mut self.inflate_buf[..limit.min(INFLATE_BUF_SIZE)],
                         FlushDecompress::Sync,
                     )
                     .map_err(|e| {
@@ -380,17 +385,45 @@ impl ImapStream {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn read_buf(&mut self, buf: &mut BytesMut) -> std::io::Result<usize> {
+        self.read_buf_limited(buf, 8192).await
+    }
+
+    pub(super) async fn read_buf_limited(
+        &mut self,
+        buf: &mut BytesMut,
+        limit: usize,
+    ) -> std::io::Result<usize> {
+        buf.reserve(limit);
+        let mut bounded = (&mut *buf).limit(limit);
         match self {
-            Self::Plain(s) => s.read_buf(buf).await,
-            Self::Tls(s) => s.read_buf(buf).await,
-            Self::Compressed(s) => s.read_buf(buf).await,
+            Self::Plain(s) => s.read_buf(&mut bounded).await,
+            Self::Tls(s) => s.read_buf(&mut bounded).await,
+            Self::Compressed(s) => s.read_buf_limited(buf, limit).await,
             Self::Poisoned => Err(std::io::Error::other("stream poisoned during upgrade")),
             #[cfg(test)]
-            Self::Memory(s) => s.read_buf(buf).await,
+            Self::Memory(s) => s.read_buf(&mut bounded).await,
         }
     }
 
+    pub(super) async fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.write(data).await,
+            Self::Tls(s) => s.write(data).await,
+            // COMPRESS drains the bounded plaintext offer, including its sync
+            // flush, before reporting success. Errors retain the whole grant.
+            Self::Compressed(s) => {
+                s.write_all(data).await?;
+                Ok(data.len())
+            }
+            Self::Poisoned => Err(std::io::Error::other("stream poisoned during upgrade")),
+            #[cfg(test)]
+            Self::Memory(s) => s.write(data).await,
+        }
+    }
+
+    #[cfg(test)]
     pub(super) async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
         match self {
             Self::Plain(s) => s.write_all(data).await,

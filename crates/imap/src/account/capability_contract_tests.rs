@@ -94,7 +94,7 @@ async fn account_with_submission() -> ImapAccount {
             &submission_config,
             &Credentials::password("user", "pass"),
             None,
-            Arc::clone(&parts.bandwidth_cap),
+            parts.bandwidth_budget.clone(),
         )
         .expect("a plaintext relay transport builds without I/O"),
     );

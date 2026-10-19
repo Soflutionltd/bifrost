@@ -81,9 +81,17 @@ impl CalDavClient {
         self.dav.move_resource(from, to, operation).await
     }
 
-    pub(crate) fn new(account_id: AccountId, config: &CalDavConfig) -> Self {
+    pub(crate) fn new_on_net(
+        account_id: AccountId,
+        config: &CalDavConfig,
+        net: Option<&bifrost_net::Net>,
+    ) -> Self {
+        let net = net
+            .cloned()
+            .unwrap_or_else(bifrost_net::Net::shared_default);
         Self {
-            dav: DavDispatch::new(
+            dav: DavDispatch::on_net(
+                &net,
                 account_id,
                 &config.base_url,
                 config.credentials.to_shared(),

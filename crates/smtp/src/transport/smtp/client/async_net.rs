@@ -17,16 +17,16 @@ use std::{
 // deadline and the timers it hands out must read the same clock.
 use tokio::time::Instant;
 
+use bifrost_net::BandwidthDirection;
 use std::fmt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(unix)]
 use tokio::net::UnixStream as TokioUnixStream;
 use tokio::net::{TcpSocket, TcpStream, ToSocketAddrs};
-use tokio::time::Sleep;
 use tokio_native_tls::TlsStream as TokioTlsStream;
 
 use super::DEFAULT_TLS_HANDSHAKE_TIMEOUT;
-use super::metering::{MAX_OFFER, Reservation, WireMetering};
+use super::metering::{Reservation, WireMetering};
 use super::net::resolved_address_filter;
 use super::{ConnectionState, TlsParameters};
 use crate::transport::smtp::{Error, error};
@@ -56,41 +56,21 @@ impl AsyncDeadline {
             .map(Some)
     }
 
-    /// Push the deadline out by `by`, leaving an unbounded deadline unbounded.
-    ///
-    /// The one legitimate use is excluding time this crate spent deliberately
-    /// NOT touching the socket - bandwidth-throttle debt - from a deadline
-    /// whose whole job is to judge the PEER. It must never be applied to the
-    /// shared SETUP deadline, which is an absolute ceiling: postponing that
-    /// one does not spend it, it overruns it.
-    pub(super) fn postponed_by(self, by: Duration) -> Self {
-        Self {
-            expires_at: self.expires_at.map(|expires_at| expires_at + by),
-        }
-    }
-
-    /// An unbounded deadline becomes a fresh one of `default`; a bounded one is
-    /// returned untouched.
-    ///
-    /// For the one operation that must never hang whatever the caller asked
-    /// for. Substituting only in the unbounded case is what keeps this from
-    /// nesting a timer inside another: a bounded deadline already IS the timer
-    /// governing the operation and is used as it stands, while an unbounded one
-    /// has no timer to nest in.
     pub(super) fn or_bounded(self, default: Duration) -> Self {
-        match self.expires_at {
-            Some(_) => self,
-            None => Self::new(Some(default)),
+        if self.expires_at.is_some() {
+            self
+        } else {
+            Self::new(Some(default))
         }
     }
-
-    async fn timeout<T, F>(self, message: &'static str, future: F) -> Result<T, Error>
-    where
-        F: Future<Output = T>,
-    {
+    async fn timeout<T, F: Future<Output = T>>(
+        self,
+        message: &'static str,
+        future: F,
+    ) -> Result<T, Error> {
         match self.remaining(message)? {
             None => Ok(future.await),
-            Some(timeout) => tokio::time::timeout(timeout, future)
+            Some(duration) => tokio::time::timeout(duration, future)
                 .await
                 .map_err(|_| error::timeout(message)),
         }
@@ -125,43 +105,14 @@ pub(crate) struct AsyncNetworkStream {
     /// Byte accounting and cap for this connection. `disabled()` unless
     /// an account wired one in, so the non-account path is unchanged.
     metering: WireMetering,
-    /// Outstanding inbound throttle debt. Polled to completion before the
-    /// next read touches the socket, and never consulted by a write.
-    ///
-    /// Held here rather than awaited inline because both the read and
-    /// write funnels are `poll_` methods that cannot await. Parking the
-    /// sleep in the stream means a throttled connection yields to the
-    /// runtime like any other pending IO instead of blocking the task.
-    ///
-    /// Inbound and outbound debt are separate slots on purpose: the meter
-    /// already keeps separate buckets, and a single shared slot silently
-    /// undid that, because the debt parked by the last DATA-body write
-    /// gated the read of the server's reply to it. That spends the caller's
-    /// per-operation read timeout on outbound debt. See "Bandwidth metering
-    /// and throttling" in `reference/smtp.md`.
-    throttle_in: Option<Pin<Box<Sleep>>>,
-    /// Bytes this stream is admitted to write under the outbound cap and has
-    /// not written yet. Installed by `admit_outbound` (or by `poll_write`
-    /// itself for a caller that did not admit first), spent by accepted bytes,
-    /// and never re-gated on the shared schedule: once admitted, a write only
-    /// waits on its socket. Survives short writes; the funnel admits at most
-    /// what the current write has left, so a successful write leaves none.
-    out_allowance: Option<usize>,
-    /// Length of the last offer that returned `Pending`, which the next poll
-    /// must offer again. OpenSSL refuses a retry after `WANT_WRITE` that is
-    /// shorter than the pending write, so neither a retune nor the allowance
-    /// may shrink it. Cleared once the socket answers.
+    /// Offered inbound grant retained across pending reads. Direction lanes
+    /// hold at most one pending admission or offered grant each.
+    in_grant: Option<Reservation>,
+    out_grant: Option<Reservation>,
+    in_admission: Option<Admission>,
+    out_admission: Option<Admission>,
+    /// Pending TLS writes must be retried with their original offered length.
     retry_len: Option<usize>,
-    /// `admit_outbound` found no cap in force for the write about to happen,
-    /// so its next offer goes out uncharged even if a cap is imposed before
-    /// the socket is polled. Without this, a cap appearing between admission
-    /// and the timed write would make `poll_write` reserve and WAIT inside the
-    /// caller's write timeout.
-    uncapped_pass: bool,
-    /// Admission `poll_write` is waiting on for a caller that wrote without
-    /// `admit_outbound` first. The production funnel never gets here; the wait
-    /// it imposes runs inside whatever timer the caller wrapped the write in.
-    self_admission: Option<(Reservation, Pin<Box<Sleep>>)>,
     /// Test-injected peer-certificate DER, returned by
     /// [`Self::peer_certificate_der`] ahead of the TLS session's. The
     /// transcript harness is an in-memory duplex with no TLS, so without this
@@ -170,6 +121,14 @@ pub(crate) struct AsyncNetworkStream {
     /// would be untestable in both directions.
     #[cfg(test)]
     test_peer_certificate_der: Option<Vec<u8>>,
+}
+
+struct Admission(Pin<Box<dyn Future<Output = Reservation> + Send + Sync>>);
+
+impl fmt::Debug for Admission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Admission")
+    }
 }
 
 pub(crate) trait AsyncTokioStream:
@@ -219,11 +178,11 @@ impl AsyncNetworkStream {
             inner,
             state: ConnectionState::Ok,
             metering: WireMetering::disabled(),
-            throttle_in: None,
-            out_allowance: None,
+            in_grant: None,
+            out_grant: None,
+            in_admission: None,
+            out_admission: None,
             retry_len: None,
-            uncapped_pass: false,
-            self_admission: None,
             #[cfg(test)]
             test_peer_certificate_der: None,
         }
@@ -231,161 +190,42 @@ impl AsyncNetworkStream {
 
     /// Install byte accounting / capping for this connection. Called by
     /// the transport when an account supplied a meter sink or cap.
-    pub(super) fn set_metering(&mut self, metering: WireMetering) {
+    pub(crate) fn set_metering(&mut self, metering: WireMetering) {
         self.metering = metering;
     }
 
-    /// Wait out any inbound throttle debt owed from the previous read.
-    ///
-    /// Returns `Pending` while the debt is outstanding, which parks the
-    /// caller the same way a not-yet-readable socket would.
-    fn poll_throttle_in(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if let Some(delay) = &mut self.throttle_in {
-            std::task::ready!(delay.as_mut().poll(cx));
-            self.throttle_in = None;
-        }
-        Poll::Ready(())
-    }
-
-    /// Admit the next write of up to `len` bytes against the shared outbound
-    /// schedule, waiting for its slot.
-    ///
-    /// This is the half of a capped write that is this crate's OWN doing - the
-    /// cap the consumer asked for - and the caller's per-operation write
-    /// timeout is a statement about the PEER, so the write loop runs this
-    /// BEFORE it arms that timeout. Once it returns the stream holds an
-    /// allowance, and `poll_write` spends it without consulting the schedule
-    /// again: no throttle wait can happen inside the timer, and a peer that
-    /// never accepts a byte always reaches its timeout.
-    ///
-    /// Unbounded on purpose: the CALLER decides what the wait may run outside.
-    /// A per-operation write timeout may be left entirely; an absolute setup
-    /// deadline may not, since waiting past a ceiling is not the same as
-    /// spending it. `write_stream_with_budget` makes that choice per budget.
-    /// The wait itself is bounded by the reservations ahead of this one: about
-    /// a second per live connection sharing the schedule, plus one.
-    ///
-    /// Waits in slices of at most a second and re-reads the cap after each,
-    /// so a cap lifted mid-wait releases the write within a second.
-    ///
-    /// Cancel-safe: the reservation lives in this future and gives its time
-    /// back when dropped, and the stream is not touched until the allowance is
-    /// installed.
+    /// Admission completes before the caller arms a peer I/O timer.
     pub(super) async fn admit_outbound(&mut self, len: usize) {
-        if self.retry_len.is_some() || self.out_allowance.is_some() {
-            return;
-        }
-        let Some(reservation) = self.metering.reserve_out(len) else {
-            self.uncapped_pass = true;
-            return;
+        std::future::poll_fn(|cx| self.poll_admission(cx, BandwidthDirection::Outbound, len)).await;
+    }
+
+    pub(super) async fn admit_inbound(&mut self, len: usize) {
+        std::future::poll_fn(|cx| self.poll_admission(cx, BandwidthDirection::Inbound, len)).await;
+    }
+
+    fn poll_admission(
+        &mut self,
+        cx: &mut Context<'_>,
+        direction: BandwidthDirection,
+        len: usize,
+    ) -> Poll<()> {
+        let (grant, pending) = match direction {
+            BandwidthDirection::Inbound => (&mut self.in_grant, &mut self.in_admission),
+            BandwidthDirection::Outbound => (&mut self.out_grant, &mut self.out_admission),
+            _ => unreachable!("unknown bandwidth direction"),
         };
-        loop {
-            let Some(cap) = self.metering.cap_now() else {
-                drop(reservation);
-                self.uncapped_pass = true;
-                return;
-            };
-            let now = Instant::now();
-            if now >= reservation.ready_at() {
-                self.out_allowance = Some(reservation.install(cap));
-                return;
-            }
-            tokio::time::sleep((reservation.ready_at() - now).min(Duration::from_secs(1))).await;
+        if grant.is_some() {
+            return Poll::Ready(());
         }
-    }
-
-    /// How many bytes the next socket write may offer out of `len`, or
-    /// `Pending` while a self-admitted write waits for its slot.
-    fn poll_outbound_offer(&mut self, cx: &mut Context<'_>, len: usize) -> Poll<usize> {
-        if let Some(retry) = self.retry_len {
-            return Poll::Ready(len.min(retry));
-        }
-        if let Some(allowance) = self.out_allowance {
-            return Poll::Ready(len.min(allowance).min(MAX_OFFER));
-        }
-        if self.uncapped_pass {
-            return Poll::Ready(len.min(MAX_OFFER));
-        }
-        loop {
-            let Some((reservation, sleep)) = &mut self.self_admission else {
-                let Some(reservation) = self.metering.reserve_out(len) else {
-                    return Poll::Ready(len.min(MAX_OFFER));
-                };
-                let wake = reservation
-                    .ready_at()
-                    .min(Instant::now() + Duration::from_secs(1));
-                self.self_admission = Some((reservation, Box::pin(tokio::time::sleep_until(wake))));
-                continue;
-            };
-            std::task::ready!(sleep.as_mut().poll(cx));
-            let Some(cap) = self.metering.cap_now() else {
-                self.self_admission = None;
-                return Poll::Ready(len.min(MAX_OFFER));
-            };
-            let now = Instant::now();
-            if now < reservation.ready_at() {
-                let wake = reservation.ready_at().min(now + Duration::from_secs(1));
-                sleep.as_mut().reset(wake);
-                continue;
-            }
-            let Some((reservation, _)) = self.self_admission.take() else {
-                unreachable!("matched just above");
-            };
-            let allowance = reservation.install(cap);
-            self.out_allowance = Some(allowance);
-            return Poll::Ready(len.min(allowance));
-        }
-    }
-
-    /// Await any inbound throttle debt parked by an earlier read, and report
-    /// how long that took.
-    ///
-    /// The read-side counterpart of `admit_outbound`, and it exists for the
-    /// same reason: the debt is the cap the CONSUMER asked for, while the read
-    /// deadline is a statement about the PEER. It differs in what the caller
-    /// does with the answer. A per-operation write timeout is a fresh duration
-    /// per write, so the write loop simply waits for admission outside it; a
-    /// reply read has
-    /// no such thing, because the per-operation budget has been collapsed into
-    /// one deadline spanning the whole reply precisely so a trickling peer
-    /// cannot stretch it. There is no "outside" a deadline - only past it - so
-    /// the reader pushes the reply deadline out by the returned duration
-    /// instead, which leaves the peer exactly the patience it was configured
-    /// with and charges our own waiting to neither side.
-    ///
-    /// Cancel-safe for the same reason: a dropped future leaves the `Sleep`
-    /// parked in its slot, so the debt is neither lost nor double-counted. The
-    /// elapsed measurement is on `tokio::time::Instant`, the clock the `Sleep`
-    /// itself runs on.
-    pub(super) async fn drain_inbound_throttle(&mut self) -> Duration {
-        if self.throttle_in.is_none() {
-            return Duration::ZERO;
-        }
-        let started = Instant::now();
-        std::future::poll_fn(|cx| self.poll_throttle_in(cx)).await;
-        started.elapsed()
-    }
-
-    /// Record `n` received bytes and park the resulting inbound debt, if any.
-    ///
-    /// `n` is PLAINTEXT bytes, never ciphertext, in both directions, and the
-    /// gap is not always negligible. This stream sits above native-tls, so the
-    /// record header, MAC and padding the TLS layer adds are invisible here.
-    /// Each capped outbound write is at most one second of cap and typically
-    /// becomes its own TLS record, so the bytes actually on the wire exceed the
-    /// cap by roughly one record's overhead (tens of bytes) per second of cap:
-    /// immaterial at a megabyte, around a third at a 100 B/s cap - the smaller
-    /// the cap, the worse the ratio. Metering real wire bytes would mean putting
-    /// this meter BELOW the TLS layer, which native-tls does not expose, so the
-    /// gap is recorded rather than closed. A consumer sizing a cap against a
-    /// hard link budget should leave headroom for it.
-    fn charge_in(&mut self, n: usize) {
-        if n == 0 || !self.metering.is_enabled() {
-            return;
-        }
-        if let Some(debt) = self.metering.record_in(n) {
-            self.throttle_in = Some(Box::pin(tokio::time::sleep(debt)));
-        }
+        let admission = pending.get_or_insert_with(|| {
+            let metering = self.metering.clone();
+            Admission(Box::pin(
+                async move { metering.admit(direction, len).await },
+            ))
+        });
+        *grant = Some(std::task::ready!(admission.0.as_mut().poll(cx)));
+        *pending = None;
+        Poll::Ready(())
     }
 
     /// Inject a peer-certificate DER for tests. See the field's comment.
@@ -605,22 +445,38 @@ impl AsyncRead for AsyncNetworkStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {
         let this = self.as_mut().get_mut();
-        std::task::ready!(this.poll_throttle_in(cx));
-        let before = buf.filled().len();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        std::task::ready!(this.poll_admission(cx, BandwidthDirection::Inbound, buf.remaining()));
+        let size = this
+            .in_grant
+            .as_ref()
+            .expect("admitted read")
+            .granted()
+            .min(buf.remaining());
+        let mut limited = ReadBuf::new(buf.initialize_unfilled_to(size));
+        let buf_for_peer = &mut limited;
         let result = match &mut this.inner {
-            InnerAsyncNetworkStream::TokioTcp(s) => Pin::new(s).poll_read(cx, buf),
+            InnerAsyncNetworkStream::TokioTcp(s) => Pin::new(s).poll_read(cx, buf_for_peer),
             #[cfg(unix)]
-            InnerAsyncNetworkStream::TokioUnix(s) => Pin::new(s).poll_read(cx, buf),
-            InnerAsyncNetworkStream::TokioNativeTls(s) => Pin::new(s).poll_read(cx, buf),
+            InnerAsyncNetworkStream::TokioUnix(s) => Pin::new(s).poll_read(cx, buf_for_peer),
+            InnerAsyncNetworkStream::TokioNativeTls(s) => Pin::new(s).poll_read(cx, buf_for_peer),
             #[cfg(test)]
-            InnerAsyncNetworkStream::Transcript(s) => Pin::new(s).poll_read(cx, buf),
+            InnerAsyncNetworkStream::Transcript(s) => Pin::new(s).poll_read(cx, buf_for_peer),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Poll::Ready(Ok(()))
             }
         };
-        if matches!(result, Poll::Ready(Ok(()))) {
-            this.charge_in(buf.filled().len().saturating_sub(before));
+        if let Poll::Ready(outcome) = &result {
+            let grant = this.in_grant.take().expect("admitted read");
+            if outcome.is_ok() {
+                let n = limited.filled().len();
+                buf.advance(n);
+                grant.finish(n);
+                this.metering.record_in(n);
+            }
         }
         result
     }
@@ -633,10 +489,17 @@ impl AsyncWrite for AsyncNetworkStream {
         buf: &[u8],
     ) -> Poll<IoResult<usize>> {
         let this = self.as_mut().get_mut();
-        // The offer is the admitted allowance (at most one second of cap), a
-        // pending TLS retry's original length, or `MAX_OFFER` when uncapped.
-        // A caller that did not `admit_outbound` first is admitted here.
-        let offer = std::task::ready!(this.poll_outbound_offer(cx, buf.len()));
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        std::task::ready!(this.poll_admission(cx, BandwidthDirection::Outbound, buf.len()));
+        let offer = this.retry_len.unwrap_or_else(|| {
+            this.out_grant
+                .as_ref()
+                .expect("admitted write")
+                .granted()
+                .min(buf.len())
+        });
         let buf = &buf[..offer];
         let result = match &mut this.inner {
             InnerAsyncNetworkStream::TokioTcp(s) => Pin::new(s).poll_write(cx, buf),
@@ -651,25 +514,18 @@ impl AsyncWrite for AsyncNetworkStream {
             }
         };
         match &result {
-            // The allowance is spent by what the socket ACCEPTED: a short
-            // write leaves the rest admitted for the next offer.
             Poll::Ready(Ok(n)) => {
                 this.retry_len = None;
-                this.uncapped_pass = false;
-                if let Some(allowance) = this.out_allowance {
-                    let left = allowance.saturating_sub(*n);
-                    this.out_allowance = (left > 0).then_some(left);
-                }
-                if *n > 0 {
-                    this.metering.record_out(*n);
-                }
+                this.out_grant.take().expect("admitted write").finish(*n);
+                this.metering.record_out(*n);
             }
             Poll::Pending => this.retry_len = Some(offer),
             Poll::Ready(Err(_)) => {
                 this.retry_len = None;
-                this.uncapped_pass = false;
+                this.out_grant = None;
             }
         }
+
         result
     }
 
@@ -737,8 +593,6 @@ mod tokio_test {
     /// the outbound schedule is a second behind.
     #[tokio::test(crate = "tokio", start_paused = true)]
     async fn an_outbound_backlog_does_not_gate_the_next_read() {
-        use std::sync::{Arc, atomic::AtomicU64};
-
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         use crate::transport::smtp::client::metering::WireMetering;
@@ -746,21 +600,21 @@ mod tokio_test {
 
         // Six bytes per second, which is exactly one `PING` line: the write
         // spends the schedule's whole second of credit.
-        let cap = Arc::new(AtomicU64::new(6));
+        let cap = bifrost_net::BandwidthBudget::new(Some(6));
         let metering = WireMetering::new(None, Some(cap));
         let transcript = Transcript::new("").expect("PING\r\n", "250 pong\r\n");
         let mut stream = AsyncNetworkStream::from_transcript(transcript);
         stream.set_metering(metering.clone());
 
         stream.write_all(b"PING\r\n").await.unwrap();
-        let next_write = metering.reserve_out(6).expect("capped");
+        let next_write = metering.reserve_out(6);
         assert!(
-            !next_write.remaining().is_zero(),
+            next_write.ready_at() > Instant::now(),
             "the outbound schedule must be behind for this test to mean anything"
         );
         drop(next_write);
         assert!(
-            stream.throttle_in.is_none(),
+            stream.in_grant.is_none(),
             "an outbound write must not park inbound debt"
         );
 
@@ -774,7 +628,26 @@ mod tokio_test {
         let Poll::Ready(Ok(n)) = polled else {
             panic!("the reply read was gated on outbound throttling: {polled:?}");
         };
-        assert_eq!(&buf[..n], b"250 pong\r\n");
+        assert_eq!(&buf[..n], b"250 po");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_connection_first_read_waits_for_shared_inbound_reservations() {
+        use crate::transport::smtp::test_support::Transcript;
+        use bifrost_net::{BandwidthBudget, BandwidthDirection};
+        use tokio::io::AsyncReadExt;
+
+        let budget = BandwidthBudget::new(Some(10));
+        let mut first = budget.reserve(BandwidthDirection::Inbound, 10);
+        assert!(first.offer());
+        first.finish(10);
+        let _sibling = budget.reserve(BandwidthDirection::Inbound, 10);
+        let mut stream = AsyncNetworkStream::from_transcript(Transcript::new("250 ready\r\n"));
+        stream.set_metering(WireMetering::new(None, Some(budget)));
+        let mut buf = [0; 100];
+        let read = stream.read(&mut buf);
+        assert_eq!(assert_held_for(read, Duration::from_secs(2)).await, 10);
+        assert_eq!(&buf[..10], b"250 ready\r");
     }
 
     /// Drive `write` until it has waited `held` without reaching the socket,
@@ -812,14 +685,12 @@ mod tokio_test {
     /// waits its turn on the same stream.
     #[tokio::test(crate = "tokio", start_paused = true)]
     async fn the_next_write_waits_for_its_slot() {
-        use std::sync::{Arc, atomic::AtomicU64};
-
         use tokio::io::AsyncWriteExt;
 
         use crate::transport::smtp::client::metering::WireMetering;
         use crate::transport::smtp::test_support::SlowSinkPeer;
 
-        let cap = Arc::new(AtomicU64::new(1000));
+        let cap = bifrost_net::BandwidthBudget::new(Some(1000));
         let mut stream = AsyncNetworkStream::from_raw_stream_for_test(Box::new(SlowSinkPeer::new(
             usize::MAX,
             Duration::ZERO,
@@ -843,14 +714,12 @@ mod tokio_test {
     /// the second stream's very first write must queue behind the first's.
     #[tokio::test(crate = "tokio", start_paused = true)]
     async fn a_second_connection_cannot_spend_the_first_connections_budget() {
-        use std::sync::{Arc, atomic::AtomicU64};
-
         use tokio::io::AsyncWriteExt;
 
         use crate::transport::smtp::client::metering::WireMetering;
         use crate::transport::smtp::test_support::SlowSinkPeer;
 
-        let metering = WireMetering::new(None, Some(Arc::new(AtomicU64::new(1000))));
+        let metering = WireMetering::new(None, Some(bifrost_net::BandwidthBudget::new(Some(1000))));
         let sink = || Box::new(SlowSinkPeer::new(usize::MAX, Duration::ZERO));
         let mut first = AsyncNetworkStream::from_raw_stream_for_test(sink());
         first.set_metering(metering.clone());
@@ -912,19 +781,17 @@ mod tokio_test {
     /// when a cap is imposed in between. OpenSSL refuses a retry after
     /// `WANT_WRITE` that is shorter than the pending write, so re-clamping the
     /// retry to the new cap - as the per-poll clamp used to - would fail the
-    /// write instead of throttling it. The uncapped offer completes as offered
-    /// and uncharged: the one transition exception, bounded by `MAX_OFFER`.
+    /// write instead of throttling it. The unlimited offer remains tracked at
+    /// its issued length, bounded by `MAX_OFFER`.
     #[tokio::test(crate = "tokio", start_paused = true)]
     async fn a_pending_retry_keeps_its_length_when_a_cap_is_imposed() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use crate::transport::smtp::client::metering::WireMetering;
 
-        use crate::transport::smtp::client::metering::{UNLIMITED_BANDWIDTH, WireMetering};
-
-        let cap = Arc::new(AtomicU64::new(UNLIMITED_BANDWIDTH));
+        let cap = bifrost_net::BandwidthBudget::default();
         let peer = RetryRecordingPeer::default();
         let offers = Arc::clone(&peer.offers);
         let mut stream = AsyncNetworkStream::from_raw_stream_for_test(Box::new(peer));
-        stream.set_metering(WireMetering::new(None, Some(Arc::clone(&cap))));
+        stream.set_metering(WireMetering::new(None, Some(cap.clone())));
 
         let body = vec![b'x'; 100_000];
         let waker = futures::task::noop_waker();
@@ -935,7 +802,7 @@ mod tokio_test {
                 .is_pending(),
             "the peer answers the first offer Pending"
         );
-        cap.store(10, Ordering::Relaxed);
+        cap.set_cap(Some(10));
         let Poll::Ready(Ok(written)) = Pin::new(&mut stream).poll_write(&mut cx, &body) else {
             panic!("the retry must go out at once, not wait for a slot at the new cap");
         };
@@ -955,15 +822,13 @@ mod tokio_test {
     /// same one the admission wait and this assertion's `Instant::now()` read.
     #[tokio::test(crate = "tokio", start_paused = true)]
     async fn a_capped_write_offers_at_most_one_second_of_cap() {
-        use std::sync::{Arc, atomic::AtomicU64};
-
         use tokio::io::AsyncWriteExt;
 
         use crate::transport::smtp::client::metering::WireMetering;
         use crate::transport::smtp::test_support::SlowSinkPeer;
 
         // A sink that accepts everything offered, immediately.
-        let cap = Arc::new(AtomicU64::new(100));
+        let cap = bifrost_net::BandwidthBudget::new(Some(100));
         let mut stream = AsyncNetworkStream::from_raw_stream_for_test(Box::new(SlowSinkPeer::new(
             usize::MAX,
             Duration::ZERO,

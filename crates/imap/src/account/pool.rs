@@ -1,4 +1,3 @@
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -23,7 +22,7 @@ struct PoolInner {
     idle: Mutex<Vec<PoolMember>>,
     config: Arc<ImapAccountConfig>,
     meter: Option<bifrost_net::MeterSinkHandle>,
-    bandwidth_cap: Arc<AtomicU64>,
+    bandwidth_budget: bifrost_net::BandwidthBudget,
     closed: std::sync::atomic::AtomicBool,
     /// The account's QRESYNC policy (`ImapAccount::qresync_enabled`). Lives
     /// here because `dial` reads it: a member dialed while it is set is
@@ -48,7 +47,7 @@ impl Pool {
         primed: ImapConnection,
         data_cap: usize,
         meter: Option<bifrost_net::MeterSinkHandle>,
-        bandwidth_cap: Arc<AtomicU64>,
+        bandwidth_budget: bifrost_net::BandwidthBudget,
     ) -> Self {
         let primed = Arc::new(primed);
         let primed_weak = Arc::downgrade(&primed);
@@ -61,7 +60,7 @@ impl Pool {
                 }]),
                 config,
                 meter,
-                bandwidth_cap,
+                bandwidth_budget,
                 closed: std::sync::atomic::AtomicBool::new(false),
                 qresync_policy: std::sync::atomic::AtomicBool::new(false),
                 sessions: Mutex::new(vec![primed_weak]),
@@ -226,7 +225,7 @@ impl PoolInner {
                 &self.config.credentials,
                 &self.config.auth_policy,
                 self.meter.clone(),
-                Some(Arc::clone(&self.bandwidth_cap)),
+                Some(self.bandwidth_budget.clone()),
             )
             .await?;
         let conn = Arc::new(conn);
@@ -434,7 +433,6 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
     use super::super::factory::ImapAccountConfig;
@@ -454,6 +452,44 @@ mod tests {
             Credentials::password("user", "pass"),
             AuthPolicy::default(),
         ))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bandwidth_two_pool_members_share_one_inbound_rate() {
+        use crate::connection::test_support::driver_pair_metered;
+        use tokio::time::Instant;
+        let budget = bifrost_net::BandwidthBudget::default();
+        let (a, mut peer_a) =
+            driver_pair_metered(&preauth_greeting("IMAP4rev1"), budget.clone()).await;
+        let (b, mut peer_b) =
+            driver_pair_metered(&preauth_greeting("IMAP4rev1"), budget.clone()).await;
+        let pool = Pool::new(config(), a, 2, None, budget.clone());
+        pool.inner.idle.lock().unwrap().push(PoolMember {
+            conn: Arc::new(b),
+            selected: None,
+        });
+        let a = pool.checkout_any().await.unwrap();
+        let b = pool.checkout_any().await.unwrap();
+        budget.set_cap(Some(64));
+        let start = Instant::now();
+        async fn answer(peer: &mut tokio::io::DuplexStream) {
+            let command = read_line(peer).await;
+            let tag = tag_of(&command);
+            respond(
+                peer,
+                &format!("{tag} OK {}\r\n", "x".repeat(64 - tag.len() - 6)),
+            )
+            .await;
+        }
+        let (a, b, (), ()) = tokio::join!(
+            a.connection().noop(Duration::from_secs(10)),
+            b.connection().noop(Duration::from_secs(10)),
+            answer(&mut peer_a),
+            answer(&mut peer_b),
+        );
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
     }
 
     fn folder(name: &str) -> MailboxName {
@@ -476,7 +512,7 @@ mod tests {
             primed,
             data_cap,
             None,
-            Arc::new(AtomicU64::new(0)),
+            bifrost_net::BandwidthBudget::default(),
         )
     }
 

@@ -53,9 +53,17 @@ impl fmt::Debug for CardDavClient {
 }
 
 impl CardDavClient {
-    pub(crate) fn new(account_id: AccountId, config: &CardDavConfig) -> Self {
+    pub(crate) fn new_on_net(
+        account_id: AccountId,
+        config: &CardDavConfig,
+        net: Option<&bifrost_net::Net>,
+    ) -> Self {
+        let net = net
+            .cloned()
+            .unwrap_or_else(bifrost_net::Net::shared_default);
         Self {
-            dav: DavDispatch::new(
+            dav: DavDispatch::on_net(
+                &net,
                 account_id,
                 &config.base_url,
                 config.credentials.to_shared(),

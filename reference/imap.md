@@ -461,7 +461,7 @@ the same cursor payload no matter which path built them.
 
 `ImapConfig` centralizes TLS mode (Implicit / StartTls / Plaintext), connect/command timeouts, keepalive, and optional native-tls connector. Ports default per mode (993 / 143 / 143). Public constructors are `tls`, `starttls`, `plaintext`; builders cover port, timeouts, keepalive disablement, and custom TLS connectors. `ImapAccountConfig::idle_connection_budget` is the visible non-NOTIFY push-session budget and defaults to 4. The raw `connect` / `connect_authenticated` entry points were deleted in S1-W3.
 
-Internally, `connect_authenticated_metered(credentials, policy, meter, cap)` composes connect + STARTTLS-if-needed + `authenticate_best` for the factory and pool, returning `(ImapConnection, AuthOutcome)` crate-only.
+Internally, `connect_authenticated_metered(credentials, policy, meter, budget)` composes connect + STARTTLS-if-needed + `authenticate_best` for the factory and pool, returning `(ImapConnection, AuthOutcome)` crate-only.
 
 ## Sync helpers
 
@@ -473,14 +473,14 @@ Internally, `connect_authenticated_metered(credentials, policy, meter, cap)` com
 
 ## Account layer
 
-The shared `bifrost_types::Account` impl lives under `crates/imap/src/account/`. `ImapAccountFactory::open(account_id)` opens a connection pool, lists folders, builds capabilities, and threads the engine account id into optional raw-socket bandwidth metering. `ImapAccount` backs both the sync methods and Stage 1 PIM primitives.
+The shared `bifrost_types::Account` impl lives under `crates/imap/src/account/`. `ImapAccountFactory::open(account_id)` opens a connection pool, lists folders, builds capabilities, and threads the engine account id into plaintext bandwidth admission and optional byte accounting. `ImapAccount` backs both the sync methods and Stage 1 PIM primitives.
 
 The public account module re-exports only `ImapAccountFactory`, `ImapAccountConfig`, and `ManageSieveConfig` (preserving the conformance-test path `bifrost_imap::account::{...}`); the crate root re-exports the factory and config types directly. `ImapAccount` itself is `pub(crate)`.
 
 Submodules:
 
 - `factory.rs` - `ImapAccountConfig`, `AccountFactory::open(account_id)`, optional `BandwidthMeter`/`MeterSink` wiring, fail-soft CardDAV/CalDAV sub-account open (`DavAttach`), open-time construction of the `DavScopeIndex` from each attached DAV account's collection-folder cursor scopes, `ID` probe, QRESYNC negotiation, folder LIST, and A5c NAMESPACE/ACL shared-folder discovery (`discover_shared_folders`).
-- `pool.rs` - per-folder connection checkout. Push lane reserves one slot; data lanes share the rest. Every dialed connection receives the account-scoped `MeterSinkHandle` and shared bandwidth-cap atomic when configured, and is brought to the account's QRESYNC policy (`enable_qresync`) before it is handed out; see "CONDSTORE / QRESYNC strategy".
+- `pool.rs` - per-folder connection checkout. Push lane reserves one slot; data lanes share the rest. Every dialed connection receives the account-scoped `MeterSinkHandle` and shared account `BandwidthBudget`, and is brought to the account's QRESYNC policy (`enable_qresync`) before it is handed out; see "CONDSTORE / QRESYNC strategy".
 - `folder_registry.rs` - mailbox map plus per-folder cursor and MODSEQ caches (`record_modseq`, `modseq`, `clear_modseqs`), keyed by `(folder, uidvalidity, uid)`, storing LIST delimiter/attributes and the A5c `shared_owner` tag, clearing on UIDVALIDITY change, delete, or rename.
 - `envelope.rs` - `FolderCursor` (QResync/Condstore/Basic) plus `encode_cursor`/`decode_cursor` over `OpaqueChangeState`.
 - `capabilities.rs`, `inventory.rs`, `changes.rs`, `get.rs`, `blob.rs`, `mutate.rs`, `push.rs`, `close.rs`, `scopes.rs` - one file per `Account` method group. `mod.rs` holds `route_scope`/`ScopeHandler`; typed legacy DAV scopes dispatch by object type, while per-collection DAV folder scopes dispatch through `DavScopeIndex`. `FolderId` carries no protocol namespace and IMAP mailbox names are arbitrary strings, so the index is built once at open and made unambiguous there: a collection href equal to a known IMAP mailbox name is not indexed (the mailbox keeps its scope), and a href claimed by both sub-accounts is not indexed (the tie is never resolved silently in favour of contacts). Both exclusions are reported as open-time warnings on the degraded-DAV lane, so a dropped entry routes to IMAP or to `Unsupported` rather than syncing the wrong collection quietly. Push admission consults the same index: an indexed DAV collection scope is a syntactically valid mailbox name but names no mailbox, so it is refused per-item (the DAV sub-accounts have no push lane) instead of being reported as pushed and burning an IDLE budget slot on a folder no worker can SELECT. `scopes.rs` holds the discovery fan-in.
@@ -724,7 +724,69 @@ Stage 2 wires it: a hydration/inventory projection that attaches handles, the
 
 ### Bandwidth metering
 
-`ImapAccountConfig` carries a process `BandwidthMeter` or generic `MeterSink`. The factory builds a `MeterSinkHandle` with the engine `AccountId` on every open and passes it to the initial connection plus pool dials. `WireReader` records bytes read/written on every read/write path; the shared bandwidth-cap atomic is read per chunk (`set_bandwidth_cap(None)` unlimited; `Some(0)` clamps to 1 B/s with a warning). The token bucket honors the cap exactly: a chunk larger than one second of budget owes `bytes / cap` seconds in total, slept in slices of at most 60 s (the 60 s value bounds a single timer, never the total debt), so a very low cap makes big reads proportionally slow rather than being silently exceeded. The bucket keeps time with `tokio::time::Instant`, so the metering arithmetic is testable under `tokio::time::pause()`.
+`ImapAccountFactory::with_net(bifrost_net::Net)` selects the shared HTTP
+transport used by composed DAV. Before bootstrap, the factory obtains the
+account's `BandwidthBudget` from that Net's registry by account id. The engine
+and other protocol clients must use the same Net or its registry. Overlapping
+incarnations with the same id then share admission. Without `with_net`, the
+factory uses `Net::shared_default()` and resolves the IMAP budget from that
+same shared transport's registry. Sharing therefore also holds by default.
+`Account::set_bandwidth_cap` retunes this budget directly; there is no cap
+atomic, sentinel, connection-local token bucket or submission-only budget.
+`None` is unlimited and `Some(0)` clamps to 1 B/s in the shared budget.
+
+The bootstrap connection, every pool dial and redial, ManageSieve and SMTP
+submission all receive clones of that handle. `WireReader` performs admission
+above TLS and COMPRESS. Each read offers at most its grant, including bounded
+inflation output; each write reserves before offering a bounded plaintext
+slice. Inflation drains retained decoded output even when compressed input is
+empty, so a small grant cannot strand already received bytes. There is at most
+one outstanding reservation per direction on a connection. Short success
+finishes with the actual byte count and refunds only a current tail. Error or cancellation after offer retains the full charge.
+STARTTLS and COMPRESS rebuild the reader with cloned metering state, preserving
+the budget and observation sink. The underlying socket progress counter remains
+below TLS and COMPRESS for transmission evidence, independently of admission.
+
+An IDLE read pre-spends a slot before waiting on the peer; it holds no budget
+lock or exclusive turn. Bootstrap greeting, CAPABILITY and STARTTLS each have
+one absolute exchange deadline that includes admission, unsolicited responses,
+and (for STARTTLS) the handshake and post-upgrade CAPABILITY. Each exchange also
+has a cumulative peer-wait allowance: admitted I/O spends it, admission does
+not, and individual reads cannot reset it. The allowance is shared across
+stream upgrades and charges cancelled pending I/O as well.
+ManageSieve places a cumulative peer-read allowance below `MeteredStream`,
+covering one whole line or literal while excluding admission waits. Explicit
+command deadlines still bound the whole operation, including admission.
+Time arithmetic uses the Tokio clock. The smoothing bound and
+outstanding-allowance rules are in `reference/net.md`.
+
+At the COMPRESS boundary, the final read reservation stays outstanding until
+the tagged OK identifies the plaintext prefix. A coalesced compressed suffix
+is excluded from completion and byte observation, then handed to the inflater.
+Its decoded plaintext pays admission when read above COMPRESS. Short completion
+still follows the shared budget's tail-only refund rule; no second inbound
+reservation is issued while the deferred one remains outstanding.
+
+`ImapAccountConfig` carries an optional process `BandwidthMeter` or generic
+`MeterSink`. The factory creates the account-tagged `MeterSinkHandle` for the
+initial connection, pool dials and submission. IMAP records successful admitted
+plaintext reads and writes. ManageSieve wraps each sequential read/write
+operation in `MeteredStream`, charging the account budget above TLS, including
+its plaintext greeting and STARTTLS exchange.
+
+Composed CardDAV and CalDAV attach through the factory's selected Net before
+discovery. Opens and reopens clone that Net; they never construct a new HTTP
+transport. The reqwest connection pool, per-host rate-limit governor and budget
+registry stay shared across accounts and incarnations. The default continues
+to be the process-wide `Net::shared_default()`, including for standalone DAV.
+
+Paused-clock, duplex and scripted-HTTP tests pin shared pool admission,
+redial credit, a real IDLE session alongside sibling work, bounded reads, short
+writes, conservative cancellation, peer timers, Sieve charging, submission/FETCH
+admission, account cap wakeups, the real default Net identity, and repeated account opens sharing
+scripted DAV discovery and IMAP FETCH admission with or without `with_net`.
+The default-provider seam substitutes scripted HTTP in that combined test; a
+separate assertion pins the production fallback to `Net::shared_default()`.
 
 ### Folder lifecycle
 
