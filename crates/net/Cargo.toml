@@ -39,7 +39,9 @@ zeroize = { workspace = true }
 uuid = { workspace = true }
 # Only used to assemble canned responses in `test_support`.
 http = { workspace = true }
+http-body = { workspace = true }
+h2 = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "time", "macros", "rt", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt", "rt-multi-thread", "test-util", "io-util"] }
 http = { workspace = true }

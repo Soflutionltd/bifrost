@@ -19,6 +19,7 @@ use reqwest::header::RANGE;
 
 use crate::auth::{DEFAULT_TOKEN_MAX_AGE, OAuthRefresher, TokenSource};
 use crate::bandwidth::{AccountMeter, BandwidthMeter};
+use crate::budget::{BandwidthBudget, BandwidthDirection, BandwidthRegistry};
 use crate::concurrency::{ConcurrencyLimit, WeakLimit};
 use crate::config::NetConfig;
 use crate::error::{Error, RangeFailureKind};
@@ -55,6 +56,7 @@ pub(crate) struct NetInner {
     pub(crate) governor: RateLimitGovernor,
     /// Bandwidth meter, partitioned per account.
     pub(crate) meter: BandwidthMeter,
+    bandwidth_registry: Arc<BandwidthRegistry>,
     /// Successfully registered hosts, indexed first by `AccountId`
     /// and then by the exact attachment token.
     pub(crate) account_hosts: Mutex<HashMap<AccountId, HashMap<u64, Vec<RateKey>>>>,
@@ -95,6 +97,29 @@ impl Net {
     pub(crate) fn new_with_dispatch(
         config: NetConfig,
         dispatch: Arc<dyn Dispatch>,
+    ) -> Result<Self, Error> {
+        Self::build(config, dispatch, Arc::new(BandwidthRegistry::new()))
+    }
+
+    /// Build with an injected registry shared with the engine and stream
+    /// factories. Matching account ids coordinate only within one registry.
+    pub fn with_bandwidth_registry(
+        config: NetConfig,
+        registry: Arc<BandwidthRegistry>,
+    ) -> Result<Self, Error> {
+        Self::build(config, Arc::new(ReqwestDispatch), registry)
+    }
+
+    /// Registry used by all accounts attached to this transport.
+    #[must_use]
+    pub fn bandwidth_registry(&self) -> &Arc<BandwidthRegistry> {
+        &self.inner.bandwidth_registry
+    }
+
+    fn build(
+        config: NetConfig,
+        dispatch: Arc<dyn Dispatch>,
+        bandwidth_registry: Arc<BandwidthRegistry>,
     ) -> Result<Self, Error> {
         let mut builder = reqwest::ClientBuilder::new()
             .pool_idle_timeout(config.pool_idle_timeout)
@@ -144,6 +169,7 @@ impl Net {
                 dispatch,
                 governor: RateLimitGovernor::new(),
                 meter: BandwidthMeter::new(),
+                bandwidth_registry,
                 account_hosts: Mutex::new(HashMap::new()),
                 next_registration_id: AtomicU64::new(1),
                 concurrency_limits: Mutex::new(HashMap::new()),
@@ -263,6 +289,7 @@ impl Net {
         AccountNet {
             inner: Arc::new(AccountNetInner {
                 net: self.clone(),
+                bandwidth_budget: self.inner.bandwidth_registry.budget(id.clone()),
                 account: id,
                 registration_id,
                 meter: account_meter,
@@ -280,7 +307,6 @@ impl Net {
                 user_agent: spec.user_agent,
                 follow_redirects: spec.follow_redirects,
                 priority: AtomicU8::new(Priority::Foreground as u8),
-                bandwidth_cap: AtomicU64::new(BANDWIDTH_CAP_NONE),
             }),
         }
     }
@@ -363,11 +389,6 @@ impl Net {
     }
 }
 
-/// Sentinel encoding `None` on the `bandwidth_cap: AtomicU64` field.
-/// `u64::MAX` is unreachable in practice (it implies ~18 EB/s) and
-/// distinguishable from any real cap.
-pub(crate) const BANDWIDTH_CAP_NONE: u64 = u64::MAX;
-
 /// Account-scoped view onto `Net`. Carries the account identity used
 /// for metering, the token source for OAuth, and the rate-limit plus
 /// retry defaults the protocol crate supplied at registration.
@@ -415,9 +436,8 @@ pub(crate) struct AccountNetInner {
     /// read does not take a lock. Stored as the `Priority` enum's
     /// discriminant byte; `priority()` converts back.
     pub(crate) priority: AtomicU8,
-    /// Engine-controlled bandwidth cap in bytes per second.
-    /// `BANDWIDTH_CAP_NONE` (sentinel `u64::MAX`) means unlimited.
-    pub(crate) bandwidth_cap: AtomicU64,
+    /// Shared per-id payload admission, independent of handle registration.
+    pub(crate) bandwidth_budget: BandwidthBudget,
 }
 
 /// Release the registration when the last clone of the handle goes.
@@ -596,46 +616,22 @@ impl AccountNet {
         self.inner.meter.clone()
     }
 
-    /// Set a per-account bandwidth cap in bytes per second.
-    ///
-    /// `None` disables the cap. `Some(0)` is **not** a sentinel for
-    /// "unlimited" (that's `None`'s job) and not a sentinel for
-    /// "block everything" (the throttle is a smoothing layer; we
-    /// never park a stream forever on a caller mistake). It would
-    /// otherwise collide with the previous behaviour where the
-    /// `ByteBucket::consume` early-return treated 0 as no-cap, which
-    /// silently undid the cap. We normalise to `Some(1)` (one byte
-    /// per second, a trickle) and emit a `tracing::warn!` so a
-    /// caller misconfiguration is visible without crashing the
-    /// stream.
-    ///
-    /// Single atomic store after the normalisation; safe to call
-    /// from any task without taking a lock.
+    /// Set the shared account payload smoothing cap. Zero becomes one B/s.
+    /// See `BandwidthBudget` for the allowance bound and plaintext scope.
     pub fn set_bandwidth_cap(&self, bps: Option<u64>) {
-        let raw = match bps {
-            None => BANDWIDTH_CAP_NONE,
-            Some(0) => {
-                tracing::warn!(
-                    target: "bifrost_net::bandwidth",
-                    account = ?self.inner.account,
-                    "set_bandwidth_cap(Some(0)) clamped to 1 B/s; use None for unlimited",
-                );
-                1
-            }
-            Some(n) => n,
-        };
-        self.inner.bandwidth_cap.store(raw, Ordering::Relaxed);
+        self.inner.bandwidth_budget.set_cap(bps);
     }
 
-    /// Current bandwidth cap if any. `None` means unlimited.
+    /// Current shared cap; None means unlimited.
     #[must_use]
     pub fn bandwidth_cap(&self) -> Option<u64> {
-        let raw = self.inner.bandwidth_cap.load(Ordering::Relaxed);
-        if raw == BANDWIDTH_CAP_NONE {
-            None
-        } else {
-            Some(raw)
-        }
+        self.inner.bandwidth_budget.cap()
+    }
+
+    /// Shared account admission budget, also usable by stream adapters.
+    #[must_use]
+    pub fn bandwidth_budget(&self) -> &BandwidthBudget {
+        &self.inner.bandwidth_budget
     }
 
     /// Set the engine-controlled priority hint. Single atomic store.
@@ -754,8 +750,9 @@ impl AccountNet {
     /// Re-mint this `AccountNet` under a new engine `AccountId`.
     ///
     /// The returned handle shares the same parent `Net`, token
-    /// source, default retry policy, priority hint, and bandwidth
-    /// cap. Used by protocol-crate factories that need to honor
+    /// source, default retry policy and priority hint. Future admissions use
+    /// the destination id budget; outstanding source grants stay with it.
+    /// Used by protocol-crate factories that need to honor
     /// `AccountFactory::open(account_id)` when the caller built the
     /// `AccountNet` via `Net::attach_account` ahead of time
     /// (`*Client::with_account_net`) and the engine-minted id arrives
@@ -821,6 +818,7 @@ impl AccountNet {
         AccountNet {
             inner: Arc::new(AccountNetInner {
                 net: self.inner.net.clone(),
+                bandwidth_budget: net_inner.bandwidth_registry.budget(new_id.clone()),
                 account: new_id,
                 registration_id: self.inner.registration_id,
                 meter: account_meter,
@@ -835,7 +833,6 @@ impl AccountNet {
                 user_agent: self.inner.user_agent.clone(),
                 follow_redirects: self.inner.follow_redirects.clone(),
                 priority: AtomicU8::new(self.inner.priority.load(Ordering::Relaxed)),
-                bandwidth_cap: AtomicU64::new(self.inner.bandwidth_cap.load(Ordering::Relaxed)),
             }),
         }
     }
@@ -1039,157 +1036,80 @@ fn content_range_matches(req_range: &str, resp_range: &str) -> bool {
     }
 }
 
-/// Wrap a `ByteStream` with per-chunk metering and an optional
-/// bandwidth-cap throttle. The throttle is a byte-counting token
-/// bucket refilled at `AccountNet::bandwidth_cap` bytes per second;
-/// when the cap is `None`, the wrapper is meter-only. The cap is
-/// re-read on every chunk so the engine can hot-swap it mid-stream.
-///
-/// `deadline` is the request's total deadline. The throttle sleeps
-/// below are the only waits a request performs that the retry loop
-/// never observes, so without this the cap could carry a body well
-/// past an explicit total timeout - the lower the cap, the further
-/// past. Expiry mid-body yields `Timeout { Acknowledged }`, which is a
-/// truncation error rather than a clean end-of-stream, so a partial
-/// body can never be handed back as a complete one.
+/// Deliver bounded payload slices through the shared inbound budget.
 pub(crate) fn wrap_metered(
     body: ByteStream,
     account: AccountNet,
     deadline: crate::request::RequestDeadline,
     request_bytes: crate::request::RequestByteCounter,
 ) -> ByteStream {
-    let meter = account.meter();
-    // Bucket carries its own state across chunks. Constructed full so
-    // the first chunk of a download flows immediately, then subsequent
-    // chunks pay the cap.
-    let bucket = ByteBucket::new(account.bandwidth_cap());
-
-    let stream = body.then(move |chunk| {
-        let meter = meter.clone();
-        let bucket = bucket.clone();
-        let cap_now = account.bandwidth_cap();
-        let request_bytes = request_bytes.clone();
-        async move {
-            let chunk = chunk?;
-            let n = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
-            // Metered before the deadline check: these bytes did come
-            // off the wire, whether or not we are still allowed to
-            // hand them up.
-            meter.record_bytes_in(n);
-            request_bytes.record(n);
-            deadline.check_body()?;
-            if cap_now.is_some() {
-                deadline.bound_body(bucket.consume(n, cap_now)).await?;
-            }
-            Ok(chunk)
-        }
-    });
-    Box::pin(stream)
+    wrap_delivery(body, account, deadline, request_bytes, None)
 }
 
-/// Byte-counting token bucket used by the per-account bandwidth cap.
-/// Distinct from the `RateLimitGovernor` which counts request units;
-/// the cap counts response bytes.
-#[derive(Clone)]
-pub(crate) struct ByteBucket {
-    state: Arc<std::sync::Mutex<ByteBucketState>>,
-}
-
-struct ByteBucketState {
-    /// Tokens currently available, in bytes.
-    tokens: f64,
-    /// Last refill instant.
-    last_refill: tokio::time::Instant,
-    initialized: bool,
-}
-
-impl ByteBucket {
-    /// Construct a full bucket. Initial tokens equal the configured
-    /// cap so the first chunk of a brand-new download flows without
-    /// delay; subsequent chunks pay the bandwidth-per-second cost.
-    pub(crate) fn new(cap: Option<u64>) -> Self {
-        let initial = cap.map_or(0.0, |c| c as f64);
-        Self {
-            state: Arc::new(std::sync::Mutex::new(ByteBucketState {
-                tokens: initial,
-                last_refill: tokio::time::Instant::now(),
-                initialized: cap.is_some(),
-            })),
-        }
-    }
-
-    /// Block until `n` bytes can be debited. `cap` is read at call
-    /// time so the engine can hot-swap the bandwidth cap mid-stream.
-    /// A cap of `Some(0)` cannot occur here because
-    /// `AccountNet::set_bandwidth_cap` normalises `Some(0)` to
-    /// `Some(1)` to avoid sentinel collision with `None` semantics;
-    /// the early return guards against a hand-rolled call site that
-    /// stores 0 anyway.
-    ///
-    /// When a single chunk is larger than the per-second cap, the
-    /// bucket can never accumulate enough tokens for the steady-state
-    /// path (`tokens` is clamped at `cap` on every refill). Looping
-    /// would hang the stream. We instead sleep for the proportional
-    /// duration the chunk represents at the configured rate
-    /// (`chunk_size / cap` seconds) and let the chunk through; the
-    /// bucket then resets to the empty state. The cap is a smoothing
-    /// throttle, not a hard per-chunk ceiling.
-    pub(crate) async fn consume(&self, n: u64, cap: Option<u64>) {
-        let Some(cap) = cap else { return };
-        if cap == 0 {
-            return;
-        }
-        let cap_f = cap as f64;
-        let want = n as f64;
-        {
-            let mut state = self.state.lock().expect("byte-bucket lock poisoned");
-            if !state.initialized {
-                state.tokens = cap_f;
-                state.last_refill = tokio::time::Instant::now();
-                state.initialized = true;
-            }
-        }
-        // Oversized-chunk path: pay the proportional throttle and
-        // continue. We zero the bucket and reset `last_refill` to
-        // `now`. Side effect: the *next* normal-sized chunk starts
-        // from an empty bucket and has to wait one refill cycle even
-        // if real time has moved on - it will not benefit from the
-        // elapsed-since-last-refill credit. This is intentional: an
-        // oversized chunk already paid the proportional throttle, so
-        // crediting the elapsed time again would double-spend the
-        // throttle window. Callers that stream a steady mix of large
-        // and small chunks may see the small chunks throttled a hair
-        // more than the average rate suggests; the cap is a smoothing
-        // throttle, not a precision shaper.
-        if n > cap {
-            let secs = (want / cap_f).min(60.0);
-            tokio::time::sleep(Duration::from_secs_f64(secs)).await;
-            let mut state = self.state.lock().expect("byte-bucket lock poisoned");
-            state.tokens = 0.0;
-            state.last_refill = tokio::time::Instant::now();
-            return;
-        }
-        loop {
-            let wait = {
-                let mut state = self.state.lock().expect("byte-bucket lock poisoned");
-                let now = tokio::time::Instant::now();
-                let elapsed = now.duration_since(state.last_refill).as_secs_f64();
-                state.tokens = (state.tokens + elapsed * cap_f).min(cap_f);
-                state.last_refill = now;
-                if state.tokens >= want {
-                    state.tokens -= want;
-                    return;
+/// Diagnostic drains limit delivery before admission. Bytes buffered in the
+/// current hyper chunk but abandoned after the limit remain unpaid.
+pub(crate) fn wrap_delivery(
+    body: ByteStream,
+    account: AccountNet,
+    deadline: crate::request::RequestDeadline,
+    request_bytes: crate::request::RequestByteCounter,
+    limit: Option<usize>,
+) -> ByteStream {
+    let stream = futures::stream::unfold(
+        (
+            body,
+            bytes::Bytes::new(),
+            limit.unwrap_or(usize::MAX),
+            false,
+        ),
+        move |(mut body, mut chunk, mut remaining, done)| {
+            let account = account.clone();
+            let request_bytes = request_bytes.clone();
+            async move {
+                if done || remaining == 0 {
+                    return None;
                 }
-                let deficit = want - state.tokens;
-                // Cap the sleep duration so a slow refill cannot
-                // park a single chunk indefinitely. The loop will
-                // re-evaluate on wakeup.
-                let secs = (deficit / cap_f).min(60.0);
-                Duration::from_secs_f64(secs)
-            };
-            tokio::time::sleep(wait).await;
-        }
-    }
+                let result = async {
+                    deadline.check_body()?;
+                    while chunk.is_empty() {
+                        let Some(next) = deadline.bound_body(body.next()).await? else {
+                            return Ok(None);
+                        };
+                        chunk = next?;
+                        let n = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                        account.meter().record_bytes_in(n);
+                        request_bytes.record(n);
+                        deadline.check_body()?;
+                    }
+                    let grant = loop {
+                        let mut grant = deadline
+                            .bound_body(
+                                account
+                                    .bandwidth_budget()
+                                    .ready(BandwidthDirection::Inbound, chunk.len().min(remaining)),
+                            )
+                            .await?;
+                        deadline.check_body()?;
+                        if grant.offer() {
+                            break grant;
+                        }
+                    };
+                    let len = grant.granted();
+                    let slice = chunk.split_to(len);
+                    grant.finish(len);
+                    remaining -= len;
+                    Ok(Some(slice))
+                }
+                .await;
+                match result {
+                    Ok(Some(slice)) => Some((Ok(slice), (body, chunk, remaining, false))),
+                    Ok(None) => None,
+                    Err(error) => Some((Err(error), (body, chunk, remaining, true))),
+                }
+            }
+        },
+    );
+    Box::pin(stream)
 }
 
 /// Public re-export helper so `request.rs` can build a response body
@@ -1237,9 +1157,7 @@ pub(crate) fn into_byte_stream(
 #[cfg(test)]
 mod tests {
     use super::content_range_matches;
-    use super::{
-        AccountId, AccountSpec, ByteBucket, ByteRange, FollowRedirects, Net, encode_range,
-    };
+    use super::{AccountId, AccountSpec, ByteRange, FollowRedirects, Net, encode_range};
     use crate::StaticTokenSource;
     use crate::config::NetConfig;
     use crate::rate::{RateKey, RateLimit};
@@ -1470,41 +1388,6 @@ mod tests {
     #[test]
     fn content_range_rejects_a_zero_total_resource() {
         assert!(!content_range_matches("bytes=0-", "bytes 0-0/0"));
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn byte_bucket_refills_on_tokio_virtual_time() {
-        let bucket = ByteBucket::new(Some(10));
-        bucket.consume(10, Some(10)).await;
-        let waiting = {
-            let bucket = bucket.clone();
-            tokio::spawn(async move {
-                bucket.consume(10, Some(10)).await;
-            })
-        };
-        tokio::task::yield_now().await;
-        assert!(!waiting.is_finished());
-
-        tokio::time::advance(Duration::from_secs(1)).await;
-        waiting.await.expect("byte-bucket waiter completes");
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn byte_bucket_initializes_when_a_cap_first_appears() {
-        let bucket = ByteBucket::new(None);
-        bucket.consume(10, None).await;
-        let started = tokio::time::Instant::now();
-        bucket.consume(10, Some(10)).await;
-        assert_eq!(started.elapsed(), Duration::ZERO);
-
-        let waiting = tokio::spawn(async move {
-            bucket.consume(10, Some(10)).await;
-        });
-        tokio::task::yield_now().await;
-        assert!(
-            !waiting.is_finished(),
-            "only the first capped chunk starts full"
-        );
     }
 
     fn build_net() -> Net {
@@ -1798,5 +1681,59 @@ mod tests {
         assert_eq!(net.governor().cost_default_for("shared.example"), Some(1));
         valid.detach();
         assert_eq!(net.governor().cost_default_for("shared.example"), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retag_uses_destination_budget_and_keeps_source_grants_attributed() {
+        let net = build_net();
+        let source = net.attach_account(AccountId("source-budget".into()), AccountSpec::new(None));
+        let destination = net.attach_account(
+            AccountId("destination-budget".into()),
+            AccountSpec::new(None),
+        );
+        source.set_bandwidth_cap(Some(10));
+        destination.set_bandwidth_cap(Some(1));
+        let mut outstanding = source
+            .bandwidth_budget()
+            .reserve(crate::BandwidthDirection::Inbound, 10);
+        assert!(outstanding.offer());
+        let retagged = source.retag(destination.account().clone());
+        assert_eq!(retagged.bandwidth_cap(), Some(1));
+        retagged.set_bandwidth_cap(Some(2));
+        assert_eq!(destination.bandwidth_cap(), Some(2));
+        assert_eq!(source.bandwidth_cap(), Some(10));
+        outstanding.finish(10);
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            source
+                .bandwidth_budget()
+                .reserve(crate::BandwidthDirection::Inbound, 10)
+                .ready_at(),
+            now + Duration::from_secs(1)
+        );
+        assert_eq!(
+            retagged
+                .bandwidth_budget()
+                .reserve(crate::BandwidthDirection::Inbound, 2)
+                .ready_at(),
+            now
+        );
+    }
+
+    #[test]
+    fn injected_registry_coordinates_distinct_nets_and_default_registries_are_private() {
+        let registry = Arc::new(crate::BandwidthRegistry::new());
+        let first = Net::with_bandwidth_registry(NetConfig::default(), Arc::clone(&registry))
+            .expect("first Net");
+        let second = Net::with_bandwidth_registry(NetConfig::default(), Arc::clone(&registry))
+            .expect("second Net");
+        assert!(Arc::ptr_eq(first.bandwidth_registry(), &registry));
+        let id = AccountId("shared-budget".into());
+        let a = first.attach_account(id.clone(), AccountSpec::new(None));
+        let b = second.attach_account(id.clone(), AccountSpec::new(None));
+        a.set_bandwidth_cap(Some(7));
+        assert_eq!(b.bandwidth_cap(), Some(7));
+        let private = build_net().attach_account(id, AccountSpec::new(None));
+        assert_eq!(private.bandwidth_cap(), None);
     }
 }

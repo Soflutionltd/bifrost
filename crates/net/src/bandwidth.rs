@@ -12,6 +12,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+pub use crate::budget::{BandwidthBudget, BandwidthDirection, BandwidthRegistry, Reservation};
+
 use crate::AccountId;
 
 /// One second's worth of byte counts. Ten of these in a ring buffer

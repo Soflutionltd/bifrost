@@ -26,7 +26,7 @@ let account = net.attach_account(account_id, spec);     // per-account
   quota coordination on Gmail / Graph hosts works out of the box.
 - `AccountNet` is account-scoped: token source, timeouts, User-Agent,
   buffered-body ceiling, redirect policy, default `RetryPolicy`,
-  `AtomicU8` priority, and `AtomicU64` bandwidth cap.
+  `AtomicU8` priority, and a shared `BandwidthBudget` from its Net registry.
   `Clone` is one `Arc` bump; protocol crates clone per spawned task.
 - `Net::shared_default()` returns a process-wide `OnceLock<Net>`
   built from `NetConfig::default()`. The default registration target
@@ -90,7 +90,9 @@ moves under `new_id`, and the meter transfers one attachment count from
 the old id to the new one (it does not separately register the new id,
 so a retag never inflates the total attach count). The new handle
 inherits token
-source, retry policy, priority, and bandwidth cap from the old.
+source, retry policy and priority from the old. Future admissions use the
+destination id budget from the registry; outstanding source grants retain
+the source budget, even after the old handle is dropped.
 Governor refcounts are per-host and not touched. The old handle keeps
 working for in-flight clones; its old-id teardown is a no-op because
 the token moved.
@@ -142,12 +144,11 @@ own arithmetic - no call site reads the underlying instant - because the
 per-attempt-versus-overall conflation is exactly the bug the split was made to
 prevent.
 
-The deadline reaches the response body as well as the retry loop, through
-`wrap_metered` and the capped status-body reader. That matters because the bandwidth-cap throttle sleeps inside
-`ByteBucket::consume` are the one class of wait a request performs that the
-retry loop never observes: with a low cap, a buffered response could otherwise
-finish minutes after an explicit total timeout, and a streaming response could
-hand up an already-buffered chunk past it. Both are now bounded.
+The deadline reaches every response-body path through the shared delivery
+adapter. It bounds both hyper reads and bandwidth admission and is checked
+again before each buffered slice is delivered, including after a suspended
+consumer resumes. A streaming response therefore cannot hand up an
+already-buffered slice past the absolute deadline.
 
 Expiry before dispatch of the replacement attempt is `Timeout { Unsent }` and
 replay-safe for any method; a `response_headers_timeout` expiry while awaiting
@@ -170,22 +171,18 @@ mid-body would otherwise block forever, and the google and graph accounts set no
 `STATUS_BODY_CAP`, where `bytes()` buffers the whole body before any cap
 applies.
 
-The capped reader meters every chunk, then checks the deadline, then pays the
-per-account bandwidth cap - the same three steps in the same order as the success
-body. This includes terminal statuses, failed attempts drained before retry,
-rejected-token 401 bodies, and followed redirects. Its evidence
-distinguishes the 4 KB ceiling, inactivity or overall timeout, and a connection
-failure with separate visible body markers, so provider JSON classifiers never
-treat an interrupted document as complete.
+The capped reader uses the same delivery adapter as success bodies. It meters
+each fetched hyper chunk, then admits bounded slices against the account's
+shared inbound budget. Terminal statuses, failed attempts drained before retry,
+rejected-token 401 bodies and followed redirects all use this path. Inactivity
+is timed only while awaiting hyper, so bandwidth waiting cannot masquerade as
+a stalled peer. Diagnostic evidence distinguishes the 4 KB ceiling, inactivity
+or overall timeout, and connection failure with separate visible markers.
 
-Metering these drains without throttling them was a half-fix, and the reason the
-throttle belongs here is that a byte counted against the account must also be paid
-for: repeated 429/5xx responses or a long redirect chain read real inbound bytes,
-and a cap that only the success path honors is not a per-account cap. The throttle
-wait is bounded by the overall deadline exactly as `wrap_metered`'s is, so putting a
-sleep on an error path cannot turn a failing request into a hang. Each drain builds
-its own `ByteBucket`, starting full, so a short error body is never delayed and the
-cap bites only once a single drain runs long.
+A diagnostic drain stops after the ceiling plus one byte, leaving the remainder
+of its buffered hyper chunk unpaid. That chunk was still fetched and metered;
+admission measures delivered plaintext, while metering measures fetched payload.
+The cap does not cover buffering below the delivery adapter.
 
 The same reasoning is why the knobs below are not exposed upward. If a
 per-deployment value is genuinely needed, it belongs on the protocol
@@ -204,8 +201,8 @@ takes this path, so without a ceiling a provider outage page, a
 mis-routed blob URL, or a hostile response OOMs the process; the error
 path already had a 4 KB cap in `read_capped_response_body` and the
 success path had nothing. `None` disables the check.
-`send_streaming` is uncapped by design - the caller owns backpressure
-there. The CalDAV and CardDAV clients take this ceiling from `send` like
+`send_streaming` has no buffered-size ceiling - the caller owns backpressure
+there. Its payload still goes through bandwidth admission. The CalDAV and CardDAV clients take this ceiling from `send` like
 everyone else; `Error::ResponseTooLarge` is what their dispatcher converts into
 the `Protocol(PartialResponse)` an acknowledged-but-unreadable DAV body wants.
 
@@ -258,7 +255,9 @@ each answer, paired with `peak_in_flight()` for measuring a caller's fan-out
 bound. The yield is what makes concurrent legs genuinely outstanding together
 rather than each completing before the next is polled, and it is a separate
 constructor because that interleaving change is observable - most tests want the
-deterministic immediate answer. Both DAV crates use it to pin their multiget leg
+deterministic immediate answer. Request snapshots record the initial exact
+body size hint and emitted byte count separately; the dispatcher checks their
+agreement and checks Content-Length against the emitted bytes. Both DAV crates use it to pin their multiget leg
 concurrency; ablating the bound reads 10 against a bound of 4.
 
 `AccountNet` exposes `get`, `post`, `put`, `patch`, `delete`, plus
@@ -326,9 +325,12 @@ The transport-failure retry branch consults idempotency;
 `transport_error_is_replayable` allows a retry when EITHER nothing was
 transmitted (`TransmissionState::Unsent`) OR replaying cannot change
 server state. Past `Unsent` on a non-idempotent request the side effect
-may already have landed, and `send_error_to_error` classifies every
-non-connect, non-timeout reqwest failure as `Network { InFlight }` -
-exactly that evidence. Retrying regardless is how one Gmail
+may already have landed. A remote HTTP/2 `REFUSED_STREAM` reset guarantees
+the stream was not processed (RFC 9113 section 8.7), so `send_error_to_error` classifies it
+as `Network { Unsent }`. The retry loop rebuilds a fresh upload body through
+admission on each attempt; reqwest cannot clone the wrapped body for its own
+protocol retries. Other non-connect, non-timeout reqwest failures are
+`Network { InFlight }`, preserving that uncertainty. Retrying regardless is how one Gmail
 `/messages/send` becomes two delivered messages and one JMAP
 `Email/set` create becomes two drafts, and it happened three times
 before `into_account_error` ever ran, so the `Reconcile` classification
@@ -722,29 +724,78 @@ re-registers it.
 
 ### Bandwidth cap
 
-Per-account cap stored on `AccountNet` in `AtomicU64` with
-`u64::MAX` sentinel for `None`. Throttles via `ByteBucket` on every
-response-body reader - the success stream in `wrap_metered` and the capped
-status-body drains alike. Chunks larger than the per-second cap are
-admitted after `(chunk_size / cap)` seconds of sleep (the cap is a
-smoothing throttle, not a hard ceiling on chunk size). `ByteBucket`
-also uses `tokio::time::Instant`, matching its Tokio sleep clock and
-allowing deterministic virtual-time tests. Every throttle wait is bounded by
-the request's total deadline (see "Deadlines and the buffered ceiling"), so a
-low cap can slow a response but cannot carry it past an explicit total timeout.
-If a stream starts uncapped and receives a cap while live, its bucket initializes
-full on that first capped chunk rather than charging for time before the cap
-existed.
+`BandwidthBudget` is a cloneable Arc handle holding one cap and two independent
+fixed-slot GCRA schedules, inbound and outbound. `None` means unlimited;
+`Some(0)` becomes `Some(1)` with a warning. Every reservation is bounded by the
+requested length, one second of the cap and `MAX_OFFER` (256 KiB). Unlimited
+offers are also bounded by `MAX_OFFER` and tracked until finished or dropped.
 
-`RequestBuilder::without_timeout()` explicitly suppresses an account default
-total deadline while retaining header and body inactivity bounds. JMAP uses it
-for long-lived EventSource responses; ordinary JMAP requests continue to use the
-configured request timeout.
+This is a PAYLOAD cap at the protocol plaintext layer: HTTP bodies and stream
+bytes above TLS. TLS, HTTP headers and bytes buffered below the adapter are
+outside it. It is a smoothing cap, not a wire-rate guarantee. Per direction,
+for any window of length T seconds during which the cap c is constant and
+finite:
 
-`set_bandwidth_cap(Some(0))` is **not** a sentinel for unlimited
-(that is `None`'s job). It is normalised to `Some(1)` with a
-`tracing::warn!` so the caller's misconfiguration is visible
-without parking the stream forever.
+```text
+bytes <= c * (T + 1) + A
+```
+
+A is every unspent allowance outstanding at the window start: queued, ready or
+offered reservations, including earlier-cap grants at their issued size and
+outstanding unlimited offers. There is no bound across unlimited intervals.
+Each sequential adapter operation holds at most one outstanding admission.
+Stream adapters that reserve before a pending read pre-spend that slot: an idle
+read can waste capacity but never blocks siblings. HTTP reserves only after it
+has a hyper chunk to deliver.
+
+A finite reservation advances the theoretical arrival time by its issued
+bytes/cap duration, rounded up to a nanosecond. It is ready when that time is
+within one second of now. An issued slot never moves. Dropping before offer, or
+finishing a short successful I/O, pulls the tail back only when the reservation
+id is still the tail in the current epoch. A non-tail cancellation refunds
+nothing; a dropped offered I/O refunds nothing. A finite-to-finite cap change
+prices only subsequent reservations; earlier slots keep their times and sizes.
+Lifting to unlimited clears the schedules and advances the epoch; imposing a
+cap advances it again with empty schedules. Waiters select on their ready time
+and a watch of (cap, epoch), discard stale reservations and inspect the current
+policy again. Installation and epoch validation use the same mutex. Setting an
+unchanged cap is a no-op, including its watch notification. All admission times
+use the Tokio clock.
+
+`BandwidthRegistry` is an injected Arc-shared AccountId-to-Weak map. Lookup and
+insert share one lock. Inserts prune dead entries, and final budget teardown
+removes its own entry only if the pointer still matches, preserving any
+replacement. `Net::with_bandwidth_registry` injects it;
+`Net::bandwidth_registry` exposes it. `Net::new` creates a fresh private
+registry. `AccountNet` gets its budget at attach, and its cap accessors use that
+shared budget. Retag uses the destination id budget for future admission;
+outstanding grants remain attributed to the source.
+
+The consumer must wire ONE registry into every Net, the engine and the IMAP
+factory. Matching ids in different registries do not coordinate. Stream
+transport migration is separate from this HTTP implementation.
+
+All HTTP response paths use one delivery adapter: buffered and streaming
+successes, downloads, status diagnostics, redirect drains and pre-retry
+discards. It holds the current hyper chunk, lazily admits bounded slices, keeps
+its pending admission across polls and rechecks the request deadline before
+delivery. Diagnostic drains stop admission at their prefix limit; the remainder
+is unpaid. Metering still records fetched chunks before admission.
+
+Each request attempt and body-preserving redirect gets a fresh `UploadBody`, an
+`http_body::Body` whose exact remaining size hint preserves Content-Length
+framing. It splits Bytes into bounded slices and reserves before yielding.
+Cancellation before yield refunds only a current tail; after yield the charge
+stays, because this is admission rather than transmission evidence. Retries pay
+again. The response-header timer excludes request-body admission waits, while
+the absolute request deadline continues to run. Response body inactivity timers
+arm only while awaiting hyper, never while awaiting admission. An exhausted
+response-header active-time budget expires even when the next dispatch poll
+begins upload admission. Admission pauses only unspent time.
+
+`RequestBuilder::without_timeout()` suppresses an account default total deadline
+while retaining header and body inactivity bounds. JMAP uses it for long-lived
+EventSource responses; ordinary JMAP requests keep the configured timeout.
 
 ## Range fetches (`download_stream`)
 
@@ -817,7 +868,7 @@ variants: `Disabled` and `Enabled(RedirectPolicy)`. The default is
 Regardless of the variant, `Net::new` always installs
 `reqwest::redirect::Policy::none()` on the underlying HTTP client -
 `bifrost-net` owns the redirect loop unconditionally so RFC 7231
-§6.4 method rewriting, the trusted-host allowlist, and
+section 6.4 method rewriting, the trusted-host allowlist, and
 `Authorization`-stripping on cross-host hops happen exactly once
 and the same way for every HTTP protocol crate.
 
@@ -856,7 +907,7 @@ interesting is the caller's decision, not the redirect loop's.
 
 `same_origin` - the `keep_auth` / cross-host decision - compares all
 three RFC 6454 origin components: scheme, host (case-insensitively, per
-RFC 3986 §3.2.2), and `port_or_known_default`. Scheme was previously
+RFC 3986 section 3.2.2), and `port_or_known_default`. Scheme was previously
 uncompared on the reasoning that the pipeline only issues `https`;
 nothing enforced that, and an `https` -> `http` downgrade was
 classified cross-origin only because the default ports happen to differ
@@ -866,7 +917,7 @@ the bearer onto a cleartext hop.
 `RedirectPolicy::trusted_hosts` is an allowlist for cross-host hops:
 empty means every host is acceptable; populated means only matching
 hosts are admitted (case-insensitive host comparison per RFC 3986
-§3.2.2) and `Error::RedirectRejected` is returned otherwise.
+section 3.2.2) and `Error::RedirectRejected` is returned otherwise.
 `Authorization` headers are stripped on every cross-host hop
 regardless of allowlist membership, covering both the
 token-source-derived bearer the pipeline injects in `build_reqwest`
@@ -1144,7 +1195,7 @@ crates/net/src/
   request.rs      // RequestBuilder + Response/StreamingResponse;
                   // Dispatch seam, retry loop, redirect walk
   redirect.rs     // FollowRedirects + RedirectPolicy + classify_redirect
-                  // (RFC 7231 §6.4 method rewriting, trusted-host
+                  // (RFC 7231 section 6.4 method rewriting, trusted-host
                   //  allowlist, Authorization stripping)
   account_error.rs // context-aware conversion to bifrost-types AccountError
   auth.rs         // TokenSource + OAuthRefresher state machine +
@@ -1153,6 +1204,8 @@ crates/net/src/
   rate.rs         // RateLimitGovernor + HostBucket
   status_line.rs  // HTTP status-line parsing shared by the DAV crates
   test_support.rs // scripted wire dispatcher (feature "test-support")
+  budget.rs       // BandwidthBudget + BandwidthRegistry + Reservation
+  upload.rs       // exact-sized outbound Body + admission-aware header clock
   bandwidth.rs    // BandwidthMeter + AccountMeter + MeterSink +
                   // MeterSinkHandle
   error.rs        // Error + cap_status_body

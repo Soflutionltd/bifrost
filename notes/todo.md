@@ -171,19 +171,20 @@ working any of them.
   combined across protocols. Every implementation happens to keep separate
   in and out budgets. This is a ruling for the owner, and every item below
   depends on it.
-- **Three separate token-bucket copies.** `bifrost-net` (`net.rs`,
-  sleeps itself), `bifrost-imap` (`connection/wire.rs`, sleeps itself) and
-  `bifrost-smtp` (`client/metering.rs`, debt-returning, with `priced_at`
-  repricing and the tokio clock). The SMTP one is the most complete.
-  Proposed once the contract is ruled: one debt-returning bucket in
-  `bifrost-net`, owned per account per direction by `AccountNet`, shared by
-  HTTP streams, IMAP connections and SMTP connections.
-- **The cap multiplies per HTTP stream.** `wrap_metered` and the
-  error / redirect drains build a fresh, full bucket per response, so N
-  concurrent downloads get N times the cap plus a free first second each.
-- **HTTP request bodies are never throttled.** Outbound bytes are recorded
-  in `request.rs` but never capped, so JMAP blob uploads and Graph sends
-  ignore the cap.
+- **IMAP and SMTP still keep their own token buckets.** `bifrost-net` now
+  has the shared `BandwidthBudget` and `BandwidthRegistry`
+  (`crates/net/src/budget.rs`); `bifrost-imap` (`connection/wire.rs`) and
+  `bifrost-smtp` (`client/metering.rs`) have not migrated onto it yet.
+- **Net bandwidth test gaps (P3s from the net budget review).** The
+  refused-stream test calls the classifier directly and never drives the
+  retry loop, so a retry that dropped or emptied the body would pass; the
+  Content-Length framing assertion checks a header `ScriptedDispatch`
+  synthesizes from the size hint rather than production framing (an
+  in-memory HTTP transcript would cover it); `ScriptedDispatch` now picks a
+  scripted outcome after draining the upload, so concurrent requests with
+  different admission delays can pair outcomes and snapshots out of order;
+  `BandwidthRegistry` scans every entry on each new identity, quadratic
+  over many simultaneously live ids.
 - **The cap multiplies per IMAP connection.** Every pool dial and the
   bootstrap connection build their own `WireMetering` from the account's
   atomic, so a pool of N connections runs at about N times the cap, and a
@@ -197,14 +198,6 @@ working any of them.
   atomic; `set_priority` does not forward either, and the DAV sub-accounts
   keep their own `AccountNet`. A stale "until IMAP byte-metering is wired"
   comment sits next to it.
-- **IMAP's bucket refills on `std::time::Instant` while sleeping on
-  tokio**, the paused-clock mismatch SMTP's bucket already fixed.
-- **`bifrost-net` clamps an oversized chunk's sleep at 60 seconds**, so a
-  very low cap is exceeded: the overrun the IMAP and SMTP buckets warn
-  against.
-- **A re-tagged `AccountNet` copies the cap instead of sharing it.** The
-  constructor that re-tags the account id builds a new `AtomicU64`, so a
-  later `set_bandwidth_cap` on one handle does not reach the other.
 - **SMTP's INBOUND cap is still per connection.** Outbound now goes
   through shared admission (`OutboundSchedule` in
   `crates/smtp/src/transport/smtp/client/metering.rs`); inbound keeps the

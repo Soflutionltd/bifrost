@@ -25,6 +25,7 @@
 pub mod account_error;
 pub mod auth;
 pub mod bandwidth;
+pub mod budget;
 pub mod concurrency;
 pub mod config;
 pub mod error;
@@ -40,11 +41,13 @@ pub mod status_line;
 #[cfg(any(feature = "test-support", test))]
 pub mod test_support;
 pub(crate) mod trace;
+mod upload;
 pub mod url;
 
 pub use account_error::{NetErrorContext, into_account_error};
 pub use auth::{AccessToken, OAuthRefresher, RefreshState, StaticTokenSource, TokenSource};
 pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink, MeterSinkHandle};
+pub use budget::{BandwidthBudget, BandwidthDirection, BandwidthRegistry, Reservation};
 // Shared identity / priority / byte-range / future-alias types live
 // in bifrost-types so the engine, the protocol crates, and this
 // crate all speak the same language. Re-exported here for ergonomic

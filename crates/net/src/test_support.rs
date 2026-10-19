@@ -136,6 +136,10 @@ pub struct RequestSnapshot {
     pub headers: HeaderMap,
     /// Request body, if the request carried one in memory.
     pub body: Option<Bytes>,
+    /// Exact body size hint before any frames were polled.
+    pub body_size_hint: Option<u64>,
+    /// Bytes emitted by the body, counted independently of its size hint.
+    pub emitted_body_bytes: u64,
     /// Total request deadline as sent. `None` unless the caller set
     /// one: the pipeline supplies no deadline of its own, bounding a
     /// stalled request with an account request timeout instead. Exposed
@@ -234,6 +238,19 @@ impl ScriptedDispatch {
     }
 }
 
+fn headers_content_length(request: &reqwest::Request) -> Option<u64> {
+    request
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .map(|value| {
+            value
+                .to_str()
+                .expect("ASCII Content-Length")
+                .parse()
+                .expect("numeric Content-Length")
+        })
+}
+
 impl Dispatch for ScriptedDispatch {
     fn send(
         &self,
@@ -245,22 +262,65 @@ impl Dispatch for ScriptedDispatch {
         let peak_in_flight = Arc::clone(&self.peak_in_flight);
         let yield_before_answering = self.yield_before_answering;
         Box::pin(async move {
-            let request = request.build().map_err(send_error_to_error)?;
-            let body = request
-                .body()
-                .and_then(reqwest::Body::as_bytes)
-                .map(Bytes::copy_from_slice);
-            requests
-                .lock()
-                .expect("scripted request lock poisoned")
-                .push(RequestSnapshot {
+            let mut request = request.build().map_err(send_error_to_error)?;
+            // Consume the real Body so admission and framing are exercised
+            // below the retry loop, just as they are by hyper.
+            let mut body = request.body_mut().take();
+            let mut headers = request.headers().clone();
+            use http_body::Body as _;
+            let body_size_hint = body.as_ref().and_then(|body| body.size_hint().exact());
+            if let Some(body) = &body {
+                use http_body::Body as _;
+                if let Some(len) = body.size_hint().exact() {
+                    headers
+                        .entry(reqwest::header::CONTENT_LENGTH)
+                        .or_insert_with(|| len.into());
+                }
+            }
+            let index = {
+                let mut requests = requests.lock().expect("scripted request lock poisoned");
+                let index = requests.len();
+                requests.push(RequestSnapshot {
                     method: request.method().clone(),
                     url: request.url().clone(),
-                    headers: request.headers().clone(),
-                    body,
+                    headers,
+                    body: None,
+                    body_size_hint,
+                    emitted_body_bytes: 0,
                     timeout: request.timeout().copied(),
                 });
+                index
+            };
             let _in_flight = InFlightGuard::enter(&in_flight, &peak_in_flight);
+            if let Some(ref mut body) = body {
+                use http_body::Body as _;
+                let mut bytes = Vec::new();
+                while let Some(frame) =
+                    futures::future::poll_fn(|cx| std::pin::Pin::new(&mut *body).poll_frame(cx))
+                        .await
+                {
+                    let frame = frame.map_err(send_error_to_error)?;
+                    if let Ok(data) = frame.into_data() {
+                        bytes.extend_from_slice(&data);
+                    }
+                }
+                let emitted_body_bytes = bytes.len() as u64;
+                if let Some(expected) = body_size_hint {
+                    assert_eq!(
+                        expected, emitted_body_bytes,
+                        "body size hint disagrees with frames"
+                    );
+                }
+                if let Some(length) = headers_content_length(&request) {
+                    assert_eq!(
+                        length, emitted_body_bytes,
+                        "Content-Length disagrees with frames"
+                    );
+                }
+                let mut requests = requests.lock().expect("scripted request lock poisoned");
+                requests[index].emitted_body_bytes = emitted_body_bytes;
+                requests[index].body = Some(Bytes::from(bytes));
+            }
             if yield_before_answering {
                 tokio::task::yield_now().await;
             }

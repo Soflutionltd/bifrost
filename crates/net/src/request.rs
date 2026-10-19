@@ -26,7 +26,7 @@ use crate::error::{
     Error, FinalResponse, STATUS_BODY_CAP, STATUS_BODY_CONNECTION_MARKER,
     STATUS_BODY_TIMEOUT_MARKER,
 };
-use crate::net::{AccountNet, ByteBucket, into_byte_stream, wrap_metered};
+use crate::net::{AccountNet, into_byte_stream, wrap_delivery, wrap_metered};
 use crate::rate::{RateGeneration, RateLimitGovernor};
 use crate::redirect::{FollowRedirects, RedirectAction, RedirectPolicy, classify_redirect};
 use crate::retry::RetryPolicy;
@@ -59,8 +59,7 @@ impl RequestDeadline {
     }
 
     /// Bound a wait on the response-body path by the total deadline.
-    /// The bandwidth-cap throttle sleeps inside `ByteBucket::consume`
-    /// are the reason this exists: they are the one class of wait the
+    /// Shared bandwidth admission waits are the reason this exists: they are the one class of wait the
     /// retry loop never sees, and with a low cap they can outlast the
     /// caller's total timeout by minutes.
     pub(crate) async fn bound_body<F: std::future::Future>(
@@ -104,6 +103,19 @@ impl RequestDeadline {
                 .await
                 .map_err(|_| Error::Timeout {
                     transmission_state: TransmissionState::Unsent,
+                }),
+            None => Ok(future.await),
+        }
+    }
+
+    /// Bound dispatch, including upload admission, by the absolute deadline.
+    /// Once dispatch starts, expiry carries in-flight transmission evidence.
+    async fn bound_dispatch<F: std::future::Future>(self, future: F) -> Result<F::Output, Error> {
+        match self.0 {
+            Some(at) => tokio::time::timeout_at(at, future)
+                .await
+                .map_err(|_| Error::Timeout {
+                    transmission_state: TransmissionState::InFlight,
                 }),
             None => Ok(future.await),
         }
@@ -829,7 +841,7 @@ async fn acquire_claims(claims: Vec<(ConcurrencyLimit, usize)>) -> Vec<Concurren
 ///
 /// The function also walks 3xx redirect chains under the configured
 /// `FollowRedirects` policy. Redirect classification calls
-/// `redirect::classify_redirect` which enforces RFC 7231 §6.4 method
+/// `redirect::classify_redirect` which enforces RFC 7231 section 6.4 method
 /// rewriting, the trusted-host allowlist, and `Authorization` stripping
 /// on cross-host hops; this function then rebuilds the request from
 /// the resulting `RedirectStep` and re-enters the retry loop with the
@@ -949,7 +961,7 @@ pub(crate) async fn send_streaming_inner(
         deadline.remaining()?;
         let attempt = attempts.begin();
         // Resolved per attempt rather than once, because a redirect hop
-        // can rewrite the method: RFC 7231 §6.4 turns a 301/302/303 on a
+        // can rewrite the method: RFC 7231 section 6.4 turns a 301/302/303 on a
         // POST into a GET, and the GET that results is replayable even
         // though the request the caller wrote was not.
         let replayable = idempotent.unwrap_or_else(|| method.is_idempotent());
@@ -1023,6 +1035,7 @@ pub(crate) async fn send_streaming_inner(
             bytes_out = bytes_out.saturating_add(out_n);
         }
 
+        let header_clock = crate::upload::HeaderClock::new();
         let request = build_reqwest(
             account.net().client(),
             &method,
@@ -1031,26 +1044,20 @@ pub(crate) async fn send_streaming_inner(
             &body,
             token.as_ref(),
             deadline.remaining()?,
+            &account,
+            &header_clock,
         );
 
         let dispatched = account.net().dispatch().send(request);
-        let headers_timeout = account.response_headers_timeout();
-        let dispatch_limit = match (headers_timeout, deadline.remaining()?) {
-            (Some(headers), Some(remaining)) => Some(headers.min(remaining)),
-            (Some(headers), None) => Some(headers),
-            (None, Some(remaining)) => Some(remaining),
-            (None, None) => None,
+        let dispatched = async {
+            header_clock
+                .bound(dispatched, account.response_headers_timeout())
+                .await?
         };
-        let dispatched = if let Some(limit) = dispatch_limit {
-            match tokio::time::timeout(limit, dispatched).await {
-                Ok(result) => result,
-                Err(_) => Err(Error::Timeout {
-                    transmission_state: TransmissionState::InFlight,
-                }),
-            }
-        } else {
-            dispatched.await
-        };
+        let dispatched = deadline
+            .bound_dispatch(dispatched)
+            .await
+            .and_then(std::convert::identity);
         let response = match dispatched {
             Ok(r) => {
                 if let Some(debit) = rate_debit.as_mut() {
@@ -1214,7 +1221,7 @@ pub(crate) async fn send_streaming_inner(
                             url = step.next_url;
                             if !step.preserve_body {
                                 body = None;
-                                // RFC 7231 §6.4 also drops content-
+                                // RFC 7231 section 6.4 also drops content-
                                 // describing headers when the body is
                                 // dropped, otherwise the next hop
                                 // carries a content-type for a body
@@ -1402,6 +1409,7 @@ pub(crate) async fn send_streaming_inner(
 /// pieces. Injects `Authorization`, `traceparent`, and the per-request
 /// timeout. Body is cloned from `Bytes` so each retry attempt sends
 /// the same payload.
+#[allow(clippy::too_many_arguments)]
 fn build_reqwest(
     client: &reqwest::Client,
     method: &reqwest::Method,
@@ -1410,6 +1418,8 @@ fn build_reqwest(
     body: &Option<Bytes>,
     token: Option<&AccessToken>,
     timeout: Option<Duration>,
+    account: &AccountNet,
+    clock: &Arc<crate::upload::HeaderClock>,
 ) -> reqwest::RequestBuilder {
     let mut req = client.request(method.clone(), url);
     for (k, v) in headers {
@@ -1432,7 +1442,11 @@ fn build_reqwest(
         req = req.timeout(t);
     }
     if let Some(b) = body {
-        req = req.body(b.clone());
+        req = req.body(reqwest::Body::wrap(crate::upload::UploadBody::new(
+            b.clone(),
+            account.bandwidth_budget().clone(),
+            Arc::clone(clock),
+        )));
     }
     req
 }
@@ -1442,8 +1456,8 @@ fn build_reqwest(
 /// Two conditions make a replay safe, and either suffices: nothing was
 /// transmitted, or transmitting it again cannot change server state.
 /// Past `Unsent` on a non-idempotent request the side effect may
-/// already have landed - `send_error_to_error` classifies every
-/// non-connect, non-timeout reqwest failure as
+/// already have landed - `send_error_to_error` classifies other
+/// non-connect, non-timeout reqwest failures as
 /// `Network { InFlight }`, which is precisely the "may have landed"
 /// evidence - and a blind replay is how one Gmail `messages/send`
 /// becomes two delivered messages, or one JMAP `Email/set` create
@@ -1499,7 +1513,7 @@ pub(crate) fn send_error_to_error(e: reqwest::Error) -> Error {
             transmission_state: TransmissionState::InFlight,
         };
     }
-    if e.is_connect() {
+    if e.is_connect() || refused_stream_in_source_chain(&e) {
         return Error::Network {
             message,
             transmission_state: TransmissionState::Unsent,
@@ -1511,6 +1525,23 @@ pub(crate) fn send_error_to_error(e: reqwest::Error) -> Error {
         transmission_state: TransmissionState::InFlight,
         source: Some(Box::new(e)),
     }
+}
+
+// RFC 9113 section 8.7: REFUSED_STREAM guarantees no processing. Wrapped
+// upload bodies cannot be cloned by reqwest, so our retry loop rebuilds them.
+fn refused_stream_in_source_chain(e: &(dyn StdError + 'static)) -> bool {
+    let mut current = Some(e);
+    while let Some(err) = current {
+        if let Some(h2) = err.downcast_ref::<h2::Error>()
+            && h2.is_reset()
+            && h2.is_remote()
+            && h2.reason() == Some(h2::Reason::REFUSED_STREAM)
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }
 
 fn native_tls_error_in_source_chain(e: &reqwest::Error) -> bool {
@@ -1558,58 +1589,28 @@ async fn read_capped_response_body(
 ) -> Result<Bytes, Error> {
     use futures::StreamExt;
 
-    let mut stream = response.bytes_stream();
+    let mut stream = wrap_delivery(
+        into_byte_stream(response, account.read_timeout()),
+        account.clone(),
+        deadline,
+        request_bytes.clone(),
+        Some(STATUS_BODY_CAP + 1),
+    );
     let mut buf = Vec::new();
-    // A byte counted against the account must also be paid for. These
-    // drains - terminal statuses, pre-retry discards, rejected-token
-    // 401 bodies, followed redirects - read real inbound bytes, so
-    // they owe the same per-account bandwidth cap the success body
-    // pays in `wrap_metered`. Without this a 429/5xx storm or a long
-    // redirect chain consumes uncapped inbound bandwidth. The bucket
-    // is per-drain rather than per-request for the same reason
-    // `wrap_metered` builds one per stream: it starts full so a short
-    // error body is never delayed, and the cap only bites once a
-    // single drain runs long.
-    let bucket = ByteBucket::new(account.bandwidth_cap());
-    loop {
-        let next = match account.read_timeout() {
-            Some(limit) => match deadline
-                .bound_body(tokio::time::timeout(limit, stream.next()))
-                .await
-            {
-                Ok(Ok(next)) => next,
-                Ok(Err(_)) => {
-                    append_status_marker(&mut buf, STATUS_BODY_TIMEOUT_MARKER);
-                    break;
-                }
-                Err(error) => return Err(error),
-            },
-            None => match deadline.bound_body(stream.next()).await {
-                Ok(next) => next,
-                Err(error) => return Err(error),
-            },
-        };
-        let Some(chunk) = next else { break };
+    while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(chunk) => chunk,
-            Err(_) => {
-                append_status_marker(&mut buf, STATUS_BODY_CONNECTION_MARKER);
+            Err(error) => {
+                deadline.check_body()?;
+                let marker = if matches!(error, Error::Timeout { .. }) {
+                    STATUS_BODY_TIMEOUT_MARKER
+                } else {
+                    STATUS_BODY_CONNECTION_MARKER
+                };
+                append_status_marker(&mut buf, marker);
                 break;
             }
         };
-        let n = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
-        // Meter first, then the deadline, then the throttle - the
-        // ordering the success body uses. The throttle wait is bounded
-        // by the overall deadline exactly as `wrap_metered`'s is, so
-        // adding it to an error path cannot turn a failing request
-        // into a hang.
-        account.meter().record_bytes_in(n);
-        request_bytes.record(n);
-        deadline.check_body()?;
-        let cap_now = account.bandwidth_cap();
-        if cap_now.is_some() {
-            deadline.bound_body(bucket.consume(n, cap_now)).await?;
-        }
         if buf.len() <= STATUS_BODY_CAP {
             let remaining = STATUS_BODY_CAP + 1 - buf.len();
             if chunk.len() > remaining {
@@ -1676,7 +1677,7 @@ fn resolve_quota_scope(
 /// is what the no-override path already did per hop. A same-host hop
 /// keeps it: the units mean the same thing on the same bucket.
 ///
-/// Host comparison is case-insensitive (RFC 3986 §3.2.2), matching the
+/// Host comparison is case-insensitive (RFC 3986 section 3.2.2), matching the
 /// redirect classifier's own same-origin test.
 fn cost_override_for_hop(
     prior_host: Option<&str>,
@@ -1706,7 +1707,7 @@ fn recompute_cost_units(
 }
 
 /// Strip body-describing headers after a redirect demands the body
-/// be dropped (RFC 7231 §6.4 method rewrite to GET). Without this,
+/// be dropped (RFC 7231 section 6.4 method rewrite to GET). Without this,
 /// the next hop carries `Content-Type` / `Content-Length` /
 /// `Content-Encoding` for a body that no longer exists.
 fn strip_body_headers(headers: &mut HeaderMap) {
@@ -3169,5 +3170,293 @@ mod tests {
             None,
             "no override stays no override"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_streams_share_one_inbound_schedule() {
+        let script = ScriptedDispatch::new((0..4).map(|_| canned(StatusCode::OK, b"0123456789")));
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+        account.set_bandwidth_cap(Some(10));
+        let started = tokio::time::Instant::now();
+        use futures::StreamExt as _;
+        let results = futures::future::join_all((0..4).map(|_| {
+            let account = account.clone();
+            async move {
+                let mut response = account
+                    .get("https://shared.test/body")
+                    .send_streaming()
+                    .await
+                    .expect("shared download headers");
+                let mut len = 0;
+                while let Some(chunk) = response.body.next().await {
+                    len += chunk.expect("shared download slice").len();
+                }
+                len
+            }
+        }))
+        .await;
+        assert_eq!(results, vec![10; 4]);
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        assert_eq!(account.meter().bytes_in(), 40);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "Content-Length disagrees with frames")]
+    async fn scripted_upload_rejects_wrong_content_length() {
+        let script = ScriptedDispatch::new([canned(StatusCode::OK, b"")]);
+        let account = crate::test_support::scripted_net(&script, NetConfig::default())
+            .attach_account(
+                crate::AccountId("wrong-length".into()),
+                crate::AccountSpec::new(None),
+            );
+        account
+            .post("https://upload.test/body")
+            .without_bearer_auth()
+            .header("Content-Length", "99")
+            .body(Bytes::from_static(b"abc"))
+            .send()
+            .await
+            .expect("script response");
+    }
+
+    #[tokio::test]
+    async fn refused_stream_is_unsent_and_post_replayable() {
+        use http_body::Body as _;
+        for (reason, expected) in [
+            (h2::Reason::REFUSED_STREAM, TransmissionState::Unsent),
+            (h2::Reason::CANCEL, TransmissionState::InFlight),
+            (h2::Reason::INTERNAL_ERROR, TransmissionState::InFlight),
+        ] {
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let server = tokio::spawn(async move {
+                let mut connection = h2::server::handshake(server_io)
+                    .await
+                    .expect("server handshake");
+                let (_, mut response) = connection
+                    .accept()
+                    .await
+                    .expect("request")
+                    .expect("valid request");
+                response.send_reset(reason);
+                let _ = connection.accept().await;
+            });
+            let (mut client, connection) = h2::client::handshake(client_io)
+                .await
+                .expect("client handshake");
+            let driver = tokio::spawn(connection);
+            let request = http::Request::builder()
+                .method("POST")
+                .uri("https://upload.test/body")
+                .body(())
+                .expect("request");
+            let (response, _) = client.send_request(request, true).expect("send request");
+            let reset = response.await.expect_err("remote reset");
+            assert!(reset.is_reset() && reset.is_remote());
+            server.abort();
+            driver.abort();
+            let mut body =
+                reqwest::Body::wrap_stream(futures::stream::once(
+                    async move { Err::<Bytes, _>(reset) },
+                ));
+            let frame = futures::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+                .await
+                .expect("error frame");
+            let error = send_error_to_error(frame.expect_err("transport error"));
+            assert!(
+                matches!(&error, Error::Network { transmission_state, .. } if *transmission_state == expected)
+            );
+            assert_eq!(
+                transport_error_is_replayable(&error, false),
+                expected == TransmissionState::Unsent
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capped_upload_preserves_content_length_and_excludes_admission_from_headers_timeout() {
+        let script = ScriptedDispatch::new([canned(StatusCode::OK, b"")]);
+        let mut spec = crate::AccountSpec::new(None);
+        spec.response_headers_timeout = Some(Duration::from_millis(100));
+        let account = crate::test_support::scripted_net(&script, NetConfig::default())
+            .attach_account(crate::AccountId("upload".into()), spec);
+        account.set_bandwidth_cap(Some(10));
+        let started = tokio::time::Instant::now();
+        let payload = Bytes::from_static(b"0123456789012345678901234567890123456789");
+        account
+            .post("https://upload.test/body")
+            .without_bearer_auth()
+            .body(payload.clone())
+            .send()
+            .await
+            .expect("admission does not consume header timeout");
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        let requests = script.requests();
+        assert_eq!(requests[0].headers[reqwest::header::CONTENT_LENGTH], "40");
+        assert_eq!(requests[0].body_size_hint, Some(40));
+        assert_eq!(requests[0].emitted_body_bytes, 40);
+        assert_eq!(requests[0].body.as_ref(), Some(&payload));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn header_timeout_still_runs_after_upload_admission() {
+        let script = ScriptedDispatch::new([Canned::Pending]);
+        let mut spec = crate::AccountSpec::new(None);
+        spec.response_headers_timeout = Some(Duration::from_millis(100));
+        let account = crate::test_support::scripted_net(&script, NetConfig::default())
+            .attach_account(crate::AccountId("upload-stall".into()), spec);
+        account.set_bandwidth_cap(Some(10));
+        let started = tokio::time::Instant::now();
+        let error = account
+            .post("https://upload.test/stall")
+            .without_bearer_auth()
+            .body(Bytes::from_static(b"01234567890123456789"))
+            .send()
+            .await
+            .err()
+            .expect("headers stall");
+        assert!(matches!(
+            error,
+            Error::Timeout {
+                transmission_state: TransmissionState::InFlight
+            }
+        ));
+        assert_eq!(started.elapsed(), Duration::from_millis(1100));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_pays_upload_admission_again() {
+        let script = ScriptedDispatch::new([
+            canned(StatusCode::SERVICE_UNAVAILABLE, b""),
+            canned(StatusCode::OK, b""),
+        ]);
+        let mut policy = two_attempts();
+        policy.initial_backoff = Duration::ZERO;
+        policy.max_backoff = Duration::ZERO;
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), policy);
+        account.set_bandwidth_cap(Some(10));
+        let started = tokio::time::Instant::now();
+        account
+            .put("https://retry-upload.test/body")
+            .body(Bytes::from_static(b"01234567890123456789"))
+            .send()
+            .await
+            .expect("retry upload");
+        assert_eq!(script.requests().len(), 2);
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        assert_eq!(account.meter().bytes_out(), 40);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_body_preserving_redirect_pays_upload_admission_again() {
+        let mut headers = HeaderMap::new();
+        headers.insert(LOCATION, HeaderValue::from_static("/next"));
+        let script = ScriptedDispatch::new([
+            canned_with_headers(StatusCode::TEMPORARY_REDIRECT, headers, b""),
+            canned(StatusCode::OK, b""),
+        ]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+        account.set_bandwidth_cap(Some(10));
+        let started = tokio::time::Instant::now();
+        account
+            .put("https://redirect-upload.test/body")
+            .body(Bytes::from_static(b"01234567890123456789"))
+            .send()
+            .await
+            .expect("redirect upload");
+        assert_eq!(script.requests().len(), 2);
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn diagnostics_pay_only_the_delivered_prefix_of_a_large_hyper_chunk() {
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: StatusCode::NOT_FOUND,
+            headers: HeaderMap::new(),
+            body: Bytes::from(vec![b'x'; 512 * 1024]),
+        }]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+        account.set_bandwidth_cap(Some(1024));
+        let started = tokio::time::Instant::now();
+        let error = account
+            .get("https://diagnostic.test/body")
+            .send()
+            .await
+            .err()
+            .expect("terminal status");
+        assert!(matches!(error, Error::Status { .. }));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(started.elapsed() >= Duration::from_secs(3));
+        assert_eq!(account.meter().bytes_in(), 512 * 1024);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_slice_rechecks_deadline_when_the_consumer_resumes() {
+        use futures::StreamExt as _;
+        let script = ScriptedDispatch::new([canned(StatusCode::OK, b"0123456789abcdefghij")]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+        account.set_bandwidth_cap(Some(10));
+        let mut response = account
+            .get("https://resume.test/body")
+            .timeout(Duration::from_secs(2))
+            .send_streaming()
+            .await
+            .expect("response headers");
+        assert_eq!(
+            response
+                .body
+                .next()
+                .await
+                .expect("first slice")
+                .expect("data")
+                .len(),
+            10
+        );
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(matches!(
+            response.body.next().await.expect("deadline error"),
+            Err(Error::Timeout {
+                transmission_state: TransmissionState::Acknowledged
+            })
+        ));
+        assert!(response.body.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_inactivity_timer_does_not_run_during_admission() {
+        let script = ScriptedDispatch::new([canned(StatusCode::OK, b"0123456789abcdefghij")]);
+        let mut spec = crate::AccountSpec::new(None);
+        spec.read_timeout = Some(Duration::from_millis(100));
+        let account = crate::test_support::scripted_net(&script, NetConfig::default())
+            .attach_account(crate::AccountId("body-admission".into()), spec);
+        account.set_bandwidth_cap(Some(10));
+        let started = tokio::time::Instant::now();
+        let response = account
+            .get("https://body-admission.test/body")
+            .without_bearer_auth()
+            .send()
+            .await
+            .expect("throttle is not body inactivity");
+        assert_eq!(response.body.len(), 20);
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
     }
 }
