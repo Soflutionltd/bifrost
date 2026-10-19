@@ -11,7 +11,7 @@
 //! Applies to all four protocols today; the
 //! `MutationReplaySafety::ReplayToken` variant is reserved but unused.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use bifrost_types::{
     Account, AccountErrorKind, FlagOp, HydratedObject, HydratedObjectKind, ItemOutcome,
@@ -83,38 +83,16 @@ pub(crate) async fn run_readback_guard_observed(
     op: &FlagOp,
     sink: ReadbackErrorSink<'_>,
 ) -> Result<ReadbackOutcome, Error> {
-    let input = stream::iter(ids).boxed();
-    let mut stream = account.get_stream(input, Projection::FlagsOnly);
+    let (objects, error) = run_object_readback(account, ids, ReadbackTarget::Flags(op), sink).await;
+    if let Some(error) = error {
+        return Err(error);
+    }
     let mut outcome = ReadbackOutcome::default();
-    while let Some(event) = stream.next().await {
-        match event {
-            SyncEvent::Batch(batch) => {
-                for item in batch.items {
-                    observe(sink, &item);
-                    match item {
-                        ItemOutcome::Succeeded(success) => {
-                            if matches_target(&success.output, op) {
-                                outcome.skipped = outcome.skipped.saturating_add(1);
-                            } else {
-                                outcome.still_failed = outcome.still_failed.saturating_add(1);
-                            }
-                        }
-                        ItemOutcome::Failed(_) | ItemOutcome::Uncertain(_) => {
-                            // The hydration itself failed or was
-                            // ambiguous; the read-back cannot
-                            // disambiguate so the mutation's original
-                            // `Failed` outcome stands.
-                            outcome.uncertain = outcome.uncertain.saturating_add(1);
-                        }
-                    }
-                }
-            }
-            SyncEvent::Done(_) => break,
-            SyncEvent::Terminated(err) => {
-                return Err(Error::Account(err));
-            }
-            SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
-            _ => {}
+    for result in objects.values() {
+        match result {
+            ObjectReadback::Matched => outcome.skipped += 1,
+            ObjectReadback::Mismatched => outcome.still_failed += 1,
+            ObjectReadback::Unresolved => outcome.uncertain += 1,
         }
     }
     Ok(outcome)
@@ -173,34 +151,17 @@ pub(crate) async fn run_move_readback_guard_observed(
     destination: &MembershipScope,
     sink: ReadbackErrorSink<'_>,
 ) -> Result<ReadbackOutcome, Error> {
-    let input = stream::iter(ids).boxed();
-    let mut stream = account.get_stream(input, Projection::Metadata);
+    let (objects, error) =
+        run_object_readback(account, ids, ReadbackTarget::Move(destination), sink).await;
+    if let Some(error) = error {
+        return Err(error);
+    }
     let mut outcome = ReadbackOutcome::default();
-    while let Some(event) = stream.next().await {
-        match event {
-            SyncEvent::Batch(batch) => {
-                for item in batch.items {
-                    observe(sink, &item);
-                    match item {
-                        ItemOutcome::Succeeded(success) => {
-                            if membership_contains(&success.output, destination) {
-                                outcome.skipped = outcome.skipped.saturating_add(1);
-                            } else {
-                                outcome.still_failed = outcome.still_failed.saturating_add(1);
-                            }
-                        }
-                        ItemOutcome::Failed(_) | ItemOutcome::Uncertain(_) => {
-                            outcome.uncertain = outcome.uncertain.saturating_add(1);
-                        }
-                    }
-                }
-            }
-            SyncEvent::Done(_) => break,
-            SyncEvent::Terminated(err) => {
-                return Err(Error::Account(err));
-            }
-            SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
-            _ => {}
+    for result in objects.values() {
+        match result {
+            ObjectReadback::Matched => outcome.skipped += 1,
+            ObjectReadback::Mismatched => outcome.still_failed += 1,
+            ObjectReadback::Unresolved => outcome.uncertain += 1,
         }
     }
     Ok(outcome)
@@ -237,40 +198,100 @@ pub(crate) async fn run_destroy_readback_guard_observed(
     ids: Vec<ObjectId>,
     sink: ReadbackErrorSink<'_>,
 ) -> Result<ReadbackOutcome, Error> {
-    let input = stream::iter(ids).boxed();
-    let mut stream = account.get_stream(input, Projection::Metadata);
+    let (objects, error) = run_object_readback(account, ids, ReadbackTarget::Destroy, sink).await;
+    if let Some(error) = error {
+        return Err(error);
+    }
     let mut outcome = ReadbackOutcome::default();
+    for result in objects.values() {
+        match result {
+            ObjectReadback::Matched => outcome.skipped += 1,
+            ObjectReadback::Mismatched => outcome.still_failed += 1,
+            ObjectReadback::Unresolved => outcome.uncertain += 1,
+        }
+    }
+    Ok(outcome)
+}
+
+/// Per-object observations retain identity and partial progress even when the
+/// hydration stream terminates. Missing ids remain explicitly unresolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectReadback {
+    Matched,
+    Mismatched,
+    Unresolved,
+}
+
+pub(crate) enum ReadbackTarget<'a> {
+    Flags(&'a FlagOp),
+    Move(&'a MembershipScope),
+    Destroy,
+}
+
+pub(crate) async fn run_object_readback(
+    account: &dyn Account,
+    ids: Vec<ObjectId>,
+    target: ReadbackTarget<'_>,
+    sink: ReadbackErrorSink<'_>,
+) -> (HashMap<ObjectId, ObjectReadback>, Option<Error>) {
+    let mut objects: HashMap<_, _> = ids
+        .iter()
+        .cloned()
+        .map(|id| (id, ObjectReadback::Unresolved))
+        .collect();
+    let projection = match target {
+        ReadbackTarget::Flags(_) => Projection::FlagsOnly,
+        _ => Projection::Metadata,
+    };
+    let mut stream = account.get_stream(stream::iter(ids).boxed(), projection);
     while let Some(event) = stream.next().await {
         match event {
             SyncEvent::Batch(batch) => {
                 for item in batch.items {
                     observe(sink, &item);
-                    match item {
-                        ItemOutcome::Succeeded(_) => {
-                            outcome.still_failed = outcome.still_failed.saturating_add(1);
+                    let (id, observation) = match item {
+                        ItemOutcome::Succeeded(success) => {
+                            let matched = match target {
+                                ReadbackTarget::Flags(op) => matches_target(&success.output, op),
+                                ReadbackTarget::Move(destination) => {
+                                    membership_contains(&success.output, destination)
+                                }
+                                ReadbackTarget::Destroy => false,
+                            };
+                            (
+                                ObjectId(success.item.0),
+                                if matched {
+                                    ObjectReadback::Matched
+                                } else {
+                                    ObjectReadback::Mismatched
+                                },
+                            )
                         }
                         ItemOutcome::Failed(failure) => {
-                            if destroy_readback_saw_absence(&failure.error) {
-                                outcome.skipped = outcome.skipped.saturating_add(1);
+                            let result = if matches!(target, ReadbackTarget::Destroy)
+                                && destroy_readback_saw_absence(&failure.error)
+                            {
+                                ObjectReadback::Matched
                             } else {
-                                outcome.uncertain = outcome.uncertain.saturating_add(1);
-                            }
+                                ObjectReadback::Unresolved
+                            };
+                            (ObjectId(failure.item.0), result)
                         }
-                        ItemOutcome::Uncertain(_) => {
-                            outcome.uncertain = outcome.uncertain.saturating_add(1);
+                        ItemOutcome::Uncertain(uncertain) => {
+                            (ObjectId(uncertain.item.0), ObjectReadback::Unresolved)
                         }
+                    };
+                    if let Some(value) = objects.get_mut(&id) {
+                        *value = observation;
                     }
                 }
             }
             SyncEvent::Done(_) => break,
-            SyncEvent::Terminated(err) => {
-                return Err(Error::Account(err));
-            }
-            SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
+            SyncEvent::Terminated(error) => return (objects, Some(Error::Account(error))),
             _ => {}
         }
     }
-    Ok(outcome)
+    (objects, None)
 }
 
 fn destroy_readback_saw_absence(error: &bifrost_types::AccountError) -> bool {

@@ -239,17 +239,15 @@ pub struct MutationConfig {
     /// behalf. It is the default a consumer should reach for, not a bound the
     /// engine enforces.
     pub fanout_buffer: usize,
-    /// Widest single resubmission a bulk-mutation campaign may make.
+    /// Campaign-wide retry-target allowance shared across all throttle cohorts.
     ///
-    /// A campaign's retry set only ever shrinks - it is filtered out of the
-    /// targets still outstanding - so this is not a guard against unbounded
-    /// growth. It caps the per-attempt work one oversized campaign can demand
-    /// of an account, which would otherwise resubmit its entire still-failing
-    /// set on every attempt up to `EngineConfig::mutation_max_retries`.
+    /// A target reserves a slot on its first scheduled retry and retains that
+    /// slot for later retries. Slots are reserved when the retry is scheduled,
+    /// so a held cohort can consume slots before another cohort retries.
     ///
-    /// Targets past the cap are reported `pending_retry` and still pass through
-    /// the read-back guard, so nothing is silently dropped; they are deferred,
-    /// not failed. Campaigns smaller than this are unaffected.
+    /// Excess targets remain `PendingRetry` and pass through the read-back
+    /// guard. This allowance does not bound the initial submission or the
+    /// number of unresolved outcomes retained by the campaign.
     pub retry_queue_cap: usize,
 }
 

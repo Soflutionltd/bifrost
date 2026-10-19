@@ -1,12 +1,16 @@
 //! Mutation pipeline.
 //!
-//! The engine wraps each `Account::bulk_*` call with:
-//! - `IdempotencyKey` vending (run_id + monotonic sequence + protocol salt),
+//! The engine deduplicates campaign targets into throttle cohorts and schedules
+//! one ready submission, retry, or read-back action at a time. It wraps each
+//! `Account::bulk_*` call with:
+//! - one frozen, vended `IdempotencyKey` per cohort (run_id + monotonic
+//!   sequence + protocol salt),
 //! - per-id accumulation through `ItemOutcome<MutationSuccess>` lanes
 //!   (applied / skipped / failed_terminal / pending_retry /
 //!   pending_readback / blocked_by_engine),
-//! - retry on `RecoveryPlan::Retry`, sleeping per `RetryAdvice` and
-//!   re-submitting unresolved ids with the same key,
+//! - retry on `RecoveryPlan::Retry`, respecting each cohort's `RetryAdvice`
+//!   deadline and resubmitting with its frozen key, within a campaign-wide
+//!   retry target allowance,
 //! - the read-back guard, which re-fetches each pending-readback id via
 //!   `account.get_stream(_, Projection::FlagsOnly)` and reconciles
 //!   apparent failures against actual server state.

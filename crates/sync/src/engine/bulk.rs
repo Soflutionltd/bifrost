@@ -126,17 +126,10 @@ impl SyncEngine {
         .await
     }
 
-    /// Shared bulk-mutation pipeline backing [`Self::bulk_move`] and
-    /// [`Self::bulk_destroy`].
-    ///
-    /// Mirrors [`Self::bulk_set_flags`] exactly - idempotency-key
-    /// vending, the per-id `classify_item_outcome` accumulation, the
-    /// retry loop, the stream-terminated recovery dispatch
-    /// (Retry / Reconcile / Engine / Terminal), and the final read-back
-    /// guard - with two op-specific seams: the wire submit call and the
-    /// matching read-back guard. All three entry points route through
-    /// here; the read-back shape (`FlagOp` / membership / absence) is
-    /// selected from `op` rather than by duplicating the loop.
+    /// Schedule bulk mutations as independently ready throttle cohorts.
+    /// Targets are deduplicated and grouped by their singleton declarations;
+    /// each cohort owns one vended key and its own retry and read-back state.
+    /// The per-object outcome map and retry allowance belong to the campaign.
     async fn run_bulk_pipeline(
         &self,
         account_id: &AccountId,
@@ -152,92 +145,291 @@ impl SyncEngine {
             .map(|r| Arc::clone(r.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         let max_retries = self.config.mutation_max_retries;
-        let retry_queue_cap = self.config.mutation.retry_queue_cap;
-
-        let key = vendor.next(protocol);
-
-        let mut outcomes: HashMap<bifrost_types::ObjectId, MutationBucket> = HashMap::new();
-        let mut retry_ids: Vec<bifrost_types::ObjectId> = Vec::new();
-        let mut dedupe_count: u64 = 0;
-        let mut remaining: Vec<bifrost_types::ObjectId> = targets;
-        let mut attempt: u32 = 0;
-        let mut retry_advice: Option<RetryAdvice> = None;
-        let mut blocked_by_engine: bool = false;
-        let mut forwarded_directives: HashSet<DirectiveKey> = HashSet::new();
+        let mut retry_slots = self.config.mutation.retry_queue_cap;
+        let mut retry_owners = HashSet::new();
+        let mut identities = HashMap::new();
+        let mut cohorts = Vec::new();
+        let mut seen = HashSet::new();
+        let account = slot.current.load_full();
+        for id in targets.into_iter().filter(|id| seen.insert(id.clone())) {
+            route_target(
+                &mut cohorts,
+                &mut identities,
+                account.as_ref().as_ref(),
+                account_id,
+                id,
+                &op,
+                vendor,
+                protocol,
+            );
+        }
+        let mut outcomes = HashMap::new();
+        let mut dedupe_count = 0;
+        let mut forwarded_directives = HashSet::new();
+        let mut first_error = None;
+        let mut blocked_by_engine = false;
+        let mut cursor = 0;
 
         loop {
-            if let Some(advice) = retry_advice.take() {
-                let delay = crate::recovery::retry_delay(
-                    &advice,
-                    std::time::SystemTime::now(),
-                    Duration::from_secs(1),
-                );
-                tokio::select! {
-                    () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
-                    () = tokio::time::sleep(delay) => {}
+            if slot.shutdown.is_cancelled() {
+                first_error.get_or_insert(Error::ShuttingDown);
+                break;
+            }
+            let aborting = first_error.is_some();
+            let mut boundary = slot.boundary_tx.subscribe();
+            let mut generation = slot.account_generation_tx.subscribe();
+            if aborting && !matches!(*boundary.borrow_and_update(), BoundaryRequest::Run) {
+                break;
+            }
+            if !aborting && !slot.control.wait_until_running(&slot.shutdown).await {
+                first_error.get_or_insert(Error::ShuttingDown);
+                break;
+            }
+            // Re-route only work never submitted. Submitted and uncertain ids
+            // keep their execution identity even when a reopened account changes
+            // its declaration. Interning keys gives a canonical BTreeSet without
+            // imposing Ord on the published ThrottleKey type.
+            let account = slot.current.load_full();
+            if !aborting && !blocked_by_engine {
+                let mut reroute = Vec::new();
+                for cohort in &mut cohorts {
+                    if !cohort.submitted && !cohort.done {
+                        cohort.remaining.retain(|id| {
+                            let identity = cohort_identity(
+                                &mut identities,
+                                campaign_keys(
+                                    account.as_ref().as_ref(),
+                                    account_id,
+                                    std::slice::from_ref(id),
+                                    &op,
+                                ),
+                            );
+                            if identity == cohort.identity {
+                                true
+                            } else {
+                                reroute.push(id.clone());
+                                false
+                            }
+                        });
+                        cohort.targets = cohort.remaining.clone();
+                        cohort.done = cohort.remaining.is_empty();
+                    }
+                }
+                for id in reroute {
+                    route_target(
+                        &mut cohorts,
+                        &mut identities,
+                        account.as_ref().as_ref(),
+                        account_id,
+                        id,
+                        &op,
+                        vendor,
+                        protocol,
+                    );
                 }
             }
-            // Honor every throttle deadline this attempt consumes - the
-            // account-wide holds plus the keys the account declares for the
-            // targets being submitted and the move's memberships (recorded by
-            // this campaign's previous attempt, a poll, or a sibling account
-            // via a shared key) - before submitting.
-            //
-            // A campaign is ONE throttle unit: it waits until every budget its
-            // submission consumes is free, rather than splitting the targets
-            // by budget. Its idempotency key, retry counter, read-back guard
-            // and every termination sweep all assume one submitted set, so a
-            // campaign spanning a held mailbox and a free one waits for the
-            // held one. That costs latency inside one operation; it never
-            // sends to a held budget and never burns a retry on a wait (this
-            // loop sits outside the attempt counter).
-            //
-            // The check is the LAST thing before submission: it runs again
-            // after the retry-advice sleep above, after a pause park, and
-            // after admission, because a deadline recorded during any of
-            // those waits existed before this attempt started. No permit or
-            // activity guard is held across a throttle wait.
-            let (_activity, _admission, account) = loop {
-                if !slot.control.wait_until_running(&slot.shutdown).await {
-                    return Err(Error::ShuttingDown);
+            // A campaign schedules ONE ready action at a time. A held cohort
+            // yields to siblings; neither a hold nor an admission re-check burns
+            // an attempt, and no admission or activity spans a hold wait.
+            if aborting || blocked_by_engine {
+                for cohort in cohorts.iter_mut().filter(|cohort| !cohort.done) {
+                    if !cohort.submitted {
+                        for id in &cohort.targets {
+                            outcomes.insert(
+                                id.clone(),
+                                if aborting {
+                                    MutationBucket::PendingRetry
+                                } else {
+                                    MutationBucket::BlockedByEngine
+                                },
+                            );
+                        }
+                        cohort.done = true;
+                        continue;
+                    }
+                    if blocked_by_engine && !aborting {
+                        for id in &cohort.targets {
+                            if matches!(outcomes.get(id), Some(MutationBucket::PendingRetry)) {
+                                outcomes.insert(id.clone(), MutationBucket::BlockedByEngine);
+                            }
+                        }
+                    }
+                    cohort.readback = true;
                 }
-                let keys = campaign_keys(
-                    slot.current.load_full().as_ref().as_ref(),
-                    account_id,
-                    &remaining,
-                    &op,
-                );
+            }
+            let readback_set: HashSet<_> = unresolved_readback_ids(&outcomes).into_iter().collect();
+            let mut selected = None;
+            let mut earliest = None;
+            for offset in 0..cohorts.len() {
+                let index = (cursor + offset) % cohorts.len();
+                let cohort = &mut cohorts[index];
+                if cohort.done {
+                    continue;
+                }
+                let ids = if cohort.readback {
+                    cohort
+                        .targets
+                        .iter()
+                        .filter(|id| readback_set.contains(*id))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                } else {
+                    cohort.remaining.clone()
+                };
+                if ids.is_empty() {
+                    cohort.done = true;
+                    continue;
+                }
+                let keys = if cohort.readback {
+                    crate::recovery::declared_keys(
+                        account.as_ref().as_ref(),
+                        account_id,
+                        bifrost_types::ThrottleWork::Objects(&ids),
+                    )
+                } else {
+                    campaign_keys(account.as_ref().as_ref(), account_id, &ids, &op)
+                };
+                let now = tokio::time::Instant::now();
+                let mut ready_at = if cohort.readback {
+                    cohort.reconcile_at
+                } else {
+                    cohort.retry_at
+                };
                 if let Some(wait) =
                     crate::recovery::throttle_wait(&slot.throttles, account_id, &keys)
                 {
-                    tokio::select! {
-                        () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
-                        () = tokio::time::sleep(wait) => {}
-                    }
-                    continue;
+                    ready_at = ready_at.max(now + wait);
                 }
-                let admission = tokio::select! {
-                    () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
-                    permit = slot.scheduler.admit(
-                        account_id.clone(),
-                        slot.control.priority_snapshot(),
-                        crate::scheduler::WorkKind::Mutation,
-                    ) => permit?,
+                if ready_at <= now {
+                    selected = Some((index, ids));
+                    break;
+                }
+                earliest =
+                    Some(earliest.map_or(ready_at, |old: tokio::time::Instant| old.min(ready_at)));
+            }
+            let Some((index, remaining)) = selected else {
+                let Some(deadline) = earliest else {
+                    break;
                 };
-                // The final check asks the account snapshot this attempt
-                // submits through, not the one the keys above came from: a
-                // reopen during admission can install one whose declaration
-                // differs.
-                let account = slot.current.load_full();
-                let keys = campaign_keys(account.as_ref().as_ref(), account_id, &remaining, &op);
-                if crate::recovery::throttle_wait(&slot.throttles, account_id, &keys).is_some() {
-                    drop(admission);
-                    continue;
+                if aborting && slot.control.begin_activity().is_none() {
+                    break;
                 }
-                if let Some(activity) = slot.control.begin_activity() {
-                    break (activity, admission, account);
+                tokio::select! {
+                    () = slot.shutdown.cancelled() => { first_error.get_or_insert(Error::ShuttingDown); break; },
+                    _ = boundary.changed(), if aborting => {},
+                    _ = generation.changed() => {},
+                    () = tokio::time::sleep_until(deadline) => {}
+                }
+                continue;
+            };
+            cursor = (index + 1) % cohorts.len();
+            let admission = tokio::select! {
+                () = slot.shutdown.cancelled() => { first_error.get_or_insert(Error::ShuttingDown); break; },
+                _ = boundary.changed(), if aborting => { continue; },
+                result = slot.scheduler.admit(account_id.clone(), slot.control.priority_snapshot(), crate::scheduler::WorkKind::Mutation) => match result {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                        // Failed observation admission is final for this
+                        // cohort, but cannot discard submitted siblings.
+                        if cohorts[index].readback {
+                            for id in &remaining {
+                                outcomes.insert(id.clone(), MutationBucket::Unresolved);
+                            }
+                            cohorts[index].done = true;
+                        }
+                        continue;
+                    }
                 }
             };
+            let account = slot.current.load_full();
+            let cohort = &mut cohorts[index];
+            let keys = if cohort.readback {
+                crate::recovery::declared_keys(
+                    account.as_ref().as_ref(),
+                    account_id,
+                    bifrost_types::ThrottleWork::Objects(&remaining),
+                )
+            } else {
+                campaign_keys(account.as_ref().as_ref(), account_id, &remaining, &op)
+            };
+            // Admission can wait through a reopen or a newly recorded hold.
+            // Return to the scheduler rather than parking this cohort inline.
+            if crate::recovery::throttle_wait(&slot.throttles, account_id, &keys).is_some() {
+                drop(admission);
+                continue;
+            }
+            if !cohort.submitted
+                && remaining.iter().any(|id| {
+                    cohort_identity(
+                        &mut identities,
+                        campaign_keys(
+                            account.as_ref().as_ref(),
+                            account_id,
+                            std::slice::from_ref(id),
+                            &op,
+                        ),
+                    ) != cohort.identity
+                })
+            {
+                drop(admission);
+                continue;
+            }
+            let Some(activity) = slot.control.begin_activity() else {
+                drop(admission);
+                if aborting {
+                    break;
+                }
+                continue;
+            };
+            if cohort.readback {
+                use crate::mutation::readback::{
+                    ObjectReadback, ReadbackTarget, run_object_readback,
+                };
+                let target = match &op {
+                    BulkPipelineOp::SetFlags(flags) => ReadbackTarget::Flags(flags),
+                    BulkPipelineOp::Move { destination, .. } => ReadbackTarget::Move(destination),
+                    BulkPipelineOp::Destroy => ReadbackTarget::Destroy,
+                };
+                let record = |error: &AccountError| {
+                    record_error_throttle(&slot.throttles, account_id, error);
+                };
+                let result = tokio::select! {
+                    () = slot.shutdown.cancelled() => { first_error.get_or_insert(Error::ShuttingDown); None },
+                    _ = boundary.changed(), if aborting => None,
+                    result = run_object_readback(account.as_ref().as_ref(), remaining.clone(), target, Some(&record)) => Some(result),
+                };
+                if let Some((objects, error)) = result {
+                    for (id, result) in objects {
+                        outcomes.insert(
+                            id,
+                            match result {
+                                ObjectReadback::Matched => MutationBucket::Skipped,
+                                ObjectReadback::Mismatched => MutationBucket::FailedTerminal,
+                                ObjectReadback::Unresolved => MutationBucket::Unresolved,
+                            },
+                        );
+                    }
+                    if let Some(error) = error {
+                        if let Error::Account(error) = &error {
+                            record(error);
+                        }
+                        first_error.get_or_insert(error);
+                    }
+                } else {
+                    for id in remaining {
+                        outcomes.insert(id, MutationBucket::Unresolved);
+                    }
+                }
+                cohort.done = true;
+                drop(activity);
+                drop(admission);
+                continue;
+            }
+            cohort.submitted = true;
+            let key = cohort.key.clone();
+            let mut retry_ids = Vec::new();
+            let mut reconcile_at = cohort.reconcile_at;
             let target_stream: AccountStream<bifrost_types::ObjectId> =
                 Box::pin(futures::stream::iter(remaining.clone()));
             let mut stream = match &op {
@@ -255,17 +447,14 @@ impl SyncEngine {
                 ),
                 BulkPipelineOp::Destroy => account.bulk_destroy(target_stream, key.clone()),
             };
-            // Only the retry queue is per-attempt. Read-back membership
-            // is derived from `outcomes` after the campaign ends, so an
-            // id parked in the read-back lane survives an attempt that
-            // resubmits its siblings.
-            retry_ids.clear();
+            // Read-back membership comes from the outcome map, so an id
+            // parked there survives attempts that resubmit its siblings.
             let mut stream_termination_advice: Option<RetryAdvice> = None;
             let mut item_retry_advice: Option<RetryAdvice> = None;
 
             loop {
                 let event = tokio::select! {
-                    () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
+                    () = slot.shutdown.cancelled() => { first_error = Some(Error::ShuttingDown); break; },
                     event = stream.next() => event,
                 };
                 let Some(event) = event else {
@@ -274,6 +463,40 @@ impl SyncEngine {
                 match event {
                     bifrost_types::SyncEvent::Batch(batch) => {
                         for item in batch.items {
+                            let error = match &item {
+                                ItemOutcome::Failed(failure) => Some(&failure.error),
+                                ItemOutcome::Uncertain(uncertain) => Some(&uncertain.error),
+                                _ => None,
+                            };
+                            if let Some(error) = error {
+                                record_error_throttle(&slot.throttles, account_id, error);
+                                let delay = match error.recovery() {
+                                    bifrost_types::RecoveryClass::Reconcile(advice) => {
+                                        Some(crate::recovery::reconcile_delay(
+                                            advice,
+                                            std::time::SystemTime::now(),
+                                            Duration::from_secs(1),
+                                        ))
+                                    }
+                                    bifrost_types::RecoveryClass::Retry(advice)
+                                        if matches!(
+                                            advice.disposition,
+                                            bifrost_types::RetryDisposition::AfterStateRefresh
+                                        ) =>
+                                    {
+                                        Some(crate::recovery::retry_delay(
+                                            advice,
+                                            std::time::SystemTime::now(),
+                                            Duration::from_secs(1),
+                                        ))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(delay) = delay {
+                                    reconcile_at =
+                                        reconcile_at.max(tokio::time::Instant::now() + delay);
+                                }
+                            }
                             if let Some((directive, error)) = classify_item_outcome(
                                 item,
                                 &mut outcomes,
@@ -320,6 +543,14 @@ impl SyncEngine {
                                     &advice,
                                     &original,
                                 );
+                                reconcile_at = reconcile_at.max(
+                                    tokio::time::Instant::now()
+                                        + crate::recovery::reconcile_delay(
+                                            &advice,
+                                            std::time::SystemTime::now(),
+                                            Duration::from_secs(1),
+                                        ),
+                                );
                                 let mut wants_dedupe = false;
                                 for action in &advice.guidance.actions {
                                     match action {
@@ -335,6 +566,7 @@ impl SyncEngine {
                                             MutationBucket::Applied
                                                 | MutationBucket::Skipped
                                                 | MutationBucket::FailedTerminal
+                                                | MutationBucket::PendingReadback
                                         )
                                     ) {
                                         outcomes
@@ -358,15 +590,19 @@ impl SyncEngine {
                                 break;
                             }
                             RecoveryPlan::Engine(directive) => {
-                                let directive_scope =
-                                    crate::recovery::directive_target_scope(&directive);
-                                let _ = slot
-                                    .reopen_tx
-                                    .send(ReopenRequest::Recovery {
-                                        scope: directive_scope,
-                                        error: original,
-                                    })
-                                    .await;
+                                if should_forward_engine_recovery(
+                                    &mut forwarded_directives,
+                                    &directive,
+                                ) {
+                                    let scope = crate::recovery::directive_target_scope(&directive);
+                                    let _ = slot
+                                        .reopen_tx
+                                        .send(ReopenRequest::Recovery {
+                                            scope,
+                                            error: original,
+                                        })
+                                        .await;
+                                }
                                 blocked_by_engine = true;
                                 for id in &remaining {
                                     if !matches!(
@@ -375,6 +611,7 @@ impl SyncEngine {
                                             MutationBucket::Applied
                                                 | MutationBucket::Skipped
                                                 | MutationBucket::FailedTerminal
+                                                | MutationBucket::PendingReadback
                                         )
                                     ) {
                                         outcomes
@@ -384,7 +621,8 @@ impl SyncEngine {
                                 break;
                             }
                             RecoveryPlan::Terminal(fatal) => {
-                                return Err(Error::Account(fatal.into_inner()));
+                                first_error = Some(Error::Account(fatal.into_inner()));
+                                break;
                             }
                         }
                     }
@@ -412,210 +650,140 @@ impl SyncEngine {
                 }
             }
 
-            if blocked_by_engine {
-                for id in &remaining {
-                    // `PendingReadback` is deliberately excluded, exactly as it
-                    // is from the retry-termination sweep. Those are the ids
-                    // whose write may already have landed - `Uncertain`,
-                    // downgrades, `AfterStateRefresh` - and the read-back lane
-                    // exists so they are VERIFIED rather than replayed or
-                    // guessed at. Claiming them here emptied
-                    // `unresolved_readback_ids`, skipped the guard entirely,
-                    // and reported a mutation that actually applied as
-                    // `blocked_by_engine`. The campaign still stops submitting;
-                    // the guard that follows only observes state.
-                    if !matches!(
-                        outcomes.get(id),
-                        Some(
-                            MutationBucket::Applied
-                                | MutationBucket::Skipped
-                                | MutationBucket::FailedTerminal
-                                | MutationBucket::BlockedByEngine
-                                | MutationBucket::PendingReadback
-                        )
+            cohort.reconcile_at = reconcile_at;
+            cohort.attempt = cohort.attempt.saturating_add(1);
+            // Every submitted target must occupy a lane, even when a stream
+            // ends without reporting it. Such an omission is uncertain.
+            for id in &remaining {
+                outcomes.entry(id.clone()).or_insert(if blocked_by_engine {
+                    MutationBucket::BlockedByEngine
+                } else {
+                    MutationBucket::PendingReadback
+                });
+            }
+            let retry_set: HashSet<_> = retry_ids.into_iter().collect();
+            let mut next = Vec::new();
+            for id in &remaining {
+                if retry_set.contains(id) {
+                    outcomes.insert(id.clone(), MutationBucket::PendingRetry);
+                    if cohort.attempt < max_retries
+                        && (retry_owners.contains(id) || retry_slots > 0)
+                    {
+                        if retry_owners.insert(id.clone()) {
+                            retry_slots -= 1;
+                        }
+                        next.push(id.clone());
+                    }
+                }
+            }
+            if first_error.is_some() || blocked_by_engine || next.is_empty() {
+                cohort.readback = true;
+            } else {
+                cohort.remaining = next;
+                if let Some(advice) = stream_termination_advice.or(item_retry_advice) {
+                    cohort.retry_at = tokio::time::Instant::now()
+                        + crate::recovery::retry_delay(
+                            &advice,
+                            std::time::SystemTime::now(),
+                            Duration::from_secs(1),
+                        );
+                }
+            }
+            drop(activity);
+            drop(admission);
+        }
+        // Never-submitted targets are known unsent and never observed. A
+        // cancelled, paused, detached or failed observation leaves submitted
+        // unresolved targets explicit rather than implying a terminal failure.
+        for cohort in &cohorts {
+            for id in &cohort.targets {
+                if !cohort.submitted {
+                    outcomes
+                        .entry(id.clone())
+                        .or_insert(MutationBucket::PendingRetry);
+                } else if !cohort.done {
+                    let value = outcomes
+                        .entry(id.clone())
+                        .or_insert(MutationBucket::Unresolved);
+                    if matches!(
+                        value,
+                        MutationBucket::PendingRetry | MutationBucket::PendingReadback
                     ) {
-                        outcomes.insert(id.clone(), MutationBucket::BlockedByEngine);
+                        *value = MutationBucket::Unresolved;
                     }
                 }
-                break;
             }
-
-            attempt = attempt.saturating_add(1);
-            let retry_set: HashSet<_> = retry_ids.iter().cloned().collect();
-            let mut next_remaining: Vec<bifrost_types::ObjectId> = remaining
-                .iter()
-                .filter(|id| retry_set.contains(*id))
-                .cloned()
-                .collect();
-            // `MutationConfig::retry_queue_cap` bounds how wide ONE
-            // resubmission may be. The retry set only ever shrinks (it is
-            // filtered out of `remaining`), so this is not a guard against
-            // unbounded growth - it is a ceiling on the per-attempt work a
-            // single oversized campaign can demand of the account, which
-            // otherwise resubmits its whole still-failing set on every one of
-            // `mutation_max_retries` attempts.
-            //
-            // The excess is NOT dropped. It is marked `PendingRetry` HERE
-            // rather than left to the post-loop sweep below, because that sweep
-            // runs only on the break path: an id merely truncated out of
-            // `next_remaining` before a `continue` is no longer in `remaining`,
-            // so no later attempt resolves it and it would leave the campaign
-            // uncounted entirely - reporting success for work that never
-            // happened. Marked here, it is counted as pending and then run
-            // through the read-back guard, so a mutation that actually landed
-            // is still reconciled rather than reported as outstanding.
-            //
-            // `split_off` keeps the retained prefix in `remaining` order, so
-            // what survives is the earliest-submitted ids rather than an
-            // arbitrary hash-order slice.
-            if next_remaining.len() > retry_queue_cap {
-                let deferred = next_remaining.split_off(retry_queue_cap);
-                tracing::warn!(
-                    target: "bifrost.sync.mutation",
-                    account_id = ?account_id,
-                    attempt,
-                    cap = retry_queue_cap,
-                    deferred = deferred.len(),
-                    "retry queue cap reached; deferring the excess as pending retry"
-                );
-                for id in deferred {
-                    outcomes.insert(id, MutationBucket::PendingRetry);
-                }
-            }
-            if attempt < max_retries && !next_remaining.is_empty() {
-                // A stream-level Retry termination speaks for the whole
-                // submission, so it wins; otherwise the per-item advice of the
-                // failures actually being resubmitted supplies the delay. With
-                // neither, `retry_delay`'s own fallback applies once an advice
-                // exists - what must not happen is resubmitting instantly.
-                retry_advice = stream_termination_advice.or(item_retry_advice);
-                std::mem::swap(&mut remaining, &mut next_remaining);
-                continue;
-            }
-            for id in &retry_set {
-                outcomes.insert(id.clone(), MutationBucket::PendingRetry);
-            }
-            break;
         }
-
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         let mut totals = counters_from_outcomes(&outcomes);
-        for _ in 0..dedupe_count {
-            totals.record_dedupe_by_client_id();
-        }
-        let readback_ids = unresolved_readback_ids(&outcomes);
-        if !readback_ids.is_empty() {
-            // The read-back guard hydrates over the wire, and the
-            // campaign's own admission permit was released when the
-            // attempt loop broke. Re-admit rather than running unbudgeted
-            // work: an oversized campaign otherwise leaves the caps
-            // behind exactly where its heaviest fan-out begins.
-            //
-            // The read-back is wire work against the same budgets the write
-            // used, so it honours them too: the ids it hydrates are the whole
-            // unresolved set (`unresolved_readback_ids`), not the last retry
-            // vector, which may have shrunk past an id a held budget still
-            // covers. Waiting here never turns a `PendingReadback` id into a
-            // resubmission; it only delays the observation.
-            let (_activity, _readback_admission, account) = loop {
-                if !slot.control.wait_until_running(&slot.shutdown).await {
-                    return Err(Error::ShuttingDown);
-                }
-                let keys = crate::recovery::declared_keys(
-                    slot.current.load_full().as_ref().as_ref(),
-                    account_id,
-                    bifrost_types::ThrottleWork::Objects(&readback_ids),
-                );
-                if let Some(wait) =
-                    crate::recovery::throttle_wait(&slot.throttles, account_id, &keys)
-                {
-                    tokio::select! {
-                        () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
-                        () = tokio::time::sleep(wait) => {}
-                    }
-                    continue;
-                }
-                let admission = tokio::select! {
-                    () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
-                    permit = slot.scheduler.admit(
-                        account_id.clone(),
-                        slot.control.priority_snapshot(),
-                        crate::scheduler::WorkKind::Mutation,
-                    ) => permit?,
-                };
-                // Asked of the snapshot the read-back hydrates through.
-                let account = slot.current.load_full();
-                let keys = crate::recovery::declared_keys(
-                    account.as_ref().as_ref(),
-                    account_id,
-                    bifrost_types::ThrottleWork::Objects(&readback_ids),
-                );
-                if crate::recovery::throttle_wait(&slot.throttles, account_id, &keys).is_some() {
-                    drop(admission);
-                    continue;
-                }
-                if let Some(activity) = slot.control.begin_activity() {
-                    break (activity, admission, account);
-                }
-            };
-            // A hydration the guard absorbs as `uncertain` may still have
-            // failed on a 429; its deadline goes into the shared bucket like
-            // any other lane's, so siblings see a hold the read-back found.
-            let throttles = Arc::clone(&slot.throttles);
-            let record = move |error: &AccountError| {
-                record_error_throttle(&throttles, account_id, error);
-            };
-            let sink: crate::mutation::readback::ReadbackErrorSink<'_> = Some(&record);
-            let readback = async {
-                match &op {
-                    BulkPipelineOp::SetFlags(flag_op) => {
-                        crate::mutation::readback::run_readback_guard_observed(
-                            account.as_ref().as_ref(),
-                            readback_ids,
-                            flag_op,
-                            sink,
-                        )
-                        .await
-                    }
-                    BulkPipelineOp::Move { destination, .. } => {
-                        crate::mutation::readback::run_move_readback_guard_observed(
-                            account.as_ref().as_ref(),
-                            readback_ids,
-                            destination,
-                            sink,
-                        )
-                        .await
-                    }
-                    BulkPipelineOp::Destroy => {
-                        crate::mutation::readback::run_destroy_readback_guard_observed(
-                            account.as_ref().as_ref(),
-                            readback_ids,
-                            sink,
-                        )
-                        .await
-                    }
-                }
-            };
-            let outcome = tokio::select! {
-                () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
-                outcome = readback => match outcome {
-                    Ok(outcome) => outcome,
-                    Err(Error::Account(error)) => {
-                        // A stream-level read-back termination is returned,
-                        // not absorbed; record its hold before surfacing it.
-                        record_error_throttle(&slot.throttles, account_id, &error);
-                        return Err(Error::Account(error));
-                    }
-                    Err(other) => return Err(other),
-                },
-            };
-            totals.pending_retry = totals
-                .pending_retry
-                .saturating_sub(outcome.skipped)
-                .saturating_sub(outcome.still_failed);
-            totals.skipped = totals.skipped.saturating_add(outcome.skipped);
-            totals.failed_terminal = totals.failed_terminal.saturating_add(outcome.still_failed);
-        }
+        totals.dedupe_by_client_id = dedupe_count;
         Ok(totals)
+    }
+}
+
+/// A key is interned once per campaign; equal declarations produce identical
+/// ordered sets regardless of declaration order or duplicate keys.
+fn cohort_identity(
+    registry: &mut HashMap<bifrost_types::ThrottleKey, usize>,
+    keys: Vec<bifrost_types::ThrottleKey>,
+) -> std::collections::BTreeSet<usize> {
+    keys.into_iter()
+        .map(|key| {
+            let next = registry.len();
+            *registry.entry(key).or_insert(next)
+        })
+        .collect()
+}
+
+struct MutationCohort {
+    identity: std::collections::BTreeSet<usize>,
+    key: bifrost_types::IdempotencyKey,
+    targets: Vec<bifrost_types::ObjectId>,
+    remaining: Vec<bifrost_types::ObjectId>,
+    submitted: bool,
+    readback: bool,
+    done: bool,
+    attempt: u32,
+    retry_at: tokio::time::Instant,
+    reconcile_at: tokio::time::Instant,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_target(
+    cohorts: &mut Vec<MutationCohort>,
+    registry: &mut HashMap<bifrost_types::ThrottleKey, usize>,
+    account: &dyn Account,
+    account_id: &AccountId,
+    id: bifrost_types::ObjectId,
+    op: &BulkPipelineOp,
+    vendor: &crate::mutation::IdempotencyVendor,
+    protocol: bifrost_types::ProtocolKind,
+) {
+    let identity = cohort_identity(
+        registry,
+        campaign_keys(account, account_id, std::slice::from_ref(&id), op),
+    );
+    if let Some(cohort) = cohorts
+        .iter_mut()
+        .find(|c| c.identity == identity && !c.submitted && !c.done)
+    {
+        cohort.targets.push(id.clone());
+        cohort.remaining.push(id);
+    } else {
+        cohorts.push(MutationCohort {
+            identity,
+            key: vendor.next(protocol),
+            targets: vec![id.clone()],
+            remaining: vec![id],
+            submitted: false,
+            readback: false,
+            done: false,
+            attempt: 0,
+            retry_at: tokio::time::Instant::now(),
+            reconcile_at: tokio::time::Instant::now(),
+        });
     }
 }
 
@@ -702,6 +870,8 @@ pub(super) enum MutationBucket {
     FailedTerminal,
     PendingRetry,
     PendingReadback,
+    /// A submitted write could not be observed conclusively.
+    Unresolved,
     BlockedByEngine,
 }
 
@@ -993,7 +1163,9 @@ fn counters_from_outcomes(
             MutationBucket::Skipped => counters.record_skipped(),
             MutationBucket::FailedTerminal => counters.record_failed(),
             MutationBucket::BlockedByEngine => counters.record_blocked_by_engine(),
-            MutationBucket::PendingRetry | MutationBucket::PendingReadback => {
+            MutationBucket::PendingRetry
+            | MutationBucket::PendingReadback
+            | MutationBucket::Unresolved => {
                 counters.record_pending();
             }
         }

@@ -28,7 +28,8 @@ impl MutationCampaignId {
     }
 }
 
-/// Vends `IdempotencyKey`s for a single mutation campaign.
+/// Vends `IdempotencyKey`s for a mutation campaign's throttle cohorts.
+/// Each cohort allocates once and retains its key across retries.
 ///
 /// `run_id` is persisted across process restarts so retries from the
 /// previous process look correlated to engine bookkeeping; the

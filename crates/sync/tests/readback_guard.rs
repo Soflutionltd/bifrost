@@ -54,8 +54,23 @@ struct FlagsAccount {
     campaign: Option<Arc<CampaignState>>,
 }
 
+// Script selection stays atomic so a test can change the next action while
+// another campaign is sleeping on a virtual-time deadline.
+const COHORT_APPLY: usize = 1;
+const COHORT_RETRY_ONCE: usize = 2;
+const COHORT_ERROR_IN_SECOND: usize = 3;
+const COHORT_UNCERTAIN: usize = 4;
+const COHORT_RETRY_BESIDE_UNCERTAIN: usize = 5;
+type CohortCall = (Vec<ObjectId>, IdempotencyKey, tokio::time::Instant);
+
 #[derive(Default)]
 struct CampaignState {
+    cohort_mode: AtomicUsize,
+    target_keys:
+        std::sync::Mutex<std::collections::HashMap<ObjectId, Vec<bifrost_types::ThrottleKey>>>,
+    calls: std::sync::Mutex<Vec<CohortCall>>,
+    observations: std::sync::Mutex<Vec<Vec<ObjectId>>>,
+    duplicate_observations: AtomicBool,
     engine_block_first: AtomicBool,
     /// First attempt: one item raises an engine directive while a SIBLING item
     /// comes back `Uncertain`, i.e. parked in the read-back lane.
@@ -149,11 +164,21 @@ impl Account for FlagsAccount {
         work: bifrost_types::ThrottleWork<'_>,
     ) -> Vec<bifrost_types::ThrottleKey> {
         match (work, self.campaign.as_ref()) {
-            (bifrost_types::ThrottleWork::Objects(_), Some(campaign)) => campaign
-                .object_keys
-                .lock()
-                .expect("object keys lock")
-                .clone(),
+            (bifrost_types::ThrottleWork::Objects(ids), Some(campaign)) => {
+                let mut keys = campaign
+                    .object_keys
+                    .lock()
+                    .expect("object keys lock")
+                    .clone();
+                let per_target = campaign.target_keys.lock().expect("target keys");
+                keys.extend(
+                    ids.iter()
+                        .filter_map(|id| per_target.get(id))
+                        .flatten()
+                        .cloned(),
+                );
+                keys
+            }
             _ => Vec::new(),
         }
     }
@@ -196,6 +221,7 @@ impl Account for FlagsAccount {
     ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
         assert_eq!(projection, Projection::FlagsOnly);
         let table = self.flag_table.clone();
+        let observer = self.campaign.clone();
         let gate = self.campaign.as_ref().and_then(|campaign| {
             (campaign.gate_readback.load(Ordering::SeqCst)
                 && campaign.readbacks.fetch_add(1, Ordering::SeqCst) == 0)
@@ -208,7 +234,17 @@ impl Account for FlagsAccount {
                 campaign.readback_started.notify_one();
                 campaign.release_readback.notified().await;
             }
-            let ids: Vec<ObjectId> = collected.await;
+            let mut ids: Vec<ObjectId> = collected.await;
+            if let Some(observer) = observer {
+                observer
+                    .observations
+                    .lock()
+                    .expect("observations")
+                    .push(ids.clone());
+                if observer.duplicate_observations.load(Ordering::SeqCst) {
+                    ids.extend(ids.clone());
+                }
+            }
             let items: Vec<ItemOutcome<HydratedObject>> = ids
                 .into_iter()
                 .map(|id| {
@@ -286,7 +322,86 @@ impl Account for FlagsAccount {
         let Some(campaign) = &self.campaign else {
             return Box::pin(stream::empty());
         };
-        campaign.keys.lock().expect("keys lock").push(key);
+        campaign.keys.lock().expect("keys lock").push(key.clone());
+        if campaign.cohort_mode.load(Ordering::SeqCst) != 0 {
+            let campaign = Arc::clone(campaign);
+            return Box::pin(stream::once(async move {
+                let ids: Vec<ObjectId> = targets.collect().await;
+                let mode = campaign.cohort_mode.load(Ordering::SeqCst);
+                let previous = {
+                    let mut calls = campaign.calls.lock().expect("calls");
+                    let previous: std::collections::HashSet<_> = calls
+                        .iter()
+                        .flat_map(|(ids, _, _)| ids.iter().cloned())
+                        .collect();
+                    calls.push((ids.clone(), key, tokio::time::Instant::now()));
+                    previous
+                };
+                campaign.submitted.notify_one();
+                if mode == COHORT_ERROR_IN_SECOND && ids.iter().any(|id| id.0 == "b") {
+                    return SyncEvent::Terminated(unsupported(
+                        bifrost_types::AccountOperation::UpdateFlags,
+                    ));
+                }
+                let items = ids
+                    .into_iter()
+                    .map(|id| {
+                        let item = bifrost_types::BatchItemId(id.0.clone());
+                        if mode == COHORT_ERROR_IN_SECOND
+                            || mode == COHORT_UNCERTAIN
+                            || (mode == COHORT_RETRY_BESIDE_UNCERTAIN && id.0 == "b")
+                        {
+                            return ItemOutcome::Uncertain(bifrost_types::BatchUncertain::new(
+                                item,
+                                retryable_transport(),
+                            ));
+                        }
+                        if (mode == COHORT_RETRY_ONCE || mode == COHORT_RETRY_BESIDE_UNCERTAIN)
+                            && !previous.contains(&id)
+                        {
+                            let mut builder = AccountErrorBuilder::new(
+                                AccountErrorKind::Server(
+                                    bifrost_types::ServerErrorKind::RateLimited,
+                                ),
+                                Cause::Server(bifrost_types::ServerCause::RateLimited {
+                                    retry_hint: Some(bifrost_types::RetryHint::After(
+                                        std::time::Duration::from_secs(30),
+                                    )),
+                                }),
+                            );
+                            if let Some(bifrost_types::ThrottleKey::Budget(budget)) = campaign
+                                .target_keys
+                                .lock()
+                                .expect("keys")
+                                .get(&id)
+                                .and_then(|keys| {
+                                    keys.iter().find(|key| {
+                                        matches!(key, bifrost_types::ThrottleKey::Budget(_))
+                                    })
+                                })
+                            {
+                                builder = builder.throttle_budget(budget.clone());
+                            }
+                            return ItemOutcome::Failed(bifrost_types::BatchFailure::new(
+                                item,
+                                builder.try_build().expect("retry error"),
+                            ));
+                        }
+                        ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
+                            item,
+                            MutationSuccess::Applied,
+                        ))
+                    })
+                    .collect();
+                SyncEvent::Batch(Batch {
+                    items,
+                    page_boundary: PageBoundary::Final,
+                    server_latency: std::time::Duration::ZERO,
+                    bytes_in: 0,
+                    checkpoint: None,
+                })
+            }));
+        }
         let attempt = campaign.submissions.fetch_add(1, Ordering::SeqCst);
         campaign.submitted.notify_one();
         if campaign.gate_first_campaign.load(Ordering::SeqCst) && attempt == 0 {
@@ -1306,6 +1421,8 @@ async fn a_per_item_retry_delays_the_resubmission() {
 /// account key holds nothing.
 #[tokio::test(start_paused = true)]
 async fn a_campaign_waits_for_a_budget_its_targets_declare() {
+    // This remains a single-cohort case: every target declares the held
+    // budget. Splitting campaigns must not bypass a hold on that cohort.
     let budget = bifrost_types::ThrottleBudget::new("test|mailbox:shared@example.com");
     let engine = SyncEngine::builder().build().expect("engine");
 
@@ -1554,4 +1671,277 @@ async fn detach_abandons_a_parked_campaign() {
         Err(Error::ShuttingDown)
     ));
     assert_eq!(state.submissions.load(Ordering::SeqCst), 1);
+}
+
+fn cohort_state(mode: usize) -> Arc<CampaignState> {
+    let state = Arc::new(CampaignState::default());
+    state.cohort_mode.store(mode, Ordering::SeqCst);
+    for id in ["a", "b", "c", "d"] {
+        state.target_keys.lock().expect("keys").insert(
+            ObjectId(id.into()),
+            vec![bifrost_types::ThrottleKey::Budget(
+                bifrost_types::ThrottleBudget::new(format!("cohort|{id}")),
+            )],
+        );
+    }
+    state
+}
+
+async fn cohort_engine(state: &Arc<CampaignState>, cap: usize) -> (Arc<SyncEngine>, AccountId) {
+    let mut config = bifrost_sync::EngineConfig::default();
+    config.mutation.retry_queue_cap = cap;
+    let engine = Arc::new(
+        SyncEngine::builder()
+            .config(config)
+            .build()
+            .expect("engine"),
+    );
+    let account = AccountId("cohorts".into());
+    engine
+        .attach(
+            account.clone(),
+            Arc::new(FlagsFactory(campaign_account(Arc::clone(state)))),
+        )
+        .await
+        .expect("attach");
+    (engine, account)
+}
+
+async fn cohort_run(
+    engine: &SyncEngine,
+    account: &AccountId,
+    ids: &[&str],
+) -> Result<bifrost_sync::MutationCounters, Error> {
+    engine
+        .bulk_set_flags(
+            account,
+            ids.iter().map(|id| ObjectId((*id).into())).collect(),
+            FlagOp::Add(set(&["\\Seen"])),
+            &vendor(),
+            ProtocolKind::Imap,
+        )
+        .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn cohort_free_mailbox_finishes_while_sibling_is_held() {
+    let state = cohort_state(COHORT_RETRY_ONCE);
+    let (engine, account) = cohort_engine(&state, 10).await;
+    // First create a mailbox-specific hold using a separate campaign.
+    let held = {
+        let engine = Arc::clone(&engine);
+        let account = account.clone();
+        tokio::spawn(async move { cohort_run(&engine, &account, &["a"]).await })
+    };
+    while state.calls.lock().expect("calls").is_empty() {
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    state.cohort_mode.store(COHORT_APPLY, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let run = {
+        let engine = Arc::clone(&engine);
+        let account = account.clone();
+        tokio::spawn(async move { cohort_run(&engine, &account, &["a", "b"]).await })
+    };
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    {
+        let calls = state.calls.lock().expect("calls");
+        assert!(
+            calls
+                .iter()
+                .any(|(ids, _, at)| ids == &[ObjectId("b".into())] && *at == started),
+            "free mailbox must finish before held mailbox becomes ready: {calls:?}"
+        );
+        assert_eq!(calls.len(), 2, "held cohort must still be waiting");
+    }
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    run.await.expect("task").expect("campaign");
+    held.await.expect("held task").expect("held campaign");
+    engine.detach(&account).await.expect("detach");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cohort_retry_hold_yields_to_a_sibling_readback() {
+    let state = cohort_state(COHORT_RETRY_BESIDE_UNCERTAIN);
+    let (engine, account) = cohort_engine(&state, 10).await;
+    let run = {
+        let engine = Arc::clone(&engine);
+        let account = account.clone();
+        tokio::spawn(async move { cohort_run(&engine, &account, &["a", "b"]).await })
+    };
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        *state.observations.lock().expect("reads"),
+        vec![vec![ObjectId("b".into())]],
+        "one cohort's 429 must not postpone another cohort's ready read-back"
+    );
+    assert_eq!(state.calls.lock().expect("calls").len(), 2);
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    run.await.expect("task").expect("campaign");
+    engine.detach(&account).await.expect("detach");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cohort_deduplicates_targets_into_one_submission() {
+    let state = cohort_state(COHORT_APPLY);
+    let (engine, account) = cohort_engine(&state, 10).await;
+    let counters = cohort_run(&engine, &account, &["a", "b", "a", "b"])
+        .await
+        .expect("campaign");
+    let submitted: Vec<_> = state
+        .calls
+        .lock()
+        .expect("calls")
+        .iter()
+        .flat_map(|(ids, _, _)| ids.clone())
+        .collect();
+    assert_eq!(submitted, vec![ObjectId("a".into()), ObjectId("b".into())]);
+    assert_eq!(counters.applied, 2);
+    engine.detach(&account).await.expect("detach");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cohort_frozen_keys_are_vended_once_per_cohort() {
+    let state = cohort_state(COHORT_RETRY_ONCE);
+    let (engine, account) = cohort_engine(&state, 10).await;
+    cohort_run(&engine, &account, &["a", "b"])
+        .await
+        .expect("campaign");
+    {
+        let calls = state.calls.lock().expect("calls");
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0].0, calls[2].0);
+        assert_eq!(calls[1].0, calls[3].0);
+        assert_eq!(key_parts(&calls[0].1), key_parts(&calls[2].1));
+        assert_eq!(key_parts(&calls[1].1), key_parts(&calls[3].1));
+        assert_ne!(
+            key_parts(&calls[0].1),
+            key_parts(&calls[1].1),
+            "cohorts must each vend their own key"
+        );
+    }
+    engine.detach(&account).await.expect("detach");
+}
+
+/// Equal singleton declarations form one cohort even when the account returns
+/// the keys in a different order or repeats keys. Both objects retry together
+/// under the single key allocated for their shared execution identity.
+#[tokio::test(start_paused = true)]
+async fn cohort_equal_declarations_share_submission_and_frozen_key() {
+    let state = cohort_state(COHORT_RETRY_ONCE);
+    let first = bifrost_types::ThrottleKey::Budget(bifrost_types::ThrottleBudget::new(
+        "cohort|shared-first",
+    ));
+    let second = bifrost_types::ThrottleKey::Budget(bifrost_types::ThrottleBudget::new(
+        "cohort|shared-second",
+    ));
+    {
+        let mut keys = state.target_keys.lock().expect("keys");
+        keys.insert(ObjectId("a".into()), vec![first.clone(), second.clone()]);
+        keys.insert(
+            ObjectId("b".into()),
+            vec![second.clone(), first.clone(), second, first],
+        );
+    }
+    let (engine, account) = cohort_engine(&state, 10).await;
+    let counters = cohort_run(&engine, &account, &["a", "b"])
+        .await
+        .expect("campaign");
+    {
+        let calls = state.calls.lock().expect("calls");
+        assert_eq!(
+            calls.len(),
+            2,
+            "equal declarations require one initial submission and one retry"
+        );
+        let targets = vec![ObjectId("a".into()), ObjectId("b".into())];
+        assert_eq!(
+            calls[0].0, targets,
+            "distinct targets must share the initial submission"
+        );
+        assert_eq!(calls[1].0, targets, "both targets retry in the same cohort");
+        assert_eq!(
+            key_parts(&calls[0].1),
+            key_parts(&calls[1].1),
+            "the shared cohort key must remain frozen"
+        );
+        assert_eq!(state.keys.lock().expect("keys").len(), 2);
+    }
+    assert_eq!(counters.applied, 2);
+    assert_eq!(counters.pending_retry, 0);
+    engine.detach(&account).await.expect("detach");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cohort_retry_allowance_is_shared_campaign_wide() {
+    let state = cohort_state(COHORT_RETRY_ONCE);
+    let (engine, account) = cohort_engine(&state, 1).await;
+    let counters = cohort_run(&engine, &account, &["a", "b", "c"])
+        .await
+        .expect("campaign");
+    {
+        let calls = state.calls.lock().expect("calls");
+        assert_eq!(
+            calls.len(),
+            4,
+            "three singleton initial submissions and ONE retry total"
+        );
+        assert!(calls.iter().all(|(ids, _, _)| ids.len() == 1));
+    }
+    assert_eq!(counters.applied, 1);
+    assert_eq!(counters.failed_terminal, 2);
+    engine.detach(&account).await.expect("detach");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cohort_error_observes_submitted_siblings_and_excludes_unsent() {
+    let state = cohort_state(COHORT_ERROR_IN_SECOND);
+    let (engine, account) = cohort_engine(&state, 10).await;
+    assert!(matches!(
+        cohort_run(&engine, &account, &["a", "b", "c"]).await,
+        Err(Error::Account(_))
+    ));
+    let mut reads = state.observations.lock().expect("reads").clone();
+    reads.sort_by_key(|ids| ids[0].0.clone());
+    assert_eq!(
+        reads,
+        vec![vec![ObjectId("a".into())], vec![ObjectId("b".into())]],
+        "both submitted cohorts get one observation; known-unsent c must not be hydrated"
+    );
+    assert_eq!(
+        state.calls.lock().expect("calls").len(),
+        2,
+        "c stays known unsent"
+    );
+    engine.detach(&account).await.expect("detach");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cohort_counters_derive_from_per_object_observations() {
+    let state = cohort_state(COHORT_UNCERTAIN);
+    state.duplicate_observations.store(true, Ordering::SeqCst);
+    let (engine, account) = cohort_engine(&state, 10).await;
+    let counters = cohort_run(&engine, &account, &["a", "b", "c"])
+        .await
+        .expect("campaign");
+    assert_eq!(
+        counters.failed_terminal, 3,
+        "duplicate observations cannot inflate accounting: {counters:?}"
+    );
+    assert_eq!(
+        counters.pending_retry + counters.applied + counters.skipped + counters.blocked_by_engine,
+        0
+    );
+    engine.detach(&account).await.expect("detach");
+}
+
+fn key_parts(key: &IdempotencyKey) -> (&bifrost_types::RunId, u64, &bifrost_types::ProtocolSalt) {
+    (&key.run_id, key.sequence, &key.protocol_salt)
 }
