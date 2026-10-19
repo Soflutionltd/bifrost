@@ -54,6 +54,7 @@ use tokio_util::sync::CancellationToken;
 
 // pub: consumers build a GraphClient before registering GraphAccountFactory with the engine.
 pub use crate::client::GraphClient;
+use crate::client::Resource;
 use crate::types::GraphMailFolder;
 
 // Re-exported for the client-side api-base override test, which pins that a
@@ -407,7 +408,7 @@ impl GraphAccount {
     ///
     /// `new_for_tests_with_shared` goes through `shared_clients_map`, whose
     /// `for_shared_mailbox` clients share the primary's scripted-response
-    /// queue (as they share its `AccountNet` and semaphore). That is right
+    /// queue (as they share its `AccountNet`). That is right
     /// for a test that only wants foreign requests scripted, and useless for
     /// a test that has to prove WHICH client issued a request: either client
     /// answers from the same queue and records into the same log, so a path
@@ -531,6 +532,22 @@ impl GraphAccount {
             return None;
         }
         self.budget_for_owner(parsed.owner())
+    }
+
+    /// Keep one owner per subrequest; the REST funnel merges final keys
+    /// before applying the per-mailbox batch weight.
+    pub(crate) fn batch_resource(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<Resource, crate::error::GraphError> {
+        let clients = ids
+            .iter()
+            .map(|id| {
+                let parsed = foreign::parse_message_id(id);
+                self.client_for_owner(parsed.owner()).cloned()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Resource::Batch(clients))
     }
 
     /// The mailbox budget a drive of `scope` is charged to. Follows
@@ -804,7 +821,8 @@ impl AccountFactory for GraphAccountFactory {
             let user_email = profile.mail.or(profile.user_principal_name);
             // Names the primary mailbox in its throttle budget. Set before
             // the account (and its shared clients) is built, and on every
-            // open, so a reopen picks up a changed address.
+            // primary open, so a reopen picks up a changed address.
+            // A derived mailbox client cannot write the shared address slot.
             client.set_primary_address(user_email.clone());
             let mut account = GraphAccount::new(
                 client.clone(),

@@ -18,6 +18,7 @@ use bifrost_types::{
 };
 use serde::Deserialize;
 
+use crate::client::Resource;
 use crate::origin::AdmittedUrl;
 use crate::types::ODataCollection;
 
@@ -40,7 +41,8 @@ pub(crate) async fn directory_groups_list(
             first_page(&account, &groups_list_path(&prefix), operation)?
         }
     };
-    let page: ODataCollection<GraphDirectoryGroup> = get_page(&account, &url, operation).await?;
+    let page: ODataCollection<GraphDirectoryGroup> =
+        get_page(&account, Resource::Unmetered, &url, operation).await?;
     let next_cursor = link_cursor(admit_next(&account, &page, operation)?);
     Ok(Page {
         items: page.value.into_iter().filter_map(classify_group).collect(),
@@ -61,7 +63,8 @@ pub(crate) async fn directory_group_expand(
         Some(next) => next,
         None => first_page(&account, &transitive_members_path(&group), operation)?,
     };
-    let page: ODataCollection<GraphGroupMember> = get_page(&account, &url, operation).await?;
+    let page: ODataCollection<GraphGroupMember> =
+        get_page(&account, Resource::Unmetered, &url, operation).await?;
     let next_cursor = link_cursor(admit_next(&account, &page, operation)?);
     Ok(Page {
         items: page.value.into_iter().filter_map(member_to_row).collect(),

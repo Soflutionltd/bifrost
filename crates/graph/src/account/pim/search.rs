@@ -5,6 +5,7 @@ use crate::account::GraphAccount;
 use crate::account::graph_error::{
     GraphErrorContext, into_account_error, invalid_account_error, unsupported_account_error,
 };
+use crate::client::Resource;
 use crate::types::ODataCollection;
 use bifrost_types::{
     AccessErrorKind, AccountError, AccountErrorKind, AccountOperation, ErrorScope, LabelId,
@@ -123,7 +124,7 @@ pub(super) async fn search_message_rows(
                 .api_url(&search_url(&client.api_path_prefix(), &request)?)
                 .map_err(|error| into_account_error(error, ctx.clone()))?,
         };
-        let result: Result<ODataCollection<Value>, _> = client.get(&url).await;
+        let result: Result<ODataCollection<Value>, _> = client.get(Resource::Outlook, &url).await;
         match result {
             Ok(page) => break (client, page),
             Err(error) => {

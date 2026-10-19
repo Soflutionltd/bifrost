@@ -7,6 +7,7 @@ use crate::account::graph_error::{
     GraphErrorContext, into_account_error, invalid_argument_account_error,
     unsupported_account_error,
 };
+use crate::client::Resource;
 use base64::Engine;
 use bifrost_types::{AccountError, AccountOperation, DraftHandle, MailboxId, ObjectId, SendAs};
 use serde_json::{Value, json};
@@ -89,7 +90,7 @@ pub(crate) async fn send_raw_message(
     let base64_mime = base64::engine::general_purpose::STANDARD.encode(&raw);
     let path = format!("{}/messages", client.api_path_prefix());
     let created: Value = client
-        .post_mime(&path, bytes::Bytes::from(base64_mime))
+        .post_mime(Resource::Outlook, &path, bytes::Bytes::from(base64_mime))
         .await
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::Send)))?;
     let id = created.get("id").and_then(Value::as_str).ok_or_else(|| {
@@ -232,7 +233,7 @@ pub(super) async fn stamp_deferred_send_time(
     );
     let body = deferred_send_time_body(at);
     client
-        .patch(&path, &body)
+        .patch(Resource::Outlook, &path, &body)
         .await
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))
 }
@@ -263,7 +264,7 @@ pub(crate) async fn cancel_scheduled_send(
         client.api_path_prefix(),
         bifrost_net::url::encode_path_component(draft_id)
     );
-    client.delete(&path).await.map_err(|e| {
+    client.delete(Resource::Outlook, &path).await.map_err(|e| {
         into_account_error(
             e,
             GraphErrorContext::graph(AccountOperation::CancelScheduledSend),

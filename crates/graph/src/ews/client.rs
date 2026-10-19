@@ -16,6 +16,9 @@ impl EwsExecute for EwsClient {
         body_xml: &str,
         headers: &EwsHeaders,
     ) -> Result<EwsBodyStream, EwsError> {
+        // EWS throttling is per calling user under its own policy; streaming
+        // notifications have a separate subscription budget. The REST
+        // per-mailbox four does not apply, so this path stays ungated.
         let envelope = build_soap_envelope(body_xml);
         let mut req = self
             .net
@@ -80,6 +83,9 @@ impl EwsClient {
         body_xml: &str,
         headers: &EwsHeaders,
     ) -> Result<String, EwsError> {
+        // EWS throttling is per calling user under its own policy; streaming
+        // notifications have a separate subscription budget. The REST
+        // per-mailbox four does not apply, so this path stays ungated.
         let envelope = build_soap_envelope(body_xml);
         let mut req = self
             .net

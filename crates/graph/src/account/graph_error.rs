@@ -1774,7 +1774,7 @@ mod tests {
         assert_eq!(error.scope(), Some(&ErrorScope::Cursor(scope)));
     }
 
-    /// A client-side invariant (an unattached client, a closed semaphore) is
+    /// A client-side invariant (an unattached client) is
     /// `Internal`, terminal: never the `Transport(Network)` retry it used to
     /// be dressed as.
     #[test]

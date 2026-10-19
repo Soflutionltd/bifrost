@@ -9,6 +9,7 @@ use bifrost_types::{
 use futures::StreamExt;
 use serde_json::{Value, json};
 
+use crate::client::Resource;
 use crate::types::{BatchRequest, BatchRequestItem, BatchResponse};
 
 use super::GraphAccount;
@@ -257,7 +258,10 @@ async fn submit_batch(
         assign_batch_ids(&mut requests);
         let response: BatchResponse = account
             .client
-            .post_batch(&BatchRequest { requests })
+            .post_batch(
+                account.batch_resource(&request_ids)?,
+                &BatchRequest { requests },
+            )
             .await?;
         // One validated projection of the wire data, consumed by both the
         // etag cache and the outcome lanes. Two independent walks of the
@@ -496,7 +500,7 @@ async fn refresh_missing_etags(
         let prefix = client.api_path_prefix();
         let enc_id = bifrost_net::url::encode_path_component(parsed.native_id());
         let path = format!("{prefix}/messages/{enc_id}?$select=id");
-        match client.get_json::<Value>(&path).await {
+        match client.get_json::<Value>(Resource::Outlook, &path).await {
             Ok(value) => {
                 if let Some(etag) = graph_etag(&value) {
                     etags.insert(id.0.clone(), etag.clone());

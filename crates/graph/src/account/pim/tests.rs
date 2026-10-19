@@ -1424,7 +1424,7 @@ fn container_is_trash_compares_in_the_thread_owners_namespace() {
 
 /// A shared-mailbox client is derived inside `GraphAccount::new`, so a
 /// test never holds it. It shares the primary's script - the way it
-/// already shares the semaphore and the `AccountNet` a request actually
+/// already shares the `AccountNet` a request actually
 /// goes down - or every foreign-mailbox request would sit outside both
 /// the script and the recorded list.
 #[tokio::test]

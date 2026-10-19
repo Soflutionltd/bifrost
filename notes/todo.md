@@ -58,17 +58,15 @@ Filed 2026-10-19 while landing declared throttle keys and stamped budgets
   never waited on the account-wide hold either, so this predates declared
   keys; it is now the one engine lane outside the wait-site set in
   `reference/sync.md`. Found by the close-out review.
-- **Graph OneDrive throttles are stamped with the Outlook mailbox budget.**
-  `tag_throttle` attributes every request under `/me` or `/users/{key}`,
-  which includes `/me/drive/...` from `cloud.rs`; OneDrive is not one of the
-  Outlook resources Microsoft meters per mailbox, so a OneDrive 429 holds the
-  mailbox's mail work instead of the account (P3 from the close-out review).
-  Restricting attribution to Outlook resource paths fixes it.
-- **Graph continuation links in another spelling fall back to the account
-  key.** `tag_throttle` matches the client's `/users/{encoded key}` prefix
-  literally; a `nextLink` Graph writes as `users('...')` is untagged and
-  over-pauses the account. A live probe of Graph's nextLink spelling for
-  shared mailboxes settles whether it matters.
+- **Two Graph concurrency tests pair shared-mailbox claims with primary
+  URLs.** In `crates/graph/src/client.rs`, the per-mailbox admission test
+  sends `/me/messages` through the shared client and expects the shared
+  limit, and the batch-weight test gives every subrequest `/me/messages`
+  while claiming some against the shared mailbox. Both pin grouping and
+  capping but not that a claim matches the mailbox the wire request
+  addresses; the mixed-owner hydration test pins that only for hydration.
+  Use `/users/{owner}` URLs and drive a production shared-mailbox operation
+  (P3 from the concurrency close-out review).
 
 ## A9 (directory search) follow-ups
 

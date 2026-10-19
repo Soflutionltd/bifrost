@@ -10,7 +10,6 @@ use bifrost_types::TransmissionState;
 use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::Semaphore;
 
 use crate::error::{GraphError, GraphResponseError};
 use crate::origin::{AdmittedUrl, Base, ProviderLink, Refusal, UploadUrl};
@@ -28,17 +27,12 @@ pub(crate) const OUTLOOK_BASE: &str = "https://outlook.office365.com";
 /// real Graph endpoint or a harness redirect.
 const GRAPH_HOST: &str = "graph.microsoft.com";
 
-/// In-flight Graph REST requests allowed per client (shared with every
-/// client derived from it, so a shared-mailbox client does not multiply the
-/// budget). This is a LOCAL limiter, and deliberately so only for as long as
-/// there is no shared one: bifrost-net governs rate and retry, not
-/// concurrency, and bifrost-sync's budget is per-scope work, not per-account
-/// requests. If a per-account concurrency limiter ever lands in either of
-/// them, this semaphore and its permit acquisition in `execute_wire` should
-/// be deleted rather than stacked on top of it - two independent limiters on
-/// one request path make the effective ceiling a function of both and neither
-/// one tunable.
-const CONCURRENCY_LIMIT: usize = 3;
+/// Resource ownership is declared by the caller, including continuation walks.
+pub(crate) enum Resource {
+    Outlook,
+    Batch(Vec<GraphClient>),
+    Unmetered,
+}
 
 // pub: GraphAccountFactory consumers need a constructible Graph client handle.
 #[derive(Clone)]
@@ -48,7 +42,7 @@ pub struct GraphClient {
     /// anywhere. `None` on every ordinary client; a stream that needs
     /// per-batch accounting takes a metered handle via `metered()`.
     /// Kept OUTSIDE `ClientInner` so installing accounting is one `Arc`
-    /// bump over the same transport, semaphore, and script rather than a
+    /// bump over the same transport and script rather than a
     /// fork of the client's configuration.
     tally: Option<ByteTally>,
 }
@@ -67,14 +61,12 @@ struct ClientInner {
     token_source: Arc<dyn TokenSource>,
     mailbox_id: Option<String>,
     /// The primary mailbox's address (profile `mail`, else UPN), learned at
-    /// `open`. Only the primary client's slot is read: it names the mailbox
-    /// `/me` routes to in this client's throttle budget. Refreshed on every
-    /// open, so a changed address is picked up on the next reopen.
-    primary_address: RwLock<Option<String>>,
-    semaphore: Arc<Semaphore>,
+    /// `open`. Shared clients read the same slot to resolve primary aliases;
+    /// the primary also uses it for its throttle budget. Refreshed on every open.
+    primary_address: Arc<RwLock<Option<String>>>,
+    primary_account: Arc<RwLock<Option<String>>>,
     /// Shared with every client derived from this one
-    /// (`for_shared_mailbox`, `with_outlook_base`), the way the semaphore
-    /// and the `AccountNet` already are: in production those derivatives
+    /// (`for_shared_mailbox`, `with_outlook_base`), like `AccountNet`. These derivatives
     /// issue their requests down the same transport, so a seam they did not
     /// share would leave every foreign-mailbox path unscriptable and
     /// silently outside the recorded request list.
@@ -437,8 +429,8 @@ impl GraphClient {
                 rate_limit_host,
                 token_source: source,
                 mailbox_id: None,
-                primary_address: RwLock::new(None),
-                semaphore: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
+                primary_address: Arc::new(RwLock::new(None)),
+                primary_account: Arc::new(RwLock::new(None)),
                 #[cfg(test)]
                 scripted: Arc::new(std::sync::Mutex::new(ScriptedRest::default())),
             }),
@@ -462,14 +454,14 @@ impl GraphClient {
             tally: None,
             inner: Arc::new(ClientInner {
                 net: None,
-                account_net: RwLock::new(Some(net)),
+                account_net: RwLock::new(Some(net.clone())),
                 api_base,
                 outlook_base,
                 rate_limit_host,
                 token_source,
                 mailbox_id: None,
-                primary_address: RwLock::new(None),
-                semaphore: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
+                primary_address: Arc::new(RwLock::new(None)),
+                primary_account: Arc::new(RwLock::new(Some(net.account().0.clone()))),
                 #[cfg(test)]
                 scripted: Arc::new(std::sync::Mutex::new(ScriptedRest::default())),
             }),
@@ -485,6 +477,7 @@ impl GraphClient {
     /// hunt, not by that sweep. Listed so a future auditor knows where that
     /// sweep's coverage stopped.
     pub(crate) fn attach_account(&self, account_id: AccountId) {
+        self.fix_primary_account(&account_id.0);
         if let Some(net) = self.inner.net.as_ref() {
             let token_source = Arc::clone(&self.inner.token_source);
             let mut spec = AccountSpec::new(Some(token_source));
@@ -649,8 +642,8 @@ impl GraphClient {
                 rate_limit_host: self.inner.rate_limit_host.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
                 mailbox_id: self.inner.mailbox_id.clone(),
-                primary_address: RwLock::new(self.primary_address()),
-                semaphore: Arc::clone(&self.inner.semaphore),
+                primary_address: Arc::clone(&self.inner.primary_address),
+                primary_account: Arc::clone(&self.inner.primary_account),
                 #[cfg(test)]
                 scripted: Arc::clone(&self.inner.scripted),
             }),
@@ -685,7 +678,11 @@ impl GraphClient {
 
     /// Record the primary mailbox's address, learned from the profile at
     /// `open`, so the primary client's throttle budget names that mailbox.
+    /// Derived mailbox clients may read this slot but cannot overwrite it.
     pub(crate) fn set_primary_address(&self, address: Option<String>) {
+        if self.inner.mailbox_id.is_some() {
+            return;
+        }
         if let Ok(mut slot) = self.inner.primary_address.write() {
             *slot = address;
         }
@@ -732,67 +729,70 @@ impl GraphClient {
         bifrost_types::ThrottleBudget::new(format!("graph-outlook|{origin}|{mailbox}"))
     }
 
-    /// The API base as a parsed URL would spell it: scheme and host
-    /// lowercased, default port dropped, no trailing slash, so the request
-    /// URLs `tag_throttle` compares against (which arrive normalized) match
-    /// a base configured in any equivalent spelling.
-    /// An unparseable base (which no request can be admitted onto) falls
-    /// back to its raw text.
-    fn canonical_api_base(&self) -> String {
-        match self.inner.api_base.url() {
-            Some(url) => format!(
-                "{}{}",
-                url.origin().ascii_serialization(),
-                url.path().trim_end_matches('/')
-            ),
-            None => self.inner.api_base.as_str().to_owned(),
-        }
+    fn fix_primary_account(&self, account: &str) -> String {
+        let mut slot = self
+            .inner
+            .primary_account
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.get_or_insert_with(|| account.to_owned()).clone()
     }
 
-    /// Tag a throttle-shaped failure of a request THIS client sent with its
-    /// mailbox budget, when the request was charged to that mailbox: its URL
-    /// sits under the client's own `/me` or `/users/{key}` prefix. Anything
-    /// else is left untagged and falls back to the account-wide key -
-    /// over-pausing, never under-pausing. That includes `/subscriptions`, a
-    /// continuation link Graph spelled in a different form, and `$batch`: a
-    /// mutation batch is posted through the PRIMARY client with sub-requests
-    /// routed to whichever mailbox each id belongs to, so an outer `$batch`
-    /// 429 cannot be pinned on one mailbox. Its per-item 429s are, and the
-    /// subresponse classifiers stamp each with its own id's mailbox.
-    fn tag_throttle(&self, url: &str, error: GraphError) -> GraphError {
-        let throttled = matches!(
-            error.response_status(),
-            // 507 is the mailbox quota `classify_by_status` maps to
-            // `QuotaExhausted`, which is as attributable as a 429.
-            Some(
-                reqwest::StatusCode::TOO_MANY_REQUESTS
-                    | reqwest::StatusCode::SERVICE_UNAVAILABLE
-                    | reqwest::StatusCode::INSUFFICIENT_STORAGE
-            )
+    fn concurrency_key(&self, net: &AccountNet) -> String {
+        let primary = self.fix_primary_account(&net.account().0);
+        let mailbox = match self.inner.mailbox_id.as_deref() {
+            Some(id)
+                if !self
+                    .primary_address()
+                    .is_some_and(|address| address.eq_ignore_ascii_case(id)) =>
+            {
+                format!("mailbox:{}", id.to_lowercase())
+            }
+            _ => format!("primary|{primary}"),
+        };
+        let origin = self.inner.api_base.url().map_or_else(
+            || self.inner.api_base.as_str().to_owned(),
+            |url| url.origin().ascii_serialization(),
         );
-        if !throttled {
-            return error;
+        format!("graph-outlook|{origin}|{mailbox}")
+    }
+
+    fn claims(
+        &self,
+        resource: &Resource,
+        net: &AccountNet,
+    ) -> Vec<(bifrost_net::ConcurrencyLimit, usize)> {
+        let mut groups = std::collections::BTreeMap::<String, usize>::new();
+        match resource {
+            Resource::Outlook => {
+                groups.insert(self.concurrency_key(net), 1);
+            }
+            Resource::Batch(clients) => {
+                for client in clients {
+                    *groups.entry(client.concurrency_key(net)).or_default() += 1;
+                }
+            }
+            Resource::Unmetered => {}
         }
-        // Compared in canonical form on both sides, so a base configured in
-        // another spelling (an upper-case host, an explicit default port)
-        // still attributes its own requests.
-        let base = self.canonical_api_base();
-        let Some(request) = reqwest::Url::parse(url).ok() else {
-            return error;
-        };
-        let request = format!(
-            "{}{}",
-            request.origin().ascii_serialization(),
-            request.path()
-        );
-        let Some(path) = request.strip_prefix(base.as_str()) else {
-            return error;
-        };
-        let prefix = self.api_path_prefix();
-        let under_prefix = path
-            .strip_prefix(prefix.as_str())
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '?', '(']));
-        if !under_prefix {
+        groups
+            .into_iter()
+            .map(|(key, count)| (net.shared_concurrency_limit(key, 4), count.min(4)))
+            .collect()
+    }
+
+    /// Outer batch failures have no single owning mailbox; subresponses
+    /// are stamped by their per-item classifiers instead.
+    fn tag_throttle(&self, resource: &Resource, error: GraphError) -> GraphError {
+        if !matches!(resource, Resource::Outlook)
+            || !matches!(
+                error.response_status(),
+                Some(
+                    reqwest::StatusCode::TOO_MANY_REQUESTS
+                        | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                        | reqwest::StatusCode::INSUFFICIENT_STORAGE
+                )
+            )
+        {
             return error;
         }
         GraphError::MailboxThrottled {
@@ -813,8 +813,8 @@ impl GraphClient {
                 rate_limit_host: self.inner.rate_limit_host.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
                 mailbox_id: Some(mailbox_id.into()),
-                primary_address: RwLock::new(None),
-                semaphore: Arc::clone(&self.inner.semaphore),
+                primary_address: Arc::clone(&self.inner.primary_address),
+                primary_account: Arc::clone(&self.inner.primary_account),
                 #[cfg(test)]
                 scripted: Arc::clone(&self.inner.scripted),
             }),
@@ -835,59 +835,73 @@ impl GraphClient {
         self.inner.mailbox_id.as_deref()
     }
 
-    pub(crate) async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, GraphError> {
+    pub(crate) async fn get_json<T: DeserializeOwned>(
+        &self,
+        resource: Resource,
+        path: &str,
+    ) -> Result<T, GraphError> {
         let url = self.api_url(path)?;
-        self.get(&url).await
+        self.get(resource, &url).await
     }
 
     pub(crate) async fn get_json_prefer<T: DeserializeOwned>(
         &self,
+        resource: Resource,
         path: &str,
         prefer: &str,
     ) -> Result<T, GraphError> {
         let url = self.api_url(path)?;
-        self.get_prefer(&url, prefer).await
+        self.get_prefer(resource, &url, prefer).await
     }
 
     /// GET an admitted URL: a crate-built path (`api_url`) or an admitted
     /// cursor / server link. There is no string-taking twin on purpose.
     pub(crate) async fn get<T: DeserializeOwned>(
         &self,
+        resource: Resource,
         url: &AdmittedUrl,
     ) -> Result<T, GraphError> {
-        self.request::<T, ()>(url, "GET", None).await
+        self.request::<T, ()>(resource, url, "GET", None).await
     }
 
     pub(crate) async fn get_prefer<T: DeserializeOwned>(
         &self,
+        resource: Resource,
         url: &AdmittedUrl,
         prefer: &str,
     ) -> Result<T, GraphError> {
-        self.request_prefer::<T, ()>(url, "GET", prefer, None).await
+        self.request_prefer::<T, ()>(resource, url, "GET", prefer, None)
+            .await
     }
 
     pub(crate) async fn post<T: DeserializeOwned, B: Serialize>(
         &self,
+        resource: Resource,
         path: &str,
         body: &B,
     ) -> Result<T, GraphError> {
         let url = self.api_url(path)?;
-        self.request(&url, "POST", Some(body)).await
+        self.request(resource, &url, "POST", Some(body)).await
     }
 
-    pub(crate) async fn post_empty(&self, path: &str) -> Result<(), GraphError> {
+    pub(crate) async fn post_empty(
+        &self,
+        resource: Resource,
+        path: &str,
+    ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
-        let response = self.execute(&url, "POST", None::<&()>).await?;
+        let response = self.execute(resource, &url, "POST", None::<&()>).await?;
         check_response_status(response)
     }
 
     pub(crate) async fn post_no_response<B: Serialize>(
         &self,
+        resource: Resource,
         path: &str,
         body: &B,
     ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
-        let response = self.execute(&url, "POST", Some(body)).await?;
+        let response = self.execute(resource, &url, "POST", Some(body)).await?;
         check_response_status(response)
     }
 
@@ -898,110 +912,137 @@ impl GraphClient {
     /// content type and serializes its body; raw MIME needs neither.
     pub(crate) async fn post_mime<T: DeserializeOwned>(
         &self,
+        resource: Resource,
         path: &str,
         base64_mime: Bytes,
     ) -> Result<T, GraphError> {
         let url = self.api_url(path)?;
         let response = self
-            .execute_wire(&url, "POST", None, None, Some(WireBody::mime(base64_mime)))
+            .execute_wire(
+                resource,
+                &url,
+                "POST",
+                None,
+                None,
+                Some(WireBody::mime(base64_mime)),
+            )
             .await?;
         parse_json_response(response)
     }
 
-    pub(crate) async fn patch<B: Serialize>(&self, path: &str, body: &B) -> Result<(), GraphError> {
+    pub(crate) async fn patch<B: Serialize>(
+        &self,
+        resource: Resource,
+        path: &str,
+        body: &B,
+    ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
-        let response = self.execute(&url, "PATCH", Some(body)).await?;
+        let response = self.execute(resource, &url, "PATCH", Some(body)).await?;
         check_response_status(response)
     }
 
     pub(crate) async fn patch_if_match<B: Serialize>(
         &self,
+        resource: Resource,
         path: &str,
         etag: &str,
         body: &B,
     ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
         let response = self
-            .execute_if_match(&url, "PATCH", etag, Some(body))
+            .execute_if_match(resource, &url, "PATCH", etag, Some(body))
             .await?;
         check_response_status(response)
     }
 
     pub(crate) async fn patch_json<T: DeserializeOwned, B: Serialize>(
         &self,
+        resource: Resource,
         path: &str,
         body: &B,
     ) -> Result<T, GraphError> {
         let url = self.api_url(path)?;
-        self.request(&url, "PATCH", Some(body)).await
+        self.request(resource, &url, "PATCH", Some(body)).await
     }
 
-    pub(crate) async fn delete(&self, path: &str) -> Result<(), GraphError> {
+    pub(crate) async fn delete(&self, resource: Resource, path: &str) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
-        let response = self.execute(&url, "DELETE", None::<&()>).await?;
+        let response = self.execute(resource, &url, "DELETE", None::<&()>).await?;
         check_response_status(response)
     }
 
-    pub(crate) async fn delete_if_match(&self, path: &str, etag: &str) -> Result<(), GraphError> {
+    pub(crate) async fn delete_if_match(
+        &self,
+        resource: Resource,
+        path: &str,
+        etag: &str,
+    ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
         let response = self
-            .execute_if_match(&url, "DELETE", etag, None::<&()>)
+            .execute_if_match(resource, &url, "DELETE", etag, None::<&()>)
             .await?;
         check_response_status(response)
     }
 
     pub(crate) async fn post_batch(
         &self,
+        resource: Resource,
         batch: &crate::types::BatchRequest,
     ) -> Result<crate::types::BatchResponse, GraphError> {
-        self.post("/$batch", batch).await
+        self.post(resource, "/$batch", batch).await
     }
 
     async fn request<T: DeserializeOwned, B: Serialize>(
         &self,
+        resource: Resource,
         url: &AdmittedUrl,
         method: &str,
         body: Option<&B>,
     ) -> Result<T, GraphError> {
-        let response = self.execute(url, method, body).await?;
+        let response = self.execute(resource, url, method, body).await?;
         parse_json_response(response)
     }
 
     async fn request_prefer<T: DeserializeOwned, B: Serialize>(
         &self,
+        resource: Resource,
         url: &AdmittedUrl,
         method: &str,
         prefer: &str,
         body: Option<&B>,
     ) -> Result<T, GraphError> {
         let response = self
-            .execute_request(url, method, None, Some(prefer), body)
+            .execute_request(resource, url, method, None, Some(prefer), body)
             .await?;
         parse_json_response(response)
     }
 
     async fn execute<B: Serialize>(
         &self,
+        resource: Resource,
         url: &AdmittedUrl,
         method: &str,
         body: Option<&B>,
     ) -> Result<RestResponse, GraphError> {
-        self.execute_request(url, method, None, None, body).await
+        self.execute_request(resource, url, method, None, None, body)
+            .await
     }
 
     async fn execute_if_match<B: Serialize>(
         &self,
+        resource: Resource,
         url: &AdmittedUrl,
         method: &str,
         etag: &str,
         body: Option<&B>,
     ) -> Result<RestResponse, GraphError> {
-        self.execute_request(url, method, Some(etag), None, body)
+        self.execute_request(resource, url, method, Some(etag), None, body)
             .await
     }
 
     async fn execute_request<B: Serialize>(
         &self,
+        resource: Resource,
         url: &AdmittedUrl,
         method: &str,
         if_match: Option<&str>,
@@ -1012,18 +1053,20 @@ impl GraphClient {
             Some(body) => Some(WireBody::json(body)?),
             None => None,
         };
-        self.execute_wire(url, method, if_match, prefer, body).await
+        self.execute_wire(resource, url, method, if_match, prefer, body)
+            .await
     }
 
     /// The one place a Graph REST request leaves this crate. Every helper
     /// above funnels through here, raw MIME included, so the scripted seam
     /// covers the whole surface and no path can quietly bypass it.
     ///
-    /// It takes an `AdmittedUrl` and nothing else: bifrost-net attaches the
+    /// The URL must be an `AdmittedUrl`: bifrost-net attaches the
     /// bearer to the first request whatever its host, so the origin decision
     /// has to be made before this point, and the type proves it was.
     async fn execute_wire(
         &self,
+        resource: Resource,
         url: &AdmittedUrl,
         method: &str,
         if_match: Option<&str>,
@@ -1036,16 +1079,6 @@ impl GraphClient {
         // below, through the production retry loop.
         #[cfg(test)]
         self.record_wire(method, url, if_match, prefer, body.as_ref());
-        // Nothing closes this semaphore, so a closed one is the client's own
-        // invariant failing - not a network fault a retry could clear.
-        let _permit = self
-            .inner
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|_| GraphError::Internal {
-                message: "Graph request semaphore closed".to_string(),
-            })?;
         let account_net = self.attached_net()?;
 
         let mut builder = match method {
@@ -1060,6 +1093,10 @@ impl GraphClient {
                 unreachable!("unsupported HTTP method passed to GraphClient::execute: {other}")
             }
         };
+
+        for (limit, weight) in self.claims(&resource, &account_net) {
+            builder = builder.concurrency_claim(limit, weight);
+        }
 
         builder = builder.header(
             "Content-Type",
@@ -1080,7 +1117,8 @@ impl GraphClient {
         let counter = bifrost_net::RequestByteCounter::new();
         let sent = builder.count_bytes_into(counter.clone()).send().await;
         self.record_bytes(&counter);
-        let response = sent.map_err(|error| self.tag_throttle(url, GraphError::Net(error)))?;
+        let response =
+            sent.map_err(|error| self.tag_throttle(&resource, GraphError::Net(error)))?;
         Ok(RestResponse::from(response))
     }
 
@@ -1091,13 +1129,6 @@ impl GraphClient {
     /// the Autodiscover POST (XML to the Autodiscover origin, which is not
     /// the Graph host).
     ///
-    /// Deliberately NOT folded into `execute_wire`: that funnel takes the
-    /// client's concurrency permit and always sends a bearer, and a chunked
-    /// upload holding a Graph permit per chunk is a different production
-    /// behavior than the one this path has always had. Keeping it separate
-    /// makes the seam an extraction of the existing code rather than a
-    /// change to it.
-    ///
     /// `timeout`, when given, is the request's TOTAL deadline in bifrost-net
     /// (admission, every attempt, retry backoff, redirects, body drain), so a
     /// caller spending one budget across several requests passes what is
@@ -1105,12 +1136,17 @@ impl GraphClient {
     /// `None` keeps the account default.
     pub(crate) async fn execute_aux(
         &self,
+        resource: Resource,
         method: &str,
         target: AuxTarget<'_>,
         headers: &[(&str, &str)],
         body: Bytes,
         timeout: Option<std::time::Duration>,
     ) -> Result<RestResponse, GraphError> {
+        debug_assert!(matches!(resource, Resource::Unmetered));
+        // Autodiscover is ungated: EWS throttling is per calling user under
+        // its own policy, and streaming notifications have a separate
+        // subscription budget. The REST per-mailbox four does not apply.
         let (url, bearer) = match target {
             AuxTarget::Bearer(url) => (url.as_str(), true),
             AuxTarget::Anonymous(url) => (url.as_str(), false),
@@ -1151,7 +1187,8 @@ impl GraphClient {
             .send()
             .await;
         self.record_bytes(&counter);
-        let response = sent.map_err(GraphError::Net)?;
+        let response =
+            sent.map_err(|error| self.tag_throttle(&resource, GraphError::Net(error)))?;
         Ok(RestResponse::from(response))
     }
 
@@ -1212,6 +1249,7 @@ impl GraphClient {
     /// open failure.
     pub(crate) async fn download_stream(
         &self,
+        resource: Resource,
         url: &AdmittedUrl,
         range: Option<bifrost_types::ByteRange>,
     ) -> Result<bifrost_net::ByteStream, GraphError> {
@@ -1219,10 +1257,13 @@ impl GraphClient {
         #[cfg(test)]
         self.record_download(url, range);
         let account_net = self.attached_net()?;
+        // Downloads stay ungated: a streamed body holds its permit until
+        // drained or dropped, and Graph has no admission deadline. Gating
+        // risks an indefinite local stall where a 429 would be recoverable.
         account_net
             .download_stream(url, range)
             .await
-            .map_err(|error| self.tag_throttle(url, GraphError::Net(error)))
+            .map_err(|error| self.tag_throttle(&resource, GraphError::Net(error)))
     }
 
     /// The transport a wire call should use: the scripted one under test
@@ -1695,39 +1736,31 @@ mod tests {
 
         assert!(is_internal(
             client
-                .get::<serde_json::Value>(&url)
+                .get::<serde_json::Value>(Resource::Outlook, &url)
                 .await
                 .expect_err("rest")
         ));
         assert!(is_internal(
             client
-                .execute_aux("POST", AuxTarget::Bearer(&url), &[], Bytes::new(), None)
+                .execute_aux(
+                    Resource::Unmetered,
+                    "POST",
+                    AuxTarget::Bearer(&url),
+                    &[],
+                    Bytes::new(),
+                    None
+                )
                 .await
                 .err()
                 .expect("aux")
         ));
         assert!(is_internal(
             client
-                .download_stream(&url, None)
+                .download_stream(Resource::Outlook, &url, None)
                 .await
                 .err()
                 .expect("download")
         ));
-    }
-
-    /// Nothing closes the request semaphore, so a closed one is the client's
-    /// invariant too, not a network fault.
-    #[tokio::test]
-    async fn a_closed_request_semaphore_is_an_internal_failure() {
-        let client = GraphClient::new("token");
-        client.script_rest([]);
-        client.inner.semaphore.close();
-        let url = client.api_url("/me").expect("api url");
-        assert!(matches!(
-            client.get::<serde_json::Value>(&url).await,
-            Err(GraphError::Internal { .. })
-        ));
-        assert_eq!(client.wire_attempts(), 0);
     }
 
     #[test]
@@ -1856,7 +1889,10 @@ mod tests {
         let url = shared
             .api_url(&format!("{}/messages", shared.api_path_prefix()))
             .expect("api url");
-        match shared.execute_wire(&url, "GET", None, None, None).await {
+        match shared
+            .execute_wire(Resource::Outlook, &url, "GET", None, None, None)
+            .await
+        {
             Err(GraphError::MailboxThrottled { budget, .. }) => {
                 assert_eq!(budget, shared.mailbox_budget());
                 assert!(
@@ -1889,7 +1925,9 @@ mod tests {
             .api_url(&format!("{}/messages", shouted.api_path_prefix()))
             .expect("api url");
         assert!(matches!(
-            shouted.execute_wire(&url, "GET", None, None, None).await,
+            shouted
+                .execute_wire(Resource::Outlook, &url, "GET", None, None, None)
+                .await,
             Err(GraphError::MailboxThrottled { .. })
         ));
 
@@ -1898,12 +1936,297 @@ mod tests {
             let url = primary.api_url(path).expect("api url");
             assert!(
                 matches!(
-                    primary.execute_wire(&url, "GET", None, None, None).await,
+                    primary
+                        .execute_wire(Resource::Unmetered, &url, "GET", None, None, None)
+                        .await,
                     Err(GraphError::Net(_))
                 ),
                 "{path} is not charged to one mailbox and must stay untagged"
             );
         }
+    }
+
+    // A reserved concurrency claim is not yet a recorded wire request:
+    // admission, rate and token futures precede polling ScriptedDispatch.
+    // Drive those stages with a bounded poll/yield loop before inspecting
+    // counts. The operation must stay pending on a claim or canned response.
+    async fn drive_pending<F: std::future::Future>(mut request: std::pin::Pin<&mut F>) {
+        for _ in 0..64 {
+            assert!(futures::FutureExt::now_or_never(request.as_mut()).is_none());
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn outlook_admission_is_per_mailbox_and_unmetered_work_bypasses_it() {
+        let primary = GraphClient::new("token");
+        primary.script_aux_pending(7);
+        let shared = primary.for_shared_mailbox("shared@contoso.com");
+        let net = primary.attached_net().expect("scripted net");
+        let limit = net.shared_concurrency_limit(primary.concurrency_key(&net), 4);
+        let other = net.shared_concurrency_limit(shared.concurrency_key(&net), 4);
+        let url = primary.api_url("/me/messages").expect("url");
+        let mut active = Vec::new();
+        for _ in 0..4 {
+            let mut request = Box::pin(primary.get::<serde_json::Value>(Resource::Outlook, &url));
+            drive_pending(request.as_mut()).await;
+            active.push(request);
+        }
+        assert_eq!(limit.in_flight(), 4);
+        assert_eq!(primary.wire_attempts(), 4);
+        let mut fifth = Box::pin(primary.get::<serde_json::Value>(Resource::Outlook, &url));
+        drive_pending(fifth.as_mut()).await;
+        assert_eq!(primary.wire_attempts(), 4);
+        let mut foreign = Box::pin(shared.get::<serde_json::Value>(Resource::Outlook, &url));
+        drive_pending(foreign.as_mut()).await;
+        assert_eq!(other.in_flight(), 1);
+        let mut unmetered = Box::pin(primary.get::<serde_json::Value>(Resource::Unmetered, &url));
+        drive_pending(unmetered.as_mut()).await;
+        assert_eq!(primary.wire_attempts(), 6);
+        assert_eq!(limit.in_flight(), 4);
+        drop(active.pop());
+        drive_pending(fifth.as_mut()).await;
+        assert_eq!(primary.wire_attempts(), 7);
+        assert_eq!(limit.in_flight(), 4);
+        drop((active, fifth, foreign, unmetered));
+        assert_eq!(limit.in_flight(), 0);
+        assert_eq!(other.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_primary_address_alias_shares_the_fixed_primary_limit() {
+        let primary = GraphClient::new("token");
+        primary.script_aux_pending(5);
+        let alias = primary.for_shared_mailbox("ME@contoso.com");
+        let net = primary.attached_net().expect("scripted net");
+        let key = primary.concurrency_key(&net);
+        primary.set_primary_address(Some("me@Contoso.com".into()));
+        assert_eq!(primary.concurrency_key(&net), key);
+        assert_eq!(alias.concurrency_key(&net), key);
+        let limit = net.shared_concurrency_limit(key, 4);
+        let url = primary.api_url("/me/messages").expect("url");
+        let mut active = Vec::new();
+        for _ in 0..4 {
+            let mut request = Box::pin(primary.get::<serde_json::Value>(Resource::Outlook, &url));
+            drive_pending(request.as_mut()).await;
+            active.push(request);
+        }
+        let mut fifth = Box::pin(alias.get::<serde_json::Value>(Resource::Outlook, &url));
+        drive_pending(fifth.as_mut()).await;
+        assert_eq!(primary.wire_attempts(), 4);
+        assert_eq!(limit.in_flight(), 4);
+        drop(active);
+        drive_pending(fifth.as_mut()).await;
+        assert_eq!(primary.wire_attempts(), 5);
+        assert_eq!(limit.in_flight(), 1);
+    }
+
+    #[tokio::test]
+    async fn directory_queries_bypass_a_saturated_mailbox_without_throttle_tags() {
+        use bifrost_types::Account;
+        let client = GraphClient::new("token");
+        client.script_aux_pending(4);
+        let net = client.attached_net().expect("net");
+        let limit = net.shared_concurrency_limit(client.concurrency_key(&net), 4);
+        let url = client.api_url("/me/messages").expect("url");
+        let mut active = Vec::new();
+        for _ in 0..4 {
+            let mut request = Box::pin(client.get::<serde_json::Value>(Resource::Outlook, &url));
+            drive_pending(request.as_mut()).await;
+            active.push(request);
+        }
+        client.script_rest([ScriptedRestResponse::empty(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+        )]);
+        let account = crate::account::GraphAccount::new_for_tests(
+            client.clone(),
+            crate::account::PushMode::GraphSubscriptions,
+        );
+        let mut query = Account::directory_search(&account, "ada".into(), None, None);
+        let mut result = None;
+        for _ in 0..64 {
+            if let Some(value) = futures::FutureExt::now_or_never(query.as_mut()) {
+                result = Some(value);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let error = result
+            .expect("directory query must bypass mailbox admission")
+            .expect_err("429");
+        assert!(error.throttle_budgets().is_empty());
+        assert_eq!(limit.in_flight(), 4);
+        assert!(
+            client
+                .take_rest_requests()
+                .last()
+                .expect("query")
+                .url
+                .contains("/users?")
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_derived_factory_preserves_primary_identity() {
+        use bifrost_types::AccountFactory;
+        let primary = GraphClient::new("token");
+        primary.set_primary_address(Some("a@contoso.com".into()));
+        primary.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                serde_json::json!({"mail": "b@contoso.com"}),
+            ),
+            ScriptedRestResponse::json(reqwest::StatusCode::OK, serde_json::json!({"value": []})),
+        ]);
+        let shared = primary
+            .for_shared_mailbox("b@contoso.com")
+            .with_outlook_base("https://outlook.office365.com");
+        let alias = primary.for_shared_mailbox("A@CONTOSO.COM");
+        let budget = primary.mailbox_budget();
+        crate::account::GraphAccountFactory::new(shared.clone())
+            .open(AccountId("primary".into()))
+            .await
+            .expect("open shared factory");
+        let net = primary.attached_net().expect("net");
+        assert_eq!(primary.mailbox_budget(), budget);
+        assert_eq!(alias.concurrency_key(&net), primary.concurrency_key(&net));
+        assert_ne!(shared.concurrency_key(&net), primary.concurrency_key(&net));
+    }
+
+    #[tokio::test]
+    async fn mixed_owner_hydration_claims_both_mailbox_limits() {
+        use bifrost_types::{Account, ObjectId, Projection};
+        use futures::StreamExt;
+        let primary = GraphClient::new("token");
+        primary.script_aux_pending(1);
+        let shared = primary.for_shared_mailbox("shared@contoso.com");
+        let net = primary.attached_net().expect("net");
+        let limit = net.shared_concurrency_limit(primary.concurrency_key(&net), 4);
+        let other = net.shared_concurrency_limit(shared.concurrency_key(&net), 4);
+        let account = crate::account::GraphAccount::new_for_tests_with_shared(
+            primary.clone(),
+            crate::account::PushMode::GraphSubscriptions,
+            &["shared@contoso.com".into()],
+        );
+        let ids = vec![
+            ObjectId("p1".into()),
+            ObjectId("p2".into()),
+            ObjectId("shared@contoso.com\u{1f}s1".into()),
+        ];
+        let mut stream = Account::get_stream(
+            &account,
+            Box::pin(futures::stream::iter(ids)),
+            Projection::Metadata,
+        );
+        let mut next = Box::pin(stream.next());
+        drive_pending(next.as_mut()).await;
+        assert_eq!((limit.in_flight(), other.in_flight()), (2, 1));
+        let requests = primary.take_rest_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert!(requests[0].url.ends_with("/$batch"));
+        let body = requests[0].body.as_ref().expect("batch body");
+        let urls: Vec<_> = body["requests"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| {
+                item["url"]
+                    .as_str()
+                    .expect("url")
+                    .split('?')
+                    .next()
+                    .expect("path")
+            })
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "/me/messages/p1",
+                "/me/messages/p2",
+                "/users/shared%40contoso.com/messages/s1"
+            ]
+        );
+        drop(next);
+        drop(stream);
+        assert_eq!((limit.in_flight(), other.in_flight()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn batches_claim_capped_weights_after_merging_mailbox_aliases() {
+        let primary = GraphClient::new("token");
+        primary.script_aux_pending(3);
+        primary.set_primary_address(Some("me@contoso.com".into()));
+        let shared = primary.for_shared_mailbox("shared@contoso.com");
+        let alias = primary.for_shared_mailbox("ME@CONTOSO.COM");
+        let net = primary.attached_net().expect("scripted net");
+        let limit = net.shared_concurrency_limit(primary.concurrency_key(&net), 4);
+        let other = net.shared_concurrency_limit(shared.concurrency_key(&net), 4);
+        for (clients, expected) in [
+            (
+                vec![
+                    primary.clone(),
+                    primary.clone(),
+                    primary.clone(),
+                    shared.clone(),
+                    shared.clone(),
+                ],
+                (3, 2),
+            ),
+            (vec![primary.clone(); 6], (4, 0)),
+            (
+                vec![
+                    primary.clone(),
+                    primary.clone(),
+                    primary.clone(),
+                    alias.clone(),
+                    alias.clone(),
+                    alias,
+                ],
+                (4, 0),
+            ),
+        ] {
+            let batch = crate::types::BatchRequest {
+                requests: clients
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| crate::types::BatchRequestItem {
+                        id: index.to_string(),
+                        method: "GET".into(),
+                        url: "/me/messages".into(),
+                        body: None,
+                        headers: None,
+                    })
+                    .collect(),
+            };
+            let mut request = Box::pin(primary.post_batch(Resource::Batch(clients), &batch));
+            drive_pending(request.as_mut()).await;
+            assert_eq!((limit.in_flight(), other.in_flight()), expected);
+            drop(request);
+            assert_eq!((limit.in_flight(), other.in_flight()), (0, 0));
+        }
+        assert_eq!(primary.wire_attempts(), 3);
+    }
+
+    #[tokio::test]
+    async fn continuation_spelling_keeps_the_walk_mailbox_on_a_throttle() {
+        let primary = GraphClient::new("token");
+        let shared = primary.for_shared_mailbox("shared@contoso.com");
+        shared.script_rest([
+            ScriptedRestResponse::json(reqwest::StatusCode::OK, serde_json::json!({
+                "value": [],
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/users('shared@contoso.com')/mailFolders?$skiptoken=next",
+            })),
+            ScriptedRestResponse::empty(reqwest::StatusCode::TOO_MANY_REQUESTS),
+        ]);
+        match shared.list_mail_folders().await {
+            Err(GraphError::MailboxThrottled { budget, .. }) => {
+                assert_eq!(budget, shared.mailbox_budget());
+                assert_ne!(budget, primary.mailbox_budget());
+            }
+            other => panic!("the walk retains its owning mailbox: {other:?}"),
+        }
+        assert_eq!(shared.wire_attempts(), 2);
     }
 
     #[test]
@@ -1982,8 +2305,10 @@ mod tests {
     ) -> Result<RestResponse, GraphError> {
         let client = GraphClient::new("token");
         client.script_rest(responses);
-        let url = client.api_url("/me").expect("api url");
-        client.execute_wire(&url, "GET", None, None, None).await
+        let url = client.api_url("/me/messages").expect("api url");
+        client
+            .execute_wire(Resource::Outlook, &url, "GET", None, None, None)
+            .await
     }
 
     /// `bifrost-net` returns `Ok(Response)` for 2xx and a passed-through
@@ -2014,8 +2339,8 @@ mod tests {
             _ => panic!("a terminal 4xx is Error::Status"),
         }
 
-        // The funnel tags a throttle on a request under the client's own
-        // mailbox prefix with that mailbox's budget; the transport's shape
+        // The funnel tags an Outlook throttle with the client's mailbox
+        // budget; the transport's shape
         // survives underneath it unchanged.
         match outcome_for([ScriptedRestResponse::empty(StatusCode::TOO_MANY_REQUESTS)
             .with_header("Retry-After", "5")])
@@ -2031,7 +2356,7 @@ mod tests {
                 }
                 _ => panic!("429 past the budget is Error::RateLimited"),
             },
-            _ => panic!("a 429 under the mailbox prefix carries the mailbox budget"),
+            _ => panic!("an Outlook 429 carries the mailbox budget"),
         }
 
         match outcome_for([ScriptedRestResponse::empty(
@@ -2099,7 +2424,7 @@ mod tests {
 
         let url = client.api_url("/me").expect("api url");
         let response = client
-            .execute_wire(&url, "GET", None, None, None)
+            .execute_wire(Resource::Outlook, &url, "GET", None, None, None)
             .await
             .expect("the retried 503 succeeds on the second attempt");
 

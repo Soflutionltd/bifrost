@@ -13,6 +13,7 @@ use bifrost_types::{
 use super::GraphAccount;
 use super::error::warning_blob_not_byte_stream;
 use super::graph_error::{GraphErrorContext, into_account_error};
+use crate::client::Resource;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum GraphBlobKind {
@@ -406,7 +407,10 @@ async fn fetch_raw_stream(
     let url = client
         .api_url(&format!("{prefix}/messages/{enc_message_id}/$value"))
         .map_err(Box::new)?;
-    client.download_stream(&url, None).await.map_err(Box::new)
+    client
+        .download_stream(Resource::Outlook, &url, None)
+        .await
+        .map_err(Box::new)
 }
 
 async fn fetch_blob_stream(
@@ -432,7 +436,7 @@ async fn fetch_blob_stream(
         ))
         .map_err(|error| BlobFetchError::Failed(Box::new(error)))?;
     client
-        .download_stream(&url, range)
+        .download_stream(Resource::Outlook, &url, range)
         .await
         .map_err(BlobFetchError::from)
 }

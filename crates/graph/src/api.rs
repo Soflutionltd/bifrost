@@ -1,4 +1,4 @@
-use crate::client::GraphClient;
+use crate::client::{GraphClient, Resource};
 use crate::error::GraphError;
 use crate::paging::PageWalk;
 use crate::types::{GraphMailFolder, GraphMessageRule, GraphProfile, ODataCollection};
@@ -6,9 +6,10 @@ use crate::types::{GraphMailFolder, GraphMessageRule, GraphProfile, ODataCollect
 impl GraphClient {
     pub(crate) async fn get_profile(&self) -> Result<GraphProfile, GraphError> {
         let prefix = self.api_path_prefix();
-        self.get_json(&format!(
-            "{prefix}?$select=displayName,mail,userPrincipalName"
-        ))
+        self.get_json(
+            Resource::Unmetered,
+            &format!("{prefix}?$select=displayName,mail,userPrincipalName"),
+        )
         .await
     }
 
@@ -22,7 +23,7 @@ impl GraphClient {
 
         while let Some(url) = next_url {
             walk.enter(&url)?;
-            let page: ODataCollection<GraphMailFolder> = self.get(&url).await?;
+            let page: ODataCollection<GraphMailFolder> = self.get(Resource::Outlook, &url).await?;
             folders.extend(page.value);
             next_url = self.admit_next(page.next_link.as_ref())?;
         }
@@ -60,7 +61,8 @@ impl GraphClient {
 
             while let Some(url) = next_url {
                 walk.enter(&url)?;
-                let page: ODataCollection<GraphMailFolder> = self.get(&url).await?;
+                let page: ODataCollection<GraphMailFolder> =
+                    self.get(Resource::Outlook, &url).await?;
                 for folder in page.value {
                     if folder.child_folder_count.unwrap_or(0) > 0 {
                         queue.push_back(folder.id.clone());
@@ -82,7 +84,7 @@ impl GraphClient {
 
         while let Some(url) = next_url {
             walk.enter(&url)?;
-            let page: ODataCollection<GraphMessageRule> = self.get(&url).await?;
+            let page: ODataCollection<GraphMessageRule> = self.get(Resource::Outlook, &url).await?;
             rules.extend(page.value);
             next_url = self.admit_next(page.next_link.as_ref())?;
         }
@@ -95,8 +97,12 @@ impl GraphClient {
         rule: &GraphMessageRule,
     ) -> Result<GraphMessageRule, GraphError> {
         let prefix = self.api_path_prefix();
-        self.post(&format!("{prefix}/mailFolders/inbox/messageRules"), rule)
-            .await
+        self.post(
+            Resource::Outlook,
+            &format!("{prefix}/mailFolders/inbox/messageRules"),
+            rule,
+        )
+        .await
     }
 
     pub(crate) async fn update_message_rule(
@@ -107,6 +113,7 @@ impl GraphClient {
         let prefix = self.api_path_prefix();
         let encoded = bifrost_net::url::encode_path_component(rule_id);
         self.patch_json(
+            Resource::Outlook,
             &format!("{prefix}/mailFolders/inbox/messageRules/{encoded}"),
             patch,
         )
@@ -116,9 +123,10 @@ impl GraphClient {
     pub(crate) async fn delete_message_rule(&self, rule_id: &str) -> Result<(), GraphError> {
         let prefix = self.api_path_prefix();
         let encoded = bifrost_net::url::encode_path_component(rule_id);
-        self.delete(&format!(
-            "{prefix}/mailFolders/inbox/messageRules/{encoded}"
-        ))
+        self.delete(
+            Resource::Outlook,
+            &format!("{prefix}/mailFolders/inbox/messageRules/{encoded}"),
+        )
         .await
     }
 }

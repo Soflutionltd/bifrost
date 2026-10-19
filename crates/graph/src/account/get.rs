@@ -331,7 +331,10 @@ async fn fetch_batch(
         })
         .collect();
     let request = BatchRequest { requests };
-    let response: BatchResponse = account.client.post_batch(&request).await?;
+    let response: BatchResponse = account
+        .client
+        .post_batch(account.batch_resource(&rest_ids)?, &request)
+        .await?;
     let etags = reconcile_hydration_responses(
         &rest_ids,
         response.responses,

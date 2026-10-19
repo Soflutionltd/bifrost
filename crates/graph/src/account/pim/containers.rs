@@ -7,6 +7,7 @@ use crate::account::GraphClient;
 use crate::account::graph_error::{
     GraphErrorContext, into_account_error, unsupported_account_error,
 };
+use crate::client::Resource;
 use crate::types::GraphMailFolder;
 use bifrost_types::{
     AccountError, AccountOperation, Container, ContainerContentClass, ContainerId, ContainerKind,
@@ -252,7 +253,7 @@ pub(crate) async fn container_create(
     };
     let folder: GraphMailFolder = account
         .client
-        .post(&path, &json!({ "displayName": name }))
+        .post(Resource::Outlook, &path, &json!({ "displayName": name }))
         .await
         .map_err(|e| {
             into_account_error(
@@ -277,7 +278,7 @@ pub(crate) async fn container_rename(
     );
     account
         .client
-        .patch(&path, &json!({ "displayName": name }))
+        .patch(Resource::Outlook, &path, &json!({ "displayName": name }))
         .await
         .map_err(|e| {
             into_account_error(
@@ -300,7 +301,11 @@ pub(crate) async fn container_move(
     );
     let _: GraphMailFolder = account
         .client
-        .post(&path, &json!({ "destinationId": destination_id }))
+        .post(
+            Resource::Outlook,
+            &path,
+            &json!({ "destinationId": destination_id }),
+        )
         .await
         .map_err(|e| {
             into_account_error(e, GraphErrorContext::graph(AccountOperation::ContainerMove))
@@ -317,12 +322,16 @@ pub(crate) async fn container_delete(
         account.client.api_path_prefix(),
         bifrost_net::url::encode_path_component(&container.0)
     );
-    account.client.delete(&path).await.map_err(|e| {
-        into_account_error(
-            e,
-            GraphErrorContext::graph(AccountOperation::ContainerDelete),
-        )
-    })
+    account
+        .client
+        .delete(Resource::Outlook, &path)
+        .await
+        .map_err(|e| {
+            into_account_error(
+                e,
+                GraphErrorContext::graph(AccountOperation::ContainerDelete),
+            )
+        })
 }
 
 /// Resolve the well-known folder ids of ONE mailbox. Takes the client
@@ -336,7 +345,7 @@ pub(super) async fn well_known_folder_roles(client: &GraphClient) -> HashMap<Str
             client.api_path_prefix(),
             bifrost_net::url::encode_path_component(name)
         );
-        if let Ok(value) = client.get_json::<Value>(&path).await
+        if let Ok(value) = client.get_json::<Value>(Resource::Outlook, &path).await
             && let Some(id) = value.get("id").and_then(Value::as_str)
         {
             roles.insert(id.to_string(), *role);
@@ -464,12 +473,15 @@ pub(super) async fn trash_container_id(
         "{}/mailFolders/{DELETED_ITEMS}?$select=id",
         client.api_path_prefix()
     );
-    let folder: Value = client.get_json(&path).await.map_err(|error| {
-        into_account_error(
-            error,
-            GraphErrorContext::graph(AccountOperation::BulkMove).with_scope(scope.clone()),
-        )
-    })?;
+    let folder: Value = client
+        .get_json(Resource::Outlook, &path)
+        .await
+        .map_err(|error| {
+            into_account_error(
+                error,
+                GraphErrorContext::graph(AccountOperation::BulkMove).with_scope(scope.clone()),
+            )
+        })?;
     let native = folder
         .get("id")
         .and_then(Value::as_str)

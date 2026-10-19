@@ -6,6 +6,7 @@ use bifrost_types::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::client::Resource;
 use crate::origin::AdmittedUrl;
 use crate::types::ODataCollection;
 
@@ -47,7 +48,8 @@ pub(crate) async fn address_books_list(
     while let Some(url) = next {
         walk.enter(&url)
             .map_err(|error| into_error(error, operation))?;
-        let page: ODataCollection<GraphContactFolder> = get_page(&account, &url, operation).await?;
+        let page: ODataCollection<GraphContactFolder> =
+            get_page(&account, Resource::Outlook, &url, operation).await?;
         next = admit_next(&account, &page, operation)?;
         books.extend(page.value.into_iter().map(folder_to_address_book));
     }
@@ -76,7 +78,8 @@ async fn contact_page(
             .api_url(&contacts_url(&account, address_book.as_ref(), top))
             .map_err(|error| into_error(error, operation))?,
     };
-    let page: ODataCollection<GraphContact> = get_page(&account, &url, operation).await?;
+    let page: ODataCollection<GraphContact> =
+        get_page(&account, Resource::Outlook, &url, operation).await?;
     let next_cursor = link_cursor(admit_next(&account, &page, operation)?);
     Ok(Page {
         items: page.value.into_iter().map(contact_from_graph).collect(),
@@ -96,7 +99,7 @@ pub(crate) async fn get(
     let path = format!("{prefix}/contacts/{encoded}?$select={CONTACT_SELECT}");
     let contact = account
         .client
-        .get_json::<GraphContact>(&path)
+        .get_json::<GraphContact>(Resource::Outlook, &path)
         .await
         .map_err(|error| into_error(error, AccountOperation::ContactGet))?;
     Ok(contact_from_graph(contact))
@@ -109,7 +112,11 @@ pub(crate) async fn create(
     let path = create_url(&account, contact.address_book_id.as_ref());
     let created = account
         .client
-        .post::<GraphContact, _>(&path, &graph_contact_from_create(&contact))
+        .post::<GraphContact, _>(
+            Resource::Outlook,
+            &path,
+            &graph_contact_from_create(&contact),
+        )
         .await
         .map_err(|error| into_error(error, AccountOperation::ContactCreate))?;
     Ok(ContactId(created.id))
@@ -138,9 +145,12 @@ pub(crate) async fn update(
     let path = format!("{prefix}/contacts/{encoded}");
     let body = graph_contact_from_patch(&patch);
     let result = if let Some(etag) = etag.as_deref() {
-        account.client.patch_if_match(&path, etag, &body).await
+        account
+            .client
+            .patch_if_match(Resource::Outlook, &path, etag, &body)
+            .await
     } else {
-        account.client.patch(&path, &body).await
+        account.client.patch(Resource::Outlook, &path, &body).await
     };
     result.map_err(|error| into_error(error, AccountOperation::ContactUpdate))
 }
@@ -151,9 +161,12 @@ pub(crate) async fn delete(account: GraphAccount, contact: ContactId) -> Result<
     let encoded = bifrost_net::url::encode_path_component(&contact.0);
     let path = format!("{prefix}/contacts/{encoded}");
     let result = if let Some(etag) = current.etag.as_deref() {
-        account.client.delete_if_match(&path, etag).await
+        account
+            .client
+            .delete_if_match(Resource::Outlook, &path, etag)
+            .await
     } else {
-        account.client.delete(&path).await
+        account.client.delete(Resource::Outlook, &path).await
     };
     result.map_err(|error| into_error(error, AccountOperation::ContactDelete))
 }
@@ -194,7 +207,8 @@ pub(crate) async fn search(
                 graph_error::GraphErrorContext::graph(AccountOperation::ContactSearch),
             )
         })?;
-        let page: ODataCollection<GraphContact> = get_page(&account, &url, operation).await?;
+        let page: ODataCollection<GraphContact> =
+            get_page(&account, Resource::Outlook, &url, operation).await?;
         let next_link = admit_next(&account, &page, operation)?;
         let page_len = page.value.len();
         for (index, value) in page.value.into_iter().enumerate().skip(skip) {
@@ -280,7 +294,8 @@ pub(crate) async fn directory_search(
                 graph_error::GraphErrorContext::graph(AccountOperation::DirectorySearch),
             )
         })?;
-        let page: ODataCollection<GraphDirectoryUser> = get_page(&account, &url, operation).await?;
+        let page: ODataCollection<GraphDirectoryUser> =
+            get_page(&account, Resource::Unmetered, &url, operation).await?;
         let next_link = admit_next(&account, &page, operation)?;
         let page_len = page.value.len();
         for (index, value) in page.value.into_iter().enumerate().skip(skip) {
@@ -527,12 +542,13 @@ fn directory_user_to_card(user: GraphDirectoryUser) -> Option<DirectoryCard> {
 
 pub(crate) async fn get_page<T: serde::de::DeserializeOwned>(
     account: &GraphAccount,
+    resource: Resource,
     url: &AdmittedUrl,
     operation: AccountOperation,
 ) -> Result<ODataCollection<T>, AccountError> {
     account
         .client
-        .get(url)
+        .get(resource, url)
         .await
         .map_err(|error| into_error(error, operation))
 }

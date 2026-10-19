@@ -266,8 +266,7 @@ Consequences worth knowing when writing a test:
   crate riding the transport instead of per crate.
 
 The script is shared with every client derived from the one a test holds
-(`for_shared_mailbox`, `with_outlook_base`), the way the semaphore and
-`AccountNet` already are, so a foreign-mailbox request - issued by a client
+(`for_shared_mailbox`, `with_outlook_base`), the way `AccountNet` already is, so a foreign-mailbox request - issued by a client
 minted inside `GraphAccount::new` - is scripted and recorded alongside the
 primary's. That sharing silently weakens any test written past it: a derived
 client answers from the primary's queue and records into the primary's log,
@@ -313,10 +312,8 @@ Graph REST JSON calls. Both now share the REST dispatcher:
   test could record a `ByteRange` the account never actually put on the wire.
   The scripted header is now checked against the real request.
 - `GraphClient::execute_aux` - the pre-authenticated OneDrive chunk PUTs and
-  session cancel `DELETE`, and the Autodiscover POST. Deliberately NOT folded into `execute_wire`: that
-  funnel always sends a bearer and takes the client's concurrency permit,
-  and a chunked upload holding a Graph permit per chunk would be different
-  production behavior from the one this path has always had. The recorded
+  session cancel `DELETE`, and the Autodiscover POST. These are explicitly
+  `Unmetered`; bearer handling differs from `execute_wire`. The recorded
   request keeps the header list verbatim (`Content-Range`, `SOAPAction`) plus
   whether a bearer was attached, so "the pre-authed session URL never carries
   the Graph token" is an assertion rather than a comment. Whether a bearer is
@@ -499,8 +496,8 @@ Every send path takes its transport from one accessor, `attached_net`, and an
 EWS lane from `public_folder::ews_client`. A client with no attached
 `AccountNet` is unreachable - the factory attaches before any `GraphAccount`
 exists, `with_account_net` fills the slot at construction, derived clients
-copy a filled slot, and nothing empties it - so an empty or poisoned slot, and
-likewise a closed request semaphore, is `GraphError::Internal` /
+copy a filled slot, and nothing empties it - so an empty or poisoned slot
+is `GraphError::Internal` /
 `EwsError::Internal` -> `Internal(InvariantViolated)`. It used to be minted as
 `Network(Unsent)`, which the engine retried forever although a retry of the
 same request never attaches anything. The EWS streaming worker reports it as
@@ -2157,27 +2154,67 @@ the engine then records ALONE.
 - **Identity.** `GraphClient::mailbox_budget` is the API origin plus the mailbox
   the client routes to: the `/users/{key}` routing key for a shared-mailbox
   client, the profile address (`mail`, else UPN, set by
-  `set_primary_address` on every `open`) for the primary. Both lowercased;
+  `set_primary_address` on every primary/default-mailbox `open`) for the primary.
+  Opening a derived mailbox client cannot overwrite this shared slot; derived
+  clients only read it for primary-address alias resolution. Both lowercased;
   with no profile address the primary uses the engine account id, which never
   shares. It is an approximation, stated at the method: a mailbox reached
   through two address forms gets two budgets, an address reassigned while a
   deadline is pending (or a stale profile address) can hold the wrong mailbox,
   and the app id is hidden behind the `TokenSource`. Each deadline is in memory
   and expires on its own; the cost is pacing, never a misrouted request.
-- **Stamp, REST funnel.** `execute_wire` and `download_stream` wrap a 429 / 503 / 507
-  as `GraphError::MailboxThrottled { budget, source }` when the URL sits under
-  the client's own `/me` or `/users/{key}` prefix. That prefix also covers
-  OneDrive (`/me/drive/...`), whose throttles are therefore stamped with the
-  mailbox budget too: an over-attribution, filed for narrowing to Outlook
-  resource paths. The budget only survives classification when the failure
-  classifies as a throttle (`Server(RateLimited | QuotaExhausted)`): a plain
-  503 classifies `Unavailable`, so it keeps its local retry delay but records
-  no shared hold. `/subscriptions`, a
-  continuation link spelled in another form, and `$batch` stay untagged and
-  fall back to the account key: a mutation or hydration `$batch` is posted
-  through the PRIMARY client with sub-requests routed per id, so an outer
-  `$batch` 429 cannot be pinned on one mailbox. `response_status` sees through
-  the wrapper; `into_account_error` unwraps it into `GraphErrorContext::budget`.
+- **Stamp, REST funnel.** Call sites pass `Resource::Outlook`, `Batch` or
+  `Unmetered` through every wrapper. Ownership is independent of URL spelling:
+  continuation walks keep their starting mailbox even when Graph returns a
+  quote-style `/users('id')` link. Outlook includes mail, mail folders,
+  messages (including MIME drafts), calendars and events, contacts and contact
+  folders, mailbox settings, inference classification, profile photos, and
+  message or attachment value downloads. OneDrive (all of `cloud.rs`, including
+  upload sessions, sharing links and chunk PUTs), subscriptions, profile user
+  lookup (`/me` itself), directory `/users`, `/memberOf` and `/groups/{id}/transitiveMembers`
+  queries and Autodiscover are
+  `Unmetered`. This means no Outlook claim or mailbox throttle tag; account
+  rate limits and any injected account concurrency claim still apply.
+  `execute_wire` and `download_stream` wrap Outlook 429 / 503 / 507 failures
+  as `GraphError::MailboxThrottled { budget, source }` using the unchanged
+  `mailbox_budget` string. The budget survives classification only for
+  `Server(RateLimited | QuotaExhausted)`; a plain 503 remains `Unavailable`.
+  Unmetered failures and outer `$batch` failures stay untagged and fall back
+  to the account key. Per-item batch stamps remain independent of the outer
+  POST. `response_status` sees through the wrapper; `into_account_error`
+  unwraps it into `GraphErrorContext::budget`.
+- **Concurrency.** Buffered Outlook requests add a weight-1 claim on a
+  `ConcurrencyLimit` of 4, Microsoft's documented concurrent-request limit
+  per app per mailbox. `AccountNet::shared_concurrency_limit` shares the
+  registry within one `Net`. The primary key is fixed at construction with
+  an injected account or first attachment:
+  `graph-outlook|ORIGIN|primary|ACCOUNT_ID`. Learning the primary address
+  never changes it. Shared clients read the primary's shared address slot:
+  a case-insensitive match resolves to the primary key, otherwise the key is
+  `graph-outlook|ORIGIN|mailbox:LOWERCASED_ID`. ORIGIN excludes the API path,
+  so v1.0 and beta share a budget. These concurrency keys are separate from
+  throttle budget strings, whose identity remains unchanged.
+- **Batch admission.** Each subrequest carries its owning client, resolved
+  from the same object routing as its URL. The outer POST merges owners by
+  final concurrency key and adds one weighted claim per merged group,
+  `min(subrequest_count, 4)`. Three primary plus two shared subrequests claim
+  3 and 2; six for one mailbox claim 4. Aliases are merged before capping,
+  so no batch invokes the limiter's exclusive oversized-claim path.
+- **Ungated streams and Exchange surfaces.** Downloads add no Outlook claim:
+  a streamed body holds its permit until drained or dropped, and Graph has
+  no admission deadline, so gating risks an indefinite local stall where a
+  429 would be recoverable. Outlook downloads retain mailbox throttle
+  attribution; OneDrive downloads are Unmetered. Downloads can therefore
+  cause concurrency 429s on buffered work even when its local claims fit.
+  EWS and Autodiscover are ungated. EWS throttling is per calling user under
+  its own policy, and streaming notifications have a separate subscription
+  budget; the REST per-mailbox 4 does not apply.
+- **Concurrency residuals.** SMTP address and directory object id spellings
+  of one mailbox give two keys. A shared client created before the primary
+  address is known keeps its mailbox key for requests already admitted;
+  later requests can resolve to the primary key. The app id is behind an
+  opaque `TokenSource`, so primary identity is per Net and engine account,
+  not per app. No attempt is made to infer these identities from the token.
 - **Stamp, `$batch` items.** `mutation_item_outcome`,
   `reconcile_mutation_responses` and `reconcile_hydration_responses` take each
   id's budget (`GraphAccount::budget_for_object`) and stamp it on a throttled

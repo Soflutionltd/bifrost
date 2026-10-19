@@ -6,6 +6,7 @@
 //! The worker itself lives in `super::super::ews_stream`; it is spawned by
 //! `push_stream::ensure_ews_worker`.
 
+use crate::client::Resource;
 use std::collections::{HashMap, HashSet};
 
 use bifrost_types::{
@@ -258,7 +259,11 @@ pub(super) async fn translate_ews_scopes(
         };
         match account
             .client
-            .post::<TranslateExchangeIdsResponse, _>("/me/translateExchangeIds", &request)
+            .post::<TranslateExchangeIdsResponse, _>(
+                Resource::Outlook,
+                "/me/translateExchangeIds",
+                &request,
+            )
             .await
         {
             Ok(response) => translated.extend(response.value),

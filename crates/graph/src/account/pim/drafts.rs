@@ -6,6 +6,7 @@ use crate::account::GraphClient;
 use crate::account::graph_error::{
     GraphErrorContext, into_account_error, unsupported_account_error,
 };
+use crate::client::Resource;
 use base64::Engine;
 use bifrost_types::{
     AccountError, AccountOperation, Address, AttachmentInline, DraftHandle, DraftPatch, ObjectId,
@@ -45,7 +46,7 @@ pub(crate) async fn draft_update(
     );
     account
         .client
-        .patch(&path, &message)
+        .patch(Resource::Outlook, &path, &message)
         .await
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftUpdate)))
 }
@@ -59,9 +60,13 @@ pub(crate) async fn draft_discard(
         account.client.api_path_prefix(),
         bifrost_net::url::encode_path_component(&draft.0)
     );
-    account.client.delete(&path).await.map_err(|e| {
-        into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftDiscard))
-    })
+    account
+        .client
+        .delete(Resource::Outlook, &path)
+        .await
+        .map_err(|e| {
+            into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftDiscard))
+        })
 }
 
 pub(crate) async fn draft_send(
@@ -253,9 +258,12 @@ pub(super) async fn create_draft_message(
     message: Value,
 ) -> Result<DraftHandle, AccountError> {
     let path = format!("{}/messages", client.api_path_prefix());
-    let created: Value = client.post(&path, &message).await.map_err(|e| {
-        into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftCreate))
-    })?;
+    let created: Value = client
+        .post(Resource::Outlook, &path, &message)
+        .await
+        .map_err(|e| {
+            into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftCreate))
+        })?;
     let id = created.get("id").and_then(Value::as_str).ok_or_else(|| {
         pim_protocol_error(
             AccountOperation::DraftCreate,
@@ -276,7 +284,7 @@ pub(super) async fn send_draft_message(
         bifrost_net::url::encode_path_component(&draft.0)
     );
     client
-        .post_empty(&path)
+        .post_empty(Resource::Outlook, &path)
         .await
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::Send)))
 }

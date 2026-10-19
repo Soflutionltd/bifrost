@@ -135,7 +135,16 @@ pub(crate) async fn message_reactions(
                 headers: None,
             })
             .collect();
-        match account.client.post_batch(&BatchRequest { requests }).await {
+        match account
+            .client
+            .post_batch(
+                account
+                    .batch_resource(&chunk)
+                    .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?,
+                &BatchRequest { requests },
+            )
+            .await
+        {
             Ok(response) => classify_chunk(&chunk, response.responses, operation, &mut builder),
             Err(e) => {
                 // The whole chunk never returned: every item's fate is

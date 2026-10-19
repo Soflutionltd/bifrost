@@ -11,6 +11,8 @@
 use bifrost_types::{AccountError, AccountOperation, CategoryDefinition};
 use serde::Deserialize;
 
+use crate::client::Resource;
+
 use super::GraphAccount;
 use super::graph_error::{GraphErrorContext, into_account_error};
 
@@ -37,7 +39,10 @@ pub(crate) async fn category_definitions_list(
     let prefix = account.client.api_path_prefix();
     let response: CategoryListResponse = account
         .client
-        .get_json(&format!("{prefix}/outlook/masterCategories"))
+        .get_json(
+            Resource::Outlook,
+            &format!("{prefix}/outlook/masterCategories"),
+        )
         .await
         .map_err(|e| {
             into_account_error(

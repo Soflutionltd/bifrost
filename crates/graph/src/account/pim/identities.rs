@@ -3,6 +3,7 @@
 
 use crate::account::GraphAccount;
 use crate::account::graph_error::{GraphErrorContext, into_account_error};
+use crate::client::Resource;
 use bifrost_types::{AccountError, AccountOperation, Identity, IdentityId, VacationConfig};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -39,9 +40,13 @@ pub(crate) async fn vacation_get(
         "{}/mailboxSettings?$select=automaticRepliesSetting",
         account.client.api_path_prefix()
     );
-    let settings: MailboxSettings = account.client.get_json(&path).await.map_err(|e| {
-        into_account_error(e, GraphErrorContext::graph(AccountOperation::VacationGet))
-    })?;
+    let settings: MailboxSettings = account
+        .client
+        .get_json(Resource::Outlook, &path)
+        .await
+        .map_err(|e| {
+            into_account_error(e, GraphErrorContext::graph(AccountOperation::VacationGet))
+        })?;
     Ok(settings.automatic_replies_setting.map(vacation_from_graph))
 }
 
@@ -76,7 +81,7 @@ pub(crate) async fn vacation_set(
     let path = format!("{}/mailboxSettings", account.client.api_path_prefix());
     account
         .client
-        .patch(&path, &setting)
+        .patch(Resource::Outlook, &path, &setting)
         .await
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::VacationSet)))
 }

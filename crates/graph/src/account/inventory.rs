@@ -7,6 +7,7 @@ use bifrost_types::{
 };
 use serde_json::Value;
 
+use crate::client::Resource;
 use crate::origin::AdmittedUrl;
 use crate::types::{CONTACT_SELECT, MESSAGE_SELECT, ODataCollection};
 
@@ -560,7 +561,7 @@ async fn fetch_page(
     client: &crate::client::GraphClient,
     url: &AdmittedUrl,
 ) -> Result<ODataCollection<Value>, crate::error::GraphError> {
-    client.get(url).await
+    client.get(Resource::Outlook, url).await
 }
 
 fn internet_header(value: &Value, name: &str) -> Option<String> {

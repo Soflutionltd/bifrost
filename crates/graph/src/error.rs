@@ -53,7 +53,7 @@ pub(crate) enum GraphError {
     ProviderLinkRefused { reason: String },
 
     /// A state this crate believes impossible was reached: a client used
-    /// with no attached `AccountNet`, a closed request semaphore. The
+    /// with no attached `AccountNet`. The
     /// client's fault, never the provider's or the network's, and not
     /// something a retry of the same request can repair
     /// (`Internal(InvariantViolated)`).

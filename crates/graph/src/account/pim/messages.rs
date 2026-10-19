@@ -9,6 +9,7 @@ use crate::account::graph_error::{
     unsupported_account_error,
 };
 use crate::account::inventory::graph_etag;
+use crate::client::Resource;
 use crate::types::{BatchRequest, BatchRequestItem, BatchResponse, ODataCollection};
 use bifrost_types::{
     AccountError, AccountOperation, ContainerId, ErrorScope, Importance, MutationTarget, ObjectId,
@@ -180,7 +181,16 @@ pub(super) async fn delete_extended_property(
             headers: None,
         });
     }
-    submit_write_batch(account, requests, true, operation).await
+    submit_write_batch(
+        account,
+        account
+            .batch_resource(ids)
+            .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?,
+        requests,
+        true,
+        operation,
+    )
+    .await
 }
 
 pub(crate) async fn set_is_read(
@@ -390,7 +400,7 @@ pub(super) async fn fetch_message_value(
         select_query(select)
     );
     let value = client
-        .get_json(&path)
+        .get_json(Resource::Outlook, &path)
         .await
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::Hydrate)))?;
     // Cache the etag under the encoded id (the key the mutation paths
@@ -416,7 +426,7 @@ pub(super) async fn fetch_paged_values(
         walk.enter(&url)
             .map_err(|e| into_account_error(e, ctx.clone()))?;
         let page: ODataCollection<Value> = client
-            .get(&url)
+            .get(Resource::Outlook, &url)
             .await
             .map_err(|e| into_account_error(e, ctx.clone()))?;
         values.extend(page.value);
@@ -586,21 +596,36 @@ pub(super) async fn message_values_for_ids(
 
 pub(super) async fn submit_write_batch(
     account: &GraphAccount,
+    resource: Resource,
     requests: Vec<BatchRequestItem>,
     destroy: bool,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
-    submit_write_batch_with_targets(account, requests, &[], destroy, operation).await
+    submit_write_batch_resource(account, resource, requests, &[], destroy, operation).await
 }
 
 /// Variant of `submit_write_batch` that threads per-request target
 /// message ids so per-item failures carry `ErrorScope::Message { id }`
 /// rather than the coarser `ErrorScope::Account`. `targets[i]` is the
 /// `ObjectId` of the request whose `BatchRequestItem::id == i.to_string()`;
-/// an empty `targets` slice falls back to `ErrorScope::Account` for
-/// callers that have no per-request id.
+/// callers without per-request ids use `submit_write_batch` with explicit
+/// ownership instead.
 pub(super) async fn submit_write_batch_with_targets(
     account: &GraphAccount,
+    requests: Vec<BatchRequestItem>,
+    targets: &[ObjectId],
+    destroy: bool,
+    operation: AccountOperation,
+) -> Result<(), AccountError> {
+    let resource = account
+        .batch_resource(targets)
+        .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?;
+    submit_write_batch_resource(account, resource, requests, targets, destroy, operation).await
+}
+
+async fn submit_write_batch_resource(
+    account: &GraphAccount,
+    resource: Resource,
     requests: Vec<BatchRequestItem>,
     targets: &[ObjectId],
     destroy: bool,
@@ -627,7 +652,7 @@ pub(super) async fn submit_write_batch_with_targets(
     let mut first_error: Option<AccountError> = None;
     let response: BatchResponse = account
         .client
-        .post_batch(&BatchRequest { requests })
+        .post_batch(resource, &BatchRequest { requests })
         .await
         .map_err(|e| into_account_error(e, ctx.clone()))?;
     for item in response.responses {

@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use super::graph_error::{GraphErrorContext, into_account_error, invalid_account_error};
 use crate::account::GraphAccount;
-use crate::client::{AuxTarget, GraphClient};
+use crate::client::{AuxTarget, GraphClient, Resource};
 use crate::error::{GraphError, GraphResponseError};
 use crate::origin::{Refusal, UploadUrl};
 
@@ -222,6 +222,7 @@ async fn cancel_upload_session(
         return;
     }
     let cancel = client.execute_aux(
+        Resource::Unmetered,
         "DELETE",
         AuxTarget::Anonymous(upload_url),
         &[],
@@ -327,7 +328,7 @@ async fn create_upload_session(
         conflict_behavior: "rename",
     };
 
-    client.post(&path, &body).await
+    client.post(Resource::Unmetered, &path, &body).await
 }
 
 /// Upload the payload in `chunk_size`-aligned chunks against the
@@ -425,6 +426,7 @@ async fn upload_chunks(
         // it would leak the token to whatever host OneDrive minted.
         let headers = [("Content-Range", content_range.as_str())];
         let put = client.execute_aux(
+            Resource::Unmetered,
             "PUT",
             AuxTarget::Anonymous(upload_url),
             &headers,
@@ -542,7 +544,7 @@ async fn create_sharing_link(
         "scope": onedrive_scope(scope),
     });
 
-    let response: CreateLinkResponse = client.post(&path, &body).await?;
+    let response: CreateLinkResponse = client.post(Resource::Unmetered, &path, &body).await?;
     Ok(response.link.web_url)
 }
 
@@ -1362,6 +1364,19 @@ mod tests {
         );
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(1));
         assert_cancelled_once(&client, 1);
+    }
+
+    #[tokio::test]
+    async fn an_onedrive_session_throttle_has_no_mailbox_tag() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::empty(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+        )]);
+        assert!(matches!(
+            create_upload_session(&client, "a.txt").await,
+            Err(GraphError::Net(bifrost_net::Error::RateLimited { .. }))
+        ));
+        assert_eq!(client.wire_attempts(), 1);
     }
 
     #[test]

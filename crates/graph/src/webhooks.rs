@@ -1,5 +1,6 @@
 //! Microsoft Graph change notification subscription CRUD.
 
+use crate::client::Resource;
 use serde::{Deserialize, Serialize};
 
 use crate::error::GraphError;
@@ -51,7 +52,9 @@ pub(crate) async fn create_subscription(
         client_state: client_state.to_string(),
     };
 
-    let response: SubscriptionResponse = client.post("/subscriptions", &body).await?;
+    let response: SubscriptionResponse = client
+        .post(Resource::Unmetered, "/subscriptions", &body)
+        .await?;
     tracing::info!(
         "[Graph webhooks] Created subscription {} for resource '{}' (expires {})",
         response.id,
@@ -75,7 +78,11 @@ pub(crate) async fn renew_subscription(
     };
 
     let response: SubscriptionResponse = client
-        .patch_json(&format!("/subscriptions/{subscription_id}"), &body)
+        .patch_json(
+            Resource::Unmetered,
+            &format!("/subscriptions/{subscription_id}"),
+            &body,
+        )
         .await?;
     tracing::info!(
         "[Graph webhooks] Renewed subscription {subscription_id} (new expiry: {})",
@@ -104,7 +111,10 @@ pub(crate) async fn delete_subscription(
     subscription_id: &str,
 ) -> Result<(), GraphError> {
     let server_result = client
-        .delete(&format!("/subscriptions/{subscription_id}"))
+        .delete(
+            Resource::Unmetered,
+            &format!("/subscriptions/{subscription_id}"),
+        )
         .await;
     if let Err(error) = server_result {
         if !subscription_is_gone(&error) {
