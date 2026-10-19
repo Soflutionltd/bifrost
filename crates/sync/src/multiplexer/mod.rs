@@ -1298,12 +1298,26 @@ async fn spawn_scope_poll_inner(
                 }
             }
         }
-        // Honor any account-wide throttle deadline (recorded by a
-        // sibling scope's Retry-After, or by a sibling account via a
-        // shared tenant/provider key) before driving the wire.
-        // Re-checked after waking: a longer deadline can land while
-        // this scope sleeps off the first one.
-        while let Some(wait) = crate::recovery::account_throttle_wait(&throttles, &account_id) {
+        // Honor any throttle deadline this scope's drive consumes - the
+        // account-wide holds plus the keys the account declares for the
+        // scope (a mailbox budget a sibling scope or a sibling account
+        // recorded) - before driving the wire. Re-checked after waking: a
+        // longer deadline can land while this scope sleeps off the first one.
+        //
+        // The declaration is re-asked after every wake: a reattach can swap in
+        // an account that declares a different budget, and waiting on the
+        // retired one's keys could hold this scope for as long as a sibling
+        // keeps extending a budget it no longer consumes.
+        let declared_now = || {
+            crate::recovery::declared_keys(
+                account.load_full().as_ref().as_ref(),
+                &account_id,
+                bifrost_types::ThrottleWork::Scope(&scope),
+            )
+        };
+        while let Some(wait) =
+            crate::recovery::throttle_wait(&throttles, &account_id, &declared_now())
+        {
             tracing::debug!(
                 target: "bifrost.sync.changes",
                 account = ?account_id,
@@ -1347,6 +1361,13 @@ async fn spawn_scope_poll_inner(
                 }
             },
         };
+        // Admission can park behind other work, and a deadline recorded while
+        // it parked existed before this drive started. Re-check with the
+        // permit in hand; on a hold, release it (no permit is held across a
+        // throttle wait) and go back round to the wait above.
+        if crate::recovery::throttle_wait(&throttles, &account_id, &declared_now()).is_some() {
+            continue;
+        }
         // The drive's OWN boundary arm answers `Stop` and `Pause`, which is
         // what a detach publishes. This outer select answers the two signals
         // the boundary cannot carry: scope deletion or restart, which cancels
@@ -1381,8 +1402,30 @@ async fn spawn_scope_poll_inner(
                 let delivery = Arc::clone(&delivery);
                 let boundary = boundary.clone();
                 let control = control.clone();
+                let throttles = Arc::clone(&throttles);
+                let account_id = account_id.clone();
                 async move {
+                    // The LAST check before the wire. `with_drive` can park on
+                    // the drive lease after admission, and a hold recorded
+                    // while it parked predates this drive. A held drive
+                    // returns without driving; the loop goes back round,
+                    // releasing the lease and the permit before it waits.
+                    //
+                    // The keys are asked of `acc_arc`, the very account this
+                    // drive runs against: a reopen during the waits above can
+                    // install an account whose declaration differs, and keys
+                    // cached from the old one would check the wrong budget.
                     let acc: &dyn Account = acc_arc.as_ref().as_ref();
+                    let final_keys = crate::recovery::declared_keys(
+                        acc,
+                        &account_id,
+                        bifrost_types::ThrottleWork::Scope(&scope),
+                    );
+                    if crate::recovery::throttle_wait(&throttles, &account_id, &final_keys)
+                        .is_some()
+                    {
+                        return None;
+                    }
                     let outcome = drive_changes_stream(
                         acc,
                         scope,
@@ -1403,16 +1446,20 @@ async fn spawn_scope_poll_inner(
                     let advanced = advance_cursors
                         .snapshot(&advance_scope)
                         .is_some_and(|c| c.server_state.bytes != pre_advance_state);
-                    (advanced, outcome)
+                    Some((advanced, outcome))
                 }
             }) => driven,
         };
         drop(_admission);
-        let Some((advanced, outcome)) = driven else {
+        let Some(driven) = driven else {
             // The scope left the registry - either before the drive started or
             // while it ran, `with_drive` reporting both the same way. Exit
             // cleanly; if the scope is re-established the 1s scan respawns us.
             return PollExit::Retire;
+        };
+        let Some((advanced, outcome)) = driven else {
+            // Held at the last check: wait it out at the top of the loop.
+            continue;
         };
         let recovered = handle_drive_outcome(
             &scope,

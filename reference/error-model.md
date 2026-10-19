@@ -54,7 +54,7 @@ AccountErrorBuildError>`**, not an infallible `build`. The `Err` arm is
 a producer-bug surface, not recoverable runtime state: protocol-crate
 translation boundaries call
 `.expect("valid account error classification")`. `AccountErrorBuildError`
-(`#[non_exhaustive]`) enumerates the five enforced invariants:
+(`#[non_exhaustive]`) enumerates the enforced invariants:
 
 - `EmptyChain` - every error carries at least one primary `Cause`.
   `CauseChain::try_new` enforces this at the chain boundary. The current
@@ -68,6 +68,9 @@ translation boundaries call
   kind and cause may match each other perfectly; the diagnosis must
   point the producer at the throttle scope, not a mismatch that is
   not there.
+- `ThrottleBudgetNotApplicable { kind }` - a `throttle_budget` stamped
+  on anything but `Server(RateLimited | QuotaExhausted)`, for the same
+  reason.
 - `TransportAcknowledged` - `Transport(_)` kind paired with any
   `Attempt(Acknowledged)` cause. Transport failure means no complete
   server response arrived; an acknowledged attempt belongs on a
@@ -194,6 +197,30 @@ shape is not accidentally sealed.
 is the producer hint; the engine lifts the sharable scopes into a
 `ThrottleKey::{Mailbox, Account, Tenant, Provider}` bucket.
 `CurrentOperation` is a per-call inline delay and never enters a key.
+
+A producer that knows which provider rate budget a throttled request was
+charged to names it instead: `AccountErrorBuilder::throttle_budget(ThrottleBudget)`
+(repeatable, read back through `AccountError::throttle_budgets()`), valid only on
+`Server(RateLimited | QuotaExhausted)` like `throttle_scope`
+(`ThrottleBudgetNotApplicable` otherwise). A `ThrottleBudget` is an opaque,
+process-wide identity minted by the protocol crate; it does not embed an
+`AccountId`. When an error stamps budgets, the engine records the deadline on
+exactly `ThrottleKey::Budget(_)` for each and does NOT also lift the
+`ThrottleScope` (recording the account key too would pause every sibling
+mailbox the budget exists to keep running); a stamped budget with no retry
+hint is held for the one-second local retry fallback. The other half of the
+contract is `Account::throttle_keys(account, ThrottleWork)`: the keys a unit of
+work (`ThrottleWork::{Scope, Objects, Membership}`) consumes, defaulting to
+none. A crate that stamps a budget must declare it for the same work, through
+the same function of the same routing decision, or the hold is recorded where
+no wait site looks. Budgets survive `into_builder`.
+
+No in-tree producer emits `ThrottleScope::Tenant` or `ThrottleScope::Provider`.
+Graph tagged every throttle `Tenant`, but Microsoft documents the Outlook mail,
+calendar and contacts limits per app per mailbox, so a tenant hold paused
+mailboxes the provider never throttled; Graph now emits `Account` and stamps
+the mailbox budget where it can attribute the request. The variants stay
+published for implementations whose provider genuinely throttles that wide.
 
 `Fatal(AccountError)` is the terminal-only newtype. `TryFrom` accepts
 iff `recovery().is_terminal()`, returning the error back on the `Err`

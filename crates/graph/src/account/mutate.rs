@@ -264,7 +264,9 @@ async fn submit_batch(
         // raw subresponses disagreed on malformed input.
         let resolved = resolve_batch_responses(&request_ids, response.responses);
         update_etag_cache_from_responses(account, &request_ids, &resolved, kind).await;
-        reconcile_mutation_responses(&request_ids, resolved, kind, &mut item_outcomes);
+        reconcile_mutation_responses(&request_ids, resolved, kind, &mut item_outcomes, &|id| {
+            account.budget_for_object(id)
+        });
     }
 
     let events = vec![SyncEvent::Batch(Batch {
@@ -381,6 +383,9 @@ fn reconcile_mutation_responses(
     responses: Vec<(usize, crate::types::BatchResponseItem)>,
     kind: &MutationKind,
     item_outcomes: &mut Vec<ItemOutcome<MutationSuccess>>,
+    // The mailbox budget each id's sub-request was charged to
+    // (`GraphAccount::budget_for_object`), stamped on a throttled item.
+    budget_for: &dyn Fn(&ObjectId) -> Option<bifrost_types::ThrottleBudget>,
 ) {
     let mut seen_indices: HashSet<usize> = HashSet::new();
     for (index, item) in responses {
@@ -417,6 +422,7 @@ fn reconcile_mutation_responses(
             BatchItemId(id.0.clone()),
             operation_for_kind(kind),
             scope,
+            budget_for(&id),
         ));
     }
 
@@ -844,6 +850,7 @@ mod tests {
             resolve_batch_responses(&request_ids, vec![ok_response("0")]),
             &MutationKind::Move(MembershipScope::Folder(FolderId("archive".to_string()))),
             &mut outcomes,
+            &|_| None,
         );
 
         assert_eq!(outcomes.len(), 2);
@@ -875,6 +882,7 @@ mod tests {
             Vec::new(),
             &MutationKind::SetFlags(FlagOp::Add(HashSet::from(["\\seen".to_string()]))),
             &mut outcomes,
+            &|_| None,
         );
 
         let ItemOutcome::Uncertain(uncertain) = &outcomes[0] else {
@@ -904,6 +912,7 @@ mod tests {
             ),
             &MutationKind::Destroy,
             &mut outcomes,
+            &|_| None,
         );
 
         assert_eq!(outcomes.len(), 1);
@@ -989,7 +998,7 @@ mod tests {
         let kind = MutationKind::SetFlags(FlagOp::Set(HashSet::new()));
         update_etag_cache_from_responses(&account, &ids, &resolved, &kind).await;
         let mut outcomes = Vec::new();
-        reconcile_mutation_responses(&ids, resolved, &kind, &mut outcomes);
+        reconcile_mutation_responses(&ids, resolved, &kind, &mut outcomes, &|_| None);
 
         assert_eq!(
             account.etag_index.write().await.get("m0"),

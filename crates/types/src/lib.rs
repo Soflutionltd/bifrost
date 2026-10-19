@@ -129,8 +129,9 @@ pub use error::{
     RequestCause, RequestErrorKind, ResourceKind, RetryAdvice, RetryDisposition, RetryHint,
     RetryReason, ServerCause, ServerErrorKind, StateCause, StrategyDowngrade,
     SupportExportConsented, SupportExportInternal, SupportExportMinimal, SyncStateErrorKind,
-    TelemetryView, ThrottleKey, ThrottleScope, TransmissionState, TransportCause,
-    TransportErrorKind, TransportKind, Warning, WarningKind, WireCause, validate_batch_input,
+    TelemetryView, ThrottleBudget, ThrottleKey, ThrottleScope, ThrottleWork, TransmissionState,
+    TransportCause, TransportErrorKind, TransportKind, Warning, WarningKind, WireCause,
+    validate_batch_input,
 };
 
 // Stream-event types.

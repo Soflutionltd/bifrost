@@ -684,6 +684,7 @@ pub(super) async fn submit_write_batch_with_targets(
             bifrost_types::BatchItemId(item.id.clone()),
             operation,
             scope,
+            target.as_ref().and_then(|id| account.budget_for_object(id)),
         );
         match outcome {
             bifrost_types::ItemOutcome::Succeeded(_) => {

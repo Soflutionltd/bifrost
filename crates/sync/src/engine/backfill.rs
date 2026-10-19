@@ -92,7 +92,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             tokio::time::Instant::now(),
             &coverage,
         );
-        for (scope, incarnation) in scopes {
+        'scopes: for (scope, incarnation) in scopes {
             if shutdown.is_cancelled() {
                 return;
             }
@@ -118,6 +118,50 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             // incarnation is still the live one rather than walking a scope the
             // registry has since dropped or re-established.
             if !cursors.all_scope_incarnations().contains(&incarnation_key) {
+                continue;
+            }
+            // A hold on THIS scope alone (a mailbox budget the account declares
+            // for it) defers the scope and lets the scan move on to the next
+            // one: walks run one after another, so sleeping it out here would
+            // stall every later scope's cold start behind one mailbox. An
+            // ACCOUNT-WIDE hold blocks every scope equally and is slept out
+            // here, inline. A hold that lands
+            // between two partitions of a walk already under way is also
+            // waited out inline there: the walk must finish against the same
+            // budget either way, and abandoning it would cost a re-walk.
+            //
+            // The account-wide hold is slept out FIRST, and the scope-local
+            // decision is taken after it: a short account hold overlapping a
+            // long mailbox hold would otherwise hand the scope to the partition
+            // runner's inline wait, which would then sit out the mailbox hold
+            // with every later scope behind it.
+            while let Some(wait) = crate::recovery::account_throttle_wait(&throttles, &account_id) {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(wait) => {}
+                }
+            }
+            // That sleep is unbounded in the same way the subscriber wait is,
+            // so the incarnation is re-validated after it, and BEFORE the walk's
+            // fence is captured below: a scope reset during the sleep must not
+            // be adopted as this walk's own starting fence.
+            if !cursors.all_scope_incarnations().contains(&incarnation_key) {
+                continue;
+            }
+            let keys = crate::recovery::declared_keys(
+                account.load_full().as_ref().as_ref(),
+                &account_id,
+                bifrost_types::ThrottleWork::Scope(&scope),
+            );
+            if let Some(wait) = crate::recovery::throttle_wait(&throttles, &account_id, &keys) {
+                tracing::debug!(
+                    target: "bifrost.sync.backfill",
+                    account = ?account_id,
+                    scope = ?scope,
+                    wait_secs = wait.as_secs(),
+                    "backfill walk deferred by a throttle on this scope"
+                );
+                scan.defer_until(incarnation_key, tokio::time::Instant::now() + wait);
                 continue;
             }
             // What the walk has to beat: any page that reaches nobody bumps this,
@@ -262,6 +306,32 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                 scan.settled(incarnation_key);
                 continue;
             };
+            // Re-check the scope-local hold now that the walk is about to
+            // START: admission, the barrier query and the checkpoint read
+            // above can all park, and a hold recorded meanwhile still finds
+            // no partition walked, so it defers the scope rather than letting
+            // the first partition sit it out with every later scope behind it.
+            // The resume decision is simply recomputed next time; the
+            // pre-walk discard above is idempotent.
+            while let Some(wait) = crate::recovery::account_throttle_wait(&throttles, &account_id) {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(wait) => {}
+                }
+            }
+            // Asked of the current account, not the keys computed before
+            // admission, the barrier query and the checkpoint read: a reopen
+            // during those waits can change the declaration.
+            let walk_keys = crate::recovery::declared_keys(
+                account.load_full().as_ref().as_ref(),
+                &account_id,
+                bifrost_types::ThrottleWork::Scope(&scope),
+            );
+            if let Some(wait) = crate::recovery::throttle_wait(&throttles, &account_id, &walk_keys)
+            {
+                scan.defer_until(incarnation_key, tokio::time::Instant::now() + wait);
+                continue;
+            }
             registry.mark(account_id.clone(), scope.clone(), BackfillState::Running);
             // The driver owns the sequence: a barrier stops the SCOPE, not
             // merely the partition that hit it, so a stopped walk simply
@@ -274,10 +344,18 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             // below the requested `chunk` returns a short page with more
             // behind it, and a window whose ids all vanished between listing
             // and hydration is empty with more behind it.
+            let mut first_partition = true;
             while let Some(partition) = driver.next_partition() {
                 if shutdown.is_cancelled() {
                     return;
                 }
+                let mut held_before_first = None;
+                let defer_first = if first_partition {
+                    Some(&mut held_before_first)
+                } else {
+                    None
+                };
+                first_partition = false;
                 let Some(result) = run_backfill_partition_at_boundary(
                     &account,
                     &account_id,
@@ -293,9 +371,24 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     &lane_gate,
                     &delivery,
                     fence_at_walk_start,
+                    defer_first,
                 )
                 .await
                 else {
+                    // A scope-local hold landed before the walk read a
+                    // single partition (during lane admission, say): defer
+                    // the scope and move on, exactly as the pre-walk check
+                    // does, rather than sit the hold out with every later
+                    // scope behind it. Nothing was walked, so the scope
+                    // returns to Pending and its next pass starts afresh.
+                    if let Some(wait) = held_before_first {
+                        registry.mark(account_id.clone(), scope.clone(), BackfillState::Pending);
+                        scan.defer_until(
+                            incarnation_key.clone(),
+                            tokio::time::Instant::now() + wait,
+                        );
+                        continue 'scopes;
+                    }
                     return;
                 };
                 match result {
@@ -589,9 +682,21 @@ pub(super) struct BackfillScan {
     /// walks over the hole and settles the scope having never re-offered them.
     /// The next attempt starts the walk over instead.
     lost_pages: HashSet<(CursorScope, u64)>,
+    /// Incarnations whose walk was NOT started because a scope-local throttle
+    /// (a key the account declares for this scope alone) was pending, with the
+    /// instant that hold expires. Kept apart from `failed`: nothing failed, so
+    /// the retry ramp must not grow, and the scope is due again exactly when
+    /// its hold lifts rather than on the next exponential step.
+    held: HashMap<(CursorScope, u64), tokio::time::Instant>,
 }
 
 impl BackfillScan {
+    /// Do not start this incarnation's walk before `until`: a scope-local
+    /// throttle holds it. The other scopes of the scan carry on meanwhile.
+    pub(super) fn defer_until(&mut self, key: (CursorScope, u64), until: tokio::time::Instant) {
+        self.held.insert(key, until);
+    }
+
     pub(super) fn select(
         &mut self,
         available: Vec<(CursorScope, u64)>,
@@ -612,6 +717,8 @@ impl BackfillScan {
         self.baseline.retain(|key, _| live.contains(key));
         self.failed.retain(|key, _| live.contains(key));
         self.lost_pages.retain(|key| live.contains(key));
+        self.held
+            .retain(|key, until| live.contains(key) && *until > now);
         let mut pending = Vec::new();
         for (scope, incarnation) in available {
             let key = (scope, incarnation);
@@ -668,6 +775,9 @@ impl BackfillScan {
                 continue;
             }
             if self.failed.get(&key).is_some_and(|(_, at)| *at > now) {
+                continue;
+            }
+            if self.held.contains_key(&key) {
                 continue;
             }
             pending.push(key);
@@ -775,6 +885,12 @@ async fn run_backfill_partition_at_boundary(
     lane: &LaneGate,
     delivery: &crate::multiplexer::ChangeDelivery,
     fence_at_walk_start: u64,
+    // `Some` on the walk's FIRST partition: a scope-local hold found before
+    // it is read is reported here (and `None` returned) instead of slept out,
+    // so the orchestrator defers the scope while no inventory has been
+    // walked. Later partitions pass `None` and wait inline - the walk is
+    // under way and must finish against the same budget.
+    mut defer_first: Option<&mut Option<std::time::Duration>>,
 ) -> Option<Result<crate::backfill::BackfillPartitionOutcome, Error>> {
     // One generation per partition pass, so a re-walk's proof is ordered after
     // the debt an earlier pass raised.
@@ -783,13 +899,37 @@ async fn run_backfill_partition_at_boundary(
         if !control.wait_until_running(shutdown).await {
             return None;
         }
-        // Honor any account-wide throttle deadline before walking the
-        // partition: cold-start hydration is the heaviest request lane
-        // the engine drives, so barreling through a provider Retry-After
+        // Honor any throttle deadline this scope's walk consumes (account-wide
+        // holds plus the keys the account declares for the scope) before
+        // walking the partition: cold-start hydration is the heaviest request
+        // lane the engine drives, so barreling through a provider Retry-After
         // that paused the polls would defeat the pause. Re-checked after
         // waking, and boundary-checked again, since a pause or a longer
         // deadline can land mid-sleep.
-        if let Some(wait) = crate::recovery::account_throttle_wait(throttles, account_id) {
+        let keys = crate::recovery::declared_keys(
+            account.load_full().as_ref().as_ref(),
+            account_id,
+            bifrost_types::ThrottleWork::Scope(&scope),
+        );
+        if let Some(wait) = crate::recovery::throttle_wait(throttles, account_id, &keys) {
+            if let Some(held) = defer_first.as_deref_mut() {
+                // Before the first partition only the ACCOUNT-WIDE part is
+                // slept, never the combined wait; a scope-local hold left
+                // over is handed back for deferral.
+                match crate::recovery::account_throttle_wait(throttles, account_id) {
+                    None => {
+                        *held = Some(wait);
+                        return None;
+                    }
+                    Some(account_wait) => {
+                        tokio::select! {
+                            () = shutdown.cancelled() => return None,
+                            () = tokio::time::sleep(account_wait) => {}
+                        }
+                        continue;
+                    }
+                }
+            }
             tracing::debug!(
                 target: "bifrost.sync.backfill",
                 account = ?account_id,
@@ -815,6 +955,27 @@ async fn run_backfill_partition_at_boundary(
             Ok(()) => {}
             Err(crate::engine::lane::WaitFailed::ShuttingDown) => return None,
             Err(crate::engine::lane::WaitFailed::Refused(error)) => return Some(Err(error)),
+        }
+        // Admission can park, and a hold recorded meanwhile predates this
+        // partition. Release the admission rather than carry it across the
+        // wait, and go back round. The keys are asked of `current`, the very
+        // account snapshot the partition runs against, not the ones computed
+        // before the waits: a reopen can change them.
+        let current = account.load_full();
+        let final_keys = crate::recovery::declared_keys(
+            current.as_ref().as_ref(),
+            account_id,
+            bifrost_types::ThrottleWork::Scope(&scope),
+        );
+        if let Some(wait) = crate::recovery::throttle_wait(throttles, account_id, &final_keys) {
+            lane.release_admission();
+            if let Some(held) = defer_first.as_deref_mut()
+                && crate::recovery::account_throttle_wait(throttles, account_id).is_none()
+            {
+                *held = Some(wait);
+                return None;
+            }
+            continue;
         }
         // RE-CHECK THE WALK'S FENCE, with admission in hand and before a single
         // page has been read. Every step above this line can park indefinitely -
@@ -848,7 +1009,6 @@ async fn run_backfill_partition_at_boundary(
                 "scope reset between two partitions of the backfill walk".into(),
             )));
         }
-        let current = account.load_full();
         let result = BackfillRunner::run_partition(
             current.as_ref().as_ref(),
             scope.clone(),

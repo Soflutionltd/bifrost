@@ -66,6 +66,11 @@ struct ClientInner {
     rate_limit_host: String,
     token_source: Arc<dyn TokenSource>,
     mailbox_id: Option<String>,
+    /// The primary mailbox's address (profile `mail`, else UPN), learned at
+    /// `open`. Only the primary client's slot is read: it names the mailbox
+    /// `/me` routes to in this client's throttle budget. Refreshed on every
+    /// open, so a changed address is picked up on the next reopen.
+    primary_address: RwLock<Option<String>>,
     semaphore: Arc<Semaphore>,
     /// Shared with every client derived from this one
     /// (`for_shared_mailbox`, `with_outlook_base`), the way the semaphore
@@ -432,6 +437,7 @@ impl GraphClient {
                 rate_limit_host,
                 token_source: source,
                 mailbox_id: None,
+                primary_address: RwLock::new(None),
                 semaphore: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
                 #[cfg(test)]
                 scripted: Arc::new(std::sync::Mutex::new(ScriptedRest::default())),
@@ -462,6 +468,7 @@ impl GraphClient {
                 rate_limit_host,
                 token_source,
                 mailbox_id: None,
+                primary_address: RwLock::new(None),
                 semaphore: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
                 #[cfg(test)]
                 scripted: Arc::new(std::sync::Mutex::new(ScriptedRest::default())),
@@ -642,6 +649,7 @@ impl GraphClient {
                 rate_limit_host: self.inner.rate_limit_host.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
                 mailbox_id: self.inner.mailbox_id.clone(),
+                primary_address: RwLock::new(self.primary_address()),
                 semaphore: Arc::clone(&self.inner.semaphore),
                 #[cfg(test)]
                 scripted: Arc::clone(&self.inner.scripted),
@@ -667,6 +675,132 @@ impl GraphClient {
         }
     }
 
+    fn primary_address(&self) -> Option<String> {
+        self.inner
+            .primary_address
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    /// Record the primary mailbox's address, learned from the profile at
+    /// `open`, so the primary client's throttle budget names that mailbox.
+    pub(crate) fn set_primary_address(&self, address: Option<String>) {
+        if let Ok(mut slot) = self.inner.primary_address.write() {
+            *slot = address;
+        }
+    }
+
+    /// The provider rate budget every Outlook request this client issues is
+    /// charged to: Microsoft meters Outlook mail, calendar and contacts per
+    /// app per MAILBOX, and one mailbox's throttle does not affect another.
+    ///
+    /// The id is the API origin plus the mailbox the client routes to: the
+    /// `/users/{key}` routing key for a shared-mailbox client, the profile
+    /// address for the primary (whose requests go to `/me`). Both are
+    /// lowercased, since Exchange addresses are case-insensitive. With no
+    /// profile address the primary falls back to the engine account id,
+    /// which is unique per account and so never shares.
+    ///
+    /// It is an approximation of the provider's identity, stated rather than
+    /// hidden. A mailbox reached through two address forms gets two budgets
+    /// (missed sharing); an address reassigned to another mailbox while a
+    /// deadline is pending, or a stale profile address, can hold the wrong
+    /// mailbox (false sharing). The app id that also keys Microsoft's budget
+    /// is behind an opaque `TokenSource`, so accounts on different apps share
+    /// too widely. Each deadline is in memory and expires on its own; the
+    /// cost is pacing, never a misrouted request.
+    pub(crate) fn mailbox_budget(&self) -> bifrost_types::ThrottleBudget {
+        let mailbox = match &self.inner.mailbox_id {
+            Some(id) => format!("mailbox:{}", id.to_lowercase()),
+            None => match self.primary_address() {
+                Some(address) => format!("mailbox:{}", address.to_lowercase()),
+                None => format!(
+                    "account:{}",
+                    self.account_net()
+                        .map(|net| net.account().0.clone())
+                        .unwrap_or_default()
+                ),
+            },
+        };
+        // ORIGIN only, not the base path: `/v1.0` and `/beta` against one
+        // mailbox are one provider budget.
+        let origin = match self.inner.api_base.url() {
+            Some(url) => url.origin().ascii_serialization(),
+            None => self.inner.api_base.as_str().to_owned(),
+        };
+        bifrost_types::ThrottleBudget::new(format!("graph-outlook|{origin}|{mailbox}"))
+    }
+
+    /// The API base as a parsed URL would spell it: scheme and host
+    /// lowercased, default port dropped, no trailing slash, so the request
+    /// URLs `tag_throttle` compares against (which arrive normalized) match
+    /// a base configured in any equivalent spelling.
+    /// An unparseable base (which no request can be admitted onto) falls
+    /// back to its raw text.
+    fn canonical_api_base(&self) -> String {
+        match self.inner.api_base.url() {
+            Some(url) => format!(
+                "{}{}",
+                url.origin().ascii_serialization(),
+                url.path().trim_end_matches('/')
+            ),
+            None => self.inner.api_base.as_str().to_owned(),
+        }
+    }
+
+    /// Tag a throttle-shaped failure of a request THIS client sent with its
+    /// mailbox budget, when the request was charged to that mailbox: its URL
+    /// sits under the client's own `/me` or `/users/{key}` prefix. Anything
+    /// else is left untagged and falls back to the account-wide key -
+    /// over-pausing, never under-pausing. That includes `/subscriptions`, a
+    /// continuation link Graph spelled in a different form, and `$batch`: a
+    /// mutation batch is posted through the PRIMARY client with sub-requests
+    /// routed to whichever mailbox each id belongs to, so an outer `$batch`
+    /// 429 cannot be pinned on one mailbox. Its per-item 429s are, and the
+    /// subresponse classifiers stamp each with its own id's mailbox.
+    fn tag_throttle(&self, url: &str, error: GraphError) -> GraphError {
+        let throttled = matches!(
+            error.response_status(),
+            // 507 is the mailbox quota `classify_by_status` maps to
+            // `QuotaExhausted`, which is as attributable as a 429.
+            Some(
+                reqwest::StatusCode::TOO_MANY_REQUESTS
+                    | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    | reqwest::StatusCode::INSUFFICIENT_STORAGE
+            )
+        );
+        if !throttled {
+            return error;
+        }
+        // Compared in canonical form on both sides, so a base configured in
+        // another spelling (an upper-case host, an explicit default port)
+        // still attributes its own requests.
+        let base = self.canonical_api_base();
+        let Some(request) = reqwest::Url::parse(url).ok() else {
+            return error;
+        };
+        let request = format!(
+            "{}{}",
+            request.origin().ascii_serialization(),
+            request.path()
+        );
+        let Some(path) = request.strip_prefix(base.as_str()) else {
+            return error;
+        };
+        let prefix = self.api_path_prefix();
+        let under_prefix = path
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '?', '(']));
+        if !under_prefix {
+            return error;
+        }
+        GraphError::MailboxThrottled {
+            budget: self.mailbox_budget(),
+            source: Box::new(error),
+        }
+    }
+
     // pub: shared-mailbox consumers derive a scoped client before building the factory.
     pub fn for_shared_mailbox(&self, mailbox_id: impl Into<String>) -> Self {
         Self {
@@ -679,6 +813,7 @@ impl GraphClient {
                 rate_limit_host: self.inner.rate_limit_host.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
                 mailbox_id: Some(mailbox_id.into()),
+                primary_address: RwLock::new(None),
                 semaphore: Arc::clone(&self.inner.semaphore),
                 #[cfg(test)]
                 scripted: Arc::clone(&self.inner.scripted),
@@ -945,7 +1080,7 @@ impl GraphClient {
         let counter = bifrost_net::RequestByteCounter::new();
         let sent = builder.count_bytes_into(counter.clone()).send().await;
         self.record_bytes(&counter);
-        let response = sent.map_err(GraphError::Net)?;
+        let response = sent.map_err(|error| self.tag_throttle(url, GraphError::Net(error)))?;
         Ok(RestResponse::from(response))
     }
 
@@ -1087,7 +1222,7 @@ impl GraphClient {
         account_net
             .download_stream(url, range)
             .await
-            .map_err(GraphError::Net)
+            .map_err(|error| self.tag_throttle(url, GraphError::Net(error)))
     }
 
     /// The transport a wire call should use: the scripted one under test
@@ -1699,6 +1834,78 @@ mod tests {
         assert!(!client.uses_default_mailbox());
     }
 
+    /// A throttle is tagged with the budget of the mailbox the request was
+    /// routed to, and only when the request was routed to one.
+    ///
+    /// The shared client's 429 under `/users/{key}` carries that mailbox's
+    /// budget, distinct from the primary's. A 429 on `/subscriptions` (an
+    /// app-and-tenant budget, not a mailbox one) and on `$batch` (which can
+    /// mix mailboxes) is left as the transport shaped it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_throttle_is_tagged_with_the_mailbox_it_was_routed_to() {
+        use reqwest::StatusCode;
+        let primary = GraphClient::new("token");
+        primary.set_primary_address(Some("Me@Contoso.com".into()));
+        let shared = primary.for_shared_mailbox("Shared@Contoso.com");
+        let throttle = || {
+            [ScriptedRestResponse::empty(StatusCode::TOO_MANY_REQUESTS)
+                .with_header("Retry-After", "5")]
+        };
+
+        shared.script_rest(throttle());
+        let url = shared
+            .api_url(&format!("{}/messages", shared.api_path_prefix()))
+            .expect("api url");
+        match shared.execute_wire(&url, "GET", None, None, None).await {
+            Err(GraphError::MailboxThrottled { budget, .. }) => {
+                assert_eq!(budget, shared.mailbox_budget());
+                assert!(
+                    budget.as_str().ends_with("mailbox:shared@contoso.com"),
+                    "{budget:?}"
+                );
+                assert_ne!(budget, primary.mailbox_budget());
+            }
+            other => panic!("a shared-mailbox 429 carries its budget: {:?}", other.err()),
+        }
+        assert!(
+            primary
+                .mailbox_budget()
+                .as_str()
+                .ends_with("mailbox:me@contoso.com")
+        );
+
+        // Another spelling of the same origin names the same budget, and
+        // still attributes its own requests.
+        let shouted = GraphClient::with_api_base("HTTPS://GRAPH.Microsoft.com:443/v1.0", "token")
+            .for_shared_mailbox("shared@contoso.com");
+        assert_eq!(shouted.mailbox_budget(), shared.mailbox_budget());
+        // And another API version against the same mailbox is the same
+        // provider budget.
+        let beta = GraphClient::with_api_base("https://graph.microsoft.com/beta", "token")
+            .for_shared_mailbox("shared@contoso.com");
+        assert_eq!(beta.mailbox_budget(), shared.mailbox_budget());
+        shouted.script_rest(throttle());
+        let url = shouted
+            .api_url(&format!("{}/messages", shouted.api_path_prefix()))
+            .expect("api url");
+        assert!(matches!(
+            shouted.execute_wire(&url, "GET", None, None, None).await,
+            Err(GraphError::MailboxThrottled { .. })
+        ));
+
+        for path in ["/subscriptions", "/$batch"] {
+            primary.script_rest(throttle());
+            let url = primary.api_url(path).expect("api url");
+            assert!(
+                matches!(
+                    primary.execute_wire(&url, "GET", None, None, None).await,
+                    Err(GraphError::Net(_))
+                ),
+                "{path} is not charged to one mailbox and must stay untagged"
+            );
+        }
+    }
+
     #[test]
     fn attach_account_uses_engine_account_id() {
         let client = GraphClient::new("token");
@@ -1807,18 +2014,24 @@ mod tests {
             _ => panic!("a terminal 4xx is Error::Status"),
         }
 
+        // The funnel tags a throttle on a request under the client's own
+        // mailbox prefix with that mailbox's budget; the transport's shape
+        // survives underneath it unchanged.
         match outcome_for([ScriptedRestResponse::empty(StatusCode::TOO_MANY_REQUESTS)
             .with_header("Retry-After", "5")])
         .await
         {
-            Err(GraphError::Net(bifrost_net::Error::RateLimited {
-                retry_after,
-                final_response,
-            })) => {
-                assert_eq!(retry_after, Some(std::time::Duration::from_secs(5)));
-                assert_eq!(final_response.status, StatusCode::TOO_MANY_REQUESTS);
-            }
-            _ => panic!("429 past the budget is Error::RateLimited"),
+            Err(GraphError::MailboxThrottled { source, .. }) => match *source {
+                GraphError::Net(bifrost_net::Error::RateLimited {
+                    retry_after,
+                    final_response,
+                }) => {
+                    assert_eq!(retry_after, Some(std::time::Duration::from_secs(5)));
+                    assert_eq!(final_response.status, StatusCode::TOO_MANY_REQUESTS);
+                }
+                _ => panic!("429 past the budget is Error::RateLimited"),
+            },
+            _ => panic!("a 429 under the mailbox prefix carries the mailbox budget"),
         }
 
         match outcome_for([ScriptedRestResponse::empty(

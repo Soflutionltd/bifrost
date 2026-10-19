@@ -183,6 +183,9 @@ pub type RepairHook = Arc<
 /// Produces the `SyncEvent<Change>`s one changes drive yields.
 pub type ChangesHook = Arc<dyn Fn(&ChangeCursor) -> Vec<SyncEvent<Change>> + Send + Sync>;
 
+/// The throttle keys a scope drive consumes.
+pub type ScopeKeysHook = Arc<dyn Fn(&CursorScope) -> Vec<bifrost_types::ThrottleKey> + Send + Sync>;
+
 /// Configurable `Account` double. Construct with [`StubAccount::new`], then
 /// set hooks for the surfaces the test drives; everything else answers
 /// `Unsupported` or an empty stream.
@@ -201,6 +204,10 @@ pub struct StubAccount {
     pub inventory_hook: Option<InventoryHook>,
     /// Hook for `changes_stream`. Default: empty stream.
     pub changes_hook: Option<ChangesHook>,
+    /// Throttle keys `throttle_keys` declares for a scope drive. Default:
+    /// none, so the engine waits on account-wide holds only - exactly the
+    /// trait's own default.
+    pub scope_keys: Option<ScopeKeysHook>,
     /// Answers one `repair_inventory` request. Mapped over the request
     /// stream, so an answer always carries the attempt id it belongs to -
     /// which a canned outcome list cannot, since attempt ids are minted at
@@ -420,6 +427,7 @@ impl StubAccount {
             partition_hook: None,
             inventory_hook: None,
             changes_hook: None,
+            scope_keys: None,
             repair_hook: None,
             memberships: Vec::new(),
             lifecycle_rx: Mutex::new(None),
@@ -501,6 +509,17 @@ impl Account for StubAccount {
     fn set_priority(&self, _priority: Priority) {}
 
     fn set_bandwidth_cap(&self, _bps: Option<u64>) {}
+
+    fn throttle_keys(
+        &self,
+        _account: &AccountId,
+        work: bifrost_types::ThrottleWork<'_>,
+    ) -> Vec<bifrost_types::ThrottleKey> {
+        match (work, self.scope_keys.as_ref()) {
+            (bifrost_types::ThrottleWork::Scope(scope), Some(hook)) => hook(scope),
+            _ => Vec::new(),
+        }
+    }
 
     fn describe_cursor(&self, _cursor: &ChangeCursor) -> CursorDescriptor {
         unreachable!("describe_cursor not exercised by StubAccount tests")

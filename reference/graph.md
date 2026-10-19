@@ -573,7 +573,7 @@ Failures Autodiscover reports inside an HTTP 200 are classified by what the code
 says, never as the caller's input, since the lookup's only inputs are the
 account's own address and the settings this crate names
 (`graph_error::autodiscover_error_code_to_account_error`). `ServerBusy` is
-`Server(RateLimited)` at tenant throttle scope; `InternalServerError` is
+`Server(RateLimited)` at account throttle scope; `InternalServerError` is
 `Server(Unavailable)`; `InvalidUser` is `NotFound(Mailbox)`; `InvalidRequest` /
 `InvalidSetting` are `Request(Malformed)`, the answer an HTTP 400 would get; and
 `SettingIsNotAvailable`, `InvalidDomain`, `NotFederated` and any code this build
@@ -2138,10 +2138,62 @@ Mapping highlights:
 
 - `Gone` / 410 / `InvalidDeltaToken` / `SyncStateNotFound` ->
   `SyncState(CursorInvalid)` -> `Engine(RestartScope(scope))`.
-- `TooManyRequests` / 429 -> `Server(RateLimited)`, `throttle_scope: Tenant`,
+- `TooManyRequests` / 429 -> `Server(RateLimited)`, `throttle_scope: Account`,
   `retry_hint: After(_)` from `Retry-After` (seconds + HTTP-date via
-  `bifrost_net::parse_retry_after`); 503 / 504 -> `Server(Unavailable)` ->
+  `bifrost_net::parse_retry_after`), plus the Outlook mailbox
+  `ThrottleBudget` wherever the request can be attributed (see "Throttle
+  budgets" below); 503 / 504 -> `Server(Unavailable)` ->
   `Retry::SameRequest`.
+
+### Throttle budgets
+
+Microsoft documents the Outlook mail, calendar and contacts limits per app
+per MAILBOX: one mailbox's throttle does not affect another. Graph therefore
+never tags a throttle `Tenant` (that paused mailboxes the provider never
+throttled); `throttle_scope_for` answers `Account`, the conservative fallback,
+and an attributable throttle also stamps the mailbox's `ThrottleBudget`, which
+the engine then records ALONE.
+
+- **Identity.** `GraphClient::mailbox_budget` is the API origin plus the mailbox
+  the client routes to: the `/users/{key}` routing key for a shared-mailbox
+  client, the profile address (`mail`, else UPN, set by
+  `set_primary_address` on every `open`) for the primary. Both lowercased;
+  with no profile address the primary uses the engine account id, which never
+  shares. It is an approximation, stated at the method: a mailbox reached
+  through two address forms gets two budgets, an address reassigned while a
+  deadline is pending (or a stale profile address) can hold the wrong mailbox,
+  and the app id is hidden behind the `TokenSource`. Each deadline is in memory
+  and expires on its own; the cost is pacing, never a misrouted request.
+- **Stamp, REST funnel.** `execute_wire` and `download_stream` wrap a 429 / 503 / 507
+  as `GraphError::MailboxThrottled { budget, source }` when the URL sits under
+  the client's own `/me` or `/users/{key}` prefix. That prefix also covers
+  OneDrive (`/me/drive/...`), whose throttles are therefore stamped with the
+  mailbox budget too: an over-attribution, filed for narrowing to Outlook
+  resource paths. The budget only survives classification when the failure
+  classifies as a throttle (`Server(RateLimited | QuotaExhausted)`): a plain
+  503 classifies `Unavailable`, so it keeps its local retry delay but records
+  no shared hold. `/subscriptions`, a
+  continuation link spelled in another form, and `$batch` stay untagged and
+  fall back to the account key: a mutation or hydration `$batch` is posted
+  through the PRIMARY client with sub-requests routed per id, so an outer
+  `$batch` 429 cannot be pinned on one mailbox. `response_status` sees through
+  the wrapper; `into_account_error` unwraps it into `GraphErrorContext::budget`.
+- **Stamp, `$batch` items.** `mutation_item_outcome`,
+  `reconcile_mutation_responses` and `reconcile_hydration_responses` take each
+  id's budget (`GraphAccount::budget_for_object`) and stamp it on a throttled
+  item.
+- **Declaration.** `Account::throttle_keys` answers from the same clients:
+  `budget_for_scope` follows `client_for_scope` (a bare `CursorScope::Folder` is
+  a public folder read over EWS and declares nothing), `budget_for_object`
+  follows `client_for_owner` (public-folder items declare nothing), and a move
+  destination declares its folder owner's budget.
+  `a_mailbox_declares_the_budget_its_throttles_stamp` pins that the declared and
+  stamped budgets agree and that two mailboxes never share one.
+- **Not attributed.** EWS (`ErrorServerBusy`), Autodiscover `ServerBusy`, the
+  subscription service and webhook renewal keep the `Account` fallback, a chosen
+  approximation rather than a claim about how those services meter. Renewal and
+  EWS reconnect pace themselves inside this crate; their retryable errors are
+  not engine lanes, so no engine hold paces them either.
 - `InvalidAuthenticationToken` / 401 ->
   `Authentication(ReauthorizationRequired)` -> `AuthLost`;
   `AdminConsentRequired` -> `Authorization(AdminConsentRequired)` ->

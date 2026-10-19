@@ -688,10 +688,17 @@ fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
 /// extend the match as providers document their throttle vocabulary.
 /// `None` is the honest answer for providers whose throttling scope is
 /// undocumented - do not invent one.
+///
+/// Microsoft is `Account`, not `Tenant`: its Outlook limits are documented
+/// per app per mailbox, and this layer sees no request target, so the
+/// account is the widest honest answer that names no identity it lacks. A
+/// caller that knows the mailbox (`bifrost-graph`'s REST funnel) stamps that
+/// mailbox's throttle budget on top, and the engine then holds the budget
+/// alone.
 fn throttle_scope(ctx: &NetErrorContext) -> Option<ThrottleScope> {
-    if ctx.protocol == Protocol::Graph || ctx.provider == Some(Provider::Microsoft) {
-        Some(ThrottleScope::Tenant)
-    } else if ctx.protocol == Protocol::Gmail
+    if ctx.protocol == Protocol::Graph
+        || ctx.provider == Some(Provider::Microsoft)
+        || ctx.protocol == Protocol::Gmail
         || ctx.provider == Some(Provider::Gmail)
         || (ctx.protocol == Protocol::Jmap && ctx.provider == Some(Provider::Fastmail))
     {

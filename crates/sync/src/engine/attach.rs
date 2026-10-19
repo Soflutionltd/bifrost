@@ -871,20 +871,77 @@ pub(super) async fn run_deferred_inventory_establishment(
     if !wait_for_real_subscriber(&ctx.delivery, &ctx.subscriber_notify, &shutdown).await {
         return;
     }
-    for inventory in scopes {
+    // The walks run one after another, so a scope held by a throttle on IT
+    // ALONE (a key the account declares for that scope, such as one mailbox's
+    // budget) goes to the back of the queue instead of being slept on: the
+    // scopes behind it are not held and should not wait. Only once every
+    // queued scope has been found held in a row does the worker sleep, until
+    // the earliest of those holds lifts.
+    let mut queue: std::collections::VecDeque<DeferredInventory> = scopes.into();
+    let mut held_in_a_row = 0_usize;
+    let mut earliest_hold: Option<std::time::Duration> = None;
+    'queue: while let Some(inventory) = queue.pop_front() {
         let scope = inventory.scope().clone();
         if shutdown.is_cancelled() {
             return;
         }
+        // The account-wide hold is slept out FIRST and the scope-local decision
+        // taken after it, so a short account hold overlapping a long mailbox
+        // hold cannot leave this scope in the inline wait below with every
+        // later scope queued behind it.
+        while let Some(wait) = crate::recovery::account_throttle_wait(&throttles, &account_id) {
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(wait) => {}
+            }
+        }
+        let mut keys = crate::recovery::declared_keys(
+            account.load_full().as_ref().as_ref(),
+            &account_id,
+            bifrost_types::ThrottleWork::Scope(&scope),
+        );
+        if let Some(wait) = crate::recovery::throttle_wait(&throttles, &account_id, &keys) {
+            tracing::debug!(
+                target: "bifrost.sync.backfill",
+                account = ?account_id,
+                scope = ?scope,
+                wait_secs = wait.as_secs(),
+                "deferred inventory requeued behind a throttle on this scope"
+            );
+            queue.push_back(inventory);
+            held_in_a_row += 1;
+            earliest_hold = Some(earliest_hold.map_or(wait, |e| e.min(wait)));
+            if held_in_a_row >= queue.len() {
+                let sleep_for = earliest_hold.take().unwrap_or_default();
+                held_in_a_row = 0;
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(sleep_for) => {}
+                }
+            }
+            continue;
+        }
+        held_in_a_row = 0;
+        earliest_hold = None;
         let outcome = loop {
             if !control.wait_until_running(&shutdown).await {
                 return;
             }
-            // Honor any account-wide throttle deadline before the
+            // Honor every throttle deadline this walk consumes before the
             // inventory walk, mirroring the backfill partition runner:
             // deferred establishment drives the same heavy inventory
             // lane. Loop back to the boundary check after waking.
-            if let Some(wait) = crate::recovery::account_throttle_wait(&throttles, &account_id) {
+            if crate::recovery::throttle_wait(&throttles, &account_id, &keys).is_some() {
+                // A hold that appeared during the pause park or admission.
+                // Only the ACCOUNT-WIDE part is slept here, never the
+                // combined wait: a scope-local hold sends this scope back on
+                // the queue (the outer check counts and sleeps it), so it
+                // never holds the scopes behind it.
+                let Some(wait) = crate::recovery::account_throttle_wait(&throttles, &account_id)
+                else {
+                    queue.push_back(inventory);
+                    continue 'queue;
+                };
                 tracing::debug!(
                     target: "bifrost.sync.backfill",
                     account = ?account_id,
@@ -926,8 +983,26 @@ pub(super) async fn run_deferred_inventory_establishment(
                     }
                 },
             };
+            // Admission can park, and a hold recorded meanwhile predates this
+            // walk. Release the permit and go back round to the wait above.
+            //
+            // The keys are asked of the account the walk is about to run
+            // against: a reopen during the waits above can install one whose
+            // declaration differs from the keys computed before them.
             let acc_arc = account.load_full();
             let acc: &dyn Account = acc_arc.as_ref().as_ref();
+            let final_keys = crate::recovery::declared_keys(
+                acc,
+                &account_id,
+                bifrost_types::ThrottleWork::Scope(&scope),
+            );
+            if crate::recovery::throttle_wait(&throttles, &account_id, &final_keys).is_some() {
+                // Carry the fresh keys to the wait at the top of the loop, or
+                // it would check the stale ones and re-admit straight away.
+                keys = final_keys;
+                drop(admission);
+                continue;
+            }
             let fusion = crate::multiplexer::InventoryFusion {
                 account_id: account_id.clone(),
                 cursors: Arc::clone(&cursors),

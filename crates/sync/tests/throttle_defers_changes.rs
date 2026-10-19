@@ -76,12 +76,22 @@ struct PollCounts {
 
 /// Build a stub whose NOISY scope terminates every drive with `error` and
 /// whose QUIET scope yields an empty (immediately complete) change stream.
+///
+/// The noisy scope starts failing only once the quiet one has polled. Every
+/// wait site re-checks the bucket after scheduler admission, so a deadline
+/// recorded while the quiet scope's FIRST poll was still being admitted now
+/// (correctly) holds that poll too - and the precondition below, that the
+/// quiet scope was running before the deadline landed, would rest on winning
+/// that race instead of on staging.
 fn stub(counts: &Arc<PollCounts>, error: AccountError) -> Arc<common::StubAccount> {
     let mut account =
         common::StubAccount::new(vec![CursorScope::Type(NOISY), CursorScope::Type(QUIET)]);
     let counts = Arc::clone(counts);
     account.changes_hook = Some(Arc::new(move |cursor: &ChangeCursor| match &cursor.scope {
         CursorScope::Type(t) if *t == NOISY => {
+            if counts.quiet.load(Ordering::SeqCst) == 0 {
+                return Vec::<SyncEvent<Change>>::new();
+            }
             counts.noisy.fetch_add(1, Ordering::SeqCst);
             vec![SyncEvent::Terminated(error.clone())]
         }

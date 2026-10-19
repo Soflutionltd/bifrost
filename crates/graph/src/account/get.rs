@@ -332,8 +332,13 @@ async fn fetch_batch(
         .collect();
     let request = BatchRequest { requests };
     let response: BatchResponse = account.client.post_batch(&request).await?;
-    let etags =
-        reconcile_hydration_responses(&rest_ids, response.responses, projection, &mut outcomes);
+    let etags = reconcile_hydration_responses(
+        &rest_ids,
+        response.responses,
+        projection,
+        &mut outcomes,
+        &|id| account.budget_for_object(id),
+    );
 
     if !etags.is_empty() {
         let mut cache = account.etag_index.write().await;
@@ -389,6 +394,10 @@ fn reconcile_hydration_responses(
     responses: Vec<crate::types::BatchResponseItem>,
     projection: Projection,
     outcomes: &mut Vec<ItemOutcome<HydratedObject>>,
+    // The mailbox budget each id's sub-request was charged to
+    // (`GraphAccount::budget_for_object`), stamped on a throttled item. The
+    // outer `$batch` mixes mailboxes; each sub-request does not.
+    budget_for: &dyn Fn(&ObjectId) -> Option<bifrost_types::ThrottleBudget>,
 ) -> Vec<(String, String)> {
     let mut etags = Vec::new();
     let mut seen_indices = HashSet::new();
@@ -432,11 +441,12 @@ fn reconcile_hydration_responses(
                 headers,
                 body,
             );
-            let ctx = GraphErrorContext::graph(AccountOperation::Hydrate).with_scope(
+            let mut ctx = GraphErrorContext::graph(AccountOperation::Hydrate).with_scope(
                 ErrorScope::Message {
                     id: (id.0.clone()).into(),
                 },
             );
+            ctx.budget = budget_for(&id);
             let error = response_to_account_error_pub(response, &ctx);
             outcomes.push(ItemOutcome::Failed(BatchFailure::new(batch_id, error)));
             continue;
@@ -682,6 +692,7 @@ mod tests {
             vec![ok_response("1", "m1")],
             Projection::Metadata,
             &mut outcomes,
+            &|_| None,
         );
 
         assert!(etags.is_empty());
@@ -723,6 +734,7 @@ mod tests {
             ],
             Projection::Metadata,
             &mut outcomes,
+            &|_| None,
         );
 
         assert_eq!(outcomes.len(), 1);
@@ -742,6 +754,7 @@ mod tests {
             vec![ok_response("0", "m0"), ok_response("0", "m0")],
             Projection::Metadata,
             &mut outcomes,
+            &|_| None,
         );
 
         assert_eq!(outcomes.len(), 1);

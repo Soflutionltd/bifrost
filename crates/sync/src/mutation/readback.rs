@@ -53,6 +53,36 @@ pub async fn run_readback_guard(
     ids: Vec<ObjectId>,
     op: &FlagOp,
 ) -> Result<ReadbackOutcome, Error> {
+    run_readback_guard_observed(account, ids, op, None).await
+}
+
+/// Where a read-back pass reports every per-item hydration failure it
+/// absorbs. The guards count such a failure as `uncertain` and move on, which
+/// is right for the ACCOUNTING - but a hydration that failed on a 429 carries
+/// a provider throttle deadline, and absorbing it silently hid that deadline
+/// from every other lane and every sibling account. The engine's campaign
+/// passes a sink that records it in the shared throttle bucket; the published
+/// guards pass none, keeping their behaviour exactly as documented.
+/// Stream-level terminations need no sink: they are returned to the caller as
+/// `Error::Account`, which records them itself.
+pub(crate) type ReadbackErrorSink<'a> = Option<&'a (dyn Fn(&bifrost_types::AccountError) + Sync)>;
+
+fn observe(sink: ReadbackErrorSink<'_>, item: &ItemOutcome<HydratedObject>) {
+    if let Some(sink) = sink {
+        match item {
+            ItemOutcome::Failed(failure) => sink(&failure.error),
+            ItemOutcome::Uncertain(uncertain) => sink(&uncertain.error),
+            ItemOutcome::Succeeded(_) => {}
+        }
+    }
+}
+
+pub(crate) async fn run_readback_guard_observed(
+    account: &dyn Account,
+    ids: Vec<ObjectId>,
+    op: &FlagOp,
+    sink: ReadbackErrorSink<'_>,
+) -> Result<ReadbackOutcome, Error> {
     let input = stream::iter(ids).boxed();
     let mut stream = account.get_stream(input, Projection::FlagsOnly);
     let mut outcome = ReadbackOutcome::default();
@@ -60,6 +90,7 @@ pub async fn run_readback_guard(
         match event {
             SyncEvent::Batch(batch) => {
                 for item in batch.items {
+                    observe(sink, &item);
                     match item {
                         ItemOutcome::Succeeded(success) => {
                             if matches_target(&success.output, op) {
@@ -133,6 +164,15 @@ pub async fn run_move_readback_guard(
     ids: Vec<ObjectId>,
     destination: &MembershipScope,
 ) -> Result<ReadbackOutcome, Error> {
+    run_move_readback_guard_observed(account, ids, destination, None).await
+}
+
+pub(crate) async fn run_move_readback_guard_observed(
+    account: &dyn Account,
+    ids: Vec<ObjectId>,
+    destination: &MembershipScope,
+    sink: ReadbackErrorSink<'_>,
+) -> Result<ReadbackOutcome, Error> {
     let input = stream::iter(ids).boxed();
     let mut stream = account.get_stream(input, Projection::Metadata);
     let mut outcome = ReadbackOutcome::default();
@@ -140,6 +180,7 @@ pub async fn run_move_readback_guard(
         match event {
             SyncEvent::Batch(batch) => {
                 for item in batch.items {
+                    observe(sink, &item);
                     match item {
                         ItemOutcome::Succeeded(success) => {
                             if membership_contains(&success.output, destination) {
@@ -188,6 +229,14 @@ pub async fn run_destroy_readback_guard(
     account: &dyn Account,
     ids: Vec<ObjectId>,
 ) -> Result<ReadbackOutcome, Error> {
+    run_destroy_readback_guard_observed(account, ids, None).await
+}
+
+pub(crate) async fn run_destroy_readback_guard_observed(
+    account: &dyn Account,
+    ids: Vec<ObjectId>,
+    sink: ReadbackErrorSink<'_>,
+) -> Result<ReadbackOutcome, Error> {
     let input = stream::iter(ids).boxed();
     let mut stream = account.get_stream(input, Projection::Metadata);
     let mut outcome = ReadbackOutcome::default();
@@ -195,6 +244,7 @@ pub async fn run_destroy_readback_guard(
         match event {
             SyncEvent::Batch(batch) => {
                 for item in batch.items {
+                    observe(sink, &item);
                     match item {
                         ItemOutcome::Succeeded(_) => {
                             outcome.still_failed = outcome.still_failed.saturating_add(1);

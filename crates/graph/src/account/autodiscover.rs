@@ -1423,7 +1423,7 @@ mod tests {
             match code {
                 "ServerBusy" => match error.recovery() {
                     RecoveryClass::Retry(advice) => {
-                        assert_eq!(advice.throttle_scope, Some(ThrottleScope::Tenant));
+                        assert_eq!(advice.throttle_scope, Some(ThrottleScope::Account));
                     }
                     other => panic!("ServerBusy must retry, got {other:?}"),
                 },

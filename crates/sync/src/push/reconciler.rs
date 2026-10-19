@@ -5,6 +5,7 @@
 //! cursor for each affected scope. Output flows to the multiplexer's
 //! broadcast so consumers see a single unified `Change` stream.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bifrost_types::{Account, AccountId, CursorScope, HintPayload, InvalidationHint, WatchEvent};
@@ -56,6 +57,19 @@ impl Reconciler {
     /// the consumer flips to `Resume`. Buffered `WatchEvent`s remain
     /// in the channel and drain on resume.
     pub async fn run(mut self, mut rx: mpsc::Receiver<WatchEvent>) {
+        // Hinted scopes held by a SCOPE-LOCAL throttle (a key the account
+        // declares for that scope alone, such as one mailbox's budget). They
+        // are kept here instead of being slept on inside a sweep: the
+        // reconciler is one task for the whole account, so a sleep inside
+        // `reconcile` would stall every later hint - for healthy mailboxes,
+        // `Reconnected`, `Terminated` - behind one mailbox's Retry-After.
+        // Only the scope is held; no cursor snapshot, lease, permit or
+        // activity guard survives the wait. A hint for a scope already
+        // deferred is absorbed by the set, and one that arrives during a
+        // drive waits in the channel and re-marks the scope once read, so no
+        // invalidation is lost - events are processed BETWEEN drives, which
+        // is the granularity this task has always had.
+        let mut deferred: HashSet<CursorScope> = HashSet::new();
         loop {
             // Park while the account is paused. The boundary watch
             // notifies on every state change; we wake when it flips
@@ -77,20 +91,55 @@ impl Reconciler {
                     }
                 }
             }
+            // Wake for the earliest deferred scope whose hold has passed. A
+            // deferred scope with no pending hold any more is due now.
+            let next_due = self.next_deferred_due(&deferred);
             tokio::select! {
                 () = self.shutdown.cancelled() => return,
                 maybe_event = rx.recv() => {
                     let Some(event) = maybe_event else { return; };
-                    self.handle(event).await;
+                    self.handle(event, &mut deferred).await;
+                }
+                () = sleep_or_forever(next_due) => {
+                    // Copied, not drained: `drive_scopes` removes each
+                    // scope as it DISPATCHES it, so a sweep that returns
+                    // early (a terminal error, an account-wide directive)
+                    // leaves every scope it never reached still deferred.
+                    let due: Vec<CursorScope> = deferred.iter().cloned().collect();
+                    if let Err(err) = self.drive_scopes(due, &mut deferred).await {
+                        tracing::warn!(target: "bifrost.sync.reconcile", error=%err, "deferred reconcile failed");
+                    }
                 }
             }
         }
     }
 
-    async fn handle(&mut self, event: WatchEvent) {
+    /// Declared throttle keys for one scope's drive.
+    fn scope_keys(&self, scope: &CursorScope) -> Vec<bifrost_types::ThrottleKey> {
+        crate::recovery::declared_keys(
+            self.account.load_full().as_ref().as_ref(),
+            &self.account_id,
+            bifrost_types::ThrottleWork::Scope(scope),
+        )
+    }
+
+    /// The shortest remaining hold across the deferred scopes, `None` when
+    /// nothing is deferred. Zero when some deferred scope is already free.
+    fn next_deferred_due(&self, deferred: &HashSet<CursorScope>) -> Option<std::time::Duration> {
+        deferred
+            .iter()
+            .map(|scope| {
+                let keys = self.scope_keys(scope);
+                crate::recovery::throttle_wait(&self.throttles, &self.account_id, &keys)
+                    .unwrap_or_default()
+            })
+            .min()
+    }
+
+    async fn handle(&mut self, event: WatchEvent, deferred: &mut HashSet<CursorScope>) {
         match event {
             WatchEvent::Invalidated { hint } => {
-                if let Err(err) = self.reconcile(&hint).await {
+                if let Err(err) = self.reconcile(&hint, deferred).await {
                     tracing::warn!(target: "bifrost.sync.reconcile", error=%err, "reconcile failed");
                 }
             }
@@ -107,7 +156,7 @@ impl Reconciler {
                     source: bifrost_types::PushSource::Coalesced,
                     payload: HintPayload::Unknown,
                 };
-                if let Err(err) = self.reconcile(&hint).await {
+                if let Err(err) = self.reconcile(&hint, deferred).await {
                     tracing::warn!(target: "bifrost.sync.reconcile", error=%err, "post-reconnect reconcile failed");
                 }
             }
@@ -198,9 +247,30 @@ impl Reconciler {
         }
     }
 
-    async fn reconcile(&self, hint: &InvalidationHint) -> Result<(), Error> {
+    async fn reconcile(
+        &self,
+        hint: &InvalidationHint,
+        deferred: &mut HashSet<CursorScope>,
+    ) -> Result<(), Error> {
         let scopes = scopes_for_hint(&self.cursors, &hint.payload);
+        self.drive_scopes(scopes, deferred).await
+    }
+
+    /// Drive each scope once, deferring any held by a scope-local throttle.
+    /// Parking, deletion and every hold are re-checked here at DISPATCH, not
+    /// when the scope was queued, so a scope deferred and then parked or
+    /// deleted is never driven.
+    async fn drive_scopes(
+        &self,
+        scopes: Vec<CursorScope>,
+        deferred: &mut HashSet<CursorScope>,
+    ) -> Result<(), Error> {
         for scope in scopes {
+            // This dispatch speaks for any older deferral of the same scope:
+            // drop it, so a fresh hint that drives the scope does not leave a
+            // due entry behind for the timer to drive a second time. Every
+            // path below that is held again re-inserts it.
+            deferred.remove(&scope);
             // A parked scope is terminally failed. Only an explicit
             // scope-retiring path (lifecycle deletion, an engine restart of
             // the scope, multiplexer shutdown) clears the tombstone, and until
@@ -214,10 +284,9 @@ impl Reconciler {
                 );
                 continue;
             }
-            // Honor any account-wide throttle deadline (a sibling
-            // scope's Retry-After, or a shared tenant/provider key)
-            // before driving the wire for this hint. Re-checked after
-            // waking: a longer deadline can land mid-sleep.
+            // An ACCOUNT-WIDE hold blocks every scope equally, so sleeping it
+            // out inline stalls nothing that could otherwise run. Re-checked
+            // after waking: a longer deadline can land mid-sleep.
             while let Some(wait) =
                 crate::recovery::account_throttle_wait(&self.throttles, &self.account_id)
             {
@@ -232,6 +301,12 @@ impl Reconciler {
                     () = self.shutdown.cancelled() => return Ok(()),
                     () = tokio::time::sleep(wait) => {}
                 }
+            }
+            // A SCOPE-LOCAL hold defers this scope alone; the sweep carries on.
+            let keys = self.scope_keys(&scope);
+            if crate::recovery::throttle_wait(&self.throttles, &self.account_id, &keys).is_some() {
+                deferred.insert(scope);
+                continue;
             }
             let _admission = tokio::select! {
                 () = self.shutdown.cancelled() => return Ok(()),
@@ -254,6 +329,14 @@ impl Reconciler {
                     }
                 },
             };
+            // Admission can park, and a hold recorded meanwhile predates this
+            // drive. Re-check with the permit in hand; on a hold, release it
+            // and defer, rather than carry a permit across a throttle wait.
+            if crate::recovery::throttle_wait(&self.throttles, &self.account_id, &keys).is_some() {
+                drop(_admission);
+                deferred.insert(scope);
+                continue;
+            }
             // Same reasoning as the poll loop's: the drive's own boundary arm
             // answers `Stop` and `Pause`, and this covers root cancellation
             // arriving before this account's detach publishes `Stop`.
@@ -278,9 +361,26 @@ impl Reconciler {
                     let boundary = self.boundary.clone();
                     let control = self.control.clone();
                     let scope = scope.clone();
+                    let throttles = Arc::clone(&self.throttles);
+                    let account_id = self.account_id.clone();
                     async move {
+                        // The LAST check before the wire: `with_drive` can park
+                        // on the drive lease after admission, and a hold
+                        // recorded meanwhile predates this drive. The keys are
+                        // asked of the account this drive runs against, not
+                        // cached across the waits: a reopen can change them.
                         let account: &dyn Account = account_swap.as_ref().as_ref();
-                        drive_changes_stream(
+                        let final_keys = crate::recovery::declared_keys(
+                            account,
+                            &account_id,
+                            bifrost_types::ThrottleWork::Scope(&scope),
+                        );
+                        if crate::recovery::throttle_wait(&throttles, &account_id, &final_keys)
+                            .is_some()
+                        {
+                            return (final_keys, None);
+                        }
+                        let outcome = drive_changes_stream(
                             account,
                             scope,
                             cursor,
@@ -290,14 +390,28 @@ impl Reconciler {
                             Some(control),
                             Some(registry_generation),
                         )
-                        .await
+                        .await;
+                        // The keys travel back with the outcome: whether a
+                        // throttled drive's hint is kept is a question about
+                        // THIS account's declaration, not the one computed
+                        // before admission.
+                        (final_keys, Some(outcome))
                     }
                 }) => driven,
+            };
+            let (keys, driven) = match driven {
+                Some((keys, driven)) => (keys, Some(driven)),
+                None => (keys, None),
             };
             drop(_admission);
             // No result: the scope is gone, or left mid-drive. Either way it is
             // not ours to re-drive, and its siblings in this hint still are.
+            let Some(driven) = driven else {
+                continue;
+            };
+            // Held at the last check: defer it like any other held scope.
             let Some(outcome) = driven else {
+                deferred.insert(scope);
                 continue;
             };
             let outcome = match outcome {
@@ -366,6 +480,7 @@ impl Reconciler {
                                 ).as_secs(),
                                 "hinted scope throttled; skipping it and continuing the sweep"
                             );
+                            self.defer_if_held(&scope, &keys, deferred);
                             continue;
                         }
                         RecoveryPlan::Reconcile(advice) => {
@@ -386,6 +501,7 @@ impl Reconciler {
                                 ).as_secs(),
                                 "hinted scope deferred for reconcile; continuing the sweep"
                             );
+                            self.defer_if_held(&scope, &keys, deferred);
                             continue;
                         }
                         RecoveryPlan::Engine(directive) => {
@@ -422,6 +538,23 @@ impl Reconciler {
         Ok(())
     }
 
+    /// After a throttled drive recorded its hold: keep the hint alive by
+    /// deferring the scope, but ONLY when a hold now actually covers it.
+    /// Deferring a scope that nothing holds (a retry carrying no hint, or one
+    /// lifted to no key) would make it due immediately and re-drive the same
+    /// failure in a tight loop; such a scope is skipped as it always was, and
+    /// its poll loop picks the changes up at its own cadence.
+    fn defer_if_held(
+        &self,
+        scope: &CursorScope,
+        keys: &[bifrost_types::ThrottleKey],
+        deferred: &mut HashSet<CursorScope>,
+    ) {
+        if crate::recovery::throttle_wait(&self.throttles, &self.account_id, keys).is_some() {
+            deferred.insert(scope.clone());
+        }
+    }
+
     fn warning_event(&self, message: &str, kind: bifrost_types::WarningKind) -> MultiplexerEvent {
         let warning = Warning::user_safe(kind, message);
         MultiplexerEvent {
@@ -430,6 +563,14 @@ impl Reconciler {
             checkpoint: None,
             publication: None,
         }
+    }
+}
+
+/// Sleep for `due`, or never when nothing is deferred.
+async fn sleep_or_forever(due: Option<std::time::Duration>) {
+    match due {
+        Some(due) => tokio::time::sleep(due).await,
+        None => std::future::pending().await,
     }
 }
 

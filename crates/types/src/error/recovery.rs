@@ -239,14 +239,25 @@ pub enum ThrottleScope {
 }
 
 /// Engine bucket key for throttle holds that survive across requests.
-/// Constructed by the engine from a `ThrottleScope` plus the relevant
-/// identity. `Tenant` and `Provider` cross account boundaries by
-/// design - a tenant throttle pauses every account on that tenant.
-/// `ThrottleScope::CurrentOperation` never enters a `ThrottleKey`;
-/// it is a per-call hint, not a bucket.
 ///
-/// Tenant identity is currently a free-form provider-supplied string;
-/// the engine treats it as opaque.
+/// Two routes produce one. The engine LIFTS a `ThrottleScope` plus the
+/// identity the error carries into `Mailbox` / `Account` / `Tenant` /
+/// `Provider`; and an `Account` implementation DECLARES the keys a unit of
+/// work consumes (`Account::throttle_keys`), while its errors STAMP the
+/// [`ThrottleBudget`]s a throttled request was held against
+/// (`AccountErrorBuilder::throttle_budget`). `Tenant` and `Provider` cross
+/// account boundaries by design, and so does `Budget`: a budget identity is
+/// process-wide, so two attached accounts declaring the same one share its
+/// deadline. `ThrottleScope::CurrentOperation` never enters a
+/// `ThrottleKey`; it is a per-call hint, not a bucket.
+///
+/// No in-tree producer mints `Tenant`: the only provider that tagged its
+/// throttles tenant-wide was Microsoft Graph, whose Outlook limits are
+/// documented per app per MAILBOX, so a tenant hold would have paused
+/// mailboxes the provider never throttled. Graph declares and stamps
+/// `Budget` keys instead. The variant remains for implementations whose
+/// provider genuinely throttles a tenant; its identity is a free-form
+/// string the engine treats as opaque.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum ThrottleKey {
@@ -257,6 +268,52 @@ pub enum ThrottleKey {
     Account(AccountId),
     Tenant(String),
     Provider(Provider),
+    Budget(ThrottleBudget),
+}
+
+/// Identity of one provider rate budget, minted by the protocol crate that
+/// knows how its provider meters requests.
+///
+/// Opaque and PROCESS-WIDE: it does not embed an `AccountId`, so every
+/// attached account whose work consumes the same budget shares one deadline.
+/// A crate mints the id from what identifies the budget on the provider side
+/// (for Microsoft Graph, the API origin plus the mailbox a request is routed
+/// to) and namespaces it so ids from different crates cannot collide.
+///
+/// The id is only as precise as what the producer can observe. Where the
+/// provider-side identity is not visible (a renamed or reassigned address,
+/// an app id hidden behind an opaque token source) a budget may be shared too
+/// widely or too narrowly. That costs pacing, never correctness: a deadline is
+/// in memory only and expires on its own.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct ThrottleBudget(String);
+
+impl ThrottleBudget {
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The unit of work an engine wait site is about to drive, handed to
+/// `Account::throttle_keys` so the implementation can name the throttle keys
+/// that work consumes. Each variant carries the operation's own inputs rather
+/// than an identity the engine derived from them: only the implementation
+/// knows which provider resource a scope, object or membership routes to.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum ThrottleWork<'a> {
+    /// A changes, inventory, backfill or push-reconcile drive of one scope.
+    Scope(&'a crate::cursor::CursorScope),
+    /// Mutation targets, or the ids a mutation read-back hydrates.
+    Objects(&'a [crate::ids::ObjectId]),
+    /// A move destination, or a move's supplied source.
+    Membership(&'a crate::cursor::MembershipScope),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

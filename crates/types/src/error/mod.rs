@@ -34,7 +34,7 @@ pub use kind::{
 pub use recovery::{
     EngineDirective, Fatal, ReconcileAction, ReconcileAdvice, ReconcileGuidance, ReconcileReason,
     RecoveryClass, RemediationAction, RetryAdvice, RetryDisposition, RetryHint, RetryReason,
-    StrategyDowngrade, ThrottleKey, ThrottleScope,
+    StrategyDowngrade, ThrottleBudget, ThrottleKey, ThrottleScope, ThrottleWork,
 };
 pub use scope::{AccountOperation, ErrorScope, Protocol, Provider};
 pub use stream::{ItemOutcome, MutationEffect, MutationSuccess};

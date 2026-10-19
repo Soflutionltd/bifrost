@@ -177,16 +177,38 @@ impl SyncEngine {
                     () = tokio::time::sleep(delay) => {}
                 }
             }
-            // Honor any account-wide throttle deadline (recorded by
-            // this campaign's previous attempt, a poll, or a sibling
-            // account via a shared key) before submitting. Re-checked
-            // after waking: a longer deadline can land mid-sleep.
-            let (_activity, _admission) = loop {
+            // Honor every throttle deadline this attempt consumes - the
+            // account-wide holds plus the keys the account declares for the
+            // targets being submitted and the move's memberships (recorded by
+            // this campaign's previous attempt, a poll, or a sibling account
+            // via a shared key) - before submitting.
+            //
+            // A campaign is ONE throttle unit: it waits until every budget its
+            // submission consumes is free, rather than splitting the targets
+            // by budget. Its idempotency key, retry counter, read-back guard
+            // and every termination sweep all assume one submitted set, so a
+            // campaign spanning a held mailbox and a free one waits for the
+            // held one. That costs latency inside one operation; it never
+            // sends to a held budget and never burns a retry on a wait (this
+            // loop sits outside the attempt counter).
+            //
+            // The check is the LAST thing before submission: it runs again
+            // after the retry-advice sleep above, after a pause park, and
+            // after admission, because a deadline recorded during any of
+            // those waits existed before this attempt started. No permit or
+            // activity guard is held across a throttle wait.
+            let (_activity, _admission, account) = loop {
                 if !slot.control.wait_until_running(&slot.shutdown).await {
                     return Err(Error::ShuttingDown);
                 }
+                let keys = campaign_keys(
+                    slot.current.load_full().as_ref().as_ref(),
+                    account_id,
+                    &remaining,
+                    &op,
+                );
                 if let Some(wait) =
-                    crate::recovery::account_throttle_wait(&slot.throttles, account_id)
+                    crate::recovery::throttle_wait(&slot.throttles, account_id, &keys)
                 {
                     tokio::select! {
                         () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
@@ -202,12 +224,20 @@ impl SyncEngine {
                         crate::scheduler::WorkKind::Mutation,
                     ) => permit?,
                 };
+                // The final check asks the account snapshot this attempt
+                // submits through, not the one the keys above came from: a
+                // reopen during admission can install one whose declaration
+                // differs.
+                let account = slot.current.load_full();
+                let keys = campaign_keys(account.as_ref().as_ref(), account_id, &remaining, &op);
+                if crate::recovery::throttle_wait(&slot.throttles, account_id, &keys).is_some() {
+                    drop(admission);
+                    continue;
+                }
                 if let Some(activity) = slot.control.begin_activity() {
-                    break (activity, admission);
+                    break (activity, admission, account);
                 }
             };
-
-            let account = slot.current.load_full();
             let target_stream: AccountStream<bifrost_types::ObjectId> =
                 Box::pin(futures::stream::iter(remaining.clone()));
             let mut stream = match &op {
@@ -479,9 +509,30 @@ impl SyncEngine {
             // attempt loop broke. Re-admit rather than running unbudgeted
             // work: an oversized campaign otherwise leaves the caps
             // behind exactly where its heaviest fan-out begins.
-            let (_activity, _readback_admission) = loop {
+            //
+            // The read-back is wire work against the same budgets the write
+            // used, so it honours them too: the ids it hydrates are the whole
+            // unresolved set (`unresolved_readback_ids`), not the last retry
+            // vector, which may have shrunk past an id a held budget still
+            // covers. Waiting here never turns a `PendingReadback` id into a
+            // resubmission; it only delays the observation.
+            let (_activity, _readback_admission, account) = loop {
                 if !slot.control.wait_until_running(&slot.shutdown).await {
                     return Err(Error::ShuttingDown);
+                }
+                let keys = crate::recovery::declared_keys(
+                    slot.current.load_full().as_ref().as_ref(),
+                    account_id,
+                    bifrost_types::ThrottleWork::Objects(&readback_ids),
+                );
+                if let Some(wait) =
+                    crate::recovery::throttle_wait(&slot.throttles, account_id, &keys)
+                {
+                    tokio::select! {
+                        () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
+                        () = tokio::time::sleep(wait) => {}
+                    }
+                    continue;
                 }
                 let admission = tokio::select! {
                     () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
@@ -491,33 +542,54 @@ impl SyncEngine {
                         crate::scheduler::WorkKind::Mutation,
                     ) => permit?,
                 };
+                // Asked of the snapshot the read-back hydrates through.
+                let account = slot.current.load_full();
+                let keys = crate::recovery::declared_keys(
+                    account.as_ref().as_ref(),
+                    account_id,
+                    bifrost_types::ThrottleWork::Objects(&readback_ids),
+                );
+                if crate::recovery::throttle_wait(&slot.throttles, account_id, &keys).is_some() {
+                    drop(admission);
+                    continue;
+                }
                 if let Some(activity) = slot.control.begin_activity() {
-                    break (activity, admission);
+                    break (activity, admission, account);
                 }
             };
-            let account = slot.current.load_full();
+            // A hydration the guard absorbs as `uncertain` may still have
+            // failed on a 429; its deadline goes into the shared bucket like
+            // any other lane's, so siblings see a hold the read-back found.
+            let throttles = Arc::clone(&slot.throttles);
+            let record = move |error: &AccountError| {
+                record_error_throttle(&throttles, account_id, error);
+            };
+            let sink: crate::mutation::readback::ReadbackErrorSink<'_> = Some(&record);
             let readback = async {
                 match &op {
                     BulkPipelineOp::SetFlags(flag_op) => {
-                        crate::mutation::run_readback_guard(
+                        crate::mutation::readback::run_readback_guard_observed(
                             account.as_ref().as_ref(),
                             readback_ids,
                             flag_op,
+                            sink,
                         )
                         .await
                     }
                     BulkPipelineOp::Move { destination, .. } => {
-                        crate::mutation::run_move_readback_guard(
+                        crate::mutation::readback::run_move_readback_guard_observed(
                             account.as_ref().as_ref(),
                             readback_ids,
                             destination,
+                            sink,
                         )
                         .await
                     }
                     BulkPipelineOp::Destroy => {
-                        crate::mutation::run_destroy_readback_guard(
+                        crate::mutation::readback::run_destroy_readback_guard_observed(
                             account.as_ref().as_ref(),
                             readback_ids,
+                            sink,
                         )
                         .await
                     }
@@ -525,7 +597,16 @@ impl SyncEngine {
             };
             let outcome = tokio::select! {
                 () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
-                outcome = readback => outcome?,
+                outcome = readback => match outcome {
+                    Ok(outcome) => outcome,
+                    Err(Error::Account(error)) => {
+                        // A stream-level read-back termination is returned,
+                        // not absorbed; record its hold before surfacing it.
+                        record_error_throttle(&slot.throttles, account_id, &error);
+                        return Err(Error::Account(error));
+                    }
+                    Err(other) => return Err(other),
+                },
             };
             totals.pending_retry = totals
                 .pending_retry
@@ -556,6 +637,59 @@ enum BulkPipelineOp {
     },
     /// Destroy every target via `Account::bulk_destroy`.
     Destroy,
+}
+
+/// The throttle keys one campaign attempt consumes: every target being
+/// submitted, plus a move's destination and supplied source - a move
+/// spends the budget of the containers it touches, which need not be the
+/// targets' own.
+fn campaign_keys(
+    account: &dyn Account,
+    account_id: &AccountId,
+    targets: &[bifrost_types::ObjectId],
+    op: &BulkPipelineOp,
+) -> Vec<bifrost_types::ThrottleKey> {
+    use bifrost_types::ThrottleWork;
+    let mut keys =
+        crate::recovery::declared_keys(account, account_id, ThrottleWork::Objects(targets));
+    if let BulkPipelineOp::Move {
+        destination,
+        source,
+    } = op
+    {
+        keys.extend(crate::recovery::declared_keys(
+            account,
+            account_id,
+            ThrottleWork::Membership(destination),
+        ));
+        if let Some(source) = source {
+            keys.extend(crate::recovery::declared_keys(
+                account,
+                account_id,
+                ThrottleWork::Membership(source),
+            ));
+        }
+    }
+    keys
+}
+
+/// Record the throttle hold any retryable or reconcilable error carries,
+/// whatever lane observed it.
+fn record_error_throttle(
+    throttles: &std::sync::Mutex<crate::recovery::ThrottleBucket>,
+    account_id: &AccountId,
+    error: &AccountError,
+) {
+    match error.recovery() {
+        bifrost_types::RecoveryClass::Retry(advice) => {
+            crate::recovery::record_throttle(throttles, account_id, advice, error);
+        }
+        bifrost_types::RecoveryClass::Reconcile(advice) => {
+            crate::recovery::record_reconcile_throttle(throttles, account_id, advice, error);
+        }
+        // Engine directives and terminal classes carry no throttle hold.
+        _ => {}
+    }
 }
 
 /// Per-id mutation bookkeeping bucket. Reflects the campaign's final

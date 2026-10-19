@@ -10,7 +10,7 @@ use super::diagnostic::{
 use super::kind::AccountErrorKind;
 use super::recovery::{
     ReconcileAction, ReconcileReason, RecoveryClass, RemediationAction, RetryDisposition,
-    RetryReason, ThrottleScope,
+    RetryReason, ThrottleBudget, ThrottleScope,
 };
 use super::scope::{AccountOperation, ErrorScope, Protocol, Provider};
 
@@ -34,6 +34,7 @@ struct AccountErrorInner {
     message_key: &'static str,
     idempotency_override: Option<bool>,
     throttle_scope: Option<ThrottleScope>,
+    throttle_budgets: Vec<ThrottleBudget>,
 }
 
 impl AccountError {
@@ -52,8 +53,19 @@ impl AccountError {
                 message_key: parts.message_key,
                 idempotency_override: parts.idempotency_override,
                 throttle_scope: parts.throttle_scope,
+                throttle_budgets: parts.throttle_budgets,
             }),
         }
+    }
+
+    /// The provider rate budgets the failed request was held against, as
+    /// the producer stamped them (`AccountErrorBuilder::throttle_budget`).
+    /// Empty unless the error is a throttle whose producer can name its
+    /// budget; the engine then records the deadline on exactly these
+    /// instead of lifting the `ThrottleScope`.
+    #[must_use]
+    pub fn throttle_budgets(&self) -> &[ThrottleBudget] {
+        &self.inner.throttle_budgets
     }
 
     #[must_use]
@@ -182,6 +194,7 @@ impl AccountError {
             diagnostics: inner.diagnostics,
             idempotency_override: inner.idempotency_override,
             throttle_scope: inner.throttle_scope,
+            throttle_budgets: inner.throttle_budgets,
         })
     }
 }
@@ -211,6 +224,7 @@ pub(crate) struct AccountErrorParts {
     pub message_key: &'static str,
     pub idempotency_override: Option<bool>,
     pub throttle_scope: Option<ThrottleScope>,
+    pub throttle_budgets: Vec<ThrottleBudget>,
 }
 
 impl<'a> TelemetryView<'a> {

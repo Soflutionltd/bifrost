@@ -5,7 +5,7 @@ use super::cause::{Cause, CauseChain};
 use super::diagnostic::{DiagnosticInfo, DiagnosticText, TelemetryToken};
 use super::kind::{AccountErrorKind, ServerErrorKind, SyncStateErrorKind};
 use super::message_key;
-use super::recovery::{self, ThrottleScope};
+use super::recovery::{self, ThrottleBudget, ThrottleScope};
 use super::scope::{AccountOperation, ErrorScope, Protocol, Provider};
 
 #[derive(Clone, Copy)]
@@ -67,6 +67,11 @@ pub enum AccountErrorBuildError {
         kind: AccountErrorKind,
         throttle_scope: ThrottleScope,
     },
+    /// A `throttle_budget` stamped on a kind that is not
+    /// `Server(RateLimited | QuotaExhausted)`. Same fault shape as
+    /// `ThrottleScopeNotApplicable`: a budget names where a throttle hold
+    /// is recorded, so on anything but a throttle it is a producer bug.
+    ThrottleBudgetNotApplicable { kind: AccountErrorKind },
 }
 
 impl fmt::Display for AccountErrorBuildError {
@@ -95,6 +100,11 @@ impl fmt::Display for AccountErrorBuildError {
                 "throttle_scope {throttle_scope:?} is only meaningful on \
                  Server(RateLimited | QuotaExhausted), not {kind:?}",
             ),
+            Self::ThrottleBudgetNotApplicable { kind } => write!(
+                f,
+                "throttle_budget is only meaningful on \
+                 Server(RateLimited | QuotaExhausted), not {kind:?}",
+            ),
         }
     }
 }
@@ -112,6 +122,7 @@ pub(crate) struct RebuildParts {
     pub diagnostics: DiagnosticInfo,
     pub idempotency_override: Option<bool>,
     pub throttle_scope: Option<ThrottleScope>,
+    pub throttle_budgets: Vec<ThrottleBudget>,
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +137,7 @@ pub struct AccountErrorBuilder {
     diagnostics: DiagnosticInfo,
     idempotency_override: Option<bool>,
     throttle_scope: Option<ThrottleScope>,
+    throttle_budgets: Vec<ThrottleBudget>,
 }
 
 impl AccountErrorBuilder {
@@ -142,6 +154,7 @@ impl AccountErrorBuilder {
             diagnostics: DiagnosticInfo::default(),
             idempotency_override: None,
             throttle_scope: None,
+            throttle_budgets: Vec::new(),
         }
     }
 
@@ -166,6 +179,7 @@ impl AccountErrorBuilder {
             diagnostics: parts.diagnostics,
             idempotency_override: parts.idempotency_override,
             throttle_scope: parts.throttle_scope,
+            throttle_budgets: parts.throttle_budgets,
         }
     }
 
@@ -284,19 +298,43 @@ impl AccountErrorBuilder {
         self
     }
 
+    /// Name a provider rate budget the throttled request was held against.
+    /// Repeatable. When an error stamps any budget the engine records the
+    /// deadline on exactly the stamped budgets and does NOT lift the
+    /// `ThrottleScope` into a key as well - recording both would put the
+    /// hold back on the account key and pause every sibling mailbox the
+    /// budget exists to keep running.
+    ///
+    /// A budget must name what the response says to hold, not every budget
+    /// the request consumed. The producer that stamps it must also declare it
+    /// from `Account::throttle_keys` for the same work, or the hold is
+    /// recorded where no wait site looks. Like `throttle_scope`, it is only
+    /// meaningful on `Server(RateLimited | QuotaExhausted)`.
+    #[must_use]
+    pub fn throttle_budget(mut self, budget: ThrottleBudget) -> Self {
+        if !self.throttle_budgets.contains(&budget) {
+            self.throttle_budgets.push(budget);
+        }
+        self
+    }
+
     /// Construct the `AccountError`. Returns `Err` only on producer-bug
     /// invariants (see [`AccountErrorBuildError`]); protocol-crate
     /// translation boundaries call `.expect("valid account error
     /// classification")` because an invalid combination is a library
     /// bug, not recoverable runtime state.
     pub fn try_build(self) -> Result<AccountError, AccountErrorBuildError> {
-        if let Some(throttle_scope) = self.throttle_scope
-            && !matches!(
-                &self.kind,
-                AccountErrorKind::Server(
-                    ServerErrorKind::RateLimited | ServerErrorKind::QuotaExhausted
-                )
+        let throttled = matches!(
+            &self.kind,
+            AccountErrorKind::Server(
+                ServerErrorKind::RateLimited | ServerErrorKind::QuotaExhausted
             )
+        );
+        if !throttled && !self.throttle_budgets.is_empty() {
+            return Err(AccountErrorBuildError::ThrottleBudgetNotApplicable { kind: self.kind });
+        }
+        if let Some(throttle_scope) = self.throttle_scope
+            && !throttled
         {
             // throttle_scope is meaningful only on rate-limit/quota
             // failures; producers attaching it elsewhere is a bug.
@@ -372,6 +410,7 @@ impl AccountErrorBuilder {
             message_key,
             idempotency_override: self.idempotency_override,
             throttle_scope: self.throttle_scope,
+            throttle_budgets: self.throttle_budgets,
         }))
     }
 }
@@ -477,6 +516,46 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn throttle_budget_rejected_outside_rate_or_quota() {
+        let err = AccountErrorBuilder::new(
+            AccountErrorKind::Transport(TransportErrorKind::Network),
+            Cause::Transport(TransportCause {
+                kind: TransportKind::Network,
+                message: None,
+            }),
+        )
+        .throttle_budget(ThrottleBudget::new("b"))
+        .try_build()
+        .expect_err("throttle_budget on transport is invalid");
+        assert!(matches!(
+            err,
+            AccountErrorBuildError::ThrottleBudgetNotApplicable { .. }
+        ));
+    }
+
+    /// A stamped budget is a builder input like `throttle_scope`, and must
+    /// survive decoration through `into_builder`: a producer that rebuilds an
+    /// error (to add evidence or an idempotency override) would otherwise
+    /// silently move its hold back onto the account key.
+    #[test]
+    fn throttle_budget_survives_into_builder() {
+        let err = AccountErrorBuilder::new(
+            AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            Cause::Server(crate::error::ServerCause::RateLimited { retry_hint: None }),
+        )
+        .throttle_budget(ThrottleBudget::new("b"))
+        .throttle_budget(ThrottleBudget::new("b"))
+        .try_build()
+        .expect("valid");
+        let rebuilt = err
+            .into_builder()
+            .idempotency_override(true)
+            .try_build()
+            .expect("valid");
+        assert_eq!(rebuilt.throttle_budgets(), &[ThrottleBudget::new("b")]);
     }
 
     #[test]

@@ -508,6 +508,48 @@ impl GraphAccount {
         }
     }
 
+    /// The Outlook mailbox budget a REST request for `owner` is charged to:
+    /// the budget of the very client `client_for_owner` routes it through,
+    /// so the declaration and the stamp the REST funnel puts on that
+    /// client's throttles are one function of one client. `None` for an
+    /// unconfigured owner, which never reaches the wire.
+    pub(crate) fn budget_for_owner(
+        &self,
+        owner: Option<&str>,
+    ) -> Option<bifrost_types::ThrottleBudget> {
+        self.client_for_owner(owner)
+            .ok()
+            .map(GraphClient::mailbox_budget)
+    }
+
+    /// The mailbox budget a REST request for message `id` is charged to.
+    /// A public-folder item is read over EWS, whose throttles carry no
+    /// mailbox budget, so it declares none.
+    pub(crate) fn budget_for_object(&self, id: &ObjectId) -> Option<bifrost_types::ThrottleBudget> {
+        let parsed = foreign::parse_message_id(id);
+        if parsed.public_folder().is_some() {
+            return None;
+        }
+        self.budget_for_owner(parsed.owner())
+    }
+
+    /// The mailbox budget a drive of `scope` is charged to. Follows
+    /// `client_for_scope` exactly - a foreign `FolderType` scope routes to
+    /// its owner, every other REST scope to the primary - except for a bare
+    /// `CursorScope::Folder`, which this crate drives only for public folders
+    /// over EWS: no mailbox budget there.
+    pub(crate) fn budget_for_scope(
+        &self,
+        scope: &CursorScope,
+    ) -> Option<bifrost_types::ThrottleBudget> {
+        if matches!(scope, CursorScope::Folder(_)) {
+            return None;
+        }
+        self.client_for_scope(scope)
+            .ok()
+            .map(GraphClient::mailbox_budget)
+    }
+
     /// Look up the public-folder routing for a native EWS folder id, or
     /// `None` if the folder is not a public folder. Presence in the map
     /// is the discriminator that routes a `CursorScope::Folder` onto the
@@ -760,6 +802,10 @@ impl AccountFactory for GraphAccountFactory {
                 )
             })?;
             let user_email = profile.mail.or(profile.user_principal_name);
+            // Names the primary mailbox in its throttle budget. Set before
+            // the account (and its shared clients) is built, and on every
+            // open, so a reopen picks up a changed address.
+            client.set_primary_address(user_email.clone());
             let mut account = GraphAccount::new(
                 client.clone(),
                 push_mode,
@@ -846,6 +892,41 @@ impl Account for GraphAccount {
         if let Some(account_net) = self.client.account_net() {
             account_net.set_bandwidth_cap(bps);
         }
+    }
+
+    /// The Outlook mailbox budget each unit of work is charged to - the same
+    /// budget the REST funnel and the `$batch` subresponse classifiers stamp
+    /// on that work's throttles, computed from the same client. A move also
+    /// declares its destination folder's mailbox (Graph only expresses a
+    /// same-mailbox move, so it is normally the targets' own).
+    fn throttle_keys(
+        &self,
+        _account: &bifrost_types::AccountId,
+        work: bifrost_types::ThrottleWork<'_>,
+    ) -> Vec<bifrost_types::ThrottleKey> {
+        use bifrost_types::{ThrottleKey, ThrottleWork};
+        let budgets: Vec<bifrost_types::ThrottleBudget> = match work {
+            ThrottleWork::Scope(scope) => self.budget_for_scope(scope).into_iter().collect(),
+            ThrottleWork::Objects(ids) => {
+                let mut budgets = Vec::new();
+                for id in ids {
+                    if let Some(budget) = self.budget_for_object(id)
+                        && !budgets.contains(&budget)
+                    {
+                        budgets.push(budget);
+                    }
+                }
+                budgets
+            }
+            ThrottleWork::Membership(bifrost_types::MembershipScope::Folder(folder)) => self
+                .budget_for_owner(foreign::folder_owner(folder).as_deref())
+                .into_iter()
+                .collect(),
+            // Labels, mailbox tags and queries name no folder a request is
+            // routed to; `ThrottleWork` is `#[non_exhaustive]`.
+            _ => Vec::new(),
+        };
+        budgets.into_iter().map(ThrottleKey::Budget).collect()
     }
 
     fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor {
@@ -1609,7 +1690,10 @@ where
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use bifrost_types::{AccountErrorKind, AccountOperation, FolderId, ObjectType};
+    use bifrost_types::{
+        AccountErrorKind, AccountId, AccountOperation, FolderId, ObjectType, ThrottleKey,
+        ThrottleWork,
+    };
 
     use super::cursor::{
         GraphCursorKind, GraphCursorPayload, GraphPageMarker, PublicFolderCursor,
@@ -1619,6 +1703,78 @@ mod tests {
 
     fn account() -> GraphAccount {
         GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions)
+    }
+
+    /// What a scope, an object and a move destination DECLARE is the budget
+    /// a throttle of that same work STAMPS - one function of one client - and
+    /// two mailboxes never share one.
+    ///
+    /// The stamp side is driven through the real classifier: a funnel-tagged
+    /// 429 for the shared mailbox's client becomes an error whose only
+    /// recorded hold is that budget. If the declaration and the stamp ever
+    /// disagree, the engine records a hold no wait site honours.
+    #[test]
+    fn a_mailbox_declares_the_budget_its_throttles_stamp() {
+        let client = GraphClient::new("token");
+        client.set_primary_address(Some("me@contoso.com".into()));
+        let account = GraphAccount::new_for_tests_with_shared(
+            client,
+            PushMode::GraphSubscriptions,
+            &["a@contoso.com".to_string(), "b@contoso.com".to_string()],
+        );
+        let id = AccountId("graph".into());
+        let declare = |work: ThrottleWork<'_>| Account::throttle_keys(&account, &id, work);
+        let scope_of = |mailbox: &str| CursorScope::FolderType {
+            folder: foreign::encode_foreign(mailbox, "inbox"),
+            ty: ObjectType::Email,
+        };
+        let budget_of = |mailbox: &str| {
+            account
+                .client_for_owner(Some(mailbox))
+                .expect("configured")
+                .mailbox_budget()
+        };
+
+        let a = declare(ThrottleWork::Scope(&scope_of("a@contoso.com")));
+        let b = declare(ThrottleWork::Scope(&scope_of("b@contoso.com")));
+        assert_eq!(a, vec![ThrottleKey::Budget(budget_of("a@contoso.com"))]);
+        assert_ne!(a, b, "two mailboxes must never share a budget");
+
+        let object = ObjectId(foreign::qualify_with_owner(Some("a@contoso.com"), "m1"));
+        assert_eq!(declare(ThrottleWork::Objects(&[object])), a);
+        let destination = MembershipScope::Folder(foreign::encode_foreign("a@contoso.com", "x"));
+        assert_eq!(declare(ThrottleWork::Membership(&destination)), a);
+        let primary = declare(ThrottleWork::Scope(&CursorScope::FolderType {
+            folder: FolderId("inbox".into()),
+            ty: ObjectType::Email,
+        }));
+        assert_ne!(primary, a, "the primary mailbox is its own budget");
+        assert!(
+            declare(ThrottleWork::Scope(&CursorScope::Folder(FolderId(
+                "pf".into()
+            ))))
+            .is_empty(),
+            "a public folder is read over EWS and declares no mailbox budget"
+        );
+
+        let stamped = graph_error::into_account_error(
+            crate::error::GraphError::MailboxThrottled {
+                budget: budget_of("a@contoso.com"),
+                source: Box::new(crate::error::GraphError::Response(
+                    crate::error::GraphResponseError::from_response(
+                        reqwest::StatusCode::TOO_MANY_REQUESTS,
+                        reqwest::header::HeaderMap::new(),
+                        Bytes::from_static(br#"{"error":{"code":"TooManyRequests"}}"#),
+                    ),
+                )),
+            },
+            graph_error::GraphErrorContext::graph(AccountOperation::SyncChanges),
+        );
+        assert_eq!(stamped.throttle_budgets(), &[budget_of("a@contoso.com")]);
+        let ThrottleKey::Budget(declared) = &a[0] else {
+            panic!("Graph declares budget keys");
+        };
+        assert_eq!(stamped.throttle_budgets(), std::slice::from_ref(declared));
     }
 
     #[test]

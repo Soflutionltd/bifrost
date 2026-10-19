@@ -34,6 +34,11 @@ pub(crate) struct GraphErrorContext {
     /// Overrides `AccountOperation::is_idempotent` for one call site.
     /// `None` leaves the operation's own answer in force.
     pub(crate) idempotency_override: Option<bool>,
+    /// The Outlook mailbox budget the request was charged to, when the call
+    /// site knows the client that sent it (a `$batch` subresponse) or the
+    /// REST funnel tagged the failure (`GraphError::MailboxThrottled`).
+    /// Stamped on the error only when it classifies as a throttle.
+    pub(crate) budget: Option<bifrost_types::ThrottleBudget>,
 }
 
 impl GraphErrorContext {
@@ -44,6 +49,7 @@ impl GraphErrorContext {
             operation,
             scope: None,
             idempotency_override: None,
+            budget: None,
         }
     }
 
@@ -58,12 +64,20 @@ impl GraphErrorContext {
             operation,
             scope: None,
             idempotency_override: None,
+            budget: None,
         }
     }
 
     #[must_use]
     pub(crate) fn with_scope(mut self, scope: ErrorScope) -> Self {
         self.scope = Some(scope);
+        self
+    }
+
+    /// The mailbox budget the classified request was charged to.
+    #[must_use]
+    pub(crate) fn with_budget(mut self, budget: bifrost_types::ThrottleBudget) -> Self {
+        self.budget = Some(budget);
         self
     }
 
@@ -118,6 +132,9 @@ pub(crate) fn into_account_error(error: GraphError, ctx: GraphErrorContext) -> A
             ),
             &ctx,
         ),
+        GraphError::MailboxThrottled { budget, source } => {
+            into_account_error(*source, ctx.with_budget(budget))
+        }
         GraphError::Net(net) => net_to_account_error(net, &ctx),
         GraphError::Response(response) => response_to_account_error(response, &ctx),
         GraphError::Json { message, body } => json_parse_to_account_error(&message, body, &ctx),
@@ -218,7 +235,32 @@ fn net_to_account_error(net: bifrost_net::Error, ctx: &GraphErrorContext) -> Acc
             return response_to_account_error(response, ctx);
         }
     }
-    apply_idempotency_override(bifrost_net::into_account_error(net, ctx.to_net_ctx()), ctx)
+    stamp_budget(
+        apply_idempotency_override(bifrost_net::into_account_error(net, ctx.to_net_ctx()), ctx),
+        ctx,
+    )
+}
+
+/// Stamp the context's mailbox budget on an error `bifrost-net` built, when
+/// it classified as a throttle. The response path stamps it at construction;
+/// this covers a 429 whose body was not Graph's, which bifrost-net
+/// classifies itself.
+#[must_use]
+fn stamp_budget(error: AccountError, ctx: &GraphErrorContext) -> AccountError {
+    let Some(budget) = ctx.budget.as_ref() else {
+        return error;
+    };
+    if !matches!(
+        error.kind(),
+        AccountErrorKind::Server(ServerErrorKind::RateLimited | ServerErrorKind::QuotaExhausted)
+    ) {
+        return error;
+    }
+    error
+        .into_builder()
+        .throttle_budget(budget.clone())
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// Status, headers, and body of the response a `bifrost_net::Error`
@@ -333,10 +375,10 @@ fn soap_fault_to_account_error(
     // do not branch UX on the string.
     let resource = resource_from_scope(ctx.scope.as_ref());
     // The third element flags a throttle path (rate-limit / quota): the
-    // engine needs a `throttle_scope` so it buckets the EWS backoff at
-    // the tenant level. Without it `ErrorServerBusy` -> `RateLimited`
-    // carries no scope and the EWS worker hot-loops on `SameRequest`,
-    // mirroring the REST 429 path which correctly stamps `Tenant`.
+    // engine needs a `throttle_scope` so it buckets the EWS backoff (at the
+    // account, see `throttle_scope_for`). Without it `ErrorServerBusy` ->
+    // `RateLimited` carries no scope and the EWS worker hot-loops on
+    // `SameRequest`, unlike the REST 429 path.
     let (kind, cause, throttle) = match code {
         SoapFaultCode::Server => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
@@ -428,7 +470,7 @@ fn soap_fault_to_account_error(
 /// SOAP protocol):
 ///
 /// - `ServerBusy` is throttling: `Server(RateLimited)`, bucketed at the
-///   tenant like EWS `ErrorServerBusy`.
+///   account like EWS `ErrorServerBusy`.
 /// - `InternalServerError` is the server's own failure, the in-body twin of
 ///   an HTTP 500: `Server(Unavailable)`, retried.
 /// - `InvalidUser` names a mailbox the server does not know:
@@ -687,6 +729,9 @@ fn response_to_account_error(
     // applies only on rate-limit / quota / 503 paths.
     if throttle && let Some(scope) = throttle_scope_for(ctx) {
         builder = builder.throttle_scope(scope);
+        if let Some(budget) = ctx.budget.as_ref() {
+            builder = builder.throttle_budget(budget.clone());
+        }
     }
     finish(builder, ctx)
 }
@@ -1119,10 +1164,19 @@ fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
     }
 }
 
+/// `Account`, not `Tenant`. Microsoft documents the Outlook mail, calendar
+/// and contacts limits per app per MAILBOX - one mailbox's throttle does not
+/// affect another - so a tenant hold would pause mailboxes the provider never
+/// throttled. A throttle the REST funnel or a `$batch` subresponse could
+/// attribute also carries that mailbox's budget, and the engine then records
+/// the budget alone. This scope is the fallback for the rest: EWS, the
+/// Autodiscover and subscription endpoints, and any Outlook request the
+/// funnel could not attribute. The account is the conservative answer there
+/// (it pauses this account's other mailboxes too) without inventing a
+/// tenant identity this crate never sees. It is a chosen approximation, not a
+/// claim about how EWS or the subscription service meter.
 fn throttle_scope_for(_ctx: &GraphErrorContext) -> Option<ThrottleScope> {
-    // All Microsoft tenants share the per-tenant throttle policy
-    // (Graph REST and EWS both meter at the tenant level).
-    Some(ThrottleScope::Tenant)
+    Some(ThrottleScope::Account)
 }
 
 /// Build a `SyncState(ScopeRevoked)` error scoped to one foreign
@@ -1562,6 +1616,7 @@ pub(crate) fn batch_response_missing(
 /// found, 409 / 412 -> concurrency conflict (never `Skipped`), 429 ->
 /// rate limited with retry-after + throttle scope, 5xx -> unavailable.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn mutation_item_outcome(
     status: u16,
     headers: HeaderMap,
@@ -1570,6 +1625,10 @@ pub(crate) fn mutation_item_outcome(
     item_id: bifrost_types::BatchItemId,
     operation: AccountOperation,
     scope: ErrorScope,
+    // The mailbox budget the item's sub-request was charged to, stamped on
+    // a throttled outcome. The outer `$batch` cannot carry it (it mixes
+    // mailboxes); each item can.
+    budget: Option<bifrost_types::ThrottleBudget>,
 ) -> bifrost_types::ItemOutcome<bifrost_types::MutationSuccess> {
     use bifrost_types::{BatchFailure, BatchSuccess, ItemOutcome, MutationSuccess};
 
@@ -1584,7 +1643,8 @@ pub(crate) fn mutation_item_outcome(
         headers,
         body,
     );
-    let ctx = GraphErrorContext::graph(operation).with_scope(scope);
+    let mut ctx = GraphErrorContext::graph(operation).with_scope(scope);
+    ctx.budget = budget;
     let error = response_to_account_error(response, &ctx);
     ItemOutcome::Failed(BatchFailure::new(item_id, error))
 }
@@ -2049,7 +2109,7 @@ mod tests {
         ));
         match err.recovery() {
             RecoveryClass::Retry(advice) => {
-                assert_eq!(advice.throttle_scope, Some(ThrottleScope::Tenant));
+                assert_eq!(advice.throttle_scope, Some(ThrottleScope::Account));
                 assert!(advice.retry_hint.is_some());
             }
             other => panic!("expected Retry, got {other:?}"),
@@ -2398,6 +2458,7 @@ mod tests {
             ErrorScope::Message {
                 id: ("m1".to_string()).into(),
             },
+            None,
         );
         assert!(matches!(
             outcome,
@@ -2417,6 +2478,7 @@ mod tests {
             ErrorScope::Message {
                 id: ("m1".to_string()).into(),
             },
+            None,
         );
         assert!(matches!(
             outcome,
@@ -2436,6 +2498,7 @@ mod tests {
             ErrorScope::Message {
                 id: ("m1".to_string()).into(),
             },
+            None,
         );
         match outcome {
             bifrost_types::ItemOutcome::Failed(failure) => {
@@ -2460,6 +2523,7 @@ mod tests {
             ErrorScope::Message {
                 id: ("m1".to_string()).into(),
             },
+            None,
         );
         match outcome {
             bifrost_types::ItemOutcome::Failed(failure) => {
@@ -2484,6 +2548,7 @@ mod tests {
             ErrorScope::Message {
                 id: ("m1".to_string()).into(),
             },
+            None,
         );
         match outcome {
             bifrost_types::ItemOutcome::Failed(failure) => {
@@ -2493,7 +2558,7 @@ mod tests {
                 ));
                 match failure.error.recovery() {
                     RecoveryClass::Retry(advice) => {
-                        assert_eq!(advice.throttle_scope, Some(ThrottleScope::Tenant));
+                        assert_eq!(advice.throttle_scope, Some(ThrottleScope::Account));
                         assert!(advice.retry_hint.is_some());
                     }
                     other => panic!("expected Retry, got {other:?}"),
@@ -2518,6 +2583,7 @@ mod tests {
             ErrorScope::Message {
                 id: ("m1".to_string()).into(),
             },
+            None,
         );
         let bifrost_types::ItemOutcome::Failed(failure) = outcome else {
             panic!("expected Failed");
@@ -2707,10 +2773,10 @@ mod tests {
     }
 
     // End-to-end through the wire parse: `ErrorServerBusy` in a 200-OK
-    // body must reach `Server(RateLimited)` with a `Tenant` throttle
+    // body must reach `Server(RateLimited)` with an `Account` throttle
     // scope so the EWS worker backs off instead of hot-looping.
     #[test]
-    fn wire_error_server_busy_is_rate_limited_with_tenant_throttle() {
+    fn wire_error_server_busy_is_rate_limited_with_account_throttle() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
   <s:Body>
@@ -2735,7 +2801,7 @@ mod tests {
         ));
         match err.recovery() {
             RecoveryClass::Retry(advice) => {
-                assert_eq!(advice.throttle_scope, Some(ThrottleScope::Tenant));
+                assert_eq!(advice.throttle_scope, Some(ThrottleScope::Account));
             }
             other => panic!("expected Retry, got {other:?}"),
         }

@@ -383,6 +383,61 @@ impl Account for ImapAccount {
         self.bandwidth_cap.store(raw, Ordering::Release);
     }
 
+    // Account: names the per-mailbox throttle keys engine work consumes; direct users pace themselves.
+    //
+    // IMAP's only narrower-than-account throttle is the per-mailbox one
+    // `mailbox_throttle` raises for a folder-scoped `[LIMIT]`, which the
+    // engine records as `ThrottleKey::Mailbox { account, mailbox }` keyed on
+    // the folder's name. Every arm below builds that exact key from the same
+    // `MailboxName::as_str()` the error producer scopes with, so a recorded
+    // hold and the work it should hold meet. Routing follows `route_scope`:
+    // a composed DAV collection answers for its sub-account, never as an
+    // IMAP mailbox.
+    fn throttle_keys(
+        &self,
+        account: &bifrost_types::AccountId,
+        work: bifrost_types::ThrottleWork<'_>,
+    ) -> Vec<bifrost_types::ThrottleKey> {
+        use bifrost_types::{ThrottleKey, ThrottleWork};
+        let key = |mailbox: &str| ThrottleKey::Mailbox {
+            account: account.clone(),
+            mailbox: bifrost_types::MailboxId(mailbox.to_owned()),
+        };
+        match work {
+            ThrottleWork::Scope(scope) => {
+                match route_scope(self, scope, bifrost_types::AccountOperation::SyncChanges) {
+                    Ok(ScopeHandler::Folder(mailbox)) => vec![key(mailbox.as_str())],
+                    Ok(ScopeHandler::Delegate(sub)) => sub.throttle_keys(account, work),
+                    Err(_) => Vec::new(),
+                }
+            }
+            ThrottleWork::Objects(ids) => {
+                let mut keys = Vec::new();
+                for id in ids {
+                    // An id that does not decode names no IMAP folder; its
+                    // mutation fails locally without reaching the wire.
+                    if let Ok(decoded) =
+                        decode_object_id(id, bifrost_types::AccountOperation::UpdateFlags)
+                    {
+                        let candidate = key(decoded.folder.as_str());
+                        if !keys.contains(&candidate) {
+                            keys.push(candidate);
+                        }
+                    }
+                }
+                keys
+            }
+            ThrottleWork::Membership(MembershipScope::Folder(folder))
+                if self.dav_scopes.owner(folder).is_none() =>
+            {
+                vec![key(&folder.0)]
+            }
+            // A DAV-owned collection, or a membership IMAP never routes a
+            // move to; `ThrottleWork` is `#[non_exhaustive]`.
+            _ => Vec::new(),
+        }
+    }
+
     // Account: describes opaque engine cursors; direct users inspect SyncSelectResult.
     fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor {
         changes::describe_cursor(self, cursor)
@@ -1344,6 +1399,79 @@ pub(crate) fn folder_scope(folder: &MailboxName) -> CursorScope {
 
 pub(crate) fn membership_scope(folder: &MailboxName) -> MembershipScope {
     MembershipScope::Folder(bifrost_types::FolderId(folder.as_str().to_owned()))
+}
+
+#[cfg(test)]
+mod throttle_key_tests {
+    use bifrost_types::{
+        Account, AccountId, CursorScope, FolderId, MailboxId, MembershipScope, ThrottleKey,
+        ThrottleWork,
+    };
+
+    use super::test_support::{StubAccount, scripted_account_parts, stub_arc};
+    use super::{DavScopeIndex, ImapAccount, ImapAccountParts};
+    use crate::connection::test_support::{driver_pair, preauth_greeting};
+    use crate::types::MailboxName;
+
+    /// Every shape of work on one folder declares the SAME key, and it is
+    /// the key a folder-scoped `[LIMIT]` records: `ThrottleKey::Mailbox`
+    /// over the folder's name, under the account id the engine passes in.
+    /// A composed DAV collection is never mistaken for an IMAP mailbox.
+    #[tokio::test]
+    async fn every_work_shape_on_a_folder_declares_the_key_its_limit_records() {
+        let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+        drop(server);
+        let dav = "https://dav.example.test/books/";
+        let (dav_scopes, _) = DavScopeIndex::build(
+            vec![FolderId(dav.into())],
+            Vec::new(),
+            &std::collections::HashSet::from(["INBOX".to_string()]),
+        );
+        let account = ImapAccount::new(ImapAccountParts {
+            contacts: Some(stub_arc(StubAccount::new(Vec::new()))),
+            dav_scopes,
+            ..scripted_account_parts(conn, 1)
+        });
+        let id = AccountId("imap".into());
+        let inbox = vec![ThrottleKey::Mailbox {
+            account: id.clone(),
+            mailbox: MailboxId("INBOX".into()),
+        }];
+
+        let scope = CursorScope::Folder(FolderId("INBOX".into()));
+        assert_eq!(
+            account.throttle_keys(&id, ThrottleWork::Scope(&scope)),
+            inbox
+        );
+        let object = super::envelope::encode_object_id(
+            &MailboxName::new("INBOX").expect("valid mailbox"),
+            7,
+            42,
+        );
+        assert_eq!(
+            account.throttle_keys(&id, ThrottleWork::Objects(&[object])),
+            inbox
+        );
+        let folder = MembershipScope::Folder(FolderId("INBOX".into()));
+        assert_eq!(
+            account.throttle_keys(&id, ThrottleWork::Membership(&folder)),
+            inbox
+        );
+
+        let dav_scope = CursorScope::Folder(FolderId(dav.into()));
+        assert!(
+            account
+                .throttle_keys(&id, ThrottleWork::Scope(&dav_scope))
+                .is_empty(),
+            "a DAV collection answers for its sub-account, not as an IMAP mailbox"
+        );
+        let dav_folder = MembershipScope::Folder(FolderId(dav.into()));
+        assert!(
+            account
+                .throttle_keys(&id, ThrottleWork::Membership(&dav_folder))
+                .is_empty()
+        );
+    }
 }
 
 #[cfg(test)]

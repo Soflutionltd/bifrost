@@ -27,29 +27,48 @@ has not made, and ruled work that has not landed. Nothing else.
   `net`, `sasl`, `sync`) is verified with the full-workspace `brokkr
   check`, never `-p`.
 
-## bifrost-sync
+## Throttle budgets: follow-ups
 
-- **sync-F6.** (residuals of the closed F4+F5 throttle wiring) What
-  bounds the now-wired `ThrottleBucket`:
-  (a) This is the SINGLE home for the tenant-identity item; a near-identical
-  duplicate filed under "Sync residuals" was deleted 2026-09-15, so do not
-  re-file it there. `ThrottleScope::Tenant` degrades to the `Account` key because the
-  error contract carries no tenant identity string - `ThrottleKey::
-  Tenant(String)` exists but nothing can mint one, so a Graph tenant
-  429 pauses only the observing account, not tenant siblings. Fixing it
-  is a `bifrost-types` change (a tenant identity on the error or the
-  advice) plus producer support in graph/net.
-  (b) `Mailbox` keys are recorded (from `ErrorScope::Mailbox`) but
-  excluded from the account-wide wait: the engine has no
-  scope-to-mailbox mapping, so it cannot pause anything narrower than
-  the account without widening a per-mailbox throttle to every scope.
-  Needs a scope-to-mailbox channel (or a ruling that mailbox throttles
-  stay advisory).
-  (c) Cross-account enrollment is lazy (an account joins a shared
-  `Provider` key only when its own error stream names the identity),
-  so the FIRST provider-wide deadline is invisible to a sibling that
-  has never failed. Attach-time enrollment needs the account's
-  provider identity at attach - the same identity-channel shape as (a).
+Filed 2026-10-19 while landing declared throttle keys and stamped budgets
+(the sync-F6 close-out). Each was outside that change's scope.
+
+- **Unproduced published variants, owner's call.** `ThrottleScope::Tenant`,
+  `ThrottleScope::Provider` and `ThrottleKey::Tenant` now have no in-tree
+  producer: Graph, the only `Tenant` producer, meters per mailbox and stamps
+  budgets instead, and nothing ever emitted `Provider`. They stay published
+  for out-of-tree implementations; whether to retire them is a removal, so it
+  waits for the owner.
+- **Gmail per-project quota is a cross-account budget nobody declares.**
+  `crates/google/src/account/error.rs` maps `rateLimitExceeded`,
+  `userRateLimitExceeded` and `quotaExceeded` all to `ThrottleScope::Account`.
+  If Google's project-level reasons mean the quota every account on one OAuth
+  client shares, they are a `ThrottleBudget` every Google account should
+  declare. Needs Google's reason semantics confirmed before it is a defect.
+- **A mutation campaign is one throttle unit.** A campaign spanning a held
+  mailbox and a free one waits for the held one (`reference/sync.md`).
+  Splitting a campaign into per-budget cohorts with per-cohort retry
+  accounting is a feature, not a fix.
+- **A hold landing mid-way through a backfill walk is slept out inline**, so
+  later scopes' cold start waits behind it. Abandoning the walk would cost a
+  re-walk; a resumable partition-level deferral would avoid both.
+- **Recovery-driven establishment does not honour throttle holds.**
+  `run_establish` in `crates/sync/src/engine/reattach.rs` (scope recovery and
+  replacement-account establishment) drives `InventoryFusion` without
+  consulting the bucket, and its retries use their own exponential delay. It
+  never waited on the account-wide hold either, so this predates declared
+  keys; it is now the one engine lane outside the wait-site set in
+  `reference/sync.md`. Found by the close-out review.
+- **Graph OneDrive throttles are stamped with the Outlook mailbox budget.**
+  `tag_throttle` attributes every request under `/me` or `/users/{key}`,
+  which includes `/me/drive/...` from `cloud.rs`; OneDrive is not one of the
+  Outlook resources Microsoft meters per mailbox, so a OneDrive 429 holds the
+  mailbox's mail work instead of the account (P3 from the close-out review).
+  Restricting attribution to Outlook resource paths fixes it.
+- **Graph continuation links in another spelling fall back to the account
+  key.** `tag_throttle` matches the client's `/users/{encoded key}` prefix
+  literally; a `nextLink` Graph writes as `users('...')` is untagged and
+  over-pauses the account. A live probe of Graph's nextLink spelling for
+  shared mailboxes settles whether it matters.
 
 ## A9 (directory search) follow-ups
 

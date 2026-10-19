@@ -78,6 +78,11 @@ struct CampaignState {
     /// test can observe the width of a resubmission rather than only its
     /// count.
     widths: std::sync::Mutex<Vec<usize>>,
+    /// Stamped on the `per_item_retry_then_done` failure, making it a
+    /// throttle held against this budget.
+    stamp_budget: std::sync::Mutex<Option<bifrost_types::ThrottleBudget>>,
+    /// Declared by `throttle_keys` for every mutation target.
+    object_keys: std::sync::Mutex<Vec<bifrost_types::ThrottleKey>>,
 }
 
 struct FlagsFactory(Arc<FlagsAccount>);
@@ -137,6 +142,21 @@ impl Account for FlagsAccount {
     fn set_priority(&self, _priority: Priority) {}
 
     fn set_bandwidth_cap(&self, _bps: Option<u64>) {}
+
+    fn throttle_keys(
+        &self,
+        _account: &AccountId,
+        work: bifrost_types::ThrottleWork<'_>,
+    ) -> Vec<bifrost_types::ThrottleKey> {
+        match (work, self.campaign.as_ref()) {
+            (bifrost_types::ThrottleWork::Objects(_), Some(campaign)) => campaign
+                .object_keys
+                .lock()
+                .expect("object keys lock")
+                .clone(),
+            _ => Vec::new(),
+        }
+    }
 
     fn describe_cursor(&self, _cursor: &ChangeCursor) -> CursorDescriptor {
         unreachable!("describe_cursor not exercised by readback guard tests")
@@ -292,19 +312,26 @@ impl Account for FlagsAccount {
             }));
         }
         if campaign.per_item_retry_then_done.load(Ordering::SeqCst) && attempt == 0 {
+            let stamp = campaign.stamp_budget.lock().expect("stamp lock").clone();
             return Box::pin(
                 stream::once(async move {
                     let ids: Vec<ObjectId> = targets.collect().await;
-                    let error = AccountErrorBuilder::new(
+                    let mut builder = AccountErrorBuilder::new(
                         AccountErrorKind::Server(bifrost_types::ServerErrorKind::RateLimited),
                         Cause::Server(bifrost_types::ServerCause::RateLimited {
                             retry_hint: Some(bifrost_types::RetryHint::After(
                                 std::time::Duration::from_secs(HINTED_RETRY_SECS),
                             )),
                         }),
-                    )
-                    .try_build()
-                    .expect("valid rate-limited server error");
+                    );
+                    if let Some(budget) = stamp {
+                        builder = builder
+                            .throttle_scope(bifrost_types::ThrottleScope::Account)
+                            .throttle_budget(budget);
+                    }
+                    let error = builder
+                        .try_build()
+                        .expect("valid rate-limited server error");
                     SyncEvent::Batch(Batch {
                         items: vec![ItemOutcome::Failed(bifrost_types::BatchFailure::new(
                             bifrost_types::BatchItemId(ids[0].0.clone()),
@@ -1267,6 +1294,90 @@ async fn a_per_item_retry_delays_the_resubmission() {
          counters {counters:?})"
     );
     engine.detach(&account_id).await.expect("detach");
+}
+
+/// A campaign waits out a hold recorded under a budget its TARGETS declare,
+/// even when another account recorded it and this campaign never failed.
+///
+/// One account's per-item 429 stamps budget X with a long hint. A second
+/// account's campaign, whose targets declare X, must not submit until that
+/// deadline passes. Nothing local to the second campaign can explain the
+/// wait: it has no retry advice before its first attempt, and its own
+/// account key holds nothing.
+#[tokio::test(start_paused = true)]
+async fn a_campaign_waits_for_a_budget_its_targets_declare() {
+    let budget = bifrost_types::ThrottleBudget::new("test|mailbox:shared@example.com");
+    let engine = SyncEngine::builder().build().expect("engine");
+
+    let loud = Arc::new(CampaignState::default());
+    loud.per_item_retry_then_done.store(true, Ordering::SeqCst);
+    *loud.stamp_budget.lock().expect("stamp lock") = Some(budget.clone());
+    let loud_id = AccountId("budget-loud-campaign".into());
+    engine
+        .attach(
+            loud_id.clone(),
+            Arc::new(FlagsFactory(campaign_account(Arc::clone(&loud)))),
+        )
+        .await
+        .expect("attach loud");
+
+    let quiet = Arc::new(CampaignState::default());
+    *quiet.object_keys.lock().expect("object keys lock") =
+        vec![bifrost_types::ThrottleKey::Budget(budget)];
+    let quiet_id = AccountId("budget-quiet-campaign".into());
+    engine
+        .attach(
+            quiet_id.clone(),
+            Arc::new(FlagsFactory(campaign_account(Arc::clone(&quiet)))),
+        )
+        .await
+        .expect("attach quiet");
+
+    // The loud campaign records the hold on its first attempt, then sleeps
+    // out its own hint before resubmitting; run it alongside.
+    let loud_engine = Arc::new(engine);
+    let loud_run = {
+        let engine = Arc::clone(&loud_engine);
+        let loud_id = loud_id.clone();
+        tokio::spawn(async move {
+            engine
+                .bulk_set_flags(
+                    &loud_id,
+                    vec![ObjectId("one".into())],
+                    FlagOp::Add(set(&["\\Seen"])),
+                    &vendor(),
+                    ProtocolKind::Imap,
+                )
+                .await
+        })
+    };
+    while loud.submissions.load(Ordering::SeqCst) == 0 {
+        loud.submitted.notified().await;
+    }
+    // Let the per-item failure be classified and recorded.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let started = tokio::time::Instant::now();
+    loud_engine
+        .bulk_set_flags(
+            &quiet_id,
+            vec![ObjectId("two".into())],
+            FlagOp::Add(set(&["\\Seen"])),
+            &vendor(),
+            ProtocolKind::Imap,
+        )
+        .await
+        .expect("quiet campaign");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_secs(HINTED_RETRY_SECS - 2),
+        "the campaign submitted through a budget hold its targets declare \
+         (elapsed {elapsed:?})"
+    );
+
+    loud_run.await.expect("loud task").expect("loud campaign");
+    loud_engine.detach(&loud_id).await.expect("detach loud");
+    loud_engine.detach(&quiet_id).await.expect("detach quiet");
 }
 
 #[tokio::test]

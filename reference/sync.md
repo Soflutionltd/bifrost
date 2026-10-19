@@ -3290,24 +3290,98 @@ reason. The reason rides on the warning's free-form fields; the
 
 `crate::recovery::ThrottleBucket` is engine-wide (one per
 `SyncEngine`, shared by every slot): deadlines keyed by
-`ThrottleKey::{Mailbox, Account, Tenant, Provider}` plus a
-membership index recording which cross-account (`Tenant` /
-`Provider`) keys each account belongs to. An account joins a shared
-key the first time its own error stream names that identity;
+`ThrottleKey::{Mailbox, Account, Tenant, Provider, Budget}` plus a
+membership index recording which lifted cross-account (`Tenant` /
+`Provider`) keys each account belongs to. An account joins a lifted
+shared key the first time its own error stream names that identity;
 membership survives `cleanup_expired` because it is an identity
 fact, not a deadline, and is bounded by the identity space.
 `ThrottleScope::CurrentOperation` is a per-call hint and never
 enters the bucket.
 
+Keys reach the work they hold two ways. A key LIFTED from a
+`ThrottleScope` (see below) is either the account's own or a shared key
+reached through membership. A key DECLARED by `Account::throttle_keys` for
+the work about to be driven is looked up literally by
+`recovery::throttle_wait`, with no enrollment step, so an account that has
+never failed still sees the first deadline a sibling recorded under it.
+Every wait site asks the account what its work consumes, through
+`recovery::declared_keys`: the poll loop and the reconciler for the scope
+(`ThrottleWork::Scope`), the backfill orchestrator and partition runner and
+the deferred-inventory worker for the scope, the mutation campaign for its
+unresolved targets plus a move's destination and supplied source
+(`ThrottleWork::Objects`, `ThrottleWork::Membership`), and the read-back for
+every id in `unresolved_readback_ids`. Recovery-driven establishment
+(`run_establish` in `engine/reattach.rs`, for scope recovery and a
+replacement account) is the one engine lane that consults no hold at all,
+account-wide or declared; it records the holds its failures carry but does
+not wait on them. The wait is the longest pending
+deadline across the account-wide keys and the declared ones. `Mailbox` and
+`Budget` keys are never part of the account-wide wait: they hold one
+mailbox's work, and reach it only by declaration. IMAP declares its
+`ThrottleKey::Mailbox` for a folder scope, a folder's objects and a folder
+membership; Graph declares the Outlook mailbox `ThrottleKey::Budget` each
+scope, object and destination folder is routed to; every other crate
+declares nothing and waits on account-wide holds only.
+
+The guarantee is drive-start granularity. Each site checks immediately
+before driving, and checks again after every wait that precedes the drive
+(a retry-advice sleep, a pause park, scheduler or lane admission, and - for
+the poll loop and the reconciler - the drive lease, checked inside the
+lease-protected closure before `changes_stream` is called), asking the
+declaration of the very account snapshot the work then runs against (a reopen
+during the waits can install an account that declares different keys), because a
+deadline recorded during those waits existed before the drive started; on a
+hold the permit is released rather than carried across the throttle wait. A
+deadline recorded mid-drive is honoured at the next drive or attempt; pacing
+inside one drive is the protocol's own retry hint.
+
+A wait that holds one scope must not stall the others behind it, and three
+callers walk scopes one after another. The push reconciler keeps scopes held
+by a SCOPE-LOCAL key in a deferred set owned by its run loop, re-driven by a
+timer once the earliest hold lifts; only the scope is kept (no cursor, lease,
+permit or activity guard), parking and deletion are re-checked at dispatch,
+and a hint that arrives during a drive is read after it and re-marks the
+scope, so no invalidation is lost. A throttled hinted drive is deferred only
+when a hold actually covers it, else it is skipped as before and its poll loop
+catches up. The backfill orchestrator defers a scope-locally held scope on the
+scan (`BackfillScan::defer_until`, kept apart from the failure ramp) and walks
+the next one. The deferred-inventory worker requeues a held scope behind the
+others and sleeps only once every queued scope is held. An ACCOUNT-WIDE hold
+blocks every scope equally and is slept out inline at all three - BEFORE the
+scope-local decision, so a short account hold overlapping a long mailbox hold
+cannot leave the held scope in an inline wait with the others behind it. A hold that
+lands between two partitions of a backfill walk already under way is also
+waited out inline: the walk must finish against the same budget, and
+abandoning it would cost a re-walk. A mutation campaign is one throttle unit:
+it waits until every budget its submission consumes is free rather than
+splitting its targets by budget, because its idempotency key, retry counter,
+read-back guard and termination sweeps all assume one submitted set; a
+campaign spanning a held mailbox and a free one waits for the held one, and
+the wait never counts against `mutation_max_retries`.
+
 Both sides are wired. Recording: the reopen listener, the poll loop's
 and push reconciler's Retry and Reconcile arms (both the per-drive
 terminations and the reconciler's top-level `WatchEvent::Terminated`),
 and the mutation campaigns (per-item outcomes and stream-level
-terminations) funnel through `recovery::record_throttle` or
+terminations) and their read-back (every per-item hydration failure the
+guard absorbs as uncertain, through the crate-internal `*_observed` guard
+variants, plus a returned stream-level termination) funnel through
+`recovery::record_throttle` or
 `recovery::record_reconcile_throttle`, and the local sleep those arms
 observe comes from `recovery::retry_delay` /
 `recovery::reconcile_delay`, which honor the carried `RetryHint` and
-otherwise fall back to one second. Both recorders resolve the key from the
+otherwise fall back to one second. An error that stamps throttle budgets
+(`AccountError::throttle_budgets`) is recorded on exactly those
+`ThrottleKey::Budget` keys and nothing is lifted from its `ThrottleScope`:
+recording the account key as well would pause every sibling mailbox the
+budget exists to keep running. A stamped budget with no hint is held for the
+same one-second fallback the observer sleeps, so a sibling declaring it is
+paced alike. An unstamped hintless error records nothing, except on a
+lifted `Mailbox` key, which is as narrow as a budget and gets the same
+fallback: IMAP's folder-scoped `[LIMIT]` carries no hint, and without it the
+per-folder hold was never recorded at all. Otherwise
+both recorders resolve the key from the
 identities the classified error actually carries
 (the error's mailbox scope, `AccountError::provider()`). The mailbox identity is
 read in BOTH shapes it is produced in - `ErrorScope::Mailbox { id }` and
@@ -3319,18 +3393,16 @@ unreachable in production while its test passed against the synthetic shape.
 A mailbox throttle carrying no mailbox identity at all remains local to the
 current operation: degrading it to the account key would widen a per-mailbox 429
 into an account-wide stall. Broader
-provider scope may degrade to the account key. `Tenant` ALWAYS degrades today: the
-error contract carries no tenant identity string, so cross-account
-tenant pausing is blocked on that types-level channel. Reading: the poll loop (before each drive), the
-reconciler (before each hinted scope), and the mutation campaigns
-(before each attempt) call `recovery::account_throttle_wait` - the
-longest pending wait across the account's own key and its shared
-memberships, re-checked after waking since a longer deadline can
-land mid-sleep. The backfill partition runner and the
-deferred-inventory worker consult it too, at the same boundary as
-their pause checks: cold-start hydration is the heaviest request
-lane the engine drives, so it must not barrel through a Retry-After
-that paused the polls. `detach` forgets the account's shared-key memberships so
+provider scope may degrade to the account key. `Tenant` degrades too: the
+error carries no tenant identity string. No in-tree producer emits it; a
+provider whose throttle genuinely spans accounts stamps and declares a
+budget instead, which needs no identity on the error. Reading happens at
+every wait site listed above, re-checked after waking since a longer
+deadline can land mid-sleep; cold-start hydration (the backfill runner and
+the deferred-inventory worker) is the heaviest request lane the engine
+drives, so it consults the same keys at the same boundary as its pause
+checks rather than barrelling through a Retry-After that paused the
+polls. `detach` forgets the account's shared-key memberships so
 a reattached id cannot inherit a previous life's provider enrollment. Its own
 `Account` deadline is deliberately retained until expiry: it describes the
 stable account identity, not the connection incarnation, and prevents detach
@@ -3364,17 +3436,20 @@ tests cannot reach: that a recorded deadline actually defers `changes_stream`
 deadline (the sibling's own record is 1ms and long expired, so only the other
 account's 300s record can explain its pause). Both assert a poll COUNT flat
 across a window many cadences wide and then RESUMING, not a total elapsed
-time another timer could satisfy.
+time another timer could satisfy. `tests/throttle_budget_isolation.rs` pins
+the declared-key half the same way: a stamped budget holds the scopes that
+declare it, on this account and on a second attached account that never
+failed (first-deadline reach without enrollment), while a sibling scope on
+another budget keeps polling (recording precedence). In
+`tests/readback_guard.rs`, `a_campaign_waits_for_a_budget_its_targets_declare`
+pins the campaign side across two accounts.
 
-Two documented limits on the cross-account reach. Enrollment is
-lazy - an account joins a shared key only when its own error stream
-names the identity - so the very FIRST provider-wide deadline is
-invisible to a sibling that has never failed; attach-time
-enrollment needs a provider identity channel the contract does not
-carry. `Mailbox` keys are recorded but deliberately excluded from
-the account-wide wait: a per-mailbox throttle must not pause the
-whole account, and the engine has no scope-to-mailbox mapping to
-pause anything narrower with. Both remain open.
+One limit on the cross-account reach remains, and only on the legacy lifted
+route: enrollment is lazy, so the FIRST deadline under a lifted `Provider`
+key is invisible to a sibling that has never failed. Declared keys have no
+such gap, which is the route a crate should use for a budget its provider
+shares across accounts. No in-tree producer emits `ThrottleScope::Provider`
+today.
 
 Cursor envelope schema mismatches at `get_change_cursor` are
 translated through `crate::recovery::cursor_decode_failure` into an

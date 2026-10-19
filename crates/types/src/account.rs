@@ -211,6 +211,35 @@ pub trait Account: Send + Sync {
     /// unlimited.
     fn set_bandwidth_cap(&self, bps: Option<u64>);
 
+    /// The throttle keys `work` consumes, so the engine can hold it while a
+    /// provider deadline recorded under any of them is pending.
+    ///
+    /// The engine calls this at every wait site before driving work - a scope
+    /// drive, a mutation attempt, a read-back - and waits out the longest
+    /// pending deadline across the returned keys plus the account-wide ones
+    /// it always consults. Lookup is literal: a returned key is consulted
+    /// directly, with no enrollment step, so the very first deadline any
+    /// account records under a shared key reaches every account that
+    /// declares it.
+    ///
+    /// The answer must follow the same routing decision the operation itself
+    /// makes (a composed sub-account's scope answers for the sub-account), and
+    /// must include every [`ThrottleBudget`](crate::ThrottleBudget) this
+    /// implementation's errors stamp for the same work - a stamped budget no
+    /// declaration names is a hold no wait site honours. `account` is the id
+    /// the engine records under, passed in so an account-local key
+    /// (`ThrottleKey::Mailbox`) matches the recorded one exactly.
+    ///
+    /// The default declares nothing: the work waits on account-wide holds
+    /// only.
+    fn throttle_keys(
+        &self,
+        _account: &AccountId,
+        _work: crate::ThrottleWork<'_>,
+    ) -> Vec<crate::ThrottleKey> {
+        Vec::new()
+    }
+
     /// Cursor introspection. Account-aware because cost depends on
     /// capability state, not the cursor in isolation.
     fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor;
