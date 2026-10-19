@@ -186,6 +186,10 @@ pub type ChangesHook = Arc<dyn Fn(&ChangeCursor) -> Vec<SyncEvent<Change>> + Sen
 /// The throttle keys a scope drive consumes.
 pub type ScopeKeysHook = Arc<dyn Fn(&CursorScope) -> Vec<bifrost_types::ThrottleKey> + Send + Sync>;
 
+/// Optional per-handle classified failure for push teardown.
+pub type UnsubscribeErrorHook =
+    Arc<dyn Fn(&SubscriptionHandle) -> Option<AccountError> + Send + Sync>;
+
 /// Configurable `Account` double. Construct with [`StubAccount::new`], then
 /// set hooks for the surfaces the test drives; everything else answers
 /// `Unsupported` or an empty stream.
@@ -202,6 +206,8 @@ pub struct StubAccount {
     pub partition_hook: Option<PartitionHook>,
     /// Hook for `inventory_stream`. Default: empty stream.
     pub inventory_hook: Option<InventoryHook>,
+    /// Treat stored cursors as resumable inventory positions.
+    pub resume_inventory: bool,
     /// Hook for `changes_stream`. Default: empty stream.
     pub changes_hook: Option<ChangesHook>,
     /// Throttle keys `throttle_keys` declares for a scope drive. Default:
@@ -221,6 +227,8 @@ pub struct StubAccount {
     /// deletion resolves through that index - so a lifecycle deletion fired
     /// at an account that discovered no memberships silently deletes nothing.
     pub memberships: Vec<MembershipScope>,
+    /// Fail the next membership discovery; arm after attach when needed.
+    pub memberships_error: Mutex<Option<AccountError>>,
     /// Lifecycle events fired on demand, taken by the FIRST
     /// `scope_lifecycle_stream` call; later calls (a reopen re-subscribes)
     /// get an empty stream. Holding the sender keeps the stream open, which
@@ -244,6 +252,8 @@ pub struct StubAccount {
     /// When true, `close()` answers a classified transport error instead of
     /// `Ok`. Distinct from `close_gate`: a refusal, not a hang.
     pub close_fails: bool,
+    /// Optional classified close error instead of the default transport error.
+    pub close_error: Option<AccountError>,
     /// When set, `inventory_stream` yields whatever `inventory_hook` produced
     /// and then PARKS on this `Notify` before ending; `notify_waiters` lets the
     /// stream finish.
@@ -303,6 +313,8 @@ pub struct StubAccount {
     /// many times it is retried. Lets a test make some subscriptions refuse and
     /// others succeed within one reopen. Default empty.
     pub push_unsubscribe_refused: Vec<String>,
+    /// Classified teardown failures chosen per handle, after logging the call.
+    pub unsubscribe_error_hook: Option<UnsubscribeErrorHook>,
     /// A provider that errors on a handle it no longer knows: a successful
     /// `push_unsubscribe` remembers the handle, and a second call for it fails
     /// with [`push_teardown_refused`]. Default false.
@@ -426,10 +438,12 @@ impl StubAccount {
             partitioning: InventoryPartitioning::Full,
             partition_hook: None,
             inventory_hook: None,
+            resume_inventory: false,
             changes_hook: None,
             scope_keys: None,
             repair_hook: None,
             memberships: Vec::new(),
+            memberships_error: Mutex::new(None),
             lifecycle_rx: Mutex::new(None),
             walked: Arc::new(Mutex::new(Vec::new())),
             established: Arc::new(Mutex::new(Vec::new())),
@@ -437,6 +451,7 @@ impl StubAccount {
             close_returned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             close_gate: None,
             close_fails: false,
+            close_error: None,
             inventory_stall: None,
             inventory_stall_probe: None,
             memberships_stall: Mutex::new(None),
@@ -447,6 +462,7 @@ impl StubAccount {
             push_log: Arc::new(PushLog::default()),
             push_unsubscribe_failures: std::sync::atomic::AtomicUsize::new(0),
             push_unsubscribe_refused: Vec::new(),
+            unsubscribe_error_hook: None,
             push_unsubscribe_strict: false,
             push_deleted: Mutex::new(Vec::new()),
             push_subscribe_park: Mutex::new(None),
@@ -540,6 +556,14 @@ impl Account for StubAccount {
     }
 
     fn discover_memberships(&self) -> AccountStream<SyncEvent<MembershipScope>> {
+        if let Some(error) = self
+            .memberships_error
+            .lock()
+            .expect("memberships error lock")
+            .take()
+        {
+            return Box::pin(stream::iter(vec![SyncEvent::Terminated(error)]));
+        }
         let items: Vec<SyncEvent<MembershipScope>> = if self.memberships.is_empty() {
             Vec::new()
         } else {
@@ -578,6 +602,18 @@ impl Account for StubAccount {
             })),
             None => Box::pin(stream::empty()),
         }
+    }
+
+    fn is_inventory_cursor(&self, _: &ChangeCursor) -> bool {
+        self.resume_inventory
+    }
+
+    fn inventory_resume_stream(
+        &self,
+        cursor: ChangeCursor,
+    ) -> Option<AccountStream<InventoryEvent>> {
+        self.resume_inventory
+            .then(|| self.inventory_stream(cursor.scope))
     }
 
     fn establish_initial_cursor(
@@ -728,6 +764,10 @@ impl Account for StubAccount {
             .lock()
             .expect("push log lock")
             .push((self.push_label.clone(), handle.clone()));
+        let scripted_error = self
+            .unsubscribe_error_hook
+            .as_ref()
+            .and_then(|hook| hook(&handle));
         let counted = self
             .push_unsubscribe_failures
             .try_update(
@@ -739,7 +779,7 @@ impl Account for StubAccount {
         let refused = self.push_unsubscribe_refused.contains(&handle.0);
         let mut deleted = self.push_deleted.lock().expect("push deleted lock");
         let unknown = self.push_unsubscribe_strict && deleted.contains(&handle.0);
-        let fail = counted || refused || unknown;
+        let fail = scripted_error.is_some() || counted || refused || unknown;
         if !fail {
             deleted.push(handle.0);
         }
@@ -753,7 +793,9 @@ impl Account for StubAccount {
             if let Some(gate) = park {
                 gate.notified().await;
             }
-            if fail {
+            if let Some(error) = scripted_error {
+                Err(error)
+            } else if fail {
                 Err(push_teardown_refused())
             } else {
                 Ok(())
@@ -812,13 +854,20 @@ impl Account for StubAccount {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let gate = self.close_gate.clone();
         let fails = self.close_fails;
+        let error = self.close_error.clone();
         let returned = Arc::clone(&self.close_returned);
         Box::pin(async move {
             if let Some(gate) = gate {
                 gate.notified().await;
             }
             returned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if fails { Err(close_refused()) } else { Ok(()) }
+            if let Some(error) = error {
+                Err(error)
+            } else if fails {
+                Err(close_refused())
+            } else {
+                Ok(())
+            }
         })
     }
 

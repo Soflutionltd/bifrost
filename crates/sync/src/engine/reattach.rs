@@ -116,13 +116,13 @@ pub(crate) async fn handle_account_error(
             // `unsubscribe_push` - which needs the same lock - hang for
             // the entire pause, so push teardown was unavailable exactly
             // when a consumer was trying to detach cleanly. The lock it
-            // does need is taken inside `open_replacement`, spanning only
-            // the open and the swap. Reintroducing an acquisition here
-            // deadlocks against that one rather than silently regressing.
+            // does need is taken in `restart_account`'s admitted open loop,
+            // spanning only the open and the swap. Reintroducing an acquisition
+            // here deadlocks against that one rather than silently regressing.
             //
             // `DowngradeStrategy` restarts the account too, so the same
             // holds: taking the lock here made its `restart_account` wait
-            // forever on `open_replacement`'s acquisition of this very
+            // forever on the restart loop's acquisition of this very
             // (non-reentrant) mutex, hanging recovery on the first strategy
             // downgrade. Its trailing scope restart takes the lock itself.
             let _reopen_guard = match directive {
@@ -491,6 +491,110 @@ pub(super) async fn sleep_unless_shutdown(delay: Duration, shutdown: &Cancellati
 const REOPEN_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const REOPEN_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 
+/// Pacing belongs to the entire repair, including discarded replacements.
+#[derive(Default)]
+struct RepairPacing {
+    local_deadline: Option<tokio::time::Instant>,
+    // A failed replacement is closed before its retry; preserve its declaration
+    // until the next open, when there is no replacement left to ask.
+    failed_keys: Vec<bifrost_types::ThrottleKey>,
+    waited: Duration,
+    exhausted: bool,
+    observed: bool,
+}
+
+impl RepairPacing {
+    fn exhaust_wait_budget(&mut self) -> Error {
+        self.waited = REOPEN_BACKOFF_CAP;
+        self.exhausted = true;
+        Error::EstablishCursorFailed("recovery wait budget exhausted".into())
+    }
+
+    fn observe(&mut self, ctx: &RecoveryContext<'_>, error: &AccountError) {
+        self.observed = true;
+        self.record_holds(ctx, error);
+    }
+
+    // Cleanup evidence must not suppress recording the original returned error.
+    fn record_holds(&mut self, ctx: &RecoveryContext<'_>, error: &AccountError) {
+        let deadline =
+            crate::recovery::record_repair_throttle(ctx.throttles, ctx.account_id, error);
+        self.local_deadline = self.local_deadline.max(deadline);
+    }
+
+    fn pending_wait(
+        &self,
+        ctx: &RecoveryContext<'_>,
+        account: Option<&dyn Account>,
+        scope: Option<&CursorScope>,
+    ) -> Duration {
+        let mut keys = if account.is_none() {
+            self.failed_keys.clone()
+        } else {
+            Vec::new()
+        };
+        if let (Some(account), Some(scope)) = (account, scope) {
+            keys.extend(crate::recovery::declared_keys(
+                account,
+                ctx.account_id,
+                bifrost_types::ThrottleWork::Scope(scope),
+            ));
+        }
+        let local = self
+            .local_deadline
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or_default();
+        let shared = crate::recovery::throttle_wait(ctx.throttles, ctx.account_id, &keys)
+            .unwrap_or_default();
+        local.max(shared)
+    }
+
+    async fn wait(
+        &mut self,
+        ctx: &RecoveryContext<'_>,
+        account: Option<&dyn Account>,
+        scope: Option<&CursorScope>,
+    ) -> Result<(), Error> {
+        loop {
+            if ctx.shutdown.is_cancelled() {
+                return Err(Error::ShuttingDown);
+            }
+            let now = tokio::time::Instant::now();
+            let wait = self.pending_wait(ctx, account, scope);
+            if wait.is_zero() {
+                return Ok(());
+            }
+            let remaining = REOPEN_BACKOFF_CAP.saturating_sub(self.waited);
+            tokio::select! {
+                biased;
+                () = ctx.shutdown.cancelled() => return Err(Error::ShuttingDown),
+                // Prefer expiry even if late polling made both timers ready.
+                // A hold ending exactly at the allowance is still admissible.
+                () = tokio::time::sleep(remaining), if wait > remaining => {
+                    return Err(self.exhaust_wait_budget());
+                }
+                () = tokio::time::sleep(wait) => {
+                    if now.elapsed() > remaining {
+                        return Err(self.exhaust_wait_budget());
+                    }
+                    self.waited = self.waited.saturating_add(now.elapsed());
+                }
+            }
+        }
+    }
+}
+
+fn warn_wait_budget(ctx: &RecoveryContext<'_>, scope: CursorScope) {
+    broadcast_warning(
+        ctx.changes_tx,
+        Some(scope),
+        bifrost_types::Warning::user_safe(
+            bifrost_types::WarningKind::OperatorAttentionNeeded,
+            "recovery wait budget exhausted",
+        ),
+    );
+}
+
 /// Restart a single scope with exponential backoff and a retry budget.
 /// After three consecutive re-establishment failures the scope is
 /// abandoned, a `SyncEvent::Terminated(last_error)` is broadcast for
@@ -606,8 +710,9 @@ async fn re_establish_scope_with_backoff(
 ) {
     let mut delay = REOPEN_BACKOFF_INITIAL;
     let mut last_account_error: Option<AccountError> = None;
+    let mut pacing = RepairPacing::default();
     for attempt in 0..REOPEN_RETRY_BUDGET {
-        if attempt > 0 {
+        if attempt > 0 && pacing.local_deadline.is_none() {
             let sleep_for = jittered(delay);
             if !sleep_unless_shutdown(sleep_for, ctx.shutdown).await {
                 return;
@@ -628,11 +733,16 @@ async fn re_establish_scope_with_backoff(
             true,
             ctx.shutdown,
             None,
+            ctx,
+            &mut pacing,
         )
         .await
         {
             Ok(_) => {
                 if let Err(err) = link_discovered_memberships(acc, ctx.cursors).await {
+                    if let Error::Account(error) = &err {
+                        pacing.observe(ctx, error);
+                    }
                     tracing::warn!(
                         target: "bifrost.sync.changes",
                         account = ?ctx.account_id,
@@ -675,6 +785,10 @@ async fn re_establish_scope_with_backoff(
                         last_account_error = Some(err);
                     }
                 }
+            }
+            Err(_) if pacing.exhausted => {
+                warn_wait_budget(ctx, scope);
+                return;
             }
             Err(err) => {
                 tracing::warn!(
@@ -741,11 +855,13 @@ async fn unwind_replacement_subscriptions(
     ctx: &RecoveryContext<'_>,
     next: &dyn Account,
     replacements: &mut ReattachGuard,
+    pacing: &mut RepairPacing,
 ) {
     while let Some(front) = replacements.live.first() {
         let result = next.push_unsubscribe(front.handle.clone()).await;
         let replacement = replacements.live.remove(0);
         if let Err(cleanup) = result {
+            pacing.record_holds(ctx, &cleanup);
             tracing::warn!(
                 target: "bifrost.sync.reopen",
                 account = ?ctx.account_id,
@@ -776,7 +892,7 @@ async fn unwind_replacement_subscriptions(
 /// persisted provisionally.
 ///
 /// The guard is armed at CONSTRUCTION, never inside an async body a poll late:
-/// `open_replacement` builds it in the same synchronous step that receives the
+/// `open_replacement_admitted` builds it synchronously on receiving the
 /// replacement from the factory, and it travels with the replacement into
 /// `reattach_account`, so there is no interval, a drop before that function's
 /// first poll included, in which a live replacement is owned only by a local. It
@@ -1174,14 +1290,11 @@ pub(super) enum ReplacementOpen {
 /// guard is returned so the caller can hand it to `reattach_account` and keep
 /// the whole reopen inside one activity registration.
 ///
-/// This is also the ONLY place the reopen serialization lock is taken for
-/// an open/swap, and the guard leaves only inside the returned tuple. That
-/// is deliberate structure, not style: callers all wait for the boundary to
-/// read `Run` before they get here, and a caller that took the lock itself
-/// would hold it across that unbounded wait - which is exactly how
-/// `unsubscribe_push` came to hang for the whole duration of a pause. With
-/// acquisition owned here, holding the lock across a pause wait is not
-/// something a caller can express.
+/// This consumer-driven path acquires the reopen lock after admission.
+/// `restart_account` acquires it in its pacing loop instead, so a hold that
+/// lands during acquisition releases both guards before waiting. Both paths
+/// hand the guards to `open_replacement_admitted` for the open and swap;
+/// neither holds the lock while waiting for a paused account to resume.
 pub(super) async fn open_replacement(
     ctx: &RecoveryContext<'_>,
 ) -> Result<(OwnedMutexGuard<()>, SyncActivityGuard, Replacement), ReplacementOpen> {
@@ -1190,6 +1303,14 @@ pub(super) async fn open_replacement(
         .begin_activity()
         .ok_or(ReplacementOpen::Paused)?;
     let reopen_guard = Arc::clone(ctx.reopen_lock).lock_owned().await;
+    open_replacement_admitted(ctx, reopen_guard, activity).await
+}
+
+async fn open_replacement_admitted(
+    ctx: &RecoveryContext<'_>,
+    reopen_guard: OwnedMutexGuard<()>,
+    activity: SyncActivityGuard,
+) -> Result<(OwnedMutexGuard<()>, SyncActivityGuard, Replacement), ReplacementOpen> {
     // Detach does not wait for consumer-driven activity, so nothing excludes a
     // `SyncEngine::reattach` that registered its activity just before detach
     // flipped the boundary to `Stop`. The slot's shutdown token is the one
@@ -1249,14 +1370,27 @@ pub(super) struct Replacement {
     skipped_scopes: Vec<SkippedScope>,
 }
 
-/// Swap in a replacement connection. `activity` is the registration taken by
-/// `open_replacement` before the connection was opened; holding it here keeps
+/// Swap in a replacement connection. `activity` is the registration taken
+/// before the connection was opened; holding it here keeps
 /// the open and the swap inside one uninterrupted non-quiescent window.
 pub(super) async fn reattach_account(
     ctx: &RecoveryContext<'_>,
     activity: SyncActivityGuard,
     replacement: Replacement,
 ) -> Result<(), Error> {
+    reattach_account_paced(ctx, activity, replacement, &mut RepairPacing::default()).await
+}
+
+async fn reattach_account_paced(
+    ctx: &RecoveryContext<'_>,
+    activity: SyncActivityGuard,
+    replacement: Replacement,
+    pacing: &mut RepairPacing,
+) -> Result<(), Error> {
+    pacing.local_deadline = None;
+    pacing.failed_keys.clear();
+    pacing.observed = false;
+    let admitted = ctx.control.admitted_by(&activity);
     let _activity = activity;
     let Replacement {
         mut guard,
@@ -1303,11 +1437,13 @@ pub(super) async fn reattach_account(
                 Arc::clone(&staged),
                 ctx.writer,
                 Arc::clone(ctx.delivery),
-                None,
+                Some(&admitted),
                 Arc::clone(ctx.coverage),
                 false,
                 ctx.shutdown,
                 Some(guard.attempt),
+                ctx,
+                pacing,
             )
             .await
             {
@@ -1330,6 +1466,8 @@ pub(super) async fn reattach_account(
             }
         }
 
+        pacing.observed = false;
+        pacing.failed_keys.clear();
         link_discovered_memberships(next.as_ref(), &staged).await?;
 
         let discovered_set: HashSet<_> = discovered.iter().cloned().collect();
@@ -1385,7 +1523,8 @@ pub(super) async fn reattach_account(
                     }
                 }
                 Err(error) => {
-                    unwind_replacement_subscriptions(ctx, next.as_ref(), &mut guard).await;
+                    pacing.observe(ctx, &error);
+                    unwind_replacement_subscriptions(ctx, next.as_ref(), &mut guard, pacing).await;
                     return Err(Error::Account(error));
                 }
             }
@@ -1425,7 +1564,7 @@ pub(super) async fn reattach_account(
         .await;
         if let Err(error) = durable_result {
             rollback_reattach_inserts(ctx, &mut guard).await;
-            unwind_replacement_subscriptions(ctx, next.as_ref(), &mut guard).await;
+            unwind_replacement_subscriptions(ctx, next.as_ref(), &mut guard, pacing).await;
             return Err(error);
         }
 
@@ -1478,6 +1617,9 @@ pub(super) async fn reattach_account(
             // account's `close()`). `unsubscribe_push` retries on the same
             // terms.
             let teardown = previous.push_unsubscribe(record.handle.clone()).await;
+            if let Err(error) = &teardown {
+                pacing.observe(ctx, error);
+            }
             match teardown {
                 Ok(()) => {
                     // Recorded immediately, with no await between the delete
@@ -1524,7 +1666,7 @@ pub(super) async fn reattach_account(
             // server-side subscriptions, so any handle whose teardown did not
             // succeed stays in the registry - on whichever side it was
             // created - and is retried later.
-            unwind_replacement_subscriptions(ctx, next.as_ref(), &mut guard).await;
+            unwind_replacement_subscriptions(ctx, next.as_ref(), &mut guard, pacing).await;
             rollback_reattach_inserts(ctx, &mut guard).await;
             return Err(Error::Account(error));
         }
@@ -1642,12 +1784,13 @@ pub(super) async fn reattach_account(
                  subscriptions, which no registry entry can hold"
             );
         }
-        unwind_replacement_subscriptions(ctx, next.as_ref(), &mut guard).await;
+        unwind_replacement_subscriptions(ctx, next.as_ref(), &mut guard, pacing).await;
 
         // Through the guard, which owes this close until it returns: a drop
         // parked here (or before it) closes the old connection instead of
         // leaking it.
         if let Err(error) = guard.close_owed().await {
+            pacing.record_holds(ctx, &error);
             tracing::warn!(
                 target: "bifrost.sync.reopen",
                 account = ?ctx.account_id,
@@ -1659,9 +1802,16 @@ pub(super) async fn reattach_account(
     }
     .await;
 
+    if let Err(Error::Account(error) | Error::EstablishCursorTerminated(error)) = &result {
+        // Establishment has already captured its deadline before rollback.
+        if !pacing.observed {
+            pacing.observe(ctx, error);
+        }
+    }
     if result.is_err()
         && let Err(error) = guard.close_owed().await
     {
+        pacing.record_holds(ctx, &error);
         tracing::warn!(
             target: "bifrost.sync.reopen",
             account = ?ctx.account_id,
@@ -1696,21 +1846,53 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
     let mut delay = REOPEN_BACKOFF_INITIAL;
     let mut last_error: Option<AccountError> = None;
     let mut attempt = 0;
-    while attempt < REOPEN_RETRY_BUDGET {
+    let mut pacing = RepairPacing::default();
+    'restart: while attempt < REOPEN_RETRY_BUDGET {
         // A consumer pause is a quiescence boundary. Keep this recovery
         // request queued until resume instead of opening a replacement while
         // the account has promised to be idle.
         if !ctx.control.wait_until_running(ctx.shutdown).await {
             return false;
         }
-        if attempt > 0 {
+        if attempt > 0 && pacing.local_deadline.is_none() {
             let sleep_for = jittered(delay);
             if !sleep_unless_shutdown(sleep_for, ctx.shutdown).await {
                 return false;
             }
             delay = (delay.saturating_mul(2)).min(REOPEN_BACKOFF_CAP);
         }
-        match open_replacement(ctx).await {
+        if pacing.wait(ctx, None, None).await.is_err() {
+            if pacing.exhausted {
+                warn_wait_budget(ctx, CursorScope::Account);
+                engine_pause(ctx, PauseReason::RetryBudgetExhausted);
+            }
+            return false;
+        }
+        let (reopen_guard, activity) = loop {
+            let Some(activity) = ctx.control.begin_activity() else {
+                continue 'restart;
+            };
+            let reopen_guard = Arc::clone(ctx.reopen_lock).lock_owned().await;
+            if pacing.pending_wait(ctx, None, None).is_zero() {
+                break (reopen_guard, activity);
+            }
+            // A hold landed while lock acquisition was pending. Neither the
+            // serialization lock nor an activity may be carried across it.
+            drop(reopen_guard);
+            drop(activity);
+            if pacing.wait(ctx, None, None).await.is_err() {
+                if pacing.exhausted {
+                    warn_wait_budget(ctx, CursorScope::Account);
+                    engine_pause(ctx, PauseReason::RetryBudgetExhausted);
+                }
+                return false;
+            }
+        };
+        // The previous attempt's holds have been paid. Failures from this
+        // open start a new local deadline set, including a hintless failure.
+        pacing.local_deadline = None;
+        pacing.observed = false;
+        match open_replacement_admitted(ctx, reopen_guard, activity).await {
             // A pause won the race between the wait above and the activity
             // registration, and nothing was opened. Loop back through the
             // boundary wait instead of spending an attempt on it.
@@ -1719,7 +1901,7 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
             // replacement (if one was opened at all) has already been closed.
             Err(ReplacementOpen::Detached) => return false,
             Ok((_reopen_guard, activity, next)) => {
-                match reattach_account(ctx, activity, next).await {
+                match reattach_account_paced(ctx, activity, next, &mut pacing).await {
                     Ok(()) => return true,
                     Err(Error::Account(error) | Error::EstablishCursorTerminated(error)) => {
                         tracing::warn!(
@@ -1733,7 +1915,13 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
                         last_error = Some(error);
                         attempt = attempt.saturating_add(1);
                     }
+                    Err(_) if pacing.exhausted => {
+                        warn_wait_budget(ctx, CursorScope::Account);
+                        engine_pause(ctx, PauseReason::RetryBudgetExhausted);
+                        return false;
+                    }
                     Err(error) => {
+                        pacing.local_deadline = None;
                         tracing::warn!(
                             target: "bifrost.sync.changes",
                             account = ?ctx.account_id,
@@ -1758,6 +1946,8 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
                     message_key = err.message_key(),
                     "RestartAccount: factory.open failed"
                 );
+                pacing.failed_keys.clear();
+                pacing.observe(ctx, &err);
                 last_error = Some(err);
                 attempt = attempt.saturating_add(1);
             }
@@ -1808,7 +1998,7 @@ pub(super) fn log_open_skips(account_id: &AccountId, skips: &[SkippedScope], pha
 }
 
 pub(super) fn jittered(base: Duration) -> Duration {
-    // ±20% jitter to break thundering-herd reopen lockstep. Entropy
+    // +/-20% jitter to break thundering-herd reopen lockstep. Entropy
     // comes from the workspace UUID RNG (the same source bifrost-net's
     // backoff uses) rather than `SystemTime::now()`: a wall-clock jump
     // or low-resolution clock must not influence the jitter, and a
@@ -1891,25 +2081,97 @@ async fn run_establish(
     persist_ready: bool,
     shutdown: &CancellationToken,
     reattach_attempt: Option<u64>,
+    ctx: &RecoveryContext<'_>,
+    pacing: &mut RepairPacing,
 ) -> Result<EstablishOrigin, Error> {
-    let _activity = match control {
-        Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
-        None => None,
-    };
-    // Only a reattach passes an attempt. Its resume read claims a still
-    // provisional row through the writer; every other caller reads without
-    // claiming.
-    match writer
-        .get_change_cursor(scope.clone(), reattach_attempt)
-        .await
-    {
-        Ok(Some(existing)) if existing.validate_envelope().is_ok() => {
-            // A stored cursor may be a mid-inventory page position rather
-            // than a live changes cursor. Putting one into the registry
-            // would hand it straight to `changes_stream`, which has no
-            // delta link to walk. Finish the inventory instead - the same
-            // decision `establish_initial_cursor` makes at open.
-            if account.is_inventory_cursor(&existing) {
+    pacing.wait(ctx, Some(account), Some(&scope)).await?;
+    pacing.failed_keys = crate::recovery::declared_keys(
+        account,
+        account_id,
+        bifrost_types::ThrottleWork::Scope(&scope),
+    );
+    pacing.local_deadline = None;
+    let result = async {
+        let _activity = match control {
+            Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
+            None => None,
+        };
+        // Only a reattach passes an attempt. Its resume read claims a still
+        // provisional row through the writer; every other caller reads without
+        // claiming.
+        match writer
+            .get_change_cursor(scope.clone(), reattach_attempt)
+            .await
+        {
+            Ok(Some(existing)) if existing.validate_envelope().is_ok() => {
+                // A stored cursor may be a mid-inventory page position rather
+                // than a live changes cursor. Putting one into the registry
+                // would hand it straight to `changes_stream`, which has no
+                // delta link to walk. Finish the inventory instead - the same
+                // decision `establish_initial_cursor` makes at open.
+                if account.is_inventory_cursor(&existing) {
+                    pacing.wait(ctx, Some(account), Some(&scope)).await?;
+                    let fusion = crate::multiplexer::InventoryFusion {
+                        account_id: account_id.clone(),
+                        cursors: Arc::clone(&cursors),
+                        control: control.cloned(),
+                        coverage: Some(Arc::clone(&coverage)),
+                        writer_tx: Some(writer.sender()),
+                        generation: coverage.next_generation(),
+                        shutdown: Some(shutdown.clone()),
+                    };
+                    return match fusion
+                        .run_resume_with_broadcast(account, existing, Some(delivery))
+                        .await?
+                    {
+                        crate::multiplexer::FusionOutcome::Established
+                        | crate::multiplexer::FusionOutcome::NoCursor => {
+                            Ok(EstablishOrigin::ResumedStored)
+                        }
+                        crate::multiplexer::FusionOutcome::Terminated(error) => {
+                            Err(Error::EstablishCursorTerminated(error))
+                        }
+                    };
+                }
+                cursors.put(existing);
+                return Ok(EstablishOrigin::ResumedStored);
+            }
+            Ok(None) => {}
+            // Unlike `establish_one`, this path runs with a live reopen
+            // listener, so an undecodable envelope is reported as a typed
+            // error whose derived `RecoveryClass` is
+            // `Engine(SchemaIncompatible)` and the listener runs the
+            // account-wide schema-clear loop.
+            Ok(Some(_)) | Err(Error::SchemaIncompatible) => {
+                return Err(Error::Account(crate::recovery::cursor_decode_failure(
+                    bifrost_types::AccountOperation::EstablishCursor,
+                )));
+            }
+            Err(other) => return Err(other),
+        }
+        // The writer may have parked while another lane recorded a hold.
+        pacing.wait(ctx, Some(account), Some(&scope)).await?;
+        match account
+            .establish_initial_cursor(scope.clone())
+            .await
+            .map_err(Error::Account)?
+        {
+            CursorEstablishment::Ready(cursor) => {
+                cursor.validate_envelope().map_err(|_| {
+                    Error::Account(crate::recovery::cursor_decode_failure(
+                        bifrost_types::AccountOperation::EstablishCursor,
+                    ))
+                })?;
+                if persist_ready {
+                    // No coverage report: preserve the ledger rather than
+                    // asserting completeness a cursor establishment never proved.
+                    writer.persist_established(cursor.clone()).await?;
+                }
+                cursors.put(cursor);
+                Ok(EstablishOrigin::CreatedFresh)
+            }
+            CursorEstablishment::EstablishViaInventory => {
+                pacing.wait(ctx, Some(account), Some(&scope)).await?;
                 let fusion = crate::multiplexer::InventoryFusion {
                     account_id: account_id.clone(),
                     cursors: Arc::clone(&cursors),
@@ -1919,77 +2181,31 @@ async fn run_establish(
                     generation: coverage.next_generation(),
                     shutdown: Some(shutdown.clone()),
                 };
-                return match fusion
-                    .run_resume_with_broadcast(account, existing, Some(delivery))
+                match fusion
+                    .run_with_broadcast(account, scope, Some(delivery))
                     .await?
                 {
                     crate::multiplexer::FusionOutcome::Established
                     | crate::multiplexer::FusionOutcome::NoCursor => {
-                        Ok(EstablishOrigin::ResumedStored)
+                        Ok(EstablishOrigin::CreatedFresh)
                     }
                     crate::multiplexer::FusionOutcome::Terminated(error) => {
                         Err(Error::EstablishCursorTerminated(error))
                     }
-                };
-            }
-            cursors.put(existing);
-            return Ok(EstablishOrigin::ResumedStored);
-        }
-        Ok(None) => {}
-        // Unlike `establish_one`, this path runs with a live reopen
-        // listener, so an undecodable envelope is reported as a typed
-        // error whose derived `RecoveryClass` is
-        // `Engine(SchemaIncompatible)` and the listener runs the
-        // account-wide schema-clear loop.
-        Ok(Some(_)) | Err(Error::SchemaIncompatible) => {
-            return Err(Error::Account(crate::recovery::cursor_decode_failure(
-                bifrost_types::AccountOperation::EstablishCursor,
-            )));
-        }
-        Err(other) => return Err(other),
-    }
-    match account
-        .establish_initial_cursor(scope.clone())
-        .await
-        .map_err(Error::Account)?
-    {
-        CursorEstablishment::Ready(cursor) => {
-            cursor.validate_envelope().map_err(|_| {
-                Error::Account(crate::recovery::cursor_decode_failure(
-                    bifrost_types::AccountOperation::EstablishCursor,
-                ))
-            })?;
-            if persist_ready {
-                // No coverage report: preserve the ledger rather than
-                // asserting completeness a cursor establishment never proved.
-                writer.persist_established(cursor.clone()).await?;
-            }
-            cursors.put(cursor);
-            Ok(EstablishOrigin::CreatedFresh)
-        }
-        CursorEstablishment::EstablishViaInventory => {
-            let fusion = crate::multiplexer::InventoryFusion {
-                account_id: account_id.clone(),
-                cursors: Arc::clone(&cursors),
-                control: control.cloned(),
-                coverage: Some(Arc::clone(&coverage)),
-                writer_tx: Some(writer.sender()),
-                generation: coverage.next_generation(),
-                shutdown: Some(shutdown.clone()),
-            };
-            match fusion
-                .run_with_broadcast(account, scope, Some(delivery))
-                .await?
-            {
-                crate::multiplexer::FusionOutcome::Established
-                | crate::multiplexer::FusionOutcome::NoCursor => Ok(EstablishOrigin::CreatedFresh),
-                crate::multiplexer::FusionOutcome::Terminated(error) => {
-                    Err(Error::EstablishCursorTerminated(error))
                 }
             }
+            _ => Err(Error::EstablishCursorFailed(
+                "unknown CursorEstablishment variant".into(),
+            )),
         }
-        _ => Err(Error::EstablishCursorFailed(
-            "unknown CursorEstablishment variant".into(),
-        )),
     }
+    .await;
+    if let Err(Error::Account(error) | Error::EstablishCursorTerminated(error)) = &result {
+        pacing.observe(ctx, error);
+    }
+    result
 }
+
+#[cfg(test)]
+#[path = "reattach_tests.rs"]
+mod recovery_establishment_tests;

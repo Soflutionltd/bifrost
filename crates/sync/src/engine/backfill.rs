@@ -120,247 +120,275 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             if !cursors.all_scope_incarnations().contains(&incarnation_key) {
                 continue;
             }
-            // A hold on THIS scope alone (a mailbox budget the account declares
-            // for it) defers the scope and lets the scan move on to the next
-            // one: walks run one after another, so sleeping it out here would
-            // stall every later scope's cold start behind one mailbox. An
-            // ACCOUNT-WIDE hold blocks every scope equally and is slept out
-            // here, inline. A hold that lands
-            // between two partitions of a walk already under way is also
-            // waited out inline there: the walk must finish against the same
-            // budget either way, and abandoning it would cost a re-walk.
-            //
-            // The account-wide hold is slept out FIRST, and the scope-local
-            // decision is taken after it: a short account hold overlapping a
-            // long mailbox hold would otherwise hand the scope to the partition
-            // runner's inline wait, which would then sit out the mailbox hold
-            // with every later scope behind it.
-            while let Some(wait) = crate::recovery::account_throttle_wait(&throttles, &account_id) {
-                tokio::select! {
-                    () = shutdown.cancelled() => return,
-                    () = tokio::time::sleep(wait) => {}
-                }
-            }
-            // That sleep is unbounded in the same way the subscriber wait is,
-            // so the incarnation is re-validated after it, and BEFORE the walk's
-            // fence is captured below: a scope reset during the sleep must not
-            // be adopted as this walk's own starting fence.
-            if !cursors.all_scope_incarnations().contains(&incarnation_key) {
-                continue;
-            }
-            let keys = crate::recovery::declared_keys(
-                account.load_full().as_ref().as_ref(),
-                &account_id,
-                bifrost_types::ThrottleWork::Scope(&scope),
-            );
-            if let Some(wait) = crate::recovery::throttle_wait(&throttles, &account_id, &keys) {
-                tracing::debug!(
-                    target: "bifrost.sync.backfill",
-                    account = ?account_id,
-                    scope = ?scope,
-                    wait_secs = wait.as_secs(),
-                    "backfill walk deferred by a throttle on this scope"
-                );
-                scan.defer_until(incarnation_key, tokio::time::Instant::now() + wait);
-                continue;
-            }
-            // What the walk has to beat: any page that reaches nobody bumps this,
-            // wherever it happens - the retire-on-sentinel-only path in the
-            // runner, or a receiver's departure sweep. Comparing two readings is
-            // the only honest way to ask "did EVERY page of this walk reach a
-            // consumer", which a subscriber count at the end cannot answer.
-            //
-            // Taken through the SCAN and taken HERE, as this walk begins: the
-            // scan owns the reading, so the settle cannot be recorded against a
-            // number nothing validated, and taking it now rather than when the
-            // batch was selected keeps a sweep during an earlier scope's walk
-            // from being charged to this one.
-            let undelivered_before = scan.begin_walk(&incarnation_key, &coverage);
-            // The incarnation this walk belongs to, snapshotted at its START.
-            // Carried all the way into the completion marker: a reset that closes
-            // anywhere inside the walk - including after its last page but before
-            // the provider's terminal `Done`, where the old stream simply finishes
-            // - must not be adopted as this walk's own. An emission-time snapshot
-            // reads the REPLACEMENT incarnation's fence, so the marker sails past
-            // both checks, is minted above the fence, acknowledges normally, and
-            // suppresses the replacement's whole inventory walk.
-            let fence_at_walk_start = coverage.scope_fence(&scope);
-            let barrier_admission = tokio::select! {
-                () = shutdown.cancelled() => return,
-                permit = scheduler.admit(
-                    account_id.clone(),
-                    control.priority_snapshot(),
-                    crate::scheduler::WorkKind::Sync,
-                ) => match permit {
-                    Ok(permit) => permit,
-                    Err(error) => {
-                        tracing::warn!(target: "bifrost.sync.scheduler", %error, "backfill admission failed");
-                        scan.record_attempt(incarnation_key, false);
-                        continue;
+            let parked = scan.parked.remove(&incarnation_key);
+            let (
+                mut driver,
+                mut pending_partition,
+                undelivered_before,
+                fence_at_walk_start,
+                labels,
+            ) = if let Some(parked) = parked {
+                if coverage.undelivered_watermark(&scope) != parked.undelivered_before {
+                    scan.note_lost_pages(incarnation_key.clone());
+                    registry.mark(account_id.clone(), scope.clone(), BackfillState::Pending);
+                    if discard_backfill_progress(&writer_tx, &account_id, &scope).await {
+                        coverage.take_backfill_discard(&scope);
                     }
-                },
-            };
-            if scope_barrier_blocked(&writer_tx, scope.clone()).await {
-                tracing::debug!(
-                    target: "bifrost.sync.backfill",
-                    account = ?account_id,
-                    scope = ?scope,
-                    "backfill parked at operator-blocked barrier"
-                );
-                // Record the park as an attempt so the incarnation rejoins
-                // the exponential rescan delay. Skipping this leaves the
-                // scope's `failed` deadline in the past, so the 1s rescan
-                // tick re-asks the single account writer about the same
-                // blocked scope every second for as long as the operator
-                // leaves the block in place - and the writer is the task
-                // that also owns every durable mutation. `select` already
-                // withholds a scope until its delay elapses, so reusing it
-                // here parks the query on the same 5s-to-5min ramp the walk
-                // itself would have used.
-                scan.record_attempt(incarnation_key, false);
-                continue;
-            }
-            drop(barrier_admission);
-            let acc_arc = account.load_full();
-            let acc: &dyn Account = acc_arc.as_ref().as_ref();
-            // Both plan shapes drive the same `ScopeWalkDriver`, so the
-            // only thing that differs between them is how the durable
-            // checkpoint is turned into a starting driver: a fixed plan
-            // has no positional "resume from here" (its partitions are a
-            // known finite set), so its durable signal is binary, while an
-            // open-ended page walk resumes at the furthest acked window.
-            // `BackfillPlan::resume` is where that difference lives; the
-            // walk below is shared, which is what keeps the two shapes
-            // from drifting apart on barrier handling, completion-marker
-            // withholding, or registry bookkeeping.
-            let plan = backfill_plan_for(acc, &scope, config);
-            let labels = plan.labels();
-            // A PRIOR attempt on this incarnation that lost pages disqualifies
-            // the stored checkpoint as a resume position, and only for a
-            // positional plan does that matter - but it matters a lot there. The
-            // pages the departed consumer never received sit BEHIND the windows
-            // the replacement did receive and acknowledge, so resuming after the
-            // furthest acked window walks past the hole, hits its empty end
-            // probe, and settles the incarnation having never re-offered the
-            // lost pages to anybody. The retry has to start where the walk is
-            // known whole, which is the walk's own beginning; `walk_from_scratch`
-            // is exactly that answer, already defined as the no-checkpoint case.
-            // Re-emitting acknowledged pages is idempotent, so the cost is
-            // re-work, not correctness.
-            let restart_whole = scan.restarts_from_scratch(&incarnation_key);
-            if restart_whole {
-                // Drop the previous attempt's durable footprint BEFORE walking,
-                // not only when the loss was noticed. The ack-time refusal
-                // repairs memory, but it cannot always repair the store: a loss
-                // that lands AFTER the marker's acknowledgement leaves that
-                // marker durable, and a detach before this retry lands its own
-                // would let the next attach read the stale marker back and answer
-                // `Skip` - the lost pages never re-offered, for good. Idempotent,
-                // and safe to fence here precisely because the retry has minted
-                // no ids yet. It also SETTLES this scope's outstanding request -
-                // but only once the writer has ACCEPTED it, or an abort at
-                // `detach_timeout` between the two loses the request with nothing
-                // left for teardown to drain.
-                if discard_backfill_progress(&writer_tx, &account_id, &scope).await {
-                    coverage.take_backfill_discard(&scope);
+                    scan.record_attempt(incarnation_key, false);
+                    continue;
                 }
-            }
-            // The stored checkpoint is read only when it can decide anything. A
-            // restart-from-scratch has already ruled it out as a resume position,
-            // so reading it costs a store round trip whose answer is discarded -
-            // and its failure logged "resume read failed" for a walk that was
-            // starting over either way, which reads as a degrade where nothing
-            // degraded.
-            let resume = if restart_whole {
-                tracing::debug!(
-                    target: "bifrost.sync.backfill",
-                    account = ?account_id,
-                    scope = ?scope,
-                    "a previous attempt on this incarnation lost pages; restarting the \
-                     walk from its beginning rather than resuming past them"
-                );
-                plan.walk_from_scratch()
+                (
+                    parked.driver,
+                    Some(parked.pending),
+                    parked.undelivered_before,
+                    parked.fence_at_walk_start,
+                    parked.labels,
+                )
             } else {
-                match store.get_backfill(&account_id, &scope).await {
-                    Ok(stored) => plan.resume(stored.as_ref()),
-                    Err(err) => {
-                        // A read failure is not authoritative; fall back to a
-                        // full walk rather than risk skipping unpersisted
-                        // pages.
-                        tracing::warn!(
-                            target: "bifrost.sync.backfill",
-                            scope = ?scope,
-                            error = %err,
-                            "{}", labels.resume_read_failed
-                        );
-                        plan.walk_from_scratch()
+                // A hold on THIS scope alone (a mailbox budget the account declares
+                // for it) defers the scope and lets the scan move on to the next
+                // one: walks run one after another, so sleeping it out here would
+                // stall every later scope's cold start behind one mailbox. An
+                // ACCOUNT-WIDE hold blocks every scope equally and is slept out
+                // here, inline. Later partitions retain their walk while deferred.
+                //
+                // The account-wide hold is slept out FIRST, and the scope-local
+                // decision is taken after it: a short account hold overlapping a
+                // long mailbox hold must still defer the scope once the account
+                // hold expires.
+                while let Some(wait) =
+                    crate::recovery::account_throttle_wait(&throttles, &account_id)
+                {
+                    tokio::select! {
+                        () = shutdown.cancelled() => return,
+                        () = tokio::time::sleep(wait) => {}
                     }
                 }
-            };
-            // Skip a scope whose backfill already reached a durable
-            // conclusion on a prior run. `get_backfill` only ever returns
-            // consumer-acked checkpoints, so this never skips a window the
-            // consumer has not durably persisted.
-            let ScopeResume::Walk(mut driver) = resume else {
-                registry.mark(account_id.clone(), scope.clone(), BackfillState::Completed);
-                scan.settled(incarnation_key);
-                continue;
-            };
-            // Re-check the scope-local hold now that the walk is about to
-            // START: admission, the barrier query and the checkpoint read
-            // above can all park, and a hold recorded meanwhile still finds
-            // no partition walked, so it defers the scope rather than letting
-            // the first partition sit it out with every later scope behind it.
-            // The resume decision is simply recomputed next time; the
-            // pre-walk discard above is idempotent.
-            while let Some(wait) = crate::recovery::account_throttle_wait(&throttles, &account_id) {
-                tokio::select! {
-                    () = shutdown.cancelled() => return,
-                    () = tokio::time::sleep(wait) => {}
+                // That sleep is unbounded in the same way the subscriber wait is,
+                // so the incarnation is re-validated after it, and BEFORE the walk's
+                // fence is captured below: a scope reset during the sleep must not
+                // be adopted as this walk's own starting fence.
+                if !cursors.all_scope_incarnations().contains(&incarnation_key) {
+                    continue;
                 }
-            }
-            // Asked of the current account, not the keys computed before
-            // admission, the barrier query and the checkpoint read: a reopen
-            // during those waits can change the declaration.
-            let walk_keys = crate::recovery::declared_keys(
-                account.load_full().as_ref().as_ref(),
-                &account_id,
-                bifrost_types::ThrottleWork::Scope(&scope),
-            );
-            if let Some(wait) = crate::recovery::throttle_wait(&throttles, &account_id, &walk_keys)
-            {
-                scan.defer_until(incarnation_key, tokio::time::Instant::now() + wait);
-                continue;
-            }
+                let keys = crate::recovery::declared_keys(
+                    account.load_full().as_ref().as_ref(),
+                    &account_id,
+                    bifrost_types::ThrottleWork::Scope(&scope),
+                );
+                if let Some(wait) = crate::recovery::throttle_wait(&throttles, &account_id, &keys) {
+                    tracing::debug!(
+                        target: "bifrost.sync.backfill",
+                        account = ?account_id,
+                        scope = ?scope,
+                        wait_secs = wait.as_secs(),
+                        "backfill walk deferred by a throttle on this scope"
+                    );
+                    scan.defer_until(incarnation_key, tokio::time::Instant::now() + wait);
+                    continue;
+                }
+                // What the walk has to beat: any page that reaches nobody bumps this,
+                // wherever it happens - the retire-on-sentinel-only path in the
+                // runner, or a receiver's departure sweep. Comparing two readings is
+                // the only honest way to ask "did EVERY page of this walk reach a
+                // consumer", which a subscriber count at the end cannot answer.
+                //
+                // Taken through the SCAN and taken HERE, as this walk begins: the
+                // scan owns the reading, so the settle cannot be recorded against a
+                // number nothing validated, and taking it now rather than when the
+                // batch was selected keeps a sweep during an earlier scope's walk
+                // from being charged to this one.
+                let undelivered_before = scan.begin_walk(&incarnation_key, &coverage);
+                // The incarnation this walk belongs to, snapshotted at its START.
+                // Carried all the way into the completion marker: a reset that closes
+                // anywhere inside the walk - including after its last page but before
+                // the provider's terminal `Done`, where the old stream simply finishes
+                // - must not be adopted as this walk's own. An emission-time snapshot
+                // reads the REPLACEMENT incarnation's fence, so the marker sails past
+                // both checks, is minted above the fence, acknowledges normally, and
+                // suppresses the replacement's whole inventory walk.
+                let fence_at_walk_start = coverage.scope_fence(&scope);
+                let barrier_admission = tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    permit = scheduler.admit(
+                        account_id.clone(),
+                        control.priority_snapshot(),
+                        crate::scheduler::WorkKind::Sync,
+                    ) => match permit {
+                        Ok(permit) => permit,
+                        Err(error) => {
+                            tracing::warn!(target: "bifrost.sync.scheduler", %error, "backfill admission failed");
+                            scan.record_attempt(incarnation_key, false);
+                            continue;
+                        }
+                    },
+                };
+                if scope_barrier_blocked(&writer_tx, scope.clone()).await {
+                    tracing::debug!(
+                        target: "bifrost.sync.backfill",
+                        account = ?account_id,
+                        scope = ?scope,
+                        "backfill parked at operator-blocked barrier"
+                    );
+                    // Record the park as an attempt so the incarnation rejoins
+                    // the exponential rescan delay. Skipping this leaves the
+                    // scope's `failed` deadline in the past, so the 1s rescan
+                    // tick re-asks the single account writer about the same
+                    // blocked scope every second for as long as the operator
+                    // leaves the block in place - and the writer is the task
+                    // that also owns every durable mutation. `select` already
+                    // withholds a scope until its delay elapses, so reusing it
+                    // here parks the query on the same 5s-to-5min ramp the walk
+                    // itself would have used.
+                    scan.record_attempt(incarnation_key, false);
+                    continue;
+                }
+                drop(barrier_admission);
+                let acc_arc = account.load_full();
+                let acc: &dyn Account = acc_arc.as_ref().as_ref();
+                // Both plan shapes drive the same `ScopeWalkDriver`, so the
+                // only thing that differs between them is how the durable
+                // checkpoint is turned into a starting driver: a fixed plan
+                // has no positional "resume from here" (its partitions are a
+                // known finite set), so its durable signal is binary, while an
+                // open-ended page walk resumes at the furthest acked window.
+                // `BackfillPlan::resume` is where that difference lives; the
+                // walk below is shared, which is what keeps the two shapes
+                // from drifting apart on barrier handling, completion-marker
+                // withholding, or registry bookkeeping.
+                let plan = backfill_plan_for(acc, &scope, config);
+                let labels = plan.labels();
+                // A PRIOR attempt on this incarnation that lost pages disqualifies
+                // the stored checkpoint as a resume position, and only for a
+                // positional plan does that matter - but it matters a lot there. The
+                // pages the departed consumer never received sit BEHIND the windows
+                // the replacement did receive and acknowledge, so resuming after the
+                // furthest acked window walks past the hole, hits its empty end
+                // probe, and settles the incarnation having never re-offered the
+                // lost pages to anybody. The retry has to start where the walk is
+                // known whole, which is the walk's own beginning; `walk_from_scratch`
+                // is exactly that answer, already defined as the no-checkpoint case.
+                // Re-emitting acknowledged pages is idempotent, so the cost is
+                // re-work, not correctness.
+                let restart_whole = scan.restarts_from_scratch(&incarnation_key);
+                if restart_whole {
+                    // Drop the previous attempt's durable footprint BEFORE walking,
+                    // not only when the loss was noticed. The ack-time refusal
+                    // repairs memory, but it cannot always repair the store: a loss
+                    // that lands AFTER the marker's acknowledgement leaves that
+                    // marker durable, and a detach before this retry lands its own
+                    // would let the next attach read the stale marker back and answer
+                    // `Skip` - the lost pages never re-offered, for good. Idempotent,
+                    // and safe to fence here precisely because the retry has minted
+                    // no ids yet. It also SETTLES this scope's outstanding request -
+                    // but only once the writer has ACCEPTED it, or an abort at
+                    // `detach_timeout` between the two loses the request with nothing
+                    // left for teardown to drain.
+                    if discard_backfill_progress(&writer_tx, &account_id, &scope).await {
+                        coverage.take_backfill_discard(&scope);
+                    }
+                }
+                // The stored checkpoint is read only when it can decide anything. A
+                // restart-from-scratch has already ruled it out as a resume position,
+                // so reading it costs a store round trip whose answer is discarded -
+                // and its failure logged "resume read failed" for a walk that was
+                // starting over either way, which reads as a degrade where nothing
+                // degraded.
+                let resume = if restart_whole {
+                    tracing::debug!(
+                        target: "bifrost.sync.backfill",
+                        account = ?account_id,
+                        scope = ?scope,
+                        "a previous attempt on this incarnation lost pages; restarting the \
+                         walk from its beginning rather than resuming past them"
+                    );
+                    plan.walk_from_scratch()
+                } else {
+                    match store.get_backfill(&account_id, &scope).await {
+                        Ok(stored) => plan.resume(stored.as_ref()),
+                        Err(err) => {
+                            // A read failure is not authoritative; fall back to a
+                            // full walk rather than risk skipping unpersisted
+                            // pages.
+                            tracing::warn!(
+                                target: "bifrost.sync.backfill",
+                                scope = ?scope,
+                                error = %err,
+                                "{}", labels.resume_read_failed
+                            );
+                            plan.walk_from_scratch()
+                        }
+                    }
+                };
+                // Skip a scope whose backfill already reached a durable
+                // conclusion on a prior run. `get_backfill` only ever returns
+                // consumer-acked checkpoints, so this never skips a window the
+                // consumer has not durably persisted.
+                let ScopeResume::Walk(driver) = resume else {
+                    registry.mark(account_id.clone(), scope.clone(), BackfillState::Completed);
+                    scan.settled(incarnation_key);
+                    continue;
+                };
+                // Re-check the scope-local hold now that the walk is about to
+                // START: admission, the barrier query and the checkpoint read
+                // above can all park, and a hold recorded meanwhile still finds
+                // no partition walked, so it defers the scope rather than letting
+                // the first partition sit it out with every later scope behind it.
+                // The resume decision is simply recomputed next time; the
+                // pre-walk discard above is idempotent.
+                while let Some(wait) =
+                    crate::recovery::account_throttle_wait(&throttles, &account_id)
+                {
+                    tokio::select! {
+                        () = shutdown.cancelled() => return,
+                        () = tokio::time::sleep(wait) => {}
+                    }
+                }
+                // Asked of the current account, not the keys computed before
+                // admission, the barrier query and the checkpoint read: a reopen
+                // during those waits can change the declaration.
+                let walk_keys = crate::recovery::declared_keys(
+                    account.load_full().as_ref().as_ref(),
+                    &account_id,
+                    bifrost_types::ThrottleWork::Scope(&scope),
+                );
+                if let Some(wait) =
+                    crate::recovery::throttle_wait(&throttles, &account_id, &walk_keys)
+                {
+                    scan.defer_until(incarnation_key, tokio::time::Instant::now() + wait);
+                    continue;
+                }
+                // The driver owns the sequence: a barrier stops the SCOPE, not
+                // merely the partition that hit it, so a stopped walk simply
+                // hands out no further partition. There is no flag here to
+                // forget to check.
+                //
+                // For the page walk that also means terminating only where a
+                // partition's completion declares `PartitionEnd::Exhausted`.
+                // The entry count is not a declaration: a server capping a page
+                // below the requested `chunk` returns a short page with more
+                // behind it, and a window whose ids all vanished between listing
+                // and hydration is empty with more behind it.
+                (
+                    driver,
+                    None,
+                    undelivered_before,
+                    fence_at_walk_start,
+                    labels,
+                )
+            };
             registry.mark(account_id.clone(), scope.clone(), BackfillState::Running);
-            // The driver owns the sequence: a barrier stops the SCOPE, not
-            // merely the partition that hit it, so a stopped walk simply
-            // hands out no further partition. There is no flag here to
-            // forget to check.
-            //
-            // For the page walk that also means terminating only where a
-            // partition's completion declares `PartitionEnd::Exhausted`.
-            // The entry count is not a declaration: a server capping a page
-            // below the requested `chunk` returns a short page with more
-            // behind it, and a window whose ids all vanished between listing
-            // and hydration is empty with more behind it.
-            let mut first_partition = true;
-            while let Some(partition) = driver.next_partition() {
+            while let Some(partition) = pending_partition.take().or_else(|| driver.next_partition())
+            {
                 if shutdown.is_cancelled() {
                     return;
                 }
-                let mut held_before_first = None;
-                let defer_first = if first_partition {
-                    Some(&mut held_before_first)
-                } else {
-                    None
-                };
-                first_partition = false;
+                let mut held = None;
                 let Some(result) = run_backfill_partition_at_boundary(
                     &account,
                     &account_id,
                     scope.clone(),
-                    partition,
+                    partition.clone(),
                     &live,
                     changes_tx.clone(),
                     &control,
@@ -371,21 +399,24 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     &lane_gate,
                     &delivery,
                     fence_at_walk_start,
-                    defer_first,
+                    &cursors,
+                    incarnation,
+                    &mut held,
                 )
                 .await
                 else {
-                    // A scope-local hold landed before the walk read a
-                    // single partition (during lane admission, say): defer
-                    // the scope and move on, exactly as the pre-walk check
-                    // does, rather than sit the hold out with every later
-                    // scope behind it. Nothing was walked, so the scope
-                    // returns to Pending and its next pass starts afresh.
-                    if let Some(wait) = held_before_first {
+                    if let Some(wait) = held {
                         registry.mark(account_id.clone(), scope.clone(), BackfillState::Pending);
-                        scan.defer_until(
+                        scan.parked.insert(
                             incarnation_key.clone(),
-                            tokio::time::Instant::now() + wait,
+                            ParkedWalk {
+                                driver,
+                                pending: partition,
+                                fence_at_walk_start,
+                                undelivered_before,
+                                labels,
+                                until: tokio::time::Instant::now() + wait,
+                            },
                         );
                         continue 'scopes;
                     }
@@ -552,7 +583,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
         }
         tokio::select! {
             () = shutdown.cancelled() => return,
-            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+            () = tokio::time::sleep_until(scan.next_wake()) => {}
         }
     }
 }
@@ -641,6 +672,16 @@ pub(super) const BACKFILL_RETRY_CAP: Duration = Duration::from_secs(300);
 /// account is reattached. Failed incarnations stay eligible and come
 /// back on an exponential delay, which is what keeps a permanently
 /// failing scope from re-walking on every rescan tick.
+// Owns sequencing and totals, but no admission, activity guard or provider stream.
+struct ParkedWalk {
+    driver: crate::backfill::ScopeWalkDriver,
+    pending: InventoryPartition,
+    fence_at_walk_start: u64,
+    undelivered_before: u64,
+    labels: &'static WalkLabels,
+    until: tokio::time::Instant,
+}
+
 #[derive(Default)]
 pub(super) struct BackfillScan {
     /// Incarnations that reached a durable conclusion, each recorded with the
@@ -688,9 +729,25 @@ pub(super) struct BackfillScan {
     /// the retry ramp must not grow, and the scope is due again exactly when
     /// its hold lifts rather than on the next exponential step.
     held: HashMap<(CursorScope, u64), tokio::time::Instant>,
+    /// Walks suspended between partitions, keyed by their original incarnation.
+    parked: HashMap<(CursorScope, u64), ParkedWalk>,
 }
 
 impl BackfillScan {
+    fn next_wake(&self) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        if self.parked.values().any(|walk| walk.until <= now) {
+            return now;
+        }
+        self.held
+            .values()
+            .copied()
+            .chain(self.parked.values().map(|walk| walk.until))
+            .chain(self.failed.values().map(|(_, until)| *until))
+            .filter(|until| *until > now)
+            .fold(now + Duration::from_secs(1), std::cmp::min)
+    }
+
     /// Do not start this incarnation's walk before `until`: a scope-local
     /// throttle holds it. The other scopes of the scan carry on meanwhile.
     pub(super) fn defer_until(&mut self, key: (CursorScope, u64), until: tokio::time::Instant) {
@@ -714,6 +771,7 @@ impl BackfillScan {
         // walked again, and incarnation numbers only ever move forward, so an
         // entry there can never be mistaken for a later one.
         let live: HashSet<(CursorScope, u64)> = available.iter().cloned().collect();
+        self.parked.retain(|key, _| live.contains(key));
         self.baseline.retain(|key, _| live.contains(key));
         self.failed.retain(|key, _| live.contains(key));
         self.lost_pages.retain(|key| live.contains(key));
@@ -722,6 +780,12 @@ impl BackfillScan {
         let mut pending = Vec::new();
         for (scope, incarnation) in available {
             let key = (scope, incarnation);
+            if let Some(parked) = self.parked.get(&key) {
+                if parked.until <= now {
+                    pending.push(key);
+                }
+                continue;
+            }
             if let Some(settled_at) = self.settled.get(&key).copied() {
                 if coverage.undelivered_watermark(&key.0) == settled_at {
                     continue;
@@ -885,12 +949,10 @@ async fn run_backfill_partition_at_boundary(
     lane: &LaneGate,
     delivery: &crate::multiplexer::ChangeDelivery,
     fence_at_walk_start: u64,
-    // `Some` on the walk's FIRST partition: a scope-local hold found before
-    // it is read is reported here (and `None` returned) instead of slept out,
-    // so the orchestrator defers the scope while no inventory has been
-    // walked. Later partitions pass `None` and wait inline - the walk is
-    // under way and must finish against the same budget.
-    mut defer_first: Option<&mut Option<std::time::Duration>>,
+    cursors: &CursorRegistry,
+    incarnation: u64,
+    // Report a scope-local hold without retaining admission or a provider stream.
+    held: &mut Option<std::time::Duration>,
 ) -> Option<Result<crate::backfill::BackfillPartitionOutcome, Error>> {
     // One generation per partition pass, so a re-walk's proof is ordered after
     // the debt an earlier pass raised.
@@ -912,36 +974,17 @@ async fn run_backfill_partition_at_boundary(
             bifrost_types::ThrottleWork::Scope(&scope),
         );
         if let Some(wait) = crate::recovery::throttle_wait(throttles, account_id, &keys) {
-            if let Some(held) = defer_first.as_deref_mut() {
-                // Before the first partition only the ACCOUNT-WIDE part is
-                // slept, never the combined wait; a scope-local hold left
-                // over is handed back for deferral.
-                match crate::recovery::account_throttle_wait(throttles, account_id) {
-                    None => {
-                        *held = Some(wait);
-                        return None;
-                    }
-                    Some(account_wait) => {
-                        tokio::select! {
-                            () = shutdown.cancelled() => return None,
-                            () = tokio::time::sleep(account_wait) => {}
-                        }
-                        continue;
-                    }
+            if let Some(account_wait) =
+                crate::recovery::account_throttle_wait(throttles, account_id)
+            {
+                tokio::select! {
+                    () = shutdown.cancelled() => return None,
+                    () = tokio::time::sleep(account_wait) => {}
                 }
+                continue;
             }
-            tracing::debug!(
-                target: "bifrost.sync.backfill",
-                account = ?account_id,
-                scope = ?scope,
-                wait_secs = wait.as_secs(),
-                "backfill partition deferred by shared throttle deadline"
-            );
-            tokio::select! {
-                () = shutdown.cancelled() => return None,
-                () = tokio::time::sleep(wait) => {}
-            }
-            continue;
+            *held = Some(wait);
+            return None;
         }
         // Admission is taken THROUGH the lane gate, which owns it for the whole
         // pass. That is not indirection for its own sake: `run_partition` parks
@@ -969,9 +1012,7 @@ async fn run_backfill_partition_at_boundary(
         );
         if let Some(wait) = crate::recovery::throttle_wait(throttles, account_id, &final_keys) {
             lane.release_admission();
-            if let Some(held) = defer_first.as_deref_mut()
-                && crate::recovery::account_throttle_wait(throttles, account_id).is_none()
-            {
+            if crate::recovery::account_throttle_wait(throttles, account_id).is_none() {
                 *held = Some(wait);
                 return None;
             }
@@ -995,7 +1036,11 @@ async fn run_backfill_partition_at_boundary(
         // scope is still in the registry it is re-walked from its replacement
         // incarnation's beginning; if the reset removed it, nothing walks it,
         // which is what a deleted folder should get.
-        if coverage.scope_fence(&scope) != fence_at_walk_start {
+        if coverage.scope_fence(&scope) != fence_at_walk_start
+            || !cursors
+                .all_scope_incarnations()
+                .contains(&(scope.clone(), incarnation))
+        {
             lane.release_admission();
             tracing::warn!(
                 target: "bifrost.sync.backfill",
@@ -1399,3 +1444,7 @@ fn backfill_plan_for(
         _ => BackfillPlan::Fixed(vec![InventoryPartition::Full]),
     }
 }
+
+#[cfg(test)]
+#[path = "../backfill/parking_tests.rs"]
+mod parking_tests;

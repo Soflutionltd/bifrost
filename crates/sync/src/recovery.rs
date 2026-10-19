@@ -46,10 +46,11 @@ use std::time::{Duration, SystemTime};
 /// Nothing here is durable: the bucket is one in-memory `Arc<Mutex<_>>` per
 /// `SyncEngine`, never serialized, never checkpointed, and dropped with the
 /// engine. A monotonic instant is therefore safe - it never has to survive a
-/// process. The wall-clock-to-monotonic conversion happens at exactly ONE
-/// boundary, [`record_throttle_parts`], where a provider `RetryHint` (a
-/// duration, or an absolute HTTP date) is resolved to a remaining duration on
-/// the wall clock and immediately anchored to `Instant::now()`.
+/// process. [`record_throttle_parts`] resolves a provider `RetryHint` to a
+/// remaining duration and immediately anchors it to `Instant::now()`.
+/// Recovery repairs also retain a local deadline: [`record_repair_throttle`]
+/// resolves an absolute hint once, anchors the local deadline, and passes an
+/// equivalent duration hint to the shared recorder.
 use tokio::time::Instant;
 
 use bifrost_types::{
@@ -551,6 +552,53 @@ pub(crate) fn record_reconcile_throttle(
     );
 }
 
+/// Record a recovery establishment failure and capture its local hold once.
+/// Resolve absolute hints before recording so the local and shared waits use
+/// the same duration, even under a paused monotonic clock.
+pub(crate) fn record_repair_throttle(
+    bucket: &std::sync::Mutex<ThrottleBucket>,
+    account: &AccountId,
+    error: &AccountError,
+) -> Option<Instant> {
+    let now = Instant::now();
+    match plan_recovery(error.clone()) {
+        RecoveryPlan::Retry(mut advice) => {
+            let signal = advice.throttle_scope.is_some()
+                || advice.retry_hint.is_some()
+                || !error.throttle_budgets().is_empty()
+                || matches!(advice.reason, bifrost_types::RetryReason::RateLimited);
+            if !signal {
+                return None;
+            }
+            let delay = retry_delay(&advice, SystemTime::now(), Duration::from_secs(1));
+            advice.retry_hint = advice
+                .retry_hint
+                .map(|_| bifrost_types::RetryHint::After(delay));
+            record_throttle(bucket, account, &advice, error);
+            Some(now + delay)
+        }
+        RecoveryPlan::Reconcile(mut advice) => {
+            let signal = advice.throttle_scope.is_some()
+                || advice.retry_hint.is_some()
+                || !error.throttle_budgets().is_empty()
+                || matches!(
+                    advice.reason,
+                    bifrost_types::ReconcileReason::ThrottledMidFlight
+                );
+            if !signal {
+                return None;
+            }
+            let delay = reconcile_delay(&advice, SystemTime::now(), Duration::from_secs(1));
+            advice.retry_hint = advice
+                .retry_hint
+                .map(|_| bifrost_types::RetryHint::After(delay));
+            record_reconcile_throttle(bucket, account, &advice, error);
+            Some(now + delay)
+        }
+        _ => None,
+    }
+}
+
 /// The hold recorded for a STAMPED budget whose response carried no retry
 /// hint. Equal to the fallback every engine retry path sleeps locally
 /// (`retry_delay` / `reconcile_delay` callers pass one second), so a sibling
@@ -606,15 +654,16 @@ fn record_throttle_parts(
         }
         None => return,
     };
-    // THE clock boundary. A provider hint arrives as wall-clock evidence -
+    // The shared bucket's clock boundary. A provider hint arrives as evidence -
     // either a bare duration (`After`) or an absolute HTTP date (`At`). It is
     // resolved to a REMAINING DURATION against the wall clock here, once, and
     // immediately anchored to the monotonic clock the wait sites sleep on.
     // `min_delay` is the right resolver for both shapes: it returns the
     // duration verbatim for `After` and the wall-clock delta for `At`,
-    // saturating at zero for a date already past. Converting anywhere else -
-    // or storing the wall-clock instant and subtracting later - reintroduces
-    // the two-clock mismatch this bucket exists to avoid.
+    // saturating at zero for a date already past. Recovery repairs normalize
+    // an absolute hint before this call when capturing their local deadline,
+    // so this recorder receives the equivalent duration in that case.
+    // Never retain an absolute hint for re-resolution after a monotonic sleep.
     let wait_until = Instant::now() + hint.min_delay(SystemTime::now());
     if let Ok(mut guard) = bucket.lock() {
         guard.record_for(account, key, wait_until);

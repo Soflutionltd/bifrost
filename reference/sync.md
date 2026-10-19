@@ -1004,6 +1004,26 @@ request is specifically for a durable cursor boundary.
 
 ## Backfill
 
+A scope-local throttle encountered between partitions parks the walk in
+`BackfillScan`, keyed by scope and incarnation, while other scopes proceed.
+The parked state retains the driver, including its totals and coverage
+verdict, the pending partition already taken from the driver, and the
+original scope fence and undelivered watermark baseline. It holds no
+scheduler admission, activity guard or provider stream.
+
+When the deadline passes, the orchestrator retries the pending partition
+before requesting another. It bypasses fresh planning, `begin_walk` and
+durable checkpoint reconstruction. Current declared throttle keys are
+checked again, including after admission; another scope-local hold parks
+the same walk again. Scope removal or an incarnation change discards it.
+The original fence remains authoritative after admission and at completion.
+A changed undelivered watermark abandons the parked walk without completion
+and sends it through the existing scratch-restart path.
+
+The rescan wait is shortened to the earliest parked, held or retry deadline,
+within the normal one-second discovery cadence, and selects shutdown.
+Account-wide holds continue to sleep inline.
+
 `BackfillRunner::run_partition` walks
 `inventory_partition_stream(scope, partition)` and broadcasts each
 page as a synthetic `Batch` carrying a `BackfillCheckpoint`. It does
@@ -1996,72 +2016,56 @@ All three bulk operations share `run_bulk_pipeline`. `BulkPipelineOp`
 selects `SetFlags`, `Move`, or `Destroy`, which determines the wire
 method and final read-back guard. Campaign flow:
 
-1. Submit the batch via the arm's wire method, all sharing `key`:
-   `Account::bulk_set_flags(targets, op, key)`,
-   `Account::bulk_move_from(targets, destination, source, key)`, or
-   `Account::bulk_destroy(targets, key)`.
-2. Collect `ItemOutcome::Failed` ids whose `AccountError::recovery()`
-   is `RecoveryClass::Retry(advice)` or
-   `RecoveryClass::Reconcile(_)`.
-   If the stream itself terminates with `Retry`, ids the stream never
-   resolved join the retry set too - a stream can end before it emits
-   an outcome for every submitted target, and without that sweep those
-   ids are neither resubmitted, read back, nor counted. The sweep is
-   deliberately narrower than the `Reconcile` / `Engine` termination
-   arms: it claims only unseen ids and ids already queued for retry.
-   An id sitting in the read-back lane belongs to the guard (that lane
-   exists so a write whose first attempt may have landed is verified
-   rather than replayed), and an engine-blocked id is waiting on a
-   directive.
-3. Sleep for the effective delay from `advice.retry_hint`
-   (`RetryHint::min_delay(now)` or `RetryHint::not_before(now)` per
-   the caller's scheduler shape) and resubmit with the **same**
-   `IdempotencyKey`
-   (engine bookkeeping; no protocol today emits it on the wire).
-   Repeat up to `EngineConfig::mutation_max_retries`.
+1. Deduplicate targets and group them by the canonical set of throttle keys
+   declared for each singleton target. Moves include the source and
+   destination membership declarations. Every target belongs to exactly one
+   cohort.
 
-   The advice comes from the stream-level `Retry` termination when there is
-   one, and otherwise from the PER-ITEM retryable failures actually being
-   resubmitted, folded to the longest of their delays. It used to come only
-   from the stream level, so a stream that ended `Done` after emitting per-item
-   `Retry(SameRequest)` failures looped straight into its next attempt with no
-   sleep at all - `mutation_max_retries` back-to-back resubmissions against a
-   provider that had just named a deadline. Pinned by
-   `a_per_item_retry_delays_the_resubmission`.
+2. Allocate each cohort's idempotency key once through `IdempotencyVendor`.
+   Retain that key across all retries. Re-declare the actual submitted set
+   before every submission. A never-submitted target whose singleton
+   declaration changes is re-routed; submitted and uncertain targets retain
+   their cohort and execution identity.
 
-   One resubmission is at most `MutationConfig::retry_queue_cap` targets
-   wide (default 4096). The retry set only shrinks - it is filtered out of
-   the ids still outstanding - so this is not a guard against unbounded
-   growth; it caps the per-attempt work one oversized campaign can demand of
-   an account, which would otherwise resubmit its whole still-failing set on
-   every attempt. Targets past the cap are marked `PendingRetry` AT THE
-   TRUNCATION, not left to the sweep that runs when the loop exits: an id
-   merely truncated out of the resubmission is no longer among the campaign's
-   outstanding targets, so no later attempt resolves it and it would leave
-   the campaign counted in no lane at all - the campaign reporting success
-   for work that never happened. Marked, it is counted as pending and then
-   passes through the read-back guard like any other unresolved id.
-   `retry_queue_cap_bounds_a_resubmission_without_losing_the_excess` pins
-   both halves, and was checked by ablation against each.
-4. Run `run_readback_guard` once at the end against unresolved
-   failures: `get_stream(Projection::FlagsOnly)` re-fetches and
-   reconciles applied / skipped / failed_terminal. The read-back set
-   is derived from the per-id outcome map when the retry loop exits
-   (every id still `PendingRetry` or `PendingReadback`), not
-   accumulated during it, so an id parked in the read-back lane cannot
-   be dropped by a later attempt that resubmits its siblings.
+3. Schedule one ready action at a time: a submission, retry, or read-back
+   for one cohort. Save its state after the action and return to the
+   scheduler. Readiness combines the current declared-key holds, retry
+   deadline, and local reconcile deadline. When every action is held,
+   sleep until the earliest readiness, selecting on shutdown. A replacement
+   account wakes the scheduler to re-evaluate declarations.
 
-That derivation holds on EVERY exit path, the engine-directive one included.
-When any item or the stream yields `RecoveryPlan::Engine`, the campaign stops
-submitting and sweeps its still-unresolved ids to `BlockedByEngine` - but the
-sweep skips `PendingReadback`, exactly as the retry-termination sweep does. Those
-are the ids whose write may already have landed (`Uncertain`, downgrades,
-`AfterStateRefresh`), and the read-back lane exists so they are verified rather
-than replayed or guessed at; claiming them emptied the read-back set, skipped the
-guard entirely, and reported a mutation that had actually applied as
-`blocked_by_engine`. The guard that follows only OBSERVES state - it submits no
-mutation - so running it does not contradict "the campaign was halted by the
-engine". Pinned by `an_engine_directive_leaves_a_sibling_read_back_alone`.
+   Admission remains mandatory. Re-check declarations and holds against
+   the account snapshot used after admission; release admission and return
+   to the scheduler if readiness changed. Hold waits consume no attempts.
+
+   `mutation_max_retries` applies independently to each cohort.
+   `MutationConfig::retry_queue_cap` is one campaign-wide retry-target
+   allowance. A target reserves a slot on its first scheduled retry and
+   retains it for later retries. Excess targets remain `PendingRetry`
+   and enter read-back rather than disappearing from accounting. Slots
+   are reserved when retries are scheduled, before readiness waits, so a
+   held cohort can consume slots before another cohort retries.
+
+4. Read back unresolved submitted objects per cohort. Observations return
+   per-object results and merge into the campaign's outcome map.
+   Matching objects become `Skipped`; observed mismatches become
+   `FailedTerminal`; failed or missing observations remain explicitly
+   unresolved. Partial observations survive a stream termination.
+   Final object counters derive from the merged map.
+
+5. Preserve the first error and stop further mutation submissions.
+   Submitted cohorts with unresolved work receive at most one read-back
+   attempt while the account remains running and attached. Shutdown,
+   detach, pause, or observation failure leaves submitted work explicitly
+   unresolved without an observation retry loop. Never-submitted targets
+   become known-unsent `PendingRetry` and are excluded from read-back.
+   Return the first error after cleanup.
+
+An engine directive also stops further submissions. Remaining retry work
+becomes `BlockedByEngine`, while `PendingReadback` remains protected:
+uncertain writes are observed rather than replayed or guessed at.
+Forwarded directives are deduplicated across the campaign by directive
+variant and target scope.
 
 `ItemOutcome::Succeeded` buckets by its `MutationSuccess` payload:
 `Applied` -> `applied`, `Skipped` -> `skipped`, and **`Downgraded { .. }` ->
@@ -2124,20 +2128,19 @@ is consumer-minted and consumer-persisted across process restarts
 so retries from a previous process correlate. `IdempotencyVendor` does not
 persist it; the consumer supplies the durable value.
 
-Before every wire submission, including read-back, the campaign waits
-through `SyncControl::wait_until_running` and registers an activity
-guard. A pause that wins the registration race parks the campaign
-without changing its retry set, attempt count, outcome map, or
-idempotency key. An in-flight attempt finishes under the activity guard,
-so `pause().await` cannot report quiescence until its accounting is
-settled; any retry then parks before resubmission. Detach cancellation
-interrupts retry delays, throttle waits, mutation streams, and read-back
-and returns `Error::ShuttingDown` instead of parking.
+Before every wire action, including read-back, the scheduler waits through
+`SyncControl::wait_until_running` and registers an activity guard.
+A pause that wins registration parks normal campaign work without
+changing its attempt count or frozen key. In-flight mutation accounting
+finishes under its activity guard. During error cleanup, a pause leaves
+remaining submitted work unresolved instead of parking cleanup.
+Detach cancellation interrupts admission, readiness waits, mutation
+streams, and read-back and returns `Error::ShuttingDown` unless an earlier
+error is already being preserved.
 
-The initial retry candidate list may be as wide as the campaign input, so
-consumers must still bound campaign input if retaining every unresolved id is
-too costly. `MutationConfig::retry_queue_cap` bounds each resubmission as
-described above; excess ids remain accounted as pending and enter read-back.
+Consumers must still bound campaign input when retaining every target and
+outcome is too costly. `retry_queue_cap` bounds the campaign-wide retry
+target allowance, not initial input or unresolved outcome retention.
 
 `mutation::fanout::partition_by_account` is a cross-account
 fanout helper: given an input stream of `(AccountId, T)` and a
@@ -3328,10 +3331,31 @@ the deferred-inventory worker for the scope, the mutation campaign for its
 unresolved targets plus a move's destination and supplied source
 (`ThrottleWork::Objects`, `ThrottleWork::Membership`), and the read-back for
 every id in `unresolved_readback_ids`. Recovery-driven establishment
-(`run_establish` in `engine/reattach.rs`, for scope recovery and a
-replacement account) is the one engine lane that consults no hold at all,
-account-wide or declared; it records the holds its failures carry but does
-not wait on them. The wait is the longest pending
+(`run_establish` in `engine/reattach.rs`, for scope recovery and replacement
+accounts) honours account-wide holds and the current account's declarations
+for `ThrottleWork::Scope`. Before every attempt, including the first, it
+waits for both those holds and the previous failure's local deadline.
+Failures record shareable Retry or Reconcile holds before rollback or close,
+and throttled failures pace on their holds instead of the jittered backoff.
+Hold waits do not consume attempts, but share a cumulative
+`REOPEN_BACKOFF_CAP` allowance per scope repair or account restart; expiry
+never authorizes a provider call and ends recovery with the distinct warning
+`recovery wait budget exhausted`. The promise is bounded additional throttle
+delay, not bounded transaction occupancy. Restart retries keep the failed
+scope's declared keys and local deadline and wait before opening another
+replacement; replacement establishment asks the replacement account for its
+declarations. Recovery repairs resolve an absolute hint once
+(`record_repair_throttle`), keep a local monotonic deadline, and pass an
+equivalent duration hint to the shared recorder. Recovery establishment
+rechecks holds after the checkpoint writer responds, before driving the
+provider. Restart rechecks after acquiring the reopen lock and releases both
+lock and activity before waiting on a newly discovered hold. Every teardown
+refusal records its holds immediately; the first refusal remains the returned
+error, while local pacing keeps the longest deadline. Recovery also records
+holds from replacement-subscription unwind failures, both account-close
+failure paths, and best-effort membership refresh failures; cleanup keeps the
+original result and the longest local deadline, and membership refresh stays
+best-effort. The wait is the longest pending
 deadline across the account-wide keys and the declared ones. `Mailbox` and
 `Budget` keys are never part of the account-wide wait: they hold one
 mailbox's work, and reach it only by declaration. IMAP declares its
@@ -3366,23 +3390,22 @@ the next one. The deferred-inventory worker requeues a held scope behind the
 others and sleeps only once every queued scope is held. An ACCOUNT-WIDE hold
 blocks every scope equally and is slept out inline at all three - BEFORE the
 scope-local decision, so a short account hold overlapping a long mailbox hold
-cannot leave the held scope in an inline wait with the others behind it. A hold that
-lands between two partitions of a backfill walk already under way is also
-waited out inline: the walk must finish against the same budget, and
-abandoning it would cost a re-walk. A mutation campaign is one throttle unit:
-it waits until every budget its submission consumes is free rather than
-splitting its targets by budget, because its idempotency key, retry counter,
-read-back guard and termination sweeps all assume one submitted set; a
-campaign spanning a held mailbox and a free one waits for the held one, and
-the wait never counts against `mutation_max_retries`.
+cannot leave the held scope in an inline wait with the others behind it.
+Scope-local holds between backfill partitions park the walk (see Backfill);
+account-wide holds still sleep inline. A mutation campaign schedules throttle
+cohorts independently. A held mailbox cohort does not delay a free cohort's
+ready submission, retry, or read-back. Each action honours the account-wide
+holds and its current declared keys, with a second check after admission. No
+admission permit or activity guard spans a hold wait, and waits never consume
+mutation attempts. Account-wide holds still cover every cohort.
 
 Both sides are wired. Recording: the reopen listener, the poll loop's
 and push reconciler's Retry and Reconcile arms (both the per-drive
 terminations and the reconciler's top-level `WatchEvent::Terminated`),
 and the mutation campaigns (per-item outcomes and stream-level
 terminations) and their read-back (every per-item hydration failure the
-guard absorbs as uncertain, through the crate-internal `*_observed` guard
-variants, plus a returned stream-level termination) funnel through
+guard absorbs as uncertain, through the crate-internal
+run_object_readback path, plus a returned stream-level termination) funnel through
 `recovery::record_throttle` or
 `recovery::record_reconcile_throttle`, and the local sleep those arms
 observe comes from `recovery::retry_delay` /

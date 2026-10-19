@@ -40,6 +40,10 @@ pub mod repair;
 pub mod scheduler;
 pub mod types;
 
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+pub(crate) mod test_common;
+
 // Engine entry types.
 pub use engine::{SyncEngine, SyncEngineBuilder};
 

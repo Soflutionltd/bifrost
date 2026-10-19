@@ -43,21 +43,11 @@ Filed 2026-10-19 while landing declared throttle keys and stamped budgets
   `userRateLimitExceeded` and `quotaExceeded` all to `ThrottleScope::Account`.
   If Google's project-level reasons mean the quota every account on one OAuth
   client shares, they are a `ThrottleBudget` every Google account should
-  declare. Needs Google's reason semantics confirmed before it is a defect.
-- **A mutation campaign is one throttle unit.** A campaign spanning a held
-  mailbox and a free one waits for the held one (`reference/sync.md`).
-  Splitting a campaign into per-budget cohorts with per-cohort retry
-  accounting is a feature, not a fix.
-- **A hold landing mid-way through a backfill walk is slept out inline**, so
-  later scopes' cold start waits behind it. Abandoning the walk would cost a
-  re-walk; a resumable partition-level deferral would avoid both.
-- **Recovery-driven establishment does not honour throttle holds.**
-  `run_establish` in `crates/sync/src/engine/reattach.rs` (scope recovery and
-  replacement-account establishment) drives `InventoryFusion` without
-  consulting the bucket, and its retries use their own exponential delay. It
-  never waited on the account-wide hold either, so this predates declared
-  keys; it is now the one engine lane outside the wait-site set in
-  `reference/sync.md`. Found by the close-out review.
+  declare. Needs Google's reason semantics confirmed before it is a defect,
+  and the Google client has no OAuth client or quota-project identity to key
+  such a budget on (auth is an opaque `TokenSource`), so a consumer-supplied
+  project id would be needed.
+
 ## A9 (directory search) follow-ups
 
 - **a9-1 (carddav)** RFC 6352 directory-gateway leg. `directory_search`
