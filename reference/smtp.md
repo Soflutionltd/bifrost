@@ -29,13 +29,16 @@ share one sans-I/O core and differ only in how they move bytes. See "Protocol
 core and I/O adapters". What still exists twice - connect, greeting, EHLO/LHLO,
 the AUTH ladder, STARTTLS, reply reading, deadlines - is I/O-shaped, and the
 paired tests over it remain intentional while the published sync and async
-transports remain separate. There are three deliberate behavioural differences:
-the `abort()` timeout (see "Connection lifecycle"), the outbound-throttle
-invariant (see "Bandwidth metering"), and what the configured timeout covers
-during SETUP, immediately below. Any proposal to remove or reshape this surface
-is the owner's call - see the standing lessons in `AGENTS.md`.
+transports remain separate. There are two deliberate behavioural differences:
+the `abort()` timeout (see "Connection lifecycle") and what the configured
+timeout covers during SETUP, immediately below. (Outbound throttling used to be
+a third: the blocking half slept outbound debt after a write, on the thread
+that would issue the next read. Both halves now wait for outbound admission
+before the write instead - see "Bandwidth metering".) Any proposal to remove or
+reshape this surface is the owner's call - see the standing lessons in
+`AGENTS.md`.
 
-The third one is easy to miss because each half is documented by its MECHANISM
+The second one is easy to miss because each half is documented by its MECHANISM
 rather than by its BOUND. The async half runs DNS, connect, TLS handshake,
 banner and EHLO under ONE shared `AsyncDeadline`, so async setup as a whole
 cannot exceed the configured timeout. The blocking half has no such thing, and
@@ -55,7 +58,7 @@ one would mean a non-blocking socket and a poll loop, which is not what that
 half is for. A blocking caller who needs a ceiling on setup must impose it
 outside the call.
 
-The write timeout is deliberately NOT a third difference, and the async half
+The write timeout is deliberately NOT a further difference, and the async half
 had to be built to keep it that way. The configured timeout bounds one write
 that makes no progress, never the whole transfer: the blocking half gets that
 for free because `SO_SNDTIMEO` is per `write(2)`, and the async half re-arms
@@ -88,48 +91,57 @@ the send in its own timeout - which is also the only place that knows what the
 message size makes reasonable.
 
 Re-arming covers the slow LINK. It does not by itself cover a bandwidth CAP,
-and the two failures look identical from inside the loop: a write that hands
-the socket several megabytes has every accepted byte charged and parks a
-multi-second `Sleep` in `throttle_out`. Two things hold that half. The offer
-clamp one layer down bounds what a single write can charge (see "Bandwidth
-metering"), and the write loop DRAINS its own outbound debt before arming the
-next timeout, so a wait this crate imposed at the consumer's request is never
-charged to the budget that exists to judge the peer. The clamp alone was not
-enough and could not be: it bounds parked debt at about one second of cap, which
-keeps the timeout meaningful only while the timeout is comfortably larger than a
-second, so any configured timeout at or below a second failed every capped write
-after the first with `Timeout` / `DataBody` and every recipient `uncertain`.
-Draining removes the dependency on that ratio entirely and makes the async half
-match the blocking one, where `NetworkStream::charge` already sleeps outside
-`SO_SNDTIMEO`. The cap itself is untouched - a throttled upload still takes
-exactly as long as the cap says, it just does not fail. Pinned by
+and the two failures look identical from inside the loop: a write held back by
+the cap and a write held back by the peer both simply take long. So each
+iteration of the loop has two phases. ADMISSION comes first, before the timeout
+is armed: `admit_outbound_within` reserves at most one second of cap against the
+outbound schedule every connection of the transport shares and waits for its
+slot (see "Bandwidth metering"). The socket write then runs under the timeout
+against the allowance admission installed, and never consults the schedule
+again. So a wait this crate imposed at the consumer's request is never charged
+to the budget that exists to judge the peer, and a peer that accepts nothing
+always reaches its timeout - nothing pauses or stretches the timer once armed.
+A short write keeps the rest of its allowance for the next iteration, whose
+admission returns at once; the allowance never exceeds what the call has left to
+write, so a successful call spends all of it. The cap itself is untouched - a
+throttled upload still takes exactly as long as the cap says, it just does not
+fail. Pinned by
 `a_capped_upload_outlives_a_write_timeout_shorter_than_its_throttle_debt`, under
-paused time with a 200 ms timeout and a 1000 B/s cap.
+paused time with a 200 ms timeout and a 1000 B/s cap; before admission existed,
+any configured timeout at or below a second failed every capped write after the
+first with `Timeout` / `DataBody` and every recipient `uncertain`.
 
-Draining before arming is right for ONE of the two budgets, and the write loop
-matches on which. `PerOperation` is a bound on one write's dealings with the
-peer, so the drain runs entirely outside it, as above. `SetupDeadline` is an
+The timeout guarantee therefore reads: a write that makes no progress times out
+once ADMITTED, and admission itself waits at most about one second per live
+connection sharing the schedule, plus one (see "Bandwidth metering"). That
+admission wait is untimed under a per-operation timeout - it is the cap, not the
+peer.
+
+Waiting outside the timer is right for ONE of the two budgets, and the write
+loop matches on which. `PerOperation` is a bound on one write's dealings with
+the peer, so admission runs entirely outside it, as above. `SetupDeadline` is an
 ABSOLUTE ceiling shared by DNS, connect, TLS, banner and EHLO, and there
-"outside the budget" is not a saving but the failure: draining outside it does
+"outside the budget" is not a saving but the failure: waiting outside it does
 not SPEND the deadline, it WAITS PAST it. Under a cap small enough to throttle a
-greeting, an EHLO write goes a byte at a time with a second of debt between
-bytes while the remaining setup budget is milliseconds, and the operation does
-report a timeout - but only after overrunning a ceiling the contract says it
-cannot exceed. So the drain is bounded by the slack left on the deadline, and
-debt that cannot be paid inside the setup budget fails as a setup timeout. The
-write and flush that follow re-read the slack for themselves, because
-`with_timeout` resolves a `SetupDeadline` when it arms the timer; computing a
-remaining duration once and reusing it across the drain and the write would hand
-back the same overrun in smaller pieces. Pinned by
-`a_setup_deadline_bounds_the_throttle_drain_rather_than_waiting_past_it` (the
-elapsed time is the finding; an unbounded drain also ends in a timeout, just
-1000 ms into a 300 ms ceiling) and
-`the_write_after_a_bounded_drain_gets_the_recomputed_slack`. There is no third
-budget shape to consider: `teardown_budget()` builds a `PerOperation` value and
-applies it directly to `stream.shutdown()`, never to a write.
+greeting, an EHLO write waits for its slot while the remaining setup budget is
+milliseconds, and the operation would report a timeout only after overrunning a
+ceiling the contract says it cannot exceed. So admission is bounded by the slack
+left on the deadline, and admission that cannot come inside the setup budget
+fails as a setup timeout, its reservation given back. The write and flush that
+follow re-read the slack for themselves, because `with_timeout` resolves a
+`SetupDeadline` when it arms the timer; computing a remaining duration once and
+reusing it across the wait and the write would hand back the same overrun in
+smaller pieces. Pinned by
+`a_setup_deadline_bounds_the_admission_wait_rather_than_waiting_past_it` (the
+elapsed time is the finding; an unbounded wait also ends in a timeout, just
+1021 ms into a 300 ms ceiling) and
+`the_write_after_a_bounded_admission_gets_the_recomputed_slack`. There is no
+third budget shape to consider: `teardown_budget()` builds a `PerOperation`
+value and applies it directly to `stream.shutdown()`, never to a write.
 
-Bounding the drain closes the overrun the drain itself introduced. It does not
-on its own prove that the public connect future returns by the setup deadline:
+Bounding the admission wait closes the overrun it would otherwise introduce. It
+does not on its own prove that the public connect future returns by the setup
+deadline:
 setup error handling goes on to call `abort()`, which carries its own teardown
 timeout (see "Connection lifecycle"), so the wall-clock bound a caller
 experiences is the setup deadline plus at most that teardown cap.
@@ -373,8 +385,8 @@ That deadline judges the PEER, so the crate's own bandwidth-throttle waiting is
 excluded from it. This is the read-side statement of the same rule the write
 loop follows (see "Transport types"), and it needed a different mechanism,
 which is why the two paths do not look alike. A write timeout is a fresh
-duration per write, so the write loop simply drains its debt before arming the
-timer. A reply read has no fresh duration to step outside of: the per-operation
+duration per write, so the write loop simply waits for admission before arming
+the timer. A reply read has no fresh duration to step outside of: the per-operation
 budget has been collapsed into ONE deadline spanning the whole reply, precisely
 so a trickling peer cannot stretch it, and there is no "outside" a deadline -
 only past it. So the async reader drains parked inbound debt and then POSTPONES
@@ -425,8 +437,8 @@ every reply after the first failed as "SMTP read timed out") and
 `a_setup_deadline_is_not_postponed_by_inbound_throttle_debt`, which holds the
 other half: the shared connect ceiling is ABSOLUTE, so debt is paid inside it
 and debt that does not fit fails as a timeout AT the ceiling. That is the same
-ruling `drain_outbound_throttle_within` makes on the write side, reached from
-the other direction - there the drain has to be bounded to stay inside the
+ruling `admit_outbound_within` makes on the write side, reached from the other
+direction - there the admission wait has to be bounded to stay inside the
 ceiling, here it simply is not exempted. The blocking half's version of the
 refund is unpinned: a test with bite would have to owe real throttle debt, and
 the blocking funnel sleeps a real thread, which the crate's testing rules put
@@ -795,101 +807,111 @@ exactly the upstream-heavy path a cap usually exists to protect.
 atomic, so one `set_bandwidth_cap` governs both halves.
 
 Both socket funnels are metered: `AsyncNetworkStream`'s
-`poll_read`/`poll_write` and `NetworkStream`'s blocking `Read`/`Write`.
-The bucket in `client/metering.rs` RETURNS the debt it wants slept rather
-than sleeping itself, which is the one design difference from IMAP's
-`WireMetering`: SMTP has three call shapes over one bucket (an `async
-fn`, a `poll_write` that cannot await, a blocking `Write`) and a
-debt-returning bucket serves all three without a second implementation to
-drift from the first. The async funnel parks the debt as a `Sleep` in the
-stream so a throttled connection yields to the runtime; the blocking
-funnel sleeps its calling thread, the semantic that caller already
-accepted.
+`poll_read`/`poll_write` and `NetworkStream`'s blocking `Read`/`Write`. The two
+directions are capped by different mechanisms, both in `client/metering.rs`.
 
-Two properties worth not regressing: tokens may go NEGATIVE, so a
-transfer larger than one second of budget owes proportional time instead
-of being clamped to one second (clamping would let a 1 B/s cap run at
-hundreds of B/s), and the cap is re-read on every transfer, so a consumer
-can retune or lift it without reconnecting. Bytes are charged as ACCEPTED
-by the socket, not as offered, so a short write charges the remainder on
-its retry.
+**Outbound is ADMITTED before the bytes go out.** Every connection the
+transport dials shares one `OutboundSchedule` through its `WireMetering` clone,
+and so do the connections of every pool built from clones of one configured
+builder. A charge-after-accept bucket cannot cap a pool: each connection's
+first write is ungated whatever the shared balance owes, so redialing - or just
+running several connections at once - evades the cap entirely. That was this
+crate's design until admission replaced it; an earlier revision of this section
+also claimed the next connection paid a dropped connection's debt, which was
+never true.
 
-What IS clamped is how much a single write offers. `poll_write` trims its
-slice to `WireMetering::write_chunk_limit()` - one second of the cap in
-force, re-read per call - before handing it to the socket. This is the
-cap half of the write-timeout property above, and it is not the same
-thing as clamping the debt: a write at or under the limit still owes
-proportional time, so a low cap still holds. Without it a TCP socket with
-an autotuned send buffer accepts megabytes in one call, all of it is
-charged, and `throttle_out` parks a sleep of many seconds - which the
-NEXT write waits out inside the caller's per-operation write timeout, so
-a healthy capped upload fails as "SMTP write timed out" with every
-recipient `uncertain`. Bounding the offer bounds the parked debt at about
-a second, which keeps the write timeout a statement about the peer.
-`a_capped_write_offers_at_most_one_second_of_budget` pins the offer and
-the resulting debt together (async only - the clamp lives in
-`poll_write`). The blocking funnel needs no
-equivalent: `NetworkStream::charge` sleeps the thread outside
-`SO_SNDTIMEO`, so throttle debt never counts against a write deadline
-there.
+The schedule is one theoretical arrival time, `tat`, in SECONDS. A request for
+`o` bytes at cap `c` - where `o` is at most one second of the cap, `MAX_OFFER`
+(256 KiB) and the bytes the write has left - atomically takes
+`end = max(tat, now) + o/c`, moves `tat` to `end`, and may start once `end` is no
+more than one second ahead of now. An idle schedule therefore admits one second
+of cap at once and every byte after that waits its turn. The reservation is the
+atomic step that a balance check followed by a write is not; its wait happens
+afterwards, outside the lock. Durations round up, so truncation cannot creep the
+rate past the cap. Reservations are FIFO by request time with no head blocking:
+a waiter that is slow, unpolled or gone holds a span of time, not a place in a
+queue, so admission waits at most about one second per connection that held a
+reservation or allowance on the schedule when the waiter requested, plus one.
+That count is taken at request time, because an issued slot never moves.
 
-What outbound debt guarantees is that it gates the NEXT write, and nothing
-more. The cap is a RATE and the rate is enforced by the `ByteBucket`: bytes are
-debited the moment the socket accepts them, and the bucket is shared by every
-connection a transport dials. The parked `Sleep` is not the accounting, only
-the mechanism that holds the next transfer until the bucket has refilled. So a
-send that ends in debt RETURNS with that debt still parked - the DATA
-terminator is a write like any other - and `poll_flush` deliberately does not
-drain it. Flushing pays nothing back, since the bytes are already charged, so
-draining there would only add latency to a send that has finished, without
-changing the rate the cap enforces. A pooled connection recycled with debt
-parked is covered: the next checkout writes through the same `throttle_out`,
-which is exactly when the wait is owed.
-`outbound_throttle_debt_gates_the_next_write` pins it.
+Once admitted, a stream holds an ALLOWANCE and spends it without consulting the
+schedule again - that is what keeps every throttle wait outside the write
+timeout (see "Transport types"). Accepted bytes spend it; a short write keeps the
+rest for the next offer; the sink is told only about accepted bytes, never
+offered or reserved ones.
 
-**The gate is PER CONNECTION, and the cap is therefore evadable by
-reconnecting.** `throttle_out` lives on the stream while the `ByteBucket` is
-shared, and `poll_write` consults the bucket only AFTER the socket has accepted
-bytes, so a fresh connection's first write is ungated whatever the bucket owes.
-A caller that writes one cap-sized chunk, drops the connection and dials again
-never waits, and N concurrent connections can each pass a chunk against the
-same zero balance because none of them reserved anything. This predates the
-throttle-drain split and is not closed by it. An earlier revision of this
-section claimed the next connection pays the debt; that was wrong and is
-recorded here so it is not restated. Closing it needs shared ADMISSION -
-permission held against the balance that another connection cannot
-simultaneously obtain - and the two shapes that would provide it both carry a
-cost worth ruling on rather than picking: an exclusive lease held across a
-write makes one stalled peer block every other connection, while byte
-reservations let permits accumulate on stalled sockets and be exercised
-together later. Both shapes await a ruling; neither is built.
+The bound, for a fixed cap `c`: in any window of length `T`, accepted bytes are
+at most `c * (T + 1 + M)`, where `M` counts every live connection sharing the
+schedule. Each live connection holds at most one reservation or allowance of at
+most one second, and that is the `M` term: a write admitted on time and then
+held up by its socket can complete late, alongside writes admitted after it. A
+bound independent of the connection count is not on offer here; it would
+require either letting one stalled peer block its siblings or charging our own
+waiting to the peer's timeout, and both are worse than a burst proportional to
+the pool. The pool bounds `M`. The cap is a CEILING on the long-run rate, not a
+promise of throughput: cancellations, forfeited allowances and the fixed slots
+below can leave capacity unused.
 
-`ByteBucket` refills on `tokio::time::Instant`, not `std`'s, for the same
-reason `AsyncDeadline` does: the debt it returns is paid off by a
-`tokio::time::Sleep`, and a bucket reading a different clock from the timer
-that retires its debt is only accidentally right. Under `start_paused` test
-time it was not right at all - virtual waiting never refilled the bucket, so a
-paused-time test accumulated debt nothing could retire and any assertion about
-elapsed transfer time measured the artifact rather than the cap.
-`tokio::time::Instant::now()` falls back to the system clock when no tokio
-clock is in force, so the blocking funnel, which sleeps its own thread, is
-unaffected.
+A reservation dropped before it is used - a cancelled send, a setup deadline
+that ran out while it waited - gives its time back to requests made AFTER the
+drop. Slots already issued keep their deadlines, so cancellation never makes a
+waiter wait longer than had the cancelled write gone ahead, but it does not
+rescue one queued behind it either: a setup that would have timed out waiting
+behind a sibling still times out when that sibling is cancelled. Advancing
+issued slots would need a movable schedule and cross-waiter wakeups that none
+of these guarantees require. The bound above already counts outstanding
+reservations, which is what keeps the give-back from opening a burst. An installed allowance is never refunded: a stream abandoned mid-write is
+`Broken`, the pool drops it, and its unspent allowance stays charged because
+some of it may already have produced TLS ciphertext.
 
-The clamp is no longer the only thing standing between a cap and a
-spurious write timeout, and must not be relied on as if it were: the
-async write loop now drains parked outbound debt BEFORE arming the
-per-operation timeout, which is what makes the guarantee independent of
-the ratio between the timeout and one second (see "Transport types"). The
-clamp still earns its place - it keeps a single charge, and therefore a
-single uninterruptible throttle wait, bounded at about a second, which
-matters for cancellation granularity and for how much traffic one retune
-can be late to govern.
+A RETUNE never reprices committed time: a slot issued at the old cap keeps its
+place in seconds and the new cap prices only later requests. A reservation that
+waited through a cap cut is shrunk to one second of the new cap when installed -
+legal then, because nothing has been offered yet. After that the length is
+frozen whenever TLS needs it: an offer that returned `Pending` is retried at its
+original length, because OpenSSL refuses a retry after `WANT_WRITE` that is
+shorter than the pending write. The per-poll clamp this replaced re-read the cap
+on every poll and so could shrink exactly that retry. The one accounting
+exception follows from it: a write offered while UNCAPPED and still pending when
+a cap is imposed completes as offered, uncharged - at most one `MAX_OFFER` per
+live connection, once, at the moment of imposition, with no debt added. Lifting
+the cap releases admission waits within a second, since they wait in slices of
+at most a second and re-read the cap between them.
+
+Pinned by `a_second_connection_cannot_spend_the_first_connections_budget` and
+`a_second_connection_queues_behind_the_first` (the redial escape),
+`the_next_write_waits_for_its_slot`, `a_capped_write_offers_at_most_one_second_of_cap`,
+`a_pending_retry_keeps_its_length_when_a_cap_is_imposed`,
+`a_dropped_reservation_gives_its_time_back`, `an_installed_reservation_stays_charged`,
+`lowering_the_cap_does_not_reprice_time_already_committed` and
+`reservation_durations_round_up`.
+
+**Inbound charges after the fact.** Nothing can be gated before a read - the
+peer decides how much arrives - so a `ByteBucket` is debited by the bytes a read
+delivered and RETURNS the debt it wants slept, which serves both the async
+`poll_read` and the blocking `Read`. Tokens may go NEGATIVE, so a transfer larger
+than one second of budget owes proportional time instead of being clamped to one
+second (clamping would let a 1 B/s cap run at hundreds of B/s). The async funnel
+parks the debt as a `Sleep` in the stream; the blocking funnel sleeps its
+calling thread. Inbound keeps the per-connection shape the outbound side
+replaced, so a fresh connection's first read is ungated too; SMTP replies are
+small enough that this has not been worth building admission for.
+
+Both mechanisms read the cap fresh on every transfer, so a consumer can retune
+or lift it without reconnecting, and both run on `tokio::time::Instant`, not
+`std`'s, for the same reason `AsyncDeadline` does: their waits are paid by
+`tokio::time::Sleep`, and a schedule reading a different clock from the timer
+that pays it is only accidentally right. Under `start_paused` test time it was
+not right at all - virtual waiting never refilled the bucket, so a paused-time
+test accumulated debt nothing could retire. `tokio::time::Instant::now()` falls
+back to the system clock when no tokio clock is in force, so the blocking
+funnel, which sleeps its own thread, is unaffected.
 
 Bytes are counted as PLAINTEXT, not as ciphertext, and the gap is not
 negligible under a small cap. The meter sits in `AsyncNetworkStream` /
-`NetworkStream`, above native-tls, so `charge` never sees the record
-header, MAC or padding the TLS layer adds. The offer clamp makes each
-capped write about one second of cap, and each such write typically
+`NetworkStream`, above native-tls, so the meter never sees the record
+header, MAC or padding the TLS layer adds. Admission makes each capped
+write at most one second of cap, and each such write typically
 becomes its own TLS record, so the bytes actually on the wire exceed the
 cap by roughly one record's overhead (tens of bytes) per second of cap -
 negligible at a megabyte, around a third at a 100 B/s cap. Charging real
@@ -898,42 +920,39 @@ native-tls does not expose, so this is recorded rather than fixed. A
 consumer sizing a cap against a hard link budget should leave headroom
 accordingly.
 
-That bound survives a RETUNE, which it did not always. Tokens are BYTES
-and debt is read back as `-tokens / cap_now`, so lowering the cap between
-two charges re-priced debt already owed: 1 MB charged at a 1 MB/s cap is
-one second of debt, and re-reading it after `set_bandwidth_cap` dropped
-the cap to 1 KB/s made it about a thousand seconds - which the next write
-then waits out inside the per-operation write timeout, the exact failure
-the offer clamp exists to prevent. `ByteBucketState` therefore records
-the cap its balance is denominated in and rescales on the way in, so a
-standing balance keeps its value in SECONDS across a retune and the new
-cap governs only future traffic.
-`lowering_the_cap_does_not_reprice_debt_already_owed` pins it.
+Inbound debt survives a RETUNE in seconds too, which it did not always.
+Tokens are BYTES and debt is read back as `-tokens / cap_now`, so lowering
+the cap between two charges re-priced debt already owed: 1 MB charged at a
+1 MB/s cap is one second of debt, and re-reading it after
+`set_bandwidth_cap` dropped the cap to 1 KB/s made it about a thousand
+seconds. `ByteBucketState` therefore records the cap its balance is
+denominated in and rescales on the way in, so a standing balance keeps its
+value in SECONDS across a retune and the new cap governs only future
+traffic. `lowering_the_cap_does_not_reprice_inbound_debt_already_owed` pins
+it; the outbound schedule needs no rescaling, since it is denominated in
+seconds to begin with.
 
-Inbound and outbound are separate buckets: a large send must not throttle
-the reply to it. In the async funnel the parked debt is separate too -
-`throttle_in` and `throttle_out` are distinct `Sleep` slots, `poll_read`
-consults only the first and `poll_write` only the second. A single shared
-slot silently undid the separate buckets, because the debt parked by the
-final DATA-body write gated the read of the server's reply to it, spending
-the caller's per-operation read timeout on outbound debt.
-`outbound_throttle_debt_does_not_gate_the_next_read` pins that a read
-completes on its first poll while a write is still in debt.
+Inbound and outbound are separate budgets: a large send must not throttle
+the reply to it. In the async funnel `poll_read` consults only `throttle_in`
+and `poll_write` only its admission state. A single shared sleep slot once
+silently undid the separate budgets, because the debt parked by the final
+DATA-body write gated the read of the server's reply to it, spending the
+caller's per-operation read timeout on outbound throttling.
+`an_outbound_backlog_does_not_gate_the_next_read` pins that a read completes
+on its first poll while the outbound schedule is behind.
 
-Separate slots keep OUTBOUND debt off the read budget; they do nothing about
+That keeps OUTBOUND throttling off the read budget; it does nothing about
 INBOUND debt, which a reply's own bytes owe and which `poll_read` waits out
 where it sits. Keeping that off the per-reply deadline is the reader's job, not
 the funnel's - see "Per-reply read deadline". `drain_inbound_throttle` is the
-seam it uses, and unlike its outbound twin it RETURNS how long it waited,
-because the caller does not skip the deadline but repays it.
+seam it uses, and it RETURNS how long it waited, because the caller does not
+skip the deadline but repays it.
 
-The blocking funnel cannot deliver that property and is not claimed to.
-`NetworkStream::charge` sleeps the calling thread, and that thread is the
-same one that will issue the next read, so outbound debt necessarily
-delays it. Overlapping the two directions there would need a second thread
-or a non-blocking socket, neither of which belongs in a transport whose
-contract is "this call blocks". For a caller who needs the guarantee under
-a tight cap, the async half is the one that has it.
+The blocking funnel waits for outbound admission BEFORE each write, by sleeping
+its calling thread outside `SO_SNDTIMEO`, so the cap never counts against a
+write deadline and a read that follows a write is not delayed by it. Inbound
+debt is still slept between reads on the same thread, which is the semantic a
+caller of a transport whose contract is "this call blocks" has accepted.
 
 ## Error model
 

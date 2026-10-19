@@ -113,7 +113,7 @@ enum TimeoutBudget {
 ///   therefore paid INSIDE it - which needs no code at all, since `poll_read`
 ///   consults `throttle_in` itself - and debt that does not fit surfaces as a
 ///   read timeout inside the setup budget. Same ruling as the write loop's
-///   `drain_outbound_throttle_within`, reached from the other direction.
+///   `admit_outbound_within`, reached from the other direction.
 #[derive(Clone, Copy, Debug)]
 enum ReplyBudget {
     Own(AsyncDeadline),
@@ -1593,54 +1593,55 @@ impl AsyncSmtpConnection {
         Self::write_stream_with_budget(&mut self.stream, string, budget).await
     }
 
-    /// Pay off parked outbound throttle debt before a write timeout is armed.
+    /// Admit the next write against the outbound cap before a write timeout
+    /// is armed.
     ///
-    /// Whether the drain may run OUTSIDE the budget depends on which budget it
-    /// is, and the two variants answer differently - hence the exhaustive
-    /// match rather than one unconditional await.
+    /// Whether the admission wait may run OUTSIDE the budget depends on which
+    /// budget it is, and the two variants answer differently - hence the
+    /// exhaustive match rather than one unconditional await.
     ///
     /// - `PerOperation` is a bound on ONE write's dealings with the peer. The
-    ///   throttle wait is this crate's own, imposed at the consumer's request,
-    ///   so it is drained outside the bound; that is what makes the guarantee
+    ///   admission wait is this crate's own, imposed at the consumer's request,
+    ///   so it runs outside the bound; that is what makes the guarantee
     ///   independent of the ratio between the timeout and one second of cap,
-    ///   and what the blocking half gets for free by sleeping outside
-    ///   `SO_SNDTIMEO`.
+    ///   and what the blocking half gets by sleeping outside `SO_SNDTIMEO`.
     /// - `SetupDeadline` is an ABSOLUTE ceiling shared by DNS, connect, TLS,
-    ///   the banner and EHLO. Draining outside it does not spend the deadline,
+    ///   the banner and EHLO. Waiting outside it does not spend the deadline,
     ///   it WAITS PAST it: under a cap small enough to throttle a greeting, an
-    ///   EHLO write goes a byte at a time with a second of debt between bytes
-    ///   while the remaining setup budget is milliseconds, and the operation
-    ///   reports its timeout only after blowing through a ceiling the contract
-    ///   says it cannot exceed. So the drain is bounded by the slack left on
-    ///   the deadline, and a cap that cannot be paid inside the setup budget
-    ///   fails as a setup timeout instead of overrunning it.
+    ///   EHLO write waits a second per second of cap while the remaining setup
+    ///   budget is milliseconds, and the operation would report its timeout
+    ///   only after blowing through a ceiling the contract says it cannot
+    ///   exceed. So the wait is bounded by the slack left on the deadline, and
+    ///   admission that cannot come inside the setup budget fails as a setup
+    ///   timeout; the abandoned reservation gives its time back.
     ///
     /// The write and flush that follow re-read the slack for themselves,
     /// because `with_timeout` resolves a `SetupDeadline` at the moment it is
-    /// armed. Handing them a duration computed BEFORE the drain would give
-    /// back exactly the overrun this bounding exists to remove.
+    /// armed. Handing them a duration computed BEFORE the wait would give back
+    /// exactly the overrun this bounding exists to remove.
     ///
     /// Teardown does not pass through here: `teardown_budget()` builds a
     /// `PerOperation` budget and applies it directly to `stream.shutdown()`,
     /// never to a write.
-    async fn drain_outbound_throttle_within(
+    async fn admit_outbound_within(
         stream: &mut BufReader<AsyncNetworkStream>,
+        len: usize,
         budget: TimeoutBudget,
     ) -> Result<(), Error> {
         const MESSAGE: &str = "SMTP write timed out";
 
         match budget {
             TimeoutBudget::PerOperation(_) => {
-                stream.get_mut().drain_outbound_throttle().await;
+                stream.get_mut().admit_outbound(len).await;
                 Ok(())
             }
             TimeoutBudget::SetupDeadline(deadline) => match deadline.remaining(MESSAGE)? {
                 None => {
-                    stream.get_mut().drain_outbound_throttle().await;
+                    stream.get_mut().admit_outbound(len).await;
                     Ok(())
                 }
                 Some(remaining) => {
-                    tokio::time::timeout(remaining, stream.get_mut().drain_outbound_throttle())
+                    tokio::time::timeout(remaining, stream.get_mut().admit_outbound(len))
                         .await
                         .map_err(|_| error::timeout(MESSAGE))
                 }
@@ -1668,16 +1669,17 @@ impl AsyncSmtpConnection {
         // connect deadline is unaffected.
         //
         // Re-arming alone does NOT cover an outbound bandwidth cap, and must
-        // not be read as covering it: a write that hands the socket megabytes
-        // parks the whole charge as throttle debt. Two things hold that half.
-        // `AsyncNetworkStream::poll_write` clamps what it offers to one second
-        // of the cap in force, which bounds a single charge; and the debt that
-        // charge parks is drained HERE, before the timeout is armed, so a wait
-        // this crate imposed on itself is never charged to the budget that
-        // exists to judge the peer. Without the drain the clamp alone is only
-        // as good as the ratio between the timeout and one second, so any
-        // configured timeout at or below a second failed every capped write
-        // after the first.
+        // not be read as covering it. Each iteration therefore has two
+        // phases. Admission comes first, HERE, before the timeout is armed: it
+        // reserves at most one second of cap against the schedule every
+        // connection of this transport shares and waits for its slot, so a
+        // wait this crate imposed on itself is never charged to the budget
+        // that exists to judge the peer. The socket write then runs under the
+        // timeout against the installed allowance and never consults the
+        // schedule again, so a peer that accepts nothing still times out. A
+        // short write leaves the rest of the allowance for the next iteration,
+        // whose admission returns at once; the allowance never exceeds what
+        // this call has left to write, so a successful call spends it all.
         //
         // The consequence is worth stating where the re-arming happens, because
         // it is the exact shape the READ side went out of its way to close:
@@ -1698,7 +1700,7 @@ impl AsyncSmtpConnection {
         // repository owner's call, not this loop's.
         let mut rest = string;
         while !rest.is_empty() {
-            Self::drain_outbound_throttle_within(stream, budget).await?;
+            Self::admit_outbound_within(stream, rest.len(), budget).await?;
             let written =
                 with_timeout(budget, "SMTP write timed out", stream.get_mut().write(rest))
                     .await?
@@ -2197,8 +2199,8 @@ mod transcript_tests {
     /// exemption - "this wait is ours, not the peer's" - buys nothing here:
     /// leaving the ceiling is the whole failure. Debt is paid inside the setup
     /// budget and debt that does not fit fails as a timeout at the ceiling,
-    /// which is the same ruling `drain_outbound_throttle_within` makes on the
-    /// write side.
+    /// which is the same ruling `admit_outbound_within` makes on the write
+    /// side.
     ///
     /// The error is not the finding - postponing the deadline also ends in a
     /// timeout eventually. The elapsed time is: 300 ms of ceiling against
@@ -4325,12 +4327,11 @@ mod transcript_tests {
     /// because `SO_SNDTIMEO` is per `write(2)`.
     ///
     /// This is the SLOW-LINK half only. The bandwidth-cap half of the same
-    /// hazard - debt parked by one write being waited out inside the next
-    /// write's timeout - is held by the write loop draining that debt before it
-    /// arms the timeout, pinned by
+    /// hazard - a throttle wait spent inside a write's timeout - is held by the
+    /// write loop waiting for admission before it arms the timeout, pinned by
     /// `a_capped_upload_outlives_a_write_timeout_shorter_than_its_throttle_debt`
-    /// below, with the size of a single charge bounded in the socket funnel by
-    /// `a_capped_write_offers_at_most_one_second_of_budget`.
+    /// below, with the size of a single admission bounded in the socket funnel
+    /// by `a_capped_write_offers_at_most_one_second_of_cap`.
     #[tokio::test(crate = "tokio", start_paused = true)]
     async fn a_slow_but_progressing_body_upload_outlives_the_operation_timeout() {
         use crate::transport::smtp::test_support::SlowSinkPeer;
@@ -4363,16 +4364,16 @@ mod transcript_tests {
     /// A bandwidth cap must not consume the per-operation write timeout, at
     /// ANY timeout.
     ///
-    /// The offer clamp bounds a single write's parked debt at about one second
-    /// of cap, which keeps the timeout meaningful only while the timeout is
-    /// comfortably larger than a second. It is not: with a sub-second timeout,
-    /// every capped write after the first waited its parked debt inside
-    /// `with_timeout` and failed as "SMTP write timed out" - a healthy upload,
-    /// throttled by this crate at the consumer's own request, reported as a
-    /// dead peer with every recipient uncertain. The write loop drains its own
-    /// outbound debt before arming the timeout, so the budget is only ever
-    /// spent on the socket. The cap itself is unchanged: the upload below still
-    /// takes longer than the timeout, it just does not fail.
+    /// Bounding each write at about one second of cap keeps the timeout
+    /// meaningful only while the timeout is comfortably larger than a second.
+    /// It is not: with a sub-second timeout, every capped write after the first
+    /// once waited out its throttle inside `with_timeout` and failed as "SMTP
+    /// write timed out" - a healthy upload, throttled by this crate at the
+    /// consumer's own request, reported as a dead peer with every recipient
+    /// uncertain. The write loop waits for outbound admission before arming
+    /// the timeout, so the budget is only ever spent on the socket. The cap
+    /// itself is unchanged: the upload below still takes longer than the
+    /// timeout, it just does not fail.
     ///
     /// The elapsed assertion is a floor, not a duration: it says the upload
     /// was throttled past the timeout at all, which is what makes the
@@ -4417,64 +4418,67 @@ mod transcript_tests {
         );
     }
 
-    /// Park exactly one second of outbound throttle debt on a stream whose
-    /// peer then wedges for good.
+    /// A stream whose next write waits a little over a second for admission,
+    /// and whose peer then wedges for good.
     ///
-    /// Two writes at a 1000 B/s cap: the first burns the bucket's initial
-    /// second of tokens and owes nothing, the second owes a full second. No
-    /// virtual time passes while that happens, so the debt is exactly 1000 ms
-    /// and nothing refills it. The peer accepts those two writes and no more,
-    /// which is what lets the tests below make the write AFTER the drain fail
-    /// on its own - a second peer is not an option, since the stream owns one.
-    async fn stream_owing_one_second_of_debt() -> tokio::io::BufReader<AsyncNetworkStream> {
+    /// At a 1000 B/s cap the stream's own 1000-byte write spends the
+    /// schedule's second of credit, and a SIBLING connection sharing the same
+    /// metering holds the next second - returned so it stays held. The
+    /// stream's next write therefore queues behind both: a 21-byte EHLO waits
+    /// 1021 ms. The peer accepts the one write and no more, which is what lets
+    /// the tests below make the write AFTER admission fail on its own - a
+    /// second peer is not an option, since the stream owns one.
+    async fn stream_queued_behind_a_sibling() -> (
+        tokio::io::BufReader<AsyncNetworkStream>,
+        crate::transport::smtp::client::metering::Reservation,
+    ) {
         use std::sync::{Arc, atomic::AtomicU64};
 
         use crate::transport::smtp::client::metering::WireMetering;
         use crate::transport::smtp::test_support::SlowSinkPeer;
 
+        let metering = WireMetering::new(None, Some(Arc::new(AtomicU64::new(1000))));
         let mut stream = AsyncNetworkStream::from_raw_stream_for_test(Box::new(
-            SlowSinkPeer::accepting(2, 100_000),
+            SlowSinkPeer::accepting(1, 100_000),
         ));
-        stream.set_metering(WireMetering::new(
-            None,
-            Some(Arc::new(AtomicU64::new(1000))),
-        ));
+        stream.set_metering(metering.clone());
         let mut stream = tokio::io::BufReader::new(stream);
 
         AsyncSmtpConnection::write_stream_with_budget(
             &mut stream,
-            &vec![b'x'; 2_000],
+            &vec![b'x'; 1_000],
             TimeoutBudget::PerOperation(None),
         )
         .await
         .expect("an unbounded write cannot fail against a peer that is still accepting");
+        let sibling = metering.reserve_out(1_000).expect("capped");
 
-        stream
+        (stream, sibling)
     }
 
-    /// A drain that runs outside a `SetupDeadline` does not SPEND the
-    /// deadline, it waits PAST it.
+    /// An admission wait that runs outside a `SetupDeadline` does not SPEND
+    /// the deadline, it waits PAST it.
     ///
     /// The setup deadline is absolute and shared across DNS, connect, TLS, the
     /// banner and EHLO, so "this wait is ours, not the peer's" - the reason a
     /// per-operation write timeout may be left entirely - buys nothing here:
     /// leaving the ceiling is the whole failure. Under a cap small enough to
-    /// throttle a greeting, an EHLO write went a byte at a time with a second
-    /// of debt between bytes while the remaining setup budget was
-    /// milliseconds, and the connect eventually reported a timeout only after
-    /// blowing through the ceiling the contract says it cannot exceed. The
-    /// drain is therefore bounded by the slack left on the deadline, and debt
-    /// that cannot be paid inside the setup budget fails as a setup timeout.
+    /// throttle a greeting, an EHLO write waits for its slot while the
+    /// remaining setup budget is milliseconds, and the connect would report a
+    /// timeout only after blowing through the ceiling the contract says it
+    /// cannot exceed. The wait is therefore bounded by the slack left on the
+    /// deadline, and admission that cannot come inside the setup budget fails
+    /// as a setup timeout.
     ///
-    /// The ERROR is not what bites here - an unbounded drain also ends in a
+    /// The ERROR is not what bites here - an unbounded wait also ends in a
     /// timeout, because the write it eventually reaches finds the deadline
     /// already spent. The elapsed time is the whole finding: 300 ms of ceiling
-    /// against 1000 ms of debt.
+    /// against a 1021 ms wait.
     #[tokio::test(crate = "tokio", start_paused = true)]
-    async fn a_setup_deadline_bounds_the_throttle_drain_rather_than_waiting_past_it() {
-        let mut stream = stream_owing_one_second_of_debt().await;
+    async fn a_setup_deadline_bounds_the_admission_wait_rather_than_waiting_past_it() {
+        let (mut stream, _sibling) = stream_queued_behind_a_sibling().await;
 
-        // 300 ms of setup budget against a second of parked debt.
+        // 300 ms of setup budget against a slot a second away.
         let deadline = AsyncDeadline::new(Some(Duration::from_millis(300)));
         let started = tokio::time::Instant::now();
         let error = AsyncSmtpConnection::write_stream_with_budget(
@@ -4483,7 +4487,7 @@ mod transcript_tests {
             TimeoutBudget::SetupDeadline(deadline),
         )
         .await
-        .expect_err("debt that outlasts the setup budget must fail as a setup timeout");
+        .expect_err("admission that outlasts the setup budget must fail as a setup timeout");
 
         assert!(error.is_timeout(), "expected a timeout, got {error:?}");
         assert_eq!(
@@ -4493,22 +4497,22 @@ mod transcript_tests {
         );
     }
 
-    /// And the write after the drain gets the slack that is LEFT, recomputed.
+    /// And the write after admission gets the slack that is LEFT, recomputed.
     ///
-    /// The easy mistake in bounding the drain is to read the remaining slack
-    /// once, spend part of it on the drain, and then arm the write with that
-    /// same pre-drain duration - which hands back exactly the overrun the
-    /// bounding removed, just in smaller pieces. Passing the deadline itself
-    /// through is what avoids it: `with_timeout` resolves a `SetupDeadline` at
-    /// the moment it arms the timer.
+    /// The easy mistake in bounding the wait is to read the remaining slack
+    /// once, spend part of it waiting, and then arm the write with that same
+    /// pre-wait duration - which hands back exactly the overrun the bounding
+    /// removed, just in smaller pieces. Passing the deadline itself through is
+    /// what avoids it: `with_timeout` resolves a `SetupDeadline` at the moment
+    /// it arms the timer.
     #[tokio::test(crate = "tokio", start_paused = true)]
-    async fn the_write_after_a_bounded_drain_gets_the_recomputed_slack() {
-        // The peer has stopped accepting, so the write that follows the drain
+    async fn the_write_after_a_bounded_admission_gets_the_recomputed_slack() {
+        // The peer has stopped accepting, so the write that follows admission
         // ends on its own timeout and the total says which one it was armed
         // with.
-        let mut stream = stream_owing_one_second_of_debt().await;
+        let (mut stream, _sibling) = stream_queued_behind_a_sibling().await;
 
-        // 1200 ms total: 1000 ms of debt to drain, 200 ms left for the write.
+        // 1200 ms total: 1021 ms waiting for the slot, 179 ms left for the write.
         let deadline = AsyncDeadline::new(Some(Duration::from_millis(1_200)));
         let started = tokio::time::Instant::now();
         let error = AsyncSmtpConnection::write_stream_with_budget(
@@ -4523,7 +4527,7 @@ mod transcript_tests {
         assert_eq!(
             started.elapsed(),
             Duration::from_millis(1_200),
-            "the write must be armed with the slack left AFTER the drain, not before it"
+            "the write must be armed with the slack left AFTER admission, not before it"
         );
     }
 

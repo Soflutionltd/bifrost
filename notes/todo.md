@@ -163,59 +163,63 @@ PUBLISHED SURFACE fence apply.
   filed rather than fixed. Same shape applies to `pim`'s upload paths, but
   those are outbound and the tally is inbound-only.
 
-## The outbound cap is evadable by reconnecting
+## Bandwidth cap: what it means across the workspace
 
-Found by the cold review of the 2026-09-07 throttle work; PRE-EXISTING, and
-explicitly not introduced by it. `throttle_out` is per-stream while `ByteBucket`
-is shared, and `poll_write` consults the bucket only AFTER the socket has
-accepted bytes. So a fresh connection's first write is ungated whatever the
-bucket owes: write one cap-sized chunk, drop the connection, dial again, and the
-cap never binds. N concurrent connections can likewise each pass a chunk against
-the same zero balance, because none of them reserved anything - ordinary async
-interleaving is enough, no threads needed.
+Surfaced 2026-10-19 by a survey made while redesigning SMTP outbound
+admission. Not verified line by line; confirm against the code before
+working any of them.
 
-What that wave DID get wrong was the claim, since corrected in
-`reference/smtp.md` and at `poll_flush`, that the next connection pays the
-dropped connection's debt. It does not.
-
-The fix is a mechanism this crate does not have: shared ADMISSION, meaning
-permission held against the balance that a second connection cannot
-simultaneously obtain. Querying the shared deficit is NOT sufficient - other
-connections consume capacity between the query and the write - and the naive
-placement is actively wrong: a shared gate consulted inside `poll_write` sits
-inside `with_timeout` and re-creates smtp-CR11 one layer down, so admission
-waiting has to stay outside the per-operation timer (and inside the absolute
-deadline under a setup budget, with the write taking the recomputed slack).
-
-Two shapes, each with a cost that wants a ruling rather than a pick:
-
-- An exclusive lease held from the balance check through one socket write and
-  its charge. Closes the race, but one connection stalled on a write - forever,
-  under `timeout(None)` - then blocks every other connection. That is a new
-  dependency between connections and must be judged deliberately.
-- A byte reservation. Avoids exclusive ownership of the socket wait, but permits
-  acquired over time can accumulate on stalled sockets and all be exercised at
-  once, so a design promising bounded bursts has to bound outstanding admission
-  or revalidate it when writes actually progress.
-
-Either way: accepted-byte debt stays in the shared bucket and a dropped future
-must neither erase it nor pay it twice; settlement of a short write has to
-happen in the same poll that observes `Ready(Ok(n))`, before any await, since
-refunding an accepted write on drop re-opens the reconnect escape; and the
-connection-local `Sleep` can survive only as a cached wakeup, never as the
-authoritative gate, because a stale one waits inside `with_timeout` and is
-CR11 again.
-
-Scope notes for whoever builds it. The async application-write funnel is
-currently complete - every production async SMTP and LMTP write reaches
-`write_stream_with_budget`, which drains before each write - but three things
-sit outside it: the BLOCKING `NetworkStream::write` uses the same bucket
-implementation and writes before charging, so a universal contract needs both
-adapters; direct `AsyncNetworkStream` writes in tests bypass the connection
-drain, and would need the admission mechanism wherever they claim to exercise
-throttling; and TLS handshake, record overhead and shutdown traffic bypass
-plaintext accounting entirely. The honest guarantee is therefore about
-admission of METERED PLAINTEXT writes, not about every byte on the wire.
+- **The `Account::set_bandwidth_cap` contract is undefined.** The doc in
+  `crates/types/src/account.rs` says only "apply the engine's current
+  bandwidth cap"; it does not say per direction, per connection, or
+  combined across protocols. Every implementation happens to keep separate
+  in and out budgets. This is a ruling for the owner, and every item below
+  depends on it.
+- **Three separate token-bucket copies.** `bifrost-net` (`net.rs`,
+  sleeps itself), `bifrost-imap` (`connection/wire.rs`, sleeps itself) and
+  `bifrost-smtp` (`client/metering.rs`, debt-returning, with `priced_at`
+  repricing and the tokio clock). The SMTP one is the most complete.
+  Proposed once the contract is ruled: one debt-returning bucket in
+  `bifrost-net`, owned per account per direction by `AccountNet`, shared by
+  HTTP streams, IMAP connections and SMTP connections.
+- **The cap multiplies per HTTP stream.** `wrap_metered` and the
+  error / redirect drains build a fresh, full bucket per response, so N
+  concurrent downloads get N times the cap plus a free first second each.
+- **HTTP request bodies are never throttled.** Outbound bytes are recorded
+  in `request.rs` but never capped, so JMAP blob uploads and Graph sends
+  ignore the cap.
+- **The cap multiplies per IMAP connection.** Every pool dial and the
+  bootstrap connection build their own `WireMetering` from the account's
+  atomic, so a pool of N connections runs at about N times the cap, and a
+  redial starts with a full bucket.
+- **IMAP and SMTP share the cap value, not the budget.** An IMAP-shaped
+  account can fetch at the cap and send at the cap at once. The comment in
+  `crates/imap/src/account/submission.rs` claiming a send cannot burst past
+  a cap the fetch path is honouring claims more than the code does.
+- **The cap never reaches an IMAP account's CardDAV and CalDAV
+  sub-accounts.** `ImapAccount::set_bandwidth_cap` stores only the IMAP
+  atomic; `set_priority` does not forward either, and the DAV sub-accounts
+  keep their own `AccountNet`. A stale "until IMAP byte-metering is wired"
+  comment sits next to it.
+- **IMAP's bucket refills on `std::time::Instant` while sleeping on
+  tokio**, the paused-clock mismatch SMTP's bucket already fixed.
+- **`bifrost-net` clamps an oversized chunk's sleep at 60 seconds**, so a
+  very low cap is exceeded: the overrun the IMAP and SMTP buckets warn
+  against.
+- **A re-tagged `AccountNet` copies the cap instead of sharing it.** The
+  constructor that re-tags the account id builds a new `AtomicU64`, so a
+  later `set_bandwidth_cap` on one handle does not reach the other.
+- **SMTP's INBOUND cap is still per connection.** Outbound now goes
+  through shared admission (`OutboundSchedule` in
+  `crates/smtp/src/transport/smtp/client/metering.rs`); inbound keeps the
+  charge-after-read `ByteBucket` with a per-stream `throttle_in`, so a fresh
+  connection's first read is ungated whatever the shared balance owes.
+  Left out of the outbound change on purpose: SMTP replies are small, and
+  a read cannot be admitted before the peer decides how much arrives.
+  Whether it is worth closing is a ruling, not a defect fix.
+- **`AsyncLmtpTransportBuilder` has no `bandwidth_metering`.** Its
+  connections can carry metering, but the public builder offers no way to
+  configure it.
 
 ## Notes
 

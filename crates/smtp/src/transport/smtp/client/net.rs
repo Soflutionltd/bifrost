@@ -16,7 +16,7 @@ use native_tls::TlsStream;
 use socket2::SockAddr;
 use socket2::{Domain, Protocol, Type};
 
-use super::metering::WireMetering;
+use super::metering::{MAX_OFFER, WireMetering};
 use super::{ConnectionState, DEFAULT_TLS_HANDSHAKE_TIMEOUT, TlsParameters};
 use crate::transport::smtp::{Error, error};
 
@@ -45,6 +45,14 @@ pub(crate) struct NetworkStream {
     /// reaches the same place by postponing its `AsyncDeadline` around
     /// `drain_inbound_throttle`.
     inbound_throttle_slept: Duration,
+    /// Bytes this stream is admitted to write under the outbound cap and has
+    /// not written yet. The blocking twin of `AsyncNetworkStream`'s field of
+    /// the same name: reserved against the schedule every connection of the
+    /// transport shares, waited for by sleeping the thread BEFORE the write
+    /// (outside `SO_SNDTIMEO`, so the cap never counts against a write
+    /// deadline), and spent by accepted bytes. `write_all` re-offers the rest
+    /// of its buffer, so a short write leaves the remainder for its next call.
+    out_allowance: Option<usize>,
 }
 
 /// Represents the different types of underlying network streams
@@ -71,6 +79,34 @@ impl NetworkStream {
             state: ConnectionState::Ok,
             metering: WireMetering::disabled(),
             inbound_throttle_slept: Duration::ZERO,
+            out_allowance: None,
+        }
+    }
+
+    /// How many of `len` bytes the next write may offer, sleeping the thread
+    /// until the shared outbound schedule admits it.
+    ///
+    /// Sleeps in slices of at most a second, re-reading the cap after each, so
+    /// a cap lifted mid-wait releases the write within a second. The
+    /// reservation gives its time back if the cap is lifted before it is used.
+    fn admit_outbound(&mut self, len: usize) -> usize {
+        if let Some(allowance) = self.out_allowance {
+            return len.min(allowance);
+        }
+        let Some(reservation) = self.metering.reserve_out(len) else {
+            return len.min(MAX_OFFER);
+        };
+        loop {
+            let Some(cap) = self.metering.cap_now() else {
+                return len.min(MAX_OFFER);
+            };
+            let wait = reservation.remaining();
+            if wait.is_zero() {
+                let allowance = reservation.install(cap);
+                self.out_allowance = Some(allowance);
+                return len.min(allowance);
+            }
+            std::thread::sleep(wait.min(Duration::from_secs(1)));
         }
     }
 
@@ -85,10 +121,11 @@ impl NetworkStream {
         self.metering = metering;
     }
 
-    /// Record `n` transferred bytes and sleep off any debt the cap
+    /// Record `n` received bytes and sleep off any inbound debt the cap
     /// imposes. Blocking, matching this transport's contract.
     ///
-    /// `n` is PLAINTEXT bytes, never ciphertext. This stream sits above
+    /// `n` is PLAINTEXT bytes, never ciphertext, in both directions. This
+    /// stream sits above
     /// native-tls, so the record header, MAC and padding the TLS layer adds are
     /// never seen or charged, and the bytes actually on the wire exceed the cap
     /// by that overhead - negligible for large transfers, proportionally worse
@@ -96,20 +133,13 @@ impl NetworkStream {
     /// would mean putting this meter BELOW the TLS layer, which native-tls does
     /// not expose, so the gap is recorded rather than closed. A consumer sizing
     /// a cap against a hard link budget should leave headroom for it.
-    fn charge(&mut self, n: usize, inbound: bool) {
+    fn charge_in(&mut self, n: usize) {
         if n == 0 || !self.metering.is_enabled() {
             return;
         }
-        let debt = if inbound {
-            self.metering.record_in(n)
-        } else {
-            self.metering.record_out(n)
-        };
-        if let Some(debt) = debt {
+        if let Some(debt) = self.metering.record_in(n) {
             std::thread::sleep(debt);
-            if inbound {
-                self.inbound_throttle_slept = self.inbound_throttle_slept.saturating_add(debt);
-            }
+            self.inbound_throttle_slept = self.inbound_throttle_slept.saturating_add(debt);
         }
     }
 
@@ -381,13 +411,15 @@ impl Read for NetworkStream {
             Some(InnerNetworkStream::Transcript(s)) => s.read(buf),
             None => Err(not_connected()),
         }?;
-        self.charge(read, true);
+        self.charge_in(read);
         Ok(read)
     }
 }
 
 impl Write for NetworkStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let offer = self.admit_outbound(buf.len());
+        let buf = &buf[..offer];
         let written = match self.inner.as_mut() {
             Some(InnerNetworkStream::Tcp(s)) => s.write(buf),
             #[cfg(unix)]
@@ -397,8 +429,15 @@ impl Write for NetworkStream {
             Some(InnerNetworkStream::Transcript(s)) => s.write(buf),
             None => Err(not_connected()),
         }?;
-        // Charge what the socket accepted, not what was offered.
-        self.charge(written, false);
+        // The allowance is spent by what the socket accepted, not by what
+        // was offered; the sink sees only accepted bytes.
+        if let Some(allowance) = self.out_allowance {
+            let left = allowance.saturating_sub(written);
+            self.out_allowance = (left > 0).then_some(left);
+        }
+        if written > 0 {
+            self.metering.record_out(written);
+        }
         Ok(written)
     }
 
