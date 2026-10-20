@@ -418,6 +418,72 @@ lossless and consistent, but a consumer must not read a Graph contact's
 `kind` as "work"/"home", and a `kind` it writes appears as the address
 display name in Outlook.
 
+### Public contact books (EWS)
+
+`contacts/public.rs` implements the read-only public contact leg. After its
+REST contact-folder walk, `address_books_list` appends discovery-seeded,
+readable public folders whose `FolderClass` is `IPF.Contact` or a
+dot-separated subclass. `HierarchyOnly` and pins govern background sync,
+not this discoverability. Every public book has all three write flags false;
+account-wide contact write capabilities still describe the writable REST books.
+
+`foreign.rs` tags public contact collection ids as
+`public-contacts\u{1e}<folder>` and item ids as
+`public-contacts\u{1e}<folder>\u{1e}<item>`. The RS delimiter cannot occur in
+native EWS ids. Dispatch uses the tag before REST cursor decoding or route
+construction, independently of routing-map membership. Native ids and
+`ContactProvenance` remain bare EWS ids. A recognized public read with no
+routing entry refuses locally as `ConcurrencyConflict` with `Unsent`
+evidence (refresh local state), including after reopen before discovery.
+No public contact id falls back to REST.
+
+`contacts_list` requests contact properties over EWS `FindItem`, using the
+folder's content-mailbox headers. The provider-owned JSON cursor contains a
+versioned public-contact discriminator, native folder id and indexed offset.
+It is bound to that folder and, for search, the exact query. Search cursors
+also retain the consumed wire-row count when the caller's limit stops inside
+a page; resuming re-reads that page before advancing the server offset. A
+non-final response must supply a strictly advancing `IndexedPagingOffset`, including an empty projected page; missing
+or stalled offsets are `Protocol(ContractViolation)`, never exhaustion.
+The offset counts wire rows, including skipped distribution lists. Estimated
+totals are omitted because EWS counts those rows too.
+
+`ews/contacts.rs` supplies the Contact shape and XML field parser. Cards
+project display name, email and phone dictionaries (preserving native keys
+as labels), company/job title and physical addresses. Email dictionary entries
+retain `RoutingType`: only SMTP (case-insensitive) is emitted. When the
+attribute is absent, a bare address must parse with `email_address` (the same
+parser used by the SMTP crate), with display-name syntax disabled. Explicit
+EX, X400, unknown or empty routing types are omitted even when their values
+look like SMTP addresses. Omissions emit a counted `skipped_email_addresses`
+warning per card; logs contain no address values. Given name plus surname
+is the display-name fallback: `ContactCard` has no structured name fields.
+`FindItem` does not request Body; notes are projected if supplied, while
+`contact_get` explicitly requests the text Body through EWS `GetItem`.
+Photos are not projected. `GetItem` verifies the returned native identity,
+Contact wire kind, and `IPM.Contact` class or dot-separated subclass before
+projecting. Non-contact results, including distribution lists, refuse as
+`Unsupported(ContactGet)`. All EWS GetItem failures carry
+`ErrorScope::Contact` with the tagged contact id. EWS `ErrorItemNotFound`
+uses the scope's resource kind and id, yielding `NotFound(Contact)` here;
+existing message hydration/blob calls retain `NotFound(Message)`, as do
+unscoped streaming and cursor-scoped folder walks through their historical
+Message fallback.
+
+`ContactCard` has no group representation. Distribution lists are skipped
+by listing with a counted `skipped_dist_lists` tracing warning per page;
+no individual-person card is invented for a group. Public scoped
+`contact_search` uses the same EWS FindItem projection, routing, read-only
+policy and indexed paging as listing. A non-empty query adds an OR
+Restriction of `Contains` clauses with `Substring` / `IgnoreCase` over
+display name, given name, surname and indexed email addresses 1-3. The XML
+constant is escaped; an empty query enumerates the book without a
+Restriction. Result limits count projected contacts, not skipped groups.
+Unscoped and REST-scoped searches retain their existing behavior. Create,
+update and delete refuse `Unsupported(operation)` before any request for public ids,
+including an update targeting a public address book through its patch.
+The account-wide write capability flags remain available for personal books.
+
 ## `GraphAccount` / `GraphAccountFactory` shape and lifecycle
 
 The `account` module path is public (consumers construct the factory
@@ -2348,7 +2414,8 @@ exhausted" without them.
   With no baseline it cannot promise deletions, mail-to-non-mail retirement,
   sub-watermark non-mail-to-mail admission, in-place edits, or deduplication
   of scan additions (including timestamped additions during recovery). A scan below the cap restores tracking.
-  Public contacts and calendars remain separate follow-ups.
+  Public contacts are available through the typed read-only contact doors;
+  public calendars remain a follow-up.
 - EWS streaming requires EWS reachable with an accepted token; webhook mode
   needs a public HTTPS endpoint (else `Unsupported(PushSubscribe)`). EWS
   streaming currently supports primary-mailbox folders only: shared-mailbox

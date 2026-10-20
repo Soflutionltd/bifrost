@@ -1,3 +1,5 @@
+mod public;
+
 use bifrost_types::{
     AccountError, AccountOperation, AddressBook, AddressBookId, ContactAddress, ContactCard,
     ContactCorpus, ContactCreate, ContactEmail, ContactId, ContactOrganization, ContactPatch,
@@ -53,6 +55,7 @@ pub(crate) async fn address_books_list(
         next = admit_next(&account, &page, operation)?;
         books.extend(page.value.into_iter().map(folder_to_address_book));
     }
+    books.extend(public::books(&account).await);
     Ok(books)
 }
 
@@ -70,6 +73,12 @@ async fn contact_page(
     page_cursor: Option<Vec<u8>>,
     top: u32,
 ) -> Result<Page<ContactCard>, AccountError> {
+    if let Some(folder) = address_book
+        .as_ref()
+        .and_then(|id| super::foreign::parse_public_address_book(&id.0))
+    {
+        return public::list(&account, folder, page_cursor).await;
+    }
     let operation = AccountOperation::ContactsList;
     let url = match decode_link_cursor(&account, page_cursor, operation)? {
         Some(url) => url,
@@ -94,6 +103,9 @@ pub(crate) async fn get(
     account: GraphAccount,
     contact: ContactId,
 ) -> Result<ContactCard, AccountError> {
+    if let Some((folder, item)) = super::foreign::parse_public_contact(&contact.0) {
+        return public::get(&account, folder, item).await;
+    }
     let prefix = account.client.api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&contact.0);
     let path = format!("{prefix}/contacts/{encoded}?$select={CONTACT_SELECT}");
@@ -109,6 +121,15 @@ pub(crate) async fn create(
     account: GraphAccount,
     contact: ContactCreate,
 ) -> Result<ContactId, AccountError> {
+    if contact
+        .address_book_id
+        .as_ref()
+        .is_some_and(|id| super::foreign::parse_public_address_book(&id.0).is_some())
+    {
+        return Err(graph_error::unsupported_account_error(
+            AccountOperation::ContactCreate,
+        ));
+    }
     let path = create_url(&account, contact.address_book_id.as_ref());
     let created = account
         .client
@@ -127,6 +148,16 @@ pub(crate) async fn update(
     contact: ContactId,
     patch: ContactPatch,
 ) -> Result<(), AccountError> {
+    if super::foreign::parse_public_contact(&contact.0).is_some()
+        || patch
+            .address_book_id
+            .as_ref()
+            .is_some_and(|id| super::foreign::parse_public_address_book(&id.0).is_some())
+    {
+        return Err(graph_error::unsupported_account_error(
+            AccountOperation::ContactUpdate,
+        ));
+    }
     if patch.photo.is_some() {
         return Err(
             graph_error::unsupported_account_error(AccountOperation::ContactUpdate)
@@ -156,6 +187,11 @@ pub(crate) async fn update(
 }
 
 pub(crate) async fn delete(account: GraphAccount, contact: ContactId) -> Result<(), AccountError> {
+    if super::foreign::parse_public_contact(&contact.0).is_some() {
+        return Err(graph_error::unsupported_account_error(
+            AccountOperation::ContactDelete,
+        ));
+    }
     let current = get(account.clone(), contact.clone()).await?;
     let prefix = account.client.api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&contact.0);
@@ -175,6 +211,13 @@ pub(crate) async fn search(
     account: GraphAccount,
     request: ContactSearchRequest,
 ) -> Result<Page<ContactCard>, AccountError> {
+    if let Some(folder) = request
+        .address_book_id
+        .as_ref()
+        .and_then(|id| super::foreign::parse_public_address_book(&id.0))
+    {
+        return public::search(&account, folder, &request).await;
+    }
     let limit = request
         .limit
         .and_then(|limit| usize::try_from(limit).ok())

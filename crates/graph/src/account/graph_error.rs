@@ -427,14 +427,19 @@ fn soap_fault_to_account_error(
             }),
             false,
         ),
-        SoapFaultCode::ErrorItemNotFound => (
-            AccountErrorKind::NotFound(ResourceKind::Message),
-            Cause::Request(RequestCause::NotFound {
-                what: ResourceKind::Message,
-                id: id_from_scope(ctx.scope.as_ref()),
-            }),
-            false,
-        ),
+        SoapFaultCode::ErrorItemNotFound => {
+            // Unscoped streaming and folder walks retain the historical item
+            // fallback; typed hydration identifies the actual resource.
+            let resource = resource.unwrap_or(ResourceKind::Message);
+            (
+                AccountErrorKind::NotFound(resource),
+                Cause::Request(RequestCause::NotFound {
+                    what: resource,
+                    id: id_from_scope(ctx.scope.as_ref()),
+                }),
+                false,
+            )
+        }
         // A streaming subscription is intentionally short lived. These
         // server codes mean the current stream must be discarded and the
         // outer worker must Subscribe again, not that the account contract
@@ -2867,6 +2872,48 @@ mod tests {
             err.kind(),
             AccountErrorKind::NotFound(ResourceKind::Message)
         ));
+    }
+
+    #[test]
+    fn nc2b_review_ews_not_found_keeps_existing_mail_read_and_unscoped_defaults() {
+        let message = ErrorScope::Message {
+            id: "public-message".into(),
+        };
+        for (operation, scope) in [
+            (AccountOperation::Hydrate, Some(message.clone())),
+            (AccountOperation::HydrateMessage, Some(message.clone())),
+            (AccountOperation::OpenBlob, Some(message.clone())),
+            (
+                AccountOperation::SyncInventory,
+                Some(ErrorScope::Cursor(CursorScope::Folder(
+                    bifrost_types::FolderId("public-folder".into()),
+                ))),
+            ),
+            (
+                AccountOperation::SyncChanges,
+                Some(ErrorScope::Cursor(CursorScope::Folder(
+                    bifrost_types::FolderId("public-folder".into()),
+                ))),
+            ),
+            (AccountOperation::PushStream, None),
+        ] {
+            let error = ews_error_to_account_error(
+                EwsError::SoapFault {
+                    code: SoapFaultCode::ErrorItemNotFound,
+                    detail: DiagnosticText::support_only("gone".to_string()),
+                },
+                GraphErrorContext {
+                    scope: scope.clone(),
+                    ..GraphErrorContext::ews(operation)
+                },
+            );
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::NotFound(ResourceKind::Message)
+            );
+            assert_eq!(error.scope(), scope.as_ref());
+            assert!(error.chain().iter().any(|cause| matches!(cause, Cause::Request(RequestCause::NotFound { what: ResourceKind::Message, id }) if id.as_deref() == if scope.as_ref() == Some(&message) { Some("public-message") } else { None })));
+        }
     }
 
     #[test]

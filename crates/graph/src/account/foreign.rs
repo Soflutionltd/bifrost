@@ -267,6 +267,27 @@ pub(crate) fn parse_message_id(id: &ObjectId) -> ParsedMessageId {
     }
 }
 
+/// Typed public contact collections and items carry a namespace tag even
+/// before discovery has populated routing. Native EWS ids never contain RS.
+pub(crate) fn public_address_book(folder: &str) -> bifrost_types::AddressBookId {
+    bifrost_types::AddressBookId(format!("public-contacts{PUBLIC_SEP}{folder}"))
+}
+
+pub(crate) fn public_contact(folder: &str, item: &str) -> bifrost_types::ContactId {
+    bifrost_types::ContactId(format!(
+        "{}{PUBLIC_SEP}{item}",
+        public_address_book(folder).0
+    ))
+}
+
+pub(crate) fn parse_public_address_book(id: &str) -> Option<&str> {
+    id.strip_prefix("public-contacts\u{1e}")
+}
+
+pub(crate) fn parse_public_contact(id: &str) -> Option<(&str, &str)> {
+    parse_public_address_book(id).map(|tail| tail.split_once(PUBLIC_SEP).unwrap_or((tail, "")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

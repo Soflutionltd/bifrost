@@ -1,4 +1,5 @@
 mod client;
+pub(crate) mod contacts;
 mod ops;
 mod parse;
 mod xml_helpers;

@@ -23,6 +23,7 @@ bifrost-net = { path = "../net" }
 bifrost-types = { path = "../types" }
 bytes = { workspace = true }
 jiff = { workspace = true }
+email_address = { version = "0.2.1", default-features = false }
 futures = { workspace = true }
 getrandom = { workspace = true }
 quick-xml = "0.42.0"

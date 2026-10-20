@@ -71,13 +71,10 @@ public-folder containers, EWS public-folder hydration, allowlisted public-folder
 scopes). Each was deliberately out of that brick's scope; none blocks the
 container projection itself.
 
-- **nc-2a (graph, remaining stages)** Stage B: public Contacts folders on
-  `address_books_list` / `contacts_list` / `contact_get` / `contact_search`
-  through a tagged public collection codec. Read-only: every write door is
-  `Unsupported`; missing routing must never become a REST request.
-  Stage C: public Calendar folders through EWS CalendarView with
-  window-splitting continuation, classified failure on unpageable density,
-  and per-occurrence ids resolvable by `event_get`. Read-only, including RSVP.
+- **nc-2a (graph, remaining stage)** Stage C: public Calendar folders through
+  EWS CalendarView with window-splitting continuation, classified failure on
+  unpageable density, and per-occurrence ids resolvable by `event_get`.
+  Read-only, including RSVP.
 
 ## Open items folded in from the bug-hunt ledgers (2026-08-23)
 
