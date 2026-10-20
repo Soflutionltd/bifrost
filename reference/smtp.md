@@ -769,10 +769,20 @@ deadline after waiting. Blocking admission uses the synchronous reserve/offer
 API and sleeps the calling thread in slices of at most one second, checking
 policy between slices. No Tokio runtime is required by the blocking transport.
 
-IMAP submission shares the account meter and a submission budget across its SMTP
-connections. `set_bandwidth_cap` updates that budget alongside the IMAP cap
-atomic. IMAP socket admission itself continues to use its existing atomic path;
-it does not share the submission schedule.
+IMAP submission and IMAP connections share the account meter and one
+`BandwidthBudget`, including its inbound and outbound admission schedules.
+`set_bandwidth_cap` updates that shared budget, so traffic on either protocol
+contends with the other and observes live cap changes.
+
+The non-default `test-support` feature implies `tokio` and exposes
+`transport::smtp::Transcript` and `ScriptedConnector`. Both async transport
+builders accept `scripted_connector`; its factory must create a fresh transcript
+for each pooled connection because transcript clones share consumption state.
+The peer accumulates partial client writes before releasing a scripted reply.
+It replaces stream creation before the normal metering installation and retains
+the shared setup deadline, greeting, EHLO/LHLO and authentication path. Scripted
+connectors require plaintext configuration; TLS and Unix socket configurations
+are rejected.
 
 ## Error model
 

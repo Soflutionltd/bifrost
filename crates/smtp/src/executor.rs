@@ -41,14 +41,20 @@ pub(crate) trait SpawnHandle: Debug + Send + Sync + 'static + private::Sealed {
     fn shutdown(&self) -> impl Future<Output = ()> + Send + '_;
 }
 
+pub(crate) struct ConnectionOptions {
+    pub(crate) protocol: Protocol,
+    pub(crate) metering: WireMetering,
+    #[cfg(feature = "test-support")]
+    pub(crate) connector: Option<crate::transport::smtp::test_support::ScriptedConnector>,
+}
+
 pub(crate) trait SmtpExecutor: Executor {
     // Keep SMTP dialing out of the public `Executor` trait. Public async
     // transport constructors intentionally use this private sealed bound, so
     // those call sites carry `#[allow(private_bounds)]`.
     //
-    // Every parameter is one field of the transport's dial configuration.
-    // Bundling them into a struct would buy nothing here: this is a
-    // crate-private trait with exactly one implementor and one caller.
+    // Connection options carry protocol policy and the optional scripted dial
+    // alongside metering, keeping the dial signature stable across features.
     #[allow(clippy::too_many_arguments)]
     fn connect<'a>(
         hostname: &'a str,
@@ -57,8 +63,7 @@ pub(crate) trait SmtpExecutor: Executor {
         timeout: Option<Duration>,
         hello_name: &'a ClientId,
         tls: &'a Tls,
-        protocol: Protocol,
-        metering: WireMetering,
+        connection: ConnectionOptions,
     ) -> impl Future<Output = Result<AsyncSmtpConnection, Error>> + Send + 'a;
 }
 
@@ -94,6 +99,7 @@ impl Executor for TokioExecutor {
 
 #[cfg(feature = "tokio")]
 impl SmtpExecutor for TokioExecutor {
+    #[allow(clippy::too_many_arguments)]
     async fn connect(
         hostname: &str,
         port: u16,
@@ -101,9 +107,20 @@ impl SmtpExecutor for TokioExecutor {
         timeout: Option<Duration>,
         hello_name: &ClientId,
         tls: &Tls,
-        protocol: Protocol,
-        metering: WireMetering,
+        connection: ConnectionOptions,
     ) -> Result<AsyncSmtpConnection, Error> {
+        let ConnectionOptions {
+            protocol,
+            metering,
+            #[cfg(feature = "test-support")]
+            connector,
+        } = connection;
+        #[cfg(feature = "test-support")]
+        if connector.is_some() && (!matches!(tls, Tls::None) || unix_socket.is_some()) {
+            return Err(crate::transport::smtp::error::invalid_input(
+                "scripted connectors require plaintext TCP configuration",
+            ));
+        }
         if let Some(path) = unix_socket {
             #[cfg(unix)]
             {
@@ -140,6 +157,8 @@ impl SmtpExecutor for TokioExecutor {
             None,
             protocol,
             metering,
+            #[cfg(feature = "test-support")]
+            connector,
         )
         .await?;
 

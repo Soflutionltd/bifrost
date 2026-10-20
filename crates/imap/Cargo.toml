@@ -44,6 +44,7 @@ tracing = { workspace = true, features = ["std"] }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+bifrost-smtp = { path = "../smtp", features = ["test-support"] }
 bifrost-net = { path = "../net", features = ["test-support"] }
 pretty_assertions = "1.2"
 proptest = "1"

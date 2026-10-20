@@ -139,7 +139,7 @@ pub(crate) trait AsyncTokioStream:
 impl AsyncTokioStream for TcpStream {}
 #[cfg(unix)]
 impl AsyncTokioStream for TokioUnixStream {}
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl AsyncTokioStream for crate::transport::smtp::test_support::AsyncTranscriptStream {}
 #[cfg(test)]
 impl AsyncTokioStream for crate::transport::smtp::test_support::StalledPeer {}
@@ -162,7 +162,7 @@ enum InnerAsyncNetworkStream {
     /// Encrypted Tokio 1.x TCP stream
     TokioNativeTls(TokioTlsStream<Box<dyn AsyncTokioStream>>),
     /// Test-only scripted in-process peer.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     Transcript(Box<dyn AsyncTokioStream>),
     /// Can't be built
     None,
@@ -234,7 +234,7 @@ impl AsyncNetworkStream {
         self.test_peer_certificate_der = Some(der);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn from_transcript(
         transcript: crate::transport::smtp::test_support::Transcript,
     ) -> Self {
@@ -407,7 +407,7 @@ impl AsyncNetworkStream {
             #[cfg(unix)]
             InnerAsyncNetworkStream::TokioUnix(_) => false,
             InnerAsyncNetworkStream::TokioNativeTls(_) => true,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             InnerAsyncNetworkStream::Transcript(_) => false,
             InnerAsyncNetworkStream::None => false,
         }
@@ -462,7 +462,7 @@ impl AsyncRead for AsyncNetworkStream {
             #[cfg(unix)]
             InnerAsyncNetworkStream::TokioUnix(s) => Pin::new(s).poll_read(cx, buf_for_peer),
             InnerAsyncNetworkStream::TokioNativeTls(s) => Pin::new(s).poll_read(cx, buf_for_peer),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             InnerAsyncNetworkStream::Transcript(s) => Pin::new(s).poll_read(cx, buf_for_peer),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
@@ -506,7 +506,7 @@ impl AsyncWrite for AsyncNetworkStream {
             #[cfg(unix)]
             InnerAsyncNetworkStream::TokioUnix(s) => Pin::new(s).poll_write(cx, buf),
             InnerAsyncNetworkStream::TokioNativeTls(s) => Pin::new(s).poll_write(cx, buf),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             InnerAsyncNetworkStream::Transcript(s) => Pin::new(s).poll_write(cx, buf),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
@@ -537,7 +537,7 @@ impl AsyncWrite for AsyncNetworkStream {
             #[cfg(unix)]
             InnerAsyncNetworkStream::TokioUnix(s) => Pin::new(s).poll_flush(cx),
             InnerAsyncNetworkStream::TokioNativeTls(s) => Pin::new(s).poll_flush(cx),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             InnerAsyncNetworkStream::Transcript(s) => Pin::new(s).poll_flush(cx),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
@@ -554,7 +554,7 @@ impl AsyncWrite for AsyncNetworkStream {
             #[cfg(unix)]
             InnerAsyncNetworkStream::TokioUnix(s) => Pin::new(s).poll_shutdown(cx),
             InnerAsyncNetworkStream::TokioNativeTls(s) => Pin::new(s).poll_shutdown(cx),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             InnerAsyncNetworkStream::Transcript(s) => Pin::new(s).poll_shutdown(cx),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");

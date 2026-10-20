@@ -3,10 +3,15 @@
 //! no threads and no sleeps in this module, so a test can never fail because
 //! of a port, a socket path or the scheduler.
 
-use std::{collections::VecDeque, time::Duration};
+use std::collections::VecDeque;
+#[cfg(test)]
+use std::time::Duration;
 
+// Public only through the feature-gated re-export; unit tests also build it
+// without that feature.
+#[cfg_attr(not(feature = "test-support"), allow(unreachable_pub))]
 #[derive(Clone, Debug)]
-pub(super) struct Transcript {
+pub struct Transcript {
     shared: std::sync::Arc<std::sync::Mutex<TranscriptState>>,
 }
 
@@ -34,6 +39,7 @@ struct TranscriptState {
     /// The transcript never enforces them - it has no clock - but recording
     /// them is how the per-reply deadline (as opposed to a per-line one) is
     /// observable hermetically.
+    #[cfg(test)]
     read_timeouts: Vec<Option<Duration>>,
 }
 
@@ -44,15 +50,17 @@ struct TranscriptStep {
     stall: bool,
     coalesced: bool,
     close: bool,
+    matched: usize,
 }
 
+#[cfg_attr(not(feature = "test-support"), allow(unreachable_pub))]
 impl Transcript {
-    pub(super) fn new(greeting: impl AsRef<[u8]>) -> Self {
+    pub fn new(greeting: impl AsRef<[u8]>) -> Self {
         Self::with_state(greeting.as_ref().iter().copied().collect(), false)
     }
 
     /// A peer that accepts the connection and never sends its banner.
-    #[cfg(feature = "tokio")]
+    #[cfg(all(test, feature = "tokio"))]
     pub(super) fn silent() -> Self {
         Self::with_state(VecDeque::new(), true)
     }
@@ -67,16 +75,17 @@ impl Transcript {
                 closed: false,
                 #[cfg(feature = "tokio")]
                 shutdown_stalled: false,
+                #[cfg(test)]
                 read_timeouts: Vec::new(),
             })),
         }
     }
 
-    pub(super) fn expect(self, client: impl AsRef<[u8]>, server: impl AsRef<[u8]>) -> Self {
+    pub fn expect(self, client: impl AsRef<[u8]>, server: impl AsRef<[u8]>) -> Self {
         self.push(client, server, false, false, false)
     }
 
-    #[cfg(feature = "tokio")]
+    #[cfg(all(test, feature = "tokio"))]
     pub(super) fn stall_shutdown(self) -> Self {
         self.shared
             .lock()
@@ -92,6 +101,7 @@ impl Transcript {
     /// write fails the way a write to a closed socket does. That is the
     /// difference from `expect_then_stall`, where the peer stays
     /// connected and simply never answers.
+    #[cfg(test)]
     pub(super) fn expect_then_close(
         self,
         client: impl AsRef<[u8]>,
@@ -104,6 +114,7 @@ impl Transcript {
     /// TCP stack coalesces adjacent replies. A `BufReader` over the stream
     /// therefore prefetches all of them, which is how the driver can observe
     /// bytes it did not ask for without a blocking read.
+    #[cfg(test)]
     pub(super) fn expect_coalesced(
         self,
         client: impl AsRef<[u8]>,
@@ -113,7 +124,7 @@ impl Transcript {
     }
 
     /// Accept the client bytes, then never answer.
-    #[cfg(feature = "tokio")]
+    #[cfg(all(test, feature = "tokio"))]
     pub(super) fn expect_then_stall(self, client: impl AsRef<[u8]>) -> Self {
         self.push(client, b"", true, false, false)
     }
@@ -136,12 +147,14 @@ impl Transcript {
                 stall,
                 coalesced,
                 close,
+                matched: 0,
             });
         self
     }
 
     /// Every read timeout armed on this transcript's stream since the last
     /// call, in order, clearing the record.
+    #[cfg(test)]
     pub(super) fn take_read_timeouts(&self) -> Vec<Option<Duration>> {
         std::mem::take(&mut self.shared.lock().expect("transcript lock").read_timeouts)
     }
@@ -152,7 +165,7 @@ impl Transcript {
         }
     }
 
-    pub(super) fn assert_exhausted(&self) {
+    pub fn assert_exhausted(&self) {
         let state = self.shared.lock().expect("transcript lock");
         assert!(
             state.steps.is_empty(),
@@ -180,6 +193,7 @@ pub(super) struct TranscriptStream {
 impl TranscriptStream {
     /// Records the timeout the driver armed. The transcript has no clock, so
     /// nothing is enforced; the record is the observable.
+    #[cfg(test)]
     pub(super) fn record_read_timeout(&self, duration: Option<Duration>) {
         self.transcript
             .shared
@@ -248,23 +262,30 @@ impl std::io::Write for TranscriptStream {
                 "SMTP client wrote before draining the scripted server replies",
             ));
         }
-        let Some(step) = state.steps.pop_front() else {
+        let Some(step) = state.steps.front_mut() else {
             return Err(std::io::Error::other(
                 "SMTP transcript exhausted by client write",
             ));
         };
-        if step.client != buf {
+        let count = buf.len().min(step.client.len() - step.matched);
+        if step.client[step.matched..step.matched + count] != buf[..count] {
             return Err(std::io::Error::other(format!(
-                "unexpected SMTP client bytes: expected {:?}, got {:?}",
+                "unexpected SMTP client bytes: expected {:?} at {}, got {:?}",
                 String::from_utf8_lossy(&step.client),
+                step.matched,
                 String::from_utf8_lossy(buf)
             )));
         }
+        step.matched += count;
+        if step.matched != step.client.len() {
+            return Ok(count);
+        }
+        let step = state.steps.pop_front().expect("completed step");
         state.pending_server_bytes.extend(step.server);
         state.stalled = step.stall;
         state.coalesced = step.coalesced;
         state.closed = step.close;
-        Ok(buf.len())
+        Ok(count)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -280,7 +301,7 @@ impl std::io::Write for TranscriptStream {
 /// with no wall-clock cost. That is what distinguishes a per-reply read
 /// deadline from a per-line one: the per-line arm gives every line a fresh
 /// full timeout and never fires, while one deadline across the reply does.
-#[cfg(feature = "tokio")]
+#[cfg(all(test, feature = "tokio"))]
 #[derive(Debug)]
 pub(super) struct SlowLinePeer {
     lines: VecDeque<Vec<u8>>,
@@ -294,7 +315,7 @@ pub(super) struct SlowLinePeer {
     next: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(all(test, feature = "tokio"))]
 impl SlowLinePeer {
     pub(super) fn new<I: IntoIterator<Item = &'static str>>(lines: I, gap: Duration) -> Self {
         Self {
@@ -322,7 +343,7 @@ impl SlowLinePeer {
     }
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(all(test, feature = "tokio"))]
 impl tokio::io::AsyncRead for SlowLinePeer {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -345,7 +366,7 @@ impl tokio::io::AsyncRead for SlowLinePeer {
     }
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(all(test, feature = "tokio"))]
 impl tokio::io::AsyncWrite for SlowLinePeer {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
@@ -421,7 +442,7 @@ mod slow_line_tests {
 /// things a write timeout has to tell apart - the async half must survive the
 /// first and still fail the second, which is what `SO_SNDTIMEO` gives the
 /// blocking half for free by being per `write(2)`.
-#[cfg(feature = "tokio")]
+#[cfg(all(test, feature = "tokio"))]
 #[derive(Debug)]
 pub(super) struct SlowSinkPeer {
     /// Bytes accepted per `gap`. `None` means the peer never accepts anything.
@@ -442,7 +463,7 @@ pub(super) struct SlowSinkPeer {
     next: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(all(test, feature = "tokio"))]
 impl SlowSinkPeer {
     pub(super) fn new(chunk: usize, gap: Duration) -> Self {
         Self {
@@ -475,7 +496,7 @@ impl SlowSinkPeer {
     }
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(all(test, feature = "tokio"))]
 impl tokio::io::AsyncRead for SlowSinkPeer {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -486,7 +507,7 @@ impl tokio::io::AsyncRead for SlowSinkPeer {
     }
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(all(test, feature = "tokio"))]
 impl tokio::io::AsyncWrite for SlowSinkPeer {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
@@ -570,11 +591,11 @@ mod slow_sink_tests {
 /// only thing that may resume the caller is the caller's own deadline. Reads
 /// park with no waker registered, exactly as `AsyncTranscriptStream` does for
 /// a stalled step, so nothing but a timeout or a cancellation can wake it.
-#[cfg(feature = "tokio")]
+#[cfg(all(test, feature = "tokio"))]
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct StalledPeer;
 
-#[cfg(feature = "tokio")]
+#[cfg(all(test, feature = "tokio"))]
 impl tokio::io::AsyncRead for StalledPeer {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -585,7 +606,7 @@ impl tokio::io::AsyncRead for StalledPeer {
     }
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(all(test, feature = "tokio"))]
 impl tokio::io::AsyncWrite for StalledPeer {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
@@ -681,6 +702,94 @@ impl tokio::io::AsyncWrite for AsyncTranscriptStream {
             std::task::Poll::Pending
         } else {
             std::task::Poll::Ready(Ok(()))
+        }
+    }
+}
+
+/// Creates an independent in-memory peer for each new pooled connection.
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub struct ScriptedConnector(std::sync::Arc<dyn Fn() -> Transcript + Send + Sync>);
+
+#[cfg(feature = "test-support")]
+impl std::fmt::Debug for ScriptedConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ScriptedConnector")
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl ScriptedConnector {
+    /// The factory must return a fresh transcript, rather than cloning one.
+    pub fn new(factory: impl Fn() -> Transcript + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(factory))
+    }
+
+    pub(crate) fn connect(&self) -> Transcript {
+        (self.0)()
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod connector_tests {
+    use super::*;
+    use crate::transport::smtp::extension::ClientId;
+    use crate::{AsyncLmtpTransport, AsyncSmtpTransport, TokioExecutor};
+
+    #[tokio::test]
+    async fn scripted_connector_creates_independent_smtp_and_lmtp_connections() {
+        for _ in 0..2 {
+            let connector = ScriptedConnector::new(|| {
+                Transcript::new("220 peer\r\n")
+                    .expect("EHLO client\r\n", "250 peer\r\n")
+                    .expect("NOOP\r\n", "250 ok\r\n")
+            });
+            let smtp = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("invalid")
+                .hello_name(ClientId::Domain("client".into()))
+                .scripted_connector(connector.clone())
+                .build::<TokioExecutor>();
+            assert!(smtp.test_connection().await.unwrap());
+            let smtp = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("invalid")
+                .hello_name(ClientId::Domain("client".into()))
+                .scripted_connector(connector)
+                .build::<TokioExecutor>();
+            assert!(smtp.test_connection().await.unwrap());
+        }
+        let lmtp = AsyncLmtpTransport::<TokioExecutor>::builder_dangerous("invalid")
+            .hello_name(ClientId::Domain("client".into()))
+            .scripted_connector(ScriptedConnector::new(|| {
+                Transcript::new("220 peer\r\n")
+                    .expect("LHLO client\r\n", "250 peer\r\n")
+                    .expect("NOOP\r\n", "250 ok\r\n")
+            }))
+            .build::<TokioExecutor>();
+        assert!(lmtp.test_connection().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn scripted_connector_rejects_tls_before_creating_peer() {
+        for starttls in [false, true] {
+            let connector = ScriptedConnector::new(|| panic!("TLS must reject before dial"));
+            let smtp = if starttls {
+                AsyncSmtpTransport::<TokioExecutor>::starttls_relay("example.com").unwrap()
+            } else {
+                AsyncSmtpTransport::<TokioExecutor>::relay("example.com").unwrap()
+            }
+            .scripted_connector(connector.clone())
+            .build::<TokioExecutor>();
+            assert!(smtp.test_connection().await.is_err());
+            let parameters =
+                crate::transport::smtp::client::TlsParameters::new("example.com".into()).unwrap();
+            let tls = if starttls {
+                crate::transport::smtp::client::Tls::Required(parameters)
+            } else {
+                crate::transport::smtp::client::Tls::Wrapper(parameters)
+            };
+            let lmtp = AsyncLmtpTransport::<TokioExecutor>::builder_dangerous("invalid")
+                .tls(tls)
+                .scripted_connector(connector)
+                .build::<TokioExecutor>();
+            assert!(lmtp.test_connection().await.is_err());
         }
     }
 }

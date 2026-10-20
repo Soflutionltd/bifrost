@@ -182,6 +182,23 @@ impl SubmissionTransport {
         meter: Option<bifrost_net::MeterSinkHandle>,
         bandwidth_budget: bifrost_net::BandwidthBudget,
     ) -> Result<Self, crate::Error> {
+        Self::build_with_connector(
+            cfg,
+            imap_credentials,
+            meter,
+            bandwidth_budget,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn build_with_connector(
+        cfg: &SmtpSubmissionConfig,
+        imap_credentials: &Credentials,
+        meter: Option<bifrost_net::MeterSinkHandle>,
+        bandwidth_budget: bifrost_net::BandwidthBudget,
+        #[cfg(test)] connector: Option<bifrost_smtp::transport::smtp::ScriptedConnector>,
+    ) -> Result<Self, crate::Error> {
         let credentials = resolve_credentials(cfg, imap_credentials);
         let port = cfg.port.unwrap_or_else(|| cfg.tls.default_port());
 
@@ -216,6 +233,10 @@ impl SubmissionTransport {
             builder = builder.pool_config(pool.clone());
         }
 
+        #[cfg(test)]
+        if let Some(connector) = connector {
+            builder = builder.scripted_connector(connector);
+        }
         Ok(Self {
             transport: builder.build(),
             budget: bandwidth_budget,
@@ -478,6 +499,128 @@ mod tests {
         account.set_bandwidth_cap(None);
         pending.await.finish(64);
         assert_eq!(wake.elapsed(), Duration::ZERO);
+    }
+
+    #[derive(Default)]
+    struct CountingSink {
+        inbound: std::sync::atomic::AtomicU64,
+        outbound: std::sync::atomic::AtomicU64,
+    }
+
+    impl bifrost_net::MeterSink for CountingSink {
+        fn record_bytes_in(&self, _: &bifrost_net::AccountId, n: u64) {
+            self.inbound
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn record_bytes_out(&self, _: &bifrost_net::AccountId, n: u64) {
+            self.outbound
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    async fn submission_budget_contention(direction: bifrost_net::BandwidthDirection) {
+        use bifrost_net::{AccountId, BandwidthBudget, MeterSinkHandle};
+        use bifrost_smtp::transport::smtp::{ScriptedConnector, Transcript};
+        use futures::FutureExt;
+        use std::sync::atomic::Ordering;
+        use tokio::time::Instant;
+
+        let hello = format!(
+            "EHLO {}\r\n",
+            bifrost_smtp::transport::smtp::extension::ClientId::default()
+        );
+        let steps = [
+            (hello.as_str(), "250-peer\r\n250 AUTH PLAIN\r\n"),
+            ("AUTH PLAIN AHVzZXIAcGFzcw==\r\n", "235 authenticated\r\n"),
+            (hello.as_str(), "250 peer\r\n"),
+            ("MAIL FROM:<user@example.com>\r\n", "250 sender\r\n"),
+            ("RCPT TO:<to@example.com>\r\n", "250 recipient\r\n"),
+            ("DATA\r\n", "354 send\r\n"),
+            ("Subject: test\r\n\r\nbody\r\n", ""),
+            (".\r\n", "250 delivered\r\n"),
+        ];
+        let greeting = "220 peer\r\n";
+        let expected_in =
+            greeting.len() + steps.iter().map(|(_, reply)| reply.len()).sum::<usize>();
+        let expected_out = steps
+            .iter()
+            .map(|(command, _)| command.len())
+            .sum::<usize>();
+        let steps: Vec<(String, String)> = steps
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        let connector = ScriptedConnector::new(move || {
+            steps
+                .iter()
+                .fold(Transcript::new(greeting), |script, (command, reply)| {
+                    script.expect(command, reply)
+                })
+        });
+        let budget = BandwidthBudget::default();
+        let sink = Arc::new(CountingSink::default());
+        let handle = MeterSinkHandle::new(
+            Arc::<CountingSink>::clone(&sink),
+            AccountId("submission".into()),
+        );
+        let cfg = SmtpSubmissionConfig::new(
+            "smtp.invalid",
+            SubmissionTls::Plaintext,
+            bifrost_types::Address::bare("user@example.com"),
+        );
+        let submission = SubmissionTransport::build_with_connector(
+            &cfg,
+            &Credentials::password("user", "pass"),
+            Some(handle),
+            budget.clone(),
+            Some(connector),
+        )
+        .unwrap();
+        use crate::account::test_support::scripted_account_parts;
+        use crate::connection::test_support::{driver_pair_metered, preauth_greeting};
+        use bifrost_types::Account;
+        let (conn, peer) =
+            driver_pair_metered(&preauth_greeting("IMAP4rev1"), budget.clone()).await;
+        let submission = Arc::new(submission);
+        let mut parts = scripted_account_parts(conn, 1);
+        parts.bandwidth_budget = budget.clone();
+        parts.submission = Some(Arc::clone(&submission));
+        let account = super::super::ImapAccount::new(parts);
+        // A small live account cap splits even commands across several writes.
+        account.set_bandwidth_cap(Some(8));
+        budget.admit(direction, 8).await.finish(8);
+        let envelope = SubmissionEnvelope {
+            from: bifrost_types::Address::bare("user@example.com"),
+            recipients: vec![bifrost_types::Address::bare("to@example.com")],
+        };
+        let start = Instant::now();
+        let mut send =
+            Box::pin(submission.send_rfc5322(&envelope, b"Subject: test\r\n\r\nbody\r\n", None));
+        assert!((&mut send).now_or_never().is_none());
+        let counter = match direction {
+            bifrost_net::BandwidthDirection::Inbound => &sink.inbound,
+            bifrost_net::BandwidthDirection::Outbound => &sink.outbound,
+            _ => unreachable!(),
+        };
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!((&mut send).now_or_never().is_none());
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        send.await.unwrap();
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        assert_eq!(sink.inbound.load(Ordering::Relaxed), expected_in as u64);
+        assert_eq!(sink.outbound.load(Ordering::Relaxed), expected_out as u64);
+        drop(peer);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn submission_budget_inbound_io() {
+        submission_budget_contention(bifrost_net::BandwidthDirection::Inbound).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn submission_budget_outbound_io() {
+        submission_budget_contention(bifrost_net::BandwidthDirection::Outbound).await;
     }
 
     #[test]

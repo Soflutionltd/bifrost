@@ -240,8 +240,10 @@ pub mod extension;
 mod pool;
 // pub: transport results and errors expose typed SMTP replies.
 pub mod response;
-#[cfg(test)]
-mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod test_support;
+#[cfg(feature = "test-support")]
+pub use test_support::{ScriptedConnector, Transcript};
 mod transport;
 pub(super) mod util;
 
@@ -303,6 +305,8 @@ struct SmtpInfo {
     /// transport's connections share ONE budget instead of each getting
     /// the full cap.
     metering: WireMetering,
+    #[cfg(feature = "test-support")]
+    connector: Option<test_support::ScriptedConnector>,
 }
 
 impl Default for SmtpInfo {
@@ -320,6 +324,8 @@ impl Default for SmtpInfo {
             timeout: Some(DEFAULT_TIMEOUT),
             tls: Tls::None,
             metering: WireMetering::disabled(),
+            #[cfg(feature = "test-support")]
+            connector: None,
         }
     }
 }

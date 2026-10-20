@@ -62,6 +62,8 @@ serde_json = { workspace = true }
 [features]
 default = ["account-error"]
 
+test-support = ["tokio"]
+
 account-error = ["dep:bifrost-types"]
 
 tokio = [

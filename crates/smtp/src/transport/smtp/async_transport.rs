@@ -688,6 +688,13 @@ impl AsyncSmtpTransportBuilder {
         }
     }
 
+    /// Substitute a fresh in-memory peer at stream creation. Plaintext only.
+    #[cfg(feature = "test-support")]
+    pub fn scripted_connector(mut self, connector: super::test_support::ScriptedConnector) -> Self {
+        self.info.connector = Some(connector);
+        self
+    }
+
     /// Set the name used during EHLO
     pub fn hello_name(mut self, name: ClientId) -> Self {
         self.info.hello_name = name;
@@ -852,6 +859,13 @@ impl AsyncSmtpTransportBuilder {
 
 /// Builder for the LMTP `AsyncLmtpTransport`
 impl AsyncLmtpTransportBuilder {
+    /// Substitute a fresh in-memory peer at stream creation. Plaintext only.
+    #[cfg(feature = "test-support")]
+    pub fn scripted_connector(mut self, connector: super::test_support::ScriptedConnector) -> Self {
+        self.info.connector = Some(connector);
+        self
+    }
+
     // Create new builder with default parameters
     pub(crate) fn new<T: Into<String>>(server: T) -> Self {
         AsyncLmtpTransportBuilder {
@@ -1023,8 +1037,12 @@ where
             self.info.timeout,
             &self.info.hello_name,
             &self.info.tls,
-            self.info.protocol,
-            self.info.metering.clone(),
+            crate::executor::ConnectionOptions {
+                protocol: self.info.protocol,
+                metering: self.info.metering.clone(),
+                #[cfg(feature = "test-support")]
+                connector: self.info.connector.clone(),
+            },
         )
         .await?;
 

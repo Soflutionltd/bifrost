@@ -244,10 +244,13 @@ impl AsyncSmtpConnection {
             local_address,
             Protocol::Smtp,
             WireMetering::disabled(),
+            #[cfg(feature = "test-support")]
+            None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn connect_with_protocol<T: tokio::net::ToSocketAddrs>(
         server: T,
         timeout: Option<Duration>,
@@ -256,11 +259,32 @@ impl AsyncSmtpConnection {
         local_address: Option<IpAddr>,
         protocol: Protocol,
         metering: WireMetering,
+        #[cfg(feature = "test-support")] connector: Option<
+            crate::transport::smtp::test_support::ScriptedConnector,
+        >,
     ) -> Result<AsyncSmtpConnection, Error> {
         let deadline = AsyncDeadline::new(timeout);
-        let mut stream =
+        #[cfg(feature = "test-support")]
+        if connector.is_some() && tls_parameters.is_some() {
+            return Err(error::invalid_input(
+                "scripted connectors require plaintext",
+            ));
+        }
+        #[cfg(feature = "test-support")]
+        let scripted =
+            connector.map(|connector| AsyncNetworkStream::from_transcript(connector.connect()));
+        let mut stream = {
+            #[cfg(feature = "test-support")]
+            if let Some(stream) = scripted {
+                stream
+            } else {
+                AsyncNetworkStream::connect_until(server, deadline, tls_parameters, local_address)
+                    .await?
+            }
+            #[cfg(not(feature = "test-support"))]
             AsyncNetworkStream::connect_until(server, deadline, tls_parameters, local_address)
-                .await?;
+                .await?
+        };
         // Installed on the dialed stream rather than threaded into the
         // dialer: the TCP/TLS handshake is not the account's traffic.
         stream.set_metering(metering);

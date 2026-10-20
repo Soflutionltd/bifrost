@@ -140,19 +140,6 @@ PUBLISHED SURFACE fence apply.
   filed rather than fixed. Same shape applies to `pim`'s upload paths, but
   those are outbound and the tally is inbound-only.
 
-## Bandwidth budget follow-ups
-
-The shared per-account budget landed 2026-10-19 (contract on
-`Account::set_bandwidth_cap`, mechanism in `reference/net.md`). What the
-reviews left:
-
-- **The submission budget test does not drive SMTP I/O.** The IMAP
-  submission tests spend the account budget directly, so removing
-  `bandwidth_metering` from `SubmissionTransport::build` would still pass.
-  Driving the built transport hermetically needs an in-memory test seam in
-  `crates/smtp` (its transport internals are private and its executor is
-  sealed); a P3 from the transport-legs review.
-
 ## Notes
 
 - The rules for working an item are at the top of this file. One more that
