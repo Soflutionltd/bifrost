@@ -492,6 +492,10 @@ impl DavDispatch {
             };
             builder = builder.header(name.as_str(), value);
         }
+        // Keep request-level safety distinct from the operation default:
+        // EventUpdate/ContactUpdate also enclose MOVE and create-PUT legs.
+        // Using operation.is_idempotent() here would replay those legs, while
+        // removing the matching error override would authorize engine replay.
         if let Some(idempotent) = request.idempotent {
             builder = builder.idempotent(idempotent);
         }
@@ -561,6 +565,11 @@ impl DavDispatch {
                     }),
                     _ => false,
                 };
+                // Terminal status is usable as data only when this wire leg
+                // can be replayed (or all earlier attempts were refusals).
+                // The logical update label alone does not prove that for MOVE
+                // or a create-PUT fallback, so honor the same request flag net
+                // used rather than substituting the operation table.
                 if request
                     .idempotent
                     .unwrap_or_else(|| request.method.is_idempotent())

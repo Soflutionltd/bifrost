@@ -576,6 +576,12 @@ impl RequestBuilder {
     /// Declare whether replaying this request can change server state,
     /// overriding the method-derived default.
     ///
+    /// This describes one wire request, not the enclosing account operation.
+    /// An account update can include a MOVE or a conditional create followed
+    /// by deletion; the operation's default cannot prove those legs replayable.
+    /// Conversely a batch POST can mix reads and writes. Callers must establish
+    /// safety for the actual payload before widening the method default.
+    ///
     /// The default is `reqwest::Method::is_idempotent()`, so POST,
     /// PATCH, and extension methods are treated as unsafe to replay and
     /// the transport will not retry them once bytes have gone out. Two
@@ -2116,6 +2122,57 @@ mod tests {
 
         assert_eq!(response.body, Bytes::from_static(b"recovered"));
         assert_eq!(script.requests().len(), 2);
+    }
+
+    /// One logical update can contain either an absolute-state PATCH or a
+    /// conditional create-PUT leg. The operation table cannot distinguish them.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn request_safety_can_narrow_an_idempotent_operation() {
+        use bifrost_types::AccountOperation;
+
+        for operation in [
+            AccountOperation::EventUpdate,
+            AccountOperation::ContactUpdate,
+        ] {
+            assert!(operation.is_idempotent());
+            for replayable in [true, false] {
+                let script = ScriptedDispatch::new([
+                    in_flight_reset(),
+                    canned(StatusCode::OK, b"recovered"),
+                ]);
+                let account =
+                    scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+                let result = account
+                    .put("https://dav.test/destination")
+                    .header("If-None-Match", "*")
+                    .idempotent(replayable)
+                    .send()
+                    .await;
+                assert_eq!(result.is_ok(), replayable);
+                assert_eq!(script.requests().len(), if replayable { 2 } else { 1 });
+            }
+        }
+    }
+
+    /// PATCH is conservative by default; explicit payload-level proof can
+    /// widen it. An operation label is not present in this transport API.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn patch_replay_requires_explicit_request_safety() {
+        for replayable in [false, true] {
+            let script =
+                ScriptedDispatch::new([in_flight_reset(), canned(StatusCode::OK, b"recovered")]);
+            let account =
+                scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+            let request = account.patch("https://graph.test/me/events/one");
+            let request = if replayable {
+                request.idempotent(true)
+            } else {
+                request
+            };
+            let result = request.send().await;
+            assert_eq!(result.is_ok(), replayable);
+            assert_eq!(script.requests().len(), if replayable { 2 } else { 1 });
+        }
     }
 
     /// And the inverse: a caller that knows a GET is really an action.

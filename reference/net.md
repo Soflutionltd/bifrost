@@ -1,5 +1,16 @@
 # bifrost-net reference
 
+HTTP request replay and logical-operation recovery have different inputs.
+`AccountOperation::is_idempotent()` defaults the latter, with an explicit
+error override taking precedence; it does not describe each wire leg of a
+compound operation. Net's method default remains conservative for PATCH and
+POST and can be narrowed or widened through `idempotent(bool)`. DAV narrows
+create-PUT and MOVE legs and preserves that declaration in error recovery.
+Replacing those declarations with the enclosing update's operation default
+would permit unsafe replay. Graph, Google and JMAP transport funnels do not
+receive an account operation; propagating request safety would require typed
+caller context, including all calls in a JMAP or Graph batch.
+
 Current architecture of the shared HTTP transport crate.
 
 Scope: HTTP/2 connection pool, OAuth bearer-token refresh, retry

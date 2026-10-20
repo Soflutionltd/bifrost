@@ -54,7 +54,7 @@ pub(in crate::codec::encode) fn encode_set_quota(
 pub(in crate::codec::encode) fn encode_set_acl(
     w: &mut CommandWriter,
     tag: &str,
-    mailbox: &str,
+    mailbox: impl AsRef<[u8]>,
     identifier: &str,
     rights: &str,
     utf8: bool,
@@ -62,7 +62,7 @@ pub(in crate::codec::encode) fn encode_set_acl(
     w.raw(tag.as_bytes());
     w.raw(b" SETACL ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    w.string(mailbox.as_bytes(), utf8);
+    w.string(mailbox.as_ref(), utf8);
     w.raw(b" ");
     w.string(identifier.as_bytes(), utf8);
     w.raw(b" ");

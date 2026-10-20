@@ -856,15 +856,13 @@ resumable inventory position before putting it into the registry. The default
 `inventory_resume_stream(cursor.clone()).is_some()`, and the resume seam guards
 both directions of that equivalence once reached. A mismatch is a scoped cursor
 invalidation (`RestartScope`), not an envelope schema change. Deferred attach
-forwards a classified resume to the ordinary recovery path so only that scope
-is reset and re-established. Replacement attach checks both the classifier and
-stream before deciding to resume; a mismatch rejects the candidate connection,
-leaving its pre-existing durable cursor untouched for a later retry. Initial
-attach still gates resume on the classifier alone, so a false classifier paired
-with a provided stream is not routed through the guard there. The guarded path
-keeps stored page positions away from `changes_stream`, which has no delta link
-to walk. The terminal `Done` still installs the ordinary live change cursor in
-the registry.
+forwards a stored resume candidate to the ordinary recovery path so only that
+scope is reset and re-established. Both initial and replacement attach check the
+classifier and stream before deciding whether a stored cursor can enter the
+changes registry. Either positive answer defers the cursor to the resume guard,
+which catches disagreements before a page position can reach `changes_stream`.
+The terminal `Done` still installs the ordinary live change cursor in the
+registry.
 
 `ChangesEvent` is the per-batch outcome returned by the driver:
 `Advanced` / `Done` / `Stopped` / `Paused` / `Terminated(AccountError)`.
@@ -3075,14 +3073,20 @@ the attach path - deletes the row and re-establishes that one scope
 inline, because the reopen listener is spawned later in `attach_inner`
 and does not exist yet. `run_establish` also translates an unreadable
 row into a typed `AccountError` whose derived `RecoveryClass` is
-`Engine(SchemaIncompatible)`, but its callers do not send that result
-through the reopen listener: per-scope recovery retries and then
-terminates that scope, while replacement attach rejects the candidate
-connection. An automatic account restart retries the reopen; a
-consumer-driven reattach returns the failure. The account-wide schema
-clear loop is reached when a running worker sends a classified error
-through `RecoveryContext::recover`, not from the `run_establish`
-result alone.
+`Engine(SchemaIncompatible)`, but its callers do not feed that result
+back through `RecoveryContext::recover` and `handle_account_error`, which
+dispatches to the schema-clear arm. Per-scope recovery retries and then
+terminates that scope. Replacement attach rejects the candidate
+connection, and automatic account restart retries the reopen. It leaves
+the durable row untouched because a replacement
+can abort while the installed account remains live. Clearing a
+preexisting cursor and its backfill completion would mutate that account's
+state, and reattach rollback has no safe restore path because consumer
+acknowledgements may persist newer rows. Rollback only deletes rows
+created by its own attempt. A consumer-driven reattach returns the
+failure. The account-wide schema clear loop is reached when a running
+worker sends a classified error through `RecoveryContext::recover`, not
+from the `run_establish` result alone.
 
 (These are engine `Error` enum variants, not `RecoveryClass`
 variants.)
@@ -3376,8 +3380,11 @@ it does not request another automatic scope restart. A provider retry,
 reconciliation, or other engine-action error is also replaced with this scoped
 operator-attention error at per-scope exhaustion; an already terminal error or
 an existing operator-attention error keeps its classification. The
-account-wide `RestartAccount` exhaustion tail still publishes the last account
-error unchanged before pausing.
+account-wide `RestartAccount` exhaustion tail applies the same rule to its last
+error: terminal and existing operator-attention errors stay intact, while retry,
+reconciliation, and other engine-action errors become account-scope operator
+attention because no automatic action remains. The tail then pauses with
+`PauseReason::RetryBudgetExhausted`.
 Account exhaustion then publishes
 `AccountControl::Pause(PauseReason::RetryBudgetExhausted)` and
 flips the boundary to `Pause` so workers park. Consumers subscribe

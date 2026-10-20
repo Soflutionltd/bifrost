@@ -228,14 +228,16 @@ pub(crate) fn inventory_resume_contract_failure(scope: CursorScope) -> AccountEr
     restart_scope_error(scope, AccountOperation::SyncInventory)
 }
 
-/// Make a scope's final recovery event match the action still available after
-/// its automatic budget is spent. A terminal provider error remains useful as
+/// Make the final recovery event match the action still available after its
+/// automatic budget is spent. A terminal provider error remains useful as
 /// authored, and an existing operator-attention verdict remains useful too.
 /// Retry, reconciliation, and other engine directives no longer describe an
-/// action the engine will take, so replace them with the same scoped operator
-/// attention error used for engine-internal establishment failures.
+/// action the engine will take, so replace them with the scoped operator
+/// attention error used for engine-internal establishment failures. The scope
+/// may be `CursorScope::Account` when the exhausted recovery restarted the
+/// whole account.
 #[must_use]
-pub(crate) fn scope_recovery_exhaustion_error(
+pub(crate) fn recovery_exhaustion_error(
     last_error: AccountError,
     scope: CursorScope,
     operation: AccountOperation,
@@ -963,10 +965,10 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_scope_actionable_errors_become_operator_attention() {
+    fn exhausted_actionable_errors_become_operator_attention() {
         let scope = CursorScope::Folder(bifrost_types::FolderId("inbox".into()));
         for last_error in [build_retry(), build_reconcile(), build_engine()] {
-            let exhausted = scope_recovery_exhaustion_error(
+            let exhausted = recovery_exhaustion_error(
                 last_error,
                 scope.clone(),
                 AccountOperation::EstablishCursor,
@@ -980,7 +982,7 @@ mod tests {
         }
 
         let terminal = build_terminal();
-        let preserved = scope_recovery_exhaustion_error(
+        let preserved = recovery_exhaustion_error(
             terminal.clone(),
             CursorScope::Account,
             AccountOperation::EstablishCursor,

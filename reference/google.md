@@ -1,5 +1,11 @@
 # bifrost-google reference
 
+The shared HTTP funnel does not receive `AccountOperation`. Net uses its
+method default, conservatively refusing in-flight replay of PATCH and POST.
+Logical error recovery can still permit retry of an idempotent update. A
+verb-to-operation mapping cannot supply request safety: the funnel serves
+Gmail, People and Calendar, including action POSTs and compound operations.
+
 Current architecture of the Google Account-layer code under
 `crates/google/src/account/`. Public surface is
 `bifrost_google::account::{GoogleAccountFactory, PubSubConfig}`;

@@ -330,13 +330,18 @@ fn multipart_fixed_prefix_is_malformed(mut input: &[u8], depth: u32) -> bool {
 /// excluded from `ATOM-CHAR`. Since this attribute is gated strict, parsing
 /// labels as plain `astring` would make an ordinary Gmail FETCH response
 /// connection-fatal. User labels arrive as normal astrings, quoted when they
-/// contain spaces, and in modified UTF-7.
-fn gmail_label(input: &[u8]) -> IResult<&[u8], String> {
+/// contain spaces, in the negotiated mailbox encoding.
+fn gmail_label(input: &[u8], utf8_mode: bool) -> IResult<&[u8], String> {
     alt((
         map((char('\\'), atom), |(_, name)| {
             format!("\\{}", String::from_utf8_lossy(name))
         }),
-        map(astring, |label| crate::codec::utf7::decode_utf7(&label)),
+        map(astring, |label| {
+            // Labels follow the negotiated mailbox encoding, including literal ampersands.
+            decode_mailbox_from_wire(&label, utf8_mode)
+                .as_str()
+                .to_owned()
+        }),
     ))
     .parse(input)
 }
@@ -568,9 +573,12 @@ fn fetch_attr_value_inner<'a>(
         }
         "X-GM-LABELS" => {
             let (rest, _) = attr_sp(input)?;
-            let (rest, labels) =
-                delimited(char('('), separated_list0(attr_sp, gmail_label), char(')'))
-                    .parse(rest)?;
+            let (rest, labels) = delimited(
+                char('('),
+                separated_list0(attr_sp, |i| gmail_label(i, utf8_mode)),
+                char(')'),
+            )
+            .parse(rest)?;
             fr.gmail_labels = Some(labels);
             Ok((rest, ()))
         }
@@ -991,4 +999,19 @@ pub(super) fn skip_paren_group(input: &[u8]) -> IResult<&[u8], &[u8]> {
         )));
     }
     Ok((&input[i..], &input[..i - 1]))
+}
+
+#[cfg(test)]
+mod label_encoding_tests {
+    use super::gmail_label;
+
+    #[test]
+    fn gmail_labels_follow_negotiated_mailbox_encoding() {
+        assert_eq!(gmail_label(b"\"&AGE-\"", false).unwrap().1, "a");
+        assert_eq!(gmail_label(b"\"&AGE-\"", true).unwrap().1, "&AGE-");
+        assert_eq!(gmail_label("\"café\"".as_bytes(), true).unwrap().1, "café");
+        for utf8 in [false, true] {
+            assert_eq!(gmail_label(b"\\Inbox", utf8).unwrap().1, "\\Inbox");
+        }
+    }
 }

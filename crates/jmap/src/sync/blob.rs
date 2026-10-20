@@ -2,15 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::StreamExt as _;
+
 use bifrost_types::{
     AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream, Batch, BlobHandle,
     ByteRange, Cause, ObjectId, PageBoundary, Protocol, RequestCause, ResourceKind, SyncEvent,
 };
 
 use crate::blob::BlobRef;
-use crate::client::Client;
+use crate::blob::download::{BlobStream, BlobTransport, DEFAULT_MAX_BLOB_SIZE};
+use crate::client::{ByteTally, Client};
 use crate::core::id::{AccountId, BlobId};
-use crate::core::transport::HttpTransport;
 use crate::email::{EmailGet, EmailId, Property};
 
 type MailAccount<T> = crate::account::Account<T>;
@@ -33,7 +35,7 @@ where
     super::foreign::parse_object(id).filter(|(account, _)| is_registered(account))
 }
 
-pub(crate) fn open<T: HttpTransport>(
+pub(crate) fn open<T: BlobTransport>(
     client: Client<T>,
     account_id: AccountId,
     foreign_accounts: Arc<HashMap<String, MailAccount<T>>>,
@@ -53,40 +55,37 @@ pub(crate) fn open<T: HttpTransport>(
             blob = blob.with_content_type(content_type);
         }
 
-        // Metered rather than measured off the decoded length: under the
-        // production transport the tally is bifrost-net's request-local
-        // inbound counter, which sees retry drains, redirects and 401
-        // recovery bodies that a decoded length cannot.
         let (client, tally) = client.metered();
-        match client.download(&blob).await {
-            Ok(bytes) => {
-                let bytes_in = tally.take();
-                yield SyncEvent::Batch(Batch {
-                    items: vec![bytes],
-                    page_boundary: PageBoundary::Final,
-                    server_latency: started.elapsed(),
-                    bytes_in,
-                    checkpoint: None,
-                });
-                yield SyncEvent::Done(None);
-            }
+        let body = match client.download_stream(&blob, DEFAULT_MAX_BLOB_SIZE).await {
+            Ok(body) => body,
             Err(err) => {
                 yield super::error::terminated_from_jmap(
                     err,
                     super::error::JmapErrorContext::new(AccountOperation::OpenBlob),
                 );
+                return;
             }
+        };
+
+        let mut events = download_events(
+            body,
+            tally,
+            started,
+            super::error::JmapErrorContext::new(AccountOperation::OpenBlob),
+        );
+        while let Some(event) = events.next().await {
+            yield event;
         }
     })
 }
 
 /// Open a message's assembled RFC822 octets.
 ///
-/// One `Email/get` for the whole-message `blobId`, then `client.download`
+/// One `Email/get` for the whole-message `blobId`, then a streamed download
 /// of that blob. The `hydrate.rs` raw-projection fatal is intentionally
 /// untouched: hydration's raw projection is A1's concern; this is the
 /// dedicated raw read.
-pub(crate) fn open_raw_rfc822<T: HttpTransport>(
+pub(crate) fn open_raw_rfc822<T: BlobTransport>(
     client: Client<T>,
     account_id: AccountId,
     mail: MailAccount<T>,
@@ -111,11 +110,11 @@ pub(crate) fn open_raw_rfc822<T: HttpTransport>(
                 ),
                 None => (account_id, mail, message.0.clone()),
             };
-        // BOTH legs report into one accumulator: the `Email/get` that
-        // resolves the whole-message blobId and the blob download itself
-        // are traffic this batch caused, and a count carrying only the
-        // blob body would omit the first while a count carrying only the
-        // API response would omit the bulk of the bytes.
+        // Both legs report into one accumulator: the `Email/get` that
+        // resolves the whole-message blobId and the streamed download are
+        // traffic this read caused. The API response count is attached to
+        // the first emitted chunk batch (or the empty final batch), then each
+        // download delta follows its own chunk.
         let tally = crate::client::ByteTally::default();
         let client = client.metered_into(&tally);
         let mail = mail.metered_into(&tally);
@@ -178,18 +177,11 @@ pub(crate) fn open_raw_rfc822<T: HttpTransport>(
         };
 
         let blob = BlobRef::new(account_id, blob_id);
-        match client.download(&blob).await {
-            Ok(bytes) => {
-                let bytes_in = tally.take();
-                yield SyncEvent::Batch(Batch {
-                    items: vec![bytes],
-                    page_boundary: PageBoundary::Final,
-                    server_latency: started.elapsed(),
-                    bytes_in,
-                    checkpoint: None,
-                });
-                yield SyncEvent::Done(None);
-            }
+        let body = match client
+            .download_stream(&blob, DEFAULT_MAX_BLOB_SIZE)
+            .await
+        {
+            Ok(body) => body,
             Err(err) => {
                 yield super::error::terminated_from_jmap(
                     err,
@@ -198,6 +190,93 @@ pub(crate) fn open_raw_rfc822<T: HttpTransport>(
                         message.0.clone(),
                     ),
                 );
+                return;
+            }
+        };
+
+        let mut events = download_events(
+            body,
+            tally,
+            started,
+            super::error::JmapErrorContext::message(
+                AccountOperation::OpenRawRfc822,
+                message.0.clone(),
+            ),
+        );
+        while let Some(event) = events.next().await {
+            yield event;
+        }
+    })
+}
+
+/// Turn a streamed blob response into engine batches without retaining the
+/// whole response. One prior transport chunk is held while polling its
+/// successor so the final successful chunk can carry `PageBoundary::Final`;
+/// the inbound count taken after reading each chunk stays attached to that
+/// chunk even while the next one is read ahead.
+fn download_events(
+    body: BlobStream,
+    tally: ByteTally,
+    started: Instant,
+    context: super::error::JmapErrorContext,
+) -> AccountStream<SyncEvent<bytes::Bytes>> {
+    Box::pin(async_stream::stream! {
+        let mut body = body;
+        let mut pending: Option<(bytes::Bytes, u64)> = None;
+        let mut batch_started = started;
+
+        loop {
+            let next = body.next().await;
+            // `Client::download_stream` updates this tally as it polls the
+            // transport. Taking after every poll partitions request-local
+            // bytes across the emitted batches instead of repeating a running
+            // total on each chunk.
+            let bytes_in = tally.take();
+            match next {
+                Some(Ok(chunk)) => {
+                    if let Some((previous, previous_bytes_in)) =
+                        pending.replace((chunk, bytes_in))
+                    {
+                        yield SyncEvent::Batch(Batch {
+                            items: vec![previous],
+                            page_boundary: PageBoundary::Partial,
+                            server_latency: batch_started.elapsed(),
+                            bytes_in: previous_bytes_in,
+                            checkpoint: None,
+                        });
+                        batch_started = Instant::now();
+                    }
+                }
+                Some(Err(error)) => {
+                    if let Some((partial, partial_bytes_in)) = pending.take() {
+                        yield SyncEvent::Batch(Batch {
+                            items: vec![partial],
+                            page_boundary: PageBoundary::Partial,
+                            server_latency: batch_started.elapsed(),
+                            bytes_in: partial_bytes_in,
+                            checkpoint: None,
+                        });
+                    }
+                    // Earlier chunks are incomplete when the body fails. The
+                    // terminal event tells the consumer to discard them.
+                    yield super::error::terminated_from_jmap(error.into(), context);
+                    return;
+                }
+                None => {
+                    // Preserve the old successful empty-blob shape and carry
+                    // API/get bytes for an empty raw-message body.
+                    let (last, last_bytes_in) =
+                        pending.take().unwrap_or_else(|| (bytes::Bytes::new(), bytes_in));
+                    yield SyncEvent::Batch(Batch {
+                        items: vec![last],
+                        page_boundary: PageBoundary::Final,
+                        server_latency: batch_started.elapsed(),
+                        bytes_in: last_bytes_in,
+                        checkpoint: None,
+                    });
+                    yield SyncEvent::Done(None);
+                    return;
+                }
             }
         }
     })
@@ -251,22 +330,20 @@ pub(crate) fn open_range(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     use super::foreign_split;
+    use bifrost_types::{PageBoundary, SyncEvent};
+    use futures::StreamExt as _;
 
-    /// A boundary that answers one `Email/get` and one blob download,
-    /// reporting an inbound byte count for each that is deliberately
-    /// UNLIKE the decoded body length, so a batch that measured the
-    /// decoded length instead of the transport's own counter is visible.
+    /// A boundary that answers one `Email/get` and then streams its blob.
     struct MeteredBlobTransport;
 
     /// What the API leg reports as its request-local inbound total.
     const API_BYTES_IN: u64 = 4_096;
-    /// What the download leg reports as its request-local inbound total.
-    /// Not `RAW.len()`: on the wire this read cost a redirect plus a
-    /// retry drain the decoded length cannot see.
-    const BLOB_BYTES_IN: u64 = 1_000_000;
     const RAW: &[u8] = b"From: a@example.test\r\n\r\nbody";
 
     impl crate::core::transport::HttpTransport for MeteredBlobTransport {
@@ -317,14 +394,9 @@ mod tests {
             &self,
             _url: &str,
         ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Ok(bytes::Bytes::from_static(RAW))
-        }
-
-        async fn download_measured(
-            &self,
-            url: &str,
-        ) -> Result<(bytes::Bytes, u64), crate::core::transport::TransportError> {
-            Ok((self.download(url).await?, BLOB_BYTES_IN))
+            Err(crate::core::transport::TransportError::new(
+                "the sync blob facade must use the streaming door",
+            ))
         }
 
         async fn get_session(
@@ -332,6 +404,30 @@ mod tests {
             _url: &str,
         ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
             Err(crate::core::transport::TransportError::new("no session"))
+        }
+    }
+
+    impl crate::blob::download::BlobTransport for MeteredBlobTransport {
+        async fn download_stream(
+            &self,
+            _url: &str,
+            max_bytes: u64,
+        ) -> Result<crate::blob::download::BlobDownload, crate::core::transport::TransportError>
+        {
+            assert!(RAW.len() as u64 <= max_bytes);
+            let chunks = RAW
+                .chunks(5)
+                .map(bytes::Bytes::copy_from_slice)
+                .collect::<Vec<_>>();
+            let body = futures::stream::iter(
+                chunks
+                    .into_iter()
+                    .map(Ok::<_, crate::core::transport::TransportError>),
+            );
+            Ok(crate::blob::download::BlobDownload {
+                body: Box::pin(body),
+                bytes_in: bifrost_net::RequestByteCounter::new(),
+            })
         }
     }
 
@@ -371,23 +467,20 @@ mod tests {
         .expect("client builds")
     }
 
-    fn only_batch_bytes_in(events: Vec<bifrost_types::SyncEvent<bytes::Bytes>>) -> u64 {
+    fn batches(events: &[SyncEvent<bytes::Bytes>]) -> Vec<&bifrost_types::Batch<bytes::Bytes>> {
         events
-            .into_iter()
-            .find_map(|event| match event {
-                bifrost_types::SyncEvent::Batch(batch) => Some(batch.bytes_in),
+            .iter()
+            .filter_map(|event| match event {
+                SyncEvent::Batch(batch) => Some(batch),
                 _ => None,
             })
-            .expect("the read emits one batch")
+            .collect()
     }
 
-    /// The blob door is metered through the same accumulator as the API
-    /// door, so the batch reports the transport's request-local inbound
-    /// count rather than the decoded blob length.
+    /// The facade uses the streaming door, emits transport chunks before it
+    /// has read the entire body, and marks only the last chunk final.
     #[tokio::test]
-    async fn a_blob_read_reports_the_transports_inbound_count() {
-        use futures::StreamExt as _;
-
+    async fn a_blob_read_emits_incremental_chunk_batches() {
         let handle = bifrost_types::BlobHandle {
             id: bifrost_types::BlobId("B1".to_string()),
             size: None,
@@ -409,17 +502,33 @@ mod tests {
         .collect::<Vec<_>>()
         .await;
 
-        assert_eq!(only_batch_bytes_in(events), BLOB_BYTES_IN);
+        let batches = batches(&events);
+        assert_eq!(batches.len(), RAW.chunks(5).count());
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|batch| batch.items.iter())
+                .flat_map(|chunk| chunk.iter().copied())
+                .collect::<Vec<_>>(),
+            RAW,
+        );
+        assert!(
+            batches[..batches.len() - 1]
+                .iter()
+                .all(|batch| batch.page_boundary == PageBoundary::Partial)
+        );
+        assert_eq!(
+            batches.last().map(|batch| batch.page_boundary),
+            Some(PageBoundary::Final),
+        );
+        assert!(matches!(events.last(), Some(SyncEvent::Done(None))));
     }
 
-    /// A raw RFC822 read is two requests - the `Email/get` that resolves
-    /// the whole-message blobId, then the blob download - and the batch
-    /// must report BOTH. Counting only the blob body omits the API leg;
-    /// counting only the API response omits the bulk of the bytes.
+    /// A raw RFC822 read is two requests. The Email/get bytes are attributed
+    /// once, to the first streamed chunk batch, and are not repeated on later
+    /// batches.
     #[tokio::test]
-    async fn a_raw_read_reports_both_the_api_leg_and_the_blob_leg() {
-        use futures::StreamExt as _;
-
+    async fn a_raw_read_accounts_for_the_api_leg_once_across_chunk_batches() {
         let client = metered_client();
         let mail = crate::account::Account::new(client.clone(), "primary");
         let events = super::open_raw_rfc822(
@@ -432,7 +541,138 @@ mod tests {
         .collect::<Vec<_>>()
         .await;
 
-        assert_eq!(only_batch_bytes_in(events), API_BYTES_IN + BLOB_BYTES_IN);
+        let batches = batches(&events);
+        assert_eq!(batches.len(), RAW.chunks(5).count());
+        assert_eq!(batches[0].bytes_in, API_BYTES_IN);
+        assert!(batches[1..].iter().all(|batch| batch.bytes_in == 0));
+        assert_eq!(
+            batches.iter().map(|batch| batch.bytes_in).sum::<u64>(),
+            API_BYTES_IN,
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_stream_preserves_the_api_count_in_its_final_batch() {
+        let (metered, tally) = metered_client().metered();
+        metered.record_bytes_in(API_BYTES_IN);
+        let body = futures::stream::empty::<
+            Result<bytes::Bytes, crate::core::transport::TransportError>,
+        >();
+        let events = super::download_events(
+            Box::pin(body),
+            tally,
+            Instant::now(),
+            super::super::error::JmapErrorContext::new(bifrost_types::AccountOperation::OpenBlob),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let [SyncEvent::Batch(batch), SyncEvent::Done(None)] = events.as_slice() else {
+            panic!("expected an empty final batch and Done, got {events:?}");
+        };
+        assert_eq!(batch.items, vec![bytes::Bytes::new()]);
+        assert_eq!(batch.bytes_in, API_BYTES_IN);
+        assert_eq!(batch.page_boundary, PageBoundary::Final);
+    }
+
+    /// The stream helper takes a fresh tally delta for each chunk. Its
+    /// one-chunk lookahead still yields before it drains the full body.
+    #[tokio::test]
+    async fn streamed_batches_partition_byte_counts_per_chunk() {
+        let (metered, tally) = metered_client().metered();
+        let polled = Arc::new(AtomicUsize::new(0));
+        let source_polled = Arc::clone(&polled);
+        let chunks = VecDeque::from([
+            (bytes::Bytes::from_static(b"first"), 11),
+            (bytes::Bytes::from_static(b"second"), 13),
+            (bytes::Bytes::from_static(b"third"), 17),
+        ]);
+        let body = futures::stream::unfold(
+            (chunks, metered, source_polled),
+            |(mut chunks, client, polled)| async move {
+                let (chunk, bytes_in) = chunks.pop_front()?;
+                polled.fetch_add(1, Ordering::Relaxed);
+                client.record_bytes_in(bytes_in);
+                Some((
+                    Ok::<_, crate::core::transport::TransportError>(chunk),
+                    (chunks, client, polled),
+                ))
+            },
+        );
+        let mut events = super::download_events(
+            Box::pin(body),
+            tally,
+            Instant::now(),
+            super::super::error::JmapErrorContext::new(bifrost_types::AccountOperation::OpenBlob),
+        );
+
+        let first = events.next().await.expect("first batch");
+        let SyncEvent::Batch(first) = first else {
+            panic!("expected a batch, got {first:?}");
+        };
+        assert_eq!(first.items, vec![bytes::Bytes::from_static(b"first")]);
+        assert_eq!(first.bytes_in, 11);
+        assert_eq!(first.page_boundary, PageBoundary::Partial);
+        assert_eq!(polled.load(Ordering::Relaxed), 2);
+
+        let rest = events.collect::<Vec<_>>().await;
+        let rest_batches = rest
+            .iter()
+            .filter_map(|event| match event {
+                SyncEvent::Batch(batch) => Some(batch),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rest_batches.len(), 2);
+        assert_eq!(
+            rest_batches[0].items,
+            vec![bytes::Bytes::from_static(b"second")]
+        );
+        assert_eq!(rest_batches[0].bytes_in, 13);
+        assert_eq!(rest_batches[0].page_boundary, PageBoundary::Partial);
+        assert_eq!(
+            rest_batches[1].items,
+            vec![bytes::Bytes::from_static(b"third")]
+        );
+        assert_eq!(rest_batches[1].bytes_in, 17);
+        assert_eq!(rest_batches[1].page_boundary, PageBoundary::Final);
+        assert!(matches!(rest.last(), Some(SyncEvent::Done(None))));
+    }
+
+    /// A body failure after a delivered prefix must remain terminal, so the
+    /// consumer knows the streamed octets do not form a complete blob.
+    #[tokio::test]
+    async fn a_stream_error_terminates_after_marking_the_prefix_partial() {
+        let (metered, tally) = metered_client().metered();
+        let body = futures::stream::iter([
+            Ok(bytes::Bytes::from_static(b"prefix")),
+            Err(crate::core::transport::TransportError::limit_exceeded(
+                "test response limit",
+            )),
+        ])
+        .map(move |chunk| {
+            metered.record_bytes_in(7);
+            chunk
+        });
+        let events = super::download_events(
+            Box::pin(body),
+            tally,
+            Instant::now(),
+            super::super::error::JmapErrorContext::new(bifrost_types::AccountOperation::OpenBlob),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                SyncEvent::Batch(bifrost_types::Batch {
+                    page_boundary: PageBoundary::Partial,
+                    ..
+                }),
+                SyncEvent::Terminated(_)
+            ]
+        ));
     }
 
     #[test]

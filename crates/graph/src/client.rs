@@ -1088,6 +1088,10 @@ impl GraphClient {
         self.record_wire(method, url, if_match, prefer, body.as_ref());
         let account_net = self.attached_net()?;
 
+        // This funnel has no AccountOperation: callers include batch POSTs
+        // and conditional PATCHes as well as absolute-state updates. A PATCH
+        // may commit and then reject its replay's stale If-Match. Widening
+        // replay needs request-specific evidence, not a verb-to-operation map.
         let mut builder = match method {
             "GET" => account_net.get(url),
             "POST" => account_net.post(url),

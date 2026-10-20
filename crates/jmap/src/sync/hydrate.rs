@@ -289,6 +289,10 @@ async fn fetch_batch<T: HttpTransport>(
     // The wire call takes the native id only when the batch runs against
     // the id's own foreign account; an unregistered-foreign id stays
     // literal on the primary route (see `wire_object_id`).
+    // Preserve repeated submissions on the wire and in the outcome slice:
+    // the engine-facing contract is one outcome per submitted occurrence.
+    // JMAP returns one object per id, and `reconcile_hydration` fans that
+    // correlated object back out to each matching occurrence.
     let ids = requested
         .iter()
         .map(|id| EmailId::new(wire_object_id(id, owner).to_string()))

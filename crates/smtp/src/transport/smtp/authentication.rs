@@ -202,9 +202,11 @@ impl Credentials {
     /// executor, by polling `current()` once. The blocking transport has
     /// no async context to await a refresh in; a `StaticTokenSource` (and
     /// an `OAuthRefresher` whose token is already fresh) resolves on the
-    /// first poll. A source that would need a network refresh yields
-    /// `Pending` and is rejected - live refresh requires the async
-    /// transport.
+    /// first poll when its state lock is immediately available. This is not
+    /// safe for every `TokenSource`: an empty or stale `OAuthRefresher` can
+    /// start refresh work and call `tokio::spawn` during this first poll,
+    /// which panics without a runtime. The blocking transport can only use
+    /// this path while the source resolves immediately.
     pub(crate) fn oauth2_token_blocking(&self) -> Result<(String, Zeroizing<String>), Error> {
         match self {
             Credentials::OAuth2 {
@@ -220,15 +222,18 @@ impl Credentials {
                     }
                     Poll::Ready(Err(e)) => Err(oauth_token_error(e)),
                     // `TokenSource::current` returns an opaque future. A
-                    // Pending poll does not tell us whether the source needs
-                    // an executor for refresh work or a fresh OAuthRefresher
-                    // is only waiting for its async mutex. Polling again can
-                    // enter OAuthRefresher's `tokio::spawn` path, which panics
-                    // without a runtime and can leave its state marked as
-                    // Refreshing. A reliable distinction needs a synchronous
-                    // snapshot/readiness contract from bifrost-net.
+                    // Pending poll does not tell us whether a fresh token is
+                    // behind OAuthRefresher's async mutex or whether the
+                    // source needs refresh work. `is_coordinating()` only
+                    // says that the source owns its cache semantics; it does
+                    // not expose a cached token or readiness. Polling again
+                    // can enter tokio::spawn without a runtime and leave the
+                    // refresher marked as Refreshing. A safe blocking decision
+                    // needs a non-refreshing synchronous snapshot from
+                    // bifrost-net distinguishing a usable cached token,
+                    // refresh required, and state-lock contention.
                     Poll::Pending => Err(error::invalid_input(
-                        "OAuth token source requires a network refresh; use the async SMTP transport",
+                        "OAuth token source is not immediately available; use the async SMTP transport",
                     )
                     .with_phase(SmtpCommandPhase::Auth { mechanism: None })),
                 }
@@ -859,16 +864,29 @@ mod test {
     }
 
     #[test]
-    fn blocking_oauth_rejects_a_pending_token_source_without_waiting() {
+    fn blocking_oauth_rejects_a_pending_coordinating_source_without_repolling() {
         use crate::transport::smtp::error::SmtpCommandPhase;
         use bifrost_net::{AccessToken, AccountFuture, Error as NetError, TokenSource};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct PendingSource;
+        struct PendingSource {
+            current_polls: Arc<AtomicUsize>,
+        }
 
         impl TokenSource for PendingSource {
+            fn is_coordinating(&self) -> bool {
+                true
+            }
+
             fn current(&self) -> AccountFuture<Result<AccessToken, NetError>> {
-                Box::pin(std::future::pending())
+                let current_polls = Arc::clone(&self.current_polls);
+                Box::pin(std::future::poll_fn(
+                    move |_| -> std::task::Poll<Result<AccessToken, NetError>> {
+                        current_polls.fetch_add(1, Ordering::SeqCst);
+                        std::task::Poll::Pending
+                    },
+                ))
             }
 
             fn refresh(&self) -> AccountFuture<Result<AccessToken, NetError>> {
@@ -876,14 +894,21 @@ mod test {
             }
         }
 
-        let credentials = Credentials::oauth2_source("alice", Arc::new(PendingSource));
+        let current_polls = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(PendingSource {
+            current_polls: Arc::clone(&current_polls),
+        });
+        assert!(source.is_coordinating());
+        let credentials = Credentials::oauth2_source("alice", source);
         let error = credentials.oauth2_token_blocking().unwrap_err();
 
         assert!(error.is_invalid_input());
+        assert!(error.to_string().contains("not immediately available"));
         assert_eq!(
             error.phase(),
             Some(SmtpCommandPhase::Auth { mechanism: None })
         );
+        assert_eq!(current_polls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

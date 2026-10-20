@@ -1565,6 +1565,10 @@ fn patch_changes_content(patch: &ContactPatch) -> bool {
 /// instead of replaying a write that already took effect. Twin of
 /// `bifrost-caldav`'s `partial_sequence_error`.
 ///
+/// This override describes the whole sequence, not HTTP method semantics.
+/// Feeding `AccountOperation::ContactUpdate` into net cannot replace it: the
+/// sequence has already changed the source identity before this failure.
+///
 /// The unreplayable declaration must be RE-STATED here. `dispatch_once` stamps
 /// `idempotency_override(false)` on the leg's own failure, but this is a FRESH
 /// `AccountErrorBuilder`, and an override is not part of the cause chain that

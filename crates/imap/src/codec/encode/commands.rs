@@ -106,7 +106,7 @@ pub(super) fn encode_authenticate(
 pub(super) fn encode_status(
     w: &mut CommandWriter,
     tag: &str,
-    mailbox: &str,
+    mailbox: impl AsRef<[u8]>,
     items: &str,
     utf8: bool,
 ) -> Result<(), crate::Error> {
@@ -116,7 +116,7 @@ pub(super) fn encode_status(
     w.raw(tag.as_bytes());
     w.raw(b" STATUS ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    w.string(mailbox.as_bytes(), utf8);
+    w.string(mailbox.as_ref(), utf8);
     w.raw(b" ");
     w.raw(status_items.as_bytes());
     w.raw(b"\r\n");
@@ -250,7 +250,7 @@ pub(super) fn encode_two_arg(
     uid: bool,
     cmd: &str,
     arg1: &str,
-    arg2: &str,
+    arg2: impl AsRef<[u8]>,
     utf8: bool,
 ) -> Result<(), crate::Error> {
     // Reject CRLF in the unquoted first argument (typically a sequence set)
@@ -267,7 +267,7 @@ pub(super) fn encode_two_arg(
     w.raw(arg1.as_bytes());
     w.raw(b" ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    w.string(arg2.as_bytes(), utf8);
+    w.string(arg2.as_ref(), utf8);
     w.raw(b"\r\n");
     Ok(())
 }
@@ -281,8 +281,8 @@ pub(super) fn encode_two_quoted_args(
     w: &mut CommandWriter,
     tag: &str,
     cmd: &str,
-    arg1: &str,
-    arg2: &str,
+    arg1: impl AsRef<[u8]>,
+    arg2: impl AsRef<[u8]>,
     utf8: bool,
 ) {
     w.raw(tag.as_bytes());
@@ -290,9 +290,9 @@ pub(super) fn encode_two_quoted_args(
     w.raw(cmd.as_bytes());
     w.raw(b" ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    w.string(arg1.as_bytes(), utf8);
+    w.string(arg1.as_ref(), utf8);
     w.raw(b" ");
-    w.string(arg2.as_bytes(), utf8);
+    w.string(arg2.as_ref(), utf8);
     w.raw(b"\r\n");
 }
 
@@ -554,9 +554,20 @@ pub(crate) fn encode_mailbox_str(name: &str, utf8: bool) -> String {
 
 /// Encode a [`MailboxName`] for the wire.
 ///
-/// Delegates to [`encode_mailbox_str`] on the inner string.
-pub(super) fn encode_mailbox_name(name: &MailboxName, utf8: bool) -> String {
-    encode_mailbox_str(name.as_str(), utf8)
+/// Replay server octets in their original mode; caller names use canonical encoding.
+pub(super) fn encode_mailbox_name(name: &MailboxName, utf8: bool) -> Result<Vec<u8>, crate::Error> {
+    let bytes = match name.wire_bytes(utf8) {
+        Some(bytes) => bytes.to_vec(),
+        None => encode_mailbox_str(name.as_str(), utf8).into_bytes(),
+    };
+    // A mailbox string cannot carry NUL. Refuse rather than letting the
+    // general string writer strip it and silently address a different mailbox.
+    if bytes.contains(&0) {
+        return Err(crate::Error::InvalidInput(
+            "mailbox wire name contains NUL".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Encode a command that takes a single mailbox argument as a quoted-or-literal string.
@@ -567,7 +578,7 @@ pub(super) fn encode_mailbox_cmd(
     w: &mut CommandWriter,
     tag: &str,
     cmd: &str,
-    mailbox: &str,
+    mailbox: impl AsRef<[u8]>,
     utf8: bool,
 ) {
     w.raw(tag.as_bytes());
@@ -575,7 +586,7 @@ pub(super) fn encode_mailbox_cmd(
     w.raw(cmd.as_bytes());
     w.raw(b" ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    w.string(mailbox.as_bytes(), utf8);
+    w.string(mailbox.as_ref(), utf8);
     w.raw(b"\r\n");
 }
 
@@ -593,7 +604,7 @@ pub(super) fn encode_select_or_examine(
     w: &mut CommandWriter,
     tag: &str,
     cmd: &str,
-    mailbox: &str,
+    mailbox: impl AsRef<[u8]>,
     condstore: bool,
     qresync: Option<&QresyncParams>,
     utf8: bool,
@@ -603,7 +614,7 @@ pub(super) fn encode_select_or_examine(
     w.raw(cmd.as_bytes());
     w.raw(b" ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    w.string(mailbox.as_bytes(), utf8);
+    w.string(mailbox.as_ref(), utf8);
 
     if condstore && qresync.is_none() {
         // RFC 7162 Section 3.1.1: SELECT mailbox (CONDSTORE)

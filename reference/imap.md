@@ -20,6 +20,21 @@ Literal decoding still copies into owned `Vec<u8>` fields (`BodySection` and `Bi
 
 SEARCH-family extension criteria are checked by the encoder using live capabilities, including pipelined commands. The handle scans no criteria capabilities before queuing. The grammar walk skips quoted and literal operands, with literal counts parsed by the same marker parser used for framing and criteria validation.
 
+Mailbox decoding keeps a lenient display string and the original wire octets plus
+encoding mode in `MailboxName`. Typed mailbox command arguments replay those
+octets when the connection uses the same mode, preserving raw 8-bit names,
+noncanonical modified UTF-7 and malformed segments. Caller-created names, and
+names sent in a different mode, use the existing display-based encoding.
+Equality and hashing distinguish noncanonical wire identities even when their
+display strings coincide, while canonical names compare equal to caller-created
+names. NUL-bearing mailbox wire strings are refused rather than silently
+stripped. Gmail FETCH labels use the negotiated mailbox decoding mode.
+
+This preservation applies while a typed name is retained. Account folder ids
+and registry keys still use display strings; converting through those strings
+loses noncanonical identity. APPEND, LIST patterns and NOTIFY filters also carry
+strings rather than retained wire names.
+
 ### One command path
 
 Every IMAP command - APPEND and MULTIAPPEND included - is a `types::Command`, encoded by one encoder (`codec::encode::encode_command`) into one form (`WireCommand`), and written by one sender (`driver::wire_send::send_wire_command`). There is no second payload type, no second encoder and no second send path.

@@ -350,8 +350,39 @@ impl EnvelopeBuilder<'_> {
                     ))
                 }
             }
-            MailParameter::Other { .. } | MailParameter::OtherRaw { .. } => Ok(()),
+            MailParameter::Other { keyword, .. } | MailParameter::OtherRaw { keyword, .. } => {
+                Self::validate_custom_mail_keyword(keyword)
+            }
         }
+    }
+
+    fn validate_custom_mail_keyword(keyword: &str) -> Result<(), Error> {
+        // The generic variants are for extensions without a typed representation.
+        // Letting them spell a standard MAIL keyword skips the capability and value
+        // checks above, such as the SIZE advertisement and limit checks.
+        const TYPED_MAIL_KEYWORDS: [&str; 10] = [
+            "BODY",
+            "SIZE",
+            "SMTPUTF8",
+            "REQUIRETLS",
+            "HOLDFOR",
+            "HOLDUNTIL",
+            "BY",
+            "MT-PRIORITY",
+            "RET",
+            "ENVID",
+        ];
+
+        if TYPED_MAIL_KEYWORDS
+            .iter()
+            .any(|typed_keyword| keyword.eq_ignore_ascii_case(typed_keyword))
+        {
+            return Err(error::invalid_input(format!(
+                "standard MAIL parameter {keyword} must use its typed variant"
+            )));
+        }
+
+        Ok(())
     }
 
     fn validate_rcpt_parameter(&self, parameter: &RcptParameter) -> Result<(), Error> {
@@ -440,7 +471,69 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_mail_keywords_are_rejected_including_raw_aliases_and_inference() {
+    fn generic_mail_parameters_cannot_spell_typed_keywords() {
+        let info = server("250 smtp.example\r\n");
+        for keyword in [
+            "BODY",
+            "SIZE",
+            "SMTPUTF8",
+            "REQUIRETLS",
+            "HOLDFOR",
+            "HOLDUNTIL",
+            "BY",
+            "MT-PRIORITY",
+            "RET",
+            "ENVID",
+        ] {
+            rejects(
+                &info,
+                &SendOptions::new().mail_parameter(MailParameter::Other {
+                    keyword: keyword.to_ascii_lowercase(),
+                    value: Some("1".to_owned()),
+                }),
+                b"body",
+                "must use its typed variant",
+            );
+            rejects(
+                &info,
+                &SendOptions::new().mail_parameter(MailParameter::OtherRaw {
+                    keyword: keyword.to_owned(),
+                    value: Some("1".to_owned()),
+                }),
+                b"body",
+                "must use its typed variant",
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_custom_mail_parameters_remain_available() {
+        let info = server("250 smtp.example\r\n");
+        let builder = EnvelopeBuilder {
+            server_info: &info,
+            encrypted: false,
+        };
+        let options = SendOptions::new()
+            .mail_parameter(MailParameter::Other {
+                keyword: "X-VENDOR".to_owned(),
+                value: Some("a b".to_owned()),
+            })
+            .mail_parameter(MailParameter::OtherRaw {
+                keyword: "X-RAW".to_owned(),
+                value: Some("value!".to_owned()),
+            });
+
+        let (mail, _) = builder
+            .build_envelope(&envelope(), b"body", &options, false)
+            .unwrap();
+        assert_eq!(
+            mail.to_string(),
+            "MAIL FROM:<sender@example.com> X-VENDOR=a+20b X-RAW=value!\r\n"
+        );
+    }
+
+    #[test]
+    fn duplicate_mail_keywords_are_rejected_for_typed_and_custom_parameters() {
         let info = server("250-smtp.example\r\n250-DSN\r\n250-8BITMIME\r\n250 SIZE 1000\r\n");
         let cases = [
             SendOptions::new()
@@ -452,16 +545,6 @@ mod tests {
             SendOptions::new()
                 .mail_parameter(MailParameter::Size(4))
                 .mail_parameter(MailParameter::Size(5)),
-            SendOptions::new()
-                .dsn_return(DsnReturn::Full)
-                .mail_parameter(MailParameter::Other {
-                    keyword: "ret".to_owned(),
-                    value: Some("HDRS".to_owned()),
-                }),
-            SendOptions::new().mail_parameter(MailParameter::OtherRaw {
-                keyword: "size".to_owned(),
-                value: Some("4".to_owned()),
-            }),
             SendOptions::new()
                 .mail_parameter(MailParameter::Other {
                     keyword: "X-TEST".to_owned(),
@@ -475,15 +558,6 @@ mod tests {
         for options in cases {
             rejects(&info, &options, b"body", "duplicate MAIL parameter keyword");
         }
-        rejects(
-            &info,
-            &SendOptions::new().mail_parameter(MailParameter::OtherRaw {
-                keyword: "body".to_owned(),
-                value: Some("8BITMIME".to_owned()),
-            }),
-            b"\xc3\xa9",
-            "duplicate MAIL parameter keyword",
-        );
     }
 
     #[test]

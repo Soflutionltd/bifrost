@@ -19,16 +19,12 @@ SCRAM continuation defect is IMAP-002.
 
 ## SMTP-003 - The blocking transport cannot tell a busy refresher from one needing refresh
 
-Residue: a stale or empty `OAuthRefresher` can still panic in `tokio::spawn`
-on a runtime-less blocking thread, and a momentarily held state lock rejects a
-fresh token as "requires a network refresh". SMTP cannot tell them apart through
-the opaque `TokenSource` future; a safe fix needs a synchronous cached-token or
-readiness API in `bifrost-net`. The one-poll rejection is pinned by a test.
-
-## SMTP-016 - `Other` and `OtherRaw` MAIL parameters bypass typed capability validation
-
-Lateral from the envelope consolidation: a lone raw `SIZE` skips the
-advertisement check that the typed `SIZE` now has, and nothing stops a raw
-keyword duplicating a typed one in spirit if its spelling differs. Existing
-custom-parameter behaviour, left unchanged.
+A stale or empty `OAuthRefresher` can still panic in `tokio::spawn` on a
+runtime-less blocking thread, and a momentarily held state lock rejects a fresh
+token as "not immediately available". SMTP cannot tell the cases apart through
+the opaque `TokenSource` future; `is_coordinating()` is metadata and does not
+resolve readiness. A safe fix needs a non-refreshing synchronous net snapshot
+that distinguishes three states (usable cached token, refresh required, state
+lock contended) while preserving typed source errors. The one-poll rejection is
+pinned by a test.
 

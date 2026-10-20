@@ -2568,10 +2568,10 @@ impl AccountFactory for ExhaustingFactory {
     }
 }
 
-/// The account-wide reopen budget (sync-D6): three consecutive
-/// `factory.open` failures, spaced by exponential backoff, then the last
-/// `AccountError` is broadcast verbatim as `SyncEvent::Terminated` and the
-/// account is paused with `PauseReason::RetryBudgetExhausted`.
+/// Three consecutive `factory.open` failures exhaust the account-wide reopen
+/// budget. This test's last error is terminal, so it remains unchanged in
+/// `SyncEvent::Terminated` before the account pauses with
+/// `PauseReason::RetryBudgetExhausted`.
 ///
 /// Run under paused time so the backoff schedule is exact: the gap between
 /// two recorded opens IS the slept delay, with no wall-clock noise. The
@@ -2646,7 +2646,7 @@ async fn three_failed_reopens_terminate_and_pause_the_account() {
     assert_eq!(
         error.message_key(),
         expected.message_key(),
-        "the LAST open failure is emitted verbatim, not the lifecycle trigger"
+        "the terminal failure is preserved, not replaced by the lifecycle trigger"
     );
     assert!(
         matches!(error.kind(), AccountErrorKind::Unsupported(_)),

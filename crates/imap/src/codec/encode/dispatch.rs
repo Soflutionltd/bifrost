@@ -145,7 +145,7 @@ pub(crate) fn encode_command(
             if qresync.is_some() && !opts.has_capability(&Capability::QResync) {
                 return Err(missing("SELECT (QRESYNC)", "QRESYNC"));
             }
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_select_or_examine(
                 &mut w,
                 tag,
@@ -169,7 +169,7 @@ pub(crate) fn encode_command(
             if qresync.is_some() && !opts.has_capability(&Capability::QResync) {
                 return Err(missing("EXAMINE (QRESYNC)", "QRESYNC"));
             }
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_select_or_examine(
                 &mut w,
                 tag,
@@ -181,7 +181,7 @@ pub(crate) fn encode_command(
             )?;
         }
         Command::Create { mailbox } => {
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_mailbox_cmd(&mut w, tag, "CREATE", &wire, utf8);
         }
         Command::CreateSpecialUse {
@@ -192,24 +192,24 @@ pub(crate) fn encode_command(
             if !opts.has_capability(&Capability::CreateSpecialUse) {
                 return Err(missing("CREATE (USE)", "CREATE-SPECIAL-USE"));
             }
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_create_special_use(&mut w, tag, &wire, special_use, utf8);
         }
         Command::Delete { mailbox } => {
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_mailbox_cmd(&mut w, tag, "DELETE", &wire, utf8);
         }
         Command::Rename { mailbox, new_name } => {
-            let wire_old = encode_mailbox_name(mailbox, utf8);
-            let wire_new = encode_mailbox_name(new_name, utf8);
+            let wire_old = encode_mailbox_name(mailbox, utf8)?;
+            let wire_new = encode_mailbox_name(new_name, utf8)?;
             encode_two_quoted_args(&mut w, tag, "RENAME", &wire_old, &wire_new, utf8);
         }
         Command::Subscribe { mailbox } => {
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_mailbox_cmd(&mut w, tag, "SUBSCRIBE", &wire, utf8);
         }
         Command::Unsubscribe { mailbox } => {
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_mailbox_cmd(&mut w, tag, "UNSUBSCRIBE", &wire, utf8);
         }
         Command::Lsub { reference, pattern } => {
@@ -244,7 +244,7 @@ pub(crate) fn encode_command(
             encode_simple(&mut w, tag, "UNSELECT");
         }
         Command::Status { mailbox, items } => {
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_status(&mut w, tag, &wire, items, utf8)?;
         }
         Command::Search { criteria } => {
@@ -297,7 +297,7 @@ pub(crate) fn encode_command(
             mailbox,
         } => {
             // SequenceSet is pre-validated at construction time (RFC 3501 Section 9).
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_two_arg(
                 &mut w,
                 tag,
@@ -317,7 +317,7 @@ pub(crate) fn encode_command(
                 return Err(missing("MOVE", "MOVE"));
             }
             // SequenceSet is pre-validated at construction time (RFC 3501 Section 9).
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_two_arg(
                 &mut w,
                 tag,
@@ -401,7 +401,7 @@ pub(crate) fn encode_command(
                 return Err(missing("UID MOVE", "MOVE"));
             }
             // SequenceSet is pre-validated at construction time (RFC 3501 Section 9).
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_two_arg(
                 &mut w,
                 tag,
@@ -417,7 +417,7 @@ pub(crate) fn encode_command(
             mailbox,
         } => {
             // SequenceSet is pre-validated at construction time (RFC 3501 Section 9).
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_two_arg(
                 &mut w,
                 tag,
@@ -486,7 +486,7 @@ pub(crate) fn encode_command(
             {
                 return Err(missing("GETMETADATA", "METADATA"));
             }
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_getmetadata(
                 &mut w,
                 tag,
@@ -504,7 +504,7 @@ pub(crate) fn encode_command(
             {
                 return Err(missing("SETMETADATA", "METADATA"));
             }
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_setmetadata(&mut w, tag, &wire, entries, utf8)?;
         }
         Command::Thread {
@@ -573,7 +573,7 @@ pub(crate) fn encode_command(
             if !opts.has_capability(&Capability::Quota) {
                 return Err(missing("GETQUOTAROOT", "QUOTA"));
             }
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_mailbox_cmd(&mut w, tag, "GETQUOTAROOT", &wire, utf8);
         }
         Command::SetQuota { root, resources } => {
@@ -594,7 +594,7 @@ pub(crate) fn encode_command(
             if !opts.has_capability(&Capability::Acl) {
                 return Err(missing("SETACL", "ACL"));
             }
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_set_acl(&mut w, tag, &wire, identifier, rights, utf8);
         }
         Command::DeleteAcl {
@@ -605,7 +605,7 @@ pub(crate) fn encode_command(
             if !opts.has_capability(&Capability::Acl) {
                 return Err(missing("DELETEACL", "ACL"));
             }
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_two_quoted_args(&mut w, tag, "DELETEACL", &wire, identifier, utf8);
         }
         Command::GetAcl { mailbox } => {
@@ -613,7 +613,7 @@ pub(crate) fn encode_command(
             if !opts.has_capability(&Capability::Acl) {
                 return Err(missing("GETACL", "ACL"));
             }
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_mailbox_cmd(&mut w, tag, "GETACL", &wire, utf8);
         }
         Command::ListRights {
@@ -624,7 +624,7 @@ pub(crate) fn encode_command(
             if !opts.has_capability(&Capability::Acl) {
                 return Err(missing("LISTRIGHTS", "ACL"));
             }
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_two_quoted_args(&mut w, tag, "LISTRIGHTS", &wire, identifier, utf8);
         }
         Command::MyRights { mailbox } => {
@@ -632,7 +632,7 @@ pub(crate) fn encode_command(
             if !opts.has_capability(&Capability::Acl) {
                 return Err(missing("MYRIGHTS", "ACL"));
             }
-            let wire = encode_mailbox_name(mailbox, utf8);
+            let wire = encode_mailbox_name(mailbox, utf8)?;
             encode_mailbox_cmd(&mut w, tag, "MYRIGHTS", &wire, utf8);
         }
 

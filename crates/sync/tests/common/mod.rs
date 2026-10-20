@@ -208,6 +208,9 @@ pub struct StubAccount {
     pub inventory_hook: Option<InventoryHook>,
     /// Treat stored cursors as resumable inventory positions.
     pub resume_inventory: bool,
+    /// Optional classifier override for testing disagreement with the resume
+    /// stream hook. `None` keeps both answers aligned through `resume_inventory`.
+    pub resume_inventory_classifier: Option<bool>,
     /// Hook for `changes_stream`. Default: empty stream.
     pub changes_hook: Option<ChangesHook>,
     /// Throttle keys `throttle_keys` declares for a scope drive. Default:
@@ -458,6 +461,7 @@ impl StubAccount {
             partition_hook: None,
             inventory_hook: None,
             resume_inventory: false,
+            resume_inventory_classifier: None,
             changes_hook: None,
             scope_keys: None,
             repair_hook: None,
@@ -624,7 +628,8 @@ impl Account for StubAccount {
     }
 
     fn is_inventory_cursor(&self, _: &ChangeCursor) -> bool {
-        self.resume_inventory
+        self.resume_inventory_classifier
+            .unwrap_or(self.resume_inventory)
     }
 
     fn inventory_resume_stream(

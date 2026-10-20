@@ -255,6 +255,65 @@ async fn repair_restart_waits_before_opening_next_replacement() {
     assert_eq!(factory.opens.load(Ordering::SeqCst), 3);
 }
 
+struct ExhaustingRetryFactory {
+    initial: Arc<common::StubAccount>,
+    opens: AtomicUsize,
+    retry_error: AccountError,
+}
+impl AccountFactory for ExhaustingRetryFactory {
+    fn open(
+        &self,
+        _: AccountId,
+    ) -> AccountFuture<Result<bifrost_types::OpenedAccount, AccountError>> {
+        let count = self.opens.fetch_add(1, Ordering::SeqCst);
+        let result = if count == 0 {
+            Ok(bifrost_types::OpenedAccount {
+                account: Arc::<common::StubAccount>::clone(&self.initial),
+                skipped_scopes: vec![],
+            })
+        } else {
+            Err(self.retry_error.clone())
+        };
+        Box::pin(async move { result })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn account_restart_exhaustion_reclassifies_retryable_last_error() {
+    let retry_error = throttle(0);
+    let factory = Arc::new(ExhaustingRetryFactory {
+        initial: Arc::new(account()),
+        opens: AtomicUsize::new(0),
+        retry_error: retry_error.clone(),
+    });
+    let concrete_factory: Arc<ExhaustingRetryFactory> = Arc::clone(&factory);
+    let factory_trait: Arc<dyn AccountFactory> = concrete_factory;
+    let fixture = Fixture::new(factory_trait).await;
+    let writer = fixture.writer();
+    let ctx = fixture.ctx(&writer);
+    let mut changes = ctx.changes_tx.subscribe();
+
+    assert!(!restart_account(&ctx).await);
+
+    assert_eq!(factory.opens.load(Ordering::SeqCst), 4);
+    let event = changes.try_recv().expect("account exhaustion event");
+    assert_eq!(event.scope, CursorScope::Account);
+    let SyncEvent::Terminated(error) = event.event.as_ref() else {
+        panic!("exhaustion publishes a termination")
+    };
+    assert_ne!(error.message_key(), retry_error.message_key());
+    assert!(matches!(
+        error.recovery(),
+        bifrost_types::RecoveryClass::Engine(
+            bifrost_types::EngineDirective::OperatorOverrideRequired { .. }
+        )
+    ));
+    assert_eq!(
+        error.scope(),
+        Some(&bifrost_types::ErrorScope::Cursor(CursorScope::Account))
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn repair_replacement_uses_its_own_declared_keys() {
     let initial = Arc::new(common::StubAccount::new(vec![]));
@@ -454,6 +513,64 @@ async fn writer_boundary_case(stored_inventory: bool, exhaust: bool) {
             usize::from(stored_inventory)
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreadable_stored_envelope_returns_error_without_reset_request() {
+    let account = Arc::new(account());
+    let fixture = Fixture::new(Arc::new(common::StubFactory::queue(vec![Arc::clone(
+        &account,
+    )])))
+    .await;
+    let (writer_tx, mut writer_rx) = mpsc::channel(8);
+    let writer = WriterHandle::new(writer_tx);
+    let ctx = fixture.ctx(&writer);
+    let mut invalid = common::cursor_for(&SCOPE, b"legacy-page");
+    invalid.envelope_version = u32::MAX;
+    let mut pacing = RepairPacing::default();
+    let establish = run_establish(
+        &fixture.id,
+        account.as_ref(),
+        SCOPE,
+        Arc::clone(ctx.cursors),
+        &writer,
+        Arc::clone(ctx.delivery),
+        Some(ctx.control),
+        Arc::clone(ctx.coverage),
+        false,
+        ctx.shutdown,
+        Some(44),
+        &ctx,
+        &mut pacing,
+    );
+    tokio::pin!(establish);
+
+    let request = tokio::select! {
+        request = writer_rx.recv() => request.expect("stored cursor read"),
+        _result = &mut establish => panic!("establishment finished before reading the cursor"),
+    };
+    let WriterRequest::GetChangeCursor {
+        scope,
+        claim_for,
+        done,
+    } = request
+    else {
+        panic!("establishment starts with the serialized cursor read")
+    };
+    assert_eq!(scope, SCOPE);
+    assert_eq!(claim_for, Some(44));
+    done.send(Ok(Some(invalid))).expect("answer cursor read");
+
+    let result = establish.await;
+    let Err(Error::Account(error)) = result else {
+        panic!("unreadable stored envelope is returned as a classified error")
+    };
+    assert!(matches!(
+        error.recovery(),
+        bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::SchemaIncompatible)
+    ));
+    assert!(account.established.lock().expect("established").is_empty());
+    assert!(writer_rx.try_recv().is_err());
 }
 
 #[tokio::test(start_paused = true)]

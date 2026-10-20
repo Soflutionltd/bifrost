@@ -1581,6 +1581,10 @@ fn patch_changes_content(patch: &EventPatch) -> bool {
 /// instead of replaying a write that already took effect. The original cause
 /// chain rides along as secondary evidence.
 ///
+/// This override describes the whole sequence, not HTTP method semantics.
+/// Feeding `AccountOperation::EventUpdate` into net cannot replace it: the
+/// sequence has already changed the source identity before this failure.
+///
 /// The unreplayable declaration must be RE-STATED here. `dispatch_once` stamps
 /// `idempotency_override(false)` on the leg's own failure, but this is a FRESH
 /// `AccountErrorBuilder`, and an override is not part of the cause chain that

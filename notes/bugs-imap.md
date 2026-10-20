@@ -18,35 +18,6 @@ scopes. Push-error triage in the IDLE worker is filed with the cross-provider
 entry SHARED-013; the private address parser in `pim.rs` with SHARED-004.
 "Live" and "latent" are the hunters' labels.
 
-## IMAP-005 - Mailbox identity is decoded lossily and never round-trips
-
-Live. Scope: imap protocol.
-
-`codec/decode/mailbox.rs` `decode_mailbox_from_wire`, `codec/utf7.rs`
-`decode_utf7`, `MailboxName::from_decoded`. A mailbox is kept only in decoded
-form, and the encoder re-derives wire bytes with `encode_utf7`. The deliberately
-lenient decoder is non-injective and non-invertible:
-
-- raw 8-bit names (which the code says Exchange sends) decode to UTF-8 and
-  re-encode as `&...-`, different octets;
-- base64 segments encoding printable ASCII (Exchange, per the comment) decode
-  to plain ASCII and re-encode differently;
-- malformed segments and control bytes become literal text or U+FFFD, which
-  cannot be re-encoded;
-- in UTF-8 mode, `from_utf8_lossy` maps invalid bytes to U+FFFD.
-
-A LISTed mailbox can be impossible to SELECT, or two wire names can collapse
-onto one `MailboxName`, so an operation lands on the wrong folder. The module
-doc ("the decoder's output is always in decoded user-facing form") is true; the
-defect is that this form is the only one kept while also used as the address.
-`MailboxName` as an identity implies addressability. Fix: keep the raw wire
-octets alongside the display form in codec-constructed names and send them
-back when the name came from the server.
-
-Latent sibling: `gmail_label` (`codec/decode/envelope_fetch.rs`) always runs
-`decode_utf7`, even in UTF-8 mode. Gmail advertises `UTF8=ACCEPT`; the account
-layer does not ENABLE it today.
-
 ## IMAP-022 - The MODSEQ cache records server state the consumer has not seen, so `UNCHANGEDSINCE` guards less than documented
 
 Scope: imap account.
@@ -112,3 +83,12 @@ the constraint is documented in `error.rs`.
 - Residual limits documented rather than fixable: the plain `EXPUNGE` fallback
   window without UIDPLUS, bulk mutation ignoring `IdempotencyKey`, and Basic
   folders being unable to observe flag changes without CONDSTORE.
+
+## IMAP-005 - Mailbox wire identity is kept by the codec, not by the account layer
+
+Residue: `MailboxName` now carries the server wire octets and their encoding
+mode, the typed encoders replay them, and equality and hashing separate
+colliding display names. Still collapsing through display strings: the account
+registry keys and folder ids, APPEND, LIST patterns and NOTIFY filters; and a
+mode change re-encodes from the display form, so wire preservation only holds in
+the original mode.

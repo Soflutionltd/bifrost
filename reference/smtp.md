@@ -199,9 +199,12 @@ before `MAIL FROM` lives in the sans-I/O sibling `client/envelope.rs`.
 both adapters delegate `build_envelope` and `build_batch` to it. Direct and
 batch sends share one MAIL option builder and one RCPT option builder.
 Explicit SIZE requires server advertisement, and the completed MAIL option
-list rejects duplicate keywords case-insensitively, including custom aliases
-and collisions with inferred options. RCPT options retain their last-value-wins
-normalization and recipient-specific overrides.
+list rejects duplicate keywords case-insensitively. `Other` and `OtherRaw` are
+reserved for custom keywords without typed `MailParameter` variants: raw
+spellings of typed keywords such as SIZE are rejected, so they cannot bypass
+capability or value validation. Unknown custom parameters remain available.
+RCPT options retain their last-value-wins normalization and recipient-specific
+overrides.
 
 ## Connection lifecycle
 
@@ -577,7 +580,9 @@ Public entry points: `send_raw_with_options(...)` on SMTP and LMTP, sync and asy
 
 RFC 3461 §4.1: any byte outside `%x21-%x7E`, plus `+`, plus `=`, is encoded as `+HH` with uppercase two-digit hex. UTF-8 multi-byte sequences are encoded byte-by-byte. Used for ENVID, ORCPT address part, and unknown ESMTP parameter values. Centralized in `util.rs`.
 
-`OtherRaw` and `HOLDUNTIL` values bypass xtext and are validated as raw ESMTP values: printable ASCII without spaces, with `=` excluded by RFC 5321. EHLO domain values use the same raw-value check.
+Unknown `OtherRaw` custom values and typed `HOLDUNTIL` values bypass xtext and
+are validated as raw ESMTP values: printable ASCII without spaces, with `=`
+excluded by RFC 5321. EHLO domain values use the same raw-value check.
 
 ## VRFY / EXPN
 
@@ -606,7 +611,7 @@ A consequence: `Message::formatted()` is byte-identical to the delivered data se
 
 ## Auth
 
-`Credentials` is enum: `Password { username, password: Zeroizing<String> }` and `OAuth2 { identity, token_source: Arc<dyn TokenSource> }` (bifrost-net's trait). The OAuth token is read live from the shared source at each connect, so a token rotated on the source is presented on reconnect without rebuilding the transport. `Credentials` is `Clone` only - no `PartialEq`/`Eq`/serde derives (a live token source is neither comparable nor serializable; rotation material is the consumer's to persist). The `AUTH` command struct (`Auth`) likewise dropped those derives. The async transport reads the token via `oauth2_token().await`, so token sources may lock, join an in-flight refresh, or perform network refresh work without a polling shortcut; the blocking transport reads it via `oauth2_token_blocking()`, a single-poll of `current()`. A static source resolves immediately. An `OAuthRefresher` with a fresh token resolves on that poll only if its async state lock is immediately available. Any `Pending` result is rejected because the trait exposes no synchronous readiness or cached-token snapshot; polling again can start refresh work that requires a Tokio runtime. Token-source errors retain bifrost-net's typed account-error projection, including terminal auth loss versus transient refresh failure.
+`Credentials` is enum: `Password { username, password: Zeroizing<String> }` and `OAuth2 { identity, token_source: Arc<dyn TokenSource> }` (bifrost-net's trait). The OAuth token is read live from the shared source at each connect, so a token rotated on the source is presented on reconnect without rebuilding the transport. `Credentials` is `Clone` only - no `PartialEq`/`Eq`/serde derives (a live token source is neither comparable nor serializable; rotation material is the consumer's to persist). The `AUTH` command struct (`Auth`) likewise dropped those derives. The async transport reads the token via `oauth2_token().await`, so token sources may lock, join an in-flight refresh, or perform network refresh work without a polling shortcut; the blocking transport reads it via `oauth2_token_blocking()`, a single-poll of `current()`. A static source resolves immediately. An `OAuthRefresher` with a fresh token resolves on that poll only if its async state lock is immediately available. A `Pending` result is rejected as not immediately available, since the trait exposes no synchronous readiness or cached-token snapshot. `TokenSource::is_coordinating()` only identifies a source that owns its cache semantics; it cannot distinguish lock contention from a token needing refresh. A safe blocking distinction needs a synchronous, non-refreshing snapshot that reports a usable cached token, refresh required, or state-lock contention while preserving typed source errors. An empty or stale `OAuthRefresher` can start refresh work and call `tokio::spawn` during that first poll; on a runtime-less blocking thread this panics and leaves the state marked as refreshing. A fresh token behind the async lock can instead return `Pending`. Token-source errors retain bifrost-net's typed account-error projection, including terminal auth loss versus transient refresh failure.
 
 Mechanisms (`Mechanism`, `#[non_exhaustive]`): PLAIN, LOGIN, XOAUTH2, OAUTHBEARER, SCRAM-SHA-1, SCRAM-SHA-256, SCRAM-SHA-1-PLUS, SCRAM-SHA-256-PLUS. SCRAM computation is consumed from `bifrost-sasl` (the `-PLUS` suffix and token spelling have a single authority there); SMTP owns only the wire sequencing. `ScramExchange` keeps its client-first and client-final lines in `Secret` values through the continuation write. The client-first is base64-framed once with a zeroizing encoder; `scram_client_final` already returns a base64 client-final, which SMTP writes unchanged.
 

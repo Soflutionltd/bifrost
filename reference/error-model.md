@@ -575,7 +575,13 @@ across the variable-width cursor shapes - a drift that self-describing
 JSON hides but length-prefixed formats turn into corrupt output.
 `AccountOperation` is the large
 `#[non_exhaustive]` operation enum; `is_idempotent()` is the
-**authoritative idempotency source** `derive` consults. Absolute-state writes
+default idempotency source `derive` consults when no explicit
+`idempotency_override` is supplied. This is a logical-operation recovery
+policy, not proof that every HTTP leg of that operation is replayable.
+An event/contact update can contain a MOVE or conditional create-PUT; its
+request and partial-sequence failures must narrow the default to reconciliation.
+Net independently uses request-level replay safety and otherwise its HTTP-method
+default. Those defaults are not equivalent. Absolute-state writes
 against a known id, including the `*Update` family (except `FilterUpdate`,
 which is delete+create on Gmail and name-keyed on ManageSieve, so it sits with
 the non-idempotent writes) and the singleton settings

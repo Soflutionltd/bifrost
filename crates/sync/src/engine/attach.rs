@@ -714,21 +714,24 @@ impl SyncEngine {
         // Check the store first - resume path.
         //
         // A schema-incompatible envelope is healed HERE rather than
-        // handed to the recovery translator. The running-account path
-        // (`run_establish`) can return a typed `AccountError` because a
-        // reopen listener is alive to receive
-        // `Engine(SchemaIncompatible)` and run the schema-clear loop;
-        // at attach that listener does not exist yet - it is spawned
-        // further down `attach_inner`. Returning an error here instead
-        // would fail the whole attach with nothing left running to
-        // clear the undecodable row, so the account would refuse to
-        // attach on every subsequent start with no recovery path.
-        // Dropping the row and re-establishing this scope is exactly
-        // what `handle_schema_incompatible` would have done, scoped to
-        // the one cursor that cannot be read. (sync-D10)
+        // returned to recovery dispatch. `run_establish` does return a
+        // typed `AccountError`, but its callers handle that result as a
+        // scoped retry or a failed replacement; they do not send it
+        // through the reopen listener's schema-clear arm. Attach has no
+        // listener yet and no retry path, so returning the error would
+        // leave the same unreadable row to fail every subsequent start.
+        // Delete this row and re-establish its scope inline.
         match self.checkpoints.get_change_cursor(account_id, &scope).await {
             Ok(Some(existing)) if existing.validate_envelope().is_ok() => {
-                if account.is_inventory_cursor(&existing) {
+                // The classifier and the stream hook are required to agree.
+                // Defer either positive answer so InventoryFusion's guard can
+                // route a disagreement through scoped recovery. In
+                // particular, putting a cursor into the registry when only
+                // the stream hook accepts it would send an inventory page
+                // cursor to changes_stream.
+                let classified_as_inventory = account.is_inventory_cursor(&existing);
+                let has_resume_stream = account.inventory_resume_stream(existing.clone()).is_some();
+                if classified_as_inventory || has_resume_stream {
                     return Ok(InitialScope::DeferredInventory(DeferredInventory::Resume(
                         existing,
                     )));
@@ -1183,4 +1186,55 @@ pub(super) async fn link_discovered_memberships(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cursor::CheckpointStore;
+    use crate::test_common as common;
+
+    #[tokio::test]
+    async fn attach_defers_a_resume_stream_rejected_by_its_classifier() {
+        let account_id = AccountId("attach-resume-contract".into());
+        let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
+        let cursor = common::cursor_for(&scope, b"inventory-page");
+        let store = Arc::new(InMemoryCheckpointStore::new());
+        store
+            .apply_transition(
+                &account_id,
+                CheckpointTransition {
+                    checkpoint: Checkpoint::Change(cursor.clone()),
+                    ledger: crate::cursor::DebtLedger::default(),
+                },
+            )
+            .await
+            .expect("seed stored cursor");
+        let engine = SyncEngine::builder()
+            .checkpoints(store)
+            .build()
+            .expect("engine");
+        let mut account = common::StubAccount::new(Vec::new());
+        account.resume_inventory = true;
+        account.resume_inventory_classifier = Some(false);
+        let cursors = Arc::new(CursorRegistry::new());
+
+        let established = engine
+            .establish_one(&account_id, &account, scope.clone(), Arc::clone(&cursors))
+            .await
+            .expect("stored cursor is deferred for the resume guard");
+
+        let InitialScope::DeferredInventory(DeferredInventory::Resume(resumed)) = established
+        else {
+            panic!("a supplied resume stream must stay out of the changes registry")
+        };
+        assert_eq!(resumed, cursor);
+        assert!(cursors.snapshot(&scope).is_none());
+        assert_eq!(
+            account
+                .inventory_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
 }

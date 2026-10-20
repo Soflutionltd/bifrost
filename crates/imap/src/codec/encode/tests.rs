@@ -8206,3 +8206,112 @@ fn list_status_return_option_rejects_unbalanced_leading_paren() {
         "an unbalanced STATUS list must not be emitted"
     );
 }
+
+#[test]
+fn listed_mailbox_wire_octets_survive_select_encoding() {
+    use crate::codec::decode::parse_response_utf8;
+    use crate::types::response::{Response, UntaggedResponse};
+
+    let cases: &[(&[u8], bool)] = &[
+        (b"caf\xc3\xa9", false),
+        (b"raw\xff", false),
+        (b"&AGE-", false),
+        (b"&not!base64-", false),
+        (b"&unterminated", false),
+        (b"&2AA-", false),
+        (b"control\x01\x7f", false),
+        (b"&AAoALQ-", false),
+        (b"caf\xc3\xa9 &AGE-", true),
+        (b"invalid\xff", true),
+        (b"line\r\nbreak", true),
+    ];
+    for &(raw, utf8) in cases {
+        let mut response = format!("* LIST () \"/\" {{{}}}\r\n", raw.len()).into_bytes();
+        response.extend_from_slice(raw);
+        response.extend_from_slice(b"\r\n");
+        let (rest, response) = parse_response_utf8(&response, utf8).unwrap();
+        assert!(rest.is_empty());
+        let Response::Untagged(response) = response else {
+            panic!("expected LIST")
+        };
+        let UntaggedResponse::List(info) = *response else {
+            panic!("expected LIST")
+        };
+        let cmd = Command::Select {
+            mailbox: info.name,
+            condstore: false,
+            qresync: None,
+        };
+        let mut encoded = BytesMut::new();
+        encode_command_to_buf(
+            &mut encoded,
+            "A1",
+            &cmd,
+            &opts(LiteralMode::LiteralPlus, utf8),
+        )
+        .unwrap();
+        // These samples contain no quote or backslash: the only legal framing
+        // choices here are a quoted string or a counted non-sync literal.
+        let mut quoted = b"A1 SELECT \"".to_vec();
+        quoted.extend_from_slice(raw);
+        quoted.extend_from_slice(b"\"\r\n");
+        let mut literal = format!("A1 SELECT {{{}+}}\r\n", raw.len()).into_bytes();
+        literal.extend_from_slice(raw);
+        literal.extend_from_slice(b"\r\n");
+        assert!(
+            encoded[..] == quoted || encoded[..] == literal,
+            "{raw:?}: {encoded:?}"
+        );
+    }
+}
+
+#[test]
+fn mailbox_identity_distinguishes_equal_display_names() {
+    use crate::codec::decode::parse_response_utf8;
+    use crate::types::response::{Response, UntaggedResponse};
+    let parse = |raw: &[u8], utf8| {
+        let mut response = format!("* LIST () NIL {{{}}}\r\n", raw.len()).into_bytes();
+        response.extend_from_slice(raw);
+        response.extend_from_slice(b"\r\n");
+        let (_, Response::Untagged(response)) = parse_response_utf8(&response, utf8).unwrap()
+        else {
+            panic!("expected LIST")
+        };
+        let UntaggedResponse::List(info) = *response else {
+            panic!("expected LIST")
+        };
+        info.name
+    };
+    for (a, b, utf8) in [
+        (b"&AGE-".as_slice(), b"a".as_slice(), false),
+        (b"\xff".as_slice(), b"\xfe".as_slice(), true),
+    ] {
+        let a = parse(a, utf8);
+        let b = parse(b, utf8);
+        assert_eq!(a.as_str(), b.as_str());
+        assert_ne!(a, b);
+        let set = std::collections::HashSet::from([a, b]);
+        assert_eq!(set.len(), 2);
+    }
+    assert_eq!(parse(b"caf&AOk-", false), MailboxName::new("café").unwrap());
+    assert_eq!(
+        parse("café".as_bytes(), true),
+        MailboxName::new("café").unwrap()
+    );
+}
+
+#[test]
+fn mailbox_wire_nul_is_refused_instead_of_addressing_a_different_name() {
+    let mailbox = MailboxName::from_wire("a\0b".into(), b"a\0b", true);
+    let cmd = Command::Select {
+        mailbox,
+        condstore: false,
+        qresync: None,
+    };
+    let mut buf = BytesMut::new();
+    assert!(matches!(
+        encode_command_to_buf(&mut buf, "A1", &cmd, &opts(LiteralMode::LiteralPlus, true)),
+        Err(crate::Error::InvalidInput(_))
+    ));
+    assert!(buf.is_empty());
+}

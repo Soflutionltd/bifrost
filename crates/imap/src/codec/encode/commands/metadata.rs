@@ -13,7 +13,7 @@ use crate::codec::encode::LiteralForm;
 pub(in crate::codec::encode) fn encode_getmetadata(
     w: &mut CommandWriter,
     tag: &str,
-    mailbox: &str,
+    mailbox: impl AsRef<[u8]>,
     entries: &[String],
     max_size: Option<u64>,
     depth: Option<&str>,
@@ -79,7 +79,7 @@ pub(in crate::codec::encode) fn encode_getmetadata(
 
     w.raw(b" ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    w.string(mailbox.as_bytes(), utf8);
+    w.string(mailbox.as_ref(), utf8);
 
     w.raw(b" ");
     if entries.len() == 1 {
@@ -107,7 +107,7 @@ pub(in crate::codec::encode) fn encode_getmetadata(
 pub(in crate::codec::encode) fn encode_setmetadata(
     w: &mut CommandWriter,
     tag: &str,
-    mailbox: &str,
+    mailbox: impl AsRef<[u8]>,
     entries: &[(String, Option<Vec<u8>>)],
     utf8: bool,
 ) -> Result<(), crate::Error> {
@@ -125,7 +125,7 @@ pub(in crate::codec::encode) fn encode_setmetadata(
     w.raw(tag.as_bytes());
     w.raw(b" SETMETADATA ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    w.string(mailbox.as_bytes(), utf8);
+    w.string(mailbox.as_ref(), utf8);
     w.raw(b" (");
     for (i, (name, value)) in entries.iter().enumerate() {
         if i > 0 {

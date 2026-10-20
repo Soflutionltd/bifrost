@@ -1,5 +1,12 @@
 # bifrost-carddav reference
 
+Request replay safety is not inferred from the enclosing operation.
+`ContactUpdate` includes relocation, whose MOVE and conditional create-PUT legs
+are explicitly unreplayable. The error overrides on those legs and on a
+partially completed sequence are required even if net is given an operation
+label. Create-PUT already explicitly disables net replay; the HTTP PUT default
+alone would be too permissive.
+
 Current Stage 3 W2 standalone CardDAV account implementation.
 
 ## Public surface

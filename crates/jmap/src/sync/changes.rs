@@ -246,6 +246,13 @@ where
                 ))
                 .collect::<Vec<_>>();
             let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
+            // This cache is a hint for later mutation `ifInState` calls, not
+            // the durable engine cursor. Advance it before yield so a
+            // concurrent mutation can use the newest state this account has
+            // already observed; if the consumer drops the stream before
+            // persisting the checkpoint, its older cursor still replays this
+            // page. A stale cached state only causes a server-side
+            // `stateMismatch` and refresh, never a skipped change page.
             state_cache::advance(&states, &account_id, Some(&since_state), new_state.clone()).await;
 
             yield SyncEvent::Batch(Batch {

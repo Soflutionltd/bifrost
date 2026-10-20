@@ -418,6 +418,10 @@ impl GmailClient {
         method: &str,
         body: Option<&B>,
     ) -> Result<Response> {
+        // This shared Gmail/People/Calendar funnel has no AccountOperation.
+        // POST covers both reads/actions and creates; operation labels cannot
+        // be recovered from the HTTP verb. Keep the conservative wire default
+        // until callers can carry replay safety for the actual request legs.
         let mut builder = match method {
             "GET" => self.account_net().get(url),
             "POST" => self.account_net().post(url),

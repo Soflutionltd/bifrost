@@ -305,10 +305,9 @@ pub(crate) fn validate_atom_bytes(bytes: &[u8], context: &str) -> Result<(), Val
 ///
 /// RFC 3501 Section 5.1 / RFC 9051 Section 5.1: IMAP mailbox names can
 /// contain almost any character (transmitted as quoted strings or literals).
-/// The primary purpose of this type is documentation and injection-safe
-/// command construction. IMAP strings forbid NUL (RFC 3501 Section 9 /
-/// RFC 9051 Section 9), and mailbox names must not contain CRLF because
-/// commands are line-delimited (RFC 3501 Section 2.2 / RFC 9051 Section 2.2).
+/// The type separates the server address from its lenient display decoding.
+/// IMAP strings forbid NUL (RFC 3501 Section 9 / RFC 9051 Section 9).
+/// Caller input also excludes CRLF; server CRLF is framed as a literal.
 ///
 /// The empty string `""` is allowed as a special case for server-level
 /// METADATA queries (RFC 5464 Section 4.2) and LIST reference names
@@ -319,16 +318,15 @@ pub(crate) fn validate_atom_bytes(bytes: &[u8], context: &str) -> Result<(), Val
 ///
 /// # Parse-don't-validate discipline
 ///
-/// `MailboxName` has exactly two construction paths: [`MailboxName::new`]
-/// (public, validating) and `from_decoded` (codec-private, **not**
-/// validating - it preserves the server's own mailbox identifier verbatim,
-/// see that constructor for why). A `MailboxName` that came off the wire is
-/// therefore guaranteed only to be valid UTF-8; do not assume the NUL / CR /
+/// `MailboxName` has caller and codec construction paths: [`MailboxName::new`]
+/// (public, validating) and `from_wire` / `from_decoded` (codec-private, **not**
+/// validating). `from_wire` retains the original address; `from_decoded`
+/// retains only display text. A parsed name's display form is valid UTF-8; do not assume the NUL / CR /
 /// LF exclusion for names you did not construct yourself. Injection safety on
 /// the wire comes from the encoder, not from this type.
 ///
 /// There is no `From<String>` or `From<&str>`  -  constructing the type
-/// outside those two paths is a compile error:
+/// outside these paths is a compile error:
 ///
 /// ```compile_fail
 /// use bifrost_imap::MailboxName;
@@ -341,8 +339,8 @@ pub(crate) fn validate_atom_bytes(bytes: &[u8], context: &str) -> Result<(), Val
 /// // There is no From<&str>. This must fail to compile.
 /// let _: MailboxName = "Inbox".into();
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MailboxName(String);
+#[derive(Debug, Clone)]
+pub struct MailboxName(String, Option<(Vec<u8>, bool)>);
 
 impl MailboxName {
     /// Create a validated mailbox name.
@@ -362,7 +360,7 @@ impl MailboxName {
                  RFC 9051 Section 2.2)",
             ));
         }
-        Ok(Self(s))
+        Ok(Self(s, None))
     }
 
     /// Return the inner string.
@@ -370,34 +368,54 @@ impl MailboxName {
         &self.0
     }
 
+    /// Retain the address separately from the lenient display decoding.
+    pub(crate) fn from_wire(s: String, bytes: &[u8], utf8: bool) -> Self {
+        Self(s, Some((bytes.to_vec(), utf8)))
+    }
+
+    /// Original octets apply only in the mode in which they were received.
+    pub(crate) fn wire_bytes(&self, utf8: bool) -> Option<&[u8]> {
+        self.1
+            .as_ref()
+            .filter(|(_, mode)| *mode == utf8)
+            .map(|(bytes, _)| bytes.as_slice())
+    }
+
+    // Canonical server spellings compare equal to caller-created names.
+    // Noncanonical octets must remain distinct even when display decoding
+    // collapses them; malformed UTF-8 needs a separate identity domain.
+    fn identity(&self) -> (bool, Vec<u8>) {
+        let canonical = crate::codec::utf7::encode_utf7(&self.0).into_bytes();
+        match &self.1 {
+            Some((bytes, false)) => (false, bytes.clone()),
+            Some((bytes, true)) if bytes != self.0.as_bytes() => (true, bytes.clone()),
+            _ => (false, canonical),
+        }
+    }
+
     /// Construct from already-decoded bytes produced by the codec's decoder.
     /// Callers must guarantee the input has already been MUTF-7 decoded (or
     /// passed through in UTF-8 mode per RFC 6855).
     ///
-    /// This constructor does **not** apply [`MailboxName::new`]'s NUL / CR / LF
-    /// rejection, and deliberately so: RFC 3501 Section 5.1 and RFC 9051
-    /// Section 5.1 make the mailbox name the server's own identifier, and
-    /// modified UTF-7 can represent control characters, so rewriting or
-    /// rejecting one would leave us naming a mailbox the server never
-    /// advertised. Wire-originated names are preserved byte-for-byte and the
-    /// injection concern is handled at the encode boundary instead: MUTF-7
-    /// encoding folds every non-printable character back into a Base64 shift
-    /// segment, and in UTF8=ACCEPT mode a name containing CR or LF fails the
-    /// `quotable` check and is sent as a literal, where those octets are legal.
-    ///
-    /// Consequence for consumers: a `MailboxName` obtained from a parsed
-    /// response satisfies "valid UTF-8, non-empty" but not "free of NUL, CR,
-    /// and LF". Anything that embeds a mailbox name in a line-oriented sink
-    /// (logs, on-disk indexes, UI) must escape it itself.
-    ///
-    /// # Visibility
-    ///
-    /// Intended for use by `crate::codec` only. Rust's `pub(in path)`
-    /// requires the path to be an ancestor of the declaring module, so
-    /// `pub(in crate::codec)` cannot compile here in `crate::types`.
-    /// `pub(crate)` is the narrowest scope available.
+    /// This display-only constructor bypasses validation. Without wire octets,
+    /// it cannot recover a noncanonical server spelling; the parser uses
+    /// `from_wire` instead. CR/LF are safely framed by the command writer.
     pub(crate) fn from_decoded(s: String) -> Self {
-        Self(s)
+        Self(s, None)
+    }
+}
+
+impl PartialEq for MailboxName {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+
+impl Eq for MailboxName {}
+
+impl std::hash::Hash for MailboxName {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.identity(), state);
     }
 }
 
@@ -407,7 +425,7 @@ impl Default for MailboxName {
     /// The empty string is valid per RFC 5464 Section 4.2 (server-level
     /// METADATA) and RFC 3501 Section 6.3.8 (LIST reference name).
     fn default() -> Self {
-        Self(String::new())
+        Self(String::new(), None)
     }
 }
 

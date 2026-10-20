@@ -1,5 +1,6 @@
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -31,6 +32,33 @@ use super::{
     blob, calendar_ops, changes, contacts, discover, filters, foreign, hydrate, inventory,
     mutation, pim, push, state,
 };
+
+pub(crate) type CloseCompletion =
+    futures::future::Shared<futures::future::BoxFuture<'static, Result<(), AccountError>>>;
+
+/// Start account teardown once, in a task that outlives any caller waiting on
+/// it. The initializer is invoked only when the returned future is first
+/// polled, so a future dropped before polling cannot mark the account closed
+/// without starting shutdown.
+fn close_once<F>(
+    completion: Arc<std::sync::OnceLock<CloseCompletion>>,
+    start: impl FnOnce() -> F + Send + 'static,
+) -> AccountFuture<Result<(), AccountError>>
+where
+    F: Future<Output = Result<(), AccountError>> + Send + 'static,
+{
+    Box::pin(async move {
+        let completion = completion
+            .get_or_init(|| {
+                let task = tokio::spawn(start());
+                async move { task.await.expect("JMAP account teardown task panicked") }
+                    .boxed()
+                    .shared()
+            })
+            .clone();
+        completion.await
+    })
+}
 
 /// The engine-facing account is pinned to the production transport, not
 /// generic over one: WebSocket push is reqwest-specific, so `JmapAccount`
@@ -79,6 +107,9 @@ pub(crate) struct JmapAccount {
     pub(crate) subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, push::DataTypeSet>>>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) closed: Arc<AtomicBool>,
+    /// Shared teardown result. The first polled `close()` starts one
+    /// background teardown; later callers join that same completion.
+    pub(crate) close_completion: Arc<std::sync::OnceLock<CloseCompletion>>,
     pub(crate) subscription_seq: AtomicU64,
     /// Per-`accountId` `Email/changes` state cache (the mutation
     /// `ifInState` cache and changes side-cache). Keyed by accountId so
@@ -138,6 +169,7 @@ impl JmapAccount {
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
             closed: Arc::new(AtomicBool::new(false)),
+            close_completion: Arc::new(std::sync::OnceLock::new()),
             subscription_seq: AtomicU64::new(1),
             email_states: Arc::new(Mutex::new(email_states)),
             mailbox_states: Arc::new(Mutex::new(mailbox_states)),
@@ -1425,14 +1457,8 @@ impl Account for JmapAccount {
     }
 
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
-        // This synchronous transition happens before the returned future is
-        // polled. Dropping that future before its first poll skips shutdown
-        // and makes a later close call return early; close-future cancellation
-        // needs a separate retryable completion state.
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return Box::pin(async { Ok(()) });
-        }
-
+        let closed = Arc::clone(&self.closed);
+        let close_completion = Arc::clone(&self.close_completion);
         let client = self.client.clone();
         let shutdown = self.shutdown.clone();
         let reader = self.ws.reader_handle();
@@ -1446,25 +1472,31 @@ impl Account for JmapAccount {
         // gone. Teardown must be bounded on exactly the paths that motivated
         // bounding the reader.
         let teardown_timeout = self.ws.teardown_timeout();
-        Box::pin(async move {
+
+        close_once(close_completion, move || {
+            // This transition must precede the push locks: a subscribe
+            // already holding them may finish and then be disabled below,
+            // while later subscribers observe the closed gate.
+            closed.store(true, Ordering::Release);
             shutdown.cancel();
-            let result = match tokio::time::timeout(
-                teardown_timeout,
-                super::push::disable_for_close(client, subscriptions, enabled, push_state),
-            )
-            .await
-            {
-                Ok(result) => result,
-                // The unsubscribe never made it out. The connection is
-                // being dropped anyway and the server drops the
-                // subscription with it, so this is not a close failure.
-                Err(_) => Ok(()),
-            };
-            // Only NOW is the reader's stop observable: `close()` used to
-            // return while the detached task was still running, which is
-            // what made the reference's "awaits teardown" claim false.
-            super::push::join_reader(&reader, teardown_timeout).await;
-            close_outcome(result)
+            async move {
+                let result = match tokio::time::timeout(
+                    teardown_timeout,
+                    super::push::disable_for_close(client, subscriptions, enabled, push_state),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    // The unsubscribe never made it out. The connection is
+                    // being dropped anyway and the server drops the
+                    // subscription with it, so this is not a close failure.
+                    Err(_) => Ok(()),
+                };
+                // The task is joined before this shared completion resolves,
+                // so every close caller observes the reader's stop.
+                super::push::join_reader(&reader, teardown_timeout).await;
+                close_outcome(result)
+            }
         })
     }
 }
@@ -1610,11 +1642,13 @@ fn route_send_as(
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use bifrost_types::{
-        AccountErrorKind, AccountOperation, CursorScope, MailboxId, MembershipScope, ObjectId,
-        ObjectType, QueryId, SendAs,
+        AccountError, AccountErrorKind, AccountOperation, CursorScope, MailboxId, MembershipScope,
+        ObjectId, ObjectType, QueryId, SendAs,
     };
+    use tokio_util::sync::CancellationToken;
 
     use super::super::{foreign, state};
     use super::{
@@ -1649,6 +1683,63 @@ mod tests {
         let error = super::close_outcome(Err(crate::Error::NotParsable("frame".to_string())))
             .expect_err("an unrelated failure is still reported");
         assert_eq!(error.operation(), Some(AccountOperation::Close));
+    }
+
+    /// Close starts only when a caller polls it. Once started, the spawned
+    /// teardown outlives that caller and later close calls join its result.
+    #[tokio::test]
+    async fn close_starts_on_poll_and_survives_caller_cancellation() {
+        let completion = Arc::new(std::sync::OnceLock::new());
+        let starts = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        let shutdown = CancellationToken::new();
+
+        let unpolled_starts = Arc::clone(&starts);
+        let unpolled_closed = Arc::clone(&closed);
+        let unpolled_shutdown = shutdown.clone();
+        drop(super::close_once(Arc::clone(&completion), move || {
+            unpolled_starts.fetch_add(1, Ordering::Relaxed);
+            unpolled_closed.store(true, Ordering::Release);
+            unpolled_shutdown.cancel();
+            std::future::ready(Ok::<(), AccountError>(()))
+        }));
+        assert_eq!(starts.load(Ordering::Relaxed), 0);
+        assert!(!closed.load(Ordering::Acquire));
+        assert!(!shutdown.is_cancelled());
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first_starts = Arc::clone(&starts);
+        let first_closed = Arc::clone(&closed);
+        let first_shutdown = shutdown.clone();
+        let mut first = super::close_once(Arc::clone(&completion), move || {
+            first_starts.fetch_add(1, Ordering::Relaxed);
+            first_closed.store(true, Ordering::Release);
+            first_shutdown.cancel();
+            async move {
+                let _ = started_tx.send(());
+                release_rx.await.expect("teardown release");
+                Ok::<(), AccountError>(())
+            }
+        });
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(closed.load(Ordering::Acquire));
+        assert!(shutdown.is_cancelled());
+        started_rx.await.expect("teardown was spawned");
+        drop(first);
+
+        let unexpected_starts = Arc::new(AtomicUsize::new(0));
+        let second_starts = Arc::clone(&unexpected_starts);
+        let mut second = super::close_once(completion, move || {
+            second_starts.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Ok::<(), AccountError>(()))
+        });
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        release_tx.send(()).expect("teardown still waits");
+        second.await.expect("shared teardown completes");
+
+        assert_eq!(starts.load(Ordering::Relaxed), 1);
+        assert_eq!(unexpected_starts.load(Ordering::Relaxed), 0);
     }
 
     /// Discovery order. The `Type` scopes lead in a fixed order and only

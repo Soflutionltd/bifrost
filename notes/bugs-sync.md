@@ -21,28 +21,6 @@ Coverage note from the engine hunter: `cursor/coverage.rs`, `cursor/ledger.rs`,
 `cursor/ledger_envelope.rs`, `backfill/*`, `engine/lane.rs` and `repair.rs`
 were NOT covered in depth. They are the largest files and need their own pass.
 
-## SYNC-009 - Push sink: queued invalidations can be lost outright, and the ingress queue is unbounded
-
-Scope: sync engine.
-
-`push/mod.rs`, `forward_events`: on a full per-account channel a non-lossless
-event is replaced by a coalesced `Invalidated { Unknown }` and sent with a
-100 ms `timeout`. If the reconciler is busy past that (an account-wide throttle
-sleep inside `drive_scopes`, a slow drive), the coalesced event is DROPPED and
-the original hint's scopes are lost until their next poll (up to `poll_max`,
-30 min default). Separately the per-registration ingress is
-`mpsc::unbounded_channel`, and the forwarder blocks indefinitely on a lossless
-event (`sender.send(..).await`), so a webhook storm behind one blocked
-`Warning` / `Terminated` grows memory without bound.
-
-Claims broken: `MultiplexerConfig::watch_capacity` presents the buffer as
-bounded; the drop counter is documented as counting "PAYLOAD loss, not delivery
-loss", yet delivery loss happens and is counted the same way.
-`WatchEvent::Disconnected` is also coalesced into an invalidation, so the "push
-transport disconnected" warning is lost. A sticky "needs full reconcile" flag
-drained by the reconciler would replace both the timeout and the unbounded
-queue: lossless, bounded, no worse than the coalesced event.
-
 ## SYNC-007 - A proven non-landing write is never resubmitted
 
 Scope: sync engine. Residue: a read-back mismatch now stays pending instead of
@@ -65,16 +43,4 @@ code sites and a test shows the semantic loss.
 Durable completion markers for scopes not in the registry survive the reset. A
 complete fix needs writer or store support for an account-wide reset or durable
 enumeration; the limitation is documented in the reference.
-
-## SYNC-021 - Smaller attach and exhaustion observations
-
-- `engine/attach.rs::establish_one` gates initial attach on the classifier only,
-  so a false classifier with a stream present is not caught the way replacement
-  attach now catches it.
-- A comment in `engine/attach.rs` says `run_establish` errors reach the reopen
-  listener and trigger schema clearing; callers do not route them there.
-- The unreadable-envelope path in `run_establish` retries or fails without
-  clearing the row.
-- Account-wide `RestartAccount` exhaustion still broadcasts its last error
-  verbatim before pausing; only per-scope exhaustion was re-derived.
 

@@ -22,24 +22,6 @@ DAV-003 to DAV-005, DAV-012, DAV-013, GOOG-005, GRAPH-011, JMAP-011, SYNC-008).
 What remains here spans crates or roots in a shared crate. Entries set aside as
 low value or awaiting a ruling are in `notes/bugs-deferred.md`.
 
-## SHARED-007 - Two idempotency authorities
-
-Scope: types adoption. Weaker finding.
-
-`AccountOperation::is_idempotent()` is documented as "the authoritative
-idempotency source `derive` consults". net's replay layer decides on
-`reqwest::Method::is_idempotent()` (`request.rs`, `replayable =
-idempotent.unwrap_or_else(|| method.is_idempotent())`), and dav-core's
-`wire_outcome` uses the same HTTP-method rule to decide whether a terminal
-status may be used as data. They routinely disagree: a DAV `PUT` for
-`EventCreate` / `ContactCreate` is replayed by net while `derive` calls the
-operation non-idempotent; a Graph `PATCH` for an idempotent `*Update` is never
-replayed while `derive` says `Retry(SameRequest)`. dav-core and carddav patch
-around it with `idempotency_override(false)` (see `partial_move_error`'s
-comment about the override being lost on rebuild). Feeding the operation's
-idempotency into the net request removes the second authority. DAV-006 sits on
-top of this.
-
 ## SHARED-008 - Provider-specific throttle policy lives in bifrost-net
 
 Scope: types adoption. Weaker finding.
@@ -134,4 +116,18 @@ silently lose label changes. Enabling it needs the baseline to live in
 account-owned state (`google/account/mod.rs`). JMAP's successful expired-history
 snapshot repair also stays local, since engine scope recovery cannot repair its
 private lifecycle position.
+
+## SHARED-007 - Replay safety needs request-level operation context
+
+Needs a design ruling. The two idempotency authorities (the
+`AccountOperation` rule that `derive` consults and the HTTP-method rule that net
+replay and dav-core `wire_outcome` use) were checked and the universal
+replacement was refused: the DAV overrides are needed because `EventUpdate` and
+`ContactUpdate` also cover MOVE, the create-PUT fallback and partly completed
+sequences; Graph and Google wire funnels carry no operation context; and a JMAP
+POST can be a mixed batch. Reasoning is at the code sites and in the references.
+Removing the second authority needs request-level context handed to net per
+request (operation, plus whether this request is a replayable leg). Related
+lateral: replaying a DAV conditional `If-Match` PUT whose first response was lost
+can turn a committed write into a 412 conflict.
 

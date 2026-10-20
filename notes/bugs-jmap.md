@@ -39,28 +39,11 @@ takes the first match, but the implicit `Email/set` carries the post-move
 `newState`, which `pim.rs` never feeds into `state_cache`; only the earlier
 explicit state is advanced, so the cache is one state behind after every send.
 
-## JMAP-003 - The sync blob facade still buffers
-
-Residue: the client and transport have streaming doors with caller-chosen
-ceilings, and the buffered APIs collect through them under a separate 512 MiB
-ceiling. `sync/blob.rs` still buffers the whole blob before it emits batches, so
-incremental delivery through the engine-facing facade is not there yet.
-
 ## JMAP-027 - WebSocket proxy inheritance and trace context
 
 Residue: the WebSocket handshake now has bounded setup, a User-Agent, refuses
 redirects and recovers once from a 401 knowing which token was rejected. It
 still does not inherit the account proxy and sends no trace context.
-
-## JMAP-038 - Smaller observations from the sync fixes
-
-- `close()` sets `closed` before its returned future is polled; dropping the
-  future before its first poll skips shutdown and makes a later close a no-op.
-- `changes_walk` advances the state cache before yielding the batch, so it can
-  run ahead of the durable checkpoint (harmless while the cache only feeds
-  `ifInState`).
-- Hydration sends repeated submitted ids as repeated wire ids and reports an
-  outcome per occurrence; tests pin that, so it is a decision rather than a bug.
 
 ## JMAP-034 - Design proposals from the jmap account hunter
 

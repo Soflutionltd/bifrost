@@ -470,9 +470,11 @@ async fn handle_schema_incompatible(ctx: &RecoveryContext<'_>) {
 }
 
 /// Reopen-failure budget. The engine attempts three reopens; after the
-/// third consecutive failure the account is paused with
-/// `PauseReason::RetryBudgetExhausted` and the last error is emitted
-/// verbatim as `SyncEvent::Terminated`. (sync-D6)
+/// third consecutive failure it pauses with
+/// `PauseReason::RetryBudgetExhausted`. Terminal and already
+/// operator-attention errors remain intact; retry, reconcile, and other
+/// engine-action errors are converted to operator attention because the
+/// automatic reopen budget is spent.
 const REOPEN_RETRY_BUDGET: u32 = 3;
 
 /// Wait out a recovery backoff, unless the account is being torn down.
@@ -822,7 +824,7 @@ async fn re_establish_scope_with_backoff(
         broadcast_terminated(
             ctx.changes_tx,
             scope.clone(),
-            crate::recovery::scope_recovery_exhaustion_error(
+            crate::recovery::recovery_exhaustion_error(
                 err,
                 scope.clone(),
                 bifrost_types::AccountOperation::EstablishCursor,
@@ -1845,8 +1847,10 @@ pub(super) fn accepted_push_scopes(result: &bifrost_types::PushSubscription) -> 
 /// budget. After three consecutive failed attempts - a `factory.open`
 /// failure or a replacement that could not be swapped in, an old-side push
 /// teardown failure included - the account is paused with
-/// `PauseReason::RetryBudgetExhausted` and the last `AccountError` is
-/// broadcast as `SyncEvent::Terminated`. (sync-D6, sync-D7)
+/// `PauseReason::RetryBudgetExhausted`. Its final error preserves terminal
+/// and existing operator-attention classifications; retry, reconcile, and
+/// other engine-action classifications become operator attention because no
+/// automatic action remains.
 ///
 /// Returns whether a replacement was actually swapped in. `false` covers the
 /// exhausted budget (the account is now paused), a detach, and shutdown; a
@@ -1963,11 +1967,20 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
             }
         }
     }
-    // Account-wide budget exhausted: emit Terminated + pause the
-    // account. All scopes pause as a consequence of the engine no
-    // longer driving work for this account.
+    // Account-wide budget exhausted: the retry and engine-action classes no
+    // longer describe work the engine will perform. Preserve terminal and
+    // existing operator-attention errors, and classify every other last error
+    // as operator attention before pausing all scopes with the account.
     if let Some(err) = last_error {
-        broadcast_terminated(ctx.changes_tx, CursorScope::Account, err);
+        broadcast_terminated(
+            ctx.changes_tx,
+            CursorScope::Account,
+            crate::recovery::recovery_exhaustion_error(
+                err,
+                CursorScope::Account,
+                bifrost_types::AccountOperation::EstablishCursor,
+            ),
+        );
     }
     engine_pause(ctx, PauseReason::RetryBudgetExhausted);
     false
@@ -2154,13 +2167,21 @@ async fn run_establish(
                 return Ok(EstablishOrigin::ResumedStored);
             }
             Ok(None) => {}
-            // Unlike `establish_one`, this path runs after attach, but its
-            // callers do not send this result back through the reopen
-            // listener: scoped re-establishment reports it at its own
-            // exhaustion tail, while replacement attach treats it as a failed
-            // replacement. The typed error derives to
-            // `Engine(SchemaIncompatible)`, but that classification alone does
-            // not invoke the account-wide schema-clear loop.
+            // Unlike `establish_one`, this path runs while an installed
+            // account may still be acknowledging checkpoints. Its callers do
+            // not route this result back through `handle_account_error` or its
+            // schema-clear arm: scoped re-establishment reports it at its own
+            // exhaustion tail, replacement attach rejects the candidate, and
+            // automatic account restart retries the replacement. Do not reset
+            // this row here. A replacement may abort, leaving the old account
+            // live.
+            // ResetScope would mutate that account's preexisting cursor and
+            // backfill state, and reattach rollback has no safe restore path
+            // for those rows because consumer acknowledgements can persist
+            // newer state. Rollback only deletes rows created by this attempt,
+            // so return the typed error and preserve the row. Its
+            // `Engine(SchemaIncompatible)` classification alone does not
+            // invoke the account-wide schema-clear loop.
             Ok(Some(_)) | Err(Error::SchemaIncompatible) => {
                 return Err(Error::Account(crate::recovery::cursor_decode_failure(
                     bifrost_types::AccountOperation::EstablishCursor,

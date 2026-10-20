@@ -1,5 +1,12 @@
 # bifrost-graph reference
 
+The HTTP wire funnel does not receive `AccountOperation`. Net uses its
+method default: PATCH and POST do not replay after an in-flight drop, even
+when logical recovery later permits retry of an idempotent update. Conditional
+PATCH and mixed batch POST need request-specific replay analysis; widening
+all updates from their operation label is insufficient. An If-Match write
+that committed can reject its replay with a stale etag.
+
 Current architecture of the Graph Account-layer code under
 `crates/graph/src/account/`. Public surface:
 `bifrost_graph::account::{GraphClient, GraphAccountFactory}` -

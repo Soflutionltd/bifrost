@@ -128,6 +128,10 @@ impl ReqwestTransport {
         total_timeout: Option<Duration>,
         limit: Option<ConcurrencyLimit>,
     ) -> Result<bifrost_net::RequestBuilder, TransportError> {
+        // A JMAP POST can batch reads with creates, sends and updates. This
+        // transport receives bytes, not an AccountOperation or typed calls;
+        // one enclosing operation cannot establish safety for the whole batch.
+        // Keep POST conservative until payload-aware callers supply that proof.
         let mut request = match method {
             "GET" => self.net.get(url),
             "POST" => self.net.post(url),

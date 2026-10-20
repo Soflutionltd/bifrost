@@ -6,7 +6,7 @@
 //!
 //! This module provides the single entry point for decoding wire-form mailbox
 //! bytes into [`MailboxName`] at parse time, so the decoder's output is always
-//! in decoded user-facing form.
+//! in decoded user-facing form, with the original address retained separately.
 
 use crate::codec::utf7::decode_utf7;
 use crate::types::validated::MailboxName;
@@ -18,7 +18,7 @@ use crate::types::validated::MailboxName;
 /// lossily. Otherwise, Modified UTF-7 decoding is applied per
 /// RFC 3501 Section 5.1.3.
 ///
-/// Returns a [`MailboxName`] via [`MailboxName::from_decoded`]. This is the
+/// Returns a [`MailboxName`] via `MailboxName::from_wire`. This is the
 /// codec-internal constructor that bypasses user-input validation  -  the
 /// bytes have already been parsed from a protocol response.
 pub(in crate::codec) fn decode_mailbox_from_wire(bytes: &[u8], utf8_mode: bool) -> MailboxName {
@@ -31,5 +31,5 @@ pub(in crate::codec) fn decode_mailbox_from_wire(bytes: &[u8], utf8_mode: bool) 
         // RFC 3501 Section 5.1.3: Modified UTF-7 encoding.
         decode_utf7(bytes)
     };
-    MailboxName::from_decoded(decoded)
+    MailboxName::from_wire(decoded, bytes, utf8_mode)
 }

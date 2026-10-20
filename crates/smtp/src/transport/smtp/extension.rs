@@ -488,14 +488,15 @@ pub enum MailParameter {
     DsnReturn(DsnReturn),
     /// `ENVID` parameter
     EnvelopeId(String),
-    /// Custom parameter
+    /// Custom parameter without a typed `MailParameter` variant.
     Other {
         /// Parameter keyword
         keyword: String,
         /// Parameter value
         value: Option<String>,
     },
-    /// Custom parameter whose value is emitted without xtext encoding.
+    /// Custom parameter without a typed `MailParameter` variant, whose value
+    /// is emitted without xtext encoding.
     OtherRaw {
         /// Parameter keyword
         keyword: String,
@@ -617,16 +618,16 @@ impl SendOptions {
         Self::default()
     }
 
-    /// Adds a raw `MAIL FROM` parameter.
+    /// Adds a typed or custom `MAIL FROM` parameter.
     ///
-    /// Prefer typed helpers such as [`Self::require_tls`] and
-    /// [`Self::deliver_by`] when one exists.
+    /// Generic `Other` and `OtherRaw` parameters are accepted at send time only
+    /// for keywords without a typed `MailParameter` variant.
     pub fn mail_parameter(mut self, parameter: MailParameter) -> Self {
         self.mail_parameters.push(parameter);
         self
     }
 
-    /// Adds multiple raw `MAIL FROM` parameters.
+    /// Adds multiple typed or custom `MAIL FROM` parameters.
     pub fn extend_mail_parameters<I>(mut self, parameters: I) -> Self
     where
         I: IntoIterator<Item = MailParameter>,
@@ -822,7 +823,7 @@ fn upsert_rcpt_parameter(parameters: &mut Vec<RcptParameter>, parameter: RcptPar
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
-// pub: users can attach HOLDFOR or HOLDUNTIL through raw MAIL parameters.
+// pub: users can attach HOLDFOR or HOLDUNTIL through typed MAIL parameters.
 pub enum FutureReleaseParameter {
     /// `HOLDFOR=<seconds>`
     HoldFor(u64),
@@ -962,7 +963,7 @@ impl Display for MtPriorityParameter {
 /// Values for the `BODY` parameter to `MAIL FROM`
 #[derive(PartialEq, Eq, Clone, Debug, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-// pub: users can send raw BODY parameters through SendOptions.
+// pub: users can configure BODY parameters through SendOptions.
 pub enum MailBodyParameter {
     /// `7BIT`
     SevenBit,

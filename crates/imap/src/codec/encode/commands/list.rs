@@ -233,14 +233,14 @@ pub(crate) fn list_status_return_option_items(option: &str) -> Option<Result<&st
 pub(in crate::codec::encode) fn encode_create_special_use(
     w: &mut CommandWriter,
     tag: &str,
-    mailbox: &str,
+    mailbox: impl AsRef<[u8]>,
     special_use: &[MailboxAttribute],
     utf8: bool,
 ) {
     w.raw(tag.as_bytes());
     w.raw(b" CREATE ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    w.string(mailbox.as_bytes(), utf8);
+    w.string(mailbox.as_ref(), utf8);
     w.raw(b" (USE (");
     for (i, attr) in special_use.iter().enumerate() {
         if i > 0 {
