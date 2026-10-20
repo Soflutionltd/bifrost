@@ -5,6 +5,9 @@ use bifrost_net::{BandwidthBudget, BandwidthDirection, MeterSinkHandle};
 /// Legacy atomic encoding for unlimited bandwidth. Budgets use `None` instead.
 pub const UNLIMITED_BANDWIDTH: u64 = u64::MAX;
 
+// The blocking transport shares this adapter with the Tokio transport.
+// MeteredStream implements Tokio I/O only, so replacing this type would leave
+// blocking admission without its runtime-independent wait and epoch checks.
 /// Clones share the caller's budget across connections and transport pools.
 #[derive(Clone)]
 pub(crate) struct WireMetering {

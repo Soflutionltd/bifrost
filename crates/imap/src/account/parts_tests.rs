@@ -467,7 +467,7 @@ fn unrecognised_version_is_refused() {
         &PartPath(vec![1]),
         &canonical(TransferEncoding::Base64),
     );
-    let future = current.replacen("imappart2:", "imappart3:", 1);
+    let future = current.replacen("imappart3:", "imappart4:", 1);
     assert_ne!(future, current);
     assert_malformed(decode_part_handle(&future, OP), "future version");
     // A v1 handle is refused rather than upgraded. Nothing ever minted one -

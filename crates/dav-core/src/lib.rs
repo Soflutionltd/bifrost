@@ -59,6 +59,6 @@ pub use transport::{
     DAV_CLIENT_TIMEOUT, DavBody, DavRequest, DavResponse, origin_is_secure, settle_body, url_origin,
 };
 pub use xml::{
-    append_path, escape_xml, local_name, normalize_etag, push_text, resolve_href, same_dav_url,
-    trimmed,
+    DavHrefKey, append_path, dav_href_key, escape_xml, local_name, normalize_etag, push_text,
+    resolve_href, same_dav_url, trimmed,
 };

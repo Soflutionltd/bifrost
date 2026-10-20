@@ -393,6 +393,117 @@ impl MailboxName {
         }
     }
 
+    /// Stable account identity. Ordinary canonical names keep their existing ids;
+    /// noncanonical wire addresses and reserved-prefix names use an escaped form.
+    pub(crate) fn account_id(&self) -> String {
+        use base64::Engine;
+        const PREFIX: &str = "~imap-wire:";
+        if self.identity() == Self::from_decoded(self.0.clone()).identity()
+            && !self.0.starts_with(PREFIX)
+            && Self::new(self.0.clone()).is_ok()
+        {
+            return self.0.clone();
+        }
+        let (utf8, bytes) = self.identity();
+        let mut payload = vec![u8::from(utf8)];
+        payload.extend_from_slice(&bytes);
+        format!(
+            "{PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        )
+    }
+
+    /// Stable display ordering with canonical wire identity as the tie-breaker.
+    pub(crate) fn cmp_account_order(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str()).then_with(|| {
+            let (mode, bytes) = self.identity();
+            let (other_mode, other_bytes) = other.identity();
+            bytes.cmp(&other_bytes).then(mode.cmp(&other_mode))
+        })
+    }
+
+    pub(crate) fn from_account_id(id: &str) -> Result<Self, ValidationError> {
+        use base64::Engine;
+        let Some(payload) = id.strip_prefix("~imap-wire:") else {
+            return Self::new(id);
+        };
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .map_err(|_| ValidationError::new("invalid mailbox identity"))?;
+        let Some((&mode, bytes)) = payload.split_first() else {
+            return Err(ValidationError::new("empty mailbox identity"));
+        };
+        if mode > 1 || bytes.contains(&0) {
+            return Err(ValidationError::new("invalid mailbox identity payload"));
+        }
+        let display = if mode == 1 {
+            String::from_utf8_lossy(bytes).into_owned()
+        } else {
+            crate::codec::utf7::decode_utf7(bytes)
+        };
+        Ok(Self::from_wire(display, bytes, mode == 1))
+    }
+
+    pub(crate) fn child(&self, delimiter: char, leaf: &str) -> Result<Self, ValidationError> {
+        let display = Self::new(format!("{}{delimiter}{leaf}", self.0))?;
+        Self::new(leaf)?;
+        if let Some((bytes, utf8)) = &self.1 {
+            // Hierarchy syntax is meaningful in the wire address, not in a
+            // lenient display decoding. Never reconstruct a noncanonical parent.
+            if !delimiter.is_ascii() && !self.can_reencode() {
+                return Err(ValidationError::new(
+                    "noncanonical mailbox requires an ASCII hierarchy delimiter",
+                ));
+            }
+            if delimiter.is_ascii() {
+                let mut raw = bytes.clone();
+                raw.extend_from_slice(delimiter.to_string().as_bytes());
+                let leaf = if *utf8 {
+                    leaf.to_owned()
+                } else {
+                    crate::codec::utf7::encode_utf7(leaf)
+                };
+                raw.extend_from_slice(leaf.as_bytes());
+                return Ok(Self::from_wire(display.0, &raw, *utf8));
+            }
+        }
+        Ok(display)
+    }
+
+    pub(crate) fn parent(&self, delimiter: char) -> Result<Option<Self>, ValidationError> {
+        if let Some((bytes, utf8)) = &self.1 {
+            if !delimiter.is_ascii() && !self.can_reencode() {
+                return Err(ValidationError::new(
+                    "noncanonical mailbox requires an ASCII hierarchy delimiter",
+                ));
+            }
+            if delimiter.is_ascii() {
+                let separator = delimiter.to_string();
+                let Some(index) = bytes
+                    .iter()
+                    .rposition(|byte| *byte == separator.as_bytes()[0])
+                else {
+                    return Ok(None);
+                };
+                let raw = &bytes[..index];
+                let display = if *utf8 {
+                    String::from_utf8_lossy(raw).into_owned()
+                } else {
+                    crate::codec::utf7::decode_utf7(raw)
+                };
+                return Ok(Some(Self::from_wire(display, raw, *utf8)));
+            }
+        }
+        self.0
+            .rsplit_once(delimiter)
+            .map(|(parent, _)| Self::new(parent))
+            .transpose()
+    }
+
+    pub(crate) fn can_reencode(&self) -> bool {
+        self.identity() == Self::from_decoded(self.0.clone()).identity()
+    }
+
     /// Construct from already-decoded bytes produced by the codec's decoder.
     /// Callers must guarantee the input has already been MUTF-7 decoded (or
     /// passed through in UTF-8 mode per RFC 6855).
@@ -402,6 +513,58 @@ impl MailboxName {
     /// `from_wire` instead. CR/LF are safely framed by the command writer.
     pub(crate) fn from_decoded(s: String) -> Self {
         Self(s, None)
+    }
+}
+
+/// Borrowed input for mailbox commands. Typed names retain their wire address;
+/// caller text still passes the normal validation boundary.
+pub(crate) trait MailboxInput: Sync {
+    fn mailbox_name(&self) -> Result<MailboxName, ValidationError>;
+}
+impl MailboxInput for str {
+    fn mailbox_name(&self) -> Result<MailboxName, ValidationError> {
+        MailboxName::new(self)
+    }
+}
+impl MailboxInput for String {
+    fn mailbox_name(&self) -> Result<MailboxName, ValidationError> {
+        MailboxName::new(self.clone())
+    }
+}
+impl MailboxInput for MailboxName {
+    fn mailbox_name(&self) -> Result<MailboxName, ValidationError> {
+        Ok(self.clone())
+    }
+}
+impl<T: MailboxInput + ?Sized> MailboxInput for &T {
+    fn mailbox_name(&self) -> Result<MailboxName, ValidationError> {
+        T::mailbox_name(*self)
+    }
+}
+
+/// Command arguments accept caller text or a retained server address. Text is
+/// validated by the encoder, where literal framing safely handles CR and LF.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct MailboxArgument(pub(crate) MailboxName);
+
+impl From<String> for MailboxArgument {
+    fn from(value: String) -> Self {
+        Self(MailboxName::from_decoded(value))
+    }
+}
+impl From<&str> for MailboxArgument {
+    fn from(value: &str) -> Self {
+        Self::from(value.to_owned())
+    }
+}
+impl From<MailboxName> for MailboxArgument {
+    fn from(value: MailboxName) -> Self {
+        Self(value)
+    }
+}
+impl From<&MailboxName> for MailboxArgument {
+    fn from(value: &MailboxName) -> Self {
+        Self(value.clone())
     }
 }
 
@@ -707,3 +870,26 @@ impl ParsedUidSet {
 #[cfg(test)]
 #[path = "validated_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod account_identity_tests {
+    use super::MailboxName;
+
+    #[test]
+    fn equal_canonical_names_have_equal_escaped_ids_in_both_modes() {
+        for display in ["~imap-wire:literal", "~imap-wire:旅行", "line\r\nbreak"] {
+            let caller = MailboxName::from_decoded(display.into());
+            let rev1_bytes = crate::codec::utf7::encode_utf7(display).into_bytes();
+            let rev1 = MailboxName::from_wire(display.into(), &rev1_bytes, false);
+            let utf8 = MailboxName::from_wire(display.into(), display.as_bytes(), true);
+            for name in [caller.clone(), rev1, utf8] {
+                assert_eq!(name, caller);
+                assert_eq!(name.account_id(), caller.account_id());
+                assert_eq!(
+                    MailboxName::from_account_id(&name.account_id()).unwrap(),
+                    caller
+                );
+            }
+        }
+    }
+}

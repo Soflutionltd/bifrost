@@ -16,13 +16,6 @@ use crate::types::GmailLabel;
 use super::error;
 
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
-/// Ceiling for the lifecycle poll's failure backoff.
-///
-/// A retryable `labels.list` failure doubles the wait rather than
-/// re-polling on the ordinary cadence, so a multi-hour outage costs a
-/// bounded trickle of requests and warnings instead of one every thirty
-/// seconds forever.
-const LIFECYCLE_MAX_BACKOFF: Duration = Duration::from_secs(480);
 pub(crate) const SCOPE_CACHE_STALE_AFTER: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
@@ -72,25 +65,22 @@ impl ScopeCacheState {
 
 pub(crate) type ScopeCache = Arc<ScopeCacheState>;
 
+#[derive(Default)]
+pub(crate) struct LifecycleBaselineState {
+    last_emitted: Option<ScopeSnapshot>,
+    pending: VecDeque<ScopeLifecycle>,
+    // Order overlapping replacement streams' fetches as well as their commits.
+    poll: Arc<Mutex<()>>,
+}
+
+pub(crate) type LifecycleBaseline = Arc<std::sync::Mutex<LifecycleBaselineState>>;
+
 struct LifecycleState {
     client: Arc<GmailClient>,
     shutdown: CancellationToken,
-    pending: VecDeque<ScopeLifecycle>,
-    /// Diff baseline, private to this stream.
-    ///
-    /// Deliberately NOT the shared `ScopeCache`: that cache is also
-    /// written by `labels_for_flags` and `discover_memberships` whenever
-    /// it goes stale, so a refresh landing between two lifecycle polls
-    /// used to move the baseline forward and make the next diff empty -
-    /// the create, delete or rename was then never announced.
-    last_emitted: Option<ScopeSnapshot>,
-    /// How long to wait before the NEXT poll, or `None` when no poll has
-    /// been attempted yet.
-    ///
-    /// This is the attempt counter, not a baseline check. Keying the
-    /// delay off `last_emitted` instead conflates "a poll has happened"
-    /// with "a poll has SUCCEEDED", so a failing first poll looped with
-    /// no wait at all and turned an outage into a hot request loop.
+    // This state is account-owned and independent of the mutable vocabulary cache.
+    baseline: LifecycleBaseline,
+    ended: bool,
     next_delay: Option<Duration>,
 }
 
@@ -112,18 +102,6 @@ impl LifecycleState {
 
     fn note_poll_succeeded(&mut self) {
         self.next_delay = Some(LIFECYCLE_POLL_INTERVAL);
-    }
-
-    /// Backs the cadence off after a retryable failure.
-    ///
-    /// Reset happens only in `note_poll_succeeded`, on a labels.list that
-    /// actually completed. `bifrost-graph` paid for the other design: its
-    /// EWS reconnect backoff has to reset on a completed read rather than
-    /// on a successful subscribe, because an appliance that accepts every
-    /// attempt and then fails it spins forever otherwise.
-    fn note_poll_failed(&mut self) {
-        let previous = self.next_delay.unwrap_or(LIFECYCLE_POLL_INTERVAL);
-        self.next_delay = Some(previous.saturating_mul(2).min(LIFECYCLE_MAX_BACKOFF));
     }
 }
 
@@ -147,9 +125,8 @@ pub(crate) fn discover_memberships(
     client: Arc<GmailClient>,
     cache: ScopeCache,
 ) -> AccountStream<SyncEvent<MembershipScope>> {
-    // This Account operation receives no shutdown token. A token created here
-    // would never observe close(); the account adapter must wrap this stream
-    // with its token or pass that token through to interrupt a refresh.
+    // The Account adapter wraps this stream with its shutdown token, so close
+    // drops an in-flight refresh as well as an idle stream.
     Box::pin(
         stream::once(async move {
             let started = Instant::now();
@@ -186,30 +163,67 @@ pub(crate) fn discover_memberships(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn scope_lifecycle_stream(
     client: Arc<GmailClient>,
     shutdown: CancellationToken,
 ) -> AccountStream<ScopeLifecycleEvent> {
+    scope_lifecycle_stream_with_baseline(client, shutdown, Default::default())
+}
+
+pub(crate) fn scope_lifecycle_stream_with_baseline(
+    client: Arc<GmailClient>,
+    shutdown: CancellationToken,
+    baseline: LifecycleBaseline,
+) -> AccountStream<ScopeLifecycleEvent> {
     let state = LifecycleState {
         client,
         shutdown,
-        pending: VecDeque::new(),
-        last_emitted: None,
+        baseline,
+        ended: false,
         next_delay: None,
     };
     Box::pin(stream::unfold(state, |mut state| async move {
         loop {
             // Do not drain a queued diff after account closure.
-            if state.shutdown.is_cancelled() {
+            if state.ended || state.shutdown.is_cancelled() {
                 return None;
             }
-            if let Some(event) = state.pending.pop_front() {
+            let event = state
+                .baseline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending
+                .pop_front();
+            if let Some(event) = event {
                 return Some((ScopeLifecycleEvent::Lifecycle(event), state));
             }
             if !state.await_next_poll().await {
                 return None;
             }
 
+            let poll = Arc::clone(
+                &state
+                    .baseline
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .poll,
+            );
+            let _poll = tokio::select! {
+                biased;
+                () = state.shutdown.cancelled() => return None,
+                guard = poll.lock() => guard,
+            };
+            // A previous reader may have queued a diff while this one waited.
+            let event = state
+                .baseline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending
+                .pop_front();
+            if let Some(event) = event {
+                return Some((ScopeLifecycleEvent::Lifecycle(event), state));
+            }
             let snapshot = tokio::select! {
                 biased;
                 () = state.shutdown.cancelled() => return None,
@@ -218,36 +232,22 @@ pub(crate) fn scope_lifecycle_stream(
             match snapshot {
                 Ok(new) => {
                     state.note_poll_succeeded();
-                    state.pending = record_lifecycle_snapshot(&mut state.last_emitted, new).into();
+                    let mut baseline = state
+                        .baseline
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    baseline.pending =
+                        record_lifecycle_snapshot(&mut baseline.last_emitted, new).into();
                 }
                 Err(error) => {
-                    // Classify: terminal / engine-action -> emit
-                    // Terminated and end the stream so the engine
-                    // escalates. Retry classes continue with the
-                    // backoff so transient hiccups don't pollute the
-                    // engine surface.
                     let acct = super::error::into_account_error(
                         error,
                         super::error::GmailErrorContext::containers_list(),
                     );
-                    // Retry failures cannot simply end this stream yet: the
-                    // diff baseline is stream-local, and a replacement seeds
-                    // silently from current labels, losing intervening changes.
-                    // Move that baseline to account-owned state before handing
-                    // retries to the engine's reconnect policy. The shared flag
-                    // vocabulary cache is not a baseline: other readers write it.
-                    // Token refresh still runs in the authenticated transport
-                    // request funnel; this loop has no separate refresh API.
-                    if acct.recovery().is_terminal() || acct.recovery().requires_engine_action() {
-                        return Some((ScopeLifecycleEvent::Terminated(acct), state));
-                    }
-                    state.note_poll_failed();
-                    tracing::warn!(
-                        target: "bifrost.gmail.scope_lifecycle",
-                        kind = ?acct.kind(),
-                        message_key = acct.message_key(),
-                        "gmail label lifecycle poll: transient failure"
-                    );
+                    // The engine owns retry, throttle holds and reconnect cadence.
+                    // Baseline AND undelivered events survive replacement streams.
+                    state.ended = true;
+                    return Some((ScopeLifecycleEvent::Terminated(acct), state));
                 }
             }
         }
@@ -443,7 +443,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn project_hold_label_lifecycle_makes_no_wire_calls() {
-        use futures::FutureExt;
         let (client, script) = scripted_client(Vec::new());
         let client = Arc::new(client.with_quota_project("123".into()));
         let wall = std::time::SystemTime::UNIX_EPOCH;
@@ -460,15 +459,13 @@ mod tests {
             );
         let shutdown = CancellationToken::new();
         let mut lifecycle = scope_lifecycle_stream(client, shutdown.clone());
-        let mut next = Box::pin(lifecycle.next());
-        assert!(next.as_mut().now_or_never().is_none());
-        for _ in 0..3 {
-            tokio::time::advance(Duration::from_secs(500)).await;
-            assert!(next.as_mut().now_or_never().is_none());
-        }
+        assert!(matches!(
+            lifecycle.next().await,
+            Some(ScopeLifecycleEvent::Terminated(_))
+        ));
         assert!(script.requests().is_empty());
         shutdown.cancel();
-        assert!(next.await.is_none());
+        assert!(lifecycle.next().await.is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -687,93 +684,54 @@ mod tests {
         second.abort();
     }
 
-    /// A reconnect with a stream-local baseline would seed Label_2 silently.
-    /// Keep this read in one stream until the baseline can outlive a reconnect.
     #[tokio::test(start_paused = true)]
-    async fn a_retryable_failure_preserves_the_populated_lifecycle_baseline() {
-        let (client, script) = scripted_client(vec![
-            ok_json(json!({
-                "labels": [{"id": "Label_1", "name": "One", "type": "user"}]
-            })),
-            unavailable(),
-            ok_json(json!({
-                "labels": [
-                    {"id": "Label_1", "name": "One", "type": "user"},
-                    {"id": "Label_2", "name": "Two", "type": "user"}
-                ]
-            })),
-        ]);
+    async fn initial_poll_failure_terminates_once_without_local_retry() {
+        let (client, script) = scripted_client(vec![unavailable()]);
         let mut lifecycle = scope_lifecycle_stream(client, CancellationToken::new());
         assert!(matches!(
             lifecycle.next().await,
-            Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(
-                MembershipScope::Label(LabelId(id))
-            ))) if id == "Label_2"
+            Some(ScopeLifecycleEvent::Terminated(_))
         ));
-        assert_eq!(script.requests().len(), 3);
+        assert!(lifecycle.next().await.is_none());
+        assert_eq!(script.requests().len(), 1);
     }
 
-    /// Before a baseline exists there is nothing to diff, but there is
-    /// still something to WAIT for. Keying the inter-poll delay off the
-    /// baseline snapshot made a failing first poll re-issue `labels.list`
-    /// with no delay at all, so an outage became a hot request loop. Two
-    /// failures must therefore cost strictly more wall time than two
-    /// successes, and the wait must observe the shutdown token.
     #[tokio::test(start_paused = true)]
-    async fn repeated_initial_failures_back_off_instead_of_spinning() {
-        let (client, _script) = scripted_client(vec![
+    async fn reconnect_preserves_baseline_and_undelivered_events() {
+        let (client, script) = scripted_client(vec![
+            ok_json(json!({"labels": [{"id":"one", "name":"One"}]})),
             unavailable(),
-            unavailable(),
-            ok_json(json!({
-                "labels": [{"id": "Label_1", "name": "One", "type": "user"}]
-            })),
-            ok_json(json!({
-                "labels": [
-                    {"id": "Label_1", "name": "One", "type": "user"},
-                    {"id": "Label_2", "name": "Two", "type": "user"}
-                ]
-            })),
+            ok_json(json!({"labels": [
+                {"id":"one", "name":"One"},
+                {"id":"two", "name":"Two"},
+                {"id":"three", "name":"Three"}
+            ]})),
         ]);
-        let started = tokio::time::Instant::now();
-        let mut lifecycle = scope_lifecycle_stream(client, CancellationToken::new());
-
-        let event = lifecycle.next().await;
-
+        let baseline = LifecycleBaseline::default();
+        let make_stream = || {
+            scope_lifecycle_stream_with_baseline(
+                Arc::clone(&client),
+                CancellationToken::new(),
+                Arc::clone(&baseline),
+            )
+        };
+        let mut first = make_stream();
         assert!(matches!(
-            event,
-            Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(
-                MembershipScope::Label(LabelId(id))
-            ))) if id == "Label_2"
+            first.next().await,
+            Some(ScopeLifecycleEvent::Terminated(_))
         ));
-        // t=0 fail, t=30+30 fail, t=+120 seed, t=+30 the Created above.
-        assert_eq!(started.elapsed(), Duration::from_secs(210));
-    }
-
-    /// The backoff wait is a `select!` against the shutdown token, not a
-    /// bare sleep, so `close()` during an outage ends the stream rather
-    /// than parking it for the whole backoff.
-    #[tokio::test(start_paused = true)]
-    async fn a_stream_cancelled_while_backing_off_ends_promptly() {
-        let (client, script) = scripted_client(vec![unavailable(), unavailable()]);
-        let shutdown = CancellationToken::new();
-        let started = tokio::time::Instant::now();
-        let mut lifecycle = scope_lifecycle_stream(client, shutdown.clone());
-        let drained = tokio::spawn(async move { lifecycle.next().await });
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        shutdown.cancel();
-
-        assert!(drained.await.expect("lifecycle task joins").is_none());
-        assert_eq!(
-            started.elapsed(),
-            Duration::from_secs(1),
-            "cancellation must end the stream where it happens, not at the end of the backoff",
-        );
-        assert_eq!(
-            script.requests().len(),
-            1,
-            "a cancelled stream must not spend another request first",
-        );
+        assert!(first.next().await.is_none());
+        drop(first);
+        let mut second = make_stream();
+        assert!(matches!(second.next().await,
+            Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(
+                MembershipScope::Label(LabelId(id))))) if id == "two"));
+        drop(second);
+        let mut third = make_stream();
+        assert!(matches!(third.next().await,
+            Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(
+                MembershipScope::Label(LabelId(id))))) if id == "three"));
+        assert_eq!(script.requests().len(), 3);
     }
 
     fn snapshot_of(labels: Vec<GmailLabel>) -> ScopeSnapshot {

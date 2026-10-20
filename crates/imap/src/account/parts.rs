@@ -75,13 +75,14 @@ use super::envelope::malformed;
 
 /// Handle format version. Bump when the field list or separator rules change.
 ///
+/// v3 adds escaped mailbox wire identity; v2 folders decode literally.
 /// v2 added the length-prefixed original transfer-encoding token (see
 /// [`encode_part_handle`]). v1 handles are refused outright rather than
 /// migrated: nothing has ever minted one - this module is unwired and
 /// `AccountCapabilities::blob_range` still reports `No` - so there is no
 /// stored v1 handle anywhere to keep working, and a default-filled upgrade
 /// path would exist only to serve handles that cannot exist.
-const PART_HANDLE_VERSION: u32 = 2;
+const PART_HANDLE_VERSION: u32 = 3;
 const PART_HANDLE_PREFIX: &str = "imappart";
 
 /// Maximum BODYSTRUCTURE nesting this traversal will descend.
@@ -505,8 +506,8 @@ pub(crate) fn encode_part_handle(
 ) -> String {
     format!(
         "{PART_HANDLE_PREFIX}{PART_HANDLE_VERSION}:{}:{}:{uidvalidity}:{uid}:{}:{}:{}:{}",
-        folder.as_str().len(),
-        folder.as_str(),
+        folder.account_id().len(),
+        folder.account_id(),
         path.section(),
         encoding_token(encoding.classified),
         encoding.token.len(),
@@ -532,12 +533,17 @@ pub(crate) fn decode_part_handle(
     let version = version
         .parse::<u32>()
         .map_err(|_| malformed("invalid IMAP part handle version", op))?;
-    if version != PART_HANDLE_VERSION {
+    if version != 2 && version != PART_HANDLE_VERSION {
         return Err(malformed("unsupported IMAP part handle version", op));
     }
 
     let (folder, rest) = length_prefixed(rest, "IMAP part handle folder", op)?;
-    let folder = MailboxName::new(folder.to_owned()).map_err(|e| malformed(&e.to_string(), op))?;
+    let folder = if version == 2 {
+        MailboxName::new(folder)
+    } else {
+        MailboxName::from_account_id(folder)
+    }
+    .map_err(|e| malformed(&e.to_string(), op))?;
     let rest = rest.ok_or_else(|| malformed("invalid IMAP part handle separator", op))?;
 
     let (uidvalidity, rest) = split_field(rest, "IMAP part handle uidvalidity", op)?;
@@ -664,3 +670,27 @@ fn encoding_from_token(token: &str) -> Option<TransferEncoding> {
 #[cfg(test)]
 #[path = "parts_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod wire_identity_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_part_folders_remain_literal() {
+        let literal = MailboxName::from_wire("a".into(), b"&AGE-", false).account_id();
+        let folder = MailboxName::new(&literal).unwrap();
+        let old = format!(
+            "imappart2:{}:{literal}:7:9:1:base64:6:base64",
+            literal.len()
+        );
+        let op = AccountOperation::SyncChanges;
+        assert_eq!(decode_part_handle(&old, op).unwrap().folder, folder);
+        let encoding = PartEncoding {
+            classified: TransferEncoding::Base64,
+            token: "base64".into(),
+        };
+        let current = encode_part_handle(&folder, 7, 9, &PartPath(vec![1]), &encoding);
+        assert!(current.starts_with("imappart3:"));
+        assert_eq!(decode_part_handle(&current, op).unwrap().folder, folder);
+    }
+}

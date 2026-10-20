@@ -71,13 +71,13 @@ fn command_logout() {
 #[test]
 fn command_list() {
     let cmd = Command::List {
-        reference: String::new(),
+        reference: String::new().into(),
         pattern: "*".into(),
     };
     match &cmd {
         Command::List { reference, pattern } => {
-            assert!(reference.is_empty());
-            assert_eq!(pattern, "*");
+            assert!(reference.0.as_str().is_empty());
+            assert_eq!(pattern.0.as_str(), "*");
         }
         _ => panic!("expected List"),
     }
@@ -87,7 +87,7 @@ fn command_list() {
 fn command_list_extended() {
     let cmd = Command::ListExtended {
         selection_options: vec!["SUBSCRIBED".into(), "RECURSIVEMATCH".into()],
-        reference: String::new(),
+        reference: String::new().into(),
         patterns: vec!["*".into(), "%".into()],
         return_options: vec!["CHILDREN".into(), "STATUS (MESSAGES UNSEEN)".into()],
     };
@@ -99,8 +99,14 @@ fn command_list_extended() {
             return_options,
         } => {
             assert_eq!(selection_options, &["SUBSCRIBED", "RECURSIVEMATCH"]);
-            assert!(reference.is_empty());
-            assert_eq!(patterns, &["*", "%"]);
+            assert!(reference.0.as_str().is_empty());
+            assert_eq!(
+                patterns
+                    .iter()
+                    .map(|name| name.0.as_str())
+                    .collect::<Vec<_>>(),
+                ["*", "%"]
+            );
             assert_eq!(return_options, &["CHILDREN", "STATUS (MESSAGES UNSEEN)"]);
         }
         _ => panic!("expected ListExtended"),
@@ -110,7 +116,7 @@ fn command_list_extended() {
 #[test]
 fn command_list_status() {
     let cmd = Command::ListStatus {
-        reference: String::new(),
+        reference: String::new().into(),
         pattern: "*".into(),
         status_items: "MESSAGES UNSEEN".into(),
     };
@@ -120,8 +126,8 @@ fn command_list_status() {
             pattern,
             status_items,
         } => {
-            assert!(reference.is_empty());
-            assert_eq!(pattern, "*");
+            assert!(reference.0.as_str().is_empty());
+            assert_eq!(pattern.0.as_str(), "*");
             assert_eq!(status_items, "MESSAGES UNSEEN");
         }
         _ => panic!("expected ListStatus"),
@@ -255,7 +261,7 @@ fn command_subscribe_unsubscribe() {
 #[test]
 fn command_lsub() {
     let cmd = Command::Lsub {
-        reference: String::new(),
+        reference: String::new().into(),
         pattern: "*".into(),
     };
     assert!(matches!(cmd, Command::Lsub { .. }));

@@ -135,8 +135,16 @@ pub(crate) fn host_attachment(
     account_email: String,
     bytes: Bytes,
     meta: CloudUploadMeta,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
-    Box::pin(async move { run(&client, &account_email, bytes, meta).await })
+    Box::pin(async move {
+        if shutdown.is_cancelled() {
+            return Err(super::account_closed_error(
+                AccountOperation::HostAttachment,
+            ));
+        }
+        run_with_shutdown(&client, &account_email, bytes, meta, shutdown).await
+    })
 }
 
 /// What became of the resumable session on a failing path.
@@ -153,13 +161,31 @@ enum SessionDisposition {
     Abandoned,
 }
 
+#[cfg(test)]
 async fn run(
     client: &GmailClient,
     account_email: &str,
     bytes: Bytes,
     meta: CloudUploadMeta,
 ) -> Result<HostedAttachment, AccountError> {
-    match upload_and_link(client, account_email, bytes, meta).await {
+    run_with_shutdown(
+        client,
+        account_email,
+        bytes,
+        meta,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+async fn run_with_shutdown(
+    client: &GmailClient,
+    account_email: &str,
+    bytes: Bytes,
+    meta: CloudUploadMeta,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<HostedAttachment, AccountError> {
+    match upload_and_link(client, account_email, bytes, meta, shutdown).await {
         Ok(hosted) => Ok(hosted),
         Err((error, disposition)) => {
             let error = into_account_error(error, ctx());
@@ -189,6 +215,7 @@ async fn upload_and_link(
     account_email: &str,
     bytes: Bytes,
     meta: CloudUploadMeta,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<HostedAttachment, (Error, SessionDisposition)> {
     if meta.size != bytes.len() as u64 {
         return Err((
@@ -220,6 +247,9 @@ async fn upload_and_link(
     let permission =
         permission_body(meta.scope, account_email).map_err(|e| (e, SessionDisposition::NotOpen))?;
 
+    // Let session creation finish even during shutdown: interrupting it can
+    // discard the only response carrying the URI needed for cleanup. The
+    // transport request deadline still bounds this wait.
     let upload_url = create_upload_session(client, &meta)
         .await
         .map_err(|e| (e, SessionDisposition::NotOpen))?;
@@ -227,6 +257,7 @@ async fn upload_and_link(
     // From here until the upload completes there is server-side state to clean
     // up, so every exit on this leg goes through the cancel.
     //
+    // Account shutdown interrupts the chunk loop below and awaits cleanup.
     // Every exit except one: if the caller drops this future mid-upload, no
     // cancel runs and Drive holds the partial for a week. A `Drop` guard is
     // deliberately NOT the fix. `Drop` cannot await, and spawning the DELETE
@@ -234,7 +265,12 @@ async fn upload_and_link(
     // that outlives the account handle. Resuming on reopen is out too: the
     // session URI is per-call state that no `HostAttachment` request carries
     // back in, so resumption would need a published surface change.
-    let file_id = match upload_file_chunked(client, &upload_url, bytes, GDRIVE_CHUNK_SIZE).await {
+    let uploaded = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => Err(Error::Net(bifrost_net::Error::Cancelled)),
+        result = upload_file_chunked(client, &upload_url, bytes, GDRIVE_CHUNK_SIZE) => result,
+    };
+    let file_id = match uploaded {
         Ok(file_id) => file_id,
         Err(error) => {
             let disposition = cancel_upload_session(client, &upload_url).await;
@@ -949,8 +985,87 @@ mod tests {
         );
     }
 
-    /// A `Net` failure mid-upload must not walk away from the resumable
-    /// session: Drive would hold the partial upload for about a week.
+    #[tokio::test]
+    async fn host_attachment_after_shutdown_never_creates_a_session() {
+        let script = ScriptedDispatch::new([]);
+        let client = Arc::new(scripted_client(&script));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        shutdown.cancel();
+        assert!(
+            host_attachment(
+                client,
+                "user@example.com".into(),
+                Bytes::from_static(b"payload"),
+                upload_meta(),
+                shutdown,
+            )
+            .await
+            .is_err()
+        );
+        assert!(script.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_upload_awaits_session_cleanup() {
+        let script = ScriptedDispatch::new([session_created(), Canned::Pending, cancel_accepted()]);
+        let client = scripted_client(&script);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut upload = Box::pin(run_with_shutdown(
+            &client,
+            "user@example.com",
+            Bytes::from_static(b"payload"),
+            upload_meta(),
+            shutdown.clone(),
+        ));
+        for _ in 0..16 {
+            assert!(futures::future::poll_immediate(&mut upload).await.is_none());
+            if script.requests().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(script.requests().len(), 2);
+        shutdown.cancel();
+        assert!(upload.await.is_err());
+        let requests = script.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].method, reqwest::Method::DELETE);
+        assert_eq!(script.remaining(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_session_creation_still_obtains_uri_and_cleans_up() {
+        let script = ScriptedDispatch::yielding([session_created(), cancel_accepted()]);
+        let client = scripted_client(&script);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut upload = Box::pin(run_with_shutdown(
+            &client,
+            "user@example.com",
+            Bytes::from_static(b"payload"),
+            upload_meta(),
+            shutdown.clone(),
+        ));
+        for _ in 0..16 {
+            assert!(futures::future::poll_immediate(&mut upload).await.is_none());
+            if !script.requests().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "session POST is still awaiting its response"
+        );
+        shutdown.cancel();
+        assert!(upload.await.is_err());
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, reqwest::Method::POST);
+        assert_eq!(requests[1].method, reqwest::Method::DELETE);
+    }
+
+    /// A `Net` failure mid-upload must clean up the resumable session.
     #[tokio::test]
     async fn net_failure_mid_upload_cancels_the_resumable_session() {
         let script = ScriptedDispatch::new([

@@ -110,7 +110,7 @@ fn notify_flags_union_across_groups() {
     let p = params(vec![
         group(MailboxFilter::Selected, vec![NotifyEvent::FlagChange]),
         group(
-            MailboxFilter::Subtree(vec!["Archive".to_owned()]),
+            MailboxFilter::Subtree(vec!["Archive".into()]),
             vec![NotifyEvent::MailboxMetadataChange],
         ),
     ]);

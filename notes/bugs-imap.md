@@ -44,51 +44,27 @@ instead draw from a shared session budget, so the footprint stays inside
 `pool_cap` on providers with a low per-user connection limit, is a product
 decision.
 
-## IMAP-004 - FETCH budget handoff and copy-free literals
+## IMAP-004 - Copy-free literals
 
-Residue of the per-command literal ceiling (the reader now checks cumulative
-literal declarations against the budget before reading payload, and a breach is
-a fatal `Parse`). Still open:
-- `account/blob.rs` must call `uid_fetch_stream_budgeted` with its existing
-  budget; until then raw-message streaming checks its budget only after
-  decoding.
+Residue of the per-command literal ceiling (the reader checks cumulative
+literal declarations against the budget before reading payload, a breach is a
+fatal `Parse`, and raw-message streaming passes its budget to the budgeted
+stream). Still open:
 - FETCH response fields in `crates/types` (`fetch.rs`) own `Vec<u8>`, so the
   literal is still copied and nothing is emitted incrementally; splitting the
   `BytesMut` alone cannot change that.
 - Non-literal syntax and parser overhead are outside the literal ceiling.
 
-## IMAP-017 - `close()` still cannot await a dial that is inside authentication
+## IMAP-030 - Smaller observations after the wire identity work
 
-Residue: account close now has shared completion, protected pool teardown, send
-gating and SMTP submission shutdown. IMAP dials still inside authentication are
-not registered with the pool, so `close()` cannot wait for them (needs
-`account/pool.rs`), and closing the pool directly is still not
-cancellation-safe; only the account-level close is protected.
+- Response correlation in `connection/dispatch/{select,list,quota}.rs` still
+  compares mailbox display strings rather than wire identity.
+- Weak pool registration cannot track a healthy driver's detached graceful
+  shutdown after its last connection handle drops, so account close cannot
+  wait for it.
+- Role-folder selection and the quota fallback break ties only by display name,
+  so which of two folders sharing a display name is picked can vary; add the
+  wire octets and mode as the final tie-break.
+- Direct `connect_config_metered` callers keep a cancellation gap during the
+  post-spawn keepalive setup; pool dials no longer have it.
 
-## IMAP-002 - `Error::Auth` cannot carry transmission evidence
-
-Scope: imap protocol. The SASL continuation failure now cancels with `*` and
-keeps the connection, but `Error::Auth` has no attempt field, so the failure
-cannot be stamped although AUTHENTICATE and client-first are on the wire. Add
-the field and let the exact `Error::Auth` match in `account/error.rs` carry it;
-the constraint is documented in `error.rs`.
-
-## IMAP-029 - Smaller observations after the account fixes
-
-- `account/inventory.rs` advances the in-memory cursor before sending the
-  checkpoint, the ordering the changes path just fixed.
-- `account/error.rs` still words the STARTTLS refusal as "server does not
-  advertise STARTTLS", which is wrong for a PREAUTH greeting with the capability
-  advertised.
-- Residual limits documented rather than fixable: the plain `EXPUNGE` fallback
-  window without UIDPLUS, bulk mutation ignoring `IdempotencyKey`, and Basic
-  folders being unable to observe flag changes without CONDSTORE.
-
-## IMAP-005 - Mailbox wire identity is kept by the codec, not by the account layer
-
-Residue: `MailboxName` now carries the server wire octets and their encoding
-mode, the typed encoders replay them, and equality and hashing separate
-colliding display names. Still collapsing through display strings: the account
-registry keys and folder ids, APPEND, LIST patterns and NOTIFY filters; and a
-mode change re-encodes from the display form, so wire preservation only holds in
-the original mode.

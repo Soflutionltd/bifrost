@@ -12,13 +12,13 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use bifrost_types::AccountFuture;
+use bifrost_types::{AccountFuture, RetryHint};
 use reqwest::header::RETRY_AFTER;
 use tokio::sync::{Mutex, oneshot};
 use zeroize::Zeroizing;
 
 use crate::error::{Error, FinalResponse};
-use crate::request::parse_retry_after;
+use crate::request::parse_retry_after_hint;
 
 /// Default age at which a token without an `expires_at` is treated as
 /// stale enough to refresh. Typical OAuth access tokens have a 60-min
@@ -697,16 +697,26 @@ fn is_terminal_auth_error(err: &Error) -> bool {
 }
 
 fn retry_after_deadline(err: &Error) -> Option<SystemTime> {
-    let duration = match err {
+    let hint = match err {
+        Error::AttemptHistory {
+            source, attempts, ..
+        } => {
+            return retry_after_deadline(source)
+                .or_else(|| attempts.iter().rev().find_map(retry_after_deadline));
+        }
+        Error::LocalHold { attempts, .. } => {
+            return attempts.iter().rev().find_map(retry_after_deadline);
+        }
         Error::RateLimited {
             retry_after,
             final_response,
-        } => (*retry_after).or_else(|| parse_retry_after(final_response.headers.get(RETRY_AFTER))),
+        } => parse_retry_after_hint(final_response.headers.get(RETRY_AFTER))
+            .or_else(|| retry_after.map(RetryHint::After)),
         Error::Status { code, headers, .. }
             if *code == reqwest::StatusCode::TOO_MANY_REQUESTS
                 || *code == reqwest::StatusCode::SERVICE_UNAVAILABLE =>
         {
-            parse_retry_after(headers.get(RETRY_AFTER))
+            parse_retry_after_hint(headers.get(RETRY_AFTER))
         }
         Error::RetryBudgetExhausted {
             final_response: Some(final_response),
@@ -714,13 +724,20 @@ fn retry_after_deadline(err: &Error) -> Option<SystemTime> {
         } if final_response.status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || final_response.status == reqwest::StatusCode::SERVICE_UNAVAILABLE =>
         {
-            parse_retry_after(final_response.headers.get(RETRY_AFTER))
-                .or_else(|| retry_after_history.last().copied())
+            parse_retry_after_hint(final_response.headers.get(RETRY_AFTER))
+                .or_else(|| retry_after_history.last().copied().map(RetryHint::After))
         }
-        Error::RefreshFailed { retry_after, .. } => return *retry_after,
+        Error::RefreshFailed {
+            retry_after,
+            source,
+        } => return (*retry_after).or_else(|| retry_after_deadline(source)),
         _ => None,
     }?;
-    SystemTime::now().checked_add(duration)
+    match hint {
+        RetryHint::After(delay) => SystemTime::now().checked_add(delay),
+        RetryHint::At(at) => Some(at),
+        _ => None,
+    }
 }
 
 /// Internal state of `OAuthRefresher`. Wrapped in a `Mutex` so the
@@ -1201,6 +1218,54 @@ mod tests {
             .expect("test upper bound in range");
         assert!(deadline >= lower);
         assert!(deadline <= upper);
+    }
+
+    #[test]
+    fn retry_after_deadline_preserves_an_elapsed_http_date() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_234);
+        let date = httpdate::fmt_http_date(at);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&date).expect("formatted HTTP-date is a valid header"),
+        );
+
+        assert_eq!(
+            retry_after_deadline(&Error::Status {
+                code: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                body: Bytes::new(),
+                headers,
+            }),
+            Some(at),
+            "an elapsed date is still a retry deadline, not an absent hint"
+        );
+    }
+
+    #[test]
+    fn retry_after_deadline_finds_a_hint_in_prior_attempt_history() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_234);
+        let date = httpdate::fmt_http_date(at);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&date).expect("formatted HTTP-date is a valid header"),
+        );
+
+        assert_eq!(
+            retry_after_deadline(&Error::AttemptHistory {
+                source: Box::new(Error::Timeout {
+                    transmission_state: bifrost_types::TransmissionState::Unsent,
+                }),
+                attempts: vec![Error::Status {
+                    code: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    body: Bytes::new(),
+                    headers,
+                }],
+                may_have_committed: false,
+            }),
+            Some(at),
+            "a later local failure must retain the last response's retry date"
+        );
     }
 
     #[test]

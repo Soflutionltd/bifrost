@@ -306,14 +306,14 @@ impl ImapConnection {
     pub async fn copy(
         &self,
         sequence_set: &SequenceSet,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<CopyResult, Error> {
         // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
         if sequence_set.as_str().contains('$') {
             self.require_searchres()?;
         }
-        let mbox = MailboxName::new(mailbox)?;
+        let mbox = mailbox.mailbox_name()?;
         self.copy_impl(
             Command::Copy {
                 sequence_set: sequence_set.clone(),
@@ -339,7 +339,7 @@ impl ImapConnection {
     pub async fn move_messages(
         &self,
         sequence_set: &SequenceSet,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<MoveResult, Error> {
         self.require_state(crate::types::CommandKind::Move)?;
@@ -355,7 +355,7 @@ impl ImapConnection {
                 return Err(Error::MissingCapability("MOVE".into()));
             }
         }
-        let mbox = MailboxName::new(mailbox)?;
+        let mbox = mailbox.mailbox_name()?;
         self.move_native_impl(
             Command::Move {
                 sequence_set: sequence_set.clone(),

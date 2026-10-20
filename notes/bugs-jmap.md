@@ -39,11 +39,13 @@ takes the first match, but the implicit `Email/set` carries the post-move
 `newState`, which `pim.rs` never feeds into `state_cache`; only the earlier
 explicit state is advanced, so the cache is one state behind after every send.
 
-## JMAP-027 - WebSocket proxy inheritance and trace context
+## JMAP-027 - WebSocket proxy inheritance and trace context need net facilities
 
-Residue: the WebSocket handshake now has bounded setup, a User-Agent, refuses
-redirects and recovers once from a 401 knowing which token was rejected. It
-still does not inherit the account proxy and sends no trace context.
+Residue: the WebSocket handshake has bounded setup, a User-Agent, refused
+redirects, one-shot 401 recovery and metering. It still does not inherit the
+account proxy and sends no trace context, because `bifrost-net` exposes neither a
+proxy or tunnel connector nor a public trace-context builder; the limits are
+documented at the code sites.
 
 ## JMAP-034 - Design proposals from the jmap account hunter
 

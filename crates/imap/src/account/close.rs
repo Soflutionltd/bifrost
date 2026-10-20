@@ -27,10 +27,7 @@ pub(crate) fn close(account: ImapAccount) -> AccountFuture<Result<(), AccountErr
                     if let Some(submission) = &account.submission {
                         submission.shutdown().await;
                     }
-                    // The pool owns registered sessions only. A dial still inside
-                    // connect/authentication is not registered yet; that dial must
-                    // terminate itself when registration sees the closed pool.
-                    // Waiting for such dials requires pool-level lifetime tracking.
+                    // Pool completion includes dials still connecting or authenticating.
                     account.pool.close().await;
                     let mut first_error = None;
                     if let Some(contacts) = &account.contacts

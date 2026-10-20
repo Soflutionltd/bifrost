@@ -884,10 +884,36 @@ async fn directory_review_redirected_writes_check_every_source_and_rebased_desti
                     .map(|_| ()),
             }
             .expect_err("refuse before the gateway hop");
-            assert!(
-                matches!(error.kind(), AccountErrorKind::Unsupported(_)),
-                "{door}: {error:?}"
-            );
+            let unreplayable = matches!(door, "create-put" | "move-source" | "move-destination");
+            if unreplayable {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        AccountErrorKind::Protocol(
+                            bifrost_types::ProtocolErrorKind::PartialResponse
+                        )
+                    ),
+                    "{door}: {error:?}"
+                );
+                assert!(
+                    matches!(error.recovery(), RecoveryClass::Reconcile(_)),
+                    "an unreplayable redirected write requires reconciliation: {error:?}"
+                );
+                assert!(
+                    error.chain().iter().any(|cause| matches!(
+                        cause,
+                        bifrost_types::Cause::Request(
+                            bifrost_types::RequestCause::Unsupported { .. }
+                        )
+                    )),
+                    "the directory refusal remains in the evidence: {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error.kind(), AccountErrorKind::Unsupported(_)),
+                    "{door}: {error:?}"
+                );
+            }
             assert!(error.chain().iter().any(|cause| matches!(cause, Cause::Attempt(attempt) if attempt.transmission_state == TransmissionState::Acknowledged)), "answered redirect evidence: {door}");
             let requests = transcripts(&script);
             assert_eq!(requests.len(), 5, "discovery plus two safe hops: {door}");
@@ -1169,12 +1195,25 @@ async fn directory_round_two_late_markers_reach_the_redirect_guard() {
                 .await
                 .map(|_| ()),
         };
-        assert!(matches!(
-            result
-                .expect_err("later marker is shared with every redirect guard")
-                .kind(),
-            AccountErrorKind::Unsupported(_)
-        ));
+        let error = result.expect_err("later marker is shared with every redirect guard");
+        if door.starts_with("move") {
+            assert!(matches!(
+                error.kind(),
+                AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::PartialResponse)
+            ));
+            assert!(matches!(error.recovery(), RecoveryClass::Reconcile(_)));
+            assert!(error.chain().iter().any(|cause| matches!(
+                cause,
+                bifrost_types::Cause::Request(bifrost_types::RequestCause::Unsupported { .. })
+            )));
+        } else {
+            assert!(matches!(error.kind(), AccountErrorKind::Unsupported(_)));
+        }
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Attempt(attempt)
+                if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
+        )));
         assert_eq!(
             transcripts(&script).len(),
             5,

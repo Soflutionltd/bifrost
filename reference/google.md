@@ -172,7 +172,10 @@ Internal modules:
   cause.
   A resumable session is server-side state that Drive holds for about a
   week, so any failure of the upload leg cancels its own session on the
-  way out: one un-retried `DELETE` against the session URI, bounded by its
+  way out. Account shutdown interrupts the chunk loop and awaits that cleanup;
+  session creation is allowed to finish so its response can supply the cleanup
+  URI, and completed uploads finish their sharing leg. Cleanup uses one
+  un-retried `DELETE` against the session URI, bounded by its
   own deadline (`GDRIVE_CANCEL_TIMEOUT`), whose own failure is swallowed rather than replacing the
   error the caller needs. Google's accepted-cancel status is `499`, which
   bifrost-net surfaces as `Err(Status)` and not `Ok`; `499`, `404` and
@@ -207,6 +210,9 @@ Consumers construct `GoogleAccountFactory` with
 `from_access_token(token)` (raw) or `from_token_source(Arc<dyn
 TokenSource>)` (shared source, read live per request), then optionally
 attach a `PubSubConfig` via `with_pubsub_config`/`with_pubsub_topic`.
+`from_token_source_with_net(source, net)` uses an application-owned `Net`,
+including its transport, shared governor and registries; attachment still waits
+for `open(account_id)`.
 The factory is the only public entry point; the raw `GmailClient`,
 Gmail wire DTOs, and crate-local `Error` are `pub(crate)`.
 
@@ -327,17 +333,20 @@ account-scoped clone attached to `bifrost-net` under the engine
   discovery returns a fresh cached snapshot without a request; stale reads
   re-check after taking the lock. Container listing still fetches the latest
   server view, but its write uses the same lock. Lifecycle diff state is
-  private to each lifecycle stream and never reads this cache.
+  held separately in account-owned `lifecycle_baseline` and never reads this cache.
+- `lifecycle_baseline` retains the last observed label snapshot and undelivered
+  lifecycle events across replacement streams.
 - `shutdown: CancellationToken` for the watch actor, cancellable account
-  streams, and adapter-wrapped PIM, People, and Calendar futures.
+  streams, adapter-wrapped PIM, People, and Calendar futures, and Drive cleanup.
 - `set_priority` / `set_bandwidth_cap` delegate to the underlying `AccountNet`.
 
 Clients (`from_access_token` or `from_token_source`) retain their parent
 `Net` without attaching a placeholder account. `open(account_id)` is
 the first point that mints an `AccountNet`, under the engine id. A
 failed open detaches that registration before returning the error.
-There is no public custom-`Net` constructor after S1-W3; callers use
-the factory and the shared `Account` trait.
+`GoogleAccountFactory::from_token_source_with_net` accepts a consumer-owned
+`Net`; callers still interact with opened accounts through the shared `Account`
+trait.
 
 `AccountFactory::open(account_id)` returns `OpenedAccount` with an
 always-empty skip lane (single-namespace account; open probes only the
@@ -369,8 +378,14 @@ may keep delivering until the 7-day watch expires.
 on it during both its polling wait and an in-flight `labels.list` request, and
 stops before emitting queued lifecycle events. The token is also threaded
 through inventory, changes, hydration and mutations. `repair_inventory`,
-membership discovery, blob reads, and the PIM, contacts and Calendar operations
-do not currently receive it, so `close()` cannot interrupt those calls.
+membership discovery and blob reads use the adapter's stream wrapper. PIM,
+contacts and Calendar futures use its future wrapper. A cancelled active future
+carries conservative in-flight evidence; event and contact updates explicitly
+require reconciliation because a first leg may already have committed. The
+generic wrapper deliberately adds no target scope: after an event move the
+original scope may be wrong, and it has no operation-owned continuation state.
+Drive hosting handles the token internally so shutdown of an active upload
+awaits session cleanup rather than dropping the multi-request future.
 
 ## Capabilities
 
@@ -884,29 +899,18 @@ nothing cached, the operation fails rather than canonicalizing against
 an empty vocabulary; a populated stale cache stays usable when a later
 refresh fails.
 
-`scope_lifecycle_stream` owns a private `last_emitted: Option<ScopeSnapshot>`.
-Its first successful label fetch seeds that state and emits no Created events.
-Later polls diff only against the last snapshot observed by that stream, so a
-flag mutation, hydration batch, inventory prelude, or membership discovery that
-refreshes the shared vocabulary cannot consume lifecycle changes. Rename events
-carry the same stable label id in `old` and `new`, along with the previous and
-current display names. The sync multiplexer uses the scope ids to reconcile
-cursors and ignores the names; other consumers can use the names without a
-second metadata read.
+`scope_lifecycle_stream` shares an account-owned baseline and pending event
+queue, independent of the label vocabulary cache. The first successful label
+fetch seeds the baseline without emitting Created events. Later polls diff
+against that baseline, so cache refreshes by other operations cannot consume
+changes. Both the baseline and queued events survive replacement streams;
+dropping a stream halfway through a diff does not discard the remaining events.
+Rename events carry the stable label id and both display names.
 
-The poll cadence is a separate piece of state, `next_delay: Option<Duration>`,
-and NOT a function of `last_emitted`. `None` means no poll has been attempted
-yet and the first one runs immediately; every later attempt waits. Keying the
-delay off the baseline snapshot instead conflated "a poll has happened" with "a
-poll has succeeded", so a retryable `labels.list` failure before the first
-successful snapshot re-issued the request with no delay - an outage became a hot
-request loop. A retryable failure doubles the wait from
-`LIFECYCLE_POLL_INTERVAL` up to `LIFECYCLE_MAX_BACKOFF`; the reset happens only
-on a `labels.list` that actually completed, the same rule bifrost-graph's EWS
-reconnect backoff follows for the same reason. The wait is a `select!` against
-the shutdown token, so `close()` ends the stream where it happens rather than at
-the end of the backoff. Terminal and engine-action classes still end the stream
-with `ScopeLifecycleEvent::Terminated` instead of backing off.
+The first poll runs immediately and successful polls use a thirty-second cadence.
+Every classified poll failure emits `ScopeLifecycleEvent::Terminated` once and
+ends the stream. The engine owns reconnect backoff, retry hints and throttle
+holds. Waiting and in-flight reads select against the account shutdown token.
 
 `get_stream` consumes a stream of `ObjectId`s in batches of 32
 and emits `AccountStream<SyncEvent<ItemOutcome<HydratedObject>>>`.
@@ -1289,12 +1293,13 @@ stop. Residual: instances in OTHER processes are invisible to the registry and
 `users.stop` cannot be scoped to a watch, so cross-process teardown of a shared
 mailbox can still stop a live watch until the next renewal.
 
-`push_stream` is a `broadcast::Receiver<WatchEvent>` adapter with shutdown
-wiring. If a consumer falls behind the 32-event health ring, the stream emits
-a support-only `WatchEvent::Warning` with the number of health events lost,
-then resumes the retained events. The warning makes it visible that a health
-edge such as `Terminated` may have been among the dropped events; it cannot
-reconstruct that edge.
+`push_stream` adapts the 32-event broadcast health ring with shutdown wiring.
+The actor also latches terminal failures in account-owned state before
+broadcasting them. Each stream checks that latch before receiving and after
+lag, emits `Terminated` once, then ends. Late subscribers therefore see the
+terminal failure too. The latch lasts for the account instance, including if
+an explicit subscribe restarts the watch actor's lifecycle. Lag without a
+terminal latch emits a support-only warning with the number of events lost.
 
 The Pub/Sub message payload itself is not parsed by this crate;
 the consumer subscribes to the Pub/Sub topic out of process,

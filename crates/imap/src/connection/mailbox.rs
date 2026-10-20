@@ -12,8 +12,8 @@ impl ImapConnection {
     /// [`ImapConnection::list_extended`].
     pub async fn list(
         &self,
-        reference: &str,
-        pattern: &str,
+        reference: &(impl crate::types::MailboxInput + ?Sized),
+        pattern: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<Vec<MailboxInfo>, Error> {
         use super::dispatch::ListConsumer;
@@ -21,8 +21,8 @@ impl ImapConnection {
         self.check_utf8_only_enforced()?;
         self.require_state(crate::types::CommandKind::List)?;
         let cmd = Command::List {
-            reference: reference.to_owned(),
-            pattern: pattern.to_owned(),
+            reference: reference.mailbox_name()?.into(),
+            pattern: pattern.mailbox_name()?.into(),
         };
         // The ListConsumer handles NOTIFY marker classification via the
         // per-response notify_snapshot passed by the dispatcher. Mid-stream
@@ -57,11 +57,39 @@ impl ImapConnection {
         return_options: &[&str],
         timeout: Duration,
     ) -> Result<Vec<MailboxInfo>, Error> {
+        let names = patterns
+            .iter()
+            .map(|name| MailboxName::new(*name))
+            .collect::<Result<Vec<_>, _>>()?;
+        let names = names.iter().collect::<Vec<_>>();
+        self.list_extended_names(
+            reference,
+            &names,
+            selection_options,
+            return_options,
+            timeout,
+        )
+        .await
+    }
+
+    pub(crate) async fn list_extended_names(
+        &self,
+        reference: &(impl crate::types::MailboxInput + ?Sized),
+        patterns: &[&MailboxName],
+        selection_options: &[&str],
+        return_options: &[&str],
+        timeout: Duration,
+    ) -> Result<Vec<MailboxInfo>, Error> {
         use super::dispatch::ListExtendedConsumer;
 
         self.check_utf8_only_enforced()?;
         self.require_state(crate::types::CommandKind::List)?;
-        self.validate_list_extended_request(patterns, selection_options, return_options)?;
+        let names = patterns
+            .iter()
+            .map(crate::types::MailboxInput::mailbox_name)
+            .collect::<Result<Vec<_>, _>>()?;
+        let display = names.iter().map(MailboxName::as_str).collect::<Vec<_>>();
+        self.validate_list_extended_request(&display, selection_options, return_options)?;
 
         if selection_options.is_empty() && return_options.is_empty() && patterns.len() == 1 {
             return self.list(reference, patterns[0], timeout).await;
@@ -72,11 +100,8 @@ impl ImapConnection {
                 .iter()
                 .map(|option| (*option).to_owned())
                 .collect(),
-            reference: reference.to_owned(),
-            patterns: patterns
-                .iter()
-                .map(|pattern| (*pattern).to_owned())
-                .collect(),
+            reference: reference.mailbox_name()?.into(),
+            patterns: names.into_iter().map(Into::into).collect(),
             return_options: return_options
                 .iter()
                 .map(|option| (*option).to_owned())
@@ -108,8 +133,8 @@ impl ImapConnection {
     /// this method correlates them by mailbox name.
     pub async fn list_status(
         &self,
-        reference: &str,
-        pattern: &str,
+        reference: &(impl crate::types::MailboxInput + ?Sized),
+        pattern: &(impl crate::types::MailboxInput + ?Sized),
         status_items: &str,
         timeout: Duration,
     ) -> Result<Vec<(MailboxInfo, Vec<StatusItem>)>, Error> {
@@ -131,8 +156,8 @@ impl ImapConnection {
         }
         self.validate_requested_status_items(status_items)?;
         let cmd = Command::ListStatus {
-            reference: reference.to_owned(),
-            pattern: pattern.to_owned(),
+            reference: reference.mailbox_name()?.into(),
+            pattern: pattern.mailbox_name()?.into(),
             status_items: status_items.to_owned(),
         };
         tokio::time::timeout(timeout, self.submit_regular(cmd, ListStatusConsumer::new()))
@@ -143,7 +168,11 @@ impl ImapConnection {
     /// SELECT a mailbox (RFC 3501 Section 6.3.1).
     ///
     /// For CONDSTORE or QRESYNC options, use [`select_with`](Self::select_with).
-    pub async fn select(&self, mailbox: &str, timeout: Duration) -> Result<SelectedMailbox, Error> {
+    pub async fn select(
+        &self,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
+        timeout: Duration,
+    ) -> Result<SelectedMailbox, Error> {
         self.select_with(mailbox, &SelectOptions::default(), timeout)
             .await
     }
@@ -157,7 +186,7 @@ impl ImapConnection {
     /// - [`SelectOptions::qresync(params)`] for `SELECT <mailbox> (QRESYNC ...)`
     pub async fn select_with(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         options: &SelectOptions,
         timeout: Duration,
     ) -> Result<SelectedMailbox, Error> {
@@ -176,7 +205,7 @@ impl ImapConnection {
     /// For CONDSTORE or QRESYNC options, use [`examine_with`](Self::examine_with).
     pub async fn examine(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<SelectedMailbox, Error> {
         self.examine_with(mailbox, &SelectOptions::default(), timeout)
@@ -193,7 +222,7 @@ impl ImapConnection {
     /// - [`SelectOptions::qresync(params)`] for `EXAMINE <mailbox> (QRESYNC ...)`
     pub async fn examine_with(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         options: &SelectOptions,
         timeout: Duration,
     ) -> Result<SelectedMailbox, Error> {
@@ -221,7 +250,7 @@ impl ImapConnection {
     /// - Tagged BAD -> no change (RFC 3501 Section6)
     pub(super) async fn select_or_examine(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         is_examine: bool,
         condstore: bool,
         qresync: Option<QresyncParams>,
@@ -238,7 +267,7 @@ impl ImapConnection {
         if let Some(ref params) = qresync {
             self.validate_qresync_params(params)?;
         }
-        let wire_mailbox = MailboxName::new(mailbox)?;
+        let wire_mailbox = mailbox.mailbox_name()?;
         let cmd = if is_examine {
             Command::Examine {
                 mailbox: wire_mailbox,
@@ -301,7 +330,11 @@ impl ImapConnection {
     }
 
     /// CREATE a mailbox (RFC 3501 Section 6.3.3).
-    pub async fn create(&self, mailbox: &str, timeout: Duration) -> Result<(), Error> {
+    pub async fn create(
+        &self,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
+        timeout: Duration,
+    ) -> Result<(), Error> {
         self.create_with_mailbox_id(mailbox, timeout)
             .await
             .map(|_| ())
@@ -316,7 +349,7 @@ impl ImapConnection {
     /// method returns `Ok(None)` in that case.
     pub async fn create_with_mailbox_id(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<Option<String>, Error> {
         use super::dispatch::CreateConsumer;
@@ -324,7 +357,7 @@ impl ImapConnection {
         self.check_utf8_only_enforced()?;
         self.require_state(crate::types::CommandKind::Create)?;
         let cmd = Command::Create {
-            mailbox: MailboxName::new(mailbox)?,
+            mailbox: mailbox.mailbox_name()?,
         };
         tokio::time::timeout(timeout, self.submit_regular(cmd, CreateConsumer::default()))
             .await
@@ -343,7 +376,7 @@ impl ImapConnection {
     /// server advertises the CREATE-SPECIAL-USE capability."
     pub async fn create_special_use(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         special_use: &[MailboxAttribute],
         timeout: Duration,
     ) -> Result<(), Error> {
@@ -356,7 +389,7 @@ impl ImapConnection {
     /// `MAILBOXID` when present (RFC 6154 Section 3, RFC 8474 Section 4.1).
     pub async fn create_special_use_with_mailbox_id(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         special_use: &[MailboxAttribute],
         timeout: Duration,
     ) -> Result<Option<String>, Error> {
@@ -384,7 +417,7 @@ impl ImapConnection {
             )));
         }
         let cmd = Command::CreateSpecialUse {
-            mailbox: MailboxName::new(mailbox)?,
+            mailbox: mailbox.mailbox_name()?,
             special_use: special_use.to_vec(),
         };
         tokio::time::timeout(timeout, self.submit_regular(cmd, CreateConsumer::default()))
@@ -393,13 +426,17 @@ impl ImapConnection {
     }
 
     /// DELETE a mailbox (RFC 3501 Section 6.3.4).
-    pub async fn delete(&self, mailbox: &str, timeout: Duration) -> Result<(), Error> {
+    pub async fn delete(
+        &self,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
+        timeout: Duration,
+    ) -> Result<(), Error> {
         use super::dispatch::TaggedOkConsumer;
 
         self.check_utf8_only_enforced()?;
         self.require_state(crate::types::CommandKind::Delete)?;
         let cmd = Command::Delete {
-            mailbox: MailboxName::new(mailbox)?,
+            mailbox: mailbox.mailbox_name()?,
         };
         tokio::time::timeout(
             timeout,
@@ -412,8 +449,8 @@ impl ImapConnection {
     /// RENAME a mailbox (RFC 3501 Section 6.3.5).
     pub async fn rename(
         &self,
-        mailbox: &str,
-        new_name: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
+        new_name: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<(), Error> {
         use super::dispatch::TaggedOkConsumer;
@@ -421,8 +458,8 @@ impl ImapConnection {
         self.check_utf8_only_enforced()?;
         self.require_state(crate::types::CommandKind::Rename)?;
         let cmd = Command::Rename {
-            mailbox: MailboxName::new(mailbox)?,
-            new_name: MailboxName::new(new_name)?,
+            mailbox: mailbox.mailbox_name()?,
+            new_name: new_name.mailbox_name()?,
         };
         tokio::time::timeout(
             timeout,
@@ -436,13 +473,17 @@ impl ImapConnection {
     ///
     /// Adds the mailbox to the server's set of "active" or "subscribed" mailboxes
     /// returned by LSUB.
-    pub async fn subscribe(&self, mailbox: &str, timeout: Duration) -> Result<(), Error> {
+    pub async fn subscribe(
+        &self,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
+        timeout: Duration,
+    ) -> Result<(), Error> {
         use super::dispatch::TaggedOkConsumer;
 
         self.check_utf8_only_enforced()?;
         self.require_state(crate::types::CommandKind::Subscribe)?;
         let cmd = Command::Subscribe {
-            mailbox: MailboxName::new(mailbox)?,
+            mailbox: mailbox.mailbox_name()?,
         };
         tokio::time::timeout(
             timeout,
@@ -453,13 +494,17 @@ impl ImapConnection {
     }
 
     /// UNSUBSCRIBE from a mailbox (RFC 3501 Section 6.3.7).
-    pub async fn unsubscribe(&self, mailbox: &str, timeout: Duration) -> Result<(), Error> {
+    pub async fn unsubscribe(
+        &self,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
+        timeout: Duration,
+    ) -> Result<(), Error> {
         use super::dispatch::TaggedOkConsumer;
 
         self.check_utf8_only_enforced()?;
         self.require_state(crate::types::CommandKind::Unsubscribe)?;
         let cmd = Command::Unsubscribe {
-            mailbox: MailboxName::new(mailbox)?,
+            mailbox: mailbox.mailbox_name()?,
         };
         tokio::time::timeout(
             timeout,
@@ -475,8 +520,8 @@ impl ImapConnection {
     /// that don't support `\Subscribed` attribute in LIST.
     pub async fn lsub(
         &self,
-        reference: &str,
-        pattern: &str,
+        reference: &(impl crate::types::MailboxInput + ?Sized),
+        pattern: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<Vec<MailboxInfo>, Error> {
         use super::dispatch::LsubConsumer;
@@ -495,8 +540,8 @@ impl ImapConnection {
         }
 
         let cmd = Command::Lsub {
-            reference: reference.to_owned(),
-            pattern: pattern.to_owned(),
+            reference: reference.mailbox_name()?.into(),
+            pattern: pattern.mailbox_name()?.into(),
         };
         tokio::time::timeout(timeout, self.submit_regular(cmd, LsubConsumer::default()))
             .await
@@ -572,7 +617,7 @@ impl ImapConnection {
     /// details on the inherent protocol ambiguity (RFC 5465 Section 4).
     pub async fn status(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         items: &str,
         timeout: Duration,
     ) -> Result<StatusResult, Error> {
@@ -582,7 +627,7 @@ impl ImapConnection {
         self.require_state(crate::types::CommandKind::Status)?;
         self.validate_requested_status_items(items)?;
         let cmd = Command::Status {
-            mailbox: MailboxName::new(mailbox)?,
+            mailbox: mailbox.mailbox_name()?,
             items: items.to_owned(),
         };
         tokio::time::timeout(timeout, self.submit_regular(cmd, StatusConsumer::new()))

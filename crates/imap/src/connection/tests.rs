@@ -2517,7 +2517,7 @@ async fn the_driver_refuses_a_batch_holding_a_command_that_cannot_be_pipelined()
             commands: vec![
                 Command::Noop,
                 Command::Append {
-                    mailbox: "INBOX".to_owned(),
+                    mailbox: "INBOX".into(),
                     messages: vec![AppendMessage::new(b"HELLO".to_vec())],
                     multi: false,
                 },

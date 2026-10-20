@@ -27,14 +27,16 @@
 //! not replace those policies; adding one is unnecessary for these contracts.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine as _;
 use bifrost_net::{
     AccessToken, AccountNet, AccountSpec, Error as NetError, FollowRedirects,
     MalformedRedirectKind, Net, NetErrorContext, TokenSource, into_account_error,
 };
-use bifrost_types::{AccountError, AccountId, AccountOperation};
+use bifrost_types::{
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, AccountOperation, AttemptCause,
+    Cause, DiagnosticText, ProtocolErrorKind, TransmissionState, WireCause,
+};
 use bytes::Bytes;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
@@ -377,6 +379,24 @@ impl DavDispatch {
         Ok((headers, used))
     }
 
+    async fn mint_auth_until(
+        &self,
+        url: &str,
+        operation: AccountOperation,
+        deadline: Instant,
+    ) -> Result<(HeaderMap, Option<AccessToken>), AccountError> {
+        tokio::time::timeout_at(deadline, self.mint_auth(url, operation))
+            .await
+            .unwrap_or_else(|_| {
+                Err(self.redirect_error(
+                    NetError::Timeout {
+                        transmission_state: TransmissionState::Unsent,
+                    },
+                    operation,
+                ))
+            })
+    }
+
     /// Classify a `TokenSource::current()` failure.
     ///
     /// Folding every one of these into `transport_error` was survivable while
@@ -684,37 +704,22 @@ impl DavDispatch {
         request: DavRequest,
         operation: AccountOperation,
     ) -> Result<DavResponse, AccountError> {
-        let unreplayable = request.idempotent == Some(false);
-        let deadline = Instant::now() + DAV_CLIENT_TIMEOUT;
-        let sent = AtomicBool::new(false);
-        tokio::time::timeout(
-            DAV_CLIENT_TIMEOUT,
-            self.send_raw_until(request, operation, deadline, &sent),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(self.redirect_error(
-                NetError::Timeout {
-                    transmission_state: if sent.load(Ordering::Relaxed) {
-                        bifrost_types::TransmissionState::InFlight
-                    } else {
-                        bifrost_types::TransmissionState::Unsent
-                    },
-                },
-                operation,
-            ))
-        })
-        .map_err(|error| {
-            if unreplayable {
-                error
-                    .into_builder()
-                    .idempotency_override(false)
-                    .try_build()
-                    .expect("valid unreplayable DAV request classification")
-            } else {
-                error
-            }
-        })
+        let unreplayable = !request
+            .idempotent
+            .unwrap_or_else(|| request.method.is_idempotent());
+        self.send_raw_until(request, operation, Instant::now() + DAV_CLIENT_TIMEOUT)
+            .await
+            .map_err(|error| {
+                if unreplayable {
+                    error
+                        .into_builder()
+                        .idempotency_override(false)
+                        .try_build()
+                        .expect("valid unreplayable DAV request classification")
+                } else {
+                    error
+                }
+            })
     }
 
     async fn send_raw_until(
@@ -722,7 +727,6 @@ impl DavDispatch {
         request: DavRequest,
         operation: AccountOperation,
         deadline: Instant,
-        sent: &AtomicBool,
     ) -> Result<DavResponse, AccountError> {
         // The named shared constant, not `RedirectPolicy::default().max_hops`:
         // DAV has no per-account redirect config, and laundering the cap
@@ -747,9 +751,16 @@ impl DavDispatch {
                 self.protocol,
             ));
         }
+        let unreplayable = !request
+            .idempotent
+            .unwrap_or_else(|| request.method.is_idempotent());
+        let mut history = RedirectHistory::default();
         let mut request = request;
         let mut hops = 0usize;
-        let (auth, mut used) = self.mint_auth(&request.url, operation).await?;
+        let (auth, mut used) = self
+            .mint_auth_until(&request.url, operation, deadline)
+            .await
+            .map_err(|error| history.attach(error, unreplayable, operation, self.protocol))?;
         request.headers.extend(auth);
         let mut refreshed = false;
         loop {
@@ -757,15 +768,12 @@ impl DavDispatch {
             // Redirect rebasing below has already produced this hop's final
             // destination, so dialect policy cannot be bypassed by a redirect.
             self.check_request_targets(&request, operation)
-                .map_err(|error| {
-                    if hops > 0 {
-                        refused_after_answered_hop(error)
-                    } else {
-                        error
-                    }
-                })?;
-            sent.store(true, Ordering::Relaxed);
-            let response = self.dispatch_once(&request, operation, deadline).await?;
+                .map_err(|error| history.attach(error, unreplayable, operation, self.protocol))?;
+            let response = self
+                .dispatch_once(&request, operation, deadline)
+                .await
+                .map_err(|error| history.attach(error, unreplayable, operation, self.protocol))?;
+            history.record_response(response.status, unreplayable);
             if response.status == StatusCode::UNAUTHORIZED
                 && !refreshed
                 && let (DavCredentials::Bearer { token_source }, Some(token)) =
@@ -774,15 +782,32 @@ impl DavDispatch {
                 // The 401 is a refusal, so replaying the owned byte body is
                 // safe even for MOVE/conditional create. Use the token actually
                 // rejected, not a second current() read that could race rotation.
-                let token = token_source
-                    .refresh_if_unchanged(token)
-                    .await
-                    .map_err(|error| self.token_read_error(error, operation))?;
+                let refreshed_token = match tokio::time::timeout_at(
+                    deadline,
+                    token_source.refresh_if_unchanged(token),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(NetError::Timeout {
+                        transmission_state: TransmissionState::Unsent,
+                    }),
+                };
+                let token = refreshed_token
+                    .map_err(|error| self.token_read_error(error, operation))
+                    .map_err(|error| {
+                        history.attach(error, unreplayable, operation, self.protocol)
+                    })?;
                 let value =
                     HeaderValue::from_str(&format!("Bearer {}", token.as_str())).map_err(|_| {
-                        local_error(
+                        history.attach(
+                            local_error(
+                                operation,
+                                "bearer token contains header-invalid bytes",
+                                self.protocol,
+                            ),
+                            unreplayable,
                             operation,
-                            "bearer token contains header-invalid bytes",
                             self.protocol,
                         )
                     })?;
@@ -804,12 +829,17 @@ impl DavDispatch {
             );
             let location = match response.headers.get(reqwest::header::LOCATION) {
                 Some(value) if redirect => Some(value.to_str().map_err(|error| {
-                    self.redirect_error(
-                        NetError::MalformedRedirect {
-                            kind: MalformedRedirectKind::InvalidLocationEncoding,
-                            message: format!("Location header was not valid UTF-8: {error}"),
-                        },
+                    history.attach(
+                        self.redirect_error(
+                            NetError::MalformedRedirect {
+                                kind: MalformedRedirectKind::InvalidLocationEncoding,
+                                message: format!("Location header was not valid UTF-8: {error}"),
+                            },
+                            operation,
+                        ),
+                        unreplayable,
                         operation,
+                        self.protocol,
                     )
                 })?),
                 _ => None,
@@ -820,39 +850,57 @@ impl DavDispatch {
             let next = Url::parse(&response.url)
                 .and_then(|base| base.join(location))
                 .map_err(|error| {
-                    self.redirect_error(
-                        NetError::MalformedRedirect {
-                            kind: MalformedRedirectKind::UnresolvableLocation,
-                            message: format!(
-                                "Location {location:?} could not be resolved against base: {error}"
-                            ),
-                        },
+                    history.attach(
+                        self.redirect_error(
+                            NetError::MalformedRedirect {
+                                kind: MalformedRedirectKind::UnresolvableLocation,
+                                message: format!(
+                                    "Location {location:?} could not be resolved against base: {error}"
+                                ),
+                            },
+                            operation,
+                        ),
+                        unreplayable,
                         operation,
+                        self.protocol,
                     )
                 })?;
             hops += 1;
             if hops > max_hops {
-                return Err(self.redirect_error(
-                    NetError::RedirectLoop {
-                        hops: u16::try_from(hops).unwrap_or(u16::MAX),
-                    },
+                return Err(history.attach(
+                    self.redirect_error(
+                        NetError::RedirectLoop {
+                            hops: u16::try_from(hops).unwrap_or(u16::MAX),
+                        },
+                        operation,
+                    ),
+                    unreplayable,
                     operation,
+                    self.protocol,
                 ));
             }
             // Refused locally when the origin was never admitted by discovery.
             // The gate is checked here rather than left to `auth_headers`,
             // whose own refusal is right for a first hop but not for this one:
-            // by now the server has answered the previous hop, and the error
-            // must say so (see `refused_after_answered_hop`).
+            // by now the server has answered the previous hop, and that
+            // response is already in `history` below.
             if !self.is_trusted_url(next.as_str()) {
-                return Err(refused_after_answered_hop(local_error(
+                return Err(history.attach(
+                    local_error(
+                        operation,
+                        format!("refusing to follow a DAV redirect to an untrusted URL: {next}"),
+                        self.protocol,
+                    ),
+                    unreplayable,
                     operation,
-                    format!("refusing to follow a DAV redirect to an untrusted URL: {next}"),
                     self.protocol,
-                )));
+                ));
             }
             // Fresh credentials for the target origin.
-            let (auth, token) = self.mint_auth(next.as_str(), operation).await?;
+            let (auth, token) = self
+                .mint_auth_until(next.as_str(), operation, deadline)
+                .await
+                .map_err(|error| history.attach(error, unreplayable, operation, self.protocol))?;
             used = token;
             refreshed = false;
             let mut headers = request.headers.clone();
@@ -885,20 +933,26 @@ impl DavDispatch {
                 .and_then(|destination| rebase_destination(&request.url, &next, destination));
             if let Some(rebased) = rebased {
                 if !self.is_trusted_url(&rebased) {
-                    return Err(refused_after_answered_hop(local_error(
-                        operation,
-                        format!(
-                            "refusing to name an untrusted DAV move destination after a redirect: {rebased}"
+                    return Err(history.attach(
+                        local_error(
+                            operation,
+                            format!(
+                                "refusing to name an untrusted DAV move destination after a redirect: {rebased}"
+                            ),
+                            self.protocol,
                         ),
+                        unreplayable,
+                        operation,
                         self.protocol,
-                    )));
+                    ));
                 }
                 let value = HeaderValue::from_str(&rebased).map_err(|error| {
-                    refused_after_answered_hop(local_error(
+                    history.attach(
+                        local_error(operation, error.to_string(), self.protocol),
+                        unreplayable,
                         operation,
-                        error.to_string(),
                         self.protocol,
-                    ))
+                    )
                 })?;
                 headers.insert(HeaderName::from_static(DESTINATION), value);
             }
@@ -1098,22 +1152,85 @@ impl DavDispatch {
     }
 }
 
-/// Stamp a local refusal raised partway through the redirect walk with the
-/// transmission evidence it is owed.
+/// Evidence from responses received before the final DAV hop.
 ///
-/// The classification stays this client's decision: `Request(Malformed)` for
-/// origin refusal (which discovery's fallback predicate reads), or Unsupported
-/// for a dialect policy refusal. The previous hop was sent and answered, so
-/// this is not an UNSENT exchange. `Acknowledged` records that evidence without
-/// changing either refusal's recovery class. The refused next hop is not sent.
-fn refused_after_answered_hop(error: AccountError) -> AccountError {
-    error
-        .into_builder()
-        .push_cause(bifrost_types::Cause::Attempt(
-            bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Acknowledged),
-        ))
-        .try_build()
-        .expect("an acknowledged attempt is valid on a local refusal")
+/// Net aggregates its own retries, but the DAV redirect walk starts a new
+/// `AccountNet` request for each hop. Keep acknowledged responses here so a
+/// later failure cannot erase an earlier non-idempotent commit possibility.
+#[derive(Default)]
+struct RedirectHistory {
+    causes: Vec<Cause>,
+    may_have_committed: bool,
+}
+
+impl RedirectHistory {
+    fn record_response(&mut self, status: StatusCode, unreplayable: bool) {
+        self.causes.push(Cause::Attempt(AttemptCause::new(
+            TransmissionState::Acknowledged,
+        )));
+        // 401 refuses this attempt before authentication. Other responses,
+        // including redirects, retain net's conservative commit evidence.
+        self.may_have_committed |= unreplayable && status != StatusCode::UNAUTHORIZED;
+    }
+
+    fn attach(
+        &self,
+        error: AccountError,
+        unreplayable: bool,
+        operation: AccountOperation,
+        protocol: DavProtocol,
+    ) -> AccountError {
+        if self.causes.is_empty() {
+            return error;
+        }
+        let terminal_state = error.chain().iter().find_map(|cause| match cause {
+            Cause::Attempt(attempt) => Some(attempt.transmission_state),
+            _ => None,
+        });
+        if unreplayable
+            && self.may_have_committed
+            && matches!(terminal_state, None | Some(TransmissionState::Unsent))
+        {
+            // A later hop can fail before dispatch (including while waiting
+            // for admission). Credential errors can omit attempt evidence
+            // entirely. The earlier response still makes the logical
+            // mutation ambiguous, so use the existing partial-response
+            // reconciliation lane and retain the terminal error as evidence.
+            // History appended through into_builder is diagnostic only, so
+            // declare the combined outcome on a fresh builder.
+            let mut builder = AccountErrorBuilder::new(
+                AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+                Cause::Wire(WireCause::MalformedResponse {
+                    protocol: protocol.protocol(),
+                    detail: Some(DiagnosticText::support_only(
+                        "DAV redirect chain failed after an unreplayable request may have committed",
+                    )),
+                }),
+            )
+            .push_cause(Cause::Attempt(AttemptCause::new(
+                TransmissionState::InFlight,
+            )))
+            .protocol(protocol.protocol())
+            .operation(operation)
+            .idempotency_override(false);
+            for cause in &self.causes {
+                builder = builder.push_cause(cause.clone());
+            }
+            for cause in error.chain().iter() {
+                builder = builder.push_cause(cause.clone());
+            }
+            return builder
+                .try_build()
+                .expect("valid DAV redirect-chain partial response");
+        }
+        let mut builder = error.into_builder();
+        for cause in &self.causes {
+            builder = builder.push_cause(cause.clone());
+        }
+        builder
+            .try_build()
+            .expect("valid DAV redirect-chain transmission evidence")
+    }
 }
 
 /// Re-express `destination` against the URL the source was redirected to.
@@ -1191,12 +1308,13 @@ fn response_read_error_with_history(
 
 #[cfg(test)]
 mod tests {
-    use bifrost_net::test_support::Canned;
+    use bifrost_net::{NetConfig, RetryPolicy, test_support::Canned};
     use bifrost_types::{
         AccountErrorKind, AuthErrorKind, ProtocolErrorKind, ReconcileAction, RecoveryClass,
         TransmissionState,
     };
     use reqwest::header::HeaderMap;
+    use std::sync::atomic::Ordering;
 
     use super::*;
     use crate::test_support::{
@@ -1205,6 +1323,27 @@ mod tests {
     };
 
     const BASE: &str = "https://dav.example.test";
+
+    struct DispatchReachedGuard(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+
+    impl DavRequestGuard for DispatchReachedGuard {
+        fn check_target(
+            &self,
+            _method: &Method,
+            _url: &str,
+            _operation: AccountOperation,
+        ) -> Result<(), AccountError> {
+            if let Some(entered) = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = entered.send(());
+            }
+            Ok(())
+        }
+    }
 
     fn dispatch_at(net: AccountNet, base_url: &str) -> DavDispatch {
         DavDispatch::with_account_net(
@@ -1767,6 +1906,135 @@ mod tests {
         assert!(reconciles(&error));
     }
 
+    #[tokio::test]
+    async fn an_acknowledged_unreplayable_redirect_is_kept_on_a_later_unsent_failure() {
+        use bifrost_net::test_support::scripted_net;
+
+        let script = dav_script([
+            dav_redirect(StatusCode::TEMPORARY_REDIRECT, "/next"),
+            Canned::Error(NetError::Timeout {
+                transmission_state: TransmissionState::Unsent,
+            }),
+        ]);
+        let mut spec = AccountSpec::new(None);
+        spec.follow_redirects = FollowRedirects::Disabled;
+        let mut retry = RetryPolicy::default();
+        retry.max_attempts = 1;
+        retry.initial_backoff = std::time::Duration::ZERO;
+        retry.max_backoff = std::time::Duration::ZERO;
+        spec.default_retry = retry;
+        let account_net = scripted_net(&script, NetConfig::default())
+            .attach_account(AccountId("dav-redirect-history".to_string()), spec);
+        let dispatch = dispatch_at(account_net, BASE);
+        let error = dispatch
+            .send_raw_request(
+                DavRequest::new(Method::PUT, format!("{BASE}/start")).idempotent(false),
+                AccountOperation::EventUpdate,
+            )
+            .await
+            .expect_err("the second hop times out before admission");
+
+        assert!(
+            matches!(
+                error.kind(),
+                AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
+            ),
+            "the first hop may have committed: {error:?}"
+        );
+        assert!(
+            reconciles(&error),
+            "the redirect chain is ambiguous: {error:?}"
+        );
+        let states: Vec<_> = error
+            .chain()
+            .iter()
+            .filter_map(|cause| match cause {
+                Cause::Attempt(attempt) => Some(attempt.transmission_state),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            states.contains(&TransmissionState::Acknowledged),
+            "{states:?}"
+        );
+        assert!(states.contains(&TransmissionState::InFlight), "{states:?}");
+        assert!(states.contains(&TransmissionState::Unsent), "{states:?}");
+        assert_eq!(script.requests().len(), 2);
+    }
+
+    struct RedirectFailingTokenSource {
+        reads: std::sync::atomic::AtomicUsize,
+        fail_refresh: bool,
+    }
+
+    impl TokenSource for RedirectFailingTokenSource {
+        fn current(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
+            let read = self.reads.fetch_add(1, Ordering::Relaxed);
+            let succeeds = read == 0 || self.fail_refresh;
+            Box::pin(async move {
+                if succeeds {
+                    Ok(AccessToken::new("token", None))
+                } else {
+                    Err(redirect_refresh_failure())
+                }
+            })
+        }
+
+        fn refresh(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
+            Box::pin(async { Err(redirect_refresh_failure()) })
+        }
+    }
+
+    fn redirect_refresh_failure() -> NetError {
+        NetError::RefreshFailed {
+            retry_after: None,
+            source: Arc::new(NetError::Timeout {
+                transmission_state: TransmissionState::Unsent,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_failure_after_an_unreplayable_redirect_requires_reconciliation() {
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            for fail_refresh in [false, true] {
+                let mut responses = vec![dav_redirect(StatusCode::TEMPORARY_REDIRECT, "/next")];
+                if fail_refresh {
+                    responses.push(answer(StatusCode::UNAUTHORIZED));
+                }
+                let script = dav_script(responses);
+                let dispatch = DavDispatch::with_account_net(
+                    scripted_dav_net(&script),
+                    BASE,
+                    DavCredentials::Bearer {
+                        token_source: Arc::new(RedirectFailingTokenSource {
+                            reads: std::sync::atomic::AtomicUsize::new(0),
+                            fail_refresh,
+                        }),
+                    },
+                    protocol,
+                );
+                let error = dispatch
+                    .send_raw_request(
+                        DavRequest::new(Method::PUT, format!("{BASE}/start")).idempotent(false),
+                        AccountOperation::EventUpdate,
+                    )
+                    .await
+                    .expect_err("credential failure must preserve the earlier possible commit");
+
+                assert!(reconciles(&error), "{error:?}");
+                assert!(acknowledged(&error), "{error:?}");
+                assert!(
+                    error
+                        .chain()
+                        .iter()
+                        .any(|cause| matches!(cause, Cause::Auth(_)))
+                );
+                assert_eq!(script.requests().len(), if fail_refresh { 2 } else { 1 });
+            }
+        }
+    }
+
     struct AdvancingTokenSource;
 
     impl TokenSource for AdvancingTokenSource {
@@ -1796,7 +2064,6 @@ mod tests {
             },
             DavProtocol::CalDav,
         );
-        let sent = AtomicBool::new(false);
         // Model twenty seconds already spent reading credentials or prior hops.
         let remaining = std::time::Duration::from_secs(10);
         dispatch
@@ -1804,7 +2071,6 @@ mod tests {
                 DavRequest::new(Method::GET, format!("{BASE}/start")),
                 AccountOperation::EventGet,
                 Instant::now() + remaining,
-                &sent,
             )
             .await
             .expect("both hops complete inside the remaining budget");
@@ -1872,6 +2138,84 @@ mod tests {
         assert!(script.requests().is_empty());
         assert!(!acknowledged(&error));
         assert!(!reconciles(&error));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_waiting_for_net_admission_is_unsent() {
+        use bifrost_net::test_support::scripted_net;
+
+        let script = dav_script([Canned::Pending]);
+        let mut spec = AccountSpec::new(None);
+        spec.request_timeout = Some(DAV_CLIENT_TIMEOUT);
+        spec.connect_timeout = None;
+        spec.response_headers_timeout = None;
+        spec.follow_redirects = FollowRedirects::Disabled;
+        spec.concurrency_limit = Some(bifrost_net::ConcurrencyLimit::new(1));
+        let account_net = scripted_net(&script, NetConfig::default())
+            .attach_account(AccountId("dav-admission-timeout".to_string()), spec);
+        let holding_net = account_net.clone();
+        let holding_request = tokio::spawn(async move {
+            holding_net
+                .get(BASE)
+                .without_bearer_auth()
+                .timeout(std::time::Duration::from_secs(60))
+                .send()
+                .await
+        });
+        for _ in 0..100 {
+            if script.requests().len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(script.requests().len(), 1, "the permit holder is in flight");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let mut dispatch = dispatch_at(account_net, BASE);
+        dispatch.set_request_guard(Arc::new(DispatchReachedGuard(std::sync::Mutex::new(Some(
+            entered_tx,
+        )))));
+        let waiting_request = tokio::spawn(async move {
+            dispatch
+                .send_raw_request(
+                    DavRequest::new(Method::PUT, format!("{BASE}/waiting")).idempotent(false),
+                    AccountOperation::EventUpdate,
+                )
+                .await
+        });
+        entered_rx
+            .await
+            .expect("DAV request reached its guard before admission");
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "the DAV request is still waiting for concurrency admission"
+        );
+
+        tokio::time::advance(DAV_CLIENT_TIMEOUT + std::time::Duration::from_millis(1)).await;
+        let waiting_error = waiting_request
+            .await
+            .expect("waiting task completes")
+            .expect_err("admission wait times out");
+        assert!(
+            matches!(waiting_error.recovery(), RecoveryClass::Retry(_)),
+            "the PUT that never passed admission is safe to retry: {waiting_error:?}"
+        );
+        assert!(
+            waiting_error.chain().iter().any(|cause| matches!(
+                cause,
+                Cause::Attempt(attempt)
+                    if attempt.transmission_state == TransmissionState::Unsent
+            )),
+            "the expired admission wait is unsent: {waiting_error:?}"
+        );
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "the waiting PUT never dispatched"
+        );
+        holding_request.abort();
+        let _ = holding_request.await;
     }
 
     #[tokio::test(start_paused = true)]

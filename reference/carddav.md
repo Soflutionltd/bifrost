@@ -87,10 +87,18 @@ malformed-request arm, so reclassifying them without it would have silently
 narrowed the predicate.
 
 The DAV dispatcher bounds a complete logical request to 30 seconds, including
-its credential read, one-shot 401 refresh, retries and redirect hops. Wrappers
-build requests without reading credentials first; the dispatcher mints them
-inside that deadline. Standalone `auth_headers` calls have the same bound. Each net
-send receives only the remaining time; a new hop cannot restart the clock.
+credential reads, one-shot 401 refresh, retries, admission and redirect hops.
+Wrappers build requests without reading credentials first; the dispatcher mints
+them inside that deadline. Standalone `auth_headers` calls have the same bound.
+Each net send receives only the remaining time; a new hop cannot restart the
+clock. Net owns the in-flight versus pre-admission timeout state, so DAV does not
+stamp a request as sent before admission. Errors after earlier redirect
+responses retain their acknowledged attempt evidence. If an unreplayable request
+may have committed on an earlier hop, a later pre-dispatch failure enters
+`Protocol(PartialResponse)` and requires reconciliation.
+This includes credential lookup and refresh failures without attempt causes;
+the combined history is classified on a fresh error builder, since decorating
+an existing error cannot change its recovery classification.
 The local walk retains DAV's origin gate, dialect target checks and MOVE
 Destination rebasing. A transport credential callback alone would not replace
 those policies.
@@ -512,10 +520,14 @@ operations need no entry in a guard list to be protected. CalDAV installs no
 directory guard.
 
 This covers update pre-fetch GETs, personal reads, sync, discovery and writes,
-as well as redirected targets and rebased destinations. Ordinary refusals are
-Unsupported with `ErrorScope::DirectoryGateway { url }` identifying the refused
-target. A refused later hop preserves Acknowledged attempt evidence for the
-preceding answered redirect; the refused hop is never sent.
+as well as redirected targets and rebased destinations. A directory refusal
+has an Unsupported cause with `ErrorScope::DirectoryGateway { url }` identifying
+the refused target. A refused later hop preserves Acknowledged attempt evidence
+for the preceding answered redirect; the refused hop is never sent. If the
+logical write is unreplayable and an earlier redirect response may have followed
+a committed request, the overall error is `Protocol(PartialResponse)` and
+requires reconciliation, with the Unsupported refusal retained in its cause
+chain. Replayable requests keep the Unsupported classification.
 
 At the establishment, inventory and changes boundaries, a directory refusal is
 translated to `SyncState(ScopeRevoked)` with the ORIGINAL cursor scope and
@@ -631,6 +643,9 @@ cursor that starts without one does not stay without one. The PROPFIND-snapshot 
 destroy-everything failure modes: an empty multistatus against a populated
 prior snapshot suppresses the mass-delete (treated as "no observation"),
 and any href in `current.failed_hrefs` is preserved rather than destroyed.
+The snapshot diff and failed-href guard index temporary `DavHrefKey`
+equivalence keys, retaining an existing native href when a listing changes only
+its URL spelling. The keys never replace ids in cursors, hydration or inventory.
 The checkpoint preserves the prior entries and etags for both no-observation
 shapes while retaining the prior ctag. The shared snapshot helper returns an
 `Observation`; only complete observations advance tokens. Initial snapshots

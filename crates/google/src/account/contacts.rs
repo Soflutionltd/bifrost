@@ -315,8 +315,10 @@ async fn update_contact_photo(
         // not a bare `Person`. The value is discarded, so decode into a raw
         // Value rather than a type that only "works" because every Person
         // field is optional.
+        // People documents PATCH for this action, despite the colon verb path:
+        // https://developers.google.com/people/api/rest/v1/people/updateContactPhoto
         let _: serde_json::Value = client
-            .post(&url, &update_contact_photo_request(photo))
+            .patch(&url, &update_contact_photo_request(photo))
             .await
             .map_err(|error| {
                 contact_error(error, AccountOperation::ContactUpdate, contact.0.clone())
@@ -1796,6 +1798,30 @@ mod tests {
         assert_eq!(
             encode_resource_name_path("people/a b#c"),
             "people/a%20b%23c"
+        );
+    }
+
+    #[tokio::test]
+    async fn contact_photo_update_sends_patch() {
+        let (client, script) = scripted_client(b"{}");
+        update_contact_photo(
+            &client,
+            &ContactId("people/c1".into()),
+            Some(bifrost_types::ContactPhoto {
+                data: vec![1, 2, 3, 4],
+                media_type: Some("image/jpeg".into()),
+            }),
+        )
+        .await
+        .expect("photo update");
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, reqwest::Method::PATCH);
+        assert!(
+            requests[0]
+                .url
+                .as_str()
+                .ends_with("/people/c1:updateContactPhoto")
         );
     }
 

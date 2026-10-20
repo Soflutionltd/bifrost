@@ -357,6 +357,7 @@ impl<T: HttpTransport> Deref for Client<T> {
 pub(crate) struct ClientBuilder {
     credentials: Option<Credentials>,
     net_account_id: NetAccountId,
+    net: Option<bifrost_net::Net>,
     trusted_hosts: HashSet<String>,
     forwarded_for: Option<String>,
     accept_invalid_certs: bool,
@@ -374,6 +375,7 @@ impl ClientBuilder {
         Self {
             credentials: None,
             net_account_id: NetAccountId("jmap".to_string()),
+            net: None,
             trusted_hosts: HashSet::new(),
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
             forwarded_for: None,
@@ -388,6 +390,11 @@ impl ClientBuilder {
 
     pub(crate) fn net_account_id(mut self, account_id: NetAccountId) -> Self {
         self.net_account_id = account_id;
+        self
+    }
+
+    pub(crate) fn net(mut self, net: bifrost_net::Net) -> Self {
+        self.net = Some(net);
         self
     }
 
@@ -444,13 +451,14 @@ impl ClientBuilder {
 
         let trusted_hosts = Arc::new(self.trusted_hosts);
 
-        let transport = ReqwestTransport::new(
+        let transport = ReqwestTransport::new_with_net(
             headers.clone(),
             authorization.clone(),
             self.net_account_id,
             self.timeout,
             self.accept_invalid_certs,
             Arc::clone(&trusted_hosts),
+            self.net,
         )
         .map_err(crate::Error::from)?;
 

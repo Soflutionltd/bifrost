@@ -558,6 +558,13 @@ pub(crate) fn encode_mailbox_str(name: &str, utf8: bool) -> String {
 pub(super) fn encode_mailbox_name(name: &MailboxName, utf8: bool) -> Result<Vec<u8>, crate::Error> {
     let bytes = match name.wire_bytes(utf8) {
         Some(bytes) => bytes.to_vec(),
+        None if !name.can_reencode() => {
+            // Lenient display decoding is not reversible. A mode change must
+            // refuse this address instead of silently selecting another mailbox.
+            return Err(crate::Error::InvalidInput(
+                "mailbox wire identity cannot be preserved in this encoding mode".into(),
+            ));
+        }
         None => encode_mailbox_str(name.as_str(), utf8).into_bytes(),
     };
     // A mailbox string cannot carry NUL. Refuse rather than letting the
@@ -568,6 +575,13 @@ pub(super) fn encode_mailbox_name(name: &MailboxName, utf8: bool) -> Result<Vec<
         ));
     }
     Ok(bytes)
+}
+
+pub(super) fn encode_mailbox_argument(
+    name: &crate::types::MailboxArgument,
+    utf8: bool,
+) -> Result<Vec<u8>, crate::Error> {
+    encode_mailbox_name(&name.0, utf8)
 }
 
 /// Encode a command that takes a single mailbox argument as a quoted-or-literal string.

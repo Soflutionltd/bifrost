@@ -4,10 +4,10 @@ use crate::types::response::Capability;
 use super::commands::{
     encode_append, encode_authenticate, encode_create_special_use, encode_fetch,
     encode_getmetadata, encode_id, encode_list_extended, encode_list_status, encode_login,
-    encode_mailbox_cmd, encode_mailbox_name, encode_mailbox_str, encode_notify_set, encode_search,
-    encode_select_or_examine, encode_set_acl, encode_set_quota, encode_setmetadata, encode_simple,
-    encode_status, encode_store, encode_thread_or_sort_cmd, encode_two_arg, encode_two_quoted_args,
-    encode_uid_expunge, encode_uid_fetch,
+    encode_mailbox_argument, encode_mailbox_cmd, encode_mailbox_name, encode_notify_set,
+    encode_search, encode_select_or_examine, encode_set_acl, encode_set_quota, encode_setmetadata,
+    encode_simple, encode_status, encode_store, encode_thread_or_sort_cmd, encode_two_arg,
+    encode_two_quoted_args, encode_uid_expunge, encode_uid_fetch,
 };
 use super::{CommandWriter, EncodeOptions, WireCommand, encode_enable, validate_atom};
 
@@ -105,9 +105,14 @@ pub(crate) fn encode_command(
             encode_enable(&mut w, tag, capabilities)?;
         }
         Command::List { reference, pattern } => {
-            let wire_ref = encode_mailbox_str(reference, utf8);
-            let wire_pat = encode_mailbox_str(pattern, utf8);
-            encode_two_quoted_args(&mut w, tag, "LIST", &wire_ref, &wire_pat, utf8);
+            let wire_ref = encode_mailbox_argument(reference, utf8)?;
+            let wire_pat = encode_mailbox_argument(pattern, utf8)?;
+            w.raw(tag.as_bytes());
+            w.raw(b" LIST ");
+            w.string(&wire_ref, utf8);
+            w.raw(b" ");
+            w.string(&wire_pat, utf8);
+            w.raw(b"\r\n");
         }
         Command::ListExtended {
             selection_options,
@@ -213,9 +218,14 @@ pub(crate) fn encode_command(
             encode_mailbox_cmd(&mut w, tag, "UNSUBSCRIBE", &wire, utf8);
         }
         Command::Lsub { reference, pattern } => {
-            let wire_ref = encode_mailbox_str(reference, utf8);
-            let wire_pat = encode_mailbox_str(pattern, utf8);
-            encode_two_quoted_args(&mut w, tag, "LSUB", &wire_ref, &wire_pat, utf8);
+            let wire_ref = encode_mailbox_argument(reference, utf8)?;
+            let wire_pat = encode_mailbox_argument(pattern, utf8)?;
+            w.raw(tag.as_bytes());
+            w.raw(b" LSUB ");
+            w.string(&wire_ref, utf8);
+            w.raw(b" ");
+            w.string(&wire_pat, utf8);
+            w.raw(b"\r\n");
         }
         // RFC 3501 Section 6.3.11 / RFC 3502: APPEND and MULTIAPPEND carry
         // their own validation (MULTIAPPEND, BINARY for a NUL body outside

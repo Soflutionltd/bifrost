@@ -56,10 +56,12 @@ and rate declarations.
 The caller-authored configuration records `NetConfig`, `AccountSpec`,
 `RateLimit`, `RetryPolicy`, and `RedirectPolicy` are `#[non_exhaustive]`; callers
 start from their constructors or defaults and then assign supported fields.
-JMAP attaches every independently opened account to the shared transport
-selected by `Net::shared_for_tls` (see the TLS section), so its accounts share
-the client within each trust class. Both shared clients use the same governor,
-meter, bandwidth registry and provider holds. The
+JMAP attaches each opened account to the factory's supplied `Net`, when set
+with `JmapAccountFactory::with_net` or its builder, and otherwise selects the
+shared transport with `Net::shared_for_tls` (see the TLS section). The two
+TLS-class shared clients use the same governor, meter, bandwidth registry and
+provider holds. Supplying one `Net` lets JMAP accounts join the application's
+transport and registry; a `Net::new` instance otherwise has its own resources.
 CalDAV and CardDAV clients ride `AccountNet` too, through
 `bifrost-dav-core`'s `DavDispatch`: `AccountNet::request(Method, ..)` is what
 carries their WebDAV extension verbs, and they attach with no token source
@@ -72,12 +74,9 @@ registration, decrements the meter's per-id attach count, and
 decrements the governor for only the hosts that attachment
 successfully registered. Release is also automatic: `AccountNetInner`
 has a `Drop` that runs the same registration-keyed teardown when the
-last clone of a handle goes. Google and Graph call `detach()`
-explicitly, the JMAP reqwest transport never did, and
-`NetInner::account_hosts` plus the meter map therefore grew by one
-entry per JMAP account open for the process lifetime; making the
-release automatic closes that for every caller rather than relying on
-each to remember, and leaves `detach()` as the way to release early.
+last clone of a handle goes. Google and Graph call `detach()` explicitly;
+JMAP's reqwest transport relies on this automatic release when the client
+and its transport are dropped. `detach()` remains the way to release early.
 
 Keying on the exact token is what makes this safe when two live handles
 share an `AccountId`: a stale Drop cannot detach the replacement.
@@ -222,6 +221,16 @@ preserving redirect and pass-through streaming behavior. Headers are available
 before those bodies finish; the observer does not pre-drain their prefix.
 Protocol observers can record a provider hold before net attempts a retry. A response that cannot be classified from the
 capped prefix supplies no protocol-specific hold.
+
+### Shared response-body excerpt cap
+
+`bifrost_net::error::cap_status_body(Bytes)` is public for protocol crates
+that retain a response excerpt outside the normal net error path. It preserves
+bodies at or below `STATUS_BODY_CAP` and appends the shared truncation marker
+when the input is larger. Call it on the uncapped bytes so an earlier local
+truncation does not hide that the body exceeded the limit. It does not drain a
+stream or identify read failures; a streaming caller must track those while
+collecting its excerpt.
 
 ### Deadlines and the buffered ceiling
 
@@ -522,8 +531,11 @@ the driver fans `Arc<Error>` clones to every waiter (because
 `Error::RefreshFailed { retry_after, source: Arc<Error> }` preserves
 transient-vs-permanent: `Network`/`Timeout` survive as themselves;
 true auth failures (token-endpoint 401/403) map to `AuthLost`.
-OAuth 429/503 `Retry-After` hints are projected to the wrapper's
-absolute deadline.
+OAuth 429/503 `Retry-After` values are parsed as `RetryHint` before the auth
+wrapper stores an absolute deadline. An HTTP-date stays an absolute deadline
+even when it has elapsed, so account-error translation can still report
+`RetryHint::At` instead of losing the issuer's hint. Delta-seconds are resolved
+against the current time when stored.
 
 A waiter whose driver drops the sender without answering - task
 cancelled, panicked, or the runtime shutting down - also gets
@@ -913,8 +925,10 @@ existing fast path, without a timer wait.
 
 The boundary is above S: wrapping TLS meters plaintext, including framing
 above the wrapper. The JMAP WebSocket adapter therefore includes frame headers
-and the HTTP upgrade exchange, unlike HTTP body admission. No observation sink
-is attached by this adapter. It installs no peer timeout. Admission precedes
+and the HTTP upgrade exchange, unlike HTTP body admission. Its optional
+`with_meter_sink` handle observes actual successful read and write completions;
+Pending, errors, flush and shutdown add no observations. `AccountMeter::sink_handle`
+adapts an attached account's counters for this path. It installs no peer timeout. Admission precedes
 polling inner I/O, so a timer implemented inside S starts after admission;
 a caller's timeout around the entire adapter includes admission waiting.
 
@@ -1281,6 +1295,12 @@ pub struct NetErrorContext {
 }
 
 pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError;
+
+pub fn into_account_error_with_throttle_scope(
+    error: Error,
+    ctx: NetErrorContext,
+    throttle_scope: Option<ThrottleScope>,
+) -> AccountError;
 ```
 
 `operation` is required so in-flight non-idempotent failures cannot
@@ -1288,7 +1308,12 @@ fall through the central recovery mapper as retry-safe. The
 conversion attaches `Cause::Attempt` when target-attempt evidence
 exists, preserves request / trace ids and capped body text from
 `Status`, `RateLimited`, and status-backed `RetryBudgetExhausted`,
-and leaves provider JSON interpretation to JMAP, Gmail, and Graph.
+and leaves provider JSON interpretation to JMAP, Gmail, and Graph. The
+explicit throttle-scope entry point carries the caller's policy through net's
+generic status and local-hold mappings. Existing callers of
+`into_account_error` retain context-derived compatibility behavior until they
+migrate; provider funnels should choose their documented scope before net's
+legacy inference is retired.
 
 ## Status-line helpers
 

@@ -55,7 +55,9 @@ pub(crate) use secret::SecretString;
 pub(crate) use sync::{
     QresyncOutcome, SyncFetchRequest, SyncFetchResult, SyncSelectOptions, SyncSelectResult,
 };
-pub(crate) use validated::{MailboxName, SequenceSet, ValidationError};
+pub(crate) use validated::{
+    MailboxArgument, MailboxInput, MailboxName, SequenceSet, ValidationError,
+};
 
 // Re-export command types for internal use only.
 pub(crate) use command::{Command, CommandKind};

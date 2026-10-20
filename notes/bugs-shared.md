@@ -22,37 +22,6 @@ DAV-003 to DAV-005, DAV-012, DAV-013, GOOG-005, GRAPH-011, JMAP-011, SYNC-008).
 What remains here spans crates or roots in a shared crate. Entries set aside as
 low value or awaiting a ruling are in `notes/bugs-deferred.md`.
 
-## SHARED-008 - Provider-specific throttle policy lives in bifrost-net
-
-Scope: types adoption. Weaker finding.
-
-`net::account_error::throttle_scope` hard-codes "Graph / Microsoft / Gmail /
-Fastmail-JMAP get `ThrottleScope::Account`, everyone else none". Any other JMAP
-server's 429 carries no throttle scope, so the engine never lifts it to a
-`ThrottleKey::Account` and sibling scopes keep hammering. It is a provider rule
-in the transport crate keyed on `Provider` values; the protocol crate should
-say it.
-
-## SHARED-009 - JMAP WebSocket and ManageSieve traffic is capped but never metered; IMAP and SMTP each built their own meter
-
-Scope: net adoption.
-
-- Claim broken: `reference/net.md` "IMAP/SMTP report bytes-in/out through
-  `MeterSink` for unified bandwidth accounting", and the meter's
-  `observed_bps()` being the account's figure.
-- `MeteredStream` admits bytes against the budget, but "No observation sink is
-  attached by this adapter". Its two users, `crates/jmap/src/client_ws.rs`
-  (RFC 8887 WebSocket, push and any API calls over WS) and
-  `crates/imap/src/account/sieve.rs` (ManageSieve), never record into the
-  `BandwidthMeter`. IMAP and SMTP each built a private `WireMetering`
-  (`crates/imap/src/connection/wire.rs`,
-  `crates/smtp/src/transport/smtp/client/metering.rs`) to get both halves,
-  re-implementing budget admission plus sink recording around
-  `bifrost_net::Reservation`.
-- Fix in net: let `MeteredStream` take an optional `MeterSinkHandle` (or an
-  `AccountMeter`) and record actual bytes per finished operation; the two
-  `WireMetering` copies can then collapse onto it.
-
 ## SHARED-010 - Unsupported-error constructors duplicated in about a dozen places, stamping inconsistently
 
 Scope: types adoption. Weaker finding.
@@ -65,57 +34,6 @@ scope, some never can. The types crate's own default-method errors
 (`unsupported_error`, `unsupported_inventory_stream`) carry no protocol, so a
 provider leaning on a default emits a protocol-less error while its overrides
 stamp one. A public `AccountError::unsupported(op, protocol)` unifies them.
-
-## SHARED-011 - Body-excerpt capping is copied three times, two without net's truncation marker
-
-Scope: net adoption. Proposal.
-
-Graph `body_diagnostic` (`graph_error.rs`) re-implements `cap_status_body`
-inline; Google's `body_excerpt` (`crates/google/src/error.rs`,
-`MAX_BODY_EXCERPT_BYTES`) truncates without the marker net's doc promises
-("Callers ... can detect truncation"); JMAP's `open_sse` passthrough drain
-(`PASSTHROUGH_BODY_CAP`) has no marker and silently stops on a read error where
-net emits a read-failure marker. All three should call `cap_status_body` or a
-shared capped drain.
-
-## SHARED-006 - Net OAuth refresh and the DAV status ladder still use the duration projection of Retry-After
-
-Residue: `bifrost_net::request::parse_retry_after_hint` returns a `RetryHint`
-that keeps the HTTP-date syntax, and graph, jmap and google use it. Net OAuth
-refresh failure still goes through the duration-only `parse_retry_after`, which
-loses an elapsed date, and so does dav-core's status ladder. `refresh_failed` in
-`crates/net/src/account_error.rs` also drops its own `retry_after` argument when
-the nested cause carries no hint. Once no caller is left, the duration form can
-be retired (a removal, so it needs the owner).
-
-## SHARED-013 - Push health after the directive fix
-
-Residue of the push-reader fix (every reader now forwards non-Retry
-classifications as `Terminated`, and IMAP classifies and parks):
-- IMAP health edges are still per worker, so `Reconnected` from worker B does
-  not mean the account is healthy while worker A is down.
-- Graph and Google push health streams are broadcast-only and can lose a
-  terminal event for a late or lagged subscriber, the shape JMAP closed with a
-  latch.
-
-## SHARED-003 - JMAP and Google factories still take no injected `Net`
-
-Residue: both shared Nets now share one bandwidth registry, meter, governor and
-hold set per process, and Google has an internal constructor taking a Net. The
-public factory parameter is still missing for both providers: Google needs
-`account/mod.rs` and JMAP needs `transport_reqwest.rs`, so a consumer cannot
-wire its own registry into those accounts.
-
-## SHARED-012 - Google lifecycle still pre-filters failures locally
-
-Residue: JMAP now emits `Terminated` for read and snapshot-repair failures and
-the engine reconnects with a 30 to 480 s backoff that honours retry hints and
-records throttle holds. Google's `scope_lifecycle_stream` still filters locally,
-because an engine reconnect would drop its stream-local diff baseline and
-silently lose label changes. Enabling it needs the baseline to live in
-account-owned state (`google/account/mod.rs`). JMAP's successful expired-history
-snapshot repair also stays local, since engine scope recovery cannot repair its
-private lifecycle position.
 
 ## SHARED-007 - Replay safety needs request-level operation context
 
@@ -130,4 +48,41 @@ Removing the second authority needs request-level context handed to net per
 request (operation, plus whether this request is a replayable leg). Related
 lateral: replaying a DAV conditional `If-Match` PUT whose first response was lost
 can turn a committed write into a 412 conflict.
+
+## SHARED-006 - One caller of the duration-only Retry-After parser is left
+
+Residue: OAuth refresh, graph, jmap, google and dav-core classification all use
+the `RetryHint` form. `crates/jmap/src/sync/factory.rs` still calls
+`bifrost_net::parse_retry_after`, so the duration function cannot be retired;
+once it migrates, retiring it is a removal that needs the owner.
+
+## SHARED-008 - Provider funnels still rely on net's built-in throttle policy
+
+Residue: net has `into_account_error_with_throttle_scope` so a provider can pass
+its own policy, but every funnel still calls `into_account_error`, so the
+hard-coded Graph, Microsoft, Gmail and Fastmail-JMAP inference stays. Migrate
+the funnels (Graph and Google with their documented policies, JMAP passing
+account scope for its generic throttles, DAV passing the scope its ladder
+applies), then drop the inference.
+
+## SHARED-011 - Provider crates still copy body-excerpt capping
+
+Residue: `bifrost_net::error::cap_status_body` is public and documented. Graph's
+general body diagnostic and Google's body excerpt can adopt it; JMAP's SSE
+passthrough drain has to detect truncation while collecting and handle read
+failures separately from the cap.
+
+## SHARED-009 - The IMAP and SMTP wire meters stay private
+
+Residue: JMAP WebSocket and ManageSieve now record into the account meter
+through `MeteredStream`. IMAP's `WireMetering` defers accounting across COMPRESS
+and carries peer-timeout state, and SMTP's also serves blocking I/O with
+runtime-independent admission, so they were kept with comments; collapsing them
+onto the shared stream needs those two behaviours to move into it.
+
+## SHARED-018 - A comment on net's `Error::Cancelled` mapping is stale
+
+Lateral: it says direct production use is unreachable, but the Google Drive
+upload shutdown now returns it directly. The conservative `InFlight` mapping
+fits; the comment does not.
 

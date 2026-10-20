@@ -38,7 +38,10 @@ pub(crate) enum Command {
 
     // --- Mailbox management (RFC 3501 Section 6.3 / RFC 9051 Section 6.3) ---
     /// LIST command (RFC 3501 Section 6.3.8, RFC 5258 for LIST-EXTENDED).
-    List { reference: String, pattern: String },
+    List {
+        reference: super::MailboxArgument,
+        pattern: super::MailboxArgument,
+    },
     /// LIST with selection and/or return options (RFC 5258 Section 3 / RFC 9051 Section 6.3.9).
     ///
     /// RFC 5258 Section 3 extends LIST to allow:
@@ -52,8 +55,8 @@ pub(crate) enum Command {
     /// validated by the connection layer.
     ListExtended {
         selection_options: Vec<String>,
-        reference: String,
-        patterns: Vec<String>,
+        reference: super::MailboxArgument,
+        patterns: Vec<super::MailboxArgument>,
         return_options: Vec<String>,
     },
     /// LIST with STATUS return option (RFC 5819 Section 2).
@@ -61,8 +64,8 @@ pub(crate) enum Command {
     /// Requests both LIST and STATUS data in a single command.
     /// The server interleaves LIST and STATUS untagged responses.
     ListStatus {
-        reference: String,
-        pattern: String,
+        reference: super::MailboxArgument,
+        pattern: super::MailboxArgument,
         status_items: String,
     },
     /// SELECT command (RFC 3501 Section 6.3.1, RFC 7162 Section 3.1.1/3.2.5.2).
@@ -108,7 +111,10 @@ pub(crate) enum Command {
     /// UNSUBSCRIBE command (RFC 3501 Section 6.3.7).
     Unsubscribe { mailbox: MailboxName },
     /// LSUB command (RFC 3501 Section 6.3.9).
-    Lsub { reference: String, pattern: String },
+    Lsub {
+        reference: super::MailboxArgument,
+        pattern: super::MailboxArgument,
+    },
     /// APPEND (`multi == false`, exactly one message, RFC 3501 Section 6.3.11)
     /// or MULTIAPPEND (`multi == true`, RFC 3502).
     ///
@@ -120,7 +126,7 @@ pub(crate) enum Command {
     /// their length, never their content.
     Append {
         /// Destination mailbox, as the caller named it (decoded form).
-        mailbox: String,
+        mailbox: super::MailboxArgument,
         /// The messages to append; exactly one unless `multi`.
         messages: Vec<AppendMessage>,
         /// Whether this is MULTIAPPEND (requires the capability).

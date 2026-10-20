@@ -104,8 +104,9 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
     the whole-request refusals, which run in both push modes and belong to
     neither arm.
 - `push_stream.rs` - the broadcast-backed `push_stream` adapter, selecting the
-  receiver against the shutdown token, plus `ensure_ews_worker`, the
-  spawn-on-demand helper `subscribe_ews` calls.
+  receiver against the shutdown token and a watch latch for terminal health,
+  plus `publish_terminal` and `ensure_ews_worker`, the spawn-on-demand helper
+  `subscribe_ews` calls.
 - `ews_stream.rs` - EWS Streaming Notifications fallback:
   Subscribe / GetStreamingEvents / Unsubscribe XML, scope
   recovery, the long-lived worker loop - generic over the crate-private
@@ -844,7 +845,9 @@ mailboxes always install.
     provider contract violation or a retryable 500 into `Request(Malformed)`
     would derive `ClientBug` for a fault the caller cannot fix.
 - The built `AccountCapabilities`; the push mode plus optional endpoint; a
-  `broadcast::Sender<WatchEvent>` feeding `push_stream`.
+  `broadcast::Sender<WatchEvent>` for ordinary health edges and invalidations,
+  plus a `watch::Sender<Option<AccountError>>` that latches terminal health for
+  `push_stream` readers.
 - An `Arc<RwLock<CursorIndex>>` (scope list) and `Arc<RwLock<FolderTree>>`
   (parent map).
 - `HashMap<SubscriptionHandle, GraphSubscriptionGroup>` (webhook) +
@@ -894,6 +897,8 @@ Autodiscover POST are counted too. Each engine stream takes one accumulator and 
 a SECOND `GraphAccount` value over the same account. Every field that must be
 one thing per account has to be `Arc`-shared for that to hold - which is why
 the maps, the worker slots, and the `push_disconnected` health latch all are.
+A `watch::Sender` is itself a clone-shared handle, so the terminal push latch
+also stays one value across the metered view.
 A plain (non-`Arc`) field carrying account state silently FORKS across the
 metered view: the metered half would mutate its own copy, and the two halves
 would then disagree about, say, whether push is currently down - a divergence
@@ -924,10 +929,13 @@ streaming counter is complete only when fully drained, and push traffic is not
 an engine batch.
 
 Reopen is engine-delegated: on drop or after `close()`, the engine calls
-`GraphAccountFactory::open` again for a fresh `GraphAccount` (empty caches, fresh
-shutdown token); the factory holds the client, so the new account reads the
-token source's current value. `push_stream` wraps the broadcast receiver in a
-`stream::unfold` selecting against the same token.
+`GraphAccountFactory::open` again for a fresh `GraphAccount` (empty caches, a
+fresh push terminal latch, and a fresh shutdown token); the factory holds the
+client, so the new account reads the token source's current value.
+`push_stream` wraps the broadcast receiver and terminal watch receiver in a
+`stream::unfold` selecting against the same token. Terminal health is stored
+before its broadcast send, so a subscriber arriving later reads the latched
+error, and a lagged subscriber reads it instead of losing it to ring overflow.
 
 `close()` retires SERVER-side state before it stops any worker, because neither
 kind of subscription dies because this process did. In order:
@@ -1120,17 +1128,26 @@ successful cursor-less completion.
 `@removed` entries are skipped and evict their cached change key; harvested
 etags fold into the bounded LRU `account.etag_index` for the next `If-Match`.
 Inventory batches have no per-object removal event, so an inventory tombstone
-is not projected as a delete; the delta change stream emits `ScopeChange::Removed`
-for tombstones it sees there. Preserving a tombstone seen during inventory
-requires a shared inventory event and engine contract change.
+is not projected as a delete; `InventoryFusion` turns inventory entries into
+`Created` signals and has no removed-id lane. The delta change stream emits
+`ScopeChange::Removed` for tombstones it sees there. Preserving a tombstone
+seen during inventory requires a shared inventory event and engine forwarding
+contract that carries removal ids to consumers; a warning cannot make the
+deletion durable.
 
 `changes_stream(cursor)` decodes the payload, asserts `scope_matches_payload`,
 and walks `delta_link` (or `advanced_through.next_link` on resume). Each
 non-removed entry emits `ObjectChange { Updated }` + `ScopeChange { Added }`
-(Graph delta has no created/updated split); `@removed` emits one `ScopeChange
-{ Removed }`. Its page marker's `last_seen_id` uses the same projected id form
-as inventory markers, including calendar composites and foreign mailbox tags;
-the id is diagnostic, and resume follows only `next_link`. Page batches
+(Graph delta has no created/updated split, and the account keeps no complete
+per-scope id set to diff against); `@removed` emits one `ScopeChange
+{ Removed }`. The live engine driver forwards object kinds unchanged, so a
+consumer that receives `Updated` for an unknown id must decide how to apply it.
+Changing these events to `Created` would misclassify ordinary edits; solving
+the unknown-id case requires a consumer or engine contract for upsert semantics,
+not a Graph-only mapping change. Its page marker's `last_seen_id` uses the same
+projected id form as inventory markers, including calendar composites and
+foreign mailbox tags; the id is diagnostic, and resume follows only
+`next_link`. Page batches
 checkpoint `advanced_through` at the next link; the final page checkpoints the
 fresh `delta_link`, `advanced_through` cleared.
 
@@ -1603,6 +1620,11 @@ races the stream forwarder's swap onto the new account anyway, so it was never
 reliable gap coverage. Same shape as the EWS worker's `owes_reconnect` state
 and as the google crate's fix (google-B8).
 
+Terminal health uses a separate `watch::Sender<Option<AccountError>>`.
+`publish_terminal` stores the error before broadcasting it, and
+`push_stream` yields that error once and ends. This state is sticky only for
+the opened account; reopening starts with an empty terminal latch.
+
 Three further rules make the renewal path safe:
 
 - A renewal that 404/410s (`subscription_is_gone`) is not retryable - Graph
@@ -1769,8 +1791,9 @@ addressable only with its mailbox's routing headers while Subscribe sends
 namespace. Both are refused locally rather than turned into a remote failure
 that reads as a provider fault. The predicate returns the scope's native
 `restId` instead of a bool, so the check and the extraction are one step and
-no later phase can re-derive the id differently. `push_stream` is a
-`broadcast::Receiver<WatchEvent>` adapter that selects against shutdown;
+no later phase can re-derive the id differently. `push_stream` reads ordinary
+events from a `broadcast::Receiver<WatchEvent>` and terminal health from its
+watch latch, and selects against shutdown;
 the EWS worker is (re-)spawned by `subscribe_ews`, whose
 `ensure_ews_worker` helper starts a fresh worker whenever the slot is
 empty or its task has finished.

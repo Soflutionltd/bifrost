@@ -1,6 +1,6 @@
 use bifrost_dav_core::{
-    DavProtocol, SnapshotEntry, append_path, decode_snapshot, decode_watermark_cursor,
-    diff_snapshots, encode_snapshot, encode_watermark_cursor,
+    DavHrefKey, DavProtocol, SnapshotEntry, append_path, dav_href_key, decode_snapshot,
+    decode_watermark_cursor, diff_snapshots, encode_snapshot, encode_watermark_cursor,
     inventory_entry as inventory_entry_from_snapshot, object_change, preserve_unobserved_entries,
     same_dav_url, slice_after_watermark, sorted_candidate_hrefs, worse_recovery,
 };
@@ -2026,76 +2026,19 @@ fn preserve_unobserved_event_entries(previous: &EventSnapshot, current: &mut Eve
         observation.advance_token(previous.sync_token.clone(), current.sync_token.take());
 }
 
-// Match same_dav_url's resource identity without rewriting published native ids.
-// Keep decoded segments separate: an encoded slash is not a path separator.
-#[derive(Eq, Hash, PartialEq)]
-enum SyncHrefKey {
-    Url {
-        scheme: String,
-        host: Option<String>,
-        port: Option<u16>,
-        segments: Vec<String>,
-        query: Option<String>,
-    },
-    Raw(String),
-}
-
-fn sync_href_key(href: &str) -> SyncHrefKey {
-    let Ok(url) = Url::parse(href) else {
-        return SyncHrefKey::Raw(href.trim_end_matches('/').to_string());
-    };
-    let mut segments: Vec<String> = url
-        .path()
-        .split('/')
-        .map(|segment| {
-            let raw = segment.as_bytes();
-            let mut decoded = Vec::with_capacity(raw.len());
-            let mut index = 0;
-            while index < raw.len() {
-                if raw[index] == b'%'
-                    && index + 2 < raw.len()
-                    && let (Some(high), Some(low)) = (
-                        (raw[index + 1] as char).to_digit(16),
-                        (raw[index + 2] as char).to_digit(16),
-                    )
-                {
-                    decoded.push(
-                        u8::try_from(high * 16 + low).expect("two hexadecimal digits fit in u8"),
-                    );
-                    index += 3;
-                } else {
-                    decoded.push(raw[index]);
-                    index += 1;
-                }
-            }
-            String::from_utf8_lossy(&decoded).into_owned()
-        })
-        .collect();
-    if segments.last().is_some_and(String::is_empty) {
-        segments.pop();
-    }
-    SyncHrefKey::Url {
-        scheme: url.scheme().to_string(),
-        host: url.host_str().map(str::to_ascii_lowercase),
-        port: url.port_or_known_default(),
-        segments,
-        query: url.query().map(str::to_string),
-    }
-}
-
 fn apply_sync_report(
     current: &mut EventSnapshot,
     entries: Vec<crate::parse::CalDavSyncEntry>,
 ) -> Vec<Change> {
-    apply_sync_report_with_key(current, entries, sync_href_key)
+    apply_sync_report_with_key(current, entries, dav_href_key)
 }
 
 fn apply_sync_report_with_key(
     current: &mut EventSnapshot,
     entries: Vec<crate::parse::CalDavSyncEntry>,
-    mut key_for: impl FnMut(&str) -> SyncHrefKey,
+    mut key_for: impl FnMut(&str) -> DavHrefKey,
 ) -> Vec<Change> {
-    let mut aliases: HashMap<SyncHrefKey, BTreeSet<String>> = HashMap::new();
+    let mut aliases: HashMap<DavHrefKey, BTreeSet<String>> = HashMap::new();
     for entry in &current.entries {
         aliases
             .entry(key_for(&entry.uri))
@@ -4067,29 +4010,51 @@ mod tests {
 
     #[test]
     fn sync_href_index_matches_the_shared_equivalence_rule() {
-        let hrefs = [
-            "https://DAV.example.test:443/cal/a%40b.ics",
-            "https://dav.example.test/cal/a@b.ics",
-            "https://dav.example.test/cal/a@b.ics/",
-            "https://dav.example.test/cal/a@b.ics#ignored",
-            "https://dav.example.test/cal/a@b.ics?q=1",
-            "https://dav.example.test/cal/a%2Fb.ics",
-            "https://dav.example.test/cal/a/b.ics",
-            "https://dav.example.test/cal/%FF.ics",
-            "https://dav.example.test/cal/%FE.ics",
-            "https://dav.example.test/cal/%zz.ics",
-            "http://dav.example.test/cal/a@b.ics",
-            "relative/",
-            "relative",
+        let pairs = [
+            (
+                "https://DAV.example.test:443/cal/a%40b.ics",
+                "https://dav.example.test/cal/a@b.ics",
+                true,
+            ),
+            (
+                "https://dav.example.test/cal/a@b.ics",
+                "https://dav.example.test/cal/a@b.ics/",
+                true,
+            ),
+            (
+                "https://dav.example.test/cal/a@b.ics",
+                "https://dav.example.test/cal/a@b.ics#ignored",
+                true,
+            ),
+            (
+                "https://dav.example.test/cal/a@b.ics",
+                "https://dav.example.test/cal/a@b.ics?q=1",
+                false,
+            ),
+            (
+                "https://dav.example.test/cal/a%2Fb.ics",
+                "https://dav.example.test/cal/a/b.ics",
+                false,
+            ),
+            (
+                "https://dav.example.test/cal/%FF.ics",
+                "https://dav.example.test/cal/%FE.ics",
+                true,
+            ),
+            ("relative/", "relative", true),
+            (
+                "http://dav.example.test/cal/a@b.ics",
+                "https://dav.example.test/cal/a@b.ics",
+                false,
+            ),
         ];
-        for left in hrefs {
-            for right in hrefs {
-                assert_eq!(
-                    sync_href_key(left) == sync_href_key(right),
-                    same_dav_url(left, right),
-                    "{left} versus {right}",
-                );
-            }
+        for (left, right, expected) in pairs {
+            assert_eq!(
+                dav_href_key(left) == dav_href_key(right),
+                expected,
+                "{left} versus {right}"
+            );
+            assert_eq!(same_dav_url(left, right), expected, "{left} versus {right}");
         }
     }
 
@@ -4111,7 +4076,7 @@ mod tests {
         let mut normalizations = 0;
         let changes = apply_sync_report_with_key(&mut snapshot, entries, |href| {
             normalizations += 1;
-            sync_href_key(href)
+            dav_href_key(href)
         });
         assert_eq!(normalizations, 11_000);
         assert_eq!(changes.len(), 1_000);

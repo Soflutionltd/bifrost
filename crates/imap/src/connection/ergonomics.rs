@@ -52,7 +52,7 @@ impl ImapConnection {
     /// callers keep native IMAP types and own cursor persistence.
     pub async fn select_for_sync(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         options: &crate::types::SyncSelectOptions,
         timeout: Duration,
     ) -> Result<crate::types::SyncSelectResult, Error> {

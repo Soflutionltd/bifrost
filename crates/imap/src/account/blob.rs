@@ -152,9 +152,7 @@ pub(super) async fn run_fetch(
             // Cursor(Folder(..)), not ErrorScope::Mailbox: the folder
             // producers' documented scope shape (see get.rs / mutate.rs).
             .scope(bifrost_types::ErrorScope::Cursor(
-                bifrost_types::CursorScope::Folder(bifrost_types::FolderId(
-                    folder.as_str().to_owned(),
-                )),
+                bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
             ))
             .try_build()
             .expect("valid account error classification"),
@@ -187,6 +185,8 @@ pub(super) async fn run_fetch(
     };
     let attrs = [attr];
     let connection = conn.connection();
+    // Enforce the ceiling while framing literal declarations, before decoding
+    // allocates the body; the streamed-byte check below is a second boundary.
     let (mut rx, fetch_fut) = connection.uid_fetch_stream_budgeted(
         uid_set.as_sequence_set(),
         &attrs,

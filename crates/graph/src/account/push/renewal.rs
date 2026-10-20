@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use bifrost_types::WatchEvent;
 use bifrost_types::{AccountOperation, CursorScope, ErrorScope, SubscriptionHandle};
 
 use crate::account::GraphAccount;
@@ -186,7 +185,7 @@ pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
                         // Flagged, not removed: renewing stops, but teardown
                         // must still be able to DELETE it.
                         mark_subscription_terminated(&account, &handle, &server_id).await;
-                        let _ = account.push_tx.send(WatchEvent::Terminated(account_error));
+                        super::super::push_stream::publish_terminal(&account, account_error);
                     }
                     had_error = true;
                 }

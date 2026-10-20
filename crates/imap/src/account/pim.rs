@@ -262,7 +262,7 @@ pub(crate) fn draft_create(
         message.flags = vec![Flag::Draft];
         let appended = conn
             .connection()
-            .append_message(folder.as_str(), message, account.command_timeout())
+            .append_message(&folder, message, account.command_timeout())
             .await
             .map_err(err)?;
         let Some((uidvalidity, uid)) = appended else {
@@ -461,7 +461,7 @@ async fn append_to_sent_or_fallback(
     message.flags = vec![Flag::Seen];
     match conn
         .connection()
-        .append_message(sent.as_str(), message, account.command_timeout())
+        .append_message(&sent, message, account.command_timeout())
         .await
     {
         Ok(Some((uidvalidity, uid))) => encode_object_id(&sent, uidvalidity, uid),
@@ -878,7 +878,7 @@ pub(crate) fn container_create(
         let err = op_err(AccountOperation::ContainerCreate);
         let conn = account.pool.checkout_any().await.map_err(err)?;
         conn.connection()
-            .create(full_name.as_str(), account.command_timeout())
+            .create(&full_name, account.command_timeout())
             .await
             .map_err(err)?;
         refresh_folders(
@@ -887,7 +887,7 @@ pub(crate) fn container_create(
             AccountOperation::ContainerCreate,
         )
         .await?;
-        Ok(ContainerId(full_name.as_str().to_owned()))
+        Ok(ContainerId(full_name.account_id()))
     })
 }
 
@@ -908,11 +908,7 @@ pub(crate) fn container_rename(
             .await
             .map_err(err)?;
         conn.connection()
-            .rename(
-                folder.as_str(),
-                new_name.as_str(),
-                account.command_timeout(),
-            )
+            .rename(&folder, &new_name, account.command_timeout())
             .await
             .map_err(err)?;
         refresh_folders(
@@ -944,11 +940,7 @@ pub(crate) fn container_move(
             .await
             .map_err(err)?;
         conn.connection()
-            .rename(
-                folder.as_str(),
-                new_name.as_str(),
-                account.command_timeout(),
-            )
+            .rename(&folder, &new_name, account.command_timeout())
             .await
             .map_err(err)?;
         refresh_folders(&account, conn.connection(), AccountOperation::ContainerMove).await
@@ -968,7 +960,7 @@ pub(crate) fn container_delete(
             .map_err(err)?;
         let status = conn
             .connection()
-            .status(folder.as_str(), "MESSAGES", account.command_timeout())
+            .status(&folder, "MESSAGES", account.command_timeout())
             .await
             .map_err(err)?;
         let non_empty = status
@@ -982,7 +974,7 @@ pub(crate) fn container_delete(
             ));
         }
         conn.connection()
-            .delete(folder.as_str(), account.command_timeout())
+            .delete(&folder, account.command_timeout())
             .await
             .map_err(err)?;
         refresh_folders(
@@ -1027,7 +1019,7 @@ pub(crate) fn quota_get(
         let conn = account.pool.checkout_any().await.map_err(err)?;
         let quota = conn
             .connection()
-            .get_quota_root(folder.as_str(), account.command_timeout())
+            .get_quota_root(&folder, account.command_timeout())
             .await
             .map_err(err)?;
         for (_root, resources) in quota.resources {
@@ -1153,20 +1145,14 @@ pub(crate) fn delete_thread(
             return move_thread(
                 account,
                 thread,
-                ContainerId(trash.as_str().to_owned()),
+                ContainerId(trash.account_id()),
                 Some(current),
             )
             .await;
         }
         let trash = role_folder(&account, FolderRole::Trash)
             .ok_or_else(|| super::error::unsupported(AccountOperation::BulkMove))?;
-        move_thread(
-            account,
-            thread,
-            ContainerId(trash.as_str().to_owned()),
-            None,
-        )
-        .await
+        move_thread(account, thread, ContainerId(trash.account_id()), None).await
     })
 }
 
@@ -1195,7 +1181,7 @@ async fn copy_messages(
         conn.connection()
             .uid_copy(
                 uid_set.as_sequence_set(),
-                destination.as_str(),
+                &destination,
                 account.command_timeout(),
             )
             .await
@@ -1404,7 +1390,7 @@ fn group_by_folder(ids: Vec<DecodedObjectId>) -> Vec<(MailboxName, Vec<DecodedOb
     let mut grouped: HashMap<String, (MailboxName, Vec<DecodedObjectId>)> = HashMap::new();
     for id in ids {
         grouped
-            .entry(id.folder.as_str().to_owned())
+            .entry(id.folder.account_id())
             .or_insert_with(|| (id.folder.clone(), Vec::new()))
             .1
             .push(id);
@@ -1456,7 +1442,7 @@ fn folder_from_container(
     container: &ContainerId,
     op: AccountOperation,
 ) -> Result<MailboxName, AccountError> {
-    MailboxName::new(container.0.clone()).map_err(|e| pim_malformed(op, e.to_string()))
+    MailboxName::from_account_id(&container.0).map_err(|e| pim_malformed(op, e.to_string()))
 }
 
 fn imap_flag_for_keyword(keyword: &str) -> Flag {
@@ -1788,16 +1774,19 @@ fn search_folders(account: &ImapAccount, restriction: Option<&MailboxName>) -> V
     // the concatenated per-folder result list, so a nondeterministic
     // folder order would make the same `page_cursor` resolve to a
     // different slice on the next page request (dropped / duplicated
-    // results across pages). Sort by mailbox name so the concatenation
-    // order - and therefore the offset cursor - is stable.
-    let mut folders: Vec<MailboxName> = account
-        .folders
+    // results across pages). Sort by display name and wire identity so
+    // the concatenation order - and therefore the offset cursor - is stable.
+    sorted_search_folders(&account.folders)
+}
+
+fn sorted_search_folders(registry: &super::folder_registry::FolderRegistry) -> Vec<MailboxName> {
+    let mut folders: Vec<MailboxName> = registry
         .entries()
         .into_iter()
         .filter(|entry| entry.selectable())
         .map(|entry| entry.name.clone())
         .collect();
-    folders.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    folders.sort_by(MailboxName::cmp_account_order);
     folders
 }
 
@@ -1863,7 +1852,7 @@ fn container_from_folder_entry(
     entry: &super::folder_registry::FolderEntry,
     display_name: String,
 ) -> Container {
-    let native = entry.name.as_str().to_owned();
+    let native = entry.name.account_id();
     let namespace = if entry.shared_owner.is_some() {
         ContainerNamespace::Shared
     } else {
@@ -1872,7 +1861,7 @@ fn container_from_folder_entry(
     Container::new(
         ContainerId(native.clone()),
         ContainerKind::Folder,
-        folder_role(&entry.attributes(), &native, entry.delimiter()),
+        folder_role(&entry.attributes(), entry.name.as_str(), entry.delimiter()),
         Provenance {
             provider: ProtocolKind::Imap,
             kind: ContainerKind::Folder,
@@ -1968,9 +1957,11 @@ fn folder_role(
 
 fn parent_id(delimiter: Option<char>, native: &str) -> Option<ContainerId> {
     let delimiter = delimiter?;
-    native
-        .rsplit_once(delimiter)
-        .map(|(parent, _)| ContainerId(parent.to_owned()))
+    let parent = MailboxName::from_account_id(native)
+        .ok()?
+        .parent(delimiter)
+        .ok()??;
+    Some(ContainerId(parent.account_id()))
 }
 
 fn role_folder(account: &ImapAccount, role: FolderRole) -> Option<MailboxName> {
@@ -2027,7 +2018,8 @@ fn child_name(
         .get(&parent_folder)
         .and_then(|entry| entry.delimiter())
         .ok_or_else(|| super::error::unsupported(op))?;
-    MailboxName::new(format!("{}{delimiter}{leaf}", parent_folder.as_str()))
+    parent_folder
+        .child(delimiter, leaf)
         .map_err(|e| pim_malformed(op, e.to_string()))
 }
 
@@ -2044,8 +2036,12 @@ fn renamed_sibling(
     let Some(delimiter) = delimiter else {
         return MailboxName::new(new_leaf.to_owned()).map_err(|e| pim_malformed(op, e.to_string()));
     };
-    if let Some((parent, _)) = folder.as_str().rsplit_once(delimiter) {
-        MailboxName::new(format!("{parent}{delimiter}{new_leaf}"))
+    if let Some(parent) = folder
+        .parent(delimiter)
+        .map_err(|e| pim_malformed(op, e.to_string()))?
+    {
+        parent
+            .child(delimiter, new_leaf)
             .map_err(|e| pim_malformed(op, e.to_string()))
     } else {
         MailboxName::new(new_leaf.to_owned()).map_err(|e| pim_malformed(op, e.to_string()))
@@ -2175,7 +2171,7 @@ fn fetch_to_message(
         date: parsed
             .as_ref()
             .and_then(|message| message.headers.date("Date")),
-        containers: vec![ContainerId(folder.as_str().to_owned())],
+        containers: vec![ContainerId(folder.account_id())],
         importance,
         flags,
         body_text: decoded.as_ref().and_then(|body| body.text.clone()),
@@ -2343,6 +2339,41 @@ mod tests {
 
     use super::super::folder_registry::{FolderRegistry, SharedFolderEntry};
     use crate::types::MailboxInfo;
+
+    #[test]
+    fn search_folder_offsets_survive_registry_rebuild_with_display_ties() {
+        let names = [
+            MailboxName::new("a").unwrap(),
+            MailboxName::from_wire("a".into(), b"&AGE-", false),
+            MailboxName::from_wire("a".into(), b"&AAGE-", false),
+        ];
+        let expected = vec![
+            names[2].account_id(),
+            names[1].account_id(),
+            names[0].account_id(),
+        ];
+        for order in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
+            let registry = FolderRegistry::from_lists(
+                order
+                    .into_iter()
+                    .map(|i| MailboxInfo {
+                        name: names[i].clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                vec![],
+            );
+            let folders = sorted_search_folders(&registry);
+            assert_eq!(
+                folders
+                    .iter()
+                    .map(MailboxName::account_id)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(folders[1], names[1]);
+        }
+    }
 
     fn registry_with_shared(rights: Option<&str>) -> FolderRegistry {
         let personal = MailboxInfo {

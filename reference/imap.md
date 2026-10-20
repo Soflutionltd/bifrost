@@ -23,17 +23,33 @@ SEARCH-family extension criteria are checked by the encoder using live capabilit
 Mailbox decoding keeps a lenient display string and the original wire octets plus
 encoding mode in `MailboxName`. Typed mailbox command arguments replay those
 octets when the connection uses the same mode, preserving raw 8-bit names,
-noncanonical modified UTF-7 and malformed segments. Caller-created names, and
-names sent in a different mode, use the existing display-based encoding.
+noncanonical modified UTF-7 and malformed segments. Caller-created names use
+canonical encoding. A mode change re-encodes only
+canonical names; a noncanonical name is refused rather than reconstructed
+from lossy display text.
 Equality and hashing distinguish noncanonical wire identities even when their
 display strings coincide, while canonical names compare equal to caller-created
 names. NUL-bearing mailbox wire strings are refused rather than silently
 stripped. Gmail FETCH labels use the negotiated mailbox decoding mode.
 
-This preservation applies while a typed name is retained. Account folder ids
-and registry keys still use display strings; converting through those strings
-loses noncanonical identity. APPEND, LIST patterns and NOTIFY filters also carry
-strings rather than retained wire names.
+The account registry keys on `MailboxName`. Folder/container ids and the
+folder component of object, thread and part ids retain noncanonical wire
+identity in a `~imap-wire:` base64url envelope containing the mode and octets.
+Escaped ids use canonical identity octets and mode, so equal names have equal
+ids regardless of the LIST connection's encoding mode. Object ids use `imap2`
+and thread ids use `imapthread2` for escaped folder identities; legacy `imap1`
+and `imapthread1` folders always decode literally. Part handles likewise use
+`imappart3`, with legacy `imappart2` folders decoded literally.
+Search concatenates selectable folders in display-name order with canonical
+wire octets and mode breaking ties, keeping offset pagination stable across
+registry rebuilds.
+Canonical validated names retain their existing string ids; literal names
+beginning with the reserved prefix and control-bearing names are escaped too. Scope routing, grouping, push admission
+and error/throttle keys use this same identity. Display names remain readable.
+Mailbox command helpers accept typed names alongside validated caller text;
+APPEND, LIST patterns and NOTIFY filters retain typed addresses through encoding.
+Hierarchy edits preserve a noncanonical parent's wire prefix for ASCII
+hierarchy delimiters; unsupported non-ASCII delimiter combinations are refused.
 
 ### One command path
 
@@ -369,9 +385,9 @@ refusal can keep its auth error class without leaving the next command to be
 parsed as a SASL response. Errors already
 classified as connection-fatal retire the stream immediately; another
 continuation or a non-`NO` completion after cancellation is a protocol error.
-`Error::Auth` does not currently carry an attempt field, so preserving its
-auth error class also means the acknowledged cancellation phase is not stored
-on that error.
+`Error::Auth` carries optional attempt evidence like tagged NO/BAD errors.
+The driver records the acknowledged cancellation phase without losing the auth
+class, mechanism or response code, and account translation preserves it.
 
 `AuthPolicy` TLS-gates cleartext mechanisms by default: PLAIN/LOGIN refuse over plaintext unless `allow_cleartext_without_tls` is set. CRAM-MD5 is opt-in (`with_cram_md5`) AND TLS-gated (a MITM can pick the challenge and brute-force `HMAC-MD5(password, challenge)` offline). LOGIN-the-IMAP-command is opt-in (`with_login`).
 
@@ -390,7 +406,7 @@ Newtypes with explicit `::new` constructors. No `From<u32>`/`From<u64>` to preve
 
 `UidSet` and `SeqSet` wrap the validated sequence-set encoder (`from_uids`, `from_seqs`, `all()`, `saved_search()` (`$`), or range constructors). `parse(&str)` is an escape hatch bypassing the typed discipline.
 
-The account layer's string-typed object/thread ids (`imap1:` / `imapthread1:`)
+The account layer's string-typed object/thread ids (`imap2:` / `imapthread2:`, with literal-folder v1 decoding)
 enforce the same `nz-number` rule at the decode boundary:
 `decode_object_id` / `decode_thread_id` reject a 0 uid or uidvalidity as
 `Request(Malformed)`. The crate never mints a 0, and accepting one used to
@@ -518,7 +534,10 @@ the same cursor payload no matter which path built them.
 
 `ImapConfig` centralizes TLS mode (Implicit / StartTls / Plaintext), connect/command timeouts, keepalive, and optional native-tls connector. Ports default per mode (993 / 143 / 143). Public constructors are `tls`, `starttls`, `plaintext`; builders cover port, timeouts, keepalive disablement, and custom TLS connectors. `ImapAccountConfig::idle_connection_budget` is the visible non-NOTIFY push-session budget and defaults to 4. The raw `connect` / `connect_authenticated` entry points were deleted in S1-W3.
 
-Internally, `connect_authenticated_metered(credentials, policy, meter, budget)` composes connect + STARTTLS-if-needed + `authenticate_best` for the factory and pool, returning `(ImapConnection, AuthOutcome)` crate-only.
+Internally, `connect_authenticated_metered(credentials, policy, meter, budget)`
+composes connect + STARTTLS-if-needed + `authenticate_best` for the factory,
+returning `(ImapConnection, AuthOutcome)` crate-only. Pool dials register the
+connection between connect and authentication, then initialize QRESYNC.
 
 Connect-time STARTTLS requires both an unauthenticated greeting and an
 advertised `STARTTLS`. A cleartext PREAUTH greeting is refused as
@@ -526,9 +545,8 @@ advertised `STARTTLS`. A cleartext PREAUTH greeting is refused as
 an already authenticated cleartext session. The error maps to
 `Authorization(PolicyBlocked)` because the configured TLS requirement cannot
 be met either when the capability is absent or when the greeting is PREAUTH.
-Its account-boundary diagnostic currently says the server does not advertise
-STARTTLS, which is inaccurate for PREAUTH with the capability present. At
-runtime, `is_encrypted()` is
+Its account-boundary diagnostic says the required STARTTLS upgrade is
+unavailable in this session, covering both cases. At runtime, `is_encrypted()` is
 updated when the TLS stream is installed. If the required post-upgrade
 CAPABILITY exchange fails, the driver retires the connection instead of
 returning a reusable half-upgraded session, while preserving the exchange's
@@ -870,10 +888,11 @@ reservation is issued while the deferred one remains outstanding.
 
 `ImapAccountConfig` carries an optional process `BandwidthMeter` or generic
 `MeterSink`. The factory creates the account-tagged `MeterSinkHandle` for the
-initial connection, pool dials and submission. IMAP records successful admitted
+initial connection, pool dials, submission and ManageSieve. IMAP records successful admitted
 plaintext reads and writes. ManageSieve wraps each sequential read/write
 operation in `MeteredStream`, charging the account budget above TLS, including
-its plaintext greeting and STARTTLS exchange.
+its plaintext greeting and STARTTLS exchange. Successful completions report
+actual bytes through the same account sink.
 
 Composed CardDAV and CalDAV attach through the factory's selected Net before
 discovery. Opens and reopens clone that Net; they never construct a new HTTP
@@ -947,7 +966,7 @@ Local refusals made before the first byte follow the cross-crate rule in `refere
 
 The scope readers inside `classify_response_code` (`resource_from_scope`, `id_from_scope`, `mailbox_throttle`) must each accept BOTH mailbox scope shapes. Folder producers build `ErrorScope::Cursor(Folder(id))` via `with_folder_scope`, not `ErrorScope::Mailbox { id }` - `with_mailbox` is reached only from tests. A reader matching just the latter degrades on every real folder-scoped failure while its mailbox-scoped test keeps passing, which is exactly how `ThrottleScope::Mailbox` became unreachable (widening per-mailbox `[LIMIT]` to account-wide pauses) and how the folder id was dropped from `RequestCause::NotFound`. Both fixed and pinned folder-side; keep new readers symmetric.
 
-The engine records a folder-scoped `[LIMIT]` as `ThrottleKey::Mailbox { account, mailbox }` over the folder's name, and reaches the work it should hold only through `Account::throttle_keys`: `ImapAccount` declares that same key for a folder scope (`ThrottleWork::Scope`, routed through `route_scope`, so a composed DAV collection answers for its sub-account and never as a mailbox), for each object in the folder (`ThrottleWork::Objects`, the folder decoded from the `imap1:` id) and for a folder membership that is not DAV-owned (`ThrottleWork::Membership`, a move destination or source). Every arm builds the key from the same `MailboxName::as_str()` `with_folder_scope` scopes the error with, so the recorded hold and the held work meet; `every_work_shape_on_a_folder_declares_the_key_its_limit_records` pins it. Before this declaration existed, the engine had no scope-to-mailbox mapping and a recorded per-folder hold reached no wait site at all.
+The engine records a folder-scoped `[LIMIT]` as `ThrottleKey::Mailbox { account, mailbox }` over the folder's name, and reaches the work it should hold only through `Account::throttle_keys`: `ImapAccount` declares that same key for a folder scope (`ThrottleWork::Scope`, routed through `route_scope`, so a composed DAV collection answers for its sub-account and never as a mailbox), for each object in the folder (`ThrottleWork::Objects`, the folder decoded from the versioned object id) and for a folder membership that is not DAV-owned (`ThrottleWork::Membership`, a move destination or source). Every arm builds the key from the same `MailboxName::account_id()` `with_folder_scope` scopes the error with, so the recorded hold and the held work meet; `every_work_shape_on_a_folder_declares_the_key_its_limit_records` pins it. Before this declaration existed, the engine had no scope-to-mailbox mapping and a recorded per-folder hold reached no wait site at all.
 
 ManageSieve carries its own response-code vocabulary (RFC 5804 1.3), parsed into `SieveResponseCode` and surfaced as `Error::Sieve { code, message }` - deliberately NOT folded into the IMAP `ResponseCode`, since recording a code the server never sent would corrupt the wire evidence support exports exist to preserve. The code rides out as `native_code`. `split_response_code` lifts the parenthesized code off the status line BEFORE the human-readable string, which is the ordering RFC 5804 specifies and the step whose absence caused the original defect: the code stayed inside the message as opaque text, so every rejection reached `fallback_status` and derived terminal `ProviderRefused`.
 
@@ -995,11 +1014,18 @@ cancel the pool registry drain. All three send entry points hold a shared gate
 and refuse a closed account before rendering, fetching a draft, or submitting.
 Teardown takes the exclusive gate, allowing admitted sends to finish, shuts down
 the owned SMTP submission pool, then closes IMAP and the composed accounts.
-An unpolled close future starts no work. The drain covers registered IMAP
-sessions. A connection still inside connect/authentication is not registered;
-close does not wait for that dial, which terminates itself if it later reaches
-registration against the closed pool. A strict no-connected-session guarantee
-for those in-progress dials requires pool-level dial lifetime tracking.
+An unpolled close future starts no work. Direct `Pool::close` also shares one
+owned teardown task, so dropping a direct caller cannot cancel its drain.
+Each dial runs in an owned task holding read admission through connect,
+authentication and QRESYNC initialization. Close shuts admission and cancels
+in-flight dials, waits for their cleanup through exclusive admission, then
+drains registered sessions. Dials observe receiver abandonment during connect
+and authentication and terminate any unclaimed driver before releasing
+admission. Data dials share ownership of the checkout permit until cleanup
+finishes, including replacement dials, so cancelled checkouts cannot exceed
+the data capacity. Dedicated IDLE dials keep their separate push budget.
+Connect and authentication retain their configured timeouts; OAuth token
+lookup is also bounded by the authentication command timeout.
 
 The `sessions` mutex is the linearization point that protects pool registration against a completed close. `close` stores the flag before it drains; registration re-reads the flag while holding that same lock. A dial that reaches the lock first is seen by the drain; one that finishes after the drain sees the flag, is refused registration, and tears its own connection down. `checkout_*` re-checks the flag after acquiring its permit as well, and the closed semaphore releases any checkout blocked on it as `Error::Closed` rather than stranding it.
 
@@ -1031,6 +1057,10 @@ Mutation error lanes follow transmission evidence. An `InFlight` attempt makes t
 ### Per-folder mutation failure contract
 
 `mutate::mutation_stream` emits no trailing global `SyncEvent::Terminated` for a recoverable folder failure: a preparation failure surfaces as one per-item outcome for every target in that folder (carrying the classified `AccountError`; `Uncertain` on `InFlight` evidence, `Failed` otherwise), and the loop continues to the next folder. Preparation-command evidence is restamped `Unsent` relative to the mutation, since the STORE / MOVE / EXPUNGE has not been sent. Shared-folder permission denials are first converted to scoped `ScopeRevoked`, so they remain per-folder failures. Stream-level `Terminated` is reserved for failures that prevent any further folder attempt (personal authorization loss, schema/capability break); `stream_terminating` is the gate. The decoded ids are moved into `run_folder_mutation`, not cloned per batch: every failure it can raise (`FolderMutationFailure`) happens in `open_folder_for_mutation`, before a single outcome is minted, so the error hands the whole id vector back and the fallback lane mints from that. Once the folder is open, the per-group paths are infallible by type - they return outcomes, not `Result` - which is what makes moving the ids in safe.
+
+Inventory commits its in-memory cursor only after both its final batch (when
+nonempty) and terminal checkpoint have entered the output channel, matching
+the changes path. A failed send leaves the previous cursor hint intact.
 
 ### Mutation batch shape
 

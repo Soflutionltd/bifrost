@@ -1,7 +1,8 @@
 //! NOTIFY command encoder (RFC 5465).
 
 use super::{
-    CommandWriter, encode_mailbox_str, validate_atom, validate_no_crlf, validate_single_fetch_att,
+    CommandWriter, encode_mailbox_argument, validate_atom, validate_no_crlf,
+    validate_single_fetch_att,
 };
 use crate::types::notify::{MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetParams};
 
@@ -221,7 +222,7 @@ fn encode_mailbox_filter(
                 ));
             }
             w.raw(b"subtree");
-            encode_one_or_more_mailbox(w, mailboxes, utf8);
+            encode_one_or_more_mailbox(w, mailboxes, utf8)?;
         }
         MailboxFilter::Mailboxes(mailboxes) => {
             // RFC 5465 Section 8: one-or-more-mailbox requires at least one.
@@ -231,7 +232,7 @@ fn encode_mailbox_filter(
                 ));
             }
             w.raw(b"mailboxes");
-            encode_one_or_more_mailbox(w, mailboxes, utf8);
+            encode_one_or_more_mailbox(w, mailboxes, utf8)?;
         }
     }
     Ok(())
@@ -246,13 +247,17 @@ fn encode_mailbox_filter(
 /// ```
 ///
 /// A single mailbox is encoded bare; two or more are parenthesized.
-fn encode_one_or_more_mailbox(w: &mut CommandWriter, mailboxes: &[String], utf8: bool) {
+fn encode_one_or_more_mailbox(
+    w: &mut CommandWriter,
+    mailboxes: &[crate::types::MailboxArgument],
+    utf8: bool,
+) -> Result<(), crate::Error> {
     if mailboxes.len() == 1 {
         // RFC 5465 Section 8: one-or-more-mailbox = mailbox
         // RFC 3501 Section 5.1.3: encode with INBOX normalization and MUTF-7.
-        let wire = encode_mailbox_str(&mailboxes[0], utf8);
+        let wire = encode_mailbox_argument(&mailboxes[0], utf8)?;
         w.raw(b" ");
-        w.string(wire.as_bytes(), utf8);
+        w.string(&wire, utf8);
     } else {
         // RFC 5465 Section 8: many-mailboxes = "(" mailbox *(SP mailbox) ")"
         w.raw(b" (");
@@ -261,11 +266,12 @@ fn encode_one_or_more_mailbox(w: &mut CommandWriter, mailboxes: &[String], utf8:
                 w.raw(b" ");
             }
             // RFC 3501 Section 5.1.3: encode with INBOX normalization and MUTF-7.
-            let wire = encode_mailbox_str(mbox, utf8);
-            w.string(wire.as_bytes(), utf8);
+            let wire = encode_mailbox_argument(mbox, utf8)?;
+            w.string(&wire, utf8);
         }
         w.raw(b")");
     }
+    Ok(())
 }
 
 /// Encode the events portion of an event group (RFC 5465 Section 8).

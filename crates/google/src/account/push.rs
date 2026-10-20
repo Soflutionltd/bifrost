@@ -224,6 +224,7 @@ impl PubSubConfig {
 pub(crate) struct PubSubControl {
     commands: mpsc::Sender<WatchCommand>,
     health_tx: broadcast::Sender<WatchEvent>,
+    terminal: Arc<Mutex<Option<AccountError>>>,
     shutdown: CancellationToken,
 }
 
@@ -278,17 +279,20 @@ impl PubSubControl {
     ) -> Self {
         let (health_tx, _) = broadcast::channel(32);
         let (commands, receiver) = mpsc::channel(16);
+        let terminal = Arc::new(Mutex::new(None));
         tokio::spawn(watch_actor(
             client,
             config,
             shutdown.clone(),
             health_tx.clone(),
+            Arc::clone(&terminal),
             receiver,
             WatchOwnership::new(mailbox_watch(mailbox)),
         ));
         Self {
             commands,
             health_tx,
+            terminal,
             shutdown,
         }
     }
@@ -446,26 +450,44 @@ pub(crate) fn push_stream(
 ) -> AccountStream<WatchEvent> {
     let receiver = pubsub.health_tx.subscribe();
     Box::pin(futures::stream::unfold(
-        (receiver, shutdown),
-        |(mut receiver, shutdown)| async move {
-            tokio::select! {
-                () = shutdown.cancelled() => None,
-                result = receiver.recv() => {
-                    match result {
-                        Ok(event) => Some((event, (receiver, shutdown))),
-                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
-                            let warning = bifrost_types::Warning::support_only(
-                                bifrost_types::WarningKind::Other,
-                                format!(
-                                    "gmail push health stream lagged; {dropped} health events were lost"
-                                ),
-                            );
-                            Some((WatchEvent::Warning(warning), (receiver, shutdown)))
-                        }
-                        Err(broadcast::error::RecvError::Closed) => None,
-                    }
-                }
+        (receiver, shutdown, pubsub, false),
+        |(mut receiver, shutdown, pubsub, ended)| async move {
+            if ended || shutdown.is_cancelled() {
+                return None;
             }
+            let terminal = pubsub
+                .terminal
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(error) = terminal {
+                return Some((
+                    WatchEvent::Terminated(error),
+                    (receiver, shutdown, pubsub, true),
+                ));
+            }
+            let event = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return None,
+                result = receiver.recv() => match result {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                        let terminal = pubsub.terminal.lock()
+                            .unwrap_or_else(PoisonError::into_inner).clone();
+                        if let Some(error) = terminal {
+                            WatchEvent::Terminated(error)
+                        } else {
+                            WatchEvent::Warning(bifrost_types::Warning::support_only(
+                                bifrost_types::WarningKind::Other,
+                                format!("gmail push health stream lagged; {dropped} health events were lost"),
+                            ))
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                },
+            };
+            let ended = matches!(event, WatchEvent::Terminated(_));
+            Some((event, (receiver, shutdown, pubsub, ended)))
         },
     ))
 }
@@ -475,6 +497,7 @@ async fn watch_actor(
     config: Option<PubSubConfig>,
     shutdown: CancellationToken,
     health_tx: broadcast::Sender<WatchEvent>,
+    terminal: Arc<Mutex<Option<AccountError>>>,
     mut commands: mpsc::Receiver<WatchCommand>,
     mut ownership: WatchOwnership,
 ) {
@@ -614,6 +637,10 @@ async fn watch_actor(
                         // Only Retry belongs to this reconnect loop. Engine and Reconcile
                         // must reach the sync reconciler through Terminated too.
                         if !account_error.recovery().is_retryable() {
+                            // Publish the latch before waking receivers. It survives ring
+                            // overflow and subscriptions made after this actor retires.
+                            *terminal.lock().unwrap_or_else(PoisonError::into_inner) =
+                                Some(account_error.clone());
                             let _ = health_tx.send(WatchEvent::Terminated(account_error));
                             lifecycle = WatchLifecycle::Unwatched;
                             retry_after = None;
@@ -1245,12 +1272,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_health_survives_late_and_lagged_subscribers() {
+        let (health_tx, _) = broadcast::channel(1);
+        let (commands, _receiver) = mpsc::channel(1);
+        let pubsub = Arc::new(PubSubControl {
+            commands,
+            health_tx,
+            terminal: Default::default(),
+            shutdown: CancellationToken::new(),
+        });
+        let mut lagged = push_stream(Arc::clone(&pubsub), CancellationToken::new());
+        let error = super::super::account_closed_error(AccountOperation::PushSubscribe);
+        *pubsub.terminal.lock().unwrap() = Some(error.clone());
+        pubsub
+            .health_tx
+            .send(WatchEvent::Terminated(error))
+            .unwrap();
+        for _ in 0..3 {
+            pubsub.health_tx.send(WatchEvent::Disconnected).unwrap();
+        }
+        let mut late = push_stream(pubsub, CancellationToken::new());
+        for stream in [&mut lagged, &mut late] {
+            assert!(matches!(
+                stream.next().await,
+                Some(WatchEvent::Terminated(_))
+            ));
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn lagged_health_stream_emits_a_warning_with_the_loss_count() {
         let (health_tx, _) = broadcast::channel(32);
         let (commands, _receiver) = mpsc::channel(1);
         let pubsub = Arc::new(PubSubControl {
             commands,
             health_tx: health_tx.clone(),
+            terminal: Default::default(),
             shutdown: CancellationToken::new(),
         });
         let shutdown = CancellationToken::new();
@@ -1432,6 +1490,10 @@ mod tests {
             }
         }
 
+        let mut late = push_stream(Arc::clone(&pubsub), CancellationToken::new());
+        assert!(matches!(late.next().await, Some(WatchEvent::Terminated(_))));
+        assert!(late.next().await.is_none());
+
         push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
             .await
             .expect("subscribe after terminal renewal restarts the lifecycle");
@@ -1503,6 +1565,10 @@ mod tests {
                 break;
             }
         }
+
+        let mut late = push_stream(Arc::clone(&pubsub), CancellationToken::new());
+        assert!(matches!(late.next().await, Some(WatchEvent::Terminated(_))));
+        assert!(late.next().await.is_none());
 
         push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
             .await

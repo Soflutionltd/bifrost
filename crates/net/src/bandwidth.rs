@@ -296,6 +296,21 @@ pub struct AccountMeter {
 }
 
 impl AccountMeter {
+    /// Adapt this account's counters for a non-HTTP byte stream.
+    #[must_use]
+    pub fn sink_handle(&self) -> MeterSinkHandle {
+        struct Sink(AccountMeter);
+        impl MeterSink for Sink {
+            fn record_bytes_in(&self, _account: &AccountId, n: u64) {
+                self.0.record_bytes_in(n);
+            }
+            fn record_bytes_out(&self, _account: &AccountId, n: u64) {
+                self.0.record_bytes_out(n);
+            }
+        }
+        MeterSinkHandle::new(Arc::new(Sink(self.clone())), self.account.clone())
+    }
+
     /// Sliding-window bytes-per-second reading. Returns 0 if no
     /// samples have landed in the window yet.
     #[must_use]

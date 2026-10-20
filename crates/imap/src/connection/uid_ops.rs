@@ -562,7 +562,7 @@ impl ImapConnection {
     pub async fn uid_move_messages(
         &self,
         sequence_set: &SequenceSet,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<MoveResult, Error> {
         self.require_state(crate::types::CommandKind::Move)?;
@@ -583,7 +583,7 @@ impl ImapConnection {
 
         // MOVE is a base feature in IMAP4rev2 (RFC 9051 Appendix E item 2).
         if has_move {
-            let mbox = MailboxName::new(mailbox)?;
+            let mbox = mailbox.mailbox_name()?;
             self.move_native_impl(
                 Command::UidMove {
                     sequence_set: sequence_set.clone(),
@@ -658,14 +658,14 @@ impl ImapConnection {
     pub async fn uid_copy(
         &self,
         sequence_set: &SequenceSet,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<CopyResult, Error> {
         // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
         if sequence_set.as_str().contains('$') {
             self.require_searchres()?;
         }
-        let mbox = MailboxName::new(mailbox)?;
+        let mbox = mailbox.mailbox_name()?;
         self.copy_impl(
             Command::UidCopy {
                 sequence_set: sequence_set.clone(),

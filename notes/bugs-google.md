@@ -21,20 +21,6 @@ little. Gmail's read-back of trashed and partial-flag outcomes is SYNC-008;
 lifecycle and renewer recovery triage is SHARED-012 / SHARED-013; the private
 address parser is SHARED-004; the Retry-After parser copy is SHARED-006.
 
-## GOOG-024 - `update_contact_photo` HTTP method is unverified
-
-Lateral. The wave fixer reports `contacts::update_contact_photo` sends POST
-while the People API reference specifies PATCH. Unconfirmed; check the
-documented method for `:updateContactPhoto` before changing anything.
-
-## GOOG-018 - A 404 on a label id may be misattributed to every message
-
-Residue: the 404 bisection is now capped by a shared 128-call budget (it was
-about 2n calls and up to roughly 100k quota units for one 1000-id body). Still
-unconfirmed: whether Gmail answers 404 for an unknown LABEL id, in which case
-the bisection would blame every message as `NotFound(Message)`. Needs a captured
-provider response; the ambiguity is documented in code and the reference.
-
 ## GOOG-027 - The error model has no typed continuation for a failure after a committed first leg
 
 Needs a ruling. A calendar update that moves an event and then fails its
@@ -46,18 +32,3 @@ carrier (the rewritten target request or id) in the shared error model would let
 the engine do it correctly; the same shape applies to the contact update's
 second leg.
 
-## GOOG-028 - Smaller observations after the adapter shutdown wrapping
-
-- `host_attachment` is outside the shutdown wrapper; cancelling its multi-request
-  future could skip Drive resumable-session cleanup. Needs token-aware cleanup.
-- A cancelled `AccountFuture` yields a generic in-flight error with the
-  operation but no resource-specific scope, which limits recovery for
-  multi-step writes (event moves, contact updates).
-- Comments in `inventory.rs`, `blobs.rs` and `scopes.rs` still say the adapter
-  does not wrap those streams; that is stale.
-
-## GOOG-024 follow-up
-
-`update_contact_photo` is confirmed to send POST at `contacts.rs` while Google
-documents PATCH for `:updateContactPhoto`. Change it and pin the method with a
-test.

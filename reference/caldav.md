@@ -106,10 +106,18 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
 `the_base_leg_fails_on_what_the_probe_would_have_survived`.
 
 The DAV dispatcher bounds a complete logical request to 30 seconds, including
-its credential read, one-shot 401 refresh, retries and redirect hops. Wrappers
-build requests without reading credentials first; the dispatcher mints them
-inside that deadline. Standalone `auth_headers` calls have the same bound. Each net
-send receives only the remaining time; a new hop cannot restart the clock.
+credential reads, one-shot 401 refresh, retries, admission and redirect hops.
+Wrappers build requests without reading credentials first; the dispatcher mints
+them inside that deadline. Standalone `auth_headers` calls have the same bound.
+Each net send receives only the remaining time; a new hop cannot restart the
+clock. Net owns the in-flight versus pre-admission timeout state, so DAV does not
+stamp a request as sent before admission. Errors after earlier redirect
+responses retain their acknowledged attempt evidence. If an unreplayable request
+may have committed on an earlier hop, a later pre-dispatch failure enters
+`Protocol(PartialResponse)` and requires reconciliation.
+This includes credential lookup and refresh failures without attempt causes;
+the combined history is classified on a fresh error builder, since decorating
+an existing error cannot change its recovery classification.
 The local walk retains DAV's origin gate, dialect target checks and MOVE
 Destination rebasing. A transport credential callback alone would not replace
 those policies.
@@ -869,14 +877,18 @@ fall back to polling snapshot diffs. The PROPFIND-snapshot diff (not the
 sync-token path) is hardened against destroy-everything failure modes: an
 empty multistatus against a populated prior snapshot suppresses the
 mass-delete, and any href in `current.failed_hrefs` is preserved rather
-than destroyed. The checkpoint preserves the prior entries and etags for
+than destroyed. The diff and failed-href guard index temporary `DavHrefKey`
+equivalence keys, retaining the existing native href when a listing changes
+only its URL spelling. These keys never replace ids in cursors, hydration or
+inventory. The checkpoint preserves the prior entries and etags for
 both no-observation shapes while retaining the prior collection token.
 The shared snapshot helper returns an `Observation`; only complete observations
 advance tokens. Initial snapshots with refused members carry no token, so the
 next poll repeats the listing. Incremental reports with refused members retain
 the last token before the refusal and stop draining, so the next poll retries
-the missing ground. Equivalent member URL spellings in sync reports match the
-existing entry and retain its native id for updates and deletions.
+the missing ground. Equivalent member URL spellings in sync reports and full
+snapshot listings match the existing entry and retain its native id for updates
+and deletions.
 This deliberately means a genuine delete-all is not reported on that poll or a
 later poll: the empty success is indistinguishable from the transient empty
 response the guard suppresses.

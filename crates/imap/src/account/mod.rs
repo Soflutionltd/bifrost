@@ -225,7 +225,7 @@ impl ImapAccount {
         let options = self.select_options(cursor, read_only);
         let result = match conn
             .connection()
-            .select_for_sync(folder.as_str(), &options, self.command_timeout())
+            .select_for_sync(&folder, &options, self.command_timeout())
             .await
         {
             Ok(result) => result,
@@ -381,7 +381,7 @@ impl Account for ImapAccount {
     // `mailbox_throttle` raises for a folder-scoped `[LIMIT]`, which the
     // engine records as `ThrottleKey::Mailbox { account, mailbox }` keyed on
     // the folder's name. Every arm below builds that exact key from the same
-    // `MailboxName::as_str()` the error producer scopes with, so a recorded
+    // `MailboxName::account_id()` the error producer scopes with, so a recorded
     // hold and the work it should hold meet. Routing follows `route_scope`:
     // a composed DAV collection answers for its sub-account, never as an
     // IMAP mailbox.
@@ -398,7 +398,7 @@ impl Account for ImapAccount {
         match work {
             ThrottleWork::Scope(scope) => {
                 match route_scope(self, scope, bifrost_types::AccountOperation::SyncChanges) {
-                    Ok(ScopeHandler::Folder(mailbox)) => vec![key(mailbox.as_str())],
+                    Ok(ScopeHandler::Folder(mailbox)) => vec![key(&mailbox.account_id())],
                     Ok(ScopeHandler::Delegate(sub)) => sub.throttle_keys(account, work),
                     Err(_) => Vec::new(),
                 }
@@ -411,7 +411,7 @@ impl Account for ImapAccount {
                     if let Ok(decoded) =
                         decode_object_id(id, bifrost_types::AccountOperation::UpdateFlags)
                     {
-                        let candidate = key(decoded.folder.as_str());
+                        let candidate = key(&decoded.folder.account_id());
                         if !keys.contains(&candidate) {
                             keys.push(candidate);
                         }
@@ -1194,7 +1194,7 @@ pub(crate) fn folder_from_scope(
     op: bifrost_types::AccountOperation,
 ) -> Result<MailboxName, AccountError> {
     match scope {
-        CursorScope::Folder(folder) => MailboxName::new(folder.0.clone()).map_err(|e| {
+        CursorScope::Folder(folder) => MailboxName::from_account_id(&folder.0).map_err(|e| {
             error::into_account_error(
                 Error::InvalidInput(e.to_string()),
                 error::ImapErrorContext::operation(op),
@@ -1389,11 +1389,11 @@ pub(crate) fn route_typed_scope<'a>(
 }
 
 pub(crate) fn folder_scope(folder: &MailboxName) -> CursorScope {
-    CursorScope::Folder(bifrost_types::FolderId(folder.as_str().to_owned()))
+    CursorScope::Folder(bifrost_types::FolderId(folder.account_id()))
 }
 
 pub(crate) fn membership_scope(folder: &MailboxName) -> MembershipScope {
-    MembershipScope::Folder(bifrost_types::FolderId(folder.as_str().to_owned()))
+    MembershipScope::Folder(bifrost_types::FolderId(folder.account_id()))
 }
 
 #[cfg(test)]

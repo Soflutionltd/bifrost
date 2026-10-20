@@ -200,7 +200,7 @@ fn append_command(
     encode_command(
         tag,
         &Command::Append {
-            mailbox: mailbox.to_owned(),
+            mailbox: mailbox.into(),
             messages: messages.to_vec(),
             multi,
         },
@@ -747,7 +747,7 @@ fn encode_rename() {
 fn encode_list() {
     let mut buf = BytesMut::new();
     let cmd = Command::List {
-        reference: String::new(),
+        reference: String::new().into(),
         pattern: "*".into(),
     };
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
@@ -759,7 +759,7 @@ fn encode_list_extended_multiple_patterns_with_return_options() {
     let mut buf = BytesMut::new();
     let cmd = Command::ListExtended {
         selection_options: vec!["SUBSCRIBED".into(), "RECURSIVEMATCH".into()],
-        reference: String::new(),
+        reference: String::new().into(),
         patterns: vec!["*".into(), "%".into()],
         return_options: vec!["CHILDREN".into(), "STATUS (MESSAGES UNSEEN)".into()],
     };
@@ -775,7 +775,7 @@ fn encode_list_extended_rejects_empty_pattern_list() {
     let mut buf = BytesMut::new();
     let cmd = Command::ListExtended {
         selection_options: Vec::new(),
-        reference: String::new(),
+        reference: String::new().into(),
         patterns: Vec::new(),
         return_options: Vec::new(),
     };
@@ -795,7 +795,7 @@ fn encode_list_extended_trims_outer_option_whitespace() {
     let mut buf = BytesMut::new();
     let cmd = Command::ListExtended {
         selection_options: vec![" SUBSCRIBED ".into(), "\tRECURSIVEMATCH\t".into()],
-        reference: String::new(),
+        reference: String::new().into(),
         patterns: vec!["*".into()],
         return_options: vec![" CHILDREN ".into(), " STATUS (MESSAGES) ".into()],
     };
@@ -815,7 +815,7 @@ fn encode_list_extended_rejects_recursivematch_without_base_option() {
     let mut buf = BytesMut::new();
     let cmd = Command::ListExtended {
         selection_options: vec!["RECURSIVEMATCH".into()],
-        reference: String::new(),
+        reference: String::new().into(),
         patterns: vec!["*".into()],
         return_options: Vec::new(),
     };
@@ -834,7 +834,7 @@ fn encode_list_extended_rejects_bare_status_return_option() {
     let mut buf = BytesMut::new();
     let cmd = Command::ListExtended {
         selection_options: vec!["SUBSCRIBED".into()],
-        reference: String::new(),
+        reference: String::new().into(),
         patterns: vec!["*".into()],
         return_options: vec!["STATUS".into()],
     };
@@ -1044,7 +1044,7 @@ fn encode_unsubscribe() {
 fn encode_lsub() {
     let mut buf = BytesMut::new();
     let cmd = Command::Lsub {
-        reference: String::new(),
+        reference: String::new().into(),
         pattern: "*".into(),
     };
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
@@ -1221,7 +1221,7 @@ fn encode_search_return_rejects_embedded_whitespace_in_option() {
 fn encode_list_status() {
     let mut buf = BytesMut::new();
     let cmd = Command::ListStatus {
-        reference: String::new(),
+        reference: String::new().into(),
         pattern: "*".into(),
         status_items: "MESSAGES UNSEEN".into(),
     };
@@ -4797,7 +4797,7 @@ fn encode_lsub_non_ascii_pattern() {
     // when utf8 is false. "日本語" -> "&ZeVnLIqe-" (all ASCII, fits in quoted).
     let mut buf = BytesMut::new();
     let cmd = Command::Lsub {
-        reference: String::new(),
+        reference: String::new().into(),
         pattern: "日本語".into(),
     };
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
@@ -4832,7 +4832,7 @@ fn encode_list_empty_reference_percent_pattern() {
     // RFC 3501 Section 6.3.8: % matches one level of hierarchy.
     let mut buf = BytesMut::new();
     let cmd = Command::List {
-        reference: String::new(),
+        reference: String::new().into(),
         pattern: "%".into(),
     };
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
@@ -6347,7 +6347,7 @@ fn crlf_injection_uid_fetch_items_rejected() {
 #[test]
 fn crlf_injection_list_status_items_rejected() {
     let cmd = Command::ListStatus {
-        reference: String::new(),
+        reference: String::new().into(),
         pattern: "*".into(),
         status_items: "MESSAGES\r\nA002 DELETE INBOX".into(),
     };
@@ -6574,7 +6574,7 @@ fn status_rejects_empty_items_list() {
 #[test]
 fn list_status_rejects_empty_status_items() {
     let cmd = Command::ListStatus {
-        reference: String::new(),
+        reference: String::new().into(),
         pattern: "*".into(),
         status_items: String::new(),
     };
@@ -6754,7 +6754,7 @@ fn uid_fetch_rejects_unbalanced_inner_delimiters() {
 #[test]
 fn crlf_injection_normal_list_status_succeeds() {
     let cmd = Command::ListStatus {
-        reference: String::new(),
+        reference: String::new().into(),
         pattern: "*".into(),
         status_items: "MESSAGES UNSEEN".into(),
     };
@@ -8175,7 +8175,7 @@ fn list_status_return_option_accepts_one_character_item_list() {
     let mut buf = BytesMut::new();
     let cmd = Command::ListExtended {
         selection_options: Vec::new(),
-        reference: String::new(),
+        reference: String::new().into(),
         patterns: vec!["*".into()],
         return_options: vec!["STATUS (X)".into()],
     };
@@ -8193,7 +8193,7 @@ fn list_status_return_option_rejects_unbalanced_leading_paren() {
     let mut buf = BytesMut::new();
     let cmd = Command::ListExtended {
         selection_options: Vec::new(),
-        reference: String::new(),
+        reference: String::new().into(),
         patterns: vec!["*".into()],
         return_options: vec!["STATUS ((MESSAGES)".into()],
     };
@@ -8314,4 +8314,78 @@ fn mailbox_wire_nul_is_refused_instead_of_addressing_a_different_name() {
         Err(crate::Error::InvalidInput(_))
     ));
     assert!(buf.is_empty());
+}
+
+#[test]
+fn append_list_patterns_and_notify_keep_retained_wire_addresses() {
+    use crate::types::{MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetParams};
+    let name = MailboxName::from_wire("a".into(), b"&AGE-", false);
+    let commands = [
+        Command::Append {
+            mailbox: (&name).into(),
+            messages: vec![crate::types::AppendMessage::new(bytes::Bytes::from_static(
+                b"x",
+            ))],
+            multi: false,
+        },
+        Command::List {
+            reference: "".into(),
+            pattern: (&name).into(),
+        },
+        Command::ListExtended {
+            selection_options: Vec::new(),
+            reference: "".into(),
+            patterns: vec![(&name).into(), "*".into()],
+            return_options: Vec::new(),
+        },
+        Command::ListStatus {
+            reference: "".into(),
+            pattern: (&name).into(),
+            status_items: "MESSAGES".into(),
+        },
+        Command::NotifySet(NotifySetParams::new(
+            vec![NotifyEventGroup::new(
+                MailboxFilter::Mailboxes(vec![(&name).into()]),
+                vec![
+                    NotifyEvent::MessageNew {
+                        fetch_attrs: Vec::new(),
+                    },
+                    NotifyEvent::MessageExpunge,
+                ],
+            )],
+            false,
+        )),
+    ];
+    for command in commands {
+        let mut bytes = BytesMut::new();
+        encode_command_to_buf(
+            &mut bytes,
+            "A1",
+            &command,
+            &opts(LiteralMode::LiteralPlus, false),
+        )
+        .unwrap();
+        assert!(
+            bytes.windows(5).any(|window| window == b"&AGE-"),
+            "{command:?}: {bytes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_mode_change_refuses_noncanonical_addresses_before_writing() {
+    let mailbox = MailboxName::from_wire("a".into(), b"&AGE-", false);
+    let mut bytes = BytesMut::new();
+    let result = encode_command_to_buf(
+        &mut bytes,
+        "A1",
+        &Command::Select {
+            mailbox,
+            condstore: false,
+            qresync: None,
+        },
+        &opts(LiteralMode::LiteralPlus, true),
+    );
+    assert!(matches!(result, Err(crate::Error::InvalidInput(_))));
+    assert!(bytes.is_empty());
 }

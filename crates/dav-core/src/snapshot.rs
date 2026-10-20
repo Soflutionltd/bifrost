@@ -14,7 +14,7 @@
 //! name of the token (`sync-token` against `getctag`), and the error each maps
 //! a malformed cursor onto.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use bifrost_types::{
     AccountError, AccountOperation, Change, Fingerprint, InventoryEntry, ObjectChange,
@@ -22,6 +22,7 @@ use bifrost_types::{
 };
 
 use crate::error::{DavProtocol, local_error};
+use crate::{DavHrefKey, dav_href_key};
 
 /// One member of a polled collection: the href that identifies it and the
 /// validator that says whether it changed.
@@ -74,7 +75,7 @@ pub fn inventory_entry(entry: &SnapshotEntry) -> InventoryEntry {
     }
 }
 
-/// Diff two href-sorted snapshots into object changes.
+/// Diff two snapshots into object changes using href-equivalence indexes.
 ///
 /// Suspected transient empty multistatus: a server returning zero hrefs against
 /// a populated local snapshot would emit a `Destroyed` for every object and
@@ -92,7 +93,9 @@ pub fn inventory_entry(entry: &SnapshotEntry) -> InventoryEntry {
 ///
 /// `current_failed` holds the hrefs the server reported *failed* within the 207
 /// that produced `current`. A transiently-failed resource is not an absent one,
-/// so it is never destroyed.
+/// so it is never destroyed. Equivalent href spellings are paired by
+/// [`DavHrefKey`], while emitted updates and destructions retain the old native
+/// id. The index is temporary and never changes cursor or hydration identity.
 #[must_use]
 pub fn diff_snapshots(
     previous: &[SnapshotEntry],
@@ -102,43 +105,83 @@ pub fn diff_snapshots(
     if current.is_empty() && !previous.is_empty() {
         return Vec::new();
     }
-    let failed: HashSet<&str> = current_failed.iter().map(String::as_str).collect();
+    let failed: HashSet<DavHrefKey> = current_failed
+        .iter()
+        .map(|href| dav_href_key(href))
+        .collect();
+    let previous_by_key = snapshot_index(previous);
+    let mut current_by_key = snapshot_index(current);
     let mut changes = Vec::new();
-    let mut left = 0;
-    let mut right = 0;
-    while left < previous.len() || right < current.len() {
-        match (previous.get(left), current.get(right)) {
-            (Some(old), Some(new)) if old.uri == new.uri => {
+    for (key, old_indices) in previous_by_key {
+        let Some(mut new_indices) = current_by_key.remove(&key) else {
+            for old_index in old_indices {
+                push_destroyed_unless_failed(&mut changes, &failed, &previous[old_index].uri);
+            }
+            continue;
+        };
+        for old_index in old_indices {
+            let old = &previous[old_index];
+            let new_position = new_indices
+                .iter()
+                .position(|new_index| current[*new_index].uri == old.uri)
+                .or_else(|| (!new_indices.is_empty()).then_some(0));
+            if let Some(new_position) = new_position {
+                let new = &current[new_indices.remove(new_position)];
                 if old.etag != new.etag {
-                    changes.push(object_change(&new.uri, ObjectChangeKind::Updated));
+                    // Preserve the id the account already published even if
+                    // this listing used an equivalent URL spelling.
+                    changes.push(object_change(&old.uri, ObjectChangeKind::Updated));
                 }
-                left += 1;
-                right += 1;
-            }
-            (Some(old), Some(new)) if old.uri < new.uri => {
+            } else {
                 push_destroyed_unless_failed(&mut changes, &failed, &old.uri);
-                left += 1;
             }
-            (Some(_), Some(new)) => {
-                changes.push(object_change(&new.uri, ObjectChangeKind::Created));
-                right += 1;
-            }
-            (Some(old), None) => {
-                push_destroyed_unless_failed(&mut changes, &failed, &old.uri);
-                left += 1;
-            }
-            (None, Some(new)) => {
-                changes.push(object_change(&new.uri, ObjectChangeKind::Created));
-                right += 1;
-            }
-            (None, None) => break,
+        }
+        for new_index in new_indices {
+            changes.push(object_change(
+                &current[new_index].uri,
+                ObjectChangeKind::Created,
+            ));
         }
     }
+    for new_indices in current_by_key.into_values() {
+        for new_index in new_indices {
+            changes.push(object_change(
+                &current[new_index].uri,
+                ObjectChangeKind::Created,
+            ));
+        }
+    }
+    changes.sort_by(|left, right| change_id(left).cmp(change_id(right)));
     changes
 }
 
-fn push_destroyed_unless_failed(changes: &mut Vec<Change>, failed: &HashSet<&str>, uri: &str) {
-    if failed.contains(uri) {
+fn snapshot_index(entries: &[SnapshotEntry]) -> BTreeMap<DavHrefKey, Vec<usize>> {
+    let mut index = BTreeMap::<DavHrefKey, Vec<usize>>::new();
+    for (position, entry) in entries.iter().enumerate() {
+        index
+            .entry(dav_href_key(&entry.uri))
+            .or_default()
+            .push(position);
+    }
+    for positions in index.values_mut() {
+        positions.sort_by(|left, right| entries[*left].uri.cmp(&entries[*right].uri));
+    }
+    index
+}
+
+fn change_id(change: &Change) -> &str {
+    match change {
+        Change::ObjectChange(change) => &change.id.0,
+        _ => "",
+    }
+}
+
+fn push_destroyed_unless_failed(
+    changes: &mut Vec<Change>,
+    failed: &HashSet<DavHrefKey>,
+    uri: &str,
+) {
+    if failed.contains(&dav_href_key(uri)) {
         return;
     }
     changes.push(object_change(uri, ObjectChangeKind::Destroyed));
@@ -167,10 +210,12 @@ impl Observation {
 /// A wholly empty listing against a populated previous snapshot is no
 /// observation at all and the previous entries are kept verbatim. Otherwise the
 /// entries whose hrefs the server reported failed are re-inserted from the
-/// previous snapshot, then the result is re-sorted and deduplicated on href -
-/// the diff above depends on both. The returned observation also decides
-/// whether the collection token can advance; preserving entries alone cannot
-/// make checkpointing past a refused member safe.
+/// previous snapshot. URL equivalence is used only for this lookup: when a
+/// current member matches an old one under another spelling, the old native id
+/// is retained. The result is re-sorted and deduplicated on href - the diff
+/// above depends on both. The returned observation also decides whether the
+/// collection token can advance; preserving entries alone cannot make
+/// checkpointing past a refused member safe.
 pub fn preserve_unobserved_entries(
     previous: &[SnapshotEntry],
     current: &mut Vec<SnapshotEntry>,
@@ -185,11 +230,37 @@ pub fn preserve_unobserved_entries(
         current.extend_from_slice(previous);
         return observation;
     }
-    let failed: HashSet<&str> = current_failed.iter().map(String::as_str).collect();
+    current.sort_by(|left, right| left.uri.cmp(&right.uri));
+    let previous_by_key = snapshot_index(previous);
+    for entry in current.iter_mut() {
+        let key = dav_href_key(&entry.uri);
+        let Some(previous_indices) = previous_by_key.get(&key) else {
+            continue;
+        };
+        let native_id = previous_indices
+            .iter()
+            .find(|index| previous[**index].uri == entry.uri)
+            .or_else(|| previous_indices.first())
+            .map(|index| previous[*index].uri.clone());
+        if let Some(native_id) = native_id {
+            entry.uri = native_id;
+        }
+    }
+    let failed: HashSet<DavHrefKey> = current_failed
+        .iter()
+        .map(|href| dav_href_key(href))
+        .collect();
+    let observed: HashSet<DavHrefKey> = current
+        .iter()
+        .map(|entry| dav_href_key(&entry.uri))
+        .collect();
     current.extend(
         previous
             .iter()
-            .filter(|entry| failed.contains(entry.uri.as_str()))
+            .filter(|entry| {
+                failed.contains(&dav_href_key(&entry.uri))
+                    && !observed.contains(&dav_href_key(&entry.uri))
+            })
             .cloned(),
     );
     current.sort_by(|left, right| left.uri.cmp(&right.uri));
@@ -499,6 +570,49 @@ mod tests {
                 kind: ObjectChangeKind::Destroyed,
             })] if id.0 == "/c/one"
         ));
+    }
+
+    #[test]
+    fn equivalent_member_spellings_keep_the_existing_native_id() {
+        let native = "https://DAV.example.test:443/c/a%40b.ics";
+        let listed = "https://dav.example.test/c/a@b.ics/";
+        let previous = vec![entry(native, Some("old"))];
+        let mut current = vec![entry(listed, Some("new"))];
+
+        let observation = preserve_unobserved_entries(&previous, &mut current, &[]);
+        assert!(observation.complete);
+        assert_eq!(current, vec![entry(native, Some("new"))]);
+        assert!(matches!(
+            diff_snapshots(&previous, &current, &[]).as_slice(),
+            [Change::ObjectChange(ObjectChange { id, kind: ObjectChangeKind::Updated })]
+                if id.0 == native
+        ));
+        assert!(matches!(
+            diff_snapshots(&previous, &[entry(listed, Some("new"))], &[]).as_slice(),
+            [Change::ObjectChange(ObjectChange { id, kind: ObjectChangeKind::Updated })]
+                if id.0 == native
+        ));
+        assert!(diff_snapshots(&previous, &[entry(listed, Some("old"))], &[]).is_empty());
+    }
+
+    #[test]
+    fn an_equivalent_failed_href_preserves_the_previous_member() {
+        let native = "https://DAV.example.test:443/c/a%40b.ics";
+        let failed_spelling = "https://dav.example.test/c/a@b.ics/";
+        let previous = vec![
+            entry(native, Some("old")),
+            entry("https://dav.example.test/c/z", Some("z")),
+        ];
+        let failed = vec![failed_spelling.to_string()];
+        let listed = vec![entry("https://dav.example.test/c/z", Some("z"))];
+        assert!(diff_snapshots(&previous, &listed, &failed).is_empty());
+        let mut current = listed;
+
+        let observation = preserve_unobserved_entries(&previous, &mut current, &failed);
+        assert!(!observation.complete);
+        assert_eq!(observation.pending, failed);
+        assert!(current.contains(&entry(native, Some("old"))));
+        assert!(diff_snapshots(&previous, &current, &[failed_spelling.to_string()]).is_empty());
     }
 
     /// A zero page size is an exhausted page, not a page of nothing that still

@@ -93,6 +93,17 @@ impl GoogleAccountFactory {
         }
     }
 
+    /// Construct a factory using the application's shared transport and token source.
+    /// Account attachment is deferred until `open` supplies the engine account id.
+    #[must_use]
+    pub fn from_token_source_with_net(source: Arc<dyn TokenSource>, net: bifrost_net::Net) -> Self {
+        Self::from_client(GmailClient::with_api_base_source_and_net(
+            "https://www.googleapis.com/gmail/v1/users/me",
+            source,
+            net,
+        ))
+    }
+
     /// Construct a Google factory from a bearer access token.
     #[must_use]
     pub fn from_access_token(access_token: impl Into<String>) -> Self {
@@ -213,6 +224,7 @@ struct GoogleAccount {
     seed_state: OpaqueChangeState,
     pubsub: Arc<PubSubControl>,
     scope_cache: ScopeCache,
+    lifecycle_baseline: scopes::LifecycleBaseline,
     shutdown: CancellationToken,
     closed: AtomicBool,
 }
@@ -257,6 +269,7 @@ impl GoogleAccount {
             seed_state,
             pubsub,
             scope_cache: Arc::new(ScopeCacheState::new(ScopeSnapshot::empty())),
+            lifecycle_baseline: Default::default(),
             shutdown,
             closed: AtomicBool::new(false),
         }))
@@ -340,6 +353,10 @@ fn shutdown_account_future_error(operation: AccountOperation) -> AccountError {
     // These updates can commit a first write before awaiting a second one.
     // The adapter has lost that progress and continuation context, so the
     // operation's ordinary idempotency cannot justify replaying the input.
+    // Do not stamp the original event scope here: a completed move can make
+    // that scope wrong. Contact identity alone also cannot say whether the
+    // field or photo leg committed. Only the operation can supply a safe
+    // continuation; a generic wrapper cannot reconstruct it from its input.
     let builder = if matches!(
         operation,
         AccountOperation::EventUpdate | AccountOperation::ContactUpdate
@@ -451,7 +468,11 @@ impl Account for GoogleAccount {
     }
 
     fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
-        scopes::scope_lifecycle_stream(Arc::clone(&self.client), self.shutdown.clone())
+        scopes::scope_lifecycle_stream_with_baseline(
+            Arc::clone(&self.client),
+            self.shutdown.clone(),
+            Arc::clone(&self.lifecycle_baseline),
+        )
     }
 
     fn establish_initial_cursor(
@@ -773,15 +794,13 @@ impl Account for GoogleAccount {
         bytes: Bytes,
         meta: CloudUploadMeta,
     ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
-        // Keep the Drive upload outside the generic adapter cancellation
-        // wrapper: dropping this multi-request future skips its asynchronous
-        // resumable-session cancellation. It needs token-aware cleanup before
-        // close can safely interrupt it.
+        // Drive owns cancellation so it can await resumable-session cleanup.
         cloud::host_attachment(
             Arc::clone(&self.client),
             self.profile.email_address.clone(),
             bytes,
             meta,
+            self.shutdown.clone(),
         )
     }
 
@@ -1471,10 +1490,29 @@ mod tests {
                 ),
             )),
             scope_cache: Arc::new(ScopeCacheState::new(ScopeSnapshot::empty())),
+            lifecycle_baseline: Default::default(),
             shutdown,
             closed: AtomicBool::new(false),
         });
         (account, net)
+    }
+
+    #[tokio::test]
+    async fn public_factory_uses_injected_net_for_open() {
+        let script = ScriptedDispatch::new([bifrost_net::test_support::canned(
+            reqwest::StatusCode::OK,
+            br#"{"emailAddress":"user@example.com","historyId":"1"}"#,
+        )]);
+        let net =
+            bifrost_net::test_support::scripted_net(&script, bifrost_net::NetConfig::default());
+        let factory = GoogleAccountFactory::from_token_source_with_net(
+            Arc::new(bifrost_net::StaticTokenSource::new("token", None)),
+            net,
+        );
+        let opened = factory.open(AccountId("injected-google".into())).await;
+        assert!(opened.is_ok());
+        assert_eq!(script.requests().len(), 1);
+        assert!(script.requests()[0].url.as_str().ends_with("/profile"));
     }
 
     #[tokio::test]

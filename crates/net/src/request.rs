@@ -1237,8 +1237,15 @@ pub(crate) async fn send_streaming_inner(
                     });
                 }
                 if policy.statuses.contains(&status) || status.is_server_error() {
-                    let retry_after = parse_retry_after(evidence.headers.get(RETRY_AFTER))
-                        .map(|d| d.min(policy.honor_retry_after_cap));
+                    // Resolve HTTP-date hints only when choosing the actual
+                    // wait. An elapsed date means no server-imposed wait;
+                    // dropping it as an absent duration would select local
+                    // exponential backoff instead.
+                    let retry_after = retry_after_delay(
+                        evidence.headers.get(RETRY_AFTER),
+                        std::time::SystemTime::now(),
+                        policy.honor_retry_after_cap,
+                    );
                     if let Some(ra) = retry_after {
                         retry_after_history.push(ra);
                     }
@@ -1867,6 +1874,14 @@ fn backoff_for(policy: &RetryPolicy, attempt: u32) -> Duration {
     let half = capped / 2;
     let jitter = Duration::from_nanos(jitter_ns);
     half.saturating_add(jitter).min(policy.max_backoff)
+}
+
+fn retry_after_delay(
+    value: Option<&HeaderValue>,
+    now: std::time::SystemTime,
+    cap: Duration,
+) -> Option<Duration> {
+    parse_retry_after_hint(value).map(|hint| hint.min_delay(now).min(cap))
 }
 
 /// Parse a server hint without resolving an HTTP-date against the local clock.
@@ -3019,6 +3034,20 @@ mod tests {
         assert_eq!(
             RetryHint::At(at).min_delay(at + Duration::from_secs(60)),
             Duration::ZERO
+        );
+        assert_eq!(
+            retry_after_delay(
+                Some(&hv(date)),
+                at + Duration::from_secs(60),
+                Duration::from_secs(10),
+            ),
+            Some(Duration::ZERO),
+            "the retry loop treats an elapsed server date as an immediate retry"
+        );
+        assert_eq!(
+            retry_after_delay(Some(&hv("30")), at, Duration::from_secs(10),),
+            Some(Duration::from_secs(10)),
+            "the policy cap applies only when resolving the actual wait"
         );
         for invalid in ["", "-5", "soon", "1.5"] {
             assert_eq!(parse_retry_after_hint(Some(&hv(invalid))), None);

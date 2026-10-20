@@ -238,7 +238,7 @@ impl ImapAccountFactory {
             let imap_mailboxes: std::collections::HashSet<String> = registry
                 .entries()
                 .into_iter()
-                .map(|entry| entry.name.as_str().to_owned())
+                .map(|entry| entry.name.account_id())
                 .collect();
             let (dav_scopes, dav_scope_warnings) = super::DavScopeIndex::build(
                 contact_cursor_folders,
@@ -773,10 +773,7 @@ pub(crate) async fn discover_shared_folders(
                 // the personal listing's bare entry. A per-folder MYRIGHTS
                 // failure is non-fatal (log + keep the folder; SELECT stays
                 // authoritative).
-                match conn
-                    .my_rights(info.name.as_str(), cfg.imap.command_timeout)
-                    .await
-                {
+                match conn.my_rights(&info.name, cfg.imap.command_timeout).await {
                     Ok(wire) => {
                         rights = Some(MailboxRights::parse(&wire));
                     }

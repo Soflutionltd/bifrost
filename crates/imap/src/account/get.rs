@@ -42,7 +42,7 @@ pub(crate) fn get_stream(
             match decode_object_id(&id, AccountOperation::Hydrate) {
                 Ok(decoded) => {
                     grouped
-                        .entry(decoded.folder.as_str().to_owned())
+                        .entry(decoded.folder.account_id())
                         .or_insert_with(|| (decoded.folder.clone(), Vec::new()))
                         .1
                         .push(decoded);
@@ -95,7 +95,7 @@ async fn flush_get_groups(
     // Folder order is deterministic inside each bounded input window.
     let mut groups: Vec<(MailboxName, Vec<DecodedObjectId>)> =
         std::mem::take(grouped).into_values().collect();
-    groups.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    groups.sort_by(|a, b| a.0.cmp_account_order(&b.0));
     for (folder, ids) in groups {
         let mut pending = ids;
         match run_folder_get(account, &folder, &mut pending, projection, tx).await {
@@ -175,7 +175,7 @@ fn uidvalidity_changed_error(folder: &MailboxName) -> AccountError {
     // documented scope shape, so scope readers matching one shape do not
     // silently degrade (mutate.rs builds the identical condition this way).
     .scope(bifrost_types::ErrorScope::Cursor(
-        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.as_str().to_owned())),
+        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
     ))
     .try_build()
     .expect("valid account error classification")

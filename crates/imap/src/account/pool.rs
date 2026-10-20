@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use futures::FutureExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::connection::ImapConnection;
@@ -39,9 +40,19 @@ struct PoolInner {
     /// observes the flag and terminates itself. Nothing can land a live
     /// session on the far side of a completed close.
     sessions: Mutex<Vec<std::sync::Weak<ImapConnection>>>,
+    // A read guard spans connect, authentication and initialization. Close takes
+    // the write guard before draining, so no admitted dial outlives completion.
+    dials: tokio::sync::RwLock<()>,
+    cancel_dials: tokio_util::sync::CancellationToken,
+    close_completion:
+        std::sync::OnceLock<futures::future::Shared<futures::future::BoxFuture<'static, ()>>>,
 }
 
 impl Pool {
+    pub(super) fn sieve_meter(&self) -> Option<bifrost_net::MeterSinkHandle> {
+        self.inner.meter.clone()
+    }
+
     pub(crate) fn new(
         config: Arc<ImapAccountConfig>,
         primed: ImapConnection,
@@ -64,6 +75,9 @@ impl Pool {
                 closed: std::sync::atomic::AtomicBool::new(false),
                 qresync_policy: std::sync::atomic::AtomicBool::new(false),
                 sessions: Mutex::new(vec![primed_weak]),
+                dials: tokio::sync::RwLock::new(()),
+                cancel_dials: tokio_util::sync::CancellationToken::new(),
+                close_completion: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -97,7 +111,7 @@ impl Pool {
         let member = match member {
             Some(member) => member,
             None => PoolMember {
-                conn: self.inner.dial().await?,
+                conn: self.inner.dial(Some(Arc::clone(&permit))).await?,
                 selected: None,
             },
         };
@@ -122,7 +136,7 @@ impl Pool {
         let member = match member {
             Some(member) => member,
             None => PoolMember {
-                conn: self.inner.dial().await?,
+                conn: self.inner.dial(Some(Arc::clone(&permit))).await?,
                 selected: None,
             },
         };
@@ -139,27 +153,41 @@ impl Pool {
     /// sessions separately. Holding data permits for permanent IDLE workers
     /// would starve checkouts; `pool_cap` is not a shared physical-session cap.
     pub(crate) async fn dial_idle(&self) -> Result<Arc<ImapConnection>, Error> {
-        self.inner.dial().await
+        self.inner.dial(None).await
     }
 
     pub(crate) async fn close(&self) {
-        self.inner
-            .closed
-            .store(true, std::sync::atomic::Ordering::Release);
-        // Wake every checkout blocked on a permit so none lingers past
-        // close waiting for a permit that will never be returned; the
-        // post-acquire re-check turns a permit that does arrive into
-        // `Error::closed` rather than a fresh session.
-        self.inner.permits.close();
+        let completion = self
+            .inner
+            .close_completion
+            .get_or_init(|| {
+                self.inner
+                    .closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                self.inner.permits.close();
+                self.inner.cancel_dials.cancel();
+                let inner = Arc::clone(&self.inner);
+                let task = tokio::spawn(async move { inner.drain().await });
+                async move { task.await.expect("pool teardown task panicked") }
+                    .boxed()
+                    .shared()
+            })
+            .clone();
+        completion.await;
+    }
+}
+
+impl PoolInner {
+    async fn drain(&self) {
+        let _dials = self.dials.write().await;
         let members = {
-            let mut idle = self.inner.idle.lock().expect("pool lock poisoned");
+            let mut idle = self.idle.lock().expect("pool lock poisoned");
             std::mem::take(&mut *idle)
         };
         // Drain under the same mutex registration re-checks `closed` under.
-        // Everything already minted is here; anything mid-dial observes the
-        // flag when it arrives and terminates itself instead of registering.
+        // Exclusive dial admission means every admitted connect/authenticate
+        // task has finished or terminated its unclaimed session before here.
         let sessions: Vec<_> = self
-            .inner
             .sessions
             .lock()
             .expect("pool sessions lock poisoned")
@@ -175,14 +203,12 @@ impl Pool {
         let drain = futures::future::join_all(sessions.iter().map(|conn| async move {
             let _ = conn.logout().await;
         }));
-        let _ = tokio::time::timeout(self.inner.config.imap.command_timeout, drain).await;
+        let _ = tokio::time::timeout(self.config.imap.command_timeout, drain).await;
         for conn in sessions {
             conn.terminate().await;
         }
     }
-}
 
-impl PoolInner {
     fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -192,7 +218,7 @@ impl PoolInner {
     /// load-bearing one, because `close` can land while this task is parked
     /// on the semaphore and the permit it then receives must not become a
     /// live session after the drain has already run.
-    async fn permit(&self) -> Result<OwnedSemaphorePermit, Error> {
+    async fn permit(&self) -> Result<Arc<OwnedSemaphorePermit>, Error> {
         if self.is_closed() {
             return Err(Error::closed());
         }
@@ -203,7 +229,7 @@ impl PoolInner {
         if self.is_closed() {
             return Err(Error::closed());
         }
-        Ok(permit)
+        Ok(Arc::new(permit))
     }
 
     /// Dial and authenticate one fresh connection under the pool's meter and
@@ -214,37 +240,111 @@ impl PoolInner {
     /// A dial that started before `close` and completed after it is torn
     /// down here rather than handed out: `Account::close()` promises no
     /// session of this account is still connected when it returns. The
-    /// connection is registered BEFORE initialization, so a `close` landing
-    /// mid-ENABLE reaches it; a dial cancelled mid-ENABLE leaves it
-    /// abandoned, and its last handle aborts the driver.
-    async fn dial(&self) -> Result<Arc<ImapConnection>, Error> {
+    /// connection is registered BEFORE authentication and initialization.
+    /// An owned dial task retains admission until it hands out the session
+    /// or terminates it when its consumer has gone away.
+    async fn dial(
+        self: &Arc<Self>,
+        permit: Option<Arc<OwnedSemaphorePermit>>,
+    ) -> Result<Arc<ImapConnection>, Error> {
+        let inner = Arc::clone(self);
+        self.dial_with_permit(
+            async move {
+                // Keep the post-spawn keepalive await inside dial_admitted, where
+                // cancellation retains a handle it can terminate and join.
+                let mut config = inner.config.imap.clone();
+                config.keepalive = None;
+                ImapConnection::connect_config_metered(
+                    &config,
+                    inner.meter.clone(),
+                    Some(inner.bandwidth_budget.clone()),
+                )
+                .await
+            },
+            permit,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn dial_with<F>(self: &Arc<Self>, connect: F) -> Result<Arc<ImapConnection>, Error>
+    where
+        F: std::future::Future<Output = Result<ImapConnection, Error>> + Send + 'static,
+    {
+        self.dial_with_permit(connect, None).await
+    }
+
+    async fn dial_with_permit<F>(
+        self: &Arc<Self>,
+        connect: F,
+        permit: Option<Arc<OwnedSemaphorePermit>>,
+    ) -> Result<Arc<ImapConnection>, Error>
+    where
+        F: std::future::Future<Output = Result<ImapConnection, Error>> + Send + 'static,
+    {
+        let (mut tx, rx) = tokio::sync::oneshot::channel();
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            // Keep capacity charged until cancellation has terminated the driver.
+            let _permit = permit;
+            let _dial = inner.dials.read().await;
+            let mut connected = None;
+            let result = tokio::select! {
+                biased;
+                _ = inner.cancel_dials.cancelled() => Err(Error::closed()),
+                _ = tx.closed() => Err(Error::closed()),
+                result = inner.dial_admitted(connect, &mut connected) => result,
+            };
+            // This handle lives outside the cancellable future: dropping an
+            // authentication future alone does not join its driver task.
+            match result {
+                Ok(conn) => {
+                    if let Err(Ok(conn)) = tx.send(Ok(conn)) {
+                        conn.terminate().await;
+                    }
+                }
+                Err(error) => {
+                    if let Some(conn) = connected {
+                        conn.terminate().await;
+                    }
+                    let _ = tx.send(Err(error));
+                }
+            }
+        });
+        rx.await
+            .map_err(|_| Error::driver_gone_at(bifrost_types::TransmissionState::Unsent))?
+    }
+
+    async fn dial_admitted<F>(
+        &self,
+        connect: F,
+        connected: &mut Option<Arc<ImapConnection>>,
+    ) -> Result<Arc<ImapConnection>, Error>
+    where
+        F: std::future::Future<Output = Result<ImapConnection, Error>>,
+    {
         if self.is_closed() {
             return Err(Error::closed());
         }
-        let (conn, _auth) = self
-            .config
-            .imap
-            .connect_authenticated_metered(
-                &self.config.credentials,
-                &self.config.auth_policy,
-                self.meter.clone(),
-                Some(self.bandwidth_budget.clone()),
-            )
-            .await?;
-        let conn = Arc::new(conn);
+        let conn = Arc::new(connect.await?);
+        *connected = Some(Arc::clone(&conn));
         if !self.register(&conn) {
-            // The pool is closed: no graceful LOGOUT, which is unbounded
-            // and would hold this dial (and the caller's permit) open.
-            conn.terminate().await;
             return Err(Error::closed());
         }
+        if let Some(keepalive) = self.config.imap.keepalive {
+            conn.set_keepalive(keepalive).await?;
+        }
+        conn.authenticate_best(
+            &self.config.credentials,
+            &self.config.auth_policy,
+            self.config.imap.command_timeout,
+        )
+        .await?;
         if self
             .qresync_policy
             .load(std::sync::atomic::Ordering::Acquire)
-            && let Err(error) = enable_qresync(&conn, self.config.imap.command_timeout).await
         {
-            conn.terminate().await;
-            return Err(error);
+            enable_qresync(&conn, self.config.imap.command_timeout).await?;
         }
         Ok(conn)
     }
@@ -301,7 +401,7 @@ pub(crate) async fn enable_qresync(
 pub(crate) struct PooledConn {
     member: Option<PoolMember>,
     pool: Arc<PoolInner>,
-    _permit: OwnedSemaphorePermit,
+    _permit: Arc<OwnedSemaphorePermit>,
 }
 
 impl PooledConn {
@@ -390,7 +490,7 @@ impl PooledConn {
             let _ = old.conn.logout().await;
         }
         self.member = Some(PoolMember {
-            conn: self.pool.dial().await?,
+            conn: self.pool.dial(Some(Arc::clone(&self._permit))).await?,
             selected: None,
         });
         Ok(())
@@ -493,6 +593,217 @@ mod tests {
         a.unwrap();
         b.unwrap();
         assert_eq!(start.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn direct_pool_close_survives_caller_cancellation() {
+        let (primed, mut peer) = marked("ACL").await;
+        let pool = pool_of(primed, 1);
+        let held = pool.checkout_any().await.unwrap();
+        let mut first = Box::pin(pool.close());
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        let logout = read_line(&mut peer).await;
+        assert!(logout.contains("LOGOUT"));
+        drop(first);
+        respond(
+            &mut peer,
+            &format!("* BYE closing\r\n{} OK done\r\n", tag_of(&logout)),
+        )
+        .await;
+        pool.close().await;
+        assert!(!held.connection().is_alive());
+        assert!(pool.inner.sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_cancels_a_dial_before_registration() {
+        let (primed, primed_peer) = marked("ACL").await;
+        let pool = pool_of(primed, 1);
+        drop(primed_peer);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut dial = Box::pin(pool.inner.dial_with(async move {
+            started_tx.send(()).unwrap();
+            std::future::pending().await
+        }));
+        assert!(futures::poll!(dial.as_mut()).is_pending());
+        started_rx.await.unwrap();
+        pool.close().await;
+        assert!(matches!(dial.await, Err(Error::Closed { .. })));
+        assert!(pool.inner.sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_cancels_authentication_already_on_the_wire() {
+        let (primed, primed_peer) = marked("ACL").await;
+        drop(primed_peer);
+        let (late, mut peer) =
+            driver_pair(b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR] ready\r\n").await;
+        let mut cfg = (*config()).clone();
+        cfg.imap.keepalive = None;
+        cfg.auth_policy = AuthPolicy::default().allow_cleartext_without_tls();
+        let pool = Pool::new(
+            Arc::new(cfg),
+            primed,
+            1,
+            None,
+            bifrost_net::BandwidthBudget::default(),
+        );
+        let mut dial = Box::pin(pool.inner.dial_with(async move { Ok(late) }));
+        assert!(futures::poll!(dial.as_mut()).is_pending());
+        assert!(read_line(&mut peer).await.contains("AUTHENTICATE PLAIN"));
+        let conn = pool
+            .inner
+            .sessions
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        pool.close().await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(!conn.is_alive());
+        assert!(matches!(dial.await, Err(Error::Closed { .. })));
+    }
+
+    struct StalledTokenSource {
+        entered: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl bifrost_net::TokenSource for StalledTokenSource {
+        fn current(
+            &self,
+        ) -> bifrost_types::AccountFuture<Result<bifrost_net::AccessToken, bifrost_net::Error>>
+        {
+            let entered = Arc::clone(&self.entered);
+            Box::pin(async move {
+                entered.add_permits(1);
+                std::future::pending().await
+            })
+        }
+
+        fn refresh(
+            &self,
+        ) -> bifrost_types::AccountFuture<Result<bifrost_net::AccessToken, bifrost_net::Error>>
+        {
+            self.current()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_cancels_stalled_token_lookup_and_joins_its_driver() {
+        let (primed, primed_peer) = marked("ACL").await;
+        drop(primed_peer);
+        let (late, _peer) =
+            driver_pair(b"* OK [CAPABILITY IMAP4rev1 AUTH=XOAUTH2 SASL-IR] ready\r\n").await;
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut cfg = (*config()).clone();
+        cfg.imap.keepalive = None;
+        cfg.credentials = Credentials::oauth2_source(
+            "user",
+            Arc::new(StalledTokenSource {
+                entered: Arc::clone(&entered),
+            }),
+        );
+        cfg.auth_policy = AuthPolicy::default().allow_cleartext_without_tls();
+        let pool = Pool::new(
+            Arc::new(cfg),
+            primed,
+            1,
+            None,
+            bifrost_net::BandwidthBudget::default(),
+        );
+        let mut dial = Box::pin(pool.inner.dial_with(async move { Ok(late) }));
+        assert!(futures::poll!(dial.as_mut()).is_pending());
+        entered.acquire().await.unwrap().forget();
+        let conn = pool
+            .inner
+            .sessions
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        drop(dial);
+        let started = tokio::time::Instant::now();
+        pool.close().await;
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "close cancels instead of waiting for the token timeout"
+        );
+        assert!(!conn.is_alive());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_token_lookup_has_its_own_timeout() {
+        let (conn, _peer) =
+            driver_pair(b"* OK [CAPABILITY IMAP4rev1 AUTH=XOAUTH2 SASL-IR] ready\r\n").await;
+        let credentials = Credentials::oauth2_source(
+            "user",
+            Arc::new(StalledTokenSource {
+                entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            }),
+        );
+        let timeout = Duration::from_secs(3);
+        let started = tokio::time::Instant::now();
+        let error = conn
+            .authenticate_best(
+                &credentials,
+                &AuthPolicy::default().allow_cleartext_without_tls(),
+                timeout,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Timeout { .. }));
+        assert_eq!(started.elapsed(), timeout);
+        conn.terminate().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_checkouts_keep_capacity_until_the_dial_is_cancelled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let (primed, _peer) = marked("ACL").await;
+        let pool = pool_of(primed, 1);
+        let active = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        for _ in 0..16 {
+            let inner = Arc::clone(&pool.inner);
+            let dial_active = Arc::clone(&active);
+            let dial_entered = Arc::clone(&entered);
+            let mut checkout = Box::pin(async move {
+                let permit = inner.permit().await?;
+                inner
+                    .dial_with_permit(
+                        async move {
+                            assert_eq!(dial_active.fetch_add(1, Ordering::SeqCst), 0);
+                            let _active = Active(dial_active);
+                            dial_entered.add_permits(1);
+                            std::future::pending().await
+                        },
+                        Some(permit),
+                    )
+                    .await
+            });
+            assert!(futures::poll!(checkout.as_mut()).is_pending());
+            entered.acquire().await.unwrap().forget();
+            drop(checkout);
+            // No executor yield: cancellation has not reached the detached task.
+            assert_eq!(pool.inner.permits.available_permits(), 0);
+            let permit = pool.inner.permit().await.unwrap();
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+            drop(permit);
+        }
     }
 
     fn folder(name: &str) -> MailboxName {

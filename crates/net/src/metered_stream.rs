@@ -7,7 +7,7 @@ use std::task::{Context, Poll, ready};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{BandwidthBudget, BandwidthDirection, Reservation};
+use crate::{BandwidthBudget, BandwidthDirection, MeterSinkHandle, Reservation};
 
 type Admission = Pin<Box<dyn Future<Output = Reservation> + Send>>;
 
@@ -66,6 +66,7 @@ impl Lane {
 pub struct MeteredStream<S> {
     inner: S,
     budget: BandwidthBudget,
+    sink: Option<MeterSinkHandle>,
     inbound: Lane,
     outbound: Lane,
 }
@@ -76,9 +77,17 @@ impl<S> MeteredStream<S> {
         Self {
             inner,
             budget,
+            sink: None,
             inbound: Lane::default(),
             outbound: Lane::default(),
         }
+    }
+
+    /// Observe actual completed I/O through an optional account-scoped sink.
+    /// Pending operations, errors, flush and shutdown do not invent byte counts.
+    pub fn with_meter_sink(mut self, sink: Option<MeterSinkHandle>) -> Self {
+        self.sink = sink;
+        self
     }
 }
 
@@ -102,6 +111,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for MeteredStream<S> {
         let result = ready!(Pin::new(&mut this.inner).poll_read(cx, &mut limited));
         let used = limited.filled().len();
         buf.advance(used);
+        if result.is_ok()
+            && let Some(sink) = &this.sink
+        {
+            sink.record_bytes_in(u64::try_from(used).unwrap_or(u64::MAX));
+        }
         this.inbound.finish(
             &result
                 .as_ref()
@@ -130,6 +144,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for MeteredStream<S> {
         ));
         let result = ready!(Pin::new(&mut this.inner).poll_write(cx, &buf[..granted]));
         this.outbound.finish(&result);
+        if let Ok(used) = &result
+            && let Some(sink) = &this.sink
+        {
+            sink.record_bytes_out(u64::try_from(*used).unwrap_or(u64::MAX));
+        }
         Poll::Ready(result)
     }
 
@@ -148,6 +167,35 @@ mod tests {
     use futures::FutureExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn observation_counts_short_completions_and_not_pending_or_errors() {
+        let meter = crate::BandwidthMeter::new();
+        let id = crate::AccountId("stream".to_owned());
+        meter.register_account(id.clone());
+        let account = meter.account(id);
+        let (stream, mut peer) = duplex(1);
+        let mut stream = MeteredStream::new(stream, BandwidthBudget::default())
+            .with_meter_sink(Some(account.sink_handle()));
+        assert_eq!(stream.write(b"abcd").await.unwrap(), 1);
+        assert_eq!(account.bytes_out(), 1);
+        let mut pending = Box::pin(stream.write(b"bc"));
+        assert!((&mut pending).now_or_never().is_none());
+        assert_eq!(account.bytes_out(), 1);
+        drop(pending);
+        let mut byte = [0];
+        peer.read_exact(&mut byte).await.unwrap();
+        peer.write_all(b"z").await.unwrap();
+        let mut bytes = [0; 8];
+        assert_eq!(stream.read(&mut bytes).await.unwrap(), 1);
+        assert_eq!(account.bytes_in(), 1);
+        stream.flush().await.unwrap();
+        drop(peer);
+        assert_eq!(stream.read(&mut bytes).await.unwrap(), 0);
+        assert!(stream.write(b"x").await.is_err());
+        assert_eq!(account.bytes_in(), 1);
+        assert_eq!(account.bytes_out(), 1);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn two_writers_share_one_schedule() {

@@ -46,7 +46,7 @@ impl ImapConnection {
     /// (RFC 4315) and includes an `[APPENDUID]` response code, otherwise `None`.
     pub async fn append(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         flags: &[Flag],
         date: Option<&str>,
         message: &[u8],
@@ -65,7 +65,7 @@ impl ImapConnection {
     /// APPENDLIMIT (RFC 7889) preflight and its `Unsent` transmission evidence.
     pub async fn append_message(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         message: AppendMessage,
         timeout: Duration,
     ) -> Result<Option<(u32, u32)>, Error> {
@@ -86,7 +86,7 @@ impl ImapConnection {
             remaining_timeout(deadline)?,
             self.submit_regular(
                 Command::Append {
-                    mailbox: mailbox.to_owned(),
+                    mailbox: mailbox.mailbox_name()?.into(),
                     messages: vec![message],
                     multi: false,
                 },
@@ -115,7 +115,7 @@ impl ImapConnection {
     /// support UIDPLUS.
     pub async fn multi_append(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         messages: &[AppendMessage],
         timeout: Duration,
     ) -> Result<Vec<(u32, u32)>, Error> {
@@ -155,7 +155,7 @@ impl ImapConnection {
             remaining_timeout(deadline)?,
             self.submit_regular(
                 Command::Append {
-                    mailbox: mailbox.to_owned(),
+                    mailbox: mailbox.mailbox_name()?.into(),
                     messages: messages.to_vec(),
                     multi: true,
                 },
@@ -175,7 +175,7 @@ impl ImapConnection {
     /// and apply the smallest numeric value available.
     async fn append_limit_for_mailbox(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<Option<u64>, Error> {
         let advertised = {
@@ -188,7 +188,7 @@ impl ImapConnection {
 
     async fn append_limit_from_advertisement(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         advertised: AdvertisedAppendLimits,
         timeout: Duration,
     ) -> Result<Option<u64>, Error> {

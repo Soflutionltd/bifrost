@@ -81,9 +81,8 @@ pub(crate) fn repair_inventory(
     cache: ScopeCache,
     requests: AccountStream<bifrost_types::InventoryRepairRequest>,
 ) -> AccountStream<bifrost_types::InventoryRepairEvent> {
-    // This Account operation receives no shutdown token. A token created here
-    // would never observe close(); the account adapter must wrap this stream
-    // with its token or pass that token through to interrupt a refresh.
+    // The Account adapter wraps this stream with its shutdown token, so close
+    // drops an in-flight refresh as well as an idle stream.
     Box::pin(async_stream::stream! {
         let labels = match labels_for_flags(&client, &cache).await {
             Ok(labels) => Arc::new(labels),

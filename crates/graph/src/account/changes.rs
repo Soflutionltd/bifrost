@@ -204,7 +204,11 @@ pub(crate) fn changes_stream(
                     // Graph delta has no created/updated discriminator, and
                     // this account keeps no complete per-scope id set to diff
                     // against. Report a refresh as Updated; Added below names
-                    // current membership, not object creation.
+                    // current membership, not object creation. The engine's
+                    // live changes driver forwards these kinds unchanged, so
+                    // treating Updated for an unknown id as insertion is a
+                    // consumer contract; changing this to Created would also
+                    // misclassify ordinary edits.
                     changes.push(Change::ObjectChange(ObjectChange {
                         id: object_id.clone(),
                         kind: ObjectChangeKind::Updated,

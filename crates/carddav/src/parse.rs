@@ -334,7 +334,7 @@ impl MultiStatusSink for MultigetSink {
     }
 
     fn finish_response(&mut self, parts: &ResponseParts<Self::Props>) {
-        // RFC 6352 section 6.3.2: a response-level 507 for the request-URI
+        // RFC 6352 section 8.6.2: a response-level 507 for the request-URI
         // is truncation, whether or not number-of-matches-within-limits appears.
         // Consume it before ordinary per-resource quota/error classification.
         if let (Some(base), Some(href), Some(status)) = (

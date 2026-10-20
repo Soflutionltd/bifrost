@@ -426,6 +426,9 @@ pub(in crate::connection) async fn peer_io<T>(
         .map_err(Error::from)
 }
 
+// This adapter also owns the cumulative peer timeout and defers completion
+// across the COMPRESS boundary until the plaintext prefix length is known.
+// MeteredStream completes at each poll and cannot express that deferred charge.
 #[derive(Clone)]
 pub(super) struct WireMetering {
     sink: Option<MeterSinkHandle>,

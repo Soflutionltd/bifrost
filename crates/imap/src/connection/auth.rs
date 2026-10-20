@@ -66,15 +66,17 @@ impl ImapConnection {
                 // Read the current token from the shared source at connect
                 // time. On a reconnect this re-enters here and re-reads, so
                 // a token rotated since the last connect is presented fresh.
-                let access_token = token_source.current().await.map_err(|e| {
-                    // The mechanism was already selected above, so the
-                    // failure can name the rung it would have been used for.
-                    Error::auth_with_mechanism(
-                        format!("failed to read OAuth access token: {e}"),
-                        None,
-                        mechanism.name(),
-                    )
-                })?;
+                let access_token = tokio::time::timeout(timeout, token_source.current())
+                    .await
+                    .map_err(|_| Error::timeout())?
+                    .map_err(|e| {
+                        // The selected mechanism identifies the failed token lookup.
+                        Error::auth_with_mechanism(
+                            format!("failed to read OAuth access token: {e}"),
+                            None,
+                            mechanism.name(),
+                        )
+                    })?;
                 match mechanism {
                     AuthMechanism::OAuthBearer => {
                         self.authenticate_oauthbearer(identity, access_token.as_str(), timeout)

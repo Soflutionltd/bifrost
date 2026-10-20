@@ -284,9 +284,9 @@ pub(crate) struct DecodedThreadId {
 
 pub(crate) fn encode_object_id(folder: &MailboxName, uidvalidity: u32, uid: u32) -> ObjectId {
     ObjectId(format!(
-        "imap1:{}:{}:{}:{}",
-        folder.as_str().len(),
-        folder.as_str(),
+        "imap2:{}:{}:{}:{}",
+        folder.account_id().len(),
+        folder.account_id(),
         uidvalidity,
         uid
     ))
@@ -296,7 +296,7 @@ pub(crate) fn decode_object_id(
     id: &ObjectId,
     op: AccountOperation,
 ) -> Result<DecodedObjectId, AccountError> {
-    let (folder, rest) = decode_len_prefixed("imap1", &id.0, op)?;
+    let (folder, rest) = decode_len_prefixed("imap1", "imap2", &id.0, op)?;
     let mut parts = rest.split(':');
     let uidvalidity = parse_nonzero_u32(parts.next(), "IMAP object id uidvalidity", op)?;
     let uid = parse_nonzero_u32(parts.next(), "IMAP object id uid", op)?;
@@ -320,9 +320,9 @@ pub(crate) fn encode_thread_id(folder: &MailboxName, uidvalidity: u32, uids: &[u
         .collect::<Vec<_>>()
         .join(",");
     ThreadId(format!(
-        "imapthread1:{}:{}:{}:{}",
-        folder.as_str().len(),
-        folder.as_str(),
+        "imapthread2:{}:{}:{}:{}",
+        folder.account_id().len(),
+        folder.account_id(),
         uidvalidity,
         uid_list
     ))
@@ -332,7 +332,7 @@ pub(crate) fn decode_thread_id(
     id: &ThreadId,
     op: AccountOperation,
 ) -> Result<DecodedThreadId, AccountError> {
-    let (folder, rest) = decode_len_prefixed("imapthread1", &id.0, op)?;
+    let (folder, rest) = decode_len_prefixed("imapthread1", "imapthread2", &id.0, op)?;
     let mut parts = rest.splitn(2, ':');
     let uidvalidity = parse_nonzero_u32(parts.next(), "IMAP thread id uidvalidity", op)?;
     let uid_part = parts
@@ -359,10 +359,17 @@ pub(crate) fn decode_thread_id(
 }
 
 fn decode_len_prefixed(
-    prefix: &str,
+    legacy_prefix: &str,
+    wire_prefix: &str,
     value: &str,
     op: AccountOperation,
 ) -> Result<(MailboxName, String), AccountError> {
+    let wire_identity = value.starts_with(&format!("{wire_prefix}:"));
+    let prefix = if wire_identity {
+        wire_prefix
+    } else {
+        legacy_prefix
+    };
     let value = value
         .strip_prefix(prefix)
         .and_then(|v| v.strip_prefix(':'))
@@ -380,7 +387,12 @@ fn decode_len_prefixed(
         .get(len..)
         .and_then(|v| v.strip_prefix(':'))
         .ok_or_else(|| malformed("invalid IMAP id separator", op))?;
-    let folder = MailboxName::new(folder.to_owned()).map_err(|e| malformed(&e.to_string(), op))?;
+    let folder = if wire_identity {
+        MailboxName::from_account_id(folder)
+    } else {
+        MailboxName::new(folder)
+    }
+    .map_err(|e| malformed(&e.to_string(), op))?;
     Ok((folder, after.to_owned()))
 }
 
@@ -453,6 +465,77 @@ fn schema_incompatible(detail: &str) -> AccountError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_reserved_prefix_folders_remain_literal() {
+        let encoded = MailboxName::from_wire("a".into(), b"&AGE-", false).account_id();
+        for literal in [encoded.as_str(), "~imap-wire:invalid!"] {
+            let folder = MailboxName::new(literal).unwrap();
+            let object = ObjectId(format!("imap1:{}:{literal}:7:9", literal.len()));
+            let thread = ThreadId(format!("imapthread1:{}:{literal}:7:9", literal.len()));
+            assert_eq!(
+                decode_object_id(&object, AccountOperation::SyncChanges)
+                    .unwrap()
+                    .folder,
+                folder
+            );
+            assert_eq!(
+                decode_thread_id(&thread, AccountOperation::SyncChanges)
+                    .unwrap()
+                    .folder,
+                folder
+            );
+            let object = encode_object_id(&folder, 7, 9);
+            let thread = encode_thread_id(&folder, 7, &[9]);
+            assert!(object.0.starts_with("imap2:"));
+            assert!(thread.0.starts_with("imapthread2:"));
+            assert_eq!(
+                decode_object_id(&object, AccountOperation::SyncChanges)
+                    .unwrap()
+                    .folder,
+                folder
+            );
+            assert_eq!(
+                decode_thread_id(&thread, AccountOperation::SyncChanges)
+                    .unwrap()
+                    .folder,
+                folder
+            );
+        }
+    }
+
+    #[test]
+    fn hierarchy_edits_keep_noncanonical_parent_octets() {
+        let parent = MailboxName::from_wire("a".into(), b"&AGE-", false);
+        let child = parent.child('/', "b").unwrap();
+        assert_eq!(child.wire_bytes(false), Some(b"&AGE-/b".as_slice()));
+        let recovered = child.parent('/').unwrap().unwrap();
+        assert_eq!(recovered, parent);
+        assert_eq!(recovered.wire_bytes(false), parent.wire_bytes(false));
+        assert!(parent.child('é', "b").is_err());
+    }
+
+    #[test]
+    fn object_ids_roundtrip_noncanonical_wire_addresses_without_collision() {
+        let a = MailboxName::from_wire("a".into(), b"&AGE-", false);
+        let b = MailboxName::new("a").unwrap();
+        let op = AccountOperation::SyncChanges;
+        let a_id = encode_object_id(&a, 7, 9);
+        assert_ne!(a_id, encode_object_id(&b, 7, 9));
+        let decoded = decode_object_id(&a_id, op).unwrap();
+        assert_eq!(decoded.folder, a);
+        assert_eq!(decoded.folder.wire_bytes(false), Some(b"&AGE-".as_slice()));
+        let controls = MailboxName::from_wire("line\r\nbreak".into(), b"line\r\nbreak", true);
+        let restored = MailboxName::from_account_id(&controls.account_id()).unwrap();
+        assert_eq!(restored.as_str(), controls.as_str());
+        assert_eq!(restored.account_id(), controls.account_id());
+        assert!(restored.can_reencode());
+        let reserved = MailboxName::new("~imap-wire:literal").unwrap();
+        assert_eq!(
+            MailboxName::from_account_id(&reserved.account_id()).unwrap(),
+            reserved
+        );
+    }
+
     use super::*;
 
     #[test]

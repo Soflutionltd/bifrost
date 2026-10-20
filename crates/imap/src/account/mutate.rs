@@ -129,7 +129,7 @@ pub(super) fn mutation_stream(
             match decode_object_id(&id, mutation_operation(&kind)) {
                 Ok(decoded) => {
                     grouped
-                        .entry(decoded.folder.as_str().to_owned())
+                        .entry(decoded.folder.account_id())
                         .or_insert_with(|| (decoded.folder.clone(), Vec::new()))
                         .1
                         .push(decoded);
@@ -247,7 +247,7 @@ async fn flush_mutation_groups(
                 let entry = account.folders.get(&folder);
                 let shared_owner = entry.as_ref().and_then(|entry| entry.shared_owner.as_ref());
                 let account_err = super::error::shared_folder_error(
-                    error.with_attempt(TransmissionState::Unsent),
+                    (*error).with_attempt(TransmissionState::Unsent),
                     &folder,
                     shared_owner,
                     super::error::ImapErrorContext::operation(mutation_operation(kind))
@@ -308,7 +308,7 @@ fn validated_move_destination(kind: &MutationKind) -> Result<Option<MailboxName>
     let MembershipScope::Folder(destination) = destination else {
         return Err(invalid_move_destination_error());
     };
-    MailboxName::new(destination.0.clone())
+    MailboxName::from_account_id(&destination.0)
         .map(Some)
         .map_err(|_| invalid_move_destination_error())
 }
@@ -319,7 +319,7 @@ fn validated_move_destination(kind: &MutationKind) -> Result<Option<MailboxName>
 /// the id vector is still whole, which is what lets the caller move the ids
 /// in rather than clone them for a lane that usually never runs.
 struct FolderMutationFailure {
-    error: crate::Error,
+    error: Box<crate::Error>,
     unaccounted: Vec<DecodedObjectId>,
 }
 
@@ -354,7 +354,7 @@ async fn run_folder_mutation(
         Ok(opened) => opened,
         Err(error) => {
             return Err(FolderMutationFailure {
-                error,
+                error: Box::new(error),
                 unaccounted: ids,
             });
         }
@@ -394,7 +394,7 @@ async fn run_folder_mutation(
                 conn.connection()
                     .uid_move_messages(
                         uid_set.as_sequence_set(),
-                        destination.as_str(),
+                        &destination,
                         account.command_timeout(),
                     )
                     .await
@@ -1007,7 +1007,7 @@ fn concurrency_conflict_error(operation: AccountOperation, folder: &MailboxName)
     .protocol(Protocol::Imap)
     .operation(operation)
     .scope(bifrost_types::ErrorScope::Cursor(
-        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.as_str().to_owned())),
+        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
     ))
     .try_build()
     .expect("valid account error classification")
@@ -1024,7 +1024,7 @@ fn uidvalidity_changed_error(operation: AccountOperation, folder: &MailboxName) 
     .protocol(Protocol::Imap)
     .operation(operation)
     .scope(bifrost_types::ErrorScope::Cursor(
-        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.as_str().to_owned())),
+        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
     ))
     .try_build()
     .expect("valid account error classification")
@@ -1041,7 +1041,7 @@ fn store_failed_error(operation: AccountOperation, folder: &MailboxName) -> Acco
     .protocol(Protocol::Imap)
     .operation(operation)
     .scope(bifrost_types::ErrorScope::Cursor(
-        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.as_str().to_owned())),
+        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
     ))
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
@@ -1156,7 +1156,7 @@ mod tests {
         }
         let names: Vec<_> = sorted_mutation_groups(grouped)
             .into_iter()
-            .map(|(folder, _)| folder.as_str().to_owned())
+            .map(|(folder, _)| folder.account_id())
             .collect();
         assert_eq!(names, ["Archive", "INBOX", "Zeta"]);
     }

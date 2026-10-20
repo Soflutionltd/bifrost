@@ -146,7 +146,7 @@ impl<'conn, T> Pipeline<'conn, T> {
     pipeline_method! {
         /// LIST command (RFC 3501 Section6.3.8).
         fn list(reference: String, pattern: String) -> Result<Vec<MailboxInfo>, Error>;
-        command = Command::List { reference, pattern };
+        command = Command::List { reference: reference.into(), pattern: pattern.into() };
         consumer = dispatch::ListConsumer::new();
     }
 
@@ -172,8 +172,8 @@ impl<'conn, T> Pipeline<'conn, T> {
             dispatch::ListExtendedConsumer::new(filter_extended, selection_options.clone());
         self.commands.push(Command::ListExtended {
             selection_options,
-            reference,
-            patterns,
+            reference: reference.into(),
+            patterns: patterns.into_iter().map(Into::into).collect(),
             return_options,
         });
         self.pending
@@ -193,14 +193,14 @@ impl<'conn, T> Pipeline<'conn, T> {
             pattern: String,
             status_items: String,
         ) -> Result<Vec<(MailboxInfo, Vec<StatusItem>)>, Error>;
-        command = Command::ListStatus { reference, pattern, status_items };
+        command = Command::ListStatus { reference: reference.into(), pattern: pattern.into(), status_items };
         consumer = dispatch::ListStatusConsumer::new();
     }
 
     pipeline_method! {
         /// LSUB command (RFC 3501 Section6.3.9).
         fn lsub(reference: String, pattern: String) -> Vec<MailboxInfo>;
-        command = Command::Lsub { reference, pattern };
+        command = Command::Lsub { reference: reference.into(), pattern: pattern.into() };
         consumer = dispatch::LsubConsumer::default();
     }
 

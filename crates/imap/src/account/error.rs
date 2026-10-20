@@ -103,7 +103,7 @@ impl ImapErrorContext {
     #[must_use]
     pub(crate) fn with_mailbox(mut self, mailbox: &MailboxName) -> Self {
         self.scope = Some(ErrorScope::Mailbox {
-            id: mailbox.as_str().into(),
+            id: mailbox.account_id().into(),
         });
         self
     }
@@ -120,7 +120,7 @@ impl ImapErrorContext {
     #[must_use]
     pub(crate) fn with_folder_scope(mut self, mailbox: &MailboxName) -> Self {
         self.scope = Some(ErrorScope::Cursor(CursorScope::Folder(
-            bifrost_types::FolderId(mailbox.as_str().to_owned()),
+            bifrost_types::FolderId(mailbox.account_id()),
         )));
         self
     }
@@ -474,7 +474,14 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             text,
             code,
             mechanism,
-        } => classify_auth(text, code.as_ref(), *mechanism),
+            attempt,
+        } => {
+            let mut translation = classify_auth(text, code.as_ref(), *mechanism);
+            if let Some(attempt) = attempt {
+                translation.attempt = Some(attempt.transmission_state);
+            }
+            translation
+        }
         Error::AuthPolicy(failure) => {
             let mut t = Translation::new(
                 AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PolicyBlocked),
@@ -488,8 +495,10 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
                 AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PolicyBlocked),
                 Cause::Access(AccessCause::PolicyBlocked),
             );
+            // PREAUTH can make the required upgrade illegal even when the
+            // greeting advertises STARTTLS. Describe the session requirement.
             t.diagnostic_text = Some(DiagnosticText::support_only(
-                "server does not advertise STARTTLS",
+                "required STARTTLS upgrade is unavailable in this session",
             ));
             t
         }

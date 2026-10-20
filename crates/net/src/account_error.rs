@@ -34,13 +34,31 @@ pub struct NetErrorContext {
 
 #[must_use]
 pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
+    let throttle_scope = legacy_throttle_scope(&ctx);
+    into_account_error_with_throttle_scope(error, ctx, throttle_scope)
+}
+
+/// Translate a transport error using the caller's provider throttle policy.
+///
+/// Provider crates know whether a server's throttle should pause an account,
+/// mailbox, or only the current operation. This entry point lets them carry
+/// that decision through net's generic status and local-hold translation.
+/// The compatibility [`into_account_error`] entry point keeps its historical
+/// provider inference until its callers have migrated.
+#[must_use]
+pub fn into_account_error_with_throttle_scope(
+    error: Error,
+    ctx: NetErrorContext,
+    throttle_scope: Option<ThrottleScope>,
+) -> AccountError {
     match error {
         Error::AttemptHistory {
             source,
             attempts,
             may_have_committed,
         } => {
-            let terminal = into_account_error(*source, ctx.clone());
+            let terminal =
+                into_account_error_with_throttle_scope(*source, ctx.clone(), throttle_scope);
             let rejected_unauthorized: Vec<_> = attempts
                 .iter()
                 .map(|attempt| {
@@ -49,7 +67,9 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
                 .collect();
             let previous: Vec<_> = attempts
                 .into_iter()
-                .map(|error| into_account_error(error, ctx.clone()))
+                .map(|error| {
+                    into_account_error_with_throttle_scope(error, ctx.clone(), throttle_scope)
+                })
                 .collect();
             let states: Vec<_> = previous
                 .iter()
@@ -146,7 +166,9 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
             let diagnostics = format!("prior attempts: {attempts:?}");
             let evidence: Vec<_> = attempts
                 .into_iter()
-                .map(|attempt| into_account_error(attempt, ctx.clone()))
+                .map(|attempt| {
+                    into_account_error_with_throttle_scope(attempt, ctx.clone(), throttle_scope)
+                })
                 .collect();
             let states: Vec<_> = evidence
                 .iter()
@@ -173,7 +195,7 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
                 }
             }
             builder = builder.text(DiagnosticText::support_only(diagnostics));
-            if let Some(scope) = throttle_scope(&ctx) {
+            if let Some(scope) = throttle_scope {
                 builder = builder.throttle_scope(scope);
             }
             finish(builder, &ctx)
@@ -213,7 +235,7 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
             code,
             body,
             headers,
-        } => status_error(&ctx, code, &headers, &body, None),
+        } => status_error(&ctx, code, &headers, &body, None, throttle_scope),
         Error::RetryBudgetExhausted {
             final_response,
             retry_after_history,
@@ -224,6 +246,7 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
                 &response.headers,
                 &response.body,
                 retry_after_history.last().copied(),
+                throttle_scope,
             ),
             // DEFENSIVE ARM, unreachable from the retry loop. `request.rs`
             // mints `RetryBudgetExhausted` only from the status branch, always
@@ -257,7 +280,7 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
         Error::RateLimited {
             retry_after,
             final_response,
-        } => rate_limited(&ctx, retry_after, &final_response),
+        } => rate_limited(&ctx, retry_after, &final_response, throttle_scope),
         // KNOWN COARSE: `Cancelled` classifies as Transport(Network) +
         // InFlight, which for a non-idempotent op derives
         // Reconcile(TransportDropAfterSend) and a read-back even when the
@@ -455,6 +478,7 @@ fn rate_limited(
     ctx: &NetErrorContext,
     retry_after: Option<Duration>,
     final_response: &FinalResponse,
+    throttle_scope: Option<ThrottleScope>,
 ) -> AccountError {
     let retry_hint = parse_retry_after_hint(final_response.headers.get(RETRY_AFTER))
         .or_else(|| retry_after.map(RetryHint::After));
@@ -470,7 +494,7 @@ fn rate_limited(
         &final_response.headers,
         &final_response.body,
     );
-    if let Some(scope) = throttle_scope(ctx) {
+    if let Some(scope) = throttle_scope {
         builder = builder.throttle_scope(scope);
     }
     finish(builder, ctx)
@@ -482,6 +506,7 @@ fn status_error(
     headers: &HeaderMap,
     body: &Bytes,
     retry_hint_param: Option<Duration>,
+    throttle_scope: Option<ThrottleScope>,
 ) -> AccountError {
     let code = status.as_u16();
     let retry_hint = parse_retry_after_hint(headers.get(RETRY_AFTER))
@@ -490,7 +515,7 @@ fn status_error(
     let mut builder = base_builder(ctx, kind, cause);
     builder = push_attempt(builder, TransmissionState::Acknowledged);
     builder = response_diagnostics(builder, status, headers, body);
-    if throttle && let Some(scope) = throttle_scope(ctx) {
+    if throttle && let Some(scope) = throttle_scope {
         builder = builder.throttle_scope(scope);
     }
     finish(builder, ctx)
@@ -836,18 +861,12 @@ fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
     }
 }
 
-/// Per-provider throttle-scope coverage is intentionally sparse:
-/// extend the match as providers document their throttle vocabulary.
-/// `None` is the honest answer for providers whose throttling scope is
-/// undocumented - do not invent one.
-///
-/// Microsoft is `Account`, never tenant-wide: its Outlook limits are documented
-/// per app per mailbox, and this layer sees no request target, so the
-/// account is the widest honest answer that names no identity it lacks. A
-/// caller that knows the mailbox (`bifrost-graph`'s REST funnel) stamps that
-/// mailbox's throttle budget on top, and the engine then holds the budget
-/// alone.
-fn throttle_scope(ctx: &NetErrorContext) -> Option<ThrottleScope> {
+/// Preserve the old context-derived behavior for callers of
+/// `into_account_error`. Generic translation has no account-specific identity;
+/// provider funnels should use `into_account_error_with_throttle_scope` and
+/// supply their own documented policy before this compatibility inference can
+/// be retired.
+fn legacy_throttle_scope(ctx: &NetErrorContext) -> Option<ThrottleScope> {
     if ctx.protocol == Protocol::Graph
         || ctx.provider == Some(Provider::Microsoft)
         || ctx.protocol == Protocol::Gmail
@@ -1010,5 +1029,46 @@ mod refresh_deadline_tests {
             panic!("refresh failure must remain retryable");
         };
         assert_eq!(advice.retry_hint, Some(RetryHint::At(at)));
+    }
+}
+
+#[cfg(test)]
+mod explicit_throttle_scope_tests {
+    use super::*;
+
+    #[test]
+    fn caller_policy_overrides_legacy_provider_inference() {
+        let ctx = NetErrorContext {
+            provider: Some(Provider::Microsoft),
+            protocol: Protocol::Graph,
+            operation: AccountOperation::SyncChanges,
+            scope: None,
+        };
+        let error = Error::Status {
+            code: StatusCode::TOO_MANY_REQUESTS,
+            body: Bytes::new(),
+            headers: HeaderMap::new(),
+        };
+
+        let unscoped = into_account_error_with_throttle_scope(error, ctx.clone(), None);
+        assert_eq!(
+            unscoped.telemetry_fields().throttle_scope,
+            None,
+            "an explicit lack of caller policy must not fall back to provider inference"
+        );
+
+        let scoped = into_account_error_with_throttle_scope(
+            Error::Status {
+                code: StatusCode::TOO_MANY_REQUESTS,
+                body: Bytes::new(),
+                headers: HeaderMap::new(),
+            },
+            ctx,
+            Some(ThrottleScope::Mailbox),
+        );
+        assert_eq!(
+            scoped.telemetry_fields().throttle_scope,
+            Some(ThrottleScope::Mailbox)
+        );
     }
 }

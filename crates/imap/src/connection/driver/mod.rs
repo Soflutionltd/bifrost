@@ -826,8 +826,7 @@ async fn dispatch_response_loop(
                         // A tagged NO closes a cancelled SASL exchange. Return
                         // the auth error only after consuming that completion,
                         // so the next command starts on a synchronized stream.
-                        // Error::Auth has no attempt field in the current
-                        // error shape, so with_attempt cannot record the NO.
+                        // Preserve the completed exchange evidence on Auth too.
                         return Err(error.with_attempt(TransmissionState::Acknowledged));
                     }
                     return Err(Error::Protocol(

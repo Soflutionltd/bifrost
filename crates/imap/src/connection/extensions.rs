@@ -303,7 +303,7 @@ impl ImapConnection {
     /// (RFC 5464 Section 1).
     pub async fn get_metadata(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         entries: &[&str],
         max_size: Option<u64>,
         depth: Option<&str>,
@@ -319,7 +319,7 @@ impl ImapConnection {
                 return Err(Error::MissingCapability("METADATA".into()));
             }
         }
-        let mailbox_name = MailboxName::new(mailbox)?;
+        let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::GetMetadata {
             mailbox: mailbox_name.clone(),
             entries: entries.iter().map(|e| (*e).to_owned()).collect(),
@@ -342,7 +342,7 @@ impl ImapConnection {
     /// (RFC 5464 Section 1).
     pub async fn set_metadata(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         entries: &[(&str, Option<&[u8]>)],
         timeout: Duration,
     ) -> Result<(), Error> {
@@ -356,7 +356,7 @@ impl ImapConnection {
                 return Err(Error::MissingCapability("METADATA".into()));
             }
         }
-        let mailbox_name = MailboxName::new(mailbox)?;
+        let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::SetMetadata {
             mailbox: mailbox_name,
             entries: entries
@@ -412,7 +412,7 @@ impl ImapConnection {
     /// Requires the `QUOTA` capability (RFC 2087 Section 5.1).
     pub async fn get_quota_root(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<QuotaRootResponse, Error> {
         self.check_utf8_only_enforced()?;
@@ -423,7 +423,7 @@ impl ImapConnection {
                 return Err(Error::MissingCapability("QUOTA".into()));
             }
         }
-        let mailbox_name = MailboxName::new(mailbox)?;
+        let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::GetQuotaRoot {
             mailbox: mailbox_name.clone(),
         };
@@ -480,7 +480,7 @@ impl ImapConnection {
     /// Requires the `ACL` capability (RFC 4314 Section 1).
     pub async fn set_acl(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         identifier: &str,
         rights: &str,
         timeout: Duration,
@@ -493,7 +493,7 @@ impl ImapConnection {
                 return Err(Error::MissingCapability("ACL".into()));
             }
         }
-        let mailbox_name = MailboxName::new(mailbox)?;
+        let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::SetAcl {
             mailbox: mailbox_name,
             identifier: identifier.to_owned(),
@@ -515,7 +515,7 @@ impl ImapConnection {
     /// Requires the `ACL` capability (RFC 4314 Section 1).
     pub async fn delete_acl(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         identifier: &str,
         timeout: Duration,
     ) -> Result<(), Error> {
@@ -527,7 +527,7 @@ impl ImapConnection {
                 return Err(Error::MissingCapability("ACL".into()));
             }
         }
-        let mailbox_name = MailboxName::new(mailbox)?;
+        let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::DeleteAcl {
             mailbox: mailbox_name,
             identifier: identifier.to_owned(),
@@ -546,7 +546,11 @@ impl ImapConnection {
     /// Returns the list of identifier/rights pairs for the given mailbox.
     ///
     /// Requires the `ACL` capability (RFC 4314 Section 1).
-    pub async fn get_acl(&self, mailbox: &str, timeout: Duration) -> Result<Vec<AclEntry>, Error> {
+    pub async fn get_acl(
+        &self,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
+        timeout: Duration,
+    ) -> Result<Vec<AclEntry>, Error> {
         self.check_utf8_only_enforced()?;
         self.require_state(crate::types::CommandKind::GetAcl)?;
         {
@@ -555,7 +559,7 @@ impl ImapConnection {
                 return Err(Error::MissingCapability("ACL".into()));
             }
         }
-        let mailbox_name = MailboxName::new(mailbox)?;
+        let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::GetAcl {
             mailbox: mailbox_name.clone(),
         };
@@ -574,7 +578,7 @@ impl ImapConnection {
     /// Requires the `ACL` capability (RFC 4314 Section 1).
     pub async fn list_rights(
         &self,
-        mailbox: &str,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
         identifier: &str,
         timeout: Duration,
     ) -> Result<ListRightsResponse, Error> {
@@ -586,7 +590,7 @@ impl ImapConnection {
                 return Err(Error::MissingCapability("ACL".into()));
             }
         }
-        let mailbox_name = MailboxName::new(mailbox)?;
+        let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::ListRights {
             mailbox: mailbox_name.clone(),
             identifier: identifier.to_owned(),
@@ -606,7 +610,11 @@ impl ImapConnection {
     /// Returns the rights string for the current user on the given mailbox.
     ///
     /// Requires the `ACL` capability (RFC 4314 Section 1).
-    pub async fn my_rights(&self, mailbox: &str, timeout: Duration) -> Result<String, Error> {
+    pub async fn my_rights(
+        &self,
+        mailbox: &(impl crate::types::MailboxInput + ?Sized),
+        timeout: Duration,
+    ) -> Result<String, Error> {
         self.check_utf8_only_enforced()?;
         self.require_state(crate::types::CommandKind::MyRights)?;
         {
@@ -615,7 +623,7 @@ impl ImapConnection {
                 return Err(Error::MissingCapability("ACL".into()));
             }
         }
-        let mailbox_name = MailboxName::new(mailbox)?;
+        let mailbox_name = mailbox.mailbox_name()?;
         let cmd = Command::MyRights {
             mailbox: mailbox_name.clone(),
         };

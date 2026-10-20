@@ -128,7 +128,7 @@ pub(crate) fn push_subscribe(
             // concurrent subscribes cannot both admit the last free slot.
             let mut covered: HashSet<String> = subscribed_idle_folders(&subscriptions)
                 .into_iter()
-                .map(|folder| folder.as_str().to_owned())
+                .map(|folder| folder.account_id())
                 .collect();
             let mut accepted = HashSet::new();
             for (item, scope) in expected.iter().cloned().zip(scopes.iter().cloned()) {
@@ -153,7 +153,7 @@ pub(crate) fn push_subscribe(
                 // scope through `MailboxName::new`, which rejects NUL/CR/LF.
                 // Admitting such a name would report it succeeded and burn a
                 // budget slot on a folder no worker can ever SELECT.
-                if crate::types::MailboxName::new(folder.0.clone()).is_err() {
+                if crate::types::MailboxName::from_account_id(&folder.0).is_err() {
                     outcomes.push_failed(item, invalid_folder_name_error());
                     continue;
                 }
@@ -494,10 +494,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                 continue;
             }
         };
-        let selected = match conn
-            .select(folder.as_str(), account.command_timeout())
-            .await
-        {
+        let selected = match conn.select(&folder, account.command_timeout()).await {
             Ok(selected) => selected,
             Err(error) => {
                 drop(conn);
@@ -796,7 +793,7 @@ fn resubscribe_action(
     chosen: Option<&crate::types::MailboxName>,
 ) -> ResubscribeAction {
     match chosen {
-        Some(chosen) if chosen.as_str() == current.as_str() => ResubscribeAction::Reidle,
+        Some(chosen) if chosen == current => ResubscribeAction::Reidle,
         _ => ResubscribeAction::Redial,
     }
 }
@@ -855,12 +852,14 @@ fn subscribed_idle_folders(
         .values()
         .flat_map(|scopes| scopes.iter())
         .filter_map(|scope| match scope {
-            CursorScope::Folder(folder) => crate::types::MailboxName::new(folder.0.clone()).ok(),
+            CursorScope::Folder(folder) => {
+                crate::types::MailboxName::from_account_id(&folder.0).ok()
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
-    folders.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    folders.dedup_by(|left, right| left.as_str() == right.as_str());
+    folders.sort_by_key(crate::types::MailboxName::account_id);
+    folders.dedup_by(|left, right| left == right);
     folders
 }
 
@@ -895,7 +894,7 @@ fn subscribed_idle_folders(
 /// filter (Section 5.2) and we ask for none - the account layer refetches
 /// through the changes stream, so a payload here would be wasted bandwidth
 /// on every flag flip.
-fn notify_params(others: Vec<String>) -> crate::types::NotifySetParams {
+fn notify_params(others: Vec<crate::types::MailboxArgument>) -> crate::types::NotifySetParams {
     let events = || {
         vec![
             crate::types::NotifyEvent::MessageNew {
@@ -923,10 +922,10 @@ async fn register_notify(
     watched: &[crate::types::MailboxName],
     timeout: std::time::Duration,
 ) -> Result<bool, crate::Error> {
-    let others: Vec<String> = watched
+    let others: Vec<crate::types::MailboxArgument> = watched
         .iter()
-        .filter(|folder| folder.as_str() != selected.as_str())
-        .map(|folder| folder.as_str().to_owned())
+        .filter(|folder| *folder != selected)
+        .map(crate::types::MailboxArgument::from)
         .collect();
     if others.is_empty() {
         return Ok(true);
@@ -1352,9 +1351,12 @@ mod tests {
 
         let watched: Vec<String> = subscribed_idle_folders(&scopes)
             .iter()
-            .map(|folder| folder.as_str().to_owned())
+            .map(crate::types::MailboxName::account_id)
             .collect();
-        assert_eq!(watched, vec!["Archive".to_owned(), "Zebra".to_owned()]);
+        assert_eq!(
+            watched,
+            vec![String::from("Archive"), String::from("Zebra")]
+        );
     }
 
     // RFC 5465 Section 5.1 makes FlagChange illegal without MessageNew and
@@ -1364,7 +1366,10 @@ mod tests {
     // but one.
     #[test]
     fn notify_registration_is_legal_for_both_filters() {
-        let params = notify_params(vec!["Archive".to_owned(), "Zebra".to_owned()]);
+        let params = notify_params(vec![
+            crate::types::MailboxArgument::from("Archive"),
+            crate::types::MailboxArgument::from("Zebra"),
+        ]);
         assert!(
             !params.status,
             "the initial STATUS snapshot would invalidate every scope right after subscribe",
@@ -1376,7 +1381,10 @@ mod tests {
         );
         assert_eq!(
             params.event_groups[1].filter,
-            crate::types::MailboxFilter::Mailboxes(vec!["Archive".to_owned(), "Zebra".to_owned()])
+            crate::types::MailboxFilter::Mailboxes(vec![
+                crate::types::MailboxArgument::from("Archive"),
+                crate::types::MailboxArgument::from("Zebra"),
+            ])
         );
         for group in &params.event_groups {
             assert!(

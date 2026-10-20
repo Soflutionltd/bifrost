@@ -58,14 +58,14 @@ pub enum MailboxFilter {
     ///
     /// Must contain at least one mailbox name per ABNF
     /// `one-or-more-mailbox` (RFC 5465 Section 8).
-    Subtree(Vec<String>),
+    Subtree(Vec<super::MailboxArgument>),
 
     /// `mailboxes <mailbox> ...`  -  one or more explicitly named mailboxes,
     /// no wildcard expansion (RFC 5465 Section 6.7).
     ///
     /// Must contain at least one mailbox name per ABNF
     /// `one-or-more-mailbox` (RFC 5465 Section 8).
-    Mailboxes(Vec<String>),
+    Mailboxes(Vec<super::MailboxArgument>),
 }
 
 /// An event type that can be requested in a NOTIFY command

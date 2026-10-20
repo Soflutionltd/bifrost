@@ -183,8 +183,11 @@ fn inventory_stream_from(
                     // not per-object removals. A tombstone cannot be encoded
                     // as a live entry without asserting the deleted object is
                     // present; ScopeChange::Removed belongs to changes_stream.
-                    // Forwarding inventory tombstones needs a shared event and
-                    // engine contract that can represent them.
+                    // InventoryFusion turns entries into Created signals and
+                    // has no removed-id lane, so a warning cannot make this
+                    // deletion durable either. Forwarding inventory tombstones
+                    // needs a shared event and engine contract that carries
+                    // removals through to consumers.
                     if is_mail_scope(&scope)
                         && let Some(id) = value.get("id").and_then(Value::as_str) {
                         removed_etag_ids.push(super::foreign::encode_message_id(&scope, id).0);

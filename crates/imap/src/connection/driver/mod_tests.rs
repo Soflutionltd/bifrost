@@ -229,7 +229,7 @@ fn group_splits_distinct_kinds_that_share_an_untagged_response() {
                 items: "(MESSAGES)".into(),
             },
             Command::ListStatus {
-                reference: String::new(),
+                reference: String::new().into(),
                 pattern: "*".into(),
                 status_items: "(MESSAGES)".into(),
             },

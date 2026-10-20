@@ -34,13 +34,28 @@ pub struct JmapAccountFactory {
 }
 
 // pub: returned by JmapAccountFactory::builder for open-time configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct JmapAccountFactoryBuilder {
     url: String,
     credentials: JmapCredentials,
+    net: Option<bifrost_net::Net>,
     timeout: Option<Duration>,
     accept_invalid_certs: bool,
     reconnect_policy: ReconnectPolicy,
+}
+
+impl std::fmt::Debug for JmapAccountFactoryBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Net has no Debug implementation; only expose whether one was supplied.
+        f.debug_struct("JmapAccountFactoryBuilder")
+            .field("url", &self.url)
+            .field("credentials", &self.credentials)
+            .field("net", &self.net.as_ref().map(|_| "<injected>"))
+            .field("timeout", &self.timeout)
+            .field("accept_invalid_certs", &self.accept_invalid_certs)
+            .field("reconnect_policy", &self.reconnect_policy)
+            .finish()
+    }
 }
 
 // pub: caller-supplied auth material for constructing a JMAP AccountFactory.
@@ -87,6 +102,16 @@ impl JmapAccountFactory {
     ) -> JmapAccountFactoryBuilder {
         JmapAccountFactoryBuilder::new(url, credentials)
     }
+
+    /// Use an application-owned transport for JMAP HTTP requests.
+    ///
+    /// Its HTTP TLS settings come from this Net. WebSocket TLS is configured
+    /// separately by `accept_invalid_certs` when WebSocket support is enabled.
+    #[must_use]
+    pub fn with_net(mut self, net: bifrost_net::Net) -> Self {
+        self.config = self.config.with_net(net);
+        self
+    }
 }
 
 impl JmapAccountFactoryBuilder {
@@ -103,10 +128,23 @@ impl JmapAccountFactoryBuilder {
                 }
                 credentials => credentials,
             },
+            net: None,
             timeout: None,
             accept_invalid_certs: false,
             reconnect_policy: ReconnectPolicy::default(),
         }
+    }
+
+    /// Use an application-owned transport for JMAP HTTP requests.
+    ///
+    /// If omitted, the factory selects the process-shared transport for
+    /// `accept_invalid_certs`. The supplied Net controls HTTP TLS; WebSocket
+    /// TLS is configured separately by `accept_invalid_certs` when WebSocket
+    /// support is enabled.
+    #[must_use]
+    pub fn with_net(mut self, net: bifrost_net::Net) -> Self {
+        self.net = Some(net);
+        self
     }
 
     #[must_use]
@@ -865,6 +903,9 @@ async fn connect(
         .credentials(config.credentials.into_client_credentials())
         .net_account_id(account_id)
         .accept_invalid_certs(config.accept_invalid_certs);
+    if let Some(net) = config.net {
+        builder = builder.net(net);
+    }
     if let Some(timeout) = config.timeout {
         builder = builder.timeout(timeout);
     }
@@ -921,6 +962,39 @@ mod tests {
 
     use crate::core::session::Session;
     use crate::core::transport::TransportError;
+
+    #[test]
+    fn factory_accepts_an_application_net() {
+        let net =
+            bifrost_net::Net::new(bifrost_net::NetConfig::default()).expect("custom Net builds");
+        let witness = net.attach_account(
+            bifrost_net::AccountId("factory-net-witness".to_owned()),
+            bifrost_net::AccountSpec::new(None),
+        );
+        let credentials = JmapCredentials::Basic {
+            username: "user".to_owned(),
+            password: "secret".to_owned(),
+        };
+        let factories = [
+            JmapAccountFactory::new("https://jmap.test", credentials.clone()).with_net(net.clone()),
+            JmapAccountFactory::builder("https://jmap.test", credentials)
+                .with_net(net.clone())
+                .build(),
+        ];
+
+        for (index, factory) in factories.into_iter().enumerate() {
+            let attached = factory
+                .config
+                .net
+                .as_ref()
+                .expect("factory retained injected Net")
+                .attach_account(
+                    bifrost_net::AccountId(format!("factory-net-{index}")),
+                    bifrost_net::AccountSpec::new(None),
+                );
+            assert!(attached.shares_transport_with(&witness));
+        }
+    }
 
     /// Scripted JMAP HTTP boundary with the same contract as
     /// `ReqwestTransport`.

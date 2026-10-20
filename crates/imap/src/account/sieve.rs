@@ -265,6 +265,7 @@ async fn open_client(
         &account.config.credentials,
         &account.config.auth_policy,
         account.bandwidth_budget.clone(),
+        account.pool.sieve_meter(),
     )
     .await
     .map_err(to_acct_err(op))
@@ -308,6 +309,7 @@ impl ManageSieveClient {
         credentials: &Credentials,
         policy: &AuthPolicy,
         budget: bifrost_net::BandwidthBudget,
+        sink: Option<bifrost_net::MeterSinkHandle>,
     ) -> Result<Self, Error> {
         validate_tls_server_name(&config.host)?;
         let tcp = tokio::time::timeout(
@@ -321,7 +323,11 @@ impl ManageSieveClient {
         } else {
             SieveTransport::Plain(tcp)
         };
-        let mut stream = SieveStream { transport, budget };
+        let mut stream = SieveStream {
+            transport,
+            budget,
+            sink,
+        };
         let mut capabilities = read_response(&mut stream, config.command_timeout)
             .await?
             .ensure_ok()?
@@ -606,6 +612,7 @@ fn validate_tls_server_name(host: &str) -> Result<(), Error> {
 struct SieveStream {
     transport: SieveTransport,
     budget: bifrost_net::BandwidthBudget,
+    sink: Option<bifrost_net::MeterSinkHandle>,
 }
 
 enum SieveTransport {
@@ -668,7 +675,8 @@ async fn write_command(
     timeout: Duration,
     bytes: &[u8],
 ) -> Result<(), Error> {
-    let mut stream = bifrost_net::MeteredStream::new(&mut stream.transport, stream.budget.clone());
+    let mut stream = bifrost_net::MeteredStream::new(&mut stream.transport, stream.budget.clone())
+        .with_meter_sink(stream.sink.clone());
     tokio::time::timeout(timeout, async {
         stream.write_all(bytes).await?;
         stream.flush().await
@@ -759,6 +767,7 @@ fn metered_reader(
         },
         stream.budget.clone(),
     )
+    .with_meter_sink(stream.sink.clone())
 }
 
 fn peer_read_error(error: std::io::Error) -> Error {
@@ -1109,12 +1118,17 @@ mod tests {
     async fn bandwidth_sieve_charges_the_account_and_excludes_admission_from_peer_timeout() {
         use bifrost_net::{BandwidthBudget, BandwidthDirection};
         use tokio::time::Instant;
+        let meter = bifrost_net::BandwidthMeter::new();
+        let id = bifrost_net::AccountId("sieve".to_owned());
+        meter.register_account(id.clone());
+        let observed = meter.account(id);
         let budget = BandwidthBudget::new(Some(4));
         budget.admit(BandwidthDirection::Inbound, 4).await.finish(4);
         let (client, mut peer) = tokio::io::duplex(64);
         let mut stream = SieveStream {
             transport: SieveTransport::Memory(client),
             budget: budget.clone(),
+            sink: Some(observed.sink_handle()),
         };
         peer.write_all(b"OK\r\n").await.unwrap();
         let start = Instant::now();
@@ -1134,6 +1148,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(start.elapsed(), Duration::from_millis(1500));
+        assert_eq!(observed.bytes_in(), 4);
+        assert_eq!(observed.bytes_out(), 6);
         let next = budget.reserve(BandwidthDirection::Outbound, 4);
         assert_eq!(
             next.ready_at().duration_since(Instant::now()),
@@ -1147,6 +1163,7 @@ mod tests {
         let mut stream = SieveStream {
             transport: SieveTransport::Memory(client),
             budget: bifrost_net::BandwidthBudget::default(),
+            sink: None,
         };
         let writer = tokio::spawn(async move {
             for byte in b"OK\r\n" {

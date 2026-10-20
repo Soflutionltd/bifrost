@@ -14,6 +14,26 @@
 use quick_xml::escape::unescape;
 use reqwest::Url;
 
+/// Opaque lookup key for equivalent DAV href spellings.
+///
+/// This key is for matching only. Callers must keep the href they received or
+/// persisted as the native id; rewriting ids to this key would change account
+/// identities and cursor contents.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DavHrefKey(HrefIdentity);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum HrefIdentity {
+    Url {
+        scheme: String,
+        host: Option<String>,
+        port: Option<u16>,
+        segments: Vec<String>,
+        query: Option<String>,
+    },
+    Raw(String),
+}
+
 /// The local part of a namespaced XML name (`D:href` -> `href`).
 #[must_use]
 pub fn local_name(full: &str) -> String {
@@ -78,7 +98,7 @@ pub fn trimmed(text: &str) -> Option<String> {
     }
 }
 
-/// Compare two DAV URLs for resource identity.
+/// Build an equivalence key for comparing hrefs without changing their ids.
 ///
 /// A byte comparison after trimming a trailing slash reads two spellings of the
 /// SAME resource as different ones: percent-encoding (`/My%20Cal/` against
@@ -91,22 +111,34 @@ pub fn trimmed(text: &str) -> Option<String> {
 /// conflict.
 ///
 /// Path segments are decoded and compared one by one rather than as one string,
-/// so an encoded separator (`%2F`) stays distinct from a real one. Query and
-/// fragment are compared verbatim; anything that will not parse as an absolute
-/// URL falls back to the old slash-trimmed byte comparison.
+/// so an encoded separator (`%2F`) stays distinct from a real one. The query is
+/// compared verbatim and a fragment is ignored because it is not sent to the
+/// server. Anything that will not parse as an absolute URL falls back to the
+/// old slash-trimmed byte comparison. Segment decoding retains the existing
+/// lossy UTF-8 rule: distinct invalid octets such as `%FF` and `%FE` can share
+/// a key. Changing that would alter the established mutation identity rule, so
+/// this comparison index does not silently introduce a separate one.
+#[must_use]
+pub fn dav_href_key(href: &str) -> DavHrefKey {
+    match Url::parse(href) {
+        Ok(url) => DavHrefKey(HrefIdentity::Url {
+            scheme: url.scheme().to_string(),
+            host: url.host_str().map(str::to_ascii_lowercase),
+            port: url.port_or_known_default(),
+            segments: decoded_path_segments(url.path()),
+            query: url.query().map(str::to_string),
+        }),
+        Err(_) => DavHrefKey(HrefIdentity::Raw(href.trim_end_matches('/').to_string())),
+    }
+}
+
+/// Compare two DAV URLs for resource identity.
+///
+/// Equality shares the lookup key used by snapshots and sync reports, so a
+/// spelling equivalence cannot drift between mutation routing and polling.
 #[must_use]
 pub fn same_dav_url(left: &str, right: &str) -> bool {
-    match (Url::parse(left), Url::parse(right)) {
-        (Ok(left), Ok(right)) => {
-            left.scheme() == right.scheme()
-                && left.host_str().map(str::to_ascii_lowercase)
-                    == right.host_str().map(str::to_ascii_lowercase)
-                && left.port_or_known_default() == right.port_or_known_default()
-                && decoded_path_segments(left.path()) == decoded_path_segments(right.path())
-                && left.query() == right.query()
-        }
-        _ => left.trim_end_matches('/') == right.trim_end_matches('/'),
-    }
+    dav_href_key(left) == dav_href_key(right)
 }
 
 /// Percent-decode each path segment, dropping the empty trailing segment a

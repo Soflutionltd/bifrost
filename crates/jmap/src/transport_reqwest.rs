@@ -37,21 +37,41 @@ impl ReqwestTransport {
         accept_invalid_certs: bool,
         trusted_hosts: Arc<HashSet<String>>,
     ) -> Result<Self, TransportError> {
+        Self::new_with_net(
+            headers,
+            authorization,
+            account_id,
+            timeout,
+            accept_invalid_certs,
+            trusted_hosts,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_net(
+        headers: header::HeaderMap,
+        authorization: Authorization,
+        account_id: AccountId,
+        timeout: Duration,
+        accept_invalid_certs: bool,
+        trusted_hosts: Arc<HashSet<String>>,
+        injected_net: Option<Net>,
+    ) -> Result<Self, TransportError> {
         let redirect_policy = redirect_policy_from_trusted_hosts(&trusted_hosts);
         let token_source = authorization.account_token_source();
         let mut spec = AccountSpec::new(Some(token_source));
         spec.request_timeout = Some(timeout);
         spec.user_agent = concat!("bifrost-jmap/", env!("CARGO_PKG_VERSION")).to_string();
         spec.follow_redirects = FollowRedirects::Enabled(redirect_policy);
-        // TLS trust lives on the reqwest client, so it selects WHICH
-        // shared client this account attaches to rather than being a
-        // per-account setting. Accounts opting into invalid
-        // certificates share one client among themselves; everything
-        // else shares the default. Discarding the flag here would
-        // leave a self-signed deployment failing every HTTP request
-        // while its WebSocket - which builds its own TLS connector -
-        // succeeded, so the option would appear to work and not.
-        let net = Net::shared_for_tls(accept_invalid_certs).attach_account(account_id, spec);
+        // TLS trust belongs to the Net's reqwest client, not AccountSpec.
+        // Without an injected Net, choose the process-shared client matching
+        // the factory's TLS setting. With one, the supplied Net owns HTTP
+        // trust and process coordination; accept_invalid_certs still controls
+        // the separately built WebSocket TLS connection when that support is
+        // enabled.
+        let net = injected_net
+            .unwrap_or_else(|| Net::shared_for_tls(accept_invalid_certs))
+            .attach_account(account_id, spec);
 
         Ok(Self {
             net,
@@ -76,6 +96,11 @@ impl ReqwestTransport {
     #[cfg(feature = "websockets")]
     pub(crate) fn bandwidth_budget(&self) -> bifrost_net::BandwidthBudget {
         self.net.bandwidth_budget().clone()
+    }
+
+    #[cfg(feature = "websockets")]
+    pub(crate) fn websocket_meter(&self) -> bifrost_net::MeterSinkHandle {
+        self.net.meter().sink_handle()
     }
 
     pub(crate) fn set_bandwidth_cap(&self, bps: Option<u64>) {
@@ -538,6 +563,29 @@ mod tests {
         .expect("second transport builds");
 
         assert!(first.net.shares_transport_with(&second.net));
+    }
+
+    #[test]
+    fn injected_net_is_used_for_the_jmap_account_attachment() {
+        let net = Net::new(bifrost_net::NetConfig::default()).expect("custom Net builds");
+        let witness = net.attach_account(
+            AccountId("injected-witness".to_owned()),
+            AccountSpec::new(None),
+        );
+        let account_id = AccountId("jmap-injected".to_owned());
+        let transport = ReqwestTransport::new_with_net(
+            header::HeaderMap::new(),
+            Authorization::from_credentials_for_test(Credentials::basic("user", "secret")),
+            account_id.clone(),
+            Duration::from_secs(30),
+            false,
+            Arc::new(HashSet::new()),
+            Some(net),
+        )
+        .expect("transport builds with injected Net");
+
+        assert_eq!(transport.net.account(), &account_id);
+        assert!(transport.net.shares_transport_with(&witness));
     }
 
     fn scripted_transport(script: &Arc<ScriptedDispatch>) -> ReqwestTransport {

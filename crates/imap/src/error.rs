@@ -61,17 +61,13 @@ pub(crate) enum Error {
     /// support-only diagnostic text - `AuthPolicyFailure` covers the same
     /// question on the LOCAL-policy path only.
     ///
-    /// Transmission evidence is not currently stored on this variant. The
-    /// driver does stamp authentication failures after the SASL exchange, but
-    /// `with_attempt` cannot preserve it here. Adding that state also requires
-    /// the account translation match to accept the new field and keep using
-    /// `Error::attempt()`; changing only this enum would leave that match
-    /// non-exhaustive.
+    /// Transmission evidence is stamped by the driver after the SASL exchange.
     #[error("authentication failed: {text}")]
     Auth {
         text: String,
         code: Option<ResponseCode>,
         mechanism: Option<&'static str>,
+        attempt: Option<ImapAttempt>,
     },
 
     /// Server returned a NO response to a command (RFC 3501 Section 7.1.2).
@@ -331,13 +327,15 @@ impl PartialEq for Error {
                     text: t1,
                     code: c1,
                     mechanism: m1,
+                    attempt: a1,
                 },
                 Self::Auth {
                     text: t2,
                     code: c2,
                     mechanism: m2,
+                    attempt: a2,
                 },
-            ) => t1 == t2 && c1 == c2 && m1 == m2,
+            ) => t1 == t2 && c1 == c2 && m1 == m2 && a1 == a2,
             (
                 Self::No {
                     text: t1,
@@ -563,6 +561,17 @@ impl Error {
     pub(crate) fn with_attempt(self, state: TransmissionState) -> Self {
         let attempt = Some(ImapAttempt::new(state));
         match self {
+            Self::Auth {
+                text,
+                code,
+                mechanism,
+                ..
+            } => Self::Auth {
+                text,
+                code,
+                mechanism,
+                attempt,
+            },
             Self::Io { source, .. } => Self::Io { source, attempt },
             Self::Timeout { .. } => Self::Timeout { attempt },
             Self::Closed { .. } => Self::Closed { attempt },
@@ -594,7 +603,8 @@ impl Error {
     /// Read out attempt evidence, if any.
     pub(crate) fn attempt(&self) -> Option<TransmissionState> {
         match self {
-            Self::Io { attempt, .. }
+            Self::Auth { attempt, .. }
+            | Self::Io { attempt, .. }
             | Self::Timeout { attempt }
             | Self::Closed { attempt }
             | Self::Bye { attempt, .. }
@@ -640,6 +650,7 @@ impl Error {
             text,
             code,
             mechanism: None,
+            attempt: None,
         }
     }
 
@@ -658,6 +669,7 @@ impl Error {
             text,
             code,
             mechanism: Some(mechanism),
+            attempt: None,
         }
     }
 

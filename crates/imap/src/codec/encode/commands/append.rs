@@ -7,7 +7,7 @@
 //! is made from live state and cannot go stale while the command is queued.
 
 use super::{
-    CommandWriter, encode_mailbox_str, validate_and_filter_flags, validate_append_datetime,
+    CommandWriter, encode_mailbox_argument, validate_and_filter_flags, validate_append_datetime,
 };
 use crate::codec::encode::{EncodeOptions, LiteralForm};
 use crate::types::response::Capability;
@@ -57,7 +57,7 @@ enum BodyForm {
 pub(crate) fn encode_append(
     w: &mut CommandWriter,
     tag: &str,
-    mailbox: &str,
+    mailbox: &crate::types::MailboxArgument,
     messages: &[AppendMessage],
     multi: bool,
     opts: &EncodeOptions,
@@ -86,7 +86,7 @@ pub(crate) fn encode_append(
             // under UTF-8 mode the mailbox may be a quoted string.
             w.raw(tag.as_bytes());
             w.raw(b" APPEND ");
-            w.string(encode_mailbox_str(mailbox, utf8).as_bytes(), utf8);
+            w.string(&encode_mailbox_argument(mailbox, utf8)?, utf8);
         } else if wrapper {
             // RFC 6855 Section 4: close the previous message's UTF8 group.
             w.raw(b")");

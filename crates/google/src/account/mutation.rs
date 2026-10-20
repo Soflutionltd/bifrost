@@ -940,7 +940,12 @@ fn is_not_found(error: &GmailError) -> bool {
     // absent label: batchModify supplies no per-id result, so singleton
     // classification can be wrong if Gmail uses 404 for either resource.
     // Keep this ambiguity visible until a provider contract or captured
-    // response establishes a safe way to distinguish them.
+    // response establishes a safe way to distinguish them. The current REST
+    // reference (https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/batchModify)
+    // documents the label lists and empty success response, but no error
+    // contract identifying which resource a 404 names. A canned missing-label
+    // test would merely encode our guess, so it cannot justify changing this
+    // predicate or the shared 128-request budget.
     account_error::response_parts(error).is_some_and(|(status, _)| status == 404)
 }
 

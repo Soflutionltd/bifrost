@@ -617,7 +617,7 @@ pub(crate) fn shared_folder_is_selectable(
 
 #[derive(Default)]
 pub(crate) struct FolderRegistry {
-    by_name: RwLock<HashMap<String, Arc<FolderEntry>>>,
+    by_name: RwLock<HashMap<MailboxName, Arc<FolderEntry>>>,
 }
 
 impl FolderRegistry {
@@ -659,9 +659,9 @@ impl FolderRegistry {
     pub(crate) fn ingest_shared(&self, shared: Vec<SharedFolderEntry>) {
         let mut map = self.by_name.write().expect("folder registry lock poisoned");
         for shared in shared {
-            let name = shared.info.name.as_str().to_owned();
+            let name = shared.info.name.clone();
             if map.contains_key(&name)
-                && !shared_overrides_personal(&name, &shared.namespace_prefix)
+                && !shared_overrides_personal(name.as_str(), &shared.namespace_prefix)
             {
                 continue;
             }
@@ -696,13 +696,11 @@ impl FolderRegistry {
     /// UIDVALIDITY epoch, so nothing else about a surviving entry changes.
     pub(crate) fn replace_personal(&self, folders: Vec<MailboxInfo>) {
         let mut map = self.by_name.write().expect("folder registry lock poisoned");
-        let listed: std::collections::HashSet<String> = folders
-            .iter()
-            .map(|info| info.name.as_str().to_owned())
-            .collect();
+        let listed: std::collections::HashSet<MailboxName> =
+            folders.iter().map(|info| info.name.clone()).collect();
         map.retain(|name, entry| entry.shared_owner.is_some() || listed.contains(name));
         for info in folders {
-            let name = info.name.as_str().to_owned();
+            let name = info.name.clone();
             if let Some(existing) = map.get(&name) {
                 // A retained SHARED entry keeps its own listing: its
                 // selectability is derived from MYRIGHTS, which a personal
@@ -721,13 +719,13 @@ impl FolderRegistry {
         map.clear();
         for info in folders {
             let entry = Arc::new(FolderEntry::from_mailbox(info));
-            map.insert(entry.name.as_str().to_owned(), entry);
+            map.insert(entry.name.clone(), entry);
         }
     }
 
     pub(crate) fn apply_mailbox_event(&self, info: MailboxInfo) {
-        let name = info.name.as_str().to_owned();
-        let old_name = info.old_name.as_ref().map(|name| name.as_str().to_owned());
+        let name = info.name.clone();
+        let old_name = info.old_name.clone();
         let deleted = info
             .attributes
             .iter()
@@ -791,7 +789,7 @@ impl FolderRegistry {
         self.by_name
             .read()
             .expect("folder registry lock poisoned")
-            .get(folder.as_str())
+            .get(folder)
             .cloned()
     }
 
@@ -845,6 +843,32 @@ impl FolderRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registry_keeps_distinct_wire_addresses_with_the_same_display() {
+        let a = MailboxName::from_wire("a".into(), b"&AGE-", false);
+        let b = MailboxName::new("a").unwrap();
+        let registry = FolderRegistry::from_list(vec![
+            MailboxInfo {
+                name: a.clone(),
+                ..Default::default()
+            },
+            MailboxInfo {
+                name: b.clone(),
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(registry.entries().len(), 2);
+        registry.get(&a).unwrap().record_modseq(1, 7, 99).unwrap();
+        assert_eq!(registry.get(&b).unwrap().modseq(1, 7), None);
+        registry.apply_mailbox_event(MailboxInfo {
+            name: a.clone(),
+            attributes: vec![MailboxAttribute::NonExistent],
+            ..Default::default()
+        });
+        assert!(registry.get(&a).is_none());
+        assert!(registry.get(&b).is_some());
+    }
+
     use super::*;
 
     /// A shared-namespace discovery entry owned by `alice`, optionally

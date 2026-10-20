@@ -268,9 +268,19 @@ async fn run_inventory(
 
     let known_uids = CompactUidSet::from_uids(known);
     let cursor = account.cursor_from_select(&selected.mailbox, Some(known_uids))?;
-    account.folders.set_cursor(&folder, cursor.clone());
+    finish_inventory(&account.folders, &folder, cursor, batch_items, &tx).await?;
+    Ok(())
+}
+
+async fn finish_inventory(
+    folders: &super::folder_registry::FolderRegistry,
+    folder: &MailboxName,
+    cursor: super::FolderCursor,
+    batch_items: Vec<InventoryEntry>,
+    tx: &tokio::sync::mpsc::Sender<SyncEvent<InventoryEntry>>,
+) -> Result<(), ChannelDropped> {
     let checkpoint = Some(Checkpoint::Change(encode_cursor(
-        folder_scope(&folder),
+        folder_scope(folder),
         &cursor,
     )));
     if batch_items.is_empty() {
@@ -285,6 +295,8 @@ async fn run_inventory(
             .await
             .map_err(|_| ChannelDropped)?;
     }
+    // Commit only after the consumer channel accepted the checkpoint.
+    folders.set_cursor(folder, cursor);
     Ok(())
 }
 
@@ -425,6 +437,62 @@ mod tests {
                 account.take_qresync_negotiation_warning().is_none(),
                 "a delivered warning must not be re-reported per folder",
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn inventory_cursor_waits_for_terminal_checkpoint_admission() {
+        use super::super::folder_registry::{CompactUidSet, FolderRegistry};
+        for has_items in [false, true] {
+            let folder = folder();
+            let folders = FolderRegistry::from_list(vec![crate::types::MailboxInfo {
+                name: folder.clone(),
+                ..Default::default()
+            }]);
+            let cursor = super::super::FolderCursor::Basic {
+                uidvalidity: 7,
+                uidnext: 2,
+                known_uids: CompactUidSet::from_uids([1]),
+            };
+            let items = if has_items {
+                vec![fetch_to_inventory(
+                    &folder,
+                    7,
+                    FetchResponse {
+                        uid: Some(1),
+                        ..Default::default()
+                    },
+                    None,
+                )]
+            } else {
+                Vec::new()
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            // Empty inventory blocks on Done; nonempty inventory admits the
+            // final batch and then blocks on Done. Neither may commit yet.
+            if !has_items {
+                tx.send(SyncEvent::Done(None)).await.unwrap();
+            }
+            let mut finish = Box::pin(super::finish_inventory(
+                &folders, &folder, cursor, items, &tx,
+            ));
+            assert!(futures::poll!(finish.as_mut()).is_pending());
+            assert!(folders.get(&folder).unwrap().cursor().is_none());
+            drop(rx);
+            assert!(finish.await.is_err());
+            assert!(folders.get(&folder).unwrap().cursor().is_none());
+            let cursor = super::super::FolderCursor::Basic {
+                uidvalidity: 7,
+                uidnext: 2,
+                known_uids: CompactUidSet::from_uids([1]),
+            };
+            let (tx, _rx) = tokio::sync::mpsc::channel(2);
+            assert!(
+                super::finish_inventory(&folders, &folder, cursor.clone(), Vec::new(), &tx)
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(folders.get(&folder).unwrap().cursor(), Some(cursor));
         }
     }
 

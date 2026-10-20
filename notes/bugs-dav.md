@@ -17,20 +17,11 @@ Filed from the October 2026 defect hunt: the DAV scope, plus DAV findings
 from the net, types and sync adoption scopes. Several were reported
 independently by more than one scope; each entry says which.
 
-## DAV-007 - Full snapshot diff and failed-href preservation still compare member identity by bytes
+## DAV-016 - The URL identity key decodes path segments with lossy UTF-8
 
-Residue: sync reports now match equivalent URL spellings. The snapshot diff and
-the failed-href preservation still compare by bytes, so a server changing a
-member's spelling between listings can misclassify it. Canonicalising once at
-`resolve_href` was declined because it also changes listing, hydration and
-persisted identities; a migration-aware decision is needed.
+Lateral from the href-key work. The identity rule shared by `same_dav_url`, the
+sync-report lane, snapshot diffs and failed-href preservation decodes
+percent-encoded path segments lossily, so `%FF` and `%FE` produce the same key.
+Left unchanged because changing it also changes the established mutation
+identity matching; the evidence is documented at the key implementation.
 
-## DAV-015 - Smaller DAV observations after the dispatch fix
-
-- Transmission history is not aggregated across redirect hops, so a retry
-  chain split by a redirect loses `may_have_committed` evidence.
-- The CardDAV parser comment cites RFC 6352 section 6.3.2 for the truncation
-  rule; it lives in section 8.6.2.
-- The outer request timeout sets its `sent` flag before net admission, so expiry
-  while waiting for admission can report `InFlight` transmission evidence for a
-  request that was never dispatched.

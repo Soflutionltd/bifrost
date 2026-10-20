@@ -543,7 +543,37 @@ task stored behind a shared completion: dropping a close future before its
 first poll starts nothing, while dropping one after its first poll does not
 cancel shutdown and later callers await the same result.
 
-`JmapAccountFactory` carries a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic`/`Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client`, passing the engine account id into the `bifrost-net` attachment so metering / priority / caps / trace use the real key on reopen. Open resolves the primary `Mail` account plus the optional `Submission`/`VacationResponse`/`Quota`/`Sieve`/`Contacts`/`Calendars` handles through `resolve_optional_families` (which gates each on its own capability block's lane; see "Absent, Malformed, Present" above), reads the session, and then runs `validate_and_seed`: the session-only half of the capability validation (`capabilities::validate_session` - the core block's lane and its mandatory limits, plus the required mail block's lane) FIRST, and only then the initial `Email/get` and `Mailbox/get` (including names) probes, batched into one request for the primary and one request per foreign account. The order is load-bearing, not incidental: validation used to run only inside `capabilities::build`, after the whole seeding stage, so an open destined to be refused as a contract violation first spent two primary probes plus one per share against a server already known non-conformant and discarded every answer. The half of the validation that genuinely needs probe results - the `PimSupport` gates, which depend on which shares actually seeded - stays in `build`, which still calls `validate_session` itself so the refusal does not depend on the caller having run it. `build` then produces `AccountCapabilities` + `CoreLimits`. It spawns the WebSocket reader with a `CancellationToken`, and returns `OpenedAccount` (the handle plus the foreign-account skip lane; see Foreign accounts below).
+`JmapAccountFactory` carries a `JmapAccountFactoryBuilder` config (URL,
+`JmapCredentials::Basic`/`Bearer`, optional `Net` via `with_net`, timeout,
+`accept_invalid_certs`, `ReconnectPolicy`). `with_net` is available on both the
+factory and builder and supplies the HTTP transport used for every open.
+Without it, HTTP attaches to `Net::shared_for_tls(accept_invalid_certs)`.
+The factory's `accept_invalid_certs` setting also configures the separately
+built WebSocket TLS connection when WebSocket support is enabled; when a
+custom Net is supplied, its HTTP trust settings come from that Net.
+
+`AccountFactory::open(account_id)` connects a `Client`, passing the engine
+account id into the `bifrost-net` attachment so metering / priority / caps /
+trace use the real key on reopen. Open resolves the primary `Mail` account
+plus the optional `Submission`/`VacationResponse`/`Quota`/`Sieve`/`Contacts`/
+`Calendars` handles through `resolve_optional_families` (which gates each on
+its own capability block's lane; see "Absent, Malformed, Present" above),
+reads the session, and then runs `validate_and_seed`: the session-only half
+of the capability validation (`capabilities::validate_session` - the core
+block's lane and its mandatory limits, plus the required mail block's lane)
+FIRST, and only then the initial `Email/get` and `Mailbox/get` (including
+names) probes, batched into one request for the primary and one request per
+foreign account. The order is load-bearing, not incidental: validation used
+to run only inside `capabilities::build`, after the whole seeding stage, so an
+open destined to be refused as a contract violation first spent two primary
+probes plus one per share against a server already known non-conformant and
+discarded every answer. The half of the validation that genuinely needs
+probe results - the `PimSupport` gates, which depend on which shares actually
+seeded - stays in `build`, which still calls `validate_session` itself so the
+refusal does not depend on the caller having run it. `build` then produces
+`AccountCapabilities` + `CoreLimits`. It spawns the WebSocket reader with a
+`CancellationToken`, and returns `OpenedAccount` (the handle plus the
+foreign-account skip lane; see Foreign accounts below).
 
 The batch is conditional on the session's own numbers. `maxCallsInRequest` and `maxSizeRequest` are hard limits (RFC 8620 §2) the server enforces by rejecting the whole request with a request-level `limit` error, and the commonly quoted 16 calls is the minimum a server is *recommended* to support, never a floor a client may assume. So `batched_open_probes` sends the two-call batch only when the advertised call count allows it and `Request::send_methods_within` finds the encoded request inside `maxSizeRequest`; otherwise nothing is sent and the probes go out one request each. `send_methods_within` takes the size limit as a required argument (and returns `Ok(None)` without sending when the batch does not fit) precisely so a future batching call site cannot forget the question.
 
@@ -629,7 +659,8 @@ The WebSocket transport wraps its established TCP/TLS stream in
 Both directions share the JMAP transport's `AccountNet` budget with HTTP under
 the same registry account id. Admission happens below framing: frame headers,
 control frames, message payloads and the HTTP upgrade exchange are included;
-TLS records are excluded. Large sends reach the underlying stream in bounded,
+TLS records are excluded. Successful reads and writes also feed the HTTP
+account meter through its sink handle. Large sends reach the underlying stream in bounded,
 paced writes rather than one prepaid message burst. The read path charges each
 byte once before the library assembles messages; parsing, correlation routing
 and push delivery add no admission. Library and TLS buffering below this

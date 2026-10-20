@@ -85,7 +85,7 @@ pub(crate) async fn run_streaming_worker(account: GraphAccount) {
                 bifrost_types::AccountOperation::PushSubscribe,
             ),
         );
-        let _ = account.push_tx.send(WatchEvent::Terminated(error));
+        super::push_stream::publish_terminal(&account, error);
         return;
     };
     let ews = EwsClient::new(account_net, account.client.ews_url());
@@ -187,7 +187,7 @@ async fn run_worker<E: EwsExecute>(account: GraphAccount, ews: E) {
                     // release below gets to run.
                     StreamLoopExit::Terminated(error) => {
                         release_subscription(&ews, &subscription_id).await;
-                        let _ = account.push_tx.send(WatchEvent::Terminated(error));
+                        super::push_stream::publish_terminal(&account, error);
                         return;
                     }
                     StreamLoopExit::Shutdown => {
@@ -204,7 +204,7 @@ async fn run_worker<E: EwsExecute>(account: GraphAccount, ews: E) {
                 // Only Retry belongs to this reconnect loop. Engine and Reconcile
                 // must reach the sync reconciler through Terminated too.
                 if !account_error.recovery().is_retryable() {
-                    let _ = account.push_tx.send(WatchEvent::Terminated(account_error));
+                    super::push_stream::publish_terminal(&account, account_error);
                     return;
                 }
                 let telemetry = account_error.telemetry_fields();

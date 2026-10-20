@@ -494,7 +494,7 @@ impl Client {
         // This connector does not follow redirects: an upgrade target cannot
         // carry credentials onward to a Location supplied by a different host.
         // It uses a direct TCP connection; reqwest proxy configuration applies
-        // only to HTTP and cannot be inherited by this WebSocket library.
+        // only to HTTP; Net exposes no proxy resolution or tunnel connector.
         // Net's trace context builder is private to its HTTP pipeline, so this
         // path does not invent a second traceparent generation policy.
         let builder = ClientBuilder::from_uri(uri.clone())
@@ -535,7 +535,8 @@ impl Client {
             .map_err(crate::Error::WebSocketHandshake)?;
         // Admission covers plaintext upgrade bytes and frame headers as well
         // as message payloads, before the framing library buffers them.
-        let stream = bifrost_net::MeteredStream::new(stream, self.transport().bandwidth_budget());
+        let stream = bifrost_net::MeteredStream::new(stream, self.transport().bandwidth_budget())
+            .with_meter_sink(Some(self.transport().websocket_meter()));
         let (stream, response) = builder
             .connect_on(stream)
             .await
@@ -1834,7 +1835,13 @@ mod bandwidth_tests {
     async fn large_websocket_send_reaches_peer_in_paced_slices() {
         let budget = BandwidthBudget::new(Some(16));
         let (stream, mut peer) = duplex(1024);
-        let mut ws = ClientBuilder::new().take_over(MeteredStream::new(stream, budget));
+        let meter = bifrost_net::BandwidthMeter::new();
+        let id = bifrost_net::AccountId("websocket".to_owned());
+        meter.register_account(id.clone());
+        let observed = meter.account(id);
+        let mut ws = ClientBuilder::new().take_over(
+            MeteredStream::new(stream, budget).with_meter_sink(Some(observed.sink_handle())),
+        );
         let start = Instant::now();
         let mut send = Box::pin(ws.send(Message::text("x".repeat(64))));
         assert!(
@@ -1852,6 +1859,7 @@ mod bandwidth_tests {
             received += peer.read(&mut buf[received..]).await.unwrap();
         }
         assert_eq!(received, 70);
+        assert_eq!(observed.bytes_out(), 70);
     }
 
     #[tokio::test(start_paused = true)]

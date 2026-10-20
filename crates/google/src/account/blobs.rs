@@ -36,9 +36,8 @@ pub(crate) fn open_blob(
     client: Arc<GmailClient>,
     handle: BlobHandle,
 ) -> AccountStream<SyncEvent<Bytes>> {
-    // The Account adapter does not wrap blob reads with its shutdown token. A
-    // local token here would never observe close(); the adapter must wrap this
-    // stream or pass its token through to interrupt the in-flight request.
+    // The Account adapter wraps this stream with its shutdown token and drops
+    // the in-flight request when the account closes.
     Box::pin(
         stream::once(async move {
             let started = Instant::now();
@@ -92,8 +91,7 @@ pub(crate) fn open_raw_rfc822(
     client: Arc<GmailClient>,
     message: ObjectId,
 ) -> AccountStream<SyncEvent<Bytes>> {
-    // As with attachment reads, this Account operation is not wrapped with a
-    // shutdown token while format=raw is in flight.
+    // The Account adapter's shutdown wrapper interrupts format=raw in flight.
     Box::pin(
         stream::once(async move {
             let started = Instant::now();

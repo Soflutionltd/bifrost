@@ -96,6 +96,10 @@ pub(crate) struct GraphAccount {
     pub(crate) push_endpoint: Option<PushEndpoint>,
     pub(crate) push_mode: PushMode,
     pub(crate) push_tx: broadcast::Sender<WatchEvent>,
+    /// Terminal push health is sticky for this account instance. Broadcast
+    /// carries ordinary health edges and invalidations; this watch value lets
+    /// late or lagged readers still observe a terminal failure.
+    pub(crate) push_terminal: watch::Sender<Option<AccountError>>,
     pub(crate) cursor_index: Arc<RwLock<CursorIndex>>,
     pub(crate) folder_tree: Arc<RwLock<FolderTree>>,
     pub(crate) graph_subscriptions:
@@ -343,6 +347,7 @@ impl GraphAccount {
         user_email: Option<String>,
     ) -> Self {
         let (push_tx, _) = broadcast::channel(256);
+        let (push_terminal, _) = watch::channel(None);
         let shared_clients = shared_clients_map(&client, shared_mailboxes);
         // `pim_methods.send_as` mirrors this map, so derive it from the map
         // AFTER `shared_clients_map` has dropped unroutable keys: a config
@@ -356,6 +361,7 @@ impl GraphAccount {
             push_endpoint,
             push_mode,
             push_tx,
+            push_terminal,
             cursor_index: Arc::new(RwLock::new(CursorIndex::default())),
             folder_tree: Arc::new(RwLock::new(FolderTree::default())),
             graph_subscriptions: Arc::new(RwLock::new(HashMap::new())),

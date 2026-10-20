@@ -1006,3 +1006,40 @@ fn ctx_with_cursor_scope_helper_round_trip() {
         AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
     ));
 }
+
+#[test]
+fn auth_attempt_evidence_survives_account_translation_and_override() {
+    for state in [
+        TransmissionState::Unsent,
+        TransmissionState::InFlight,
+        TransmissionState::Acknowledged,
+    ] {
+        let error = Error::auth_with_mechanism("SASL failure".into(), None, "PLAIN")
+            .with_attempt(TransmissionState::InFlight)
+            .with_attempt(state);
+        assert_eq!(error.attempt(), Some(state));
+        let account = into_account_error(
+            error,
+            ImapErrorContext::operation(AccountOperation::SyncChanges),
+        );
+        assert_eq!(
+            account.chain().iter().find_map(|cause| match cause {
+                Cause::Attempt(attempt) => Some(attempt.transmission_state),
+                _ => None,
+            }),
+            Some(state)
+        );
+    }
+}
+
+#[test]
+fn starttls_refusal_does_not_claim_the_capability_was_absent() {
+    let error = into_account_error(
+        Error::StartTlsUnavailable,
+        ImapErrorContext::operation(AccountOperation::Discover),
+    );
+    assert_eq!(
+        error.support_consented().support_text,
+        ["required STARTTLS upgrade is unavailable in this session"]
+    );
+}

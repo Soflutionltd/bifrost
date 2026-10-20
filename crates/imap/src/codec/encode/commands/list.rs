@@ -1,6 +1,8 @@
 //! LIST-family command encoders.
 
-use super::{CommandWriter, encode_mailbox_str, normalize_status_items_body, validate_no_crlf};
+use super::{
+    CommandWriter, encode_mailbox_argument, normalize_status_items_body, validate_no_crlf,
+};
 use crate::types::MailboxAttribute;
 
 /// Encode LIST with STATUS return option (RFC 5819 Section 2).
@@ -10,8 +12,8 @@ use crate::types::MailboxAttribute;
 pub(in crate::codec::encode) fn encode_list_status(
     w: &mut CommandWriter,
     tag: &str,
-    reference: &str,
-    pattern: &str,
+    reference: &crate::types::MailboxArgument,
+    pattern: &crate::types::MailboxArgument,
     status_items: &str,
     utf8: bool,
 ) -> Result<(), crate::Error> {
@@ -20,14 +22,14 @@ pub(in crate::codec::encode) fn encode_list_status(
     let status_items = normalize_status_items_body(status_items, "LIST-STATUS status items")?;
     // RFC 3501 Section 5.1.3 / RFC 9051 Section 5.1: encode reference and
     // pattern with INBOX normalization and MUTF-7 when not in UTF-8 mode.
-    let wire_ref = encode_mailbox_str(reference, utf8);
-    let wire_pat = encode_mailbox_str(pattern, utf8);
+    let wire_ref = encode_mailbox_argument(reference, utf8)?;
+    let wire_pat = encode_mailbox_argument(pattern, utf8)?;
     w.raw(tag.as_bytes());
     w.raw(b" LIST ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    w.string(wire_ref.as_bytes(), utf8);
+    w.string(&wire_ref, utf8);
     w.raw(b" ");
-    w.string(wire_pat.as_bytes(), utf8);
+    w.string(&wire_pat, utf8);
     w.raw(b" RETURN (STATUS (");
     w.raw(status_items.as_bytes());
     w.raw(b"))\r\n");
@@ -48,8 +50,8 @@ pub(in crate::codec::encode) fn encode_list_extended(
     w: &mut CommandWriter,
     tag: &str,
     selection_options: &[String],
-    reference: &str,
-    patterns: &[String],
+    reference: &crate::types::MailboxArgument,
+    patterns: &[crate::types::MailboxArgument],
     return_options: &[String],
     utf8: bool,
 ) -> Result<(), crate::Error> {
@@ -85,22 +87,22 @@ pub(in crate::codec::encode) fn encode_list_extended(
 
     // RFC 3501 Section 5.1.3 / RFC 9051 Section 5.1: encode reference and
     // patterns with INBOX normalization and MUTF-7 when not in UTF-8 mode.
-    let wire_ref = encode_mailbox_str(reference, utf8);
+    let wire_ref = encode_mailbox_argument(reference, utf8)?;
     w.raw(b" ");
-    w.string(wire_ref.as_bytes(), utf8);
+    w.string(&wire_ref, utf8);
     w.raw(b" ");
 
     if patterns.len() == 1 {
-        let wire_pat = encode_mailbox_str(&patterns[0], utf8);
-        w.string(wire_pat.as_bytes(), utf8);
+        let wire_pat = encode_mailbox_argument(&patterns[0], utf8)?;
+        w.string(&wire_pat, utf8);
     } else {
         w.raw(b"(");
         for (index, pattern) in patterns.iter().enumerate() {
             if index > 0 {
                 w.raw(b" ");
             }
-            let wire_pat = encode_mailbox_str(pattern, utf8);
-            w.string(wire_pat.as_bytes(), utf8);
+            let wire_pat = encode_mailbox_argument(pattern, utf8)?;
+            w.string(&wire_pat, utf8);
         }
         w.raw(b")");
     }
