@@ -152,10 +152,6 @@ reviews left:
   Driving the built transport hermetically needs an in-memory test seam in
   `crates/smtp` (its transport internals are private and its executor is
   sealed); a P3 from the transport-legs review.
-- **Graph's `set_bandwidth_cap` is a silent no-op without an attached
-  `AccountNet`**, and nothing re-applies the cap when one is installed
-  later. With the budget now living in the registry the window is narrow,
-  but it is unverified.
 - **Net bandwidth test gaps (P3s from the net budget review).** The
   refused-stream test calls the classifier directly and never drives the
   retry loop, so a retry that dropped or emptied the body would pass; the

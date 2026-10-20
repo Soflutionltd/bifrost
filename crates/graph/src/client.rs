@@ -498,13 +498,9 @@ impl GraphClient {
             // keep metering against the same counters.
             let displaced = match self.inner.account_net.write() {
                 Ok(mut slot) => slot.replace(account_net),
-                Err(_) => {
-                    // A poisoned lock means a panic happened while a writer
-                    // held it. Skipping the detach here leaks one meter
-                    // attachment (the very leak the ordering above exists to
-                    // prevent), so it must not be silent.
-                    tracing::warn!("account_net lock poisoned; displaced attachment not detached");
-                    None
+                Err(poisoned) => {
+                    tracing::warn!("account_net lock poisoned; recovering attachment slot");
+                    poisoned.into_inner().replace(account_net)
                 }
             };
             if let Some(displaced) = displaced {
@@ -516,12 +512,7 @@ impl GraphClient {
         // `with_account_net`. Retag the existing `AccountNet` so
         // per-account metering and host bookkeeping move under the
         // engine id; in-flight requests on the old handle continue.
-        let existing = self
-            .inner
-            .account_net
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone());
+        let existing = self.account_net();
         let Some(existing) = existing else {
             return;
         };
@@ -529,17 +520,19 @@ impl GraphClient {
             return;
         }
         let retagged = existing.retag(account_id);
-        if let Ok(mut slot) = self.inner.account_net.write() {
-            *slot = Some(retagged);
-        }
+        let mut slot = self.inner.account_net.write().unwrap_or_else(|poisoned| {
+            tracing::warn!("account_net lock poisoned; recovering attachment slot");
+            poisoned.into_inner()
+        });
+        *slot = Some(retagged);
     }
 
     pub(crate) fn account_net(&self) -> Option<AccountNet> {
         self.inner
             .account_net
             .read()
-            .ok()
-            .and_then(|slot| slot.clone())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     #[cfg(test)]
@@ -2322,6 +2315,74 @@ mod tests {
             account_net.account(),
             &AccountId("engine-account".to_string())
         );
+    }
+
+    fn opened_shape_account(client: &GraphClient) -> crate::account::GraphAccount {
+        crate::account::GraphAccount::new_for_tests(
+            client.clone(),
+            crate::account::PushMode::GraphSubscriptions,
+        )
+    }
+
+    #[test]
+    fn opened_account_forwards_bandwidth_cap() {
+        use bifrost_types::Account;
+
+        let client = GraphClient::new("token");
+        client.attach_account(AccountId("graph-cap-forward".to_string()));
+        let account = opened_shape_account(&client);
+        account.set_bandwidth_cap(Some(1234));
+        assert_eq!(client.account_net().unwrap().bandwidth_cap(), Some(1234));
+        account.set_bandwidth_cap(None);
+        assert_eq!(client.account_net().unwrap().bandwidth_cap(), None);
+    }
+
+    #[test]
+    fn same_id_reattach_preserves_forwarded_bandwidth_cap() {
+        use bifrost_types::Account;
+
+        let client = GraphClient::new("token");
+        let id = AccountId("graph-cap-reattach".to_string());
+        client.attach_account(id.clone());
+        let account = opened_shape_account(&client);
+        account.set_bandwidth_cap(Some(2345));
+        assert_eq!(client.account_net().unwrap().bandwidth_cap(), Some(2345));
+        // Keep no AccountNet clone alive across replacement: only the slot
+        // may hold the registry's weakly retained budget alive.
+        client.attach_account(id);
+        assert_eq!(client.account_net().unwrap().bandwidth_cap(), Some(2345));
+        account.set_bandwidth_cap(Some(3456));
+        assert_eq!(client.account_net().unwrap().bandwidth_cap(), Some(3456));
+    }
+
+    #[test]
+    fn injected_client_retag_uses_destination_bandwidth_budget() {
+        use bifrost_types::Account;
+
+        let wire = bifrost_net::test_support::ScriptedDispatch::new([]);
+        let net = bifrost_net::test_support::scripted_net(&wire, bifrost_net::NetConfig::default());
+        let source = net.attach_account(
+            AccountId("graph-cap-source".to_string()),
+            AccountSpec::new(None),
+        );
+        source.set_bandwidth_cap(Some(1111));
+        let destination_id = AccountId("graph-cap-destination".to_string());
+        let destination = net.attach_account(destination_id.clone(), AccountSpec::new(None));
+        destination.set_bandwidth_cap(Some(2222));
+        let client = GraphClient::with_account_net(
+            source.clone(),
+            "https://graph.microsoft.com/v1.0",
+            Arc::new(StaticTokenSource::new("token", None)),
+        );
+        client.attach_account(destination_id.clone());
+        let attached = client.account_net().unwrap();
+        assert_eq!(attached.account(), &destination_id);
+        assert_eq!(attached.bandwidth_cap(), Some(2222));
+        let account = opened_shape_account(&client);
+        account.set_bandwidth_cap(Some(3333));
+        assert_eq!(attached.bandwidth_cap(), Some(3333));
+        assert_eq!(destination.bandwidth_cap(), Some(3333));
+        assert_eq!(source.bandwidth_cap(), Some(1111));
     }
 
     /// Every reopen calls `attach_account` again with the same engine

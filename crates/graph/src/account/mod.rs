@@ -901,14 +901,20 @@ impl Account for GraphAccount {
     }
 
     fn set_priority(&self, priority: Priority) {
-        if let Some(account_net) = self.client.account_net() {
-            account_net.set_priority(priority);
+        // GraphAccountFactory::open attaches before constructing the account;
+        // every client constructor carries a parent Net or an AccountNet.
+        match self.client.account_net() {
+            Some(account_net) => account_net.set_priority(priority),
+            None => tracing::error!("opened Graph account has no AccountNet"),
         }
     }
 
     fn set_bandwidth_cap(&self, bps: Option<u64>) {
-        if let Some(account_net) = self.client.account_net() {
-            account_net.set_bandwidth_cap(bps);
+        // GraphAccountFactory::open attaches before constructing the account;
+        // every client constructor carries a parent Net or an AccountNet.
+        match self.client.account_net() {
+            Some(account_net) => account_net.set_bandwidth_cap(bps),
+            None => tracing::error!("opened Graph account has no AccountNet"),
         }
     }
 

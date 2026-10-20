@@ -699,6 +699,8 @@ mailboxes always install.
   PublicFolderRouting>>>` from public-folder discovery, plus
   `public_folders_enabled` and the discovered `user_email`.
 - `set_priority` / `set_bandwidth_cap` delegate to `AccountNet`.
+  Open attaches before account construction; same-id reattachment preserves
+  the bandwidth budget, while cross-id retagging selects the destination budget.
 
 ### Per-batch byte accounting
 
