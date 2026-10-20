@@ -4,6 +4,7 @@ use ::base64::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(any(feature = "dkim", test))]
 pub(crate) fn encode<T: AsRef<[u8]>>(input: T) -> String {
     STANDARD.encode(input)
 }

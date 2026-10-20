@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bifrost_types::{
-    AccountError, AccountFuture, AccountOperation, AccountStream, CursorScope, SubscriptionHandle,
-    WatchEvent,
+    AccountError, AccountFuture, AccountOperation, AccountStream, BatchItemId, BatchOutcomeBuilder,
+    CursorScope, ErrorScope, SubscriptionHandle, WatchEvent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -18,6 +19,7 @@ use super::error;
 const DEFAULT_RENEW_AFTER: Duration = Duration::from_secs(6 * 24 * 60 * 60);
 const RENEW_BEFORE_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RENEW_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+static NEXT_SUBSCRIPTION_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
 /// Floor for any *computed* renewal delay.
 ///
 /// `start_renewer` clears `retry_after` on a successful re-watch, so the
@@ -324,36 +326,82 @@ struct GmailSubscriptionHandle {
     topic: String,
     history_id: String,
     expiration: Option<String>,
+    /// Gmail returns the same watch state to concurrent subscribers when
+    /// the mailbox is quiet. This process-local id keeps their handles
+    /// distinct so releasing one cannot consume another's registration.
+    #[serde(default)]
+    handle_id: u64,
 }
 
 pub(crate) fn push_subscribe(
     pubsub: Arc<PubSubControl>,
     scopes: Vec<CursorScope>,
-) -> AccountFuture<Result<SubscriptionHandle, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
     Box::pin(async move {
-        if scopes.is_empty()
-            || scopes
-                .iter()
-                .any(|scope| !matches!(scope, CursorScope::Account))
-        {
+        if scopes.is_empty() {
             return Err(error::into_account_error(
                 crate::error::Error::unsupported(AccountOperation::PushSubscribe),
                 error::GmailErrorContext::push_subscribe(),
             ));
         }
+        if !scopes
+            .iter()
+            .any(|scope| matches!(scope, CursorScope::Account))
+        {
+            return Err(unsupported_push_scope_error(scopes[0].clone()));
+        }
         if pubsub.shutdown.is_cancelled() {
             return Err(closed_error(AccountOperation::PushSubscribe));
         }
+
+        // Gmail exposes one account-wide history cursor. One watch therefore
+        // covers every Account entry in this request, while unsupported
+        // scopes remain independently pollable in the failed lane.
+        let expected: Vec<_> = (0..scopes.len())
+            .map(|index| BatchItemId(index.to_string()))
+            .collect();
+        let mut outcomes = BatchOutcomeBuilder::new();
+        for (item, scope) in expected.iter().cloned().zip(scopes) {
+            if matches!(&scope, CursorScope::Account) {
+                outcomes.push_succeeded(item, scope);
+            } else {
+                outcomes.push_failed(item, unsupported_push_scope_error(scope));
+            }
+        }
+        // Close the result ledger before registering a server watch, so an
+        // impossible accounting failure cannot strand a live subscription
+        // whose handle never reaches the caller.
+        let outcomes = outcomes.finalize(&expected).map_err(|failure| {
+            error::into_account_error(
+                crate::error::Error::internal(format!(
+                    "gmail push outcome ledger failed to finalize: {failure}"
+                )),
+                error::GmailErrorContext::push_subscribe(),
+            )
+        })?;
+
         let (reply, response) = oneshot::channel();
         pubsub
             .commands
             .send(WatchCommand::Subscribe { reply })
             .await
             .map_err(|_| closed_error(AccountOperation::PushSubscribe))?;
-        response
+        let handle = response
             .await
-            .unwrap_or_else(|_| Err(closed_error(AccountOperation::PushSubscribe)))
+            .unwrap_or_else(|_| Err(closed_error(AccountOperation::PushSubscribe)))?;
+        Ok(bifrost_types::PushSubscription::new(Some(handle), outcomes))
     })
+}
+
+fn unsupported_push_scope_error(scope: CursorScope) -> AccountError {
+    error::into_account_error(
+        crate::error::Error::unsupported(AccountOperation::PushSubscribe),
+        error::GmailErrorContext::push_subscribe(),
+    )
+    .into_builder()
+    .scope(ErrorScope::Cursor(scope))
+    .try_build()
+    .expect("valid scope-correlated Gmail push refusal")
 }
 
 pub(crate) fn push_unsubscribe(
@@ -393,15 +441,21 @@ pub(crate) fn push_stream(
     Box::pin(futures::stream::unfold(
         (receiver, shutdown),
         |(mut receiver, shutdown)| async move {
-            loop {
-                tokio::select! {
-                    () = shutdown.cancelled() => return None,
-                    result = receiver.recv() => {
-                        match result {
-                            Ok(event) => return Some((event, (receiver, shutdown))),
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(broadcast::error::RecvError::Closed) => return None,
+            tokio::select! {
+                () = shutdown.cancelled() => None,
+                result = receiver.recv() => {
+                    match result {
+                        Ok(event) => Some((event, (receiver, shutdown))),
+                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                            let warning = bifrost_types::Warning::support_only(
+                                bifrost_types::WarningKind::Other,
+                                format!(
+                                    "gmail push health stream lagged; {dropped} health events were lost"
+                                ),
+                            );
+                            Some((WatchEvent::Warning(warning), (receiver, shutdown)))
                         }
+                        Err(broadcast::error::RecvError::Closed) => None,
                     }
                 }
             }
@@ -615,6 +669,16 @@ async fn actor_subscribe(
             error::GmailErrorContext::push_subscribe(),
         ));
     };
+    let handle_id = NEXT_SUBSCRIPTION_HANDLE_ID
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map_err(|_| {
+            error::into_account_error(
+                crate::error::Error::internal("gmail push subscription handle id exhausted"),
+                error::GmailErrorContext::push_subscribe(),
+            )
+        })?;
     // Deliberately NOT raced against `shutdown.cancelled()` - see the
     // matching note on the renewal path. Racing the two lets a completed
     // `users.watch` be committed by the arm that won, leaving a Gmail-side
@@ -632,6 +696,7 @@ async fn actor_subscribe(
         topic: config.topic.clone(),
         history_id: response.history_id.clone(),
         expiration: response.expiration.clone(),
+        handle_id,
     };
     let handle = match serde_json::to_string(&handle).map(SubscriptionHandle) {
         Ok(handle) => handle,
@@ -832,6 +897,7 @@ mod tests {
     use bifrost_net::test_support::{Canned, ScriptedDispatch};
     use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource};
     use bytes::Bytes;
+    use futures::StreamExt;
     use reqwest::StatusCode;
 
     use super::*;
@@ -893,9 +959,18 @@ mod tests {
                 topic: "projects/p/topics/t".to_owned(),
                 history_id: "12345".to_owned(),
                 expiration: Some("1700000000000".to_owned()),
+                handle_id: 1,
             })
             .expect("handle encodes"),
         )
+    }
+
+    fn watch_response() -> Canned {
+        Canned::Response {
+            status: StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from_static(br#"{"historyId":"12345","expiration":"1700000000000"}"#),
+        }
     }
 
     fn scripted_client(
@@ -1035,12 +1110,14 @@ mod tests {
             topic: "projects/p/topics/t".to_owned(),
             history_id: "12345".to_owned(),
             expiration: Some("1700000000000".to_owned()),
+            handle_id: 7,
         };
         let encoded = serde_json::to_string(&handle).expect("encode");
         let decoded: GmailSubscriptionHandle = serde_json::from_str(&encoded).expect("decode");
         assert_eq!(decoded.topic, handle.topic);
         assert_eq!(decoded.history_id, handle.history_id);
         assert_eq!(decoded.expiration, handle.expiration);
+        assert_eq!(decoded.handle_id, handle.handle_id);
 
         assert!(
             serde_json::from_str::<GmailSubscriptionHandle>("not json").is_err(),
@@ -1050,6 +1127,141 @@ mod tests {
             serde_json::from_str::<GmailSubscriptionHandle>(r#"{"topic":"t"}"#).is_err(),
             "history_id is required in the envelope"
         );
+        let legacy: GmailSubscriptionHandle =
+            serde_json::from_str(r#"{"topic":"t","history_id":"1","expiration":null}"#)
+                .expect("persisted handles from before local identity remain readable");
+        assert_eq!(legacy.handle_id, 0);
+    }
+
+    #[tokio::test]
+    async fn identical_watch_responses_produce_distinct_handles() {
+        let (client, script) = scripted_client([
+            watch_response(),
+            watch_response(),
+            canned(StatusCode::NO_CONTENT),
+        ]);
+        let shutdown = CancellationToken::new();
+        let control = Arc::new(PubSubControl::new(
+            Arc::clone(&client),
+            Some(PubSubConfig::new("projects/p/topics/t")),
+            shutdown,
+            "identical-watch-responses@push.test",
+        ));
+
+        let first = push_subscribe(Arc::clone(&control), vec![CursorScope::Account])
+            .await
+            .expect("first watch succeeds")
+            .handle
+            .expect("first subscription has a handle");
+        let second = push_subscribe(Arc::clone(&control), vec![CursorScope::Account])
+            .await
+            .expect("second watch succeeds")
+            .handle
+            .expect("second subscription has a handle");
+        assert_ne!(
+            first, second,
+            "identical Gmail responses need distinct identities"
+        );
+
+        push_unsubscribe(Arc::clone(&control), first)
+            .await
+            .expect("releasing one subscriber succeeds");
+        assert_eq!(
+            script.requests().len(),
+            2,
+            "the first release must not stop the watch held by the second subscriber",
+        );
+
+        push_unsubscribe(control, second)
+            .await
+            .expect("releasing the last subscriber stops the watch");
+        let requests = script.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].url.path(), "/stop");
+    }
+
+    #[tokio::test]
+    async fn mixed_push_scopes_keep_the_account_watch_and_refuse_only_other_scopes() {
+        let (client, script) = scripted_client([watch_response(), canned(StatusCode::NO_CONTENT)]);
+        let shutdown = CancellationToken::new();
+        let control = Arc::new(PubSubControl::new(
+            Arc::clone(&client),
+            Some(PubSubConfig::new("projects/p/topics/t")),
+            shutdown,
+            "mixed-push-scopes@push.test",
+        ));
+        let folder = CursorScope::Folder(bifrost_types::FolderId("archive".to_owned()));
+
+        let subscription = push_subscribe(
+            Arc::clone(&control),
+            vec![CursorScope::Account, folder.clone()],
+        )
+        .await
+        .expect("supported account scope is still subscribed");
+        let handle = subscription
+            .handle
+            .expect("successful account scope has a watch handle");
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "one account watch covers the scope"
+        );
+        assert_eq!(subscription.outcomes.succeeded().len(), 1);
+        assert_eq!(
+            subscription.outcomes.succeeded()[0].item,
+            BatchItemId("0".to_owned())
+        );
+        assert_eq!(
+            subscription.outcomes.succeeded()[0].output,
+            CursorScope::Account
+        );
+        assert_eq!(subscription.outcomes.failed().len(), 1);
+        assert_eq!(
+            subscription.outcomes.failed()[0].item,
+            BatchItemId("1".to_owned())
+        );
+        assert_eq!(
+            subscription.outcomes.failed()[0].error.scope(),
+            Some(&ErrorScope::Cursor(folder)),
+            "the refusal names the exact unsupported scope",
+        );
+        assert!(matches!(
+            subscription.outcomes.failed()[0].error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
+        ));
+
+        push_unsubscribe(control, handle)
+            .await
+            .expect("the watch can be retired after inspecting the result");
+    }
+
+    #[tokio::test]
+    async fn lagged_health_stream_emits_a_warning_with_the_loss_count() {
+        let (health_tx, _) = broadcast::channel(32);
+        let (commands, _receiver) = mpsc::channel(1);
+        let pubsub = Arc::new(PubSubControl {
+            commands,
+            health_tx: health_tx.clone(),
+            shutdown: CancellationToken::new(),
+        });
+        let shutdown = CancellationToken::new();
+        let mut stream = push_stream(pubsub, shutdown);
+        for _ in 0..33 {
+            health_tx
+                .send(WatchEvent::Disconnected)
+                .expect("stream receiver is subscribed");
+        }
+
+        match stream.next().await {
+            Some(WatchEvent::Warning(warning)) => {
+                assert_eq!(warning.kind, bifrost_types::WarningKind::Other);
+                assert_eq!(
+                    warning.message.as_str(),
+                    "gmail push health stream lagged; 1 health events were lost",
+                );
+            }
+            event => panic!("expected a lag warning, got {event:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1638,10 +1850,14 @@ mod tests {
 
         let old_handle = push_subscribe(Arc::clone(&old), vec![CursorScope::Account])
             .await
-            .expect("old account subscribes");
+            .expect("old account subscribes")
+            .handle
+            .expect("old account subscription has a handle");
         let new_handle = push_subscribe(Arc::clone(&replacement), vec![CursorScope::Account])
             .await
-            .expect("replacement subscribes");
+            .expect("replacement subscribes")
+            .handle
+            .expect("replacement subscription has a handle");
 
         push_unsubscribe(Arc::clone(&old), old_handle)
             .await

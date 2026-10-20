@@ -21,27 +21,6 @@ not audited in depth. The push-merge chain-reclassification finding is
 SHARED-005; the Retry-After doc mismatch is SHARED-006; EWS push triage is
 SHARED-013.
 
-## GRAPH-001 - `bulk_destroy` is a soft delete reported as `Applied`
-
-`mutate.rs request_for_mutation`, `MutationKind::Destroy`:
-`DELETE {prefix}/messages/{id}`. On Graph this moves the message to Deleted
-Items (and from there to Recoverable Items); it does not remove it. Permanent
-removal is `POST /messages/{id}/permanentDelete`, which neither the crate nor
-`reference/graph.md` mentions. `graph_error::mutation_item_outcome` maps every
-2xx to `MutationSuccess::Applied`.
-
-Claim broken: `MutationSuccess`'s documentation in
-`crates/types/src/error/stream.rs`, whose motivating case is Gmail's TRASH
-fallback: "the messages move, they do not cease to exist. Reported as
-`Applied`, they came back on the next inventory pass and were destroyed again
-forever." The destroyed id reappears in the Deleted Items scope through delta,
-with a new id once it moves, so the engine cannot correlate it.
-`delete_thread`'s destroy-if-already-in-Trash logic in `pim/threads.rs` also
-rests on this DELETE, so a thread destroyed from Deleted Items lands in
-Recoverable Items. Fix: `permanentDelete` (a POST inside `$batch`) for destroy;
-if the soft path is kept anywhere, report `Downgraded`. Wire behaviour is well
-established publicly but not pinned in this repo.
-
 ## GRAPH-002 - The etag cache mixes two ETag forms, one not a valid `If-Match`
 
 `inventory.rs graph_etag` prefers `changeKey` over `@odata.etag`, and
@@ -107,27 +86,6 @@ reads send `Prefer: outlook.timezone="UTC"`; the delta lane uses plain
 at risk: event scopes are advertised as delta-synced ("event deltas per
 `calendars/{id}`").
 
-## GRAPH-005 - A failed `$batch` POST drops the chunk's decided outcomes and misclassifies the rest
-
-`mutate.rs submit_batch`: preflight failures (no etag, stale owner,
-cross-mailbox move) collect into `preflight_outcomes`, then
-`account.client.post_batch(...).await?` propagates and `bulk_mutation_stream`
-turns the `Err` into one `Terminated` for the whole stream:
-- the chunk's already-computed per-id `Failed` outcomes are never emitted;
-- an `InFlight` POST failure (timeout or reset after the body was sent) becomes
-  stream-terminal, although the per-item `Uncertain` lane exists for exactly
-  "the write may have landed, read it back" and
-  `reconcile_mutation_responses` uses it for missing subresponses;
-- the remaining target stream is never consumed, so its ids get no outcome.
-
-Claims broken: the three-lane `BatchOutcome` contract in
-`reference/error-model.md`; this module's own doc on missing subresponses ("a
-`move` or `DELETE` that committed and then lost its subresponse is
-byte-identical to one that never ran"); a lost POST response is the same case
-one level up. Fix: on POST error emit preflight outcomes plus every submitted
-id as `Uncertain` (`InFlight`) or `Failed` (`Unsent`, or acknowledged error);
-terminate only for truly account-wide faults.
-
 ## GRAPH-006 - Contact and calendar `If-Match` protects nothing the caller can see
 
 `contacts.rs update` / `delete` and `calendar.rs` update / delete GET the
@@ -184,3 +142,10 @@ compare SYNC-004 for the engine's own scope-less schema reset.
   bodyless GET and DELETE. Google's `execute` has an explicit comment that this
   "announced a JSON body on bodyless GET and DELETE requests" and was removed
   there; Graph still does it. (From net adoption.)
+- `delete_thread` applies the caller's container-based decision to every
+  conversation member, so a thread destroyed from Trash can permanently delete
+  members that live elsewhere (compare the JMAP thread-destroy entry).
+- A destroy subresponse with status 404 reports `Skipped` but leaves the cached
+  etags for that id in `etag_index`.
+- The shared-thread test's failure diagnostic indexes `shared_requests[4]` after
+  asserting only three requests.

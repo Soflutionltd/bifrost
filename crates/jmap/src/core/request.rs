@@ -175,27 +175,7 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         {
             return Err(crate::Error::RequestCallLimit { max });
         }
-        // A session with no `primaryAccounts` leaves the derived default
-        // account id empty. Every method this crate defines carries an
-        // `accountId`, so serializing one against that default puts
-        // `"accountId": ""` on the wire - a malformed request the server
-        // answers with an opaque error, when the fault is entirely local
-        // and knowable before a byte moves. Fail here, naming the
-        // capability whose account is missing, exactly as
-        // `Account::primary_account::<C>()` already does; the sync layer's
-        // error table already classifies this variant.
-        if self.account_id.as_str().is_empty() {
-            return Err(crate::Error::NoPrimaryAccount {
-                capability: M::Cap::URI,
-            });
-        }
         let call_id = format!("s{}", self.method_calls.len());
-
-        // Auto-add capability
-        let uri = M::Cap::URI;
-        if !self.using.contains(&uri) {
-            self.using.push(uri);
-        }
 
         // Inject the request's account ID into the method's accountId
         // field. No-op for methods that don't carry an accountId.
@@ -206,6 +186,25 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         // default ResponseDecode conversion.
         let arguments =
             serde_json::value::to_raw_value(&method).map_err(crate::Error::RequestEncode)?;
+
+        // Accountless methods (notably PushSubscription/get and /set) remain
+        // legal without primary accounts. Inspect the actual wire member so
+        // this guard follows each method's accountId serialization contract.
+        if self.account_id.as_str().is_empty() {
+            let value: serde_json::Value =
+                serde_json::from_str(arguments.get()).map_err(crate::Error::RequestEncode)?;
+            if value.get("accountId").is_some() {
+                return Err(crate::Error::NoPrimaryAccount {
+                    capability: M::Cap::URI,
+                });
+            }
+        }
+
+        // Auto-add capability
+        let uri = M::Cap::URI;
+        if !self.using.contains(&uri) {
+            self.using.push(uri);
+        }
 
         self.method_calls.push(RawMethodCall {
             name: M::NAME,

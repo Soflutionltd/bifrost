@@ -52,12 +52,14 @@ pub(super) enum MutationKind {
 }
 
 /// True when a folder-level mutation failure must collapse the entire
-/// stream rather than surfacing per-item `Uncertain` for the failing
-/// folder. Reserved for failures that prevent any further folder
-/// attempt: authentication / authorization loss, schema / capability
-/// breaks. Per-folder transient failures (transport, rate limit, mailbox
-/// unavailable) emit per-item `Uncertain` and continue.
+/// stream rather than surfacing per-item outcomes for the failing folder.
+/// Personal-folder authorization loss and schema / capability breaks are
+/// account-wide; a shared-folder permission denial is converted to scoped
+/// `ScopeRevoked` before reaching this predicate. Per-folder failures emit
+/// per-item outcomes and continue.
 fn stream_terminating(err: &AccountError) -> bool {
+    // Authorization stays terminal for a personal-folder NoPermission; the
+    // shared-folder mapper turns that same response into ScopeRevoked first.
     matches!(
         err.kind(),
         AccountErrorKind::Authentication(_)
@@ -202,10 +204,10 @@ async fn flush_mutation_groups(
     // Per-folder failure semantics:
     // - A folder error after per-item emissions in any prior folder
     //   must NOT collapse those items by emitting a global
-    //   `SyncEvent::Terminated`. The failing folder's items surface
-    //   as `ItemOutcome::Uncertain` carrying the classified error
-    //   (the engine cannot tell, post-hoc, whether the mutation
-    //   landed).
+    //   `SyncEvent::Terminated`. The failing folder's items use the
+    //   mutation transmission evidence: preparation errors are stamped
+    //   Unsent relative to the mutation, while an in-flight mutation can
+    //   be uncertain.
     // - Stream-level `Terminated` is reserved for failures that
     //   prevent any further folder attempts at all (auth lost,
     //   schema break, capability shift). Those classify as
@@ -230,8 +232,18 @@ async fn flush_mutation_groups(
             // them, so the happy path never has to clone them just to keep
             // this lane fed.
             Err(FolderMutationFailure { error, unaccounted }) => {
-                let account_err = super::account_error_with(
-                    error,
+                // SELECT and its response describe preparation, not the
+                // STORE / MOVE / EXPUNGE represented by these ids. Preserve
+                // the failure classification but reset its attempt evidence
+                // to the operation that was never sent. Shared ACL denials
+                // become folder-scoped revocations here, before the
+                // account-wide terminal check below.
+                let entry = account.folders.get(&folder);
+                let shared_owner = entry.as_ref().and_then(|entry| entry.shared_owner.as_ref());
+                let account_err = super::error::shared_folder_error(
+                    error.with_attempt(TransmissionState::Unsent),
+                    &folder,
+                    shared_owner,
                     super::error::ImapErrorContext::operation(mutation_operation(kind))
                         .with_folder_scope(&folder),
                 );
@@ -239,17 +251,28 @@ async fn flush_mutation_groups(
                     let _ = tx.send(SyncEvent::Terminated(account_err)).await;
                     return Err(());
                 }
-                let uncertain = unaccounted
+                let verdict = mutation_error_verdict(&account_err);
+                let outcomes = unaccounted
                     .into_iter()
                     .map(|id| {
                         let item = BatchItemId(
                             super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
                         );
-                        ItemOutcome::Uncertain(BatchUncertain::new(item, account_err.clone()))
+                        match &verdict {
+                            Verdict::Uncertain(error) => {
+                                ItemOutcome::Uncertain(BatchUncertain::new(item, error.clone()))
+                            }
+                            Verdict::Failed(error) => {
+                                ItemOutcome::Failed(BatchFailure::new(item, error.clone()))
+                            }
+                            Verdict::Succeeded(_) => {
+                                unreachable!("a folder error cannot produce a successful verdict")
+                            }
+                        }
                     })
                     .collect();
                 if tx
-                    .send(batch(uncertain, PageBoundary::Page, None))
+                    .send(batch(outcomes, PageBoundary::Page, None))
                     .await
                     .is_err()
                 {
@@ -1331,9 +1354,10 @@ mod tests {
     }
 
     #[test]
-    fn stream_terminating_only_for_auth_and_schema() {
+    fn stream_terminating_keeps_account_authz_and_schema_terminal() {
         use bifrost_types::{
-            AccountErrorBuilder, AuthCause, AuthErrorKind, StateCause, SyncStateErrorKind,
+            AccessCause, AccessErrorKind, AccountErrorBuilder, AuthCause, AuthErrorKind, MailboxId,
+            StateCause, SyncStateErrorKind,
         };
         let auth = AccountErrorBuilder::new(
             AccountErrorKind::Authentication(AuthErrorKind::Expired),
@@ -1354,6 +1378,23 @@ mod tests {
         .try_build()
         .expect("schema error");
         assert!(stream_terminating(&schema));
+
+        let personal_permission_denied = AccountErrorBuilder::new(
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
+            Cause::Access(AccessCause::PermissionDenied { resource: None }),
+        )
+        .protocol(Protocol::Imap)
+        .operation(AccountOperation::UpdateFlags)
+        .try_build()
+        .expect("personal-folder permission error");
+        assert!(stream_terminating(&personal_permission_denied));
+
+        let shared_revoked = super::super::error::scope_revoked(
+            &folder(),
+            &MailboxId("alice".to_owned()),
+            AccountOperation::UpdateFlags,
+        );
+        assert!(!stream_terminating(&shared_revoked));
 
         let transient = AccountErrorBuilder::new(
             AccountErrorKind::Server(bifrost_types::ServerErrorKind::Unavailable),

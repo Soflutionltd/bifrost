@@ -51,7 +51,12 @@ struct TranscriptStep {
     coalesced: bool,
     close: bool,
     matched: usize,
+    #[cfg(test)]
+    generated_server: Option<GeneratedServerReply>,
 }
+
+#[cfg(test)]
+type GeneratedServerReply = fn(&[u8]) -> Vec<u8>;
 
 #[cfg_attr(not(feature = "test-support"), allow(unreachable_pub))]
 impl Transcript {
@@ -83,6 +88,27 @@ impl Transcript {
 
     pub fn expect(self, client: impl AsRef<[u8]>, server: impl AsRef<[u8]>) -> Self {
         self.push(client, server, false, false, false)
+    }
+
+    /// Accept one complete client write and derive the reply from its bytes.
+    /// Used when an in-process protocol transcript must echo a client nonce or
+    /// verify a response whose contents are intentionally unpredictable.
+    #[cfg(test)]
+    pub(super) fn expect_generated(self, server: fn(&[u8]) -> Vec<u8>) -> Self {
+        self.shared
+            .lock()
+            .expect("transcript lock")
+            .steps
+            .push_back(TranscriptStep {
+                client: Vec::new(),
+                server: Vec::new(),
+                stall: false,
+                coalesced: false,
+                close: false,
+                matched: 0,
+                generated_server: Some(server),
+            });
+        self
     }
 
     #[cfg(all(test, feature = "tokio"))]
@@ -148,6 +174,8 @@ impl Transcript {
                 coalesced,
                 close,
                 matched: 0,
+                #[cfg(test)]
+                generated_server: None,
             });
         self
     }
@@ -262,6 +290,16 @@ impl std::io::Write for TranscriptStream {
                 "SMTP client wrote before draining the scripted server replies",
             ));
         }
+        #[cfg(test)]
+        if let Some(generate_server) = state.steps.front().and_then(|step| step.generated_server) {
+            let server = generate_server(buf);
+            let step = state.steps.pop_front().expect("generated reply step");
+            state.pending_server_bytes.extend(server);
+            state.stalled = step.stall;
+            state.coalesced = step.coalesced;
+            state.closed = step.close;
+            return Ok(buf.len());
+        }
         let Some(step) = state.steps.front_mut() else {
             return Err(std::io::Error::other(
                 "SMTP transcript exhausted by client write",
@@ -291,6 +329,70 @@ impl std::io::Write for TranscriptStream {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(super) fn scram_server_first_reply(client_line: &[u8]) -> Vec<u8> {
+    let client_line = std::str::from_utf8(client_line).expect("SCRAM client-first is UTF-8");
+    let encoded = client_line
+        .strip_suffix("\r\n")
+        .expect("SCRAM client-first ends in CRLF");
+    let decoded = crate::base64::decode(encoded).expect("SCRAM client-first is base64");
+    let decoded = String::from_utf8(decoded).expect("SCRAM client-first payload is UTF-8");
+    let client_nonce = decoded
+        .strip_prefix("n,,n=user,r=")
+        .expect("transcript uses unbound SCRAM for user")
+        .to_owned();
+    assert!(!client_nonce.is_empty());
+    assert!(!client_nonce.contains(','));
+
+    let server_first = format!("r={client_nonce}server,s=QSXCR+Q6sek8bf92,i=4096");
+    format!("334 {}\r\n", crate::base64::encode(server_first)).into_bytes()
+}
+
+#[cfg(test)]
+pub(super) fn scram_enhanced_success_reply(client_line: &[u8]) -> Vec<u8> {
+    let client_line = std::str::from_utf8(client_line).expect("SCRAM client-final is UTF-8");
+    let encoded = client_line
+        .strip_suffix("\r\n")
+        .expect("SCRAM client-final ends in CRLF");
+    let decoded = crate::base64::decode(encoded).expect("SCRAM client-final is base64");
+    let decoded = String::from_utf8(decoded).expect("SCRAM client-final payload is UTF-8");
+    assert!(decoded.starts_with("c=biws,r="), "got {decoded}");
+
+    let server_nonce = decoded
+        .split(',')
+        .nth(1)
+        .and_then(|attribute| attribute.strip_prefix("r="))
+        .expect("SCRAM client-final has a nonce");
+    assert!(server_nonce.ends_with("server"));
+    assert!(
+        decoded
+            .split(',')
+            .any(|attribute| attribute.starts_with("p="))
+    );
+    let client_nonce = server_nonce
+        .strip_suffix("server")
+        .expect("server nonce extends client nonce");
+    let client_first_bare = format!("n=user,r={client_nonce}");
+    let server_first = format!("r={server_nonce},s=QSXCR+Q6sek8bf92,i=4096");
+    let password =
+        bifrost_sasl::prepare_scram_password("pencil").expect("transcript password is valid");
+    let (_, signature) = bifrost_sasl::scram_client_final(
+        bifrost_sasl::ScramHash::Sha256,
+        &password,
+        client_nonce,
+        &client_first_bare,
+        &server_first,
+        &bifrost_sasl::ScramChannelBinding::None,
+    )
+    .expect("transcript server-first is valid");
+    let server_final = format!("v={}", crate::base64::encode(signature));
+    format!(
+        "235 2.7.0 {} authenticated\r\n",
+        crate::base64::encode(server_final)
+    )
+    .into_bytes()
 }
 
 /// A peer that trickles one reply line per `gap`, swallowing every write.

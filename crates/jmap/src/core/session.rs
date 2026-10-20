@@ -7,7 +7,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Session {
     #[serde(rename = "capabilities")]
-    #[serde(deserialize_with = "deserialize_capabilities_map")]
+    #[serde(deserialize_with = "deserialize_session_capabilities_map")]
     capabilities: HashMap<String, Capabilities>,
 
     #[serde(rename = "accounts")]
@@ -71,8 +71,9 @@ pub(crate) enum Capabilities {
     /// the unadvertised one: the two map to different recovery classes
     /// (`Protocol(ContractViolation)` versus `SyncState(CapabilityChanged)`
     /// or a silent feature-off), and `Other` is indistinguishable from
-    /// absent at every reader. `Other` now means only "a URI this crate
-    /// does not model", which is genuinely nothing to say.
+    /// absent at every reader. `Other` holds unknown extension values and
+    /// opaque session support markers; account limits are decoded only in
+    /// the account map.
     Malformed(serde_json::Value),
     WebSocket(WebSocketCapabilities),
     #[cfg(feature = "mail")]
@@ -88,6 +89,50 @@ pub(crate) enum Capabilities {
     Principals(PrincipalsCapabilities),
     PrincipalsOwner(PrincipalsOwnerCapabilities),
     Other(serde_json::Value),
+}
+
+// Session extension objects indicate support; their account-specific fields
+// must never be decoded as limits or identities for an arbitrary account.
+fn deserialize_session_capabilities_map<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, Capabilities>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: HashMap<String, JsonValue> = HashMap::deserialize(deserializer)?;
+    raw.into_iter()
+        .map(|(key, value)| {
+            let cap = if matches!(
+                key.as_str(),
+                "urn:ietf:params:jmap:core"
+                    | "urn:ietf:params:jmap:websocket"
+                    | "urn:ietf:params:jmap:quota"
+                    | "urn:ietf:params:jmap:blob"
+            ) {
+                let map = serde_json::json!({key.clone(): value});
+                deserialize_capabilities_map(map)
+                    .map_err(serde::de::Error::custom)?
+                    .remove(&key)
+                    .expect("single capability key")
+            } else if value.is_object()
+                || !matches!(
+                    key.as_str(),
+                    "urn:ietf:params:jmap:mail"
+                        | "urn:ietf:params:jmap:submission"
+                        | "urn:ietf:params:jmap:sieve"
+                        | "urn:ietf:params:jmap:contacts"
+                        | "urn:ietf:params:jmap:calendars"
+                        | "urn:ietf:params:jmap:principals"
+                        | "urn:ietf:params:jmap:principals:owner"
+                )
+            {
+                Capabilities::Other(value)
+            } else {
+                Capabilities::Malformed(value)
+            };
+            Ok((key, cap))
+        })
+        .collect()
 }
 
 /// Custom deserializer for `HashMap<String, Capabilities>` that
@@ -209,7 +254,7 @@ pub(crate) struct CoreCapabilities {
 /// "this server has no websockets".
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CapabilityState<'a, T> {
-    /// No key for this capability URI in the session at all.
+    /// No key for this capability URI in the selected map.
     Absent,
     /// Present, but not parseable as the typed capability object.
     Malformed,
@@ -314,7 +359,7 @@ pub(crate) struct PrincipalsCapabilities {
 /// diagnostic) - because to those, malformed and absent are not the same
 /// server.
 macro_rules! session_cap_accessor {
-    ($(#[$meta:meta])* $method:ident, $state_method:ident, $cap_marker:ty, $variant:ident, $return_type:ty) => {
+    ($(#[$meta:meta])* $method:ident, $state_method:ident, $cap_marker:ty, $variant:ident, $return_type:ty, $map:ident) => {
         $(#[$meta])*
         pub(crate) fn $method(&self) -> Option<&$return_type> {
             match self.$state_method() {
@@ -326,7 +371,7 @@ macro_rules! session_cap_accessor {
         $(#[$meta])*
         pub(crate) fn $state_method(&self) -> CapabilityState<'_, $return_type> {
             match self
-                .capabilities
+                .$map
                 .get(<$cap_marker as crate::core::capability::Capability>::URI)
             {
                 None => CapabilityState::Absent,
@@ -338,6 +383,168 @@ macro_rules! session_cap_accessor {
 }
 
 impl Session {
+    session_cap_accessor!(
+        #[cfg(feature = "blob")]
+        blob_capabilities,
+        blob_capability_state,
+        crate::core::capability::Blob,
+        Blob,
+        BlobCapabilities,
+        capabilities
+    );
+    session_cap_accessor!(
+        #[cfg(feature = "quota")]
+        quota_capabilities,
+        quota_capability_state,
+        crate::core::capability::Quota,
+        Quota,
+        QuotaCapabilities,
+        capabilities
+    );
+    // Convenience readers select the primary account for this capability.
+    #[cfg(feature = "mail")]
+    pub(crate) fn mail_capabilities(&self) -> Option<&MailCapabilities> {
+        match self.mail_capability_state() {
+            CapabilityState::Present(value) => Some(value),
+            _ => None,
+        }
+    }
+    #[cfg(feature = "mail")]
+    pub(crate) fn mail_capability_state(&self) -> CapabilityState<'_, MailCapabilities> {
+        let uri = <crate::core::capability::Mail as super::capability::Capability>::URI;
+        if matches!(self.capabilities.get(uri), Some(Capabilities::Malformed(_))) {
+            return CapabilityState::Malformed;
+        }
+        self.primary_accounts
+            .get(uri)
+            .and_then(|id| self.account(id))
+            .map_or(CapabilityState::Absent, Account::mail_capability_state)
+    }
+    #[cfg(feature = "mail")]
+    pub(crate) fn submission_capabilities(&self) -> Option<&SubmissionCapabilities> {
+        match self.submission_capability_state() {
+            CapabilityState::Present(value) => Some(value),
+            _ => None,
+        }
+    }
+    #[cfg(feature = "mail")]
+    pub(crate) fn submission_capability_state(
+        &self,
+    ) -> CapabilityState<'_, SubmissionCapabilities> {
+        let uri = <crate::core::capability::Submission as super::capability::Capability>::URI;
+        if matches!(self.capabilities.get(uri), Some(Capabilities::Malformed(_))) {
+            return CapabilityState::Malformed;
+        }
+        self.primary_accounts
+            .get(uri)
+            .and_then(|id| self.account(id))
+            .map_or(
+                CapabilityState::Absent,
+                Account::submission_capability_state,
+            )
+    }
+    #[cfg(feature = "mail")]
+    pub(crate) fn sieve_capabilities(&self) -> Option<&SieveCapabilities> {
+        match self.sieve_capability_state() {
+            CapabilityState::Present(value) => Some(value),
+            _ => None,
+        }
+    }
+    #[cfg(feature = "mail")]
+    pub(crate) fn sieve_capability_state(&self) -> CapabilityState<'_, SieveCapabilities> {
+        let uri = <crate::core::capability::Sieve as super::capability::Capability>::URI;
+        if matches!(self.capabilities.get(uri), Some(Capabilities::Malformed(_))) {
+            return CapabilityState::Malformed;
+        }
+        self.primary_accounts
+            .get(uri)
+            .and_then(|id| self.account(id))
+            .map_or(CapabilityState::Absent, Account::sieve_capability_state)
+    }
+
+    #[cfg(feature = "calendars")]
+    pub(crate) fn calendars_capabilities(&self) -> Option<&CalendarsCapabilities> {
+        match self.calendars_capability_state() {
+            CapabilityState::Present(value) => Some(value),
+            _ => None,
+        }
+    }
+    #[cfg(feature = "calendars")]
+    pub(crate) fn calendars_capability_state(&self) -> CapabilityState<'_, CalendarsCapabilities> {
+        let uri = <crate::core::capability::Calendars as super::capability::Capability>::URI;
+        if matches!(self.capabilities.get(uri), Some(Capabilities::Malformed(_))) {
+            return CapabilityState::Malformed;
+        }
+        self.primary_accounts
+            .get(uri)
+            .and_then(|id| self.account(id))
+            .map_or(CapabilityState::Absent, Account::calendars_capability_state)
+    }
+    #[cfg(feature = "contacts")]
+    pub(crate) fn contacts_capabilities(&self) -> Option<&ContactsCapabilities> {
+        match self.contacts_capability_state() {
+            CapabilityState::Present(value) => Some(value),
+            _ => None,
+        }
+    }
+    #[cfg(feature = "contacts")]
+    pub(crate) fn contacts_capability_state(&self) -> CapabilityState<'_, ContactsCapabilities> {
+        let uri = <crate::core::capability::Contacts as super::capability::Capability>::URI;
+        if matches!(self.capabilities.get(uri), Some(Capabilities::Malformed(_))) {
+            return CapabilityState::Malformed;
+        }
+        self.primary_accounts
+            .get(uri)
+            .and_then(|id| self.account(id))
+            .map_or(CapabilityState::Absent, Account::contacts_capability_state)
+    }
+
+    pub(crate) fn principals_capabilities(&self) -> Option<&PrincipalsCapabilities> {
+        match self.principals_capability_state() {
+            CapabilityState::Present(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn principals_capability_state(
+        &self,
+    ) -> CapabilityState<'_, PrincipalsCapabilities> {
+        let uri = <crate::core::capability::Principals as super::capability::Capability>::URI;
+        if matches!(self.capabilities.get(uri), Some(Capabilities::Malformed(_))) {
+            return CapabilityState::Malformed;
+        }
+        self.primary_accounts
+            .get(uri)
+            .and_then(|id| self.account(id))
+            .map_or(
+                CapabilityState::Absent,
+                Account::principals_capability_state,
+            )
+    }
+
+    pub(crate) fn principals_owner_capabilities(&self) -> Option<&PrincipalsOwnerCapabilities> {
+        match self.principals_owner_capability_state() {
+            CapabilityState::Present(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn principals_owner_capability_state(
+        &self,
+    ) -> CapabilityState<'_, PrincipalsOwnerCapabilities> {
+        let uri = <crate::core::capability::PrincipalsOwner as super::capability::Capability>::URI;
+        if matches!(self.capabilities.get(uri), Some(Capabilities::Malformed(_))) {
+            return CapabilityState::Malformed;
+        }
+        self.primary_accounts
+            .get(uri)
+            .and_then(|id| self.account(id))
+            .map_or(
+                CapabilityState::Absent,
+                Account::principals_owner_capability_state,
+            )
+    }
+
     pub(crate) fn capabilities(&self) -> impl Iterator<Item = &String> {
         self.capabilities.keys()
     }
@@ -361,7 +568,18 @@ impl Session {
     /// }
     /// ```
     pub(crate) fn capability_config<C: super::capability::Capability>(&self) -> Option<C::Config> {
-        let cap = self.capabilities.get(C::URI)?;
+        let cap = if matches!(
+            C::URI,
+            "urn:ietf:params:jmap:core"
+                | "urn:ietf:params:jmap:websocket"
+                | "urn:ietf:params:jmap:quota"
+                | "urn:ietf:params:jmap:blob"
+        ) {
+            self.capabilities.get(C::URI)?
+        } else {
+            self.account(self.primary_accounts.get(C::URI)?)?
+                .capability(C::URI)?
+        };
         // Serialize the enum variant to Value, then deserialize into Config.
         // This is a one-time cost per access (session parsing is infrequent).
         let value = serde_json::to_value(cap).ok()?;
@@ -389,88 +607,21 @@ impl Session {
         websocket_capability_state,
         crate::core::capability::WebSocket,
         WebSocket,
-        WebSocketCapabilities
+        WebSocketCapabilities,
+        capabilities
     );
     session_cap_accessor!(
         core_capabilities,
         core_capability_state,
         crate::core::capability::Core,
         Core,
-        CoreCapabilities
-    );
-    session_cap_accessor!(
-        #[cfg(feature = "mail")]
-        mail_capabilities,
-        mail_capability_state,
-        crate::core::capability::Mail,
-        Mail,
-        MailCapabilities
-    );
-    session_cap_accessor!(
-        #[cfg(feature = "mail")]
-        submission_capabilities,
-        submission_capability_state,
-        crate::core::capability::Submission,
-        Submission,
-        SubmissionCapabilities
-    );
-    session_cap_accessor!(
-        #[cfg(feature = "mail")]
-        sieve_capabilities,
-        sieve_capability_state,
-        crate::core::capability::Sieve,
-        Sieve,
-        SieveCapabilities
-    );
-    session_cap_accessor!(
-        #[cfg(feature = "quota")]
-        quota_capabilities,
-        quota_capability_state,
-        crate::core::capability::Quota,
-        Quota,
-        QuotaCapabilities
-    );
-    session_cap_accessor!(
-        #[cfg(feature = "blob")]
-        blob_capabilities,
-        blob_capability_state,
-        crate::core::capability::Blob,
-        Blob,
-        BlobCapabilities
-    );
-    session_cap_accessor!(
-        #[cfg(feature = "calendars")]
-        calendars_capabilities,
-        calendars_capability_state,
-        crate::core::capability::Calendars,
-        Calendars,
-        CalendarsCapabilities
-    );
-    session_cap_accessor!(
-        #[cfg(feature = "contacts")]
-        contacts_capabilities,
-        contacts_capability_state,
-        crate::core::capability::Contacts,
-        Contacts,
-        ContactsCapabilities
-    );
-    session_cap_accessor!(
-        principals_capabilities,
-        principals_capability_state,
-        crate::core::capability::Principals,
-        Principals,
-        PrincipalsCapabilities
-    );
-    session_cap_accessor!(
-        principals_owner_capabilities,
-        principals_owner_capability_state,
-        crate::core::capability::PrincipalsOwner,
-        PrincipalsOwner,
-        PrincipalsOwnerCapabilities
+        CoreCapabilities,
+        capabilities
     );
 
     /// Every capability URI the session advertises whose block this crate
-    /// models by URI and then failed to parse.
+    /// models by URI and then failed to parse, including the selected
+    /// primary account's object for that URI.
     ///
     /// The session validator uses this to refuse on a malformed block the
     /// account DEPENDS on and to name the merely-optional ones in a
@@ -481,6 +632,11 @@ impl Session {
             .iter()
             .filter(|(_, value)| matches!(value, Capabilities::Malformed(_)))
             .map(|(key, _)| key.as_str())
+            .chain(self.primary_accounts.iter().filter_map(|(uri, id)| {
+                let account = self.account(id)?;
+                matches!(account.capability(uri), Some(Capabilities::Malformed(_)))
+                    .then_some(uri.as_str())
+            }))
     }
 
     pub(crate) fn accounts(&self) -> impl Iterator<Item = &String> {
@@ -506,7 +662,8 @@ impl Session {
     /// 2026-09-04 bug hunt raised and left open. What IS refused is an
     /// EMPTY id - a session with no `primaryAccounts` at all - which
     /// `Request::call` reports as `NoPrimaryAccount` naming the method's
-    /// own capability rather than shipping `"accountId": ""`.
+    /// own capability rather than shipping `"accountId": ""`. Methods
+    /// without an accountId, such as PushSubscription, need no primary.
     pub(crate) fn default_account_id(&self) -> Option<&str> {
         self.primary_accounts()
             .min_by_key(|(capability, _)| *capability)
@@ -539,6 +696,69 @@ impl Session {
 }
 
 impl Account {
+    session_cap_accessor!(
+        #[cfg(feature = "mail")]
+        mail_capabilities,
+        mail_capability_state,
+        crate::core::capability::Mail,
+        Mail,
+        MailCapabilities,
+        account_capabilities
+    );
+    session_cap_accessor!(
+        #[cfg(feature = "mail")]
+        submission_capabilities,
+        submission_capability_state,
+        crate::core::capability::Submission,
+        Submission,
+        SubmissionCapabilities,
+        account_capabilities
+    );
+    session_cap_accessor!(
+        #[cfg(feature = "mail")]
+        sieve_capabilities,
+        sieve_capability_state,
+        crate::core::capability::Sieve,
+        Sieve,
+        SieveCapabilities,
+        account_capabilities
+    );
+
+    session_cap_accessor!(
+        #[cfg(feature = "calendars")]
+        calendars_capabilities,
+        calendars_capability_state,
+        crate::core::capability::Calendars,
+        Calendars,
+        CalendarsCapabilities,
+        account_capabilities
+    );
+    session_cap_accessor!(
+        #[cfg(feature = "contacts")]
+        contacts_capabilities,
+        contacts_capability_state,
+        crate::core::capability::Contacts,
+        Contacts,
+        ContactsCapabilities,
+        account_capabilities
+    );
+    session_cap_accessor!(
+        principals_capabilities,
+        principals_capability_state,
+        crate::core::capability::Principals,
+        Principals,
+        PrincipalsCapabilities,
+        account_capabilities
+    );
+    session_cap_accessor!(
+        principals_owner_capabilities,
+        principals_owner_capability_state,
+        crate::core::capability::PrincipalsOwner,
+        PrincipalsOwner,
+        PrincipalsOwnerCapabilities,
+        account_capabilities
+    );
+
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
@@ -729,6 +949,16 @@ pub(crate) fn encode_template_value(value: &str) -> percent_encoding::PercentEnc
     percent_encoding::utf8_percent_encode(value, TEMPLATE_VALUE)
 }
 
+/// Expand a variable in the grammar at its actual substitution position.
+/// Complete dot path segments must survive WHATWG URL normalization.
+pub(crate) fn encode_template_value_at(value: &str, prefix: &str) -> String {
+    if prefix.contains('?') || prefix.contains('#') {
+        bifrost_net::url::encode_query_value(value)
+    } else {
+        bifrost_net::url::encode_path_component(value)
+    }
+}
+
 #[non_exhaustive]
 pub(crate) enum URLPart<T: URLParser> {
     Value(String),
@@ -810,6 +1040,24 @@ mod tests {
             "state": "state-1"
         }))
         .expect("session fixture decodes")
+    }
+
+    #[test]
+    fn template_values_preserve_dot_paths_and_query_values() {
+        for (value, escaped) in [(".", "%252E"), ("..", "%252E%252E")] {
+            let prefix = "https://example.test/download/account/blob/";
+            let expanded = format!("{prefix}{}", super::encode_template_value_at(value, prefix));
+            let parsed = reqwest::Url::parse(&expanded).unwrap();
+            assert_eq!(parsed.path(), format!("/download/account/blob/{escaped}"));
+            assert_eq!(
+                super::encode_template_value_at(value, "https://example.test/?name="),
+                value
+            );
+        }
+        assert_eq!(
+            super::encode_template_value_at("a/b?x#+", "https://example.test/"),
+            "a%2Fb%3Fx%23%2B"
+        );
     }
 
     #[test]

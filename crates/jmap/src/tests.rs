@@ -603,7 +603,7 @@ mod session_capabilities_deserialization {
     use crate::core::session::{Capabilities, Session};
 
     fn sample_session_json() -> serde_json::Value {
-        json!({
+        let mut value = json!({
             "capabilities": {
                 "urn:ietf:params:jmap:core": {
                     "maxSizeUpload": 50000000,
@@ -672,7 +672,19 @@ mod session_capabilities_deserialization {
             "uploadUrl": "https://jmap.example.org/upload/{accountId}/",
             "eventSourceUrl": "https://jmap.example.org/eventsource/",
             "state": "s0"
-        })
+        });
+        for uri in [
+            "urn:ietf:params:jmap:mail",
+            "urn:ietf:params:jmap:calendars",
+            "urn:ietf:params:jmap:contacts",
+            "urn:ietf:params:jmap:principals",
+        ] {
+            let account_value = value["capabilities"][uri].take();
+            value["capabilities"][uri] = json!({});
+            value["accounts"]["acct-1"]["accountCapabilities"][uri] = account_value;
+            value["primaryAccounts"][uri] = json!("acct-1");
+        }
+        value
     }
 
     #[test]
@@ -1124,10 +1136,6 @@ mod principals_owner_capability {
                     "collationAlgorithms": []
                 },
                 "urn:ietf:params:jmap:principals": {},
-                "urn:ietf:params:jmap:principals:owner": {
-                    "accountIdForPrincipal": "acct-principals",
-                    "principalId": "p-owner"
-                }
             },
             "accounts": {
                 "acct-1": {
@@ -1158,22 +1166,10 @@ mod principals_owner_capability {
 
         let session: crate::core::session::Session = serde_json::from_value(session_json).unwrap();
 
-        // Session-level principals capability (empty object → all fields None)
-        let principals = session.principals_capabilities().unwrap();
-        assert!(principals.current_user_principal_id().is_none());
-
-        // Session-level principals:owner capability
-        let owner = session.principals_owner_capabilities().unwrap();
-        assert_eq!(
-            owner
-                .account_id_for_principal()
-                .map(crate::core::id::Id::as_str),
-            Some("acct-principals")
-        );
-        assert_eq!(
-            owner.principal_id().map(crate::core::id::Id::as_str),
-            Some("p-owner")
-        );
+        assert!(matches!(
+            session.capability("urn:ietf:params:jmap:principals"),
+            Some(crate::core::session::Capabilities::Other(_))
+        ));
 
         // Account-level principals capability
         let account = session.account("acct-1").unwrap();

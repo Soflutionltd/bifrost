@@ -825,18 +825,11 @@ pub(crate) struct MailCapabilities {
     may_create_top_level_mailbox: bool,
 }
 
-/// Capabilities for `urn:ietf:params:jmap:submission` (RFC 8621 §7).
+/// Account capabilities for `urn:ietf:params:jmap:submission` (RFC 8621 s1.3.2).
 ///
-/// Deliberately NOT `#[serde(default)]` at the container level, for the
-/// same reason `CoreCapabilities` stopped zero-filling its limits: RFC
-/// 8621 §7 makes `maxDelayedSend` a mandatory member, so a block that
-/// omits it is a server describing the capability wrongly, not a server
-/// advertising a zero-second delayed-send window. The container default
-/// merged those two into the same `0`, which read as "submission works,
-/// scheduled send does not" - a malformed optional block degrading as a
-/// silently different VALUE instead of as a named "off". Without it the
-/// block lands in `Capabilities::Malformed`, where the family gate in
-/// `sync::factory` turns the whole submission family off and says so.
+/// The session object is an empty support marker. Only the selected account
+/// supplies this mandatory delayed-send window; an absent field there is
+/// malformed, whereas an advertised zero permits immediate submission.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct SubmissionCapabilities {
     #[serde(rename = "maxDelayedSend")]

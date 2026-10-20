@@ -88,9 +88,10 @@ impl ReqwestTransport {
         url: &str,
         body: Option<Bytes>,
         content_type: Option<&str>,
+        total_timeout: Option<Duration>,
     ) -> Result<Bytes, TransportError> {
         Ok(self
-            .send_measured(method, url, body, content_type, None)
+            .send_measured(method, url, body, content_type, total_timeout, None)
             .await?
             .0)
     }
@@ -105,10 +106,11 @@ impl ReqwestTransport {
         url: &str,
         body: Option<Bytes>,
         content_type: Option<&str>,
+        total_timeout: Option<Duration>,
         limit: Option<ConcurrencyLimit>,
     ) -> Result<(Bytes, u64), TransportError> {
         let response = self
-            .send_once(method, url, body, content_type, limit)
+            .send_once(method, url, body, content_type, total_timeout, limit)
             .await?;
         let bytes_in = response.bytes_in();
         Ok((
@@ -123,6 +125,7 @@ impl ReqwestTransport {
         url: &str,
         body: Option<Bytes>,
         content_type: Option<&str>,
+        total_timeout: Option<Duration>,
         limit: Option<ConcurrencyLimit>,
     ) -> Result<bifrost_net::Response, TransportError> {
         let mut request = match method {
@@ -138,7 +141,13 @@ impl ReqwestTransport {
                 )));
             }
         };
-        request = request.timeout(self.timeout);
+        // Bulk blob doors pass `None`: they may be deliberately paced by a
+        // bandwidth cap, so net's response-header and body-inactivity bounds
+        // are the useful limits while an absolute transfer deadline is not.
+        request = match total_timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request.without_timeout(),
+        };
         for (name, value) in &self.headers {
             let value = value.to_str().map_err(|e| {
                 TransportError::invariant_with_source(
@@ -208,6 +217,7 @@ impl HttpTransport for ReqwestTransport {
             url,
             Some(Bytes::from(body)),
             Some("application/json"),
+            Some(self.timeout),
             self.api_limit(),
         )
         .await
@@ -232,20 +242,20 @@ impl HttpTransport for ReqwestTransport {
         body: Vec<u8>,
         content_type: Option<&str>,
     ) -> Result<bytes::Bytes, TransportError> {
-        self.send("POST", url, Some(Bytes::from(body)), content_type)
+        self.send("POST", url, Some(Bytes::from(body)), content_type, None)
             .await
     }
 
     async fn download(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
-        self.send("GET", url, None, None).await
+        self.send("GET", url, None, None, None).await
     }
 
     async fn download_measured(&self, url: &str) -> Result<(bytes::Bytes, u64), TransportError> {
-        self.send_measured("GET", url, None, None, None).await
+        self.send_measured("GET", url, None, None, None, None).await
     }
 
     async fn get_session(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
-        self.send("GET", url, None, None).await
+        self.send("GET", url, None, None, Some(self.timeout)).await
     }
 }
 
@@ -419,7 +429,8 @@ mod tests {
     }
 
     fn scripted_transport(script: &Arc<ScriptedDispatch>) -> ReqwestTransport {
-        let spec = AccountSpec::new(Some(Arc::new(StaticTokenSource::new("token", None))));
+        let mut spec = AccountSpec::new(Some(Arc::new(StaticTokenSource::new("token", None))));
+        spec.request_timeout = Some(Duration::from_secs(45));
         let account = scripted_net(script, bifrost_net::NetConfig::default())
             .attach_account(AccountId("api-limit".to_owned()), spec);
         ReqwestTransport {
@@ -461,6 +472,66 @@ mod tests {
             blob_script.peak_in_flight(),
             4,
             "downloads are not API requests and are not gated by the API limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_requests_disable_the_total_deadline() {
+        let script = ScriptedDispatch::new(
+            (0..5).map(|_| bifrost_net::test_support::canned(reqwest::StatusCode::OK, b"{}")),
+        );
+        let transport = scripted_transport(&script);
+
+        transport
+            .api_request("https://jmap.test/api", b"{}".to_vec())
+            .await
+            .expect("API request");
+        transport
+            .upload(
+                "https://jmap.test/upload",
+                b"blob".to_vec(),
+                Some("text/plain"),
+            )
+            .await
+            .expect("blob upload");
+        transport
+            .download("https://jmap.test/blob")
+            .await
+            .expect("blob download");
+        transport
+            .download_measured("https://jmap.test/measured-blob")
+            .await
+            .expect("measured blob download");
+        transport
+            .get_session("https://jmap.test/session")
+            .await
+            .expect("session request");
+
+        let timeouts = script
+            .requests()
+            .iter()
+            .map(|request| request.timeout)
+            .collect::<Vec<_>>();
+        assert_eq!(timeouts.len(), 5);
+        let is_client_deadline = |timeout: Option<Duration>| {
+            timeout.is_some_and(|remaining| {
+                remaining > Duration::ZERO && remaining <= Duration::from_secs(30)
+            })
+        };
+        assert!(
+            is_client_deadline(timeouts[0]),
+            "API request should keep the client's 30s deadline, got {:?}",
+            timeouts[0]
+        );
+        assert_eq!(
+            &timeouts[1..4],
+            &[None, None, None],
+            "blob upload and download doors should disable the total deadline"
+        );
+        assert!(
+            is_client_deadline(timeouts[4]),
+            "session request should keep the client's 30s deadline, got {:?}",
+            timeouts[4]
         );
     }
 

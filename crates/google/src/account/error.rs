@@ -25,7 +25,7 @@ use bifrost_types::{
     RetryHint, ServerCause, ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleScope,
     TransmissionState, WireCause,
 };
-use bifrost_types::{BatchFailure, BatchItemId, BatchSuccess, BatchUncertain, TransportErrorKind};
+use bifrost_types::{BatchFailure, BatchItemId, BatchSuccess, TransportErrorKind};
 
 use crate::error::{
     Error, GmailCursorFailure, GmailErrorEnvelope, GmailLocalError, GmailResponseError,
@@ -423,35 +423,6 @@ pub(crate) fn shutdown_inflight_error(operation: AccountOperation) -> AccountErr
     .native_code("account_closed_in_flight")
     .try_build()
     .expect("valid account error classification")
-}
-
-/// Build per-id `ItemOutcome::Uncertain` lanes for ids whose request was
-/// dispatched and whose answer we never read.
-pub(crate) fn uncertain_outcomes(
-    ids: &[ObjectId],
-    error: &AccountError,
-) -> Vec<ItemOutcome<MutationSuccess>> {
-    ids.iter()
-        .map(|id| {
-            ItemOutcome::Uncertain(BatchUncertain::new(
-                BatchItemId(id.0.clone()),
-                error.clone(),
-            ))
-        })
-        .collect()
-}
-
-/// Build per-id `MutationSuccess::Applied` outcomes for a fully
-/// successful batch.
-pub(crate) fn applied_outcomes(ids: &[ObjectId]) -> Vec<ItemOutcome<MutationSuccess>> {
-    ids.iter()
-        .map(|id| {
-            ItemOutcome::Succeeded(BatchSuccess::new(
-                BatchItemId(id.0.clone()),
-                MutationSuccess::Applied,
-            ))
-        })
-        .collect()
 }
 
 /// Build per-id `MutationSuccess::Skipped` outcomes for a legitimate

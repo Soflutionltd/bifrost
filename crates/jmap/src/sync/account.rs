@@ -857,7 +857,14 @@ impl Account for JmapAccount {
         };
         // Same submission-account routing as `send_message`: the import +
         // EmailSubmission must both target the submission-capable account.
-        pim::send_raw_message(submission, raw, save_to_sent)
+        let account_id = submission.id_str().to_string();
+        pim::send_raw_message(
+            submission,
+            Arc::clone(&self.email_states),
+            account_id,
+            raw,
+            save_to_sent,
+        )
     }
 
     fn attachment_upload(

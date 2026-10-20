@@ -2,7 +2,7 @@ use crate::{
     blob::BlobRef,
     client::Client,
     core::{
-        session::{URLPart, encode_template_value},
+        session::{URLPart, encode_template_value_at},
         transport::HttpTransport,
     },
 };
@@ -32,21 +32,27 @@ impl<Tr: HttpTransport> Client<Tr> {
                 URLPart::Value(value) => download_url.push_str(value),
                 URLPart::Parameter(param) => match param {
                     super::URLParameter::AccountId => {
-                        download_url.extend(encode_template_value(blob.account_id.as_str()));
+                        download_url.push_str(&encode_template_value_at(
+                            blob.account_id.as_str(),
+                            &download_url,
+                        ));
                     }
                     super::URLParameter::BlobId => {
-                        download_url.extend(encode_template_value(blob.blob_id.as_str()));
+                        download_url.push_str(&encode_template_value_at(
+                            blob.blob_id.as_str(),
+                            &download_url,
+                        ));
                     }
                     super::URLParameter::Name => {
                         let name = blob.name.as_deref().unwrap_or("download");
-                        download_url.extend(encode_template_value(name));
+                        download_url.push_str(&encode_template_value_at(name, &download_url));
                     }
                     super::URLParameter::Type => {
                         let ctype = blob
                             .content_type
                             .as_deref()
                             .unwrap_or("application/octet-stream");
-                        download_url.extend(encode_template_value(ctype));
+                        download_url.push_str(&encode_template_value_at(ctype, &download_url));
                     }
                 },
             }

@@ -289,7 +289,10 @@ label refresh and per-id TRASH fallback. The two remaining zero-valued sites are
 genuinely synthetic - `discover_cursor_scopes` returns a constant, and a
 `discover_memberships` cache hit performs no request - and say so at the call
 site. Blob batches keep their own exact transferred size and do not use the
-accumulator. The Drive resumable-upload session in `cloud.rs` builds its own
+accumulator. `open_raw_rfc822` takes its size from the request-local response
+tally before decoding the base64url MIME field, so it reports the JSON
+envelope bytes rather than the smaller decoded message. The Drive
+resumable-upload session in `cloud.rs` builds its own
 requests off `account_net()` and so sits outside the accumulator; it feeds no
 `bytes_in` field, so no lane reports a number it did not measure.
 
@@ -520,7 +523,10 @@ unsupported because Gmail labels are flat.
 Settings primitives map to Gmail settings endpoints:
 
 - `identities_list` and `identity_update` use
-  `users.settings.sendAs`.
+  `users.settings.sendAs`. Gmail stores the signature as HTML; when only
+  `IdentityPatch.signature_text` is supplied, the client escapes its text and
+  converts line breaks to `<br>` before writing. An explicit
+  `signature_html` patch is sent as HTML unchanged and takes precedence.
 - `vacation_get` and `vacation_set` use
   `users.settings.vacation`.
 - `quota_get` returns `Unsupported`; the Gmail API profile exposes
@@ -574,6 +580,9 @@ names / emails / phones / metadata), stamping each card
 name (`otherContacts/*` -> auto-collected). The discriminator lets the
 consumer route the two corpora to distinct local stores without matching
 on the provider.
+`contact_create` requires the successful response's `resourceName`; an absent
+field is `Protocol(MissingField)` and an empty value is `Protocol(ParseFailed)`,
+both with acknowledged response evidence.
 Update fetches the raw `Person`, requires the server ETag, and replaces only
 fields named by the shared `ContactPatch`. Display-name updates rewrite the
 first modeled name's given/family split while preserving unmodeled People name
@@ -610,7 +619,13 @@ while `PolicyBlocked` (a real admin refusal) propagates.
 
 Google Calendar RSVP fetches the raw event, updates only the matching
 account attendee's `responseStatus`, and sends the attendee array back
-with unmodeled attendee fields preserved. Event status maps through Google
+with unmodeled attendee fields preserved. It selects the provider attendee
+marked `self: true`, falling back to a case-insensitive profile-email match
+when Google omits that marker; if no account attendee is present, RSVP is
+`Unsupported(EventRsvp)` because the event state offers no target. `Delegated`,
+`Unknown`, and future shared RSVP statuses are refused as
+`Unsupported(EventRsvp)` before the event is fetched because Google has no
+safe `responseStatus` mapping for them. Event status maps through Google
 Calendar `status` on read, create, and update; an absent `status` reads as
 `Confirmed` (Google's documented default), so `Unknown` means only an
 unrecognized value. Event search sends `showDeleted=true` only when
@@ -1086,7 +1101,19 @@ without `with_pubsub_config` rejects `push_subscribe` with
 `push_subscribe` sends a command to the watch actor, which issues `users.watch`
 with the configured topic and atomically enters
 `Watched { history_id, expiration }`. The returned `SubscriptionHandle` is a
-JSON envelope `{ topic, history_id, expiration }`.
+JSON envelope `{ topic, history_id, expiration, handle_id }`. Gmail may return
+the same watch state for several subscribers on a quiet mailbox, so `handle_id`
+is a process-local monotonic identity that keeps each subscription removable
+independently. Older persisted envelopes without `handle_id` remain readable
+for unsubscribe.
+
+Gmail only accepts the account-wide `CursorScope::Account` push scope. A
+`push_subscribe` request with at least one account scope creates one watch and
+reports every account entry succeeded; each other scope is reported as an
+`Unsupported(PushSubscribe)` failure correlated to its `CursorScope`. An empty
+request or one with no account scope returns `Err` because no watch was
+created. A failed `users.watch` also returns `Err`, so no successful scope is
+claimed when the request itself failed.
 
 A subscribe emits `WatchEvent::Reconnected` only when the actor's
 `disconnected` latch is set - that is, only when it genuinely reconnects.
@@ -1209,9 +1236,12 @@ stop. Residual: instances in OTHER processes are invisible to the registry and
 `users.stop` cannot be scoped to a watch, so cross-process teardown of a shared
 mailbox can still stop a live watch until the next renewal.
 
-`push_stream` is a `broadcast::Receiver<WatchEvent>` adapter
-with shutdown wiring. `Lagged` is treated as a skip rather than
-an error.
+`push_stream` is a `broadcast::Receiver<WatchEvent>` adapter with shutdown
+wiring. If a consumer falls behind the 32-event health ring, the stream emits
+a support-only `WatchEvent::Warning` with the number of health events lost,
+then resumes the retained events. The warning makes it visible that a health
+edge such as `Terminated` may have been among the dropped events; it cannot
+reconstruct that edge.
 
 The Pub/Sub message payload itself is not parsed by this crate;
 the consumer subscribes to the Pub/Sub topic out of process,
@@ -1239,39 +1269,45 @@ share a single `mutation_stream` driver:
 - Post the batch:
   - `SetFlags` / `Move` -> `users.messages.batchModify`.
     A 404 from a multi-id request is ambiguous because Gmail rejects the whole
-    request when any one message is absent. The driver bisects the batch, keeping
-    successful sub-batches in the success lane and reducing 404 sub-batches to
-    singletons, so only genuinely absent ids receive `NotFound(Message)`. Bisection
-    is used instead of per-id replay because the common sparse-failure case takes
-    logarithmic rounds rather than one extra request per message.
-    Every non-404 sub-batch error inside the bisection goes back through
-    `mutation_error`, exactly as the unsplit call does, so a rate limit,
-    transport fault, auth loss, or engine directive arriving mid-bisection still
-    terminates the stream instead of being laundered into per-id failures. The
-    sub-batches already resolved when that happens are emitted as one final
-    non-final page ahead of `Terminated`, so no id the driver resolved loses its
-    lane; ids never transmitted stay unreported, which is what `Terminated` has
-    always meant.
+    request when any one message is absent. For each label body, the driver
+    bisects that body's id list, keeping successful sub-batches live for the
+    remaining label bodies and reducing 404 sub-batches to singletons. Only a
+    singleton that still answers 404 receives `NotFound(Message)`, and it is
+    excluded from later bodies. Bisection is used instead of per-id replay
+    because the common sparse-failure case takes logarithmic rounds rather than
+    one extra request per message.
+
+    The driver tracks acknowledgements per id across the label bodies. An id is
+    `Applied` (or `Downgraded` for unsupported flags) only after every body has
+    succeeded. A permanent non-404 failure on a later body after an earlier
+    body was acknowledged becomes `Uncertain` with the failure attached, since
+    part of the requested patch already landed. A retry-class error terminates
+    the stream; fully resolved ids and ids with an acknowledged partial patch keep
+    their lanes in a non-final page ahead of `Terminated`. A sub-batch with no
+    acknowledged effect remains unreported unless its request was ambiguous in
+    flight, so the engine can re-issue it.
 
 Shutdown of a mutation stream follows the TRANSMISSION EVIDENCE, not the loop
 that caught it. Before dispatch, cancellation ends the stream silently: no byte
 has crossed the side-effect boundary for the batch in hand, so nothing is owed.
 Once `batchModify` / `batchDelete` has been dispatched, dropping the future
-would lose writes Gmail may already have applied, and reporting the ids
-`Failed` would assert they did not land. The driver instead emits every id of
-that batch as `ItemOutcome::Uncertain`, on a `PageBoundary::Page` batch (never
-`Final` - the operation did not complete), followed by `SyncEvent::Terminated`
-carrying `Transport(Network)` with a secondary
+would lose writes Gmail may already have applied, and reporting them `Failed`
+would assert they did not land. For label patches, the driver preserves already
+resolved outcomes, reports ids with an acknowledged partial patch or an
+unanswered request as `Uncertain`, and leaves untouched ids unreported. For
+`batchDelete`, if that request itself is still unanswered, every dispatched id
+is `Uncertain`. The accounted items are emitted on a `PageBoundary::Page` batch
+(never `Final` - the operation did not complete), followed by
+`SyncEvent::Terminated` carrying
+`Transport(Network)` with a secondary
 `AttemptCause(TransmissionState::InFlight)`. That is the same rule
 `bifrost-imap` applies to an `InFlight` drop, and it is what routes a
 non-idempotent mutation to reconciliation rather than to a blind retry. The
 select is `biased` toward the request so an answer that has already arrived is
 classified normally even when the token fires in the same poll, and the
 driver's pending-event slot is drained BEFORE the shutdown check so the
-terminator parked behind the uncertain lanes cannot be swallowed by the token
-that produced it. A mid-bisection shutdown reports every id of the batch as
-`Uncertain`, including sub-batches already resolved - an over-approximation on
-the safe side, since `Uncertain` queues for read-back.
+terminator parked behind accounted lanes cannot be swallowed by the token
+that produced it.
   - `Destroy` -> `users.messages.batchDelete`. On a parsed 403 Gmail reason of
     `forbidden` or `insufficientPermissions` it falls
     back to a label patch that moves the messages into `TRASH`,
@@ -1290,13 +1326,14 @@ the safe side, since `Uncertain` queues for read-back.
     `Downgraded` lane instead of trusting it, and a trashed message still
     hydrates, so the guard files it `still_failed`: honest, and terminal.
 
-    Only ids the trash patch reported as SUCCEEDED are downgraded
-    (`downgrade_succeeded_outcomes`). An id whose trash patch failed was not
-    downgraded - it was not mutated at all - and keeps its classified failure.
-    That helper is the crate's only producer of `Downgraded`, so removing the
-    call site fails the build as dead code; the helper's own semantics,
-    including the lane-preservation rule, are pinned by
-    `the_destroy_trash_fallback_downgrades_only_what_it_trashed`. The scripted
+    Before dispatching the fallback, the driver sets its actual effect in the
+    shared progress ledger. Each successful trash sub-batch is recorded there as
+    `Downgraded` immediately, so normal completion, terminal failure and shutdown
+    all observe the same outcome. Failed and uncertain ids keep their lanes.
+    `the_destroy_trash_fallback_downgrades_only_what_it_trashed` pins that lane
+    preservation. `cancelled_trash_fallback_preserves_downgraded_sub_batch`
+    cancels with one trash sub-batch acknowledged and another pending, asserting
+    the downgrade, the uncertain pending id and the terminator. The scripted
     transport test `destroy_scope_failure_sends_trash_fallback_and_reports_downgraded`
     drives the production 403 classification, asserts both request bodies, and
     pins the downgraded outcome without a socket.
@@ -1332,10 +1369,15 @@ Result classification:
   it claims the target was already in the requested state.
 - A retry-class or auth-class error -> stream-level
   `SyncEvent::Terminated(AccountError)` so the engine can re-issue
-  via `error.recovery()`. The driver does not split applied vs
-  failed across the same batch on HTTP failure.
-- Any other error -> per-id `ItemOutcome::Failed(BatchFailure {
-  error, .. })`, carrying the projected `AccountError`.
+  via `error.recovery()`. Label-patch ids with an earlier acknowledged body
+  are emitted as `Uncertain`; ids with no acknowledged effect remain
+  unreported unless their current request was transmission-ambiguous. A
+  `batchDelete` request with `InFlight` transmission evidence also contributes
+  an `Uncertain` lane.
+- Any other non-404 error -> per-id `ItemOutcome::Failed(BatchFailure {
+  error, .. })`, carrying the projected `AccountError`, unless an earlier
+  label body was acknowledged for that id, in which case the partial patch
+  is `Uncertain` and carries the same error for read-back.
 
 Flag canonicalization in `flags.rs`:
 
@@ -1366,8 +1408,8 @@ Flag canonicalization in `flags.rs`:
 
   That vocabulary-sized removal list is load-bearing, not an oversight
   awaiting a read-back-then-diff replacement. One `LabelPatch` is computed
-  once per mutation and applied to up to 1000 ids in a single
-  `batchModify`, which is sound only because the patch is
+  once per mutation and applied to up to 1000 ids, which is sound only
+  because the patch is
   state-independent: it asserts the same absolute set for every target
   whatever each currently carries, making it idempotent and immune to a
   concurrent label change landing between decision and write. A diffed
@@ -1390,15 +1432,16 @@ Flag canonicalization in `flags.rs`:
   request under the documented figure rather than assuming the silent
   method is unbounded. `mutation::batch_modify_bodies` therefore lowers a
   patch onto as many capped request bodies as its longer label list
-  needs, all carrying the same ids. This is the one bound the 404
-  bisector cannot reach: halving the id list leaves the label list
-  exactly as long, so a label-heavy account without the split would 400
-  on every exact-set with no recovery path. Splitting is sound for the
-  same reason the vocabulary-sized list is: an idempotent,
-  state-independent patch says nothing about labels a given request does
-  not name, so several requests over one id list converge on the same
-  final label set. An account under the cap - nearly all of them - still
-  emits exactly one request.
+  needs. They initially carry the same ids; if one body returns 404, the
+  driver bisects its id list and carries only surviving ids into later
+  bodies. This is the one bound the 404 bisector cannot reach: halving
+  the id list leaves the label list exactly as long, so a label-heavy
+  account without the split would 400 on every exact-set with no recovery
+  path. Splitting is sound for the same reason the vocabulary-sized list
+  is: an idempotent, state-independent patch says nothing about labels a
+  given request does not name, so applying every body to each surviving
+  id converges on the same final label set. An account under the cap -
+  nearly all of them - still emits exactly one request.
 - `DRAFT` and `SENT` are read-only projections: Gmail answers 400 for either id
   in `addLabelIds` or in `removeLabelIds`, so neither ever reaches the wire from
   any reverse translation path, including a crafted `$gmail-label:SENT:...`
@@ -1502,12 +1545,13 @@ Mapping highlights:
     the request it would shape is sent) -> `Request(Malformed)` ->
     `ClientBug`. Google Calendar and People route an event id without a
     calendar id, a non-UTF-8 page cursor, a range bound with no RFC 3339
-    offset, an RSVP for an account that is not an attendee, and an
-    unsupported address-book id here (`caller_input_error`). A
+    offset, and an unsupported address-book id here (`caller_input_error`). A
     cross-calendar search cursor naming a calendar no longer listed is
     state that moved rather than caller input: `ConcurrencyConflict` with
     `AttemptCause(Unsent)`, retried after a state refresh.
-  - `Unsupported` and `BlobRangeUnsupported` -> `Unsupported(op)`.
+  - `Unsupported` and `BlobRangeUnsupported` -> `Unsupported(op)`. An RSVP
+    whose event has no attendee for the account is also `Unsupported(EventRsvp)`;
+    the provider event state, not caller syntax, has no target for the action.
   - `MissingField` (a response lacking something it must carry, such as a
     created event with no id or a live event missing start or end) ->
     `Protocol(MissingField)`, with `AttemptCause(Acknowledged)`. Every
@@ -1542,12 +1586,15 @@ Mapping highlights:
     engine clears the cursor; a cursor payload that does not deserialize is
     `SyncState(CursorInvalid)`.
 
-`mutation_error(ids, error, ctx)` is the ordinary per-id fan-out for batched mutations:
-it translates the crate-level error once via `into_account_error` and produces
-one `ItemOutcome::Failed(BatchFailure { error: account_error.clone(), .. })` per
-id - `AccountError` is `Arc<Inner>`-backed, so the clones share storage. The
-mutation driver intercepts ambiguous multi-id `batchModify` 404s before this
-fan-out and isolates them by bisection.
+`mutation_error(ids, error, ctx)` is the ordinary per-id fan-out for batched
+mutations: it translates the crate-level error once via `into_account_error`
+and produces one `ItemOutcome::Failed(BatchFailure { error:
+account_error.clone(), .. })` per id - `AccountError` is `Arc<Inner>`-backed,
+so the clones share storage. The label-patch driver intercepts ambiguous
+multi-id `batchModify` 404s before this fan-out and isolates them by bisection.
+When a later label body fails after an earlier one was acknowledged, the
+per-id failed lane is promoted to `Uncertain` because the requested patch has
+already changed the message.
 
 ## Known limitations
 

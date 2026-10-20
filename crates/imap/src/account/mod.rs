@@ -988,10 +988,9 @@ fn unsupported_future<T: Send + 'static>(
 fn unsupported_stream<T: Send + 'static>(
     operation: AccountOperation,
 ) -> AccountStream<SyncEvent<T>> {
-    Box::pin(futures::stream::iter([
-        SyncEvent::Terminated(error::unsupported(operation)),
-        SyncEvent::Done(None),
-    ]))
+    Box::pin(futures::stream::iter([SyncEvent::Terminated(
+        error::unsupported(operation),
+    )]))
 }
 
 /// Bring a checkout's mailbox affinity in line with its session after

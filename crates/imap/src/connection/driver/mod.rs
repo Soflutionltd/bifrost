@@ -747,6 +747,7 @@ async fn dispatch_response_loop(
 ) -> Result<Box<dyn std::any::Any + Send>, Error> {
     // After a successful send, any transport failure is InFlight: the
     // command bytes crossed the side-effect boundary.
+    let mut continuation_error = None;
     loop {
         let notify_before = state.notify();
         let utf8 = utf8_mode(state);
@@ -765,6 +766,7 @@ async fn dispatch_response_loop(
                 // (I13): emit alert/notification overflow from
                 // tagged response codes before finalization.
                 emit_tagged_response_code_events(&t, event_sink);
+                let cancellation_acknowledged = t.status == crate::types::response::StatusKind::No;
                 let ctx = build_consumer_context(state, cmd_target.as_ref(), tag);
                 // Tagged response received: the server acknowledged the
                 // command. Errors from finalization (NO/BAD status) carry
@@ -785,8 +787,35 @@ async fn dispatch_response_loop(
                         let _ = event_sink.emit(resp.into());
                     }
                 }
-                return finalized
-                    .output
+                let finalized_output = finalized.output;
+                if let Some(error) = continuation_error.take() {
+                    if cancellation_acknowledged {
+                        // Preserve a structured auth code from the terminal
+                        // NO when the consumer recognized it. Without one,
+                        // the continuation error carries the more useful
+                        // server-final explanation.
+                        let error = if matches!(&error, Error::Auth { .. }) {
+                            match finalized_output {
+                                Err(completion_error @ Error::Auth { code: Some(_), .. }) => {
+                                    completion_error
+                                }
+                                _ => error,
+                            }
+                        } else {
+                            error
+                        };
+                        // A tagged NO closes a cancelled SASL exchange. Return
+                        // the auth error only after consuming that completion,
+                        // so the next command starts on a synchronized stream.
+                        // Error::Auth has no attempt field in the current
+                        // error shape, so with_attempt cannot record the NO.
+                        return Err(error.with_attempt(TransmissionState::Acknowledged));
+                    }
+                    return Err(Error::Protocol(
+                        "SASL cancellation did not end with the command's tagged NO".into(),
+                    ));
+                }
+                return finalized_output
                     .map_err(|e| e.with_attempt(TransmissionState::Acknowledged));
             }
             crate::types::Response::Tagged(t) => {
@@ -800,8 +829,24 @@ async fn dispatch_response_loop(
                 // classification so they reach the event queue even
                 // when the response is routed to a consumer.
                 // The command is on the wire: a BYE here is InFlight.
-                let code_emitted =
-                    process_untagged_prefix(digest, &u, event_sink, TransmissionState::InFlight)?;
+                let expected_logout_bye =
+                    cmd_kind == crate::types::CommandKind::Logout && digest.had_bye();
+                let code_emitted = process_untagged_prefix(
+                    digest,
+                    &u,
+                    event_sink,
+                    TransmissionState::InFlight,
+                    Some(cmd_kind),
+                )?;
+
+                // RFC 3501 Section 6.1.3 requires LOGOUT's BYE before its
+                // tagged OK. It belongs to the LOGOUT consumer and is not a
+                // server-initiated disconnect in this one command path.
+                if expected_logout_bye {
+                    let ctx = build_consumer_context(state, cmd_target.as_ref(), tag);
+                    consumer.on_response(*u, notify_before, &ctx);
+                    continue;
+                }
 
                 let class_ctx = ClassificationContext {
                     notify: notify_before,
@@ -824,11 +869,34 @@ async fn dispatch_response_loop(
                 }
             }
             crate::types::Response::Continuation(c) => {
+                if continuation_error.is_some() {
+                    return Err(Error::Protocol(
+                        "server sent another SASL continuation after client cancellation".into(),
+                    ));
+                }
                 // A regular or streaming consumer refuses a continuation as a
                 // protocol error; only a continuation consumer (AUTHENTICATE)
                 // answers one.
                 let ctx = build_consumer_context(state, cmd_target.as_ref(), tag);
-                let ContinuationReply::Write(bytes) = consumer.on_continuation(c, &ctx)?;
+                let reply = match consumer.on_continuation(c, &ctx) {
+                    Ok(reply) => reply,
+                    Err(error) if error.is_connection_fatal() => {
+                        return Err(error.with_attempt(TransmissionState::InFlight));
+                    }
+                    Err(error) => {
+                        // A non-fatal SASL failure still occurs while the
+                        // server is waiting for this exchange's response.
+                        // Cancel it and consume the tagged NO before making
+                        // the connection available to another command.
+                        wire_reader
+                            .write_all(b"*\r\n")
+                            .await
+                            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
+                        continuation_error = Some(error);
+                        continue;
+                    }
+                };
+                let ContinuationReply::Write(bytes) = reply;
                 // The command is already on the wire and in an exchange, so a
                 // failed reply is InFlight whatever the socket counter says:
                 // this is not a new command's first byte.
@@ -864,7 +932,8 @@ fn publish_then_answer<T>(publish: impl FnOnce(), result_tx: oneshot::Sender<T>,
 }
 
 /// Turn a side-effect digest for an untagged response into the fatal BYE
-/// result every active driver read loop must honor.
+/// result every active driver read loop must honor, except command dispatch
+/// for LOGOUT, whose consumer owns the required BYE.
 ///
 /// Private on purpose: the ordering constraint below (response-code events
 /// first, so an ALERT carried by BYE reaches the event queue before the
@@ -883,6 +952,7 @@ fn short_circuit_on_bye(
     digest: super::state::SideEffectDigest,
     response: &UntaggedResponse,
     phase: bifrost_types::TransmissionState,
+    command_kind: Option<crate::types::CommandKind>,
 ) -> Result<(), Error> {
     if !digest.had_bye() {
         return Ok(());
@@ -898,24 +968,31 @@ fn short_circuit_on_bye(
         ));
     };
     debug_assert!(matches!(status, UntaggedStatus::Bye));
+    if command_kind == Some(crate::types::CommandKind::Logout) {
+        return Ok(());
+    }
     Err(Error::bye_with_code(text.clone(), code.clone()).with_attempt(phase))
 }
 
 /// The shared prologue every driver read loop runs on an untagged response:
-/// emit response-code events, then fail the command if the response was a BYE.
+/// emit response-code events, then fail on BYE unless regular command dispatch
+/// is servicing LOGOUT.
 /// Returns whether a code event was emitted, which the caller uses to decide
 /// whether the response still needs a plain event of its own.
 ///
 /// `phase` stamps the BYE error (see `short_circuit_on_bye`); each loop
 /// states how far its command had got rather than leaving it unstamped.
+/// `command_kind` is `Some` only for single-command dispatch; pipeline and
+/// event-only loops cannot make the LOGOUT exception.
 pub(super) fn process_untagged_prefix(
     digest: super::state::SideEffectDigest,
     response: &UntaggedResponse,
     event_sink: &mut event_sink::DriverEventSink,
     phase: bifrost_types::TransmissionState,
+    command_kind: Option<crate::types::CommandKind>,
 ) -> Result<bool, Error> {
     let code_emitted = emit_untagged_response_code_events(response, event_sink);
-    short_circuit_on_bye(digest, response, phase)?;
+    short_circuit_on_bye(digest, response, phase, command_kind)?;
     Ok(code_emitted)
 }
 
@@ -943,7 +1020,7 @@ pub(super) fn process_untagged_as_event(
     event_sink: &mut event_sink::DriverEventSink,
     phase: bifrost_types::TransmissionState,
 ) -> Result<(), Error> {
-    let code_emitted = process_untagged_prefix(digest, &response, event_sink, phase)?;
+    let code_emitted = process_untagged_prefix(digest, &response, event_sink, phase, None)?;
     if !code_emitted {
         let _ = event_sink.emit((*response).into());
     }

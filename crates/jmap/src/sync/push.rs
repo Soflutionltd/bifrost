@@ -9,7 +9,7 @@ use bifrost_types::{
     InvalidationHint, ObjectType, PushCapability, PushSource, SubscriptionHandle, WatchEvent,
 };
 
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::Client;
@@ -76,7 +76,7 @@ impl PushRouting {
 /// in a type, at the price of rewriting test-pinned cancellation and replay
 /// machinery with no invariant gap left to close.
 pub(crate) struct WsState {
-    pub(crate) tx: broadcast::Sender<WatchEvent>,
+    pub(crate) tx: PushEventSender,
     /// The last union actually applied to the wire. Starts EMPTY at `open()`,
     /// which is why the first reader pass sends a disable frame; see
     /// `apply_push_set`, where that behaviour is explained and ruled correct.
@@ -95,6 +95,42 @@ pub(crate) struct WsState {
     /// setup awaits by, without threading the whole policy through the
     /// account constructor.
     teardown_timeout: Duration,
+}
+
+/// Push events use broadcast for hints and a watch value for terminal health.
+/// Broadcast is still the right fit for lossy hints, but terminal failure must
+/// survive both late subscription and a lagged receiver.
+#[derive(Clone)]
+pub(crate) struct PushEventSender {
+    events: broadcast::Sender<WatchEvent>,
+    terminal: watch::Sender<Option<AccountError>>,
+}
+
+pub(crate) struct PushEventReceiver {
+    events: broadcast::Receiver<WatchEvent>,
+    terminal: watch::Receiver<Option<AccountError>>,
+}
+
+impl PushEventSender {
+    fn new(capacity: usize) -> Self {
+        let (events, _) = broadcast::channel(capacity);
+        let (terminal, _) = watch::channel(None);
+        Self { events, terminal }
+    }
+
+    pub(crate) fn subscribe(&self) -> PushEventReceiver {
+        PushEventReceiver {
+            events: self.events.subscribe(),
+            terminal: self.terminal.subscribe(),
+        }
+    }
+
+    fn send(&self, event: WatchEvent) -> Result<usize, broadcast::error::SendError<WatchEvent>> {
+        if let WatchEvent::Terminated(error) = &event {
+            let _ = self.terminal.send_replace(Some(error.clone()));
+        }
+        self.events.send(event)
+    }
 }
 
 // pub: re-exported through crate::sync for AccountFactory reconnect tuning.
@@ -202,7 +238,7 @@ impl WsState {
         policy: ReconnectPolicy,
         routing: Arc<PushRouting>,
     ) -> Self {
-        let (tx, _) = broadcast::channel(256);
+        let tx = PushEventSender::new(256);
         let enabled = Arc::new(Mutex::new(HashSet::new()));
         let push_state = Arc::new(Mutex::new(None));
         let reader = push_available.then(|| {
@@ -256,25 +292,55 @@ pub(crate) async fn join_reader(
 }
 
 pub(crate) fn stream(
-    mut rx: broadcast::Receiver<WatchEvent>,
+    mut rx: PushEventReceiver,
     shutdown: CancellationToken,
 ) -> AccountStream<WatchEvent> {
     Box::pin(async_stream::stream! {
+        let terminal = { rx.terminal.borrow_and_update().clone() };
+        if let Some(error) = terminal {
+            yield WatchEvent::Terminated(error);
+            return;
+        }
+
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
-                result = rx.recv() => {
+                result = rx.events.recv() => {
                     match result {
-                        Ok(event) => yield event,
+                        Ok(event) => {
+                            let terminal = matches!(event, WatchEvent::Terminated(_));
+                            yield event;
+                            if terminal {
+                                break;
+                            }
+                        }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            yield WatchEvent::Invalidated {
-                                hint: InvalidationHint {
-                                    source: PushSource::Coalesced,
-                                    payload: HintPayload::Unknown,
-                                },
-                            };
+                            let terminal = { rx.terminal.borrow_and_update().clone() };
+                            if let Some(error) = terminal {
+                                yield WatchEvent::Terminated(error);
+                                break;
+                            } else {
+                                yield WatchEvent::Invalidated {
+                                    hint: InvalidationHint {
+                                        source: PushSource::Coalesced,
+                                        payload: HintPayload::Unknown,
+                                    },
+                                };
+                            }
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                changed = rx.terminal.changed() => {
+                    match changed {
+                        Ok(()) => {
+                            let terminal = { rx.terminal.borrow_and_update().clone() };
+                            if let Some(error) = terminal {
+                                yield WatchEvent::Terminated(error);
+                                break;
+                            }
+                        }
+                        Err(_) => break,
                     }
                 }
             }
@@ -581,7 +647,7 @@ fn interrupted(shutdown: &CancellationToken) -> ReaderStep {
 
 async fn reader_loop<T: PushTransport>(
     transport: T,
-    tx: broadcast::Sender<WatchEvent>,
+    tx: PushEventSender,
     enabled: Arc<Mutex<DataTypeSet>>,
     push_state: Arc<Mutex<Option<String>>>,
     shutdown: CancellationToken,
@@ -596,7 +662,7 @@ async fn reader_loop<T: PushTransport>(
 
         match reader_pass(
             &transport,
-            &tx,
+            &tx.events,
             &enabled,
             &push_state,
             &shutdown,
@@ -750,10 +816,20 @@ async fn reader_pass<T: PushTransport>(
             }
             Ok(
                 crate::client_ws::WebSocketMessage::Response { .. }
+                | crate::client_ws::WebSocketMessage::IgnoredFrame
                 | crate::client_ws::WebSocketMessage::Pong,
             ) => {
                 saw_traffic = true;
                 awaiting_pong = false;
+            }
+            Ok(crate::client_ws::WebSocketMessage::UnknownFrame) => {
+                // A malformed known push may have hidden a state change, so
+                // keep the link alive while asking the engine for a broad
+                // reconcile.
+                tracing::warn!("malformed JMAP push frame; emitting unknown invalidation");
+                saw_traffic = true;
+                awaiting_pong = false;
+                let _ = tx.send(invalidated(HintPayload::Unknown));
             }
             Err(err) => {
                 // Classify every exit error so consumers learn whether
@@ -1162,6 +1238,136 @@ mod tests {
         async fn ping_push(&self) -> crate::Result<()> {
             Ok(())
         }
+    }
+
+    struct FramePushTransport {
+        frames: StdMutex<Option<Vec<crate::Result<crate::client_ws::WebSocketMessage>>>>,
+    }
+
+    impl PushTransport for FramePushTransport {
+        type Stream = BoxedWsStream;
+
+        async fn connect_push(&self) -> crate::Result<Self::Stream> {
+            let frames = self
+                .frames
+                .lock()
+                .expect("frame script")
+                .take()
+                .unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(frames)))
+        }
+
+        async fn set_push_data_types(
+            &self,
+            _data_types: &DataTypeSet,
+            _push_state: Option<String>,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn ping_push(&self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TerminalHandshakeTransport;
+
+    impl PushTransport for TerminalHandshakeTransport {
+        type Stream = BoxedWsStream;
+
+        async fn connect_push(&self) -> crate::Result<Self::Stream> {
+            Err(crate::Error::NotParsable("handshake response".to_string()))
+        }
+
+        async fn set_push_data_types(
+            &self,
+            _data_types: &DataTypeSet,
+            _push_state: Option<String>,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn ping_push(&self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_push_frame_invalidates_broadly_then_keeps_reading() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let transport = FramePushTransport {
+            frames: StdMutex::new(Some(vec![
+                Ok(crate::client_ws::WebSocketMessage::UnknownFrame),
+                Ok(crate::client_ws::WebSocketMessage::PushNotification(
+                    state_change("acct-primary", DataType::Email, "s2"),
+                )),
+            ])),
+        };
+
+        let step = reader_pass(
+            &transport,
+            &tx,
+            &Arc::new(Mutex::new(HashSet::new())),
+            &Arc::new(Mutex::new(None)),
+            &CancellationToken::new(),
+            ReconnectPolicy::default(),
+            &routing(),
+        )
+        .await;
+
+        assert!(matches!(
+            step,
+            ReaderStep::Retry {
+                reset_backoff: true
+            }
+        ));
+        assert!(matches!(rx.try_recv(), Ok(WatchEvent::Reconnected)));
+        match rx.try_recv() {
+            Ok(WatchEvent::Invalidated { hint }) => {
+                assert_eq!(hint.source, PushSource::JmapStateChange);
+                assert!(matches!(hint.payload, HintPayload::Unknown));
+            }
+            other => panic!("expected broad invalidation, got {other:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WatchEvent::Invalidated { hint })
+                if matches!(hint.payload, HintPayload::SpecificCursorScope(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_bad_ws_frame_close_reconnects_without_terminal_health() {
+        let tx = PushEventSender::new(8);
+        let mut events = tx.events.subscribe();
+        let shutdown = CancellationToken::new();
+        let reader = tokio::spawn(reader_loop(
+            FramePushTransport {
+                frames: StdMutex::new(Some(vec![Err(crate::Error::WebSocketClosed)])),
+            },
+            tx.clone(),
+            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(None)),
+            shutdown.clone(),
+            ReconnectPolicy {
+                initial: Duration::from_secs(3600),
+                max: Duration::from_secs(3600),
+                connect_timeout: Duration::from_secs(30),
+                keepalive: Duration::from_secs(120),
+            },
+            Arc::new(routing()),
+        ));
+
+        assert!(matches!(events.recv().await, Ok(WatchEvent::Reconnected)));
+        assert!(matches!(events.recv().await, Ok(WatchEvent::Disconnected)));
+        let terminal = tx.terminal.subscribe();
+        assert!(
+            terminal.borrow().is_none(),
+            "a malformed-frame close must use transient health"
+        );
+
+        shutdown.cancel();
+        reader.await.expect("reader task panicked");
     }
 
     /// Push transport whose every push-set frame fails with `error()`.
@@ -1677,9 +1883,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_push_stream_ends_when_the_shutdown_token_is_cancelled() {
-        let (tx, rx) = broadcast::channel(4);
+        let tx = PushEventSender::new(4);
         let shutdown = CancellationToken::new();
-        let mut events = super::stream(rx, shutdown.clone());
+        let mut events = super::stream(tx.subscribe(), shutdown.clone());
 
         let _ = tx.send(WatchEvent::Reconnected);
         assert!(matches!(events.next().await, Some(WatchEvent::Reconnected)));
@@ -1689,6 +1895,62 @@ mod tests {
             events.next().await.is_none(),
             "cancellation must terminate the subscriber, not just stop new sends"
         );
+    }
+
+    fn terminal_push_error() -> AccountError {
+        let error = super::super::error::into_account_error(
+            crate::Error::NotParsable("push frame".to_string()),
+            super::super::error::JmapErrorContext::new(AccountOperation::PushStream),
+        );
+        assert!(error.recovery().is_terminal());
+        error
+    }
+
+    #[tokio::test]
+    async fn a_terminal_push_event_is_replayed_to_a_late_subscriber() {
+        let tx = PushEventSender::new(4);
+        let error = terminal_push_error();
+        let reader = tokio::spawn(reader_loop(
+            TerminalHandshakeTransport,
+            tx.clone(),
+            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(None)),
+            CancellationToken::new(),
+            ReconnectPolicy::default(),
+            Arc::new(routing()),
+        ));
+
+        // No broadcast receiver exists yet. The hint send is dropped, but
+        // terminal health must remain observable for every later subscriber.
+        tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("terminal handshake failure stops the reader")
+            .expect("reader task panicked");
+
+        let mut events = super::stream(tx.subscribe(), CancellationToken::new());
+        assert!(matches!(
+            events.next().await,
+            Some(WatchEvent::Terminated(terminal))
+                if terminal.message_key() == error.message_key()
+        ));
+        assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_lagged_subscriber_reads_the_latched_terminal_event() {
+        let tx = PushEventSender::new(1);
+        let mut events = super::stream(tx.subscribe(), CancellationToken::new());
+        let _ = tx.send(WatchEvent::Reconnected);
+        let _ = tx.send(WatchEvent::Disconnected);
+        let error = terminal_push_error();
+        let _ = tx.send(WatchEvent::Terminated(error.clone()));
+
+        assert!(matches!(
+            events.next().await,
+            Some(WatchEvent::Terminated(terminal))
+                if terminal.message_key() == error.message_key()
+        ));
+        assert!(events.next().await.is_none());
     }
 
     /// Which setup await the stub transport parks on forever.
@@ -1758,7 +2020,7 @@ mod tests {
     async fn assert_cancel_unblocks(hang: Hang) {
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
         let shutdown = CancellationToken::new();
-        let (tx, _rx) = broadcast::channel(8);
+        let tx = PushEventSender::new(8);
         let reader = tokio::spawn(reader_loop(
             HangingTransport {
                 hang,
@@ -1848,7 +2110,8 @@ mod tests {
     async fn a_failed_push_re_enable_disconnects_instead_of_announcing_reconnected() {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let shutdown = CancellationToken::new();
-        let (tx, mut rx) = broadcast::channel(8);
+        let tx = PushEventSender::new(8);
+        let mut rx = tx.events.subscribe();
         let reader = tokio::spawn(reader_loop(
             FailingReenableTransport {
                 attempts: Arc::clone(&attempts),
@@ -1888,7 +2151,8 @@ mod tests {
     async fn a_handshake_that_outlives_its_bound_falls_to_the_reconnect_backoff() {
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
         let shutdown = CancellationToken::new();
-        let (tx, mut rx) = broadcast::channel(8);
+        let tx = PushEventSender::new(8);
+        let mut rx = tx.events.subscribe();
         let reader = tokio::spawn(reader_loop(
             HangingTransport {
                 hang: Hang::Handshake,
@@ -1953,7 +2217,8 @@ mod tests {
     async fn a_silent_connection_is_pinged_and_dropped_when_the_pong_never_comes() {
         let pings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let shutdown = CancellationToken::new();
-        let (tx, mut rx) = broadcast::channel(8);
+        let tx = PushEventSender::new(8);
+        let mut rx = tx.events.subscribe();
         let reader = tokio::spawn(reader_loop(
             SilentTransport {
                 pings: Arc::clone(&pings),
@@ -2029,7 +2294,8 @@ mod tests {
     async fn a_pass_that_reads_no_traffic_does_not_reset_the_backoff() {
         let connects = Arc::new(std::sync::Mutex::new(Vec::new()));
         let shutdown = CancellationToken::new();
-        let (tx, mut rx) = broadcast::channel(64);
+        let tx = PushEventSender::new(64);
+        let mut rx = tx.events.subscribe();
         let reader = tokio::spawn(reader_loop(
             RejectingTransport {
                 connects: Arc::clone(&connects),
@@ -2112,9 +2378,9 @@ mod tests {
     async fn a_lagged_broadcast_slot_coalesces_into_an_unknown_invalidation() {
         // A slow consumer must never lose a wake-up: an overflowed slot
         // becomes one coalesced invalidation so the engine full-repolls.
-        let (tx, rx) = broadcast::channel(1);
+        let tx = PushEventSender::new(1);
         let shutdown = CancellationToken::new();
-        let mut events = super::stream(rx, shutdown);
+        let mut events = super::stream(tx.subscribe(), shutdown);
 
         let _ = tx.send(WatchEvent::Reconnected);
         let _ = tx.send(WatchEvent::Disconnected);

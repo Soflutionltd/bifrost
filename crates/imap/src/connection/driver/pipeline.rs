@@ -353,6 +353,7 @@ pub(super) fn route_pipeline_response(
                 &u,
                 event_sink,
                 bifrost_types::TransmissionState::InFlight,
+                None,
             )?;
             let bound = routing.untagged_bound();
 

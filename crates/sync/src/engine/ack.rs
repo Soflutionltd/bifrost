@@ -177,19 +177,30 @@ pub(super) async fn ack_writer(
     // re-read per write because this task is the only thing that may mutate it,
     // which is what makes generation-aware conditional transitions possible
     // without a compare-and-swap on every `CheckpointStore` backend.
-    let mut ledger = match store.get_ledger(&account_id).await {
-        Ok(ledger) => ledger,
-        Err(error) => {
-            tracing::error!(
-                target: "bifrost.sync.changes",
-                account = ?account_id,
-                error = %error,
-                "failed to load debt ledger; starting empty, which can only UNDER-report debt"
-            );
-            crate::cursor::DebtLedger::default()
-        }
-    };
+    // An unread ledger is unavailable, never empty. Every durable mutation
+    // below replaces the whole ledger, so a fabricated default would erase
+    // obligations retained by earlier attachments. Retry on the next request;
+    // do not consume claims or alter publication bookkeeping on a failed read.
+    let mut loaded_ledger = None;
     while let Some(req) = rx.recv().await {
+        if loaded_ledger.is_none() {
+            match store.get_ledger(&account_id).await {
+                Ok(ledger) => loaded_ledger = Some(ledger),
+                Err(error) => {
+                    tracing::error!(
+                        target: "bifrost.sync.changes",
+                        account = ?account_id,
+                        error = %error,
+                        "failed to load debt ledger; refusing ledger-dependent requests"
+                    );
+                    reject_unloaded_request(req, error, &account_id, &store).await;
+                    continue;
+                }
+            }
+        }
+        let ledger = loaded_ledger
+            .as_mut()
+            .expect("ledger loaded before dispatch");
         let req = match req {
             WriterRequest::Ack(req) => {
                 // An acknowledgement is real committed consumer progress, so
@@ -235,7 +246,7 @@ pub(super) async fn ack_writer(
                 // alongside it. The ledger still has to reach disk, or the
                 // barrier is forgotten on restart and no operator can act on
                 // it. Persisted against the scope's existing durable position.
-                let result = persist_ledger_only(&account_id, &store, &ledger).await;
+                let result = persist_ledger_only(&account_id, &store, ledger).await;
                 let _ = done.send(result);
                 continue;
             }
@@ -255,7 +266,7 @@ pub(super) async fn ack_writer(
                 }
                 let result = persist_ledger_only(&account_id, &store, &crossed).await;
                 if result.is_ok() {
-                    ledger = crossed;
+                    *ledger = crossed;
                 }
                 let _ = done.send(result.map(|()| true));
                 continue;
@@ -294,7 +305,7 @@ pub(super) async fn ack_writer(
                 let result = apply_repair_resolutions(
                     &account_id,
                     &store,
-                    &mut ledger,
+                    ledger,
                     resolutions,
                     acknowledged,
                 )
@@ -314,7 +325,7 @@ pub(super) async fn ack_writer(
                             let outcome = apply_repair_resolutions(
                                 &account_id,
                                 &store,
-                                &mut ledger,
+                                ledger,
                                 resolutions,
                                 true,
                             )
@@ -344,7 +355,7 @@ pub(super) async fn ack_writer(
                 done,
             } => {
                 ledger.ingest_debt_only(&report, generation, jiff::Timestamp::now().as_second());
-                let result = persist_ledger_only(&account_id, &store, &ledger).await;
+                let result = persist_ledger_only(&account_id, &store, ledger).await;
                 let _ = done.send(result);
                 continue;
             }
@@ -353,17 +364,23 @@ pub(super) async fn ack_writer(
                 decision,
                 done,
             } => {
+                // Operator policy takes effect only after persistence succeeds.
+                // In particular, a failed waiver must not become accepted loss
+                // through a later unrelated checkpoint write.
+                let mut decided = ledger.clone();
                 let changed = match decision {
                     OperatorDecision::Waive {
                         by,
                         at_unix_seconds,
-                    } => ledger.waive(&key, by, at_unix_seconds),
-                    OperatorDecision::Block => ledger.block(&key),
+                    } => decided.waive(&key, by, at_unix_seconds),
+                    OperatorDecision::Block => decided.block(&key),
                 };
                 let result = if changed {
-                    persist_ledger_only(&account_id, &store, &ledger)
-                        .await
-                        .map(|()| true)
+                    let result = persist_ledger_only(&account_id, &store, &decided).await;
+                    if result.is_ok() {
+                        *ledger = decided;
+                    }
+                    result.map(|()| true)
                 } else {
                     Ok(false)
                 };
@@ -463,8 +480,7 @@ pub(super) async fn ack_writer(
                 // Unbounded: the orchestrator sends this BEFORE its retry mints
                 // anything, so there is nothing newer to protect.
                 let discarded =
-                    discard_backfill(&account_id, &store, &coverage, &mut ledger, &scope, None)
-                        .await;
+                    discard_backfill(&account_id, &store, &coverage, ledger, &scope, None).await;
                 let _ = done.send(discarded);
                 continue;
             }
@@ -497,7 +513,7 @@ pub(super) async fn ack_writer(
                     ledger.ingest_debt_only(report, debt.generation, now);
                 }
                 let result = async {
-                    persist_ledger_only(&account_id, &store, &ledger).await?;
+                    persist_ledger_only(&account_id, &store, ledger).await?;
                     if delete_backfill {
                         store.delete_backfill(&account_id, &scope).await?;
                     }
@@ -517,7 +533,7 @@ pub(super) async fn ack_writer(
                     for report in &debt.reports {
                         ledger.ingest_debt_only(report, debt.generation, now);
                     }
-                    if let Err(error) = persist_ledger_only(&account_id, &store, &ledger).await {
+                    if let Err(error) = persist_ledger_only(&account_id, &store, ledger).await {
                         tracing::warn!(
                             target: "bifrost.sync.changes",
                             account = ?account_id,
@@ -540,7 +556,7 @@ pub(super) async fn ack_writer(
         // from its checkpoint, and released a live sibling publication's
         // capacity on the strength of an acknowledgement the ledger had just
         // refused.
-        let result = persist_ack_request(&account_id, &store, &coverage, &mut ledger, &req).await;
+        let result = persist_ack_request(&account_id, &store, &coverage, ledger, &req).await;
         match result {
             Ok(AckPersistOutcome::Withheld) => {
                 // The completion sentinel was deliberately NOT written: the
@@ -848,6 +864,49 @@ async fn discard_backfill(
         coverage.take_backfill_discard(scope);
     }
     result
+}
+
+/// Refuse work without inventing durable state when the initial ledger read
+/// failed. No provisional rows can exist until that read succeeds. Cursor-only
+/// reads remain available; the boolean policy query conservatively parks work.
+async fn reject_unloaded_request(
+    req: WriterRequest,
+    error: Error,
+    account: &AccountId,
+    store: &Arc<DynCheckpointStore>,
+) {
+    match req {
+        WriterRequest::Ack(req) => {
+            if let Some(done) = req.complete {
+                let _ = done.send(Err(error));
+            }
+        }
+        WriterRequest::ReattachInsert { done, .. }
+        | WriterRequest::PersistEstablished { done, .. }
+        | WriterRequest::PersistBackfill { done, .. }
+        | WriterRequest::DiscardBackfillProgress { done, .. }
+        | WriterRequest::ResetScope { done, .. }
+        | WriterRequest::RecordBarrier { done, .. }
+        | WriterRequest::RecordDebt { done, .. }
+        | WriterRequest::ApplyRepair { done, .. }
+        | WriterRequest::AcknowledgePublication { done, .. } => {
+            let _ = done.send(Err(error));
+        }
+        WriterRequest::CrossWaivedBarriers { done, .. }
+        | WriterRequest::OperatorDecision { done, .. } => {
+            let _ = done.send(Err(error));
+        }
+        WriterRequest::ScopeBarrierBlocked { done, .. } => {
+            let _ = done.send(true);
+        }
+        WriterRequest::GetChangeCursor { scope, done, .. } => {
+            let _ = done.send(store.get_change_cursor(account, &scope).await);
+        }
+        WriterRequest::ReattachAbort { done, .. } => {
+            let _ = done.send(());
+        }
+        WriterRequest::ReattachCommit { .. } => {}
+    }
 }
 
 /// Write the ledger with no checkpoint advance.
@@ -1440,5 +1499,324 @@ mod tests {
                 .any(|line| line.contains("role=Multiplexer") && line.contains("aborted")),
             "the spent-deadline abort must name the worker's role: {lines:?}"
         );
+    }
+
+    use crate::cursor::CheckpointStore;
+
+    struct FlakyLedgerStore {
+        inner: crate::cursor::InMemoryCheckpointStore,
+        fail_reads: std::sync::atomic::AtomicBool,
+        fail_writes: std::sync::atomic::AtomicBool,
+    }
+
+    impl CheckpointStore for FlakyLedgerStore {
+        fn apply_transition<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+            transition: crate::cursor::store::CheckpointTransition,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>>
+        {
+            self.inner.apply_transition(account, transition)
+        }
+
+        fn get_change_cursor<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+            scope: &'a CursorScope,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>,
+        > {
+            self.inner.get_change_cursor(account, scope)
+        }
+
+        fn get_backfill<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+            scope: &'a CursorScope,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Option<bifrost_types::BackfillCheckpoint>, Error>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.inner.get_backfill(account, scope)
+        }
+
+        fn put_ledger<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+            ledger: crate::cursor::DebtLedger,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>>
+        {
+            if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async {
+                    Err(Error::CheckpointStore("ledger write failed".into()))
+                });
+            }
+            self.inner.put_ledger(account, ledger)
+        }
+
+        fn get_ledger<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::cursor::DebtLedger, Error>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async {
+                    Err(Error::CheckpointStore("ledger read failed".into()))
+                });
+            }
+            self.inner.get_ledger(account)
+        }
+
+        fn delete_change_cursor<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+            scope: &'a CursorScope,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>>
+        {
+            self.inner.delete_change_cursor(account, scope)
+        }
+
+        fn delete_backfill<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+            scope: &'a CursorScope,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>>
+        {
+            self.inner.delete_backfill(account, scope)
+        }
+    }
+
+    fn email_scope() -> CursorScope {
+        CursorScope::Type(bifrost_types::ObjectType::Email)
+    }
+
+    fn change_cursor(bytes: &[u8]) -> ChangeCursor {
+        ChangeCursor {
+            scope: email_scope(),
+            server_state: bifrost_types::OpaqueChangeState {
+                protocol: bifrost_types::ProtocolKind::Imap,
+                envelope_version: crate::cursor::ENGINE_VERSION,
+                bytes: bytes.to_vec(),
+            },
+            advanced_through: None,
+            envelope_version: crate::cursor::ENGINE_VERSION,
+        }
+    }
+
+    fn unrepresentable(key: &str) -> bifrost_types::InventoryObligation {
+        let error = bifrost_types::AccountErrorBuilder::new(
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+            bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
+                detail: bifrost_types::DiagnosticText::support_only("unrepresentable"),
+            }),
+        )
+        .try_build()
+        .expect("valid account error classification");
+        bifrost_types::InventoryObligation::Object {
+            key: bifrost_types::ObligationKey(key.as_bytes().to_vec()),
+            id: bifrost_types::ObjectId(key.into()),
+            error,
+            repair: Vec::new(),
+        }
+    }
+
+    fn start_flaky_writer(
+        store: Arc<FlakyLedgerStore>,
+    ) -> (mpsc::Sender<WriterRequest>, tokio::task::JoinHandle<()>) {
+        let account = AccountId("acct".into());
+        let coverage = Arc::new(PendingCoverage::new());
+        let (boundary, _view) = crate::cancel::Boundary::new();
+        let (priority, _priority_view) =
+            tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+        let (bandwidth, _bandwidth_view) = tokio::sync::watch::channel(None);
+        let control = SyncControl::new_with_publications(
+            account.clone(),
+            boundary,
+            priority,
+            bandwidth,
+            Arc::clone(&coverage),
+        );
+        let (tx, rx) = mpsc::channel(16);
+        let task = tokio::spawn(ack_writer(account, store, control, coverage, rx));
+        (tx, task)
+    }
+
+    async fn persist_test_cursor(tx: &mpsc::Sender<WriterRequest>) -> Result<(), Error> {
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::PersistEstablished {
+            cursor: change_cursor(b"next"),
+            done,
+        })
+        .await
+        .expect("writer alive");
+        wait.await.expect("writer answered")
+    }
+
+    async fn seeded_store() -> Arc<FlakyLedgerStore> {
+        let store = Arc::new(FlakyLedgerStore {
+            inner: crate::cursor::InMemoryCheckpointStore::new(),
+            fail_reads: std::sync::atomic::AtomicBool::new(false),
+            fail_writes: std::sync::atomic::AtomicBool::new(false),
+        });
+        let report = bifrost_types::InventoryCoverageReport::degraded(
+            bifrost_types::CoverageDomain::full(email_scope()),
+            vec![unrepresentable("owed")],
+        );
+        let mut ledger = crate::cursor::DebtLedger::default();
+        ledger.ingest_debt_only(&report, 1, 1);
+        store
+            .inner
+            .put_ledger(&AccountId("acct".into()), ledger)
+            .await
+            .expect("seed debt");
+        store
+    }
+
+    #[tokio::test]
+    async fn unread_ledger_refuses_writes_then_recovers_without_erasing_debt() {
+        let store = seeded_store().await;
+        let account = AccountId("acct".into());
+        store
+            .fail_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (tx, task) = start_flaky_writer(Arc::clone(&store));
+        assert!(persist_test_cursor(&tx).await.is_err());
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::Ack(AckRequest {
+            scope: email_scope(),
+            checkpoint: Checkpoint::Change(change_cursor(b"acked")),
+            publication: None,
+            auto: false,
+            complete: Some(done),
+        }))
+        .await
+        .expect("writer alive");
+        assert!(wait.await.expect("ack answered").is_err());
+        assert!(persist_test_cursor(&tx).await.is_err());
+        assert!(
+            store
+                .inner
+                .get_change_cursor(&account, &email_scope())
+                .await
+                .expect("read")
+                .is_none()
+        );
+        let key = bifrost_types::ObligationKey(b"owed".to_vec());
+        assert!(
+            store
+                .inner
+                .get_ledger(&account)
+                .await
+                .expect("read")
+                .entry(&key)
+                .is_some()
+        );
+        store
+            .fail_reads
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        persist_test_cursor(&tx).await.expect("recovered read");
+        assert!(
+            store
+                .inner
+                .get_change_cursor(&account, &email_scope())
+                .await
+                .expect("read")
+                .is_some()
+        );
+        assert!(
+            store
+                .inner
+                .get_ledger(&account)
+                .await
+                .expect("read")
+                .entry(&key)
+                .expect("debt retained")
+                .is_open()
+        );
+        drop(tx);
+        task.await.expect("writer exits");
+    }
+
+    #[tokio::test]
+    async fn failed_operator_decisions_do_not_leak_into_later_writes() {
+        for decision in [
+            OperatorDecision::Waive {
+                by: "operator".into(),
+                at_unix_seconds: 2,
+            },
+            OperatorDecision::Block,
+        ] {
+            let store = seeded_store().await;
+            let account = AccountId("acct".into());
+            let key = bifrost_types::ObligationKey(b"owed".to_vec());
+            let original = store
+                .inner
+                .get_ledger(&account)
+                .await
+                .expect("read")
+                .entry(&key)
+                .expect("seeded")
+                .policy
+                .clone();
+            let (tx, task) = start_flaky_writer(Arc::clone(&store));
+            store
+                .fail_writes
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let (done, wait) = oneshot::channel();
+            tx.send(WriterRequest::OperatorDecision {
+                key: key.clone(),
+                decision: decision.clone(),
+                done,
+            })
+            .await
+            .expect("writer alive");
+            assert!(wait.await.expect("answered").is_err());
+            store
+                .fail_writes
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            persist_test_cursor(&tx).await.expect("unrelated write");
+            assert_eq!(
+                store
+                    .inner
+                    .get_ledger(&account)
+                    .await
+                    .expect("read")
+                    .entry(&key)
+                    .expect("retained")
+                    .policy,
+                original
+            );
+            let (done, wait) = oneshot::channel();
+            tx.send(WriterRequest::OperatorDecision {
+                key: key.clone(),
+                decision,
+                done,
+            })
+            .await
+            .expect("writer alive");
+            assert!(wait.await.expect("answered").expect("retry persisted"));
+            assert_ne!(
+                store
+                    .inner
+                    .get_ledger(&account)
+                    .await
+                    .expect("read")
+                    .entry(&key)
+                    .expect("retained")
+                    .policy,
+                original
+            );
+            drop(tx);
+            task.await.expect("writer exits");
+        }
     }
 }

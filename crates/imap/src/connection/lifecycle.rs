@@ -103,7 +103,11 @@ impl ImapConnection {
         // the greeting and capability fetch they are moved into the
         // driver task, which owns them for the rest of the connection.
         let mut wire_reader = wire::WireReader::new_metered(stream, meter_sink, bandwidth_budget);
-        wire_reader.set_peer_timeout(Some(timeout));
+        // One budget covers the complete bootstrap. Reinstall this same
+        // shared value at each phase; building a new budget would reset the
+        // peer allowance for CAPABILITY or STARTTLS.
+        let setup_peer_budget = wire::PeerBudget::new(timeout);
+        wire_reader.set_peer_budget(Some(setup_peer_budget.clone()));
         let mut proto_state = state::ProtocolState::new();
         let mut tag_gen = tag::TagGenerator::new();
 
@@ -144,7 +148,7 @@ impl ImapConnection {
             let consumer = driver::DriverConsumer::Regular(
                 Box::new(CapabilityConsumer::default()) as Box<dyn driver::ConsumerErased>
             );
-            wire_reader.set_peer_timeout(Some(timeout));
+            wire_reader.set_peer_budget(Some(setup_peer_budget.clone()));
             let result = setup_timeout(
                 timeout,
                 driver::run_one_command(
@@ -190,7 +194,7 @@ impl ImapConnection {
 
             validate_tls_server_name(host)?;
 
-            wire_reader.set_peer_timeout(Some(timeout));
+            wire_reader.set_peer_budget(Some(setup_peer_budget.clone()));
             setup_timeout(
                 timeout,
                 driver::run_starttls_upgrade(

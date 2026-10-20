@@ -6,7 +6,7 @@ use crate::{
     client::Client,
     core::{
         id::{AccountId, BlobId},
-        session::{URLPart, encode_template_value},
+        session::{URLPart, encode_template_value_at},
         transport::HttpTransport,
     },
 };
@@ -52,7 +52,8 @@ impl<Tr: HttpTransport> Client<Tr> {
                 URLPart::Value(value) => upload_url.push_str(value),
                 URLPart::Parameter(param) => {
                     if let super::URLParameter::AccountId = param {
-                        upload_url.extend(encode_template_value(account_id.as_str()));
+                        upload_url
+                            .push_str(&encode_template_value_at(account_id.as_str(), &upload_url));
                     }
                 }
             }

@@ -2690,6 +2690,14 @@ Two mutations have no cursor to ride: a barrier incident (nothing advanced, by
 definition) and an operator decision. Both go through the account writer and
 persist the writer-owned ledger without a checkpoint transition.
 
+The writer loads its authoritative ledger before dispatching its first request.
+A failed load refuses ledger-dependent requests with a store error and retries
+on the next request; it never substitutes an empty ledger. Cursor-only reads
+remain available, and an unavailable barrier-policy query conservatively parks
+work. No publication claim is consumed while the ledger is unavailable.
+Operator waive and block decisions mutate a candidate ledger and adopt it only
+after persistence succeeds, so a failed decision cannot leak into a later write.
+
 Claims are applied when the CONSUMER acknowledges, never when the account emits.
 An unacknowledged report may describe entries the consumer never persisted, so it
 cannot prove anything. The one exception is `ingest_debt_only`, used for a

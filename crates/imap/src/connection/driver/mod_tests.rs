@@ -318,6 +318,7 @@ fn run_prefix(response: UntaggedResponse) -> (Result<bool, crate::error::Error>,
         &response,
         &mut sink,
         bifrost_types::TransmissionState::InFlight,
+        None,
     );
     let mut events = Vec::new();
     while let Ok(ev) = rx.try_recv() {

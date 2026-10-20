@@ -21,32 +21,6 @@ Coverage note from the engine hunter: `cursor/coverage.rs`, `cursor/ledger.rs`,
 `cursor/ledger_envelope.rs`, `backfill/*`, `engine/lane.rs` and `repair.rs`
 were NOT covered in depth. They are the largest files and need their own pass.
 
-## SYNC-001 - A transient `get_ledger` failure at writer start durably erases the account's debt ledger
-
-Scope: sync engine.
-
-`engine/ack.rs`, `ack_writer`: if `store.get_ledger` errors, the writer logs
-"starting empty, which can only UNDER-report debt" and continues with
-`DebtLedger::default()`. Every later durable mutation writes that in-memory
-ledger whole: `apply_transition { ledger: ledger.clone() }` for acks,
-`ReattachInsert`, `PersistEstablished`, `PersistBackfill`, and
-`put_ledger(ledger.clone())` for `persist_ledger_only`. The first acknowledged
-checkpoint after a flaky read overwrites the persisted ledger with an empty
-one, destroying every open obligation, barrier, waiver and block from earlier
-sessions.
-
-Claims broken: the log line (it writes the under-report over durable truth);
-the stated asymmetry (`WriterRequest::RecordDebt` docs, the lag section of
-`reference/sync.md`: "under-reporting [debt] costs objects nobody ever sees
-again"); the reattach section's "never write what an abort would have to
-restore" and fail-closed rule (same shape, a swallowed read error feeding a
-destructive write, on the ledger instead of the cursor row).
-
-Fix direction: a ledger load failure fails closed. Refuse every ledger-bearing
-write until a load succeeds (retry the load and fail acks with a store error
-meanwhile), or fail the attach. A writer that has not read the ledger never
-writes one.
-
 ## SYNC-002 - Terminal-parked scopes and a terminated lifecycle reader are never revived, even by a successful reattach
 
 Scope: sync engine.
@@ -244,18 +218,6 @@ transport disconnected" warning is lost. A sticky "needs full reconcile" flag
 drained by the reconciler would replace both the timeout and the unbounded
 queue: lossless, bounded, no worse than the coalesced event.
 
-## SYNC-010 - Operator waive and block report failure while taking effect anyway
-
-Scope: sync engine.
-
-`ack.rs`, `WriterRequest::OperatorDecision`: `ledger.waive` / `ledger.block`
-mutate the authoritative in-memory ledger in place, then `persist_ledger_only`
-runs. On persistence failure the operator gets `Err`, but the waiver stays in
-memory and is written by the next ledger-bearing write. The sibling
-`CrossWaivedBarriers` arm clones, persists, and adopts only on success. Waive
-is "the only path to accepted loss", so reporting it failed while applying it
-is the worst direction to get wrong.
-
 ## SYNC-011 - `Terminated` events carry non-terminal recovery classes
 
 Scope: sync engine.
@@ -337,3 +299,12 @@ Scope: sync engine.
 - `Scheduler::with_lane_capacity` doc refers to "`H4` in the engine notes", and
   `EngineConfig::detach_timeout` / `lane_capacity` cite `H1` / `H4`: pointers
   into notes that no longer exist, which AGENTS.md forbids in comments.
+
+## SYNC-017 - `apply_repair_resolutions` mutates the authoritative ledger before persisting
+
+Scope: sync engine. Lateral from the ack writer fix.
+
+Same shape as the operator waive/block defect that was just closed: the repair
+resolution path in `engine/ack.rs` applies discharges to the in-memory ledger
+and then persists, so a failed write leaves the discharges available to later
+ledger-bearing writes. Apply to a candidate ledger and adopt it only on success.

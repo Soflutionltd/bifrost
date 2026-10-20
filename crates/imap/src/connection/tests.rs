@@ -775,6 +775,192 @@ async fn a_refused_logout_reports_the_refusal_not_a_missing_bye() {
     let _server = script.await.unwrap();
 }
 
+/// RFC 3501 Section 6.1.3 requires the server's BYE before LOGOUT's tagged OK.
+/// The BYE is part of this command's response sequence and must reach its
+/// consumer instead of aborting dispatch as a server-initiated disconnect.
+#[tokio::test]
+async fn a_successful_logout_consumes_bye_before_its_tagged_ok() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1")).await;
+
+    let script = tokio::spawn(async move {
+        let logout = read_line(&mut server).await;
+        assert!(logout.contains("LOGOUT"), "unexpected command: {logout}");
+        let tag = tag_of(&logout).to_owned();
+        respond(
+            &mut server,
+            &format!("* BYE logging out\r\n{tag} OK LOGOUT completed\r\n"),
+        )
+        .await;
+        server
+    });
+
+    conn.logout()
+        .await
+        .expect("a conforming BYE followed by tagged OK completes LOGOUT");
+    assert_eq!(
+        conn.state_rx.borrow().session_state,
+        SessionState::Logout,
+        "the completed LOGOUT must publish the terminal session state"
+    );
+    let _server = script.await.unwrap();
+}
+
+/// The channel capacity is 16. A caller dropped while its command waits for a
+/// slot never submitted that command and must not abandon the live connection.
+#[tokio::test]
+async fn dropping_a_command_waiting_for_channel_capacity_does_not_abandon_connection() {
+    use std::future::Future;
+    use std::sync::Arc;
+
+    const QUEUED: usize = 16;
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let conn = Arc::new(conn);
+
+    let first_conn = Arc::clone(&conn);
+    let first = tokio::spawn(async move { first_conn.noop(Duration::from_secs(5)).await });
+    let first_line = read_line(&mut server).await;
+    assert!(
+        first_line.contains("NOOP"),
+        "unexpected command: {first_line}"
+    );
+    let first_tag = tag_of(&first_line).to_owned();
+
+    let queued: Vec<_> = (0..QUEUED)
+        .map(|_| {
+            let conn = Arc::clone(&conn);
+            tokio::spawn(async move { conn.noop(Duration::from_secs(5)).await })
+        })
+        .collect();
+    for _ in 0..128 {
+        if conn.cmd_tx.capacity() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        conn.cmd_tx.capacity(),
+        0,
+        "all 16 channel slots must be occupied before polling the blocked send"
+    );
+
+    let mut blocked = Box::pin(conn.noop(Duration::from_secs(5)));
+    let send_is_pending =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(blocked.as_mut().poll(cx).is_pending()))
+            .await;
+    assert!(
+        send_is_pending,
+        "the seventeenth queued command must wait to submit"
+    );
+    drop(blocked);
+    assert!(
+        conn.is_reusable(),
+        "dropping before channel admission must not mark a submitted command abandoned"
+    );
+
+    respond(&mut server, &format!("{first_tag} OK first completed\r\n")).await;
+    first
+        .await
+        .unwrap()
+        .expect("the in-flight command should complete");
+    for _ in 0..QUEUED {
+        let line = read_line(&mut server).await;
+        assert!(line.contains("NOOP"), "unexpected queued command: {line}");
+        let tag = tag_of(&line).to_owned();
+        respond(&mut server, &format!("{tag} OK queued completed\r\n")).await;
+    }
+    for task in queued {
+        task.await
+            .unwrap()
+            .expect("each submitted command should complete");
+    }
+    assert!(
+        conn.is_reusable(),
+        "draining accepted commands must leave the connection reusable"
+    );
+}
+
+/// A SCRAM server-final error is returned while AUTHENTICATE still awaits its
+/// tagged completion. Cancel and drain that completion before the next command.
+#[tokio::test]
+async fn a_scram_server_final_error_cancels_and_leaves_the_connection_reusable() {
+    use base64::Engine;
+    use bifrost_sasl::{ScramChannelBinding, ScramHash};
+
+    let greeting = b"* OK [CAPABILITY IMAP4rev1 AUTH=SCRAM-SHA-256] ready\r\n";
+    let (conn, mut server) = crate::connection::test_support::driver_pair(greeting).await;
+    let consumer = dispatch::AuthenticateScramConsumer::new(
+        ScramHash::Sha256,
+        "user".to_owned(),
+        "wrong".to_owned().into(),
+        "nonce123".to_owned(),
+        false,
+        ScramChannelBinding::None,
+    )
+    .unwrap();
+    let command = Command::Authenticate {
+        mechanism: "SCRAM-SHA-256".to_owned(),
+        initial_response: None,
+    };
+
+    let script = tokio::spawn(async move {
+        let authenticate = read_line(&mut server).await;
+        assert!(
+            authenticate.contains("AUTHENTICATE SCRAM-SHA-256"),
+            "unexpected command: {authenticate}"
+        );
+        let auth_tag = tag_of(&authenticate).to_owned();
+        respond(&mut server, "+\r\n").await;
+
+        let client_first_line = read_line(&mut server).await;
+        let client_first = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(client_first_line.trim())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(client_first, "n,,n=user,r=nonce123");
+        let server_first = "r=nonce123server,s=c2FsdA==,i=4096";
+        let server_first = base64::engine::general_purpose::STANDARD.encode(server_first);
+        respond(&mut server, &format!("+ {server_first}\r\n")).await;
+
+        let _client_final = read_line(&mut server).await;
+        let server_final = base64::engine::general_purpose::STANDARD.encode("e=invalid-proof");
+        respond(&mut server, &format!("+ {server_final}\r\n")).await;
+        assert_eq!(
+            read_line(&mut server).await,
+            "*\r\n",
+            "a local SASL failure must cancel the open exchange"
+        );
+        respond(
+            &mut server,
+            &format!("{auth_tag} NO authentication failed\r\n"),
+        )
+        .await;
+
+        let noop = read_line(&mut server).await;
+        assert!(noop.contains("NOOP"), "unexpected next command: {noop}");
+        let noop_tag = tag_of(&noop).to_owned();
+        respond(&mut server, &format!("{noop_tag} OK NOOP completed\r\n")).await;
+        server
+    });
+
+    let error = conn
+        .submit_with_continuations(command, consumer)
+        .await
+        .expect_err("the server-final error must reject authentication");
+    assert!(matches!(error, Error::Auth { .. }), "got {error:?}");
+    assert!(
+        conn.is_alive(),
+        "a completed SASL cancellation keeps the driver alive"
+    );
+    conn.noop(Duration::from_secs(5))
+        .await
+        .expect("the next command must follow the consumed tagged NO");
+    let _server = script.await.unwrap();
+}
+
 #[tokio::test]
 async fn uid_fetch_round_trip_with_a_literal_body() {
     let (conn, mut server) =

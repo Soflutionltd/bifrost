@@ -92,17 +92,18 @@ pub(crate) fn open_raw_rfc822(
     Box::pin(
         stream::once(async move {
             let started = Instant::now();
-            match download_raw(&client, &message.0).await {
-                Ok(bytes) => {
-                    let bytes_in = bytes.len() as u64;
-                    SyncEvent::Batch(Batch {
-                        items: vec![bytes],
-                        page_boundary: PageBoundary::Final,
-                        server_latency: started.elapsed(),
-                        bytes_in,
-                        checkpoint: None,
-                    })
-                }
+            // Measure the response envelope before `raw_bytes` decodes its
+            // base64url MIME field. The request-local tally belongs to this
+            // stream, so another account request cannot inflate this batch.
+            let (metered_client, tally) = client.metered();
+            match download_raw(&metered_client, &message.0).await {
+                Ok(bytes) => SyncEvent::Batch(Batch {
+                    items: vec![bytes],
+                    page_boundary: PageBoundary::Final,
+                    server_latency: started.elapsed(),
+                    bytes_in: tally.take(),
+                    checkpoint: None,
+                }),
                 Err(error) => terminate_blob(error::into_account_error(
                     error,
                     error::GmailErrorContext::open_raw_rfc822(message.0.clone()),
@@ -467,6 +468,25 @@ mod tests {
         assert_eq!(batch.items[0].as_ref(), b"hello");
         assert_eq!(batch.bytes_in, transferred);
         assert_ne!(batch.bytes_in, 5, "decoded size is not transferred size");
+    }
+
+    #[tokio::test]
+    async fn open_raw_rfc822_reports_the_transferred_envelope_size() {
+        let response = br#"{"id":"m1","threadId":"t1","raw":"RnJvbTogYUBiDQoNCmhp"}"#;
+        let transferred = response.len() as u64;
+        let events = open_raw_rfc822(
+            scripted_client(response.to_vec()),
+            ObjectId("m1".to_string()),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("raw RFC822 open must emit a batch");
+        };
+        assert_eq!(batch.items[0].as_ref(), b"From: a@b\r\n\r\nhi");
+        assert_eq!(batch.bytes_in, transferred);
+        assert_ne!(batch.bytes_in, batch.items[0].len() as u64);
     }
 
     #[tokio::test]

@@ -1130,8 +1130,8 @@ all four `$batch` paths - hydration, the bulk mutation funnel,
 `pim::messages::submit_write_batch_with_targets`, and the reaction read's
 `classify_chunk` (whose unanswered ids ride the `BatchOutcome` uncertain
 lane). The outer envelope decoding is
-evidence about the envelope only: a `move` or `DELETE` that committed and
-lost its subresponse is indistinguishable from one that never ran, so the
+evidence about the envelope only: a `move` or `permanentDelete` that committed
+and lost its subresponse is indistinguishable from one that never ran, so the
 error must not assert the item was left alone. `ContractViolation` would
 derive `ProviderContractViolation`, which is terminal, and the engine would
 file the mutation `failed_terminal` with no read-back. `PartialResponse`
@@ -1821,7 +1821,7 @@ formats may disagree". A miss still degrades to `HintPayload::Unknown`
 per-id lookup that marks them hot, not a clone of the whole map) and
 refreshes missing `SetFlags`/`Move` etags via
 `GET /messages/{id}?$select=id` (`Destroy` needs none), (2) builds one `BatchRequestItem` per id - `PATCH` /
-`POST .../move` / `DELETE` - attaching `If-Match: <changeKey>` (mandatory
+`POST .../move` / `POST .../permanentDelete` - attaching `If-Match: <changeKey>` (mandatory
 for `SetFlags`/`Move`, opportunistic for `Destroy`), (3) sends `/$batch`,
 status driving `mutation_item_outcome`.
 
@@ -1835,6 +1835,21 @@ them per item - which is precisely why propagating it there was invisible
 until a bulk destroy hit it. If step (2) leaves nothing routable, no
 `/$batch` is sent and the chunk is answered entirely from those local
 outcomes.
+
+A failed `/$batch` envelope preserves those local outcomes and answers every
+submitted id: an in-flight transport failure or an unreadable successful
+response yields `Uncertain`; an unsent request or an acknowledged envelope
+rejection yields `Failed`. The original classification and cause chain are
+preserved with each message scope. Later chunks are still consumed, including
+when the error is account-wide, so every target receives an outcome.
+
+Destroy uses Graph's
+[`permanentDelete` action](https://learn.microsoft.com/en-us/graph/api/message-permanentdelete?view=graph-rest-1.0),
+never plain message `DELETE`, which moves mail to Deleted Items or recoverable storage. The permanent action
+removes it from normal mailbox inventory but can retain it in Purges under
+server retention policy. The separate `pim/messages.rs destroy_messages`
+helper uses the same action for `delete_thread`'s already-in-Trash branch;
+threads deleted elsewhere still move to the owning mailbox's Trash.
 
 `bulk_set_flags` translates `FlagOp` to a PATCH body (`isRead`,
 `flag.flagStatus`, sorted `categories`); `Set`

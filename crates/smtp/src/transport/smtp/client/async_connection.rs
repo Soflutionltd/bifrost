@@ -1289,8 +1289,9 @@ impl AsyncSmtpConnection {
             self.abort().await;
             return Err(error::status(response).with_phase(phase));
         }
+        let client_first = exchange.client_first();
         let response = try_smtp!(
-            self.write_auth_continuation(&exchange.client_first()).await,
+            self.write_auth_continuation(client_first.as_str()).await,
             self,
             phase
         );
@@ -1301,7 +1302,7 @@ impl AsyncSmtpConnection {
         let server_first = try_smtp!(decode_auth_challenge(&response), self);
         let response = match try_smtp!(exchange.step(&server_first), self, phase) {
             ScramStep::Reply(client_final) => try_smtp!(
-                self.write_auth_continuation(&client_final).await,
+                self.write_auth_continuation(client_final.as_str()).await,
                 self,
                 phase
             ),
@@ -1428,11 +1429,12 @@ impl AsyncSmtpConnection {
             response = try_smtp!(self.command(continuation).await, self, phase);
         }
 
-        if challenges == 0 {
+        if challenges == 0 && response.has_code(334) {
             // The server never completed (or rejected) the exchange within the
             // round-trip budget: an auth-exchange failure, routed on the Auth
             // lane (InvalidInput + Auth -> Authorization), not an untagged
-            // Protocol(ParseFailed).
+            // Protocol(ParseFailed). Exhausting the budget while sending the
+            // tenth answer is fine when that answer receives a final reply.
             self.abort().await;
             Err(error::invalid_input("Unexpected number of challenges").with_phase(phase))
         } else {
@@ -1882,7 +1884,7 @@ mod transcript_tests {
                 ClientId, DeliverByMode, DsnNotify, DsnReturn, Extension, MailBodyParameter,
                 MailParameter,
             },
-            test_support::Transcript,
+            test_support::{Transcript, scram_enhanced_success_reply, scram_server_first_reply},
         },
     };
     use bifrost_types::error::BatchItemId;
@@ -3016,6 +3018,82 @@ mod transcript_tests {
         );
         assert!(!connection.has_broken());
         assert!(connection.test_connected().await);
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn whitespace_only_ehlo_extension_is_a_parse_error() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250- \r\n250 AUTH PLAIN\r\n");
+
+        let error =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .err()
+                .expect("whitespace-only EHLO text must be rejected");
+
+        assert!(error.is_parse(), "expected parse error, got {error:?}");
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn scram_client_final_is_sent_once_and_enhanced_235_verifies() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 AUTH SCRAM-SHA-256\r\n")
+            .expect("AUTH SCRAM-SHA-256\r\n", "334 \r\n")
+            .expect_generated(scram_server_first_reply)
+            .expect_generated(scram_enhanced_success_reply)
+            .expect(HELLO, "250 smtp.example\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let response = connection
+            .auth(
+                &[Mechanism::ScramSha256],
+                &Credentials::password("user", "pencil"),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.has_code(235));
+        assert!(!connection.has_broken());
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn auth_succeeds_when_the_tenth_legacy_challenge_is_answered() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let credentials = Credentials::oauth2("user", "token");
+        let payload = bifrost_sasl::oauthbearer_payload("user", "token");
+        let initial = format!(
+            "AUTH OAUTHBEARER {}\r\n",
+            crate::base64::encode(payload.as_bytes())
+        );
+        let mut transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 AUTH OAUTHBEARER\r\n")
+            .expect(initial, "334 YQ==\r\n");
+        for _ in 0..9 {
+            transcript = transcript.expect("AQ==\r\n", "334 YQ==\r\n");
+        }
+        let transcript = transcript
+            .expect("AQ==\r\n", "235 authenticated\r\n")
+            .expect(HELLO, "250 smtp.example\r\n");
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let response = connection
+            .auth(&[Mechanism::OAuthBearer], &credentials)
+            .await
+            .unwrap();
+
+        assert!(response.has_code(235));
+        assert!(!connection.has_broken());
         transcript.assert_exhausted();
     }
 

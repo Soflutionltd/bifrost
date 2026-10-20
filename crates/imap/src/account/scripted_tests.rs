@@ -330,11 +330,11 @@ async fn mutation_flushes_at_target_buffer_boundary_before_input_closes() {
 }
 
 /// A folder-level mutation failure raised before any outcome was minted -
-/// here a refused SELECT - owes exactly one `Uncertain` per requested id.
-/// The ids are moved into the folder path and handed back with the error, so
-/// this lane is what proves nothing is dropped or duplicated on the way.
+/// here a refused SELECT - is `Failed`, because the mutation command was
+/// never sent. The SELECT's acknowledged attempt is restamped `Unsent` for
+/// the operation, and every requested id still receives exactly one result.
 #[tokio::test]
-async fn mutation_select_failure_reports_every_id_uncertain_once() {
+async fn mutation_select_failure_reports_every_id_failed_once_as_unsent() {
     use bifrost_types::{FlagOp, ItemOutcome, SyncEvent};
     use futures::StreamExt;
 
@@ -371,7 +371,7 @@ async fn mutation_select_failure_reports_every_id_uncertain_once() {
         ]))),
     );
 
-    let mut uncertain = Vec::new();
+    let mut failed = Vec::new();
     let mut other = Vec::new();
     while let Some(event) = tokio::time::timeout(Duration::from_secs(5), output.next())
         .await
@@ -381,8 +381,8 @@ async fn mutation_select_failure_reports_every_id_uncertain_once() {
             SyncEvent::Batch(batch) => {
                 for outcome in batch.items {
                     match outcome {
-                        ItemOutcome::Uncertain(item) => uncertain.push(item.item.0.clone()),
-                        ItemOutcome::Failed(item) => other.push(item.item.0.clone()),
+                        ItemOutcome::Failed(item) => failed.push((item.item.0.clone(), item.error)),
+                        ItemOutcome::Uncertain(item) => other.push(item.item.0.clone()),
                         ItemOutcome::Succeeded(item) => other.push(item.item.0.clone()),
                     }
                 }
@@ -392,14 +392,180 @@ async fn mutation_select_failure_reports_every_id_uncertain_once() {
         }
     }
 
-    uncertain.sort();
+    failed.sort_by(|left, right| left.0.cmp(&right.0));
     let mut expected = vec![first_id.0.clone(), second_id.0.clone()];
     expected.sort();
     assert_eq!(
-        uncertain, expected,
-        "every requested id owes exactly one uncertain outcome"
+        failed.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+        expected,
+        "every requested id owes exactly one failed outcome"
     );
     assert!(other.is_empty(), "no id may reach a second lane: {other:?}");
+    for (_, error) in failed {
+        assert_eq!(
+            error.operation(),
+            Some(bifrost_types::AccountOperation::UpdateFlags)
+        );
+        assert!(
+            error.chain().iter().any(|cause| matches!(
+                cause,
+                bifrost_types::Cause::Attempt(attempt)
+                    if attempt.transmission_state == bifrost_types::TransmissionState::Unsent
+            )),
+            "the mutation was never sent: {error:?}"
+        );
+    }
+    let _server = script.await.unwrap();
+}
+
+/// A shared-folder SELECT denial is a scoped revocation, not an account
+/// authorization loss. Keep answering later ids, including the id beyond the
+/// first target window, so the stream's per-id accounting remains complete.
+#[tokio::test]
+async fn shared_folder_select_denial_is_scoped_and_later_mutation_targets_continue() {
+    use bifrost_types::{
+        AccountErrorKind, CursorScope, ErrorScope, FlagOp, FolderId, ItemOutcome, MailboxId,
+        SyncEvent, SyncStateErrorKind,
+    };
+    use futures::StreamExt;
+
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let shared = crate::types::MailboxName::new("Shared/Denied").unwrap();
+    let personal = crate::types::MailboxName::new("Work").unwrap();
+    let folders = FolderRegistry::from_lists(
+        vec![crate::types::MailboxInfo {
+            name: personal.clone(),
+            ..Default::default()
+        }],
+        vec![super::folder_registry::SharedFolderEntry {
+            info: crate::types::MailboxInfo {
+                name: shared.clone(),
+                ..Default::default()
+            },
+            owner: MailboxId("alice".to_owned()),
+            rights: None,
+            namespace_prefix: "Shared/".to_owned(),
+        }],
+    );
+    let account = scripted_sync_account(conn, 1, false, None, folders);
+    let shared_id = super::encode_object_id(&shared, 5, 3);
+    let personal_ids: Vec<_> = (1..=super::TARGET_BUFFER_ITEMS)
+        .map(|uid| super::encode_object_id(&personal, 5, u32::try_from(uid).unwrap()))
+        .collect();
+    let mut submitted = vec![shared_id.clone()];
+    submitted.extend(personal_ids.iter().cloned());
+    let mut expected_ids: Vec<_> = submitted.iter().map(|id| id.0.clone()).collect();
+
+    let script = tokio::spawn(async move {
+        let denied_select = read_line(&mut server).await;
+        assert!(
+            denied_select.contains("SELECT \"Shared/Denied\""),
+            "expected shared-folder SELECT, got {denied_select}"
+        );
+        respond(
+            &mut server,
+            &format!("{} NO [NOPERM] access revoked\r\n", tag_of(&denied_select)),
+        )
+        .await;
+
+        for expected_uids in ["1:255", "256"] {
+            let select = read_line(&mut server).await;
+            assert!(
+                select.contains("SELECT \"Work\""),
+                "expected later personal-folder SELECT, got {select}"
+            );
+            respond(
+                &mut server,
+                &format!(
+                    "* FLAGS (\\Seen)\r\n\
+                     * 1 EXISTS\r\n\
+                     * 0 RECENT\r\n\
+                     * OK [UIDVALIDITY 5] valid\r\n\
+                     * OK [UIDNEXT 257] next\r\n\
+                     {} OK [READ-WRITE] selected\r\n",
+                    tag_of(&select)
+                ),
+            )
+            .await;
+
+            let store = read_line(&mut server).await;
+            assert!(
+                store.contains("UID STORE"),
+                "expected UID STORE, got {store}"
+            );
+            assert!(
+                store.contains(expected_uids),
+                "expected STORE for {expected_uids}, got {store}"
+            );
+            respond(&mut server, &format!("{} OK stored\r\n", tag_of(&store))).await;
+        }
+        server
+    });
+
+    let mut output = super::mutate::mutation_stream(
+        account,
+        Box::pin(futures::stream::iter(submitted)),
+        super::mutate::MutationKind::Flags(FlagOp::Add(std::collections::HashSet::from([
+            "$flagged".to_owned(),
+        ]))),
+    );
+
+    let mut seen_ids = Vec::new();
+    let mut revoked = 0;
+    let mut succeeded = 0;
+    let mut saw_done = false;
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(5), output.next())
+        .await
+        .expect("mutation stream must continue after the shared denial")
+    {
+        match event {
+            SyncEvent::Batch(batch) => {
+                for outcome in batch.items {
+                    match outcome {
+                        ItemOutcome::Failed(failure) => {
+                            seen_ids.push(failure.item.0.clone());
+                            assert_eq!(
+                                failure.error.kind(),
+                                &AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked)
+                            );
+                            assert_eq!(
+                                failure.error.scope(),
+                                Some(&ErrorScope::Cursor(CursorScope::Folder(FolderId(
+                                    shared.as_str().to_owned()
+                                ))))
+                            );
+                            revoked += 1;
+                        }
+                        ItemOutcome::Succeeded(success) => {
+                            seen_ids.push(success.item.0.clone());
+                            succeeded += 1;
+                        }
+                        ItemOutcome::Uncertain(item) => {
+                            panic!("preparation and completed STOREs are not uncertain: {item:?}")
+                        }
+                    }
+                }
+            }
+            SyncEvent::Done(_) => {
+                saw_done = true;
+                break;
+            }
+            SyncEvent::Terminated(error) => {
+                panic!("shared-folder revocation must not terminate siblings: {error:?}")
+            }
+            other => panic!("unexpected mutation event: {other:?}"),
+        }
+    }
+
+    seen_ids.sort();
+    expected_ids.sort();
+    assert_eq!(
+        seen_ids, expected_ids,
+        "every submitted id is answered once"
+    );
+    assert_eq!(revoked, 1, "the denied shared-folder target is scoped");
+    assert_eq!(succeeded, super::TARGET_BUFFER_ITEMS);
+    assert!(saw_done, "the stream completes after all target windows");
     let _server = script.await.unwrap();
 }
 
@@ -2120,8 +2286,8 @@ async fn close_is_idempotent_and_leaves_the_pool_refusing() {
 /// The two blob openers are statically unsupported (`blob_range` is
 /// `BlobRangeSupport::No`, and nothing mints a `BlobHandle`), so both must
 /// terminate the stream with `Unsupported(<their own operation>)` and then
-/// end - never hang, and never mis-tag the operation, which is what the
-/// engine's recovery mapping keys on.
+/// end immediately - never append `Done` after `Terminated`, hang, or
+/// mis-tag the operation, which is what the engine's recovery mapping keys on.
 #[tokio::test]
 async fn the_blob_openers_terminate_unsupported_with_their_own_operation() {
     use bifrost_types::{
@@ -2165,11 +2331,7 @@ async fn the_blob_openers_terminate_unsupported_with_their_own_operation() {
         };
         assert_eq!(err.kind(), &AccountErrorKind::Unsupported(op));
         assert_eq!(err.operation(), Some(op));
-        assert!(
-            matches!(stream.next().await, Some(SyncEvent::Done(None))),
-            "an unsupported lane still closes with Done",
-        );
-        assert!(stream.next().await.is_none(), "Done is terminal");
+        assert!(stream.next().await.is_none(), "Terminated ends the stream");
     }
 }
 

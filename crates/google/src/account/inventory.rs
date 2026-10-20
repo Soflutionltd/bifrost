@@ -695,8 +695,10 @@ fn inventory_list_path(page_token: Option<&str>) -> String {
 
 fn inventory_checkpoint(profile: &GmailProfile) -> crate::Result<Option<Checkpoint>> {
     let history_id = profile.history_id.parse::<u64>().map_err(|error| {
-        crate::Error::invalid_request(
-            AccountOperation::SyncInventory,
+        // `profile` is a complete Google response. A present but unusable
+        // historyId is Google's parse failure, not malformed caller input.
+        crate::Error::provider_response(
+            crate::error::ProviderFault::ParseFailed,
             format!("gmail profile carried invalid history id: {error}"),
         )
     })?;
@@ -1425,6 +1427,38 @@ mod tests {
             super::super::cursor::decode_gmail_state(&cursor.server_state).expect("decode state");
         assert_eq!(state.history_id, 100);
         assert_eq!(state.profile_email, "person@example.com");
+    }
+
+    #[tokio::test]
+    async fn inventory_profile_with_unparseable_history_id_is_a_provider_parse_failure() {
+        let client = scripted_client(vec![ok_json(json!({
+            "emailAddress": "person@example.com",
+            "historyId": "not-a-number"
+        }))]);
+        let events = inventory_stream(
+            client,
+            Arc::new(super::super::scopes::ScopeCacheState::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            CursorScope::Account,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let bifrost_types::InventoryEvent::Terminated(error) = &events[0] else {
+            panic!("an invalid provider history id must terminate inventory: {events:?}");
+        };
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ParseFailed
+            )
+        );
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Attempt(attempt)
+                if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
+        )));
     }
 
     /// An unreadable object costs that object, not the whole partition.

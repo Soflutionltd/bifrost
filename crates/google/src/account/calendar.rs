@@ -275,12 +275,15 @@ pub(crate) fn rsvp(
     status: RsvpStatus,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        // Validate the requested status before the GET so an unrepresentable
+        // shared value can never turn into an accidental `needsAction` write.
+        let response_status = rsvp_request_value(status)?;
         let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventRsvp)?;
         let mut current: GoogleEvent = client
             .get(&event_url(client.calendar_base(), &calendar_id, &event_id))
             .await
             .map_err(|error| event_error(error, AccountOperation::EventRsvp, event.0.clone()))?;
-        rsvp_google_attendees_for_self(&mut current.attendees, &self_email, status)?;
+        rsvp_google_attendees_for_self(&mut current.attendees, &self_email, response_status)?;
         let _: GoogleEvent = client
             .patch(
                 &event_url(client.calendar_base(), &calendar_id, &event_id),
@@ -1271,30 +1274,60 @@ fn rsvp_value(value: RsvpStatus) -> &'static str {
     }
 }
 
+fn rsvp_request_value(value: RsvpStatus) -> Result<&'static str, AccountError> {
+    match value {
+        RsvpStatus::Accepted => Ok("accepted"),
+        RsvpStatus::Declined => Ok("declined"),
+        RsvpStatus::Tentative => Ok("tentative"),
+        RsvpStatus::NeedsAction => Ok("needsAction"),
+        // Google has no safe responseStatus equivalent for these shared
+        // values. Refuse them before reading or writing the event.
+        _ => Err(rsvp_unsupported(
+            "Google Calendar cannot write this RSVP status",
+        )),
+    }
+}
+
 fn rsvp_google_attendees_for_self(
     attendees: &mut Option<Vec<GoogleAttendee>>,
     self_email: &str,
-    status: RsvpStatus,
+    response_status: &str,
 ) -> Result<(), AccountError> {
     let Some(attendees) = attendees.as_mut() else {
-        return Err(caller_input_error(
-            AccountOperation::EventRsvp,
-            "Google Calendar event does not contain the account attendee".to_string(),
+        return Err(rsvp_unsupported(
+            "Google Calendar event does not contain the account attendee",
         ));
     };
-    let Some(attendee) = attendees.iter_mut().find(|attendee| {
-        attendee
-            .email
-            .as_deref()
-            .is_some_and(|email| email.eq_ignore_ascii_case(self_email))
-    }) else {
-        return Err(caller_input_error(
-            AccountOperation::EventRsvp,
-            "Google Calendar event does not contain the account attendee".to_string(),
+    // Google marks the authenticated account's attendee with `self: true`.
+    // That identity is authoritative when the account uses an alias or a
+    // secondary/delegated calendar whose attendee email differs from profile.
+    let index = attendees
+        .iter()
+        .position(|attendee| attendee.extra.get("self").and_then(Value::as_bool) == Some(true))
+        .or_else(|| {
+            attendees.iter().position(|attendee| {
+                attendee
+                    .email
+                    .as_deref()
+                    .is_some_and(|email| email.eq_ignore_ascii_case(self_email))
+            })
+        });
+    let Some(attendee) = index.and_then(|index| attendees.get_mut(index)) else {
+        // The event state has no attendee for this account. This is an
+        // unsupported RSVP target, not malformed caller input.
+        return Err(rsvp_unsupported(
+            "Google Calendar event does not contain the account attendee",
         ));
     };
-    attendee.response_status = Some(rsvp_value(status).to_string());
+    attendee.response_status = Some(response_status.to_string());
     Ok(())
+}
+
+fn rsvp_unsupported(detail: impl Into<String>) -> AccountError {
+    error::into_account_error(
+        crate::error::Error::unsupported_with(AccountOperation::EventRsvp, detail),
+        GmailErrorContext::calendar_collection(AccountOperation::EventRsvp),
+    )
 }
 
 fn collection_error(error: crate::Error, operation: AccountOperation) -> AccountError {
@@ -1306,11 +1339,10 @@ fn event_error(error: crate::Error, operation: AccountOperation, id: String) -> 
 }
 
 /// The CALLER's input cannot be used - an event id, page cursor or range
-/// bound this crate cannot express, or an RSVP for an account that is not an
-/// attendee. (A cursor that was valid when minted but names a calendar since
-/// removed is state that moved, not this.) Refused before the request it would shape is sent, so never a
-/// provider fault: `Request(Malformed)`, per the local-refusal rule in
-/// `reference/error-model.md`.
+/// bound this crate cannot express. (A cursor that was valid when minted but
+/// names a calendar since removed is state that moved, not this.) Refused
+/// before the request it would shape is sent, so never a provider fault:
+/// `Request(Malformed)`, per the local-refusal rule in `reference/error-model.md`.
 fn caller_input_error(operation: AccountOperation, message: String) -> AccountError {
     error::into_account_error(
         crate::error::Error::invalid_request(operation, message),
@@ -2361,6 +2393,7 @@ mod tests {
     fn rsvp_updates_matching_google_attendee_without_dropping_extra_fields() {
         let mut extra = Map::new();
         extra.insert("comment".to_string(), serde_json::json!("bring notes"));
+        extra.insert("self".to_string(), serde_json::json!(true));
         let mut attendees = Some(vec![
             GoogleAttendee {
                 email: Some("other@example.test".to_string()),
@@ -2371,7 +2404,7 @@ mod tests {
                 extra: Map::new(),
             },
             GoogleAttendee {
-                email: Some("SELF@example.test".to_string()),
+                email: Some("account-alias@example.test".to_string()),
                 display_name: None,
                 response_status: Some("needsAction".to_string()),
                 optional: None,
@@ -2380,17 +2413,57 @@ mod tests {
             },
         ]);
 
-        rsvp_google_attendees_for_self(&mut attendees, "self@example.test", RsvpStatus::Accepted)
+        rsvp_google_attendees_for_self(&mut attendees, "self@example.test", "accepted")
             .expect("matching attendee");
         let attendees = attendees.expect("attendees");
         assert_eq!(attendees[0].response_status.as_deref(), Some("needsAction"));
         assert_eq!(attendees[1].response_status.as_deref(), Some("accepted"));
         assert_eq!(attendees[1].extra["comment"].as_str(), Some("bring notes"));
+        assert_eq!(attendees[1].extra["self"].as_bool(), Some(true));
 
         assert!(
-            rsvp_google_attendees_for_self(&mut None, "self@example.test", RsvpStatus::Accepted)
-                .is_err()
+            rsvp_google_attendees_for_self(&mut None, "self@example.test", "accepted").is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_rsvp_statuses_are_refused_before_any_request() {
+        for status in [RsvpStatus::Delegated, RsvpStatus::Unknown] {
+            let (client, script) = scripted_client(Vec::new());
+            let error = rsvp(
+                client,
+                "self@example.test".to_string(),
+                EventId(join_event_id("primary", "event-1")),
+                status,
+            )
+            .await
+            .expect_err("Google cannot represent this RSVP status");
+
+            assert!(matches!(
+                error.kind(),
+                AccountErrorKind::Unsupported(AccountOperation::EventRsvp)
+            ));
+            assert!(script.requests().is_empty());
+        }
+    }
+
+    #[test]
+    fn an_event_without_the_account_attendee_is_not_a_caller_input_error() {
+        let mut attendees = Some(vec![GoogleAttendee {
+            email: Some("other@example.test".to_string()),
+            display_name: None,
+            response_status: Some("needsAction".to_string()),
+            optional: None,
+            resource: None,
+            extra: Map::new(),
+        }]);
+        let error = rsvp_google_attendees_for_self(&mut attendees, "self@example.test", "accepted")
+            .expect_err("the event has no attendee to answer for this account");
+
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Unsupported(AccountOperation::EventRsvp)
+        ));
     }
 
     #[test]

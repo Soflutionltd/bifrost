@@ -10,7 +10,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::client::Resource;
-use crate::types::{BatchRequest, BatchRequestItem, BatchResponse};
+use crate::types::{BatchRequest, BatchRequestItem};
 
 use super::GraphAccount;
 use super::get::folder_destination;
@@ -256,21 +256,30 @@ async fn submit_batch(
 
     if !requests.is_empty() {
         assign_batch_ids(&mut requests);
-        let response: BatchResponse = account
-            .client
-            .post_batch(
-                account.batch_resource(&request_ids)?,
-                &BatchRequest { requests },
-            )
-            .await?;
-        // One validated projection of the wire data, consumed by both the
-        // etag cache and the outcome lanes. Two independent walks of the
-        // raw subresponses disagreed on malformed input.
-        let resolved = resolve_batch_responses(&request_ids, response.responses);
-        update_etag_cache_from_responses(account, &request_ids, &resolved, kind).await;
-        reconcile_mutation_responses(&request_ids, resolved, kind, &mut item_outcomes, &|id| {
-            account.budget_for_object(id)
-        });
+        let response = match account.batch_resource(&request_ids) {
+            Ok(resource) => {
+                account
+                    .client
+                    .post_batch(resource, &BatchRequest { requests })
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match response {
+            Ok(response) => {
+                // Cache and outcome lanes must consume the same validated responses.
+                let resolved = resolve_batch_responses(&request_ids, response.responses);
+                update_etag_cache_from_responses(account, &request_ids, &resolved, kind).await;
+                reconcile_mutation_responses(
+                    &request_ids,
+                    resolved,
+                    kind,
+                    &mut item_outcomes,
+                    &|id| account.budget_for_object(id),
+                );
+            }
+            Err(error) => append_batch_failure(&request_ids, kind, error, &mut item_outcomes),
+        }
     }
 
     let events = vec![SyncEvent::Batch(Batch {
@@ -281,6 +290,43 @@ async fn submit_batch(
         checkpoint: None::<Checkpoint>,
     })];
     Ok(events)
+}
+
+/// A failed envelope must not erase local decisions or abandon later chunks.
+/// In-flight failures leave every submitted write unconfirmed. A successful
+/// envelope that cannot be decoded proves no individual write's outcome either.
+/// A rejected envelope or an unsent request instead fails each submitted id.
+/// Account-wide errors retain their classification on every item; consuming the
+/// remaining targets ensures even those ids receive an explicit outcome.
+fn append_batch_failure(
+    ids: &[ObjectId],
+    kind: &MutationKind,
+    error: crate::error::GraphError,
+    outcomes: &mut Vec<ItemOutcome<MutationSuccess>>,
+) {
+    let unreadable_success = matches!(&error, crate::error::GraphError::Json { .. });
+    let error = into_account_error(error, GraphErrorContext::graph(operation_for_kind(kind)));
+    let uncertain = unreadable_success
+        || error.chain().iter().any(|cause| {
+            matches!(cause, bifrost_types::Cause::Attempt(attempt)
+                if attempt.transmission_state == bifrost_types::TransmissionState::InFlight)
+        });
+    for id in ids {
+        let scoped = error
+            .clone()
+            .into_builder()
+            .scope(ErrorScope::Message {
+                id: id.0.clone().into(),
+            })
+            .try_build()
+            .expect("valid account error classification");
+        let item = BatchItemId(id.0.clone());
+        outcomes.push(if uncertain {
+            ItemOutcome::Uncertain(BatchUncertain::new(item, scoped))
+        } else {
+            ItemOutcome::Failed(BatchFailure::new(item, scoped))
+        });
+    }
 }
 
 /// Validate `$batch` subresponses against the submitted request ids.
@@ -376,8 +422,8 @@ async fn update_etag_cache_from_responses(
 ///
 /// An id Graph never answered lands on the UNCERTAIN lane. The `$batch`
 /// envelope decoded, which is evidence about the envelope and nothing
-/// else: a `move` or `DELETE` that committed and then lost its subresponse
-/// is byte-identical to one that never ran. The uncertain lane is exactly
+/// else: a `move` or `permanentDelete` that committed and then lost its
+/// subresponse is byte-identical to one that never ran. The uncertain lane is exactly
 /// the lane for "this write may have landed, read it back rather than
 /// replay it". Reporting `Failed(ContractViolation)` instead classified
 /// terminal, so the engine recorded `failed_terminal` with no read-back
@@ -618,8 +664,11 @@ fn request_for_mutation(
             }
             Ok(Some(BatchRequestItem {
                 id: "0".to_string(),
-                method: "DELETE".to_string(),
-                url: format!("{prefix}/messages/{enc_id}"),
+                // DELETE moves mail to Deleted Items (or recoverable storage).
+                // permanentDelete removes it from the normal mailbox inventory;
+                // retention can still keep it in Purges on the server.
+                method: "POST".to_string(),
+                url: format!("{prefix}/messages/{enc_id}/permanentDelete"),
                 body: None,
                 headers: (!headers.is_empty()).then_some(headers),
             }))
@@ -1057,8 +1106,12 @@ mod tests {
         let request = request_for_mutation(&account, &id, &MutationKind::Destroy, &HashMap::new())
             .expect("builds")
             .expect("some request");
-        assert_eq!(request.method, "DELETE");
-        assert_eq!(request.url, "/users/shared%40contoso.com/messages/AAMkmsg");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.url,
+            "/users/shared%40contoso.com/messages/AAMkmsg/permanentDelete"
+        );
+        assert!(request.body.is_none());
     }
 
     #[test]
@@ -1175,7 +1228,10 @@ mod tests {
             request_for_mutation(&account, &live, &MutationKind::Destroy, &HashMap::new())
                 .expect("the configured mailbox still routes")
                 .expect("some request");
-        assert_eq!(request.url, "/users/shared%40contoso.com/messages/AAMkmsg");
+        assert_eq!(
+            request.url,
+            "/users/shared%40contoso.com/messages/AAMkmsg/permanentDelete"
+        );
     }
 
     #[test]
@@ -1468,6 +1524,9 @@ mod tests {
                 .expect("builds")
                 .expect("destroy needs no etag");
         assert!(unconditioned.headers.is_none());
+        assert_eq!(unconditioned.method, "POST");
+        assert_eq!(unconditioned.url, "/me/messages/AAMkmsg/permanentDelete");
+        assert!(unconditioned.body.is_none());
 
         let conditioned =
             request_for_mutation(&account, &id, &MutationKind::Destroy, &etag_map(&id))
@@ -1643,6 +1702,216 @@ mod tests {
             "mutation batches are Page, never Final: {boundaries:?}"
         );
         assert!(saw_done, "the stream closes with Done(None)");
+    }
+
+    #[tokio::test]
+    async fn failed_batch_envelopes_preserve_local_outcomes_and_drain_later_chunks() {
+        use bifrost_net::test_support::Canned;
+        use bifrost_types::TransmissionState;
+        for (failure, uncertain) in [
+            (
+                Canned::Error(bifrost_net::Error::Network {
+                    message: "reset after send".to_string(),
+                    transmission_state: TransmissionState::InFlight,
+                    source: None,
+                }),
+                true,
+            ),
+            (
+                Canned::Error(bifrost_net::Error::Network {
+                    message: "connect failed".to_string(),
+                    transmission_state: TransmissionState::Unsent,
+                    source: None,
+                }),
+                false,
+            ),
+            (
+                Canned::Response {
+                    status: reqwest::StatusCode::BAD_REQUEST,
+                    headers: Default::default(),
+                    body: bytes::Bytes::from_static(b"{}"),
+                },
+                false,
+            ),
+            (
+                Canned::Response {
+                    status: reqwest::StatusCode::FORBIDDEN,
+                    headers: Default::default(),
+                    body: bytes::Bytes::from_static(b"{}"),
+                },
+                false,
+            ),
+            (
+                Canned::Response {
+                    status: reqwest::StatusCode::OK,
+                    headers: Default::default(),
+                    body: bytes::Bytes::from_static(b"not JSON"),
+                },
+                true,
+            ),
+        ] {
+            let mut account = shared_account();
+            account.capabilities.batching_policy.max_items = 2;
+            let client = account.client.clone();
+            client.script_wire(
+                [
+                    failure,
+                    Canned::Response {
+                        status: reqwest::StatusCode::OK,
+                        headers: Default::default(),
+                        body: bytes::Bytes::from_static(
+                            b"{\"responses\":[{\"id\":\"0\",\"status\":204}]}",
+                        ),
+                    },
+                ],
+                bifrost_net::RetryPolicy::disabled(),
+            );
+            let stale = foreign_message_id("gone@contoso.com", "folder", "stale");
+            let ids = [
+                stale.clone(),
+                ObjectId("submitted".to_string()),
+                ObjectId("later".to_string()),
+            ];
+            let targets = Box::pin(futures::stream::iter(ids.clone()));
+            let events: Vec<_> = bulk_destroy_stream(account, targets, idempotency_key())
+                .collect()
+                .await;
+            let mut outcomes = Vec::new();
+            let mut done = 0;
+            for event in events {
+                match event {
+                    SyncEvent::Batch(batch) => outcomes.extend(batch.items),
+                    SyncEvent::Done(None) => done += 1,
+                    SyncEvent::Terminated(error) => {
+                        panic!("chunk failure terminated targets: {error:?}")
+                    }
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+            assert_eq!(done, 1);
+            assert_eq!(outcomes.len(), 3);
+            assert_eq!(
+                outcomes.iter().map(outcome_item).collect::<Vec<_>>(),
+                ids.iter().map(|id| id.0.clone()).collect::<Vec<_>>()
+            );
+            assert!(matches!(&outcomes[0], ItemOutcome::Failed(_)));
+            assert_eq!(matches!(&outcomes[1], ItemOutcome::Uncertain(_)), uncertain);
+            assert_eq!(matches!(&outcomes[1], ItemOutcome::Failed(_)), !uncertain);
+            let error = match &outcomes[1] {
+                ItemOutcome::Failed(failure) => &failure.error,
+                ItemOutcome::Uncertain(uncertain) => &uncertain.error,
+                ItemOutcome::Succeeded(_) => panic!("failed envelope cannot confirm a write"),
+            };
+            assert_eq!(
+                error.scope(),
+                Some(&ErrorScope::Message {
+                    id: "submitted".into()
+                })
+            );
+            assert_eq!(error.operation(), Some(AccountOperation::BulkDestroy));
+            assert!(matches!(&outcomes[2], ItemOutcome::Succeeded(success)
+                if success.output == MutationSuccess::Applied));
+            let requests = client.take_rest_requests();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                requests[0].body.as_ref().unwrap()["requests"][0]["method"],
+                "POST"
+            );
+            assert_eq!(
+                requests[0].body.as_ref().unwrap()["requests"][0]["url"],
+                "/me/messages/submitted/permanentDelete"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_batch_keeps_a_failed_etag_preflight() {
+        let account = shared_account();
+        account
+            .etag_index
+            .write()
+            .await
+            .insert("cached".to_string(), "etag".to_string());
+        account.client.script_rest([
+            crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::NOT_FOUND),
+            crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::BAD_REQUEST),
+        ]);
+        let events = submit_batch(
+            &account,
+            &[
+                ObjectId("missing".to_string()),
+                ObjectId("cached".to_string()),
+            ],
+            &MutationKind::SetFlags(FlagOp::Set(HashSet::new())),
+        )
+        .await
+        .expect("envelope failures are per item");
+        let [SyncEvent::Batch(batch)] = events.as_slice() else {
+            panic!("expected batch")
+        };
+        assert_eq!(batch.items.len(), 2);
+        assert_eq!(outcome_item(&batch.items[0]), "missing");
+        assert_eq!(outcome_item(&batch.items[1]), "cached");
+        assert!(
+            batch
+                .items
+                .iter()
+                .all(|item| matches!(item, ItemOutcome::Failed(_)))
+        );
+        let requests = account.client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].body.as_ref().unwrap()["requests"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_batch_keeps_a_cross_mailbox_move_refusal() {
+        let account = shared_account();
+        let foreign = foreign_message_id("shared@contoso.com", "folder", "foreign");
+        let local = ObjectId("local".to_string());
+        for id in [&foreign, &local] {
+            account
+                .etag_index
+                .write()
+                .await
+                .insert(id.0.clone(), "etag".to_string());
+        }
+        account
+            .client
+            .script_rest([crate::client::ScriptedRestResponse::empty(
+                reqwest::StatusCode::BAD_REQUEST,
+            )]);
+        let events = submit_batch(
+            &account,
+            &[foreign.clone(), local.clone()],
+            &MutationKind::Move(MembershipScope::Folder(FolderId("archive".to_string()))),
+        )
+        .await
+        .expect("envelope failures are per item");
+        let [SyncEvent::Batch(batch)] = events.as_slice() else {
+            panic!("expected batch")
+        };
+        assert_eq!(batch.items.len(), 2);
+        assert_eq!(outcome_item(&batch.items[0]), foreign.0);
+        assert_eq!(outcome_item(&batch.items[1]), local.0);
+        assert!(
+            batch
+                .items
+                .iter()
+                .all(|item| matches!(item, ItemOutcome::Failed(_)))
+        );
+        let requests = account.client.take_rest_requests();
+        assert_eq!(requests.len(), 1);
+        let submitted = requests[0].body.as_ref().unwrap()["requests"]
+            .as_array()
+            .unwrap();
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0]["url"], "/me/messages/local/move");
     }
 
     #[tokio::test]

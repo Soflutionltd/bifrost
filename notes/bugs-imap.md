@@ -18,74 +18,15 @@ scopes. Push-error triage in the IDLE worker is filed with the cross-provider
 entry SHARED-013; the private address parser in `pim.rs` with SHARED-004.
 "Live" and "latent" are the hunters' labels.
 
-## IMAP-001 - `ImapConnection::logout()` cannot succeed against a conforming server
+## IMAP-002 - A failed SASL continuation auth error carries no transmission evidence
 
-Live. Scope: imap protocol.
+Scope: imap protocol. Residue of a closed fix (the connection is now answered
+with `*`, the tagged NO is read, and the connection stays usable).
 
-`connection/auth.rs` `logout()`, `connection/dispatch.rs` `LogoutConsumer`,
-`connection/driver/mod.rs` `dispatch_response_loop`. RFC 3501 s6.1.3 requires
-`* BYE` before the tagged OK. Every untagged response goes through
-`process_untagged_prefix` first, which returns `Err(Bye)` as soon as the
-side-effect digest says `had_bye`; nothing special-cases LOGOUT.
-
-- Conforming server: `logout()` returns `Err(Error::Bye { attempt: InFlight })`;
-  the BYE never reaches `LogoutConsumer::on_response` and the tagged OK is
-  never read.
-- Server that skips BYE: `Err(ProtocolMissing("did not send mandatory BYE"))`.
-- `LogoutConsumer::saw_bye` is dead state and `Finalized::success` there is
-  unreachable.
-
-Claims broken: the `logout()` doc ("validates the required response sequence:
-the server MUST send `* BYE` followed by a tagged OK") and `LogoutConsumer`'s
-doc. The only test is
-`a_refused_logout_reports_the_refusal_not_a_missing_bye`; no test covers a
-successful LOGOUT. Today's callers all `let _ = conn.logout().await`
-(`account/pool.rs`, `account/push.rs`), but the error is a `Bye` stamped
-`InFlight`, the shape the account layer maps to provider shutdown, so any
-caller checking the result treats a clean logout as a server-initiated
-disconnect.
-
-Fix direction: the BYE guard needs "a BYE is this command's expected answer",
-e.g. `short_circuit_on_bye` taking the command kind and passing BYE to the
-consumer for LOGOUT, then letting the tagged OK finalize. IDLE, pipeline and
-literal-wait loops must keep treating BYE as fatal; only LOGOUT dispatch
-relaxes. `logout_best_effort` also stops at the BYE without reading the
-tagged OK (harmless at teardown).
-
-## IMAP-002 - A SASL failure raised inside a continuation leaves AUTHENTICATE open and the connection unretired
-
-Live. Scope: imap protocol.
-
-`connection/driver/mod.rs` `dispatch_response_loop`, `Continuation` arm
-(`consumer.on_continuation(c, &ctx)?`); `connection/dispatch/auth.rs`
-`AuthenticateScramConsumer::on_continuation`; the `From<SaslError>` mapping.
-When `on_continuation` errs, `?` exits the loop: no reply to the server's `+`,
-tagged completion never read. Survival depends only on `is_connection_fatal`:
-
-- `verify_server_final` on a server-final with `e=...` gives
-  `SaslError::AuthFailed` -> `Error::Auth`, not connection-fatal.
-- `scram_client_final` failures go through `named_sasl_error`; current
-  `bifrost-sasl` raises only `Protocol` there (fatal), but the mapping routes
-  any future `AuthFailed` / `InvalidCredential` to non-fatal variants.
-
-For `e=`, the server is waiting for the client's response line (empty, or `*`
-to cancel per RFC 3501 s6.2.2) and still owes the tagged NO. The connection is
-kept; the next command's line is consumed as the SASL response, and its reply
-is the AUTHENTICATE tag's `NO`, surfacing as `Protocol("unexpected tag")` or
-worse. The error also carries no transmission stamp although the AUTHENTICATE
-line and client-first are on the wire.
-
-Claim broken: `reference/sasl.md` "Error mapping contract": what a protocol
-crate maps from `Protocol` is "either the peer's fault or raised mid-exchange,
-where retiring the connection is required"; `AuthFailed` is raised
-mid-exchange and not retired. The error-model rule that tagged NO/BAD leave the
-connection reusable assumes a completed exchange.
-
-Fix direction: (a) make every `on_continuation` error mid-exchange fatal
-(wrap as `InternalMidExchange`, or stamp and close in the driver), or (b) on a
-consumer error answer `*\r\n`, read to the tagged NO, and return the auth error
-with the connection intact. (b) is protocol-correct and keeps the auth-failure
-lane meaningful. SMTP's SCRAM path is filed separately (SMTP-001, SMTP-006).
+`Error::Auth` has no attempt field and `with_attempt` cannot add one, so the
+authentication failure raised mid-exchange cannot be stamped although the
+AUTHENTICATE line and client-first are on the wire. Documented at the code site
+and in `reference/imap.md`; the error type itself was outside the fix's files.
 
 ## IMAP-003 - `DriverEventSink` hard cap is documented as poisoning the connection, but every caller discards the result
 
@@ -223,84 +164,6 @@ connection with `is_encrypted() == false` and empty capabilities;
 `MissingCapability`. Make the upgrade fatal once the stream is swapped, or have
 `tls_active` follow the stream rather than the call result.
 
-## IMAP-010 - `InFlightGuard` poisons a connection whose command was never submitted
-
-Latent. Scope: imap protocol.
-
-`connection/auth.rs`: in `submit_regular`, `submit_streaming`,
-`submit_with_continuations` and `submit_upgrade`, the guard is created before
-`cmd_tx.send(dcmd).await`. If the caller's future is dropped while that send
-pends (channel full at 16), the guard marks the connection abandoned although
-the driver never received the command; a healthy connection is retired and its
-last handle aborts the driver. Breaks the `abandoned` field doc ("Set when a
-submitted command's future is dropped before its result arrives"). Create the
-guard after the send completes; `idle()` already does.
-
-## IMAP-012 - The "cumulative" peer budget is reset per setup phase
-
-Latent. Scope: imap protocol.
-
-`connection/wire.rs` `PeerBudget` doc: "One cumulative peer wait allowance,
-shared across stream upgrades." `lifecycle.rs` calls
-`set_peer_timeout(Some(timeout))` three times (greeting, CAPABILITY, STARTTLS),
-each building a fresh budget, so setup can take roughly
-`connect + TLS + 3 x timeout`. Share one budget across setup or reword the doc.
-
-## IMAP-014 - Mutation folder-preparation failures are always `Uncertain`, contradicting the documented lane rule
-
-Scope: imap account.
-
-`mutate.rs` `flush_mutation_groups`, the `Err(FolderMutationFailure { .. })`
-arm. Every `FolderMutationFailure` is raised in `open_folder_for_mutation`
-(checkout, SELECT, UIDVALIDITY read, MODSEQ-cache fold), before any STORE /
-MOVE / EXPUNGE. The arm mints `ItemOutcome::Uncertain` for every id
-unconditionally.
-
-Claims broken:
-- `reference/imap.md` "Per-folder mutation failure contract": "a per-item
-  outcome for every remaining target in that folder (... `Uncertain` on
-  `InFlight` transmission evidence, `Failed` otherwise)". No `Failed` branch.
-- `reference/imap.md` "Mutation error lanes follow transmission evidence ...
-  `Unsent` or `Acknowledged` evidence makes them `Failed`", and
-  `mutation_error_verdict`, which implements that rule and is not used here.
-- `reference/imap.md` PIM primitives stamp preparation failures `Unsent`
-  relative to the operation, because publishing the SELECT's evidence "would
-  make recovery reconcile a non-idempotent mutation that never reached the
-  server". The sync-side mutation path ignores evidence altogether.
-- The arm's comment ("the engine cannot tell, post-hoc, whether the mutation
-  landed") is false for this lane: nothing was sent.
-
-Effect: a tagged NO to SELECT, a closed pool, a dial failure or a missing
-UIDVALIDITY sends every id in the folder to read-back / reconcile instead of
-retry or fail. Fix: stamp the preparation error `Unsent` relative to the
-mutation (as `preflight_err` does in `pim.rs`) and run it through
-`mutation_error_verdict`, leaving one lane rule.
-
-## IMAP-015 - A shared-folder permission denial on mutation SELECT kills the whole mutation stream
-
-Scope: imap account.
-
-`mutate.rs` `flush_mutation_groups`, `stream_terminating`.
-`open_folder_for_mutation` errors are classified by plain
-`account_error_with`, not `error::shared_folder_error`. A `NO [NOPERM]` (or
-`[AUTHORIZATIONFAILED]`) SELECT on a shared folder classifies as
-`Authorization(PermissionDenied)`, which `stream_terminating` matches, so the
-stream emits `Terminated` and returns, leaving every later folder group
-(processed in name order) unattempted and every not-yet-pulled target
-unanswered.
-
-Claims broken: `reference/imap.md` "Mutation batch shape" ("every submitted id
-is answered exactly once, across all three lanes"); Shared folders
-("Revocation quarantines, not escalates", "`NO [ACL]` stays authoritative
-per-mutation"). Changes and inventory route this exact denial through
-`shared_folder_error` to a scoped `ScopeRevoked`; the mutation path is the
-sibling reader that was not updated. `stream_terminating`'s doc reserves
-`Terminated` for "authentication / authorization loss ... that prevent any
-further folder attempt", which a per-folder ACL denial does not. Even for a
-personal folder a per-folder `PermissionDenied` is not account-wide; consider
-narrowing `stream_terminating` to `Authentication(_)` plus sync-state breaks,
-settling per-folder authorization failures per item.
-
 ## IMAP-016 - VANISHED ranges are expanded UID by UID, and every expanded UID becomes a `Removed` change
 
 Scope: imap account.
@@ -368,16 +231,6 @@ Either IDLE workers draw from a shared session budget, or the docs and
 `ImapAccountConfig` state the real total (`pool_cap - 1 +
 idle_connection_budget`).
 
-## IMAP-019 - `unsupported_stream` emits `Done` after `Terminated`
-
-Scope: imap account.
-
-`mod.rs` `unsupported_stream` (used by `open_blob`, `open_blob_range`) yields
-`Terminated(unsupported)` then `Done(None)`. `SyncEvent` docs
-(`crates/types/src/events.rs`) say `Terminated` "signals that this stream ends
-here". Every other unsupported path in the crate, and `changes_stream`'s
-routing error, emits `Terminated` alone.
-
 ## IMAP-020 - Push events broadcast before a `push_stream` receiver exists are lost
 
 Smell, imap account. Same shape as JMAP-009.
@@ -386,20 +239,6 @@ Smell, imap account. Same shape as JMAP-009.
 event, so a `push_subscribe` that starts workers before the engine attaches its
 stream loses the first events silently. bifrost-sync may always subscribe the
 stream first; if so, that ordering is an undocumented requirement.
-
-## IMAP-021 - The opportunistic MODSEQ cache can abort sync and mutation on a value it only caches
-
-Scope: imap account.
-
-`folder_registry.rs` `FolderEntry::record_modseq` and its call sites in
-`changes.rs`, `inventory.rs`, `mutate.rs`, `push.rs`. `record_modseq` returns
-`Error::Protocol` (connection-fatal, `ProviderContractViolation`) for
-`MODSEQ 0`, propagated with `?`. A cache whose documented purpose is "only ever
-saves a round trip on `STORE UNCHANGEDSINCE`" (`MODSEQ_CACHE_CAPACITY` doc)
-thus terminates an inventory walk or changes run, or fails a folder of
-mutations (into the IMAP-014 `Uncertain` lane). The parser is the place to
-judge `MODSEQ 0`; the cache should skip the entry. UID-0 and UIDVALIDITY-0
-checks are reachable only from local bugs and belong in `debug_assert`s.
 
 ## IMAP-022 - The MODSEQ cache records server state the consumer has not seen, so `UNCHANGEDSINCE` guards less than documented
 

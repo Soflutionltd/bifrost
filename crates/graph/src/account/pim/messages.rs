@@ -563,7 +563,7 @@ pub(super) async fn destroy_messages(
     let values = message_values_for_ids(account, ids, "id,changeKey").await?;
     let mut requests = Vec::new();
     let mut targets = Vec::new();
-    // Route each DELETE by the caller-supplied (possibly foreign-encoded)
+    // Route each permanentDelete by the caller-supplied (possibly foreign-encoded)
     // routing id `ids[i]`, paired with its fetched etag `values[i]`.
     for (index, (id, value)) in ids.iter().zip(values.iter()).enumerate() {
         let mut headers = HashMap::new();
@@ -572,8 +572,11 @@ pub(super) async fn destroy_messages(
         }
         requests.push(BatchRequestItem {
             id: index.to_string(),
-            method: "DELETE".to_string(),
-            url: message_batch_url(account, id, "", operation)?,
+            // This helper also serves delete_thread's already-in-Trash arm.
+            // Plain DELETE only advances mail into recoverable storage;
+            // permanentDelete is Graph's expunge action (retention still applies).
+            method: "POST".to_string(),
+            url: message_batch_url(account, id, "/permanentDelete", operation)?,
             body: None,
             headers: (!headers.is_empty()).then_some(headers),
         });

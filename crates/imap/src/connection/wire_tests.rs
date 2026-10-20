@@ -490,6 +490,54 @@ async fn bandwidth_peer_timeout_starts_after_admission() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn setup_peer_budget_keeps_elapsed_wait_when_the_reader_is_rebuilt() {
+    use tokio::time::{Duration, Instant, advance};
+
+    let timeout = Duration::from_millis(100);
+    let budget = PeerBudget::new(timeout);
+    let (client, _peer) = tokio::io::duplex(64);
+    let mut first = WireReader::new(ImapStream::Memory(super::super::stream::Tracked::new(
+        client,
+    )));
+    first.set_peer_budget(Some(budget.clone()));
+
+    let mut first_wait = Box::pin(peer_io(
+        first.peer_budget(),
+        std::future::pending::<std::io::Result<()>>(),
+    ));
+    tokio::select! {
+        biased;
+        result = &mut first_wait => panic!("peer budget future completed unexpectedly: {result:?}"),
+        () = async {} => {}
+    }
+    advance(Duration::from_millis(60)).await;
+    drop(first_wait);
+
+    // STARTTLS installs a fresh reader from cloned metering state. Setup
+    // explicitly carries the same budget into each phase as well.
+    let metering = first.metering();
+    let (client, _peer) = tokio::io::duplex(64);
+    let mut next = WireReader::with_metering(
+        ImapStream::Memory(super::super::stream::Tracked::new(client)),
+        metering,
+    );
+    next.set_peer_budget(Some(budget));
+
+    let start = Instant::now();
+    let result = peer_io(
+        next.peer_budget(),
+        std::future::pending::<std::io::Result<()>>(),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::Timeout { .. })));
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_millis(40),
+        "the rebuilt reader must inherit the first phase's spent allowance"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn bandwidth_short_writes_refund_only_the_tail() {
     use bifrost_net::{BandwidthBudget, BandwidthDirection};
     use futures::FutureExt;

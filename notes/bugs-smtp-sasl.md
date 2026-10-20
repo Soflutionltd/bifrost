@@ -17,54 +17,6 @@ Filed from the October 2026 defect hunt: the smtp and sasl scope, plus an SMTP
 lateral from net adoption. Severity labels are the hunter's. The IMAP-side
 SCRAM continuation defect is IMAP-002.
 
-## SMTP-001 - SMTP SCRAM base64-encodes the client-final twice, so every SCRAM rung fails against a real server
-
-Hunter severity: P1.
-
-- `bifrost_sasl::scram_client_final` returns the client-final already
-  base64-encoded (`scram.rs`: `STANDARD.encode(client_final.as_bytes()).into()`).
-  IMAP writes it as is (`imap/src/connection/dispatch/auth.rs`,
-  `bytes.extend_from_slice(client_final.as_bytes())`).
-- SMTP's `ScramExchange::step` (`smtp/src/transport/smtp/authentication.rs`)
-  encodes again: `ScramStep::Reply(crate::base64::encode(client_final.as_bytes()))`.
-  Both blocking and async `auth_scram` write that through
-  `write_auth_continuation` with no decode, so the server receives
-  `base64(base64(c=...,r=...,p=...))`.
-- Every conforming server rejects it, so SCRAM-SHA-1, SCRAM-SHA-256 and both
-  `-PLUS` rungs, the top four entries of the default `PASSWORD_MECHANISMS`,
-  cannot authenticate. On a server offering SCRAM, password auth fails outright
-  and never falls back to PLAIN (a rejection is final by design). SCRAM is the
-  common case for Dovecot and Cyrus submission.
-- Claims broken: `reference/smtp.md` "Auth" (SCRAM consumed from `bifrost-sasl`,
-  SMTP owns only wire sequencing) and `reference/sasl.md` "Surface"
-  (`scram_client_final` returns "the base64 client-final").
-- Why tests missed it: no SMTP test drives SCRAM past server-first on the wire.
-  `scram_exchange_none_binding_drives_to_complete` only checks the reply is
-  non-empty, then feeds a separately computed server-final; the
-  `AUTH SCRAM-SHA-256-PLUS` transcript tests all stop at a scripted 535. A
-  transcript test decoding the client-final line once and checking for
-  `c=biws,r=` would have bitten.
-- Fix: pass `client_final.as_str()` through, ideally as a `Secret` (SMTP-007).
-
-The hunter's structural note: the SCRAM wire walk exists twice (`auth_scram`
-sync and async, including the 334-versus-235 server-final branch and the
-challenge-count loop). An `AuthMachine` yielding `Write` / `Read` ops, the
-step-function shape the send core already uses, would give this one site and
-one transcript test, and SMTP-008 and SMTP-009 one fix each.
-
-## SMTP-002 - An EHLO line made only of whitespace panics the client
-
-Hunter severity: P1.
-
-`ServerInfo::from_response` (`extension.rs`) skips empty lines, then calls
-`line.split_whitespace().next().unwrap()`. `parse_response` accepts
-`250- \r\n` or `250-\t\r\n` (the text after `-` is `take_until("\r\n")`), so the
-line is `" "`: not empty, no tokens, and the `unwrap` panics. The input is
-peer-controlled and the panic happens during connect, inside the pool, or under
-`tokio::spawn`: a remote crash, breaking the crate-wide rule that malformed peer
-input is a typed `Parse` error ("An unparseable limit is a hard `Parse` error on
-the EHLO reply").
-
 ## SMTP-003 - The blocking transport panics on an `OAuthRefresher` needing refresh, and spuriously fails one that does not
 
 Hunter severity: P1.
@@ -127,44 +79,6 @@ the error model's Authentication rows (`RefreshTransient` -> Retry, `Revoked` /
 is the error model's concern", which the model cannot reach once the kind is
 `PolicyBlocked`. The blocking `Pending` rejection (SMTP-003) takes the same
 lane.
-
-## SMTP-007 - SCRAM client lines escape the zeroizing discipline
-
-Hunter severity: P2.
-
-`reference/smtp.md` says stateless AUTH payloads stay `Secret` through the
-command boundary and are written through zeroizing buffers. SCRAM does not:
-`ScramStep::Reply(String)` and `client_first() -> String` are plain heap
-strings, and the client-final (carrying `p=`) is copied into one. They are
-written through `write_auth_continuation`, whose `format!` buffer is zeroizing,
-but the `ScramStep` string is not. The proof is single-use so exposure is small,
-but the invariant does not cover the mechanism preferred by default. Fixing
-SMTP-001 is the natural moment to carry `Secret` through.
-
-Related, from sasl: `bifrost_sasl::strip_frame_delim` returns
-`Cow::Owned(field.replace(..))` for the access token, a plain non-zeroizing copy
-of the bearer token, whenever it contains `\x01`. The module promises zeroizing
-payloads.
-
-## SMTP-008 - `auth_legacy`: a success on the last challenge is reported as failure
-
-Hunter severity: P2.
-
-After the loop, `if challenges == 0` errors with "Unexpected number of
-challenges" and aborts, even when the tenth continuation's reply was `235`. The
-server considers the session authenticated while the client reports an
-auth-lane `PolicyBlocked` and tears down. Test `response.has_code(334)`, not the
-budget. In both halves; only servers with long LOGIN-style ladders reach it.
-
-## SMTP-009 - A SCRAM server-final folded onto `235` breaks with enhanced status codes
-
-Hunter severity: P2.
-
-`decode_scram_payload` decodes `first_word()`. A server that folds the
-server-final onto the success reply and advertises `ENHANCEDSTATUSCODES` writes
-`235 2.7.0 <base64>`; the first word is `2.7.0`, base64 decoding fails, and a
-successful authentication becomes a `Parse` error plus abort. The branch exists
-to accept a field-observed shape but accepts only its non-ESC variant.
 
 ## SMTP-010 - `build_recipient_commands` silently drops recipients on short options
 

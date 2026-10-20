@@ -61,7 +61,9 @@ inside the protocol consumers, never the other way around.
   client_first_bare, server_first, binding: &ScramChannelBinding) ->
   Result<(Secret, Vec<u8>), SaslError>` - parses the server-first message,
   runs PBKDF2/HMAC, returns the base64 client-final and the expected server
-  signature. Every error it returns is about the server-first message. The `c=` attribute is
+  signature. Protocol consumers write this value as returned and do not
+  base64-encode it again. Every error it returns is about the server-first
+  message. The `c=` attribute is
   `base64(gs2_header || cbind_data)` derived from `binding`; `None` is
   byte-identical to the old `c=biws`.
 - `verify_server_final(server_final, expected_signature) -> Result<(),
@@ -86,7 +88,8 @@ inside the protocol consumers, never the other way around.
   nothing is escaped; OAUTHBEARER's `a=` identity is GS2-escaped via
   `escape_username` (same RFC-derived escape table as SCRAM saslname) and the
   optional RFC 7628 `host=` / `port=` attributes are deliberately omitted to
-  stay transport-agnostic.
+  stay transport-agnostic. The frame-delimiter-stripped intermediate copies,
+  including the access token when it contains `\x01`, use zeroizing storage.
 
 The per-hash proof helpers, `scram_field`, `escape_username`, and the HMAC/XOR
 primitives stay private to the crate. Password-derived SCRAM intermediates and the CRAM-MD5

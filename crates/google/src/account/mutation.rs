@@ -10,13 +10,14 @@
 //! Per-batch outcomes use the `MutationApply` internal enum before being
 //! lifted into `SyncEvent` at the stream boundary.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bifrost_types::{
     AccountError, AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchSuccess,
-    ContainerId, FlagOp, IdempotencyKey, ItemOutcome, LabelId, MembershipScope, MutationEffect,
-    MutationSuccess, ObjectId, PageBoundary, SyncEvent, Warning, WarningKind,
+    BatchUncertain, ContainerId, FlagOp, IdempotencyKey, ItemOutcome, LabelId, MembershipScope,
+    MutationEffect, MutationSuccess, ObjectId, PageBoundary, SyncEvent, Warning, WarningKind,
 };
 use futures::{StreamExt, stream};
 use serde::Serialize;
@@ -28,8 +29,8 @@ use crate::error::Error as GmailError;
 use super::capabilities::{GMAIL_BATCH_MODIFY_LIMIT, GMAIL_MODIFY_LABEL_LIMIT};
 use super::error as account_error;
 use super::error::{
-    GmailErrorContext, applied_outcomes, is_batch_delete_scope_failure,
-    merge_delete_fallback_error, mutation_error, skipped_outcomes,
+    GmailErrorContext, is_batch_delete_scope_failure, merge_delete_fallback_error, mutation_error,
+    skipped_outcomes,
 };
 use super::flags;
 use super::flags::{LABEL_TRASH, LabelPatch, translate_flag_op};
@@ -251,12 +252,37 @@ fn mutation_stream(
         if state.shutdown.is_cancelled() {
             return None;
         }
+        let body_count = match &state.kind {
+            MutationKind::SetFlags(_) | MutationKind::Move { .. } => {
+                let patch = state.patch.clone().unwrap_or_default();
+                batch_modify_bodies(&ids, &patch).len()
+            }
+            MutationKind::Destroy => 1,
+        };
+        let mutation_progress = Arc::new(Mutex::new(MutationProgress::new(&ids, body_count)));
+        let progress_for_operation = Arc::clone(&mutation_progress);
         let operation_future = async {
             match &state.kind {
-                MutationKind::Destroy => apply_destroy(&state.client, &ids, &state.key).await,
+                MutationKind::Destroy => {
+                    apply_destroy(
+                        &state.client,
+                        &ids,
+                        &state.key,
+                        Arc::clone(&progress_for_operation),
+                    )
+                    .await
+                }
                 MutationKind::SetFlags(_) | MutationKind::Move { .. } => {
                     let patch = state.patch.clone().unwrap_or_default();
-                    apply_label_patch(&state.client, &ids, patch, &state.key, operation).await
+                    apply_label_patch_tracked(
+                        &state.client,
+                        &ids,
+                        patch,
+                        &state.key,
+                        operation,
+                        Arc::clone(&progress_for_operation),
+                    )
+                    .await
                 }
             }
         };
@@ -267,16 +293,17 @@ fn mutation_stream(
             biased;
             event = operation_future => event,
             () = state.shutdown.cancelled() => {
-                // Dispatch had begun, so Gmail may have applied some or
-                // all of these writes and we will never read the answer.
-                // Dropping the future here without a lane would lose
-                // writes silently during `close()`; `Failed` would
-                // assert they did not land. `Uncertain` is the only
-                // honest answer, and it is what queues the ids for
-                // read-back.
+                // Preserve completed outcomes, then mark only ids with a
+                // partial write or an unanswered request as uncertain.
+                // Unattempted ids have no lane yet and remain for the
+                // engine to re-issue after this stream terminates.
                 let error = account_error::shutdown_inflight_error(operation);
+                let accounted = mutation_progress
+                    .lock()
+                    .expect("mutation progress lock poisoned")
+                    .shutdown_outcomes(&error);
                 MutationApply::Terminate {
-                    accounted: account_error::uncertain_outcomes(&ids, &error),
+                    accounted,
                     error,
                 }
             }
@@ -372,35 +399,224 @@ enum MutationApply {
         warning: Option<Warning>,
     },
     /// The stream must end. `accounted` carries the outcomes of ids the
-    /// driver had already transmitted and resolved before the terminal
-    /// error arrived - non-empty on the bisection path, where a rate
-    /// limit or an engine directive can land after some sub-batches have
-    /// already succeeded, and on shutdown of a dispatched batch, where
-    /// every id in it is `Uncertain`. Those ids are emitted as one batch
-    /// ahead of the `Terminated` event so no resolved id is silently
-    /// dropped; ids that were never transmitted stay unreported, which
-    /// is what `Terminated` has always meant.
+    /// driver has resolved or partially applied before the terminal error
+    /// arrived. These ids are emitted as one batch ahead of `Terminated`;
+    /// ids with no acknowledged effect and no ambiguous request stay
+    /// unreported so the engine can re-issue them.
     Terminate {
         accounted: Vec<ItemOutcome<MutationSuccess>>,
         error: AccountError,
     },
 }
 
-impl MutationApply {
-    fn terminate(error: AccountError) -> Self {
-        Self::Terminate {
-            accounted: Vec::new(),
-            error,
+/// Evidence for one mutation batch across its requests.
+///
+/// A label body may be sent several times while its ids are bisected after a
+/// 404, so each id counts a body at most once. Finished outcomes are retained
+/// if a later request terminates or shutdown drops the operation future.
+struct MutationProgress {
+    ids: Vec<ObjectId>,
+    positions: HashMap<String, Vec<usize>>,
+    body_count: usize,
+    completed_effect: Option<MutationEffect>,
+    states: Vec<MutationIdProgress>,
+}
+
+enum MutationIdProgress {
+    Active {
+        acknowledged_bodies: usize,
+        last_acknowledged_body: Option<usize>,
+        in_flight: bool,
+    },
+    Finished(ItemOutcome<MutationSuccess>),
+}
+
+impl MutationProgress {
+    fn new(ids: &[ObjectId], body_count: usize) -> Self {
+        let mut positions = HashMap::<String, Vec<usize>>::new();
+        for (index, id) in ids.iter().enumerate() {
+            positions.entry(id.0.clone()).or_default().push(index);
         }
+        Self {
+            ids: ids.to_vec(),
+            positions,
+            body_count,
+            completed_effect: None,
+            states: ids
+                .iter()
+                .map(|_| MutationIdProgress::Active {
+                    acknowledged_bodies: 0,
+                    last_acknowledged_body: None,
+                    in_flight: false,
+                })
+                .collect(),
+        }
+    }
+
+    fn begin(&mut self, ids: &[ObjectId]) {
+        for id in ids {
+            if let Some(indices) = self.positions.get(&id.0) {
+                for &index in indices {
+                    if let MutationIdProgress::Active { in_flight, .. } = &mut self.states[index] {
+                        *in_flight = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn end_request(&mut self, ids: &[ObjectId]) {
+        for id in ids {
+            if let Some(indices) = self.positions.get(&id.0) {
+                for &index in indices {
+                    if let MutationIdProgress::Active { in_flight, .. } = &mut self.states[index] {
+                        *in_flight = false;
+                    }
+                }
+            }
+        }
+    }
+
+    fn acknowledge(&mut self, ids: &[ObjectId], body_index: usize, unsupported: &[String]) {
+        for id in ids {
+            let Some(indices) = self.positions.get(&id.0) else {
+                continue;
+            };
+            for &index in indices {
+                let complete = match &mut self.states[index] {
+                    MutationIdProgress::Active {
+                        acknowledged_bodies,
+                        last_acknowledged_body,
+                        in_flight,
+                    } => {
+                        *in_flight = false;
+                        if *last_acknowledged_body != Some(body_index) {
+                            *acknowledged_bodies += 1;
+                            *last_acknowledged_body = Some(body_index);
+                        }
+                        *acknowledged_bodies == self.body_count
+                    }
+                    MutationIdProgress::Finished(_) => false,
+                };
+                if complete {
+                    let output = if let Some(actual) = &self.completed_effect {
+                        MutationSuccess::Downgraded {
+                            actual: actual.clone(),
+                        }
+                    } else if unsupported.is_empty() {
+                        MutationSuccess::Applied
+                    } else {
+                        MutationSuccess::Downgraded {
+                            actual: MutationEffect::FlagsPartiallyApplied {
+                                unsupported: unsupported.to_vec(),
+                            },
+                        }
+                    };
+                    self.states[index] = MutationIdProgress::Finished(ItemOutcome::Succeeded(
+                        BatchSuccess::new(BatchItemId(self.ids[index].0.clone()), output),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn finish_failures(&mut self, outcomes: Vec<ItemOutcome<MutationSuccess>>, not_found: bool) {
+        for outcome in outcomes {
+            let ItemOutcome::Failed(failure) = outcome else {
+                continue;
+            };
+            let Some(indices) = self.positions.get(&failure.item.0) else {
+                continue;
+            };
+            for &index in indices {
+                let has_partial_effect = matches!(
+                    &self.states[index],
+                    MutationIdProgress::Active {
+                        acknowledged_bodies,
+                        ..
+                    } if *acknowledged_bodies > 0
+                );
+                // A permanent non-404 refusal cannot erase an earlier
+                // acknowledged body. `Failed` would claim no effect, so keep
+                // the error but route the id through read-back as uncertain.
+                let outcome = if has_partial_effect && !not_found {
+                    ItemOutcome::Uncertain(BatchUncertain::new(
+                        failure.item.clone(),
+                        failure.error.clone(),
+                    ))
+                } else {
+                    ItemOutcome::Failed(BatchFailure::new(
+                        failure.item.clone(),
+                        failure.error.clone(),
+                    ))
+                };
+                if matches!(&self.states[index], MutationIdProgress::Active { .. }) {
+                    self.states[index] = MutationIdProgress::Finished(outcome);
+                }
+            }
+        }
+    }
+
+    fn completed_outcomes(&self) -> Vec<ItemOutcome<MutationSuccess>> {
+        self.states
+            .iter()
+            .filter_map(|state| match state {
+                MutationIdProgress::Finished(outcome) => Some(outcome.clone()),
+                MutationIdProgress::Active { .. } => None,
+            })
+            .collect()
+    }
+
+    fn terminal_outcomes(&self, error: &AccountError) -> Vec<ItemOutcome<MutationSuccess>> {
+        self.outcomes_before_stop(error, false)
+    }
+
+    fn shutdown_outcomes(&self, error: &AccountError) -> Vec<ItemOutcome<MutationSuccess>> {
+        self.outcomes_before_stop(error, true)
+    }
+
+    fn outcomes_before_stop(
+        &self,
+        error: &AccountError,
+        cancellation: bool,
+    ) -> Vec<ItemOutcome<MutationSuccess>> {
+        let ambiguous_attempt = error.chain().iter().any(|cause| {
+            matches!(
+                cause,
+                bifrost_types::Cause::Attempt(attempt)
+                    if attempt.transmission_state == bifrost_types::TransmissionState::InFlight
+            )
+        });
+        self.ids
+            .iter()
+            .zip(&self.states)
+            .filter_map(|(id, state)| match state {
+                MutationIdProgress::Finished(outcome) => Some(outcome.clone()),
+                MutationIdProgress::Active {
+                    acknowledged_bodies,
+                    in_flight,
+                    ..
+                } if *acknowledged_bodies > 0
+                    || (*in_flight && (cancellation || ambiguous_attempt)) =>
+                {
+                    Some(ItemOutcome::Uncertain(BatchUncertain::new(
+                        BatchItemId(id.0.clone()),
+                        error.clone(),
+                    )))
+                }
+                MutationIdProgress::Active { .. } => None,
+            })
+            .collect()
     }
 }
 
-async fn apply_label_patch(
+async fn apply_label_patch_tracked(
     client: &GmailClient,
     ids: &[ObjectId],
     patch: LabelPatch,
     key: &IdempotencyKey,
     operation: AccountOperation,
+    progress: Arc<Mutex<MutationProgress>>,
 ) -> MutationApply {
     if operation == AccountOperation::BulkMove && !patch.unsupported_flags.is_empty() {
         let detail = format!(
@@ -447,36 +663,114 @@ async fn apply_label_patch(
             warning: Some(unsupported_flags_warning(&patch.unsupported_flags)),
         };
     }
-    for body in batch_modify_bodies(ids, &patch) {
-        match post_empty_json(client, "/messages/batchModify", &body, key).await {
-            Ok(()) => {}
-            Err(error) if is_not_found(&error) && ids.len() > 1 => {
-                return apply_label_patch_bisected(
-                    client,
-                    ids,
-                    &body,
-                    key,
-                    operation,
-                    &patch.unsupported_flags,
-                )
-                .await;
-            }
+    let mut live_ids = ids.to_vec();
+    for (body_index, body) in batch_modify_bodies(ids, &patch).into_iter().enumerate() {
+        if live_ids.is_empty() {
+            break;
+        }
+        match apply_label_patch_body(
+            client,
+            &live_ids,
+            &body,
+            key,
+            LabelPatchBodyContext {
+                operation,
+                unsupported: &patch.unsupported_flags,
+                body_index,
+                progress: &progress,
+            },
+        )
+        .await
+        {
+            Ok(next_live_ids) => live_ids = next_live_ids,
             Err(error) => {
-                return match mutation_error(ids, error, GmailErrorContext::mutation(operation)) {
-                    Ok(outcomes) => MutationApply::Batch {
-                        items: outcomes,
-                        warning: None,
-                    },
-                    Err(account_error) => MutationApply::terminate(account_error),
-                };
+                let accounted = progress
+                    .lock()
+                    .expect("mutation progress lock poisoned")
+                    .terminal_outcomes(&error);
+                return MutationApply::Terminate { accounted, error };
             }
         }
     }
     MutationApply::Batch {
-        items: label_patch_successes(ids, &patch.unsupported_flags),
+        items: progress
+            .lock()
+            .expect("mutation progress lock poisoned")
+            .completed_outcomes(),
         warning: (!patch.unsupported_flags.is_empty())
             .then(|| unsupported_flags_warning(&patch.unsupported_flags)),
     }
+}
+
+/// Apply one label body, bisecting its ids on 404 and returning only the ids
+/// that succeeded so the caller can carry them into the next label body.
+struct LabelPatchBodyContext<'a> {
+    operation: AccountOperation,
+    unsupported: &'a [String],
+    body_index: usize,
+    progress: &'a Arc<Mutex<MutationProgress>>,
+}
+
+async fn apply_label_patch_body(
+    client: &GmailClient,
+    ids: &[ObjectId],
+    template: &BatchModifyRequest,
+    key: &IdempotencyKey,
+    context: LabelPatchBodyContext<'_>,
+) -> Result<Vec<ObjectId>, AccountError> {
+    let LabelPatchBodyContext {
+        operation,
+        unsupported,
+        body_index,
+        progress,
+    } = context;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pending = vec![ids.to_vec()];
+    let mut live_ids = Vec::new();
+    while let Some(part) = pending.pop() {
+        let body = BatchModifyRequest {
+            ids: part.iter().map(|id| id.0.clone()).collect(),
+            add_label_ids: template.add_label_ids.clone(),
+            remove_label_ids: template.remove_label_ids.clone(),
+        };
+        progress
+            .lock()
+            .expect("mutation progress lock poisoned")
+            .begin(&part);
+        match post_empty_json(client, "/messages/batchModify", &body, key).await {
+            Ok(()) => {
+                progress
+                    .lock()
+                    .expect("mutation progress lock poisoned")
+                    .acknowledge(&part, body_index, unsupported);
+                live_ids.extend(part);
+            }
+            Err(error) if is_not_found(&error) && part.len() > 1 => {
+                progress
+                    .lock()
+                    .expect("mutation progress lock poisoned")
+                    .end_request(&part);
+                let midpoint = part.len() / 2;
+                pending.push(part[midpoint..].to_vec());
+                pending.push(part[..midpoint].to_vec());
+            }
+            Err(error) => {
+                let not_found = is_not_found(&error);
+                match mutation_error(&part, error, GmailErrorContext::mutation(operation)) {
+                    Ok(outcomes) => {
+                        let mut progress =
+                            progress.lock().expect("mutation progress lock poisoned");
+                        progress.end_request(&part);
+                        progress.finish_failures(outcomes, not_found);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(live_ids)
 }
 
 /// Lower one `LabelPatch` onto the `batchModify` request bodies that carry
@@ -487,17 +781,18 @@ async fn apply_label_patch(
 /// `flags::patch_for_set` names every user label in the account in
 /// `removeLabelIds` by construction, so an account with more than a
 /// hundred labels overruns Gmail's documented per-update label cap on
-/// every exact-set. That failure mode is invisible to
-/// `apply_label_patch_bisected`, whose whole method is splitting the id
-/// list - which does not shrink the label list at all - so the split has
-/// to happen here instead.
+/// every exact-set. The 404 recovery bisects only the id list, which does
+/// not shrink the label list at all, so the label split has to happen
+/// here instead.
 ///
 /// Splitting is sound because a label patch is state-independent and
 /// idempotent: each request asserts an absolute add-or-remove for labels
-/// it names and says nothing about the rest, so applying the same id list
-/// across several requests converges on the same final label set as one
-/// oversized request would have. Only the intermediate states are
-/// observable, and Gmail offers no atomicity across ids in one call
+/// it names and says nothing about the rest. Applying every body to each
+/// live id therefore converges on the same final label set as one
+/// oversized request would have. A 404 can narrow the live id list for
+/// the remaining bodies, but no later label chunk is skipped for an id
+/// that survived the failed body's bisection. Only intermediate states
+/// are observable, and Gmail offers no atomicity across ids in one call
 /// either. The single caveat is a caller CONTRADICTION - the same label in
 /// both lists, pinned in `flags` as removal-wins - whose resolution is
 /// per-request, so a contradiction split across bodies resolves by last
@@ -525,94 +820,8 @@ fn batch_modify_bodies(ids: &[ObjectId], patch: &LabelPatch) -> Vec<BatchModifyR
     bodies
 }
 
-/// Split a `batchModify` that answered 404 until every id is isolated as
-/// present or absent.
-///
-/// Gmail fails the WHOLE call when a single id in it is unknown, so the
-/// unsplit answer told the engine that every id in the batch was gone.
-/// Only a singleton that still answers 404 is genuinely absent.
-///
-/// Every sub-batch error goes back through `mutation_error`, exactly as
-/// the unsplit path does. That funnel is what decides whether a failure
-/// is a per-id lane or a stream terminator: a rate limit, a transport
-/// fault, auth loss or an engine directive arriving mid-bisection must
-/// end the stream so the engine backs off and retries, and must not be
-/// laundered into "these ids failed". Sub-batches already resolved are
-/// handed back with the terminator so their ids keep their lane.
-///
-/// Accepted residual, deliberately left: a terminal error mid-walk DISCARDS
-/// the sub-batches not yet attempted. Their ids were never transmitted, so
-/// they go unreported - which is exactly what `Terminated` has always meant on
-/// this driver - and the engine re-issues the whole operation. Revisit only if
-/// a checkpoint ever lets a mutation stream resume mid-batch; until then there
-/// is no lane a never-sent id could honestly occupy, and inventing one would
-/// claim knowledge the walk does not have.
-async fn apply_label_patch_bisected(
-    client: &GmailClient,
-    ids: &[ObjectId],
-    patch: &BatchModifyRequest,
-    key: &IdempotencyKey,
-    operation: AccountOperation,
-    unsupported: &[String],
-) -> MutationApply {
-    let midpoint = ids.len() / 2;
-    let mut pending = vec![ids[midpoint..].to_vec(), ids[..midpoint].to_vec()];
-    let mut outcomes = Vec::with_capacity(ids.len());
-    while let Some(part) = pending.pop() {
-        let body = BatchModifyRequest {
-            ids: part.iter().map(|id| id.0.clone()).collect(),
-            add_label_ids: patch.add_label_ids.clone(),
-            remove_label_ids: patch.remove_label_ids.clone(),
-        };
-        match post_empty_json(client, "/messages/batchModify", &body, key).await {
-            Ok(()) => outcomes.extend(label_patch_successes(&part, unsupported)),
-            Err(error) if is_not_found(&error) && part.len() > 1 => {
-                let midpoint = part.len() / 2;
-                pending.push(part[midpoint..].to_vec());
-                pending.push(part[..midpoint].to_vec());
-            }
-            Err(error) => {
-                match mutation_error(&part, error, GmailErrorContext::mutation(operation)) {
-                    Ok(failures) => outcomes.extend(failures),
-                    Err(account_error) => {
-                        return MutationApply::Terminate {
-                            accounted: outcomes,
-                            error: account_error,
-                        };
-                    }
-                }
-            }
-        }
-    }
-    MutationApply::Batch {
-        items: outcomes,
-        warning: (!unsupported.is_empty()).then(|| unsupported_flags_warning(unsupported)),
-    }
-}
-
 fn is_not_found(error: &GmailError) -> bool {
     account_error::response_parts(error).is_some_and(|(status, _)| status == 404)
-}
-
-fn label_patch_successes(
-    ids: &[ObjectId],
-    unsupported: &[String],
-) -> Vec<ItemOutcome<MutationSuccess>> {
-    if unsupported.is_empty() {
-        return applied_outcomes(ids);
-    }
-    ids.iter()
-        .map(|id| {
-            ItemOutcome::Succeeded(BatchSuccess::new(
-                BatchItemId(id.0.clone()),
-                MutationSuccess::Downgraded {
-                    actual: MutationEffect::FlagsPartiallyApplied {
-                        unsupported: unsupported.to_vec(),
-                    },
-                },
-            ))
-        })
-        .collect()
 }
 
 fn failed_outcomes(ids: &[ObjectId], error: &AccountError) -> Vec<ItemOutcome<MutationSuccess>> {
@@ -632,16 +841,34 @@ async fn apply_destroy(
     client: &GmailClient,
     ids: &[ObjectId],
     key: &IdempotencyKey,
+    progress: Arc<Mutex<MutationProgress>>,
 ) -> MutationApply {
     let body = BatchDeleteRequest {
         ids: ids.iter().map(|id| id.0.clone()).collect(),
     };
+    progress
+        .lock()
+        .expect("mutation progress lock poisoned")
+        .begin(ids);
     match post_empty_json(client, "/messages/batchDelete", &body, key).await {
-        Ok(()) => MutationApply::Batch {
-            items: applied_outcomes(ids),
-            warning: None,
-        },
+        Ok(()) => {
+            progress
+                .lock()
+                .expect("mutation progress lock poisoned")
+                .acknowledge(ids, 0, &[]);
+            MutationApply::Batch {
+                items: progress
+                    .lock()
+                    .expect("mutation progress lock poisoned")
+                    .completed_outcomes(),
+                warning: None,
+            }
+        }
         Err(error) if is_batch_delete_scope_failure(&error) => {
+            progress
+                .lock()
+                .expect("mutation progress lock poisoned")
+                .end_request(ids);
             // Translate the primary failure once and consume
             // it. The original `Error` is not used after this point;
             // the fallback diagnostic attaches the primary's outermost
@@ -653,75 +880,61 @@ async fn apply_destroy(
             // The fallback is a move into TRASH, so it goes through the
             // same relocation rule as every other move rather than
             // hand-rolling a patch that would leave SPAM attached.
+            // Record the actual effect when each sub-batch is acknowledged.
+            // Shutdown reads this ledger without waiting for this future to return.
+            progress
+                .lock()
+                .expect("mutation progress lock poisoned")
+                .completed_effect = Some(MutationEffect::MovedToContainer(ContainerId(
+                LABEL_TRASH.to_string(),
+            )));
             let fallback = flags::move_placement_patch(LABEL_TRASH);
-            match apply_label_patch(client, ids, fallback, key, AccountOperation::BulkDestroy).await
+            match apply_label_patch_tracked(
+                client,
+                ids,
+                fallback,
+                key,
+                AccountOperation::BulkDestroy,
+                Arc::clone(&progress),
+            )
+            .await
             {
-                // The patch succeeding does NOT mean the destroy succeeded.
-                // These messages were moved to Trash; they still exist. Taking
-                // the patch's own `Applied` outcomes told the engine they were
-                // destroyed, so the next inventory pass observed them again and
-                // destroyed them again - a permanent reconcile loop, on the
-                // ordinary `gmail.modify` scope that triggers this fallback by
-                // design. Report the downgrade instead and let the engine
-                // read-back-verify it.
-                //
-                // Rebuilt from `ids` rather than mapped over the patch's
-                // outcomes on purpose: `apply_label_patch` may legitimately
-                // report per-item failures, and a failed trash is a failure,
-                // not a downgrade. Only ids the patch reported as SUCCEEDED
-                // become `Downgraded`; everything else keeps the lane the
-                // patch gave it.
-                MutationApply::Batch { items, warning } => MutationApply::Batch {
-                    items: downgrade_succeeded_outcomes(items),
-                    warning,
-                },
+                MutationApply::Batch { items, warning } => MutationApply::Batch { items, warning },
                 MutationApply::Terminate {
                     accounted,
                     error: fallback_error,
                 } => MutationApply::Terminate {
-                    accounted: downgrade_succeeded_outcomes(accounted),
+                    accounted,
                     error: merge_delete_fallback_error(fallback_error, &primary),
                 },
             }
         }
-        Err(error) => match mutation_error(
-            ids,
-            error,
-            GmailErrorContext::mutation(AccountOperation::BulkDestroy),
-        ) {
-            Ok(outcomes) => MutationApply::Batch {
-                items: outcomes,
-                warning: None,
-            },
-            Err(account_error) => MutationApply::terminate(account_error),
-        },
+        Err(error) => {
+            let not_found = is_not_found(&error);
+            match mutation_error(
+                ids,
+                error,
+                GmailErrorContext::mutation(AccountOperation::BulkDestroy),
+            ) {
+                Ok(outcomes) => {
+                    let mut progress = progress.lock().expect("mutation progress lock poisoned");
+                    progress.end_request(ids);
+                    progress.finish_failures(outcomes, not_found);
+                    MutationApply::Batch {
+                        items: progress.completed_outcomes(),
+                        warning: None,
+                    }
+                }
+                Err(error) => {
+                    let accounted = progress
+                        .lock()
+                        .expect("mutation progress lock poisoned")
+                        .terminal_outcomes(&error);
+                    MutationApply::Terminate { accounted, error }
+                }
+            }
+        }
     }
-}
-
-/// Re-label the SUCCEEDED outcomes of a `bulk_destroy` permission fallback as
-/// `Downgraded`, leaving the other lanes untouched.
-///
-/// The fallback trashes messages a permanent delete was refused for. A message
-/// the trash patch reported as succeeded therefore exists in Trash: not
-/// destroyed (`Applied` is false) and not unchanged (`Skipped` is false). The
-/// failed and uncertain lanes pass through unchanged, because an id whose trash
-/// patch FAILED was not downgraded - it was simply not mutated, and its
-/// classified failure is the honest answer for it.
-fn downgrade_succeeded_outcomes(
-    outcomes: Vec<ItemOutcome<MutationSuccess>>,
-) -> Vec<ItemOutcome<MutationSuccess>> {
-    outcomes
-        .into_iter()
-        .map(|outcome| match outcome {
-            ItemOutcome::Succeeded(success) => ItemOutcome::Succeeded(BatchSuccess::new(
-                success.item,
-                MutationSuccess::Downgraded {
-                    actual: MutationEffect::MovedToContainer(ContainerId("TRASH".to_string())),
-                },
-            )),
-            other => other,
-        })
-        .collect()
 }
 
 fn terminate_event(error: AccountError) -> SyncEvent<ItemOutcome<MutationSuccess>> {
@@ -924,6 +1137,132 @@ mod tests {
             )),
             "the uncertain lane must carry InFlight transmission evidence"
         );
+        assert!(matches!(&events[1], SyncEvent::Terminated(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_bisection_keeps_resolved_lanes_and_marks_in_flight_ids_uncertain() {
+        let (client, script) = scripted_client(vec![
+            canned(StatusCode::NOT_FOUND),
+            canned(StatusCode::NO_CONTENT),
+            canned(StatusCode::NOT_FOUND),
+            canned(StatusCode::NOT_FOUND),
+            Canned::Pending,
+        ]);
+        let shutdown = CancellationToken::new();
+        let mut events = bulk_move_cancellable(
+            client,
+            fresh_cache(Vec::new()),
+            Box::pin(stream::iter(
+                ["a", "b", "c", "d"].map(|id| ObjectId(id.to_string())),
+            )),
+            label("INBOX"),
+            None,
+            test_key(100),
+            shutdown.clone(),
+        );
+        let collected = tokio::spawn(async move {
+            let mut out = Vec::new();
+            while let Some(event) = events.next().await {
+                out.push(event);
+            }
+            out
+        });
+        while script.requests().len() < 5 {
+            tokio::task::yield_now().await;
+        }
+        shutdown.cancel();
+        let events = tokio::time::timeout(std::time::Duration::from_secs(1), collected)
+            .await
+            .expect("cancellation must end the in-flight sub-batch")
+            .expect("mutation task joins");
+
+        assert_eq!(events.len(), 2, "expected an accounted page and terminator");
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("the bisection outcomes must precede termination");
+        };
+        assert_eq!(batch.page_boundary, PageBoundary::Page);
+        assert!(matches!(
+            batch.items.as_slice(),
+            [
+                ItemOutcome::Succeeded(first),
+                ItemOutcome::Succeeded(second),
+                ItemOutcome::Failed(missing),
+                ItemOutcome::Uncertain(in_flight),
+            ] if first.item.0 == "a"
+                && second.item.0 == "b"
+                && missing.item.0 == "c"
+                && in_flight.item.0 == "d"
+        ));
+        let ItemOutcome::Uncertain(in_flight) = &batch.items[3] else {
+            unreachable!()
+        };
+        assert!(in_flight.error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Attempt(attempt)
+                if attempt.transmission_state == bifrost_types::TransmissionState::InFlight
+        )));
+        assert!(matches!(&events[1], SyncEvent::Terminated(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_trash_fallback_preserves_downgraded_sub_batch() {
+        let forbidden = Canned::Response {
+            status: StatusCode::FORBIDDEN,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from_static(
+                br#"{"error":{"code":403,"errors":[{"reason":"forbidden"}]}}"#,
+            ),
+        };
+        let (client, script) = scripted_client(vec![
+            forbidden,
+            canned(StatusCode::NOT_FOUND),
+            canned(StatusCode::NO_CONTENT),
+            Canned::Pending,
+        ]);
+        let shutdown = CancellationToken::new();
+        let events = bulk_destroy_cancellable(
+            client,
+            fresh_cache(Vec::new()),
+            Box::pin(stream::iter(
+                ["trashed", "pending"].map(|id| ObjectId(id.to_string())),
+            )),
+            test_key(101),
+            shutdown.clone(),
+        );
+        let collected = tokio::spawn(collect_events(events));
+        while script.requests().len() < 4 {
+            tokio::task::yield_now().await;
+        }
+        shutdown.cancel();
+        let events = tokio::time::timeout(std::time::Duration::from_secs(1), collected)
+            .await
+            .expect("shutdown must end the pending trash sub-batch")
+            .expect("mutation task joins");
+
+        assert_eq!(script.requests().len(), 4);
+        assert_eq!(events.len(), 2, "expected an accounted page and terminator");
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("trash outcomes must precede termination");
+        };
+        assert_eq!(batch.page_boundary, PageBoundary::Page);
+        assert!(matches!(
+            batch.items.as_slice(),
+            [ItemOutcome::Succeeded(trashed), ItemOutcome::Uncertain(pending)]
+                if trashed.item.0 == "trashed"
+                    && trashed.output == MutationSuccess::Downgraded {
+                        actual: MutationEffect::MovedToContainer(ContainerId("TRASH".to_string())),
+                    }
+                    && pending.item.0 == "pending"
+        ));
+        let ItemOutcome::Uncertain(pending) = &batch.items[1] else {
+            unreachable!()
+        };
+        assert!(pending.error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Attempt(attempt)
+                if attempt.transmission_state == bifrost_types::TransmissionState::InFlight
+        )));
         assert!(matches!(&events[1], SyncEvent::Terminated(_)));
     }
 
@@ -1163,6 +1502,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_later_chunk_404_bisects_ids_then_sends_remaining_chunks_to_live_ids() {
+        let (client, script) = scripted_client(vec![
+            canned(StatusCode::NO_CONTENT),
+            canned(StatusCode::NOT_FOUND),
+            canned(StatusCode::NO_CONTENT),
+            canned(StatusCode::NOT_FOUND),
+            canned(StatusCode::NOT_FOUND),
+            canned(StatusCode::NO_CONTENT),
+            canned(StatusCode::NO_CONTENT),
+        ]);
+        let labels = (0..250)
+            .map(|n| crate::types::GmailLabel {
+                id: format!("Label_{n}"),
+                name: format!("Name {n}"),
+                label_type: Some("user".to_string()),
+                color: None,
+            })
+            .collect::<Vec<_>>();
+        let events = collect_events(bulk_set_flags(
+            client,
+            fresh_cache(labels),
+            Box::pin(stream::iter(
+                ["live-1", "absent", "live-2"].map(|id| ObjectId(id.to_string())),
+            )),
+            FlagOp::Set(set(&["\\Seen"])),
+            test_key(32),
+        ))
+        .await;
+
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("chunked exact-set must produce an accounted batch");
+        };
+        assert!(matches!(
+            batch.items.as_slice(),
+            [
+                ItemOutcome::Succeeded(first),
+                ItemOutcome::Failed(missing),
+                ItemOutcome::Succeeded(last),
+            ] if first.item.0 == "live-1"
+                && missing.item.0 == "absent"
+                && matches!(missing.error.kind(), bifrost_types::AccountErrorKind::NotFound(_))
+                && last.item.0 == "live-2"
+        ));
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 7);
+        let final_body: serde_json::Value = serde_json::from_slice(
+            requests[6]
+                .body
+                .as_deref()
+                .expect("last chunk request body"),
+        )
+        .expect("last chunk JSON");
+        assert_eq!(
+            final_body["ids"],
+            serde_json::json!(["live-1", "live-2"]),
+            "a 404 in a later label chunk must not drop the remaining chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_permanent_chunk_failure_keeps_partial_writes_uncertain() {
+        let (client, script) = scripted_client(vec![
+            canned(StatusCode::NO_CONTENT),
+            canned(StatusCode::from_u16(418).expect("valid test status")),
+        ]);
+        let labels = (0..250)
+            .map(|n| crate::types::GmailLabel {
+                id: format!("Label_{n}"),
+                name: format!("Name {n}"),
+                label_type: Some("user".to_string()),
+                color: None,
+            })
+            .collect::<Vec<_>>();
+        let events = collect_events(bulk_set_flags(
+            client,
+            fresh_cache(labels),
+            Box::pin(stream::iter([ObjectId("m1".to_string())])),
+            FlagOp::Set(set(&["\\Seen"])),
+            test_key(33),
+        ))
+        .await;
+
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("a later chunk refusal must still produce an item lane");
+        };
+        assert!(matches!(
+            batch.items.as_slice(),
+            [ItemOutcome::Uncertain(item)] if item.item.0 == "m1"
+        ));
+        assert_eq!(
+            script.requests().len(),
+            2,
+            "later chunks stop after refusal"
+        );
+    }
+
+    #[tokio::test]
     async fn exact_set_never_sends_draft_or_sent_labels() {
         let (client, script) = scripted_client(vec![canned(StatusCode::NO_CONTENT)]);
         let labels = vec![crate::types::GmailLabel {
@@ -1394,21 +1831,26 @@ mod tests {
     /// the input list would bury those failures as successes-of-a-weaker-kind.
     #[test]
     fn the_destroy_trash_fallback_downgrades_only_what_it_trashed() {
-        use bifrost_types::{BatchFailure, BatchSuccess};
+        use bifrost_types::BatchFailure;
 
         let failure = crate::account::error::into_account_error(
             crate::Error::invalid_request(AccountOperation::BulkDestroy, "trash patch refused"),
             GmailErrorContext::mutation(AccountOperation::BulkDestroy),
         );
-        let outcomes = vec![
-            ItemOutcome::Succeeded(BatchSuccess::new(
-                BatchItemId("trashed".into()),
-                MutationSuccess::Applied,
-            )),
-            ItemOutcome::Failed(BatchFailure::new(BatchItemId("refused".into()), failure)),
-        ];
-
-        let downgraded = downgrade_succeeded_outcomes(outcomes);
+        let ids = [ObjectId("trashed".into()), ObjectId("refused".into())];
+        let mut progress = MutationProgress::new(&ids, 1);
+        progress.completed_effect = Some(MutationEffect::MovedToContainer(ContainerId(
+            LABEL_TRASH.to_string(),
+        )));
+        progress.acknowledge(&ids[..1], 0, &[]);
+        progress.finish_failures(
+            vec![ItemOutcome::Failed(BatchFailure::new(
+                BatchItemId("refused".into()),
+                failure,
+            ))],
+            false,
+        );
+        let downgraded = progress.completed_outcomes();
 
         match &downgraded[0] {
             ItemOutcome::Succeeded(success) => assert_eq!(

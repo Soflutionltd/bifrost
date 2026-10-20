@@ -232,7 +232,26 @@ pub(crate) fn create(
             .post(&url, &person)
             .await
             .map_err(|error| collection_error(error, AccountOperation::ContactCreate))?;
-        Ok(ContactId(person.resource_name.unwrap_or_default()))
+        let resource_name = person.resource_name.ok_or_else(|| {
+            // A successful People response must identify the created person;
+            // returning an empty id would make every follow-up URL invalid.
+            local_error_with_field(
+                AccountOperation::ContactCreate,
+                "resourceName",
+                "created Google contact has no resource name".to_string(),
+            )
+        })?;
+        if resource_name.is_empty() {
+            // The field was present, but cannot identify a People resource.
+            return Err(error::into_account_error(
+                crate::error::Error::provider_response(
+                    crate::error::ProviderFault::ParseFailed,
+                    "created Google contact has an empty resource name",
+                ),
+                GmailErrorContext::contact_collection(AccountOperation::ContactCreate),
+            ));
+        }
+        Ok(ContactId(resource_name))
     })
 }
 
@@ -1282,7 +1301,72 @@ struct ContactGroupMembership {
 
 #[cfg(test)]
 mod tests {
+    use bifrost_net::test_support::{Canned, ScriptedDispatch};
+    use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource};
+    use bytes::Bytes;
+    use reqwest::StatusCode;
+
     use super::*;
+
+    fn scripted_client(body: &'static [u8]) -> (Arc<GmailClient>, Arc<ScriptedDispatch>) {
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from_static(body),
+        }]);
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            RetryPolicy::disabled(),
+        );
+        (
+            Arc::new(GmailClient::with_account_net("https://gmail.test", net)),
+            script,
+        )
+    }
+
+    #[tokio::test]
+    async fn contact_create_requires_the_provider_resource_name() {
+        let (client, script) = scripted_client(b"{}");
+        let error = create(client, ContactCreate::default())
+            .await
+            .expect_err("a successful response without resourceName is malformed");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::MissingField
+            )
+        );
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Attempt(attempt)
+                if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
+        )));
+        assert_eq!(script.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn contact_create_rejects_an_empty_provider_resource_name() {
+        let (client, _script) = scripted_client(br#"{"resourceName":""}"#);
+        let error = create(client, ContactCreate::default())
+            .await
+            .expect_err("an empty resourceName cannot identify a contact");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ParseFailed
+            )
+        );
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Attempt(attempt)
+                if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
+        )));
+    }
 
     #[test]
     fn address_book_page_guard_refuses_repetition_and_budget_exhaustion() {

@@ -78,6 +78,8 @@ pub(crate) async fn delete_thread(
         .as_ref()
         .is_some_and(|id| container_is_trash(id, &trash, owner.as_deref()));
     if already_in_trash {
+        // Use the permanent-delete helper here too: changing only bulk_destroy
+        // leaves this separate PIM batch path performing a soft delete.
         destroy_messages(&account, &ids, AccountOperation::BulkDestroy).await
     } else {
         move_messages(&account, &ids, &trash.0, AccountOperation::BulkMove).await

@@ -6,6 +6,8 @@
 //! for the wire (IMAP base64-encodes for AUTHENTICATE; SMTP's AUTH command
 //! base64-encodes downstream).
 
+use zeroize::Zeroizing;
+
 use crate::Secret;
 
 /// Strip the `\x01` (SOH) frame delimiter from an interpolated OAuth field.
@@ -17,12 +19,12 @@ use crate::Secret;
 /// lossless for real input and closes the injection surface. The builders keep
 /// their infallible `-> Secret` signature (the consumers in IMAP/SMTP use the
 /// payload inline), so this defends rather than erroring.
-fn strip_frame_delim(field: &str) -> std::borrow::Cow<'_, str> {
-    if field.contains('\x01') {
-        std::borrow::Cow::Owned(field.replace('\x01', ""))
-    } else {
-        std::borrow::Cow::Borrowed(field)
-    }
+fn strip_frame_delim(field: &str) -> Zeroizing<String> {
+    // This may be an access token. Own the copy in zeroizing storage before
+    // stripping delimiters so no ordinary String copy survives the builder.
+    let mut cleaned = Zeroizing::new(field.to_owned());
+    cleaned.retain(|character| character != '\x01');
+    cleaned
 }
 
 /// XOAUTH2 client payload: `user=<user>\x01auth=Bearer <token>\x01\x01`.
@@ -34,7 +36,11 @@ fn strip_frame_delim(field: &str) -> std::borrow::Cow<'_, str> {
 pub fn xoauth2_payload(user: &str, access_token: &str) -> Secret {
     let user = strip_frame_delim(user);
     let access_token = strip_frame_delim(access_token);
-    Secret::from(format!("user={user}\x01auth=Bearer {access_token}\x01\x01"))
+    Secret::from(format!(
+        "user={}\x01auth=Bearer {}\x01\x01",
+        user.as_str(),
+        access_token.as_str()
+    ))
 }
 
 /// OAUTHBEARER (RFC 7628) client payload:
@@ -47,10 +53,12 @@ pub fn xoauth2_payload(user: &str, access_token: &str) -> Secret {
 pub fn oauthbearer_payload(identity: &str, access_token: &str) -> Secret {
     // `escape_username` handles the GS2 `=`/`,` escapes but not `\x01`; strip the
     // frame delimiter from both fields so neither can inject extra attributes.
-    let identity = crate::scram::escape_username(&strip_frame_delim(identity));
+    let identity = Zeroizing::new(crate::scram::escape_username(&strip_frame_delim(identity)));
     let access_token = strip_frame_delim(access_token);
     Secret::from(format!(
-        "n,a={identity},\x01auth=Bearer {access_token}\x01\x01"
+        "n,a={},\x01auth=Bearer {}\x01\x01",
+        identity.as_str(),
+        access_token.as_str()
     ))
 }
 
@@ -120,5 +128,11 @@ mod tests {
             oauthbearer_payload("a,b=c", "token").as_str(),
             "n,a=a=2Cb=3Dc,\x01auth=Bearer token\x01\x01"
         );
+    }
+
+    #[test]
+    fn stripped_fields_use_zeroizing_storage() {
+        let cleaned: Zeroizing<String> = strip_frame_delim("tok\x01en");
+        assert_eq!(cleaned.as_str(), "token");
     }
 }

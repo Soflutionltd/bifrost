@@ -418,13 +418,7 @@ impl Account for GoogleAccount {
         &self,
         scopes: &[CursorScope],
     ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
-        let scopes = scopes.to_vec();
-        let future = push::push_subscribe(Arc::clone(&self.pubsub), scopes.clone());
-        Box::pin(async move {
-            future
-                .await
-                .map(|handle| bifrost_types::PushSubscription::all_succeeded(handle, &scopes))
-        })
+        push::push_subscribe(Arc::clone(&self.pubsub), scopes.to_vec())
     }
 
     fn push_unsubscribe(

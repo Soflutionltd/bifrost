@@ -228,7 +228,11 @@ impl ServerInfo {
             }
 
             let mut split = line.split_whitespace();
-            let keyword = split.next().unwrap();
+            // Empty continuation lines are tolerated above, but whitespace-only
+            // text has no extension keyword and is malformed peer input.
+            let keyword = split
+                .next()
+                .ok_or_else(|| error::parse("invalid SMTP extension line"))?;
             if let (Some(prefix), Some(mechanism)) = (keyword.get(..5), keyword.get(5..))
                 && prefix.eq_ignore_ascii_case("AUTH=")
                 && !mechanism.is_empty()

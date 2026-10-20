@@ -475,24 +475,7 @@ pub(crate) fn identity_update(
     patch: IdentityPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let mut body = json!({});
-        if let Some(name) = patch.name {
-            body["displayName"] = json!(name);
-        }
-        if let Some(signature) = patch.signature_html {
-            body["signature"] =
-                signature.map_or(serde_json::Value::Null, serde_json::Value::String);
-        } else if let Some(signature) = patch.signature_text {
-            body["signature"] =
-                signature.map_or(serde_json::Value::Null, serde_json::Value::String);
-        }
-        if let Some(reply_to) = patch.reply_to {
-            body["replyToAddress"] =
-                reply_to.map_or(serde_json::Value::Null, |addr| json!(addr.address));
-        }
-        if let Some(is_default) = patch.is_default {
-            body["isDefault"] = json!(is_default);
-        }
+        let body = identity_update_body(patch);
         if body.as_object().is_none_or(serde_json::Map::is_empty) {
             return Ok(());
         }
@@ -502,6 +485,53 @@ pub(crate) fn identity_update(
             .map_err(|e| account_error_for(e, error::GmailErrorContext::identity_update()))?;
         Ok(())
     })
+}
+
+fn identity_update_body(patch: IdentityPatch) -> serde_json::Value {
+    let mut body = json!({});
+    if let Some(name) = patch.name {
+        body["displayName"] = json!(name);
+    }
+    if let Some(signature) = patch.signature_html {
+        body["signature"] = signature.map_or(serde_json::Value::Null, serde_json::Value::String);
+    } else if let Some(signature) = patch.signature_text {
+        // Gmail stores this field as HTML. Preserve the shared patch's
+        // plain-text semantics by escaping content and converting line breaks.
+        body["signature"] = signature.map_or(serde_json::Value::Null, |text| {
+            serde_json::Value::String(signature_text_as_html(&text))
+        });
+    }
+    if let Some(reply_to) = patch.reply_to {
+        body["replyToAddress"] =
+            reply_to.map_or(serde_json::Value::Null, |addr| json!(addr.address));
+    }
+    if let Some(is_default) = patch.is_default {
+        body["isDefault"] = json!(is_default);
+    }
+    body
+}
+
+fn signature_text_as_html(text: &str) -> String {
+    let mut html = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '&' => html.push_str("&amp;"),
+            '<' => html.push_str("&lt;"),
+            '>' => html.push_str("&gt;"),
+            '"' => html.push_str("&quot;"),
+            '\'' => html.push_str("&#39;"),
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                html.push_str("<br>");
+            }
+            '\n' => html.push_str("<br>"),
+            other => html.push(other),
+        }
+    }
+    html
 }
 
 pub(crate) fn vacation_get(
@@ -1465,6 +1495,29 @@ mod tests {
 
     fn gmail_message(value: serde_json::Value) -> GmailMessage {
         serde_json::from_value(value).expect("message fixture deserializes")
+    }
+
+    #[test]
+    fn plain_text_identity_signatures_are_escaped_and_keep_line_breaks() {
+        assert_eq!(
+            signature_text_as_html("A <B> & \"C\" 'D'\r\nnext\n"),
+            "A &lt;B&gt; &amp; &quot;C&quot; &#39;D&#39;<br>next<br>"
+        );
+
+        let mut patch = IdentityPatch::default();
+        patch.signature_text = Some(Some("A <B>\n& C".to_string()));
+        let body = identity_update_body(patch);
+        assert_eq!(body["signature"].as_str(), Some("A &lt;B&gt;<br>&amp; C"));
+    }
+
+    #[test]
+    fn an_explicit_html_identity_signature_takes_precedence() {
+        let mut patch = IdentityPatch::default();
+        patch.signature_html = Some(Some("<b>trusted HTML</b>".to_string()));
+        patch.signature_text = Some(Some("plain text".to_string()));
+
+        let body = identity_update_body(patch);
+        assert_eq!(body["signature"].as_str(), Some("<b>trusted HTML</b>"));
     }
 
     #[tokio::test]

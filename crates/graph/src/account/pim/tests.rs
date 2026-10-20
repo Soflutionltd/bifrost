@@ -2102,3 +2102,80 @@ fn an_explicitly_cleared_draft_field_still_emits_its_clear() {
     assert_eq!(message.get("cc"), None);
     assert_eq!(message.get("ccRecipients"), Some(&json!([])));
 }
+
+#[tokio::test]
+async fn deleting_a_thread_from_trash_permanently_deletes_in_its_owner_mailbox() {
+    for shared in [false, true] {
+        let mailbox = "shared@contoso.com";
+        let primary = GraphClient::new("token");
+        let owner_root = if shared {
+            GraphClient::new("token")
+        } else {
+            primary.clone()
+        };
+        owner_root.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({ "value": [{ "id": "message" }] }),
+            ),
+            ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "TrashId" })),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({ "id": "message", "@odata.etag": "W/\"version\"" }),
+            ),
+        ]);
+        primary.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "responses": [{ "id": "0", "status": 204 }] }),
+        )]);
+        let clients = if shared {
+            HashMap::from([(mailbox.to_string(), owner_root.for_shared_mailbox(mailbox))])
+        } else {
+            HashMap::new()
+        };
+        let account = GraphAccount::new_for_tests_with_shared_clients(
+            primary.clone(),
+            PushMode::GraphSubscriptions,
+            clients,
+        );
+        let (thread, current, prefix) = if shared {
+            (
+                ThreadId(format!("{mailbox}\u{1f}conversation")),
+                ContainerId(encode_foreign(mailbox, "TrashId").0),
+                "/users/shared%40contoso.com",
+            )
+        } else {
+            (
+                ThreadId("conversation".to_string()),
+                ContainerId("TrashId".to_string()),
+                "/me",
+            )
+        };
+        delete_thread(account, thread, Some(current))
+            .await
+            .expect("thread expunged");
+        let reads = owner_root.take_rest_requests();
+        assert_eq!(reads.len(), if shared { 3 } else { 4 });
+        for request in &reads[..3] {
+            assert!(
+                request.url.contains(&format!("{prefix}/")),
+                "{}",
+                request.url
+            );
+        }
+        let envelopes = if shared {
+            primary.take_rest_requests()
+        } else {
+            reads[3..].to_vec()
+        };
+        assert_eq!(envelopes.len(), 1);
+        let sub = &envelopes[0].body.as_ref().expect("batch body")["requests"][0];
+        assert_eq!(sub["method"], "POST");
+        assert_eq!(
+            sub["url"],
+            format!("{prefix}/messages/message/permanentDelete")
+        );
+        assert_eq!(sub["headers"]["If-Match"], "W/\"version\"");
+        assert!(sub.get("body").is_none_or(Value::is_null));
+    }
+}

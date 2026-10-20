@@ -205,6 +205,10 @@ greeting -> EHLO/LHLO -> [STARTTLS -> EHLO/LHLO] -> [AUTH -> EHLO/LHLO] -> ready
 
 EHLO is re-sent after STARTTLS and AUTH because capabilities can change.
 
+`ServerInfo` ignores empty EHLO/LHLO extension lines, while whitespace-only
+lines have no keyword and produce a parse error. Malformed peer input stays on
+the typed error path.
+
 STARTTLS upgrades are fail-closed at the buffered-reader boundary. If the peer
 coalesces any plaintext bytes after its positive STARTTLS reply, the connection
 is marked broken and the upgrade is refused. Pre-TLS bytes can never become a
@@ -592,15 +596,17 @@ A consequence: `Message::formatted()` is byte-identical to the delivered data se
 
 `Credentials` is enum: `Password { username, password: Zeroizing<String> }` and `OAuth2 { identity, token_source: Arc<dyn TokenSource> }` (bifrost-net's trait). The OAuth token is read live from the shared source at each connect, so a token rotated on the source is presented on reconnect without rebuilding the transport. `Credentials` is `Clone` only - no `PartialEq`/`Eq`/serde derives (a live token source is neither comparable nor serializable; rotation material is the consumer's to persist). The `AUTH` command struct (`Auth`) likewise dropped those derives. The async transport reads the token via `oauth2_token().await`, so token sources may lock, join an in-flight refresh, or perform network refresh work without a polling shortcut; the blocking transport reads it via `oauth2_token_blocking()`, a single-poll of `current()` (a `StaticTokenSource` or already-fresh `OAuthRefresher` resolves immediately; a source needing a network refresh is rejected - live refresh requires the async transport).
 
-Mechanisms (`Mechanism`, `#[non_exhaustive]`): PLAIN, LOGIN, XOAUTH2, OAUTHBEARER, SCRAM-SHA-1, SCRAM-SHA-256, SCRAM-SHA-1-PLUS, SCRAM-SHA-256-PLUS. SCRAM is consumed from `bifrost-sasl` (the `-PLUS` suffix and token spelling have a single authority there); SMTP owns only the wire sequencing.
+Mechanisms (`Mechanism`, `#[non_exhaustive]`): PLAIN, LOGIN, XOAUTH2, OAUTHBEARER, SCRAM-SHA-1, SCRAM-SHA-256, SCRAM-SHA-1-PLUS, SCRAM-SHA-256-PLUS. SCRAM computation is consumed from `bifrost-sasl` (the `-PLUS` suffix and token spelling have a single authority there); SMTP owns only the wire sequencing. `ScramExchange` keeps its client-first and client-final lines in `Secret` values through the continuation write. The client-first is base64-framed once with a zeroizing encoder; `scram_client_final` already returns a base64 client-final, which SMTP writes unchanged.
 
-Password selection (`password_mechanism` in `authentication.rs`) chooses one mechanism from the advertised and allowed sets in the fixed order `SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > LOGIN`. A 535 is final and never walks a retry ladder, because descending from a bound mechanism to an unbound mechanism or PLAIN would be a silent security downgrade. RFC 5802 Section 6 downgrade protection drops the unbound `SCRAM-SHA-N` candidate when `SCRAM-SHA-N-PLUS` is advertised. A PLUS candidate is skipped only when no TLS peer certificate exists. If a certificate is present but its channel binding cannot be computed, the typed parse error propagates and authentication cannot silently fall through to PLAIN. The certificate-derived `tls-server-end-point` value is computed at most once per authentication and shared by either PLUS hash choice. SCRAM runs as a no-IR `334` challenge exchange driven by `ScramExchange`; `Mechanism::response` is never called for SCRAM.
+Password selection (`password_mechanism` in `authentication.rs`) chooses one mechanism from the advertised and allowed sets in the fixed order `SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > LOGIN`. A 535 is final and never walks a retry ladder, because descending from a bound mechanism to an unbound mechanism or PLAIN would be a silent security downgrade. RFC 5802 Section 6 downgrade protection drops the unbound `SCRAM-SHA-N` candidate when `SCRAM-SHA-N-PLUS` is advertised. A PLUS candidate is skipped only when no TLS peer certificate exists. If a certificate is present but its channel binding cannot be computed, the typed parse error propagates and authentication cannot silently fall through to PLAIN. The certificate-derived `tls-server-end-point` value is computed at most once per authentication and shared by either PLUS hash choice. SCRAM runs as a no-IR `334` challenge exchange driven by `ScramExchange`; `Mechanism::response` is never called for SCRAM. A server-final folded onto `235` may follow a leading enhanced status code, which the decoder skips before base64 decoding.
 
 OAuth credentials never use SCRAM: they pick the first advertised OAUTHBEARER/XOAUTH2 rung in caller order (`oauth_mechanism`) and run the stateless encoder. The connection's auth driver resolves the access token from the source once, up front, and threads it into `Auth::new` / `Mechanism::response_with_token`. The XOAUTH2 / OAUTHBEARER payload bytes are built by `bifrost-sasl` (`xoauth2_payload` / `oauthbearer_payload`, including the OAUTHBEARER GS2 identity escape); `response_with_token` only base64-frames them and owns the RFC 7628 `\x01` error-continuation. OAUTHBEARER before XOAUTH2 by default.
 
-Stateless AUTH payloads remain `bifrost_sasl::Secret` values through the
-command boundary. Base64 framing returns a `Zeroizing<String>`, and both sync
-and async connections use zeroizing command buffers that are wiped before
+Stateless AUTH payloads and SCRAM client lines remain `bifrost_sasl::Secret`
+values through the command boundary. Stateless payload base64 framing returns
+a `Zeroizing<String>`; SCRAM client-final is already base64-framed by
+`bifrost-sasl` and is not encoded again. Both sync and async connections use
+zeroizing command buffers that are wiped before
 reuse, immediately after each write attempt, and on drop. The wipe covers the
 buffer the command was serialized into; it cannot cover an allocation the
 serializing `write!` outgrew and replaced, so a longer-than-usual AUTH line can
@@ -616,6 +622,10 @@ with username and password respectively.
 Plaintext AUTH is refused by default for both passwords and OAuth bearer tokens. Trusted local relays opt in with `dangerous_allow_insecure_auth(true)`.
 
 AUTH continuation formatting treats challenge responses as continuation lines even for mechanisms supporting initial response. Required for OAUTHBEARER failed-auth dummy-cancel exchange (`AQ==` on the wire).
+
+The legacy continuation budget is ten answers. Reaching zero after the tenth
+answer is accepted when that answer received a final response; a further
+`334` is a challenge-limit error.
 
 `SaslError` maps at the `From<SaslError> for Error` boundary: `Protocol` (malformed SASL, signature mismatch) to `ErrorKind::Parse`; `AuthFailed` (SCRAM `e=` server error) to `ErrorKind::InvalidInput` + `SmtpCommandPhase::Auth` so `account_error.rs` routes it to `Authorization(PolicyBlocked)`; `InvalidCredential` (a username or password that fails SASLprep) to a phase-less `ErrorKind::InvalidInput`, so `Request(Malformed)`. `ScramExchange::new` prepares both credentials, before the AUTH line is sent, so that last refusal is local and never reaches the wire.
 
@@ -916,6 +926,10 @@ greeting plus an ordered list of
   adjacent replies. That is what a `BufReader` prefetches, so it drives the
   same surplus-detection path production has. The harness has no visibility
   below the buffer that a real transport lacks.
+- `expect_generated(...)` accepts one write and derives the peer reply from its
+  bytes. The SCRAM exchange uses it to echo the client nonce, check the
+  once-decoded client-final, and return a valid server signature on an enhanced
+  `235` reply.
 
 - `expect_then_close(...)` models a peer that answers with the given bytes and
   then hangs up. The bytes may be a truncated reply line, so this is the

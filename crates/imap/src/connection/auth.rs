@@ -860,11 +860,10 @@ impl ImapConnection {
             ),
             result_tx,
         };
-        let guard = self.in_flight();
         if self.cmd_tx.send(dcmd).await.is_err() {
-            guard.completed();
             return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
         }
+        let guard = self.in_flight();
         let received = result_rx.await;
         guard.completed();
         let result = match received {
@@ -897,11 +896,10 @@ impl ImapConnection {
             ),
             result_tx,
         };
-        let guard = self.in_flight();
         if self.cmd_tx.send(dcmd).await.is_err() {
-            guard.completed();
             return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
         }
+        let guard = self.in_flight();
         let received = result_rx.await;
         guard.completed();
         let result = match received {
@@ -939,11 +937,10 @@ impl ImapConnection {
             ),
             result_tx,
         };
-        let guard = self.in_flight();
         if self.cmd_tx.send(dcmd).await.is_err() {
-            guard.completed();
             return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
         }
+        let guard = self.in_flight();
         let received = result_rx.await;
         guard.completed();
         let result = match received {
@@ -969,11 +966,10 @@ impl ImapConnection {
     ) -> Result<(), Error> {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let dcmd = driver::DriverCommand::Upgrade { payload, result_tx };
-        let guard = self.in_flight();
         if self.cmd_tx.send(dcmd).await.is_err() {
-            guard.completed();
             return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
         }
+        let guard = self.in_flight();
         let received = result_rx.await;
         guard.completed();
         match received {

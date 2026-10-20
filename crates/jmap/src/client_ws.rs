@@ -137,6 +137,13 @@ enum WebSocketMessage_ {
     #[cfg(feature = "calendars")]
     CalendarAlert(crate::CalendarAlert),
     RequestError(WebSocketError),
+    /// A known push message whose fields could not be decoded. The
+    /// connection stays usable, but consumers must reconcile broadly because
+    /// the malformed frame may have contained a state change.
+    MalformedPush,
+    /// A message type this build does not understand. RFC 8887 allows a
+    /// client to ignore messages outside the defined response/push shapes.
+    Ignored,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,25 +160,26 @@ struct WebSocketStateChange {
 }
 
 /// Decode one RFC 8887 frame: read the `@type` discriminator, then
-/// deserialize the frame's own bytes into the variant it names. An
-/// unrecognized (or absent) `@type` is a `serde_json::Error`, the same
-/// shape the derived internally-tagged dispatch produced.
+/// deserialize the frame's own bytes into the variant it names. Unknown
+/// types are ignored for forward compatibility. A malformed push payload is
+/// preserved as a soft frame error so the push lane can issue a broad
+/// invalidation without killing the connection.
 fn decode_frame(payload: &[u8]) -> Result<WebSocketMessage_, serde_json::Error> {
-    use serde::de::Error as _;
-
     let FrameType { ty } = serde_json::from_slice(payload)?;
 
     Ok(match ty.as_str() {
         "Response" => WebSocketMessage_::Response(serde_json::from_slice(payload)?),
-        "StateChange" => WebSocketMessage_::StateChange(serde_json::from_slice(payload)?),
+        "StateChange" => match serde_json::from_slice(payload) {
+            Ok(message) => WebSocketMessage_::StateChange(message),
+            Err(_) => WebSocketMessage_::MalformedPush,
+        },
         #[cfg(feature = "calendars")]
-        "CalendarAlert" => WebSocketMessage_::CalendarAlert(serde_json::from_slice(payload)?),
+        "CalendarAlert" => match serde_json::from_slice(payload) {
+            Ok(message) => WebSocketMessage_::CalendarAlert(message),
+            Err(_) => WebSocketMessage_::MalformedPush,
+        },
         "RequestError" => WebSocketMessage_::RequestError(serde_json::from_slice(payload)?),
-        other => {
-            return Err(serde_json::Error::custom(format!(
-                "unknown JMAP WebSocket frame type `{other}`"
-            )));
-        }
+        _ => WebSocketMessage_::Ignored,
     })
 }
 
@@ -187,6 +195,12 @@ pub(crate) enum WebSocketMessage {
         response: Response,
     },
     PushNotification(PushObject),
+    /// An unknown message type was ignored. This lets the push reader count
+    /// peer traffic without surfacing an event to account consumers.
+    IgnoredFrame,
+    /// A known push frame could not be decoded. The reader turns this into
+    /// an unknown invalidation so no state change is lost silently.
+    UnknownFrame,
     /// A control-frame pong. Surfaced rather than swallowed because it is
     /// the only evidence the push reader can get that a silent connection
     /// is still alive: JMAP defines no application-level keepalive, so a
@@ -674,6 +688,7 @@ where
 {
     async_stream::stream! {
         let mut saw_close = false;
+        let mut invalid_data = false;
 
         while let Some(message) = rx.next().await {
             match message {
@@ -706,6 +721,9 @@ where
                                 // the frame WAS its answer, and yielding the
                                 // error onto the push stream instead would leave
                                 // that caller parked until the connection died.
+                                // If nobody owns a malformed response, closing
+                                // the connection below makes it a transient
+                                // reconnect instead of a terminal push error.
                                 let unrouted = match request_id.as_deref() {
                                     Some(id) => pending.resolve(id, outcome).err(),
                                     None => Some(outcome),
@@ -716,6 +734,10 @@ where
                                             request_id,
                                             response,
                                         }),
+                                        Err(crate::Error::ResponseDecode(_)) => {
+                                            invalid_data = true;
+                                            break;
+                                        }
                                         Err(e) => yield Err(e),
                                     }
                                 }
@@ -746,12 +768,22 @@ where
                                     yield Err(error);
                                 }
                             }
+                            WebSocketMessage_::MalformedPush => {
+                                yield Ok(WebSocketMessage::UnknownFrame);
+                            }
+                            WebSocketMessage_::Ignored => {
+                                yield Ok(WebSocketMessage::IgnoredFrame);
+                            }
                         },
-                        Err(err) => yield Err(err.into()),
+                        Err(_) => {
+                            invalid_data = true;
+                            break;
+                        }
                     }
                 }
                 Ok(message) if message.is_binary() => {
-                    yield Err(crate::Error::NotParsable("binary WebSocket message".to_string()));
+                    invalid_data = true;
+                    break;
                 }
                 Ok(message) if message.is_close() => {
                     saw_close = true;
@@ -778,7 +810,7 @@ where
         // waiter belonging to the live connection.
         pending.fail_generation(generation, || crate::Error::WebSocketClosed);
 
-        if saw_close {
+        if saw_close || invalid_data {
             yield Err(crate::Error::WebSocketClosed);
         }
     }
@@ -951,14 +983,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn binary_frame_is_rejected_as_not_parsable() {
-        let out = decode(vec![Ok(Message::binary(Bytes::from_static(b"\x00\x01")))]).await;
+    async fn unknown_frame_type_is_ignored_and_later_push_is_decoded() {
+        let out = decode(vec![
+            Ok(Message::text(
+                r#"{"@type":"FutureExtension","value":1}"#.to_string(),
+            )),
+            Ok(Message::text(
+                r#"{"@type":"StateChange","changed":{"u1":{"Mailbox":"s1"}}}"#.to_string(),
+            )),
+        ])
+        .await;
+
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], Ok(WebSocketMessage::IgnoredFrame)));
+        assert!(matches!(
+            out[1],
+            Ok(WebSocketMessage::PushNotification(
+                PushObject::StateChange { .. }
+            ))
+        ));
+    }
+
+    #[cfg(not(feature = "calendars"))]
+    #[tokio::test]
+    async fn calendar_alert_frame_is_ignored_when_calendars_are_disabled() {
+        let out = decode(vec![
+            Ok(Message::text(r#"{"@type":"CalendarAlert"}"#.to_string())),
+            Ok(Message::text(
+                r#"{"@type":"StateChange","changed":{"u1":{"Mailbox":"s1"}}}"#.to_string(),
+            )),
+        ])
+        .await;
+
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], Ok(WebSocketMessage::IgnoredFrame)));
+        assert!(matches!(
+            out[1],
+            Ok(WebSocketMessage::PushNotification(
+                PushObject::StateChange { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_push_frame_requests_reconcile_without_ending_the_stream() {
+        let out = decode(vec![
+            Ok(Message::text(
+                r#"{"@type":"StateChange","changed":"invalid"}"#.to_string(),
+            )),
+            Ok(Message::text(
+                r#"{"@type":"StateChange","changed":{"u1":{"Mailbox":"s1"}}}"#.to_string(),
+            )),
+        ])
+        .await;
+
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], Ok(WebSocketMessage::UnknownFrame)));
+        assert!(matches!(
+            out[1],
+            Ok(WebSocketMessage::PushNotification(
+                PushObject::StateChange { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn binary_frame_ends_the_connection_as_a_retryable_close() {
+        let out = decode(vec![
+            Ok(Message::binary(Bytes::from_static(b"\x00\x01"))),
+            Ok(Message::text(
+                r#"{"@type":"StateChange","changed":{"u1":{"Mailbox":"s1"}}}"#.to_string(),
+            )),
+        ])
+        .await;
 
         assert_eq!(out.len(), 1);
-        let Err(crate::Error::NotParsable(what)) = &out[0] else {
-            panic!("expected NotParsable, got {:?}", out[0]);
-        };
-        assert_eq!(what, "binary WebSocket message");
+        assert!(matches!(out[0], Err(crate::Error::WebSocketClosed)));
     }
 
     #[tokio::test]
@@ -1013,11 +1113,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_text_frame_is_a_response_decode_error() {
+    async fn malformed_text_frame_ends_the_connection_as_a_retryable_close() {
         let out = decode(vec![Ok(Message::text("not json".to_string()))]).await;
 
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0], Err(crate::Error::ResponseDecode(_))));
+        assert!(matches!(out[0], Err(crate::Error::WebSocketClosed)));
     }
 
     #[tokio::test]
@@ -1118,7 +1218,8 @@ mod tests {
                     r#"{"@type":"Response","methodResponses":[[1,2]],"sessionState":"s-2"}"#
                         .to_string(),
                 )),
-                // Not a response frame: nothing to compare.
+                // The malformed unclaimed response closes the connection, so
+                // this later push frame is not read.
                 Ok(Message::text(
                     r#"{"@type":"StateChange","changed":{"u1":{"Mailbox":"s1"}}}"#.to_string(),
                 )),
@@ -1127,7 +1228,9 @@ mod tests {
         )
         .await;
 
-        assert_eq!(out.len(), 3);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], Ok(WebSocketMessage::Response { .. })));
+        assert!(matches!(out[1], Err(crate::Error::WebSocketClosed)));
         assert_eq!(
             *seen.lock().expect("seen"),
             vec!["s-1".to_string(), "s-2".to_string()]
@@ -1135,16 +1238,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_frame_with_malformed_method_responses_decodes_to_an_error() {
+    async fn unclaimed_response_decode_failure_reconnects_the_connection() {
         // The outer frame parses (methodResponses is a JSON array), but
-        // its entries are not call triples: this pins the method-response
-        // decode failure arm distinctly from the frame-level one.
+        // its entries are not call triples. With no matching requestId to
+        // deliver the error to, the reader closes this connection so push
+        // reconnects rather than treating the bad response as terminal.
         let frame = r#"{"@type":"Response","methodResponses":[[1,2]],"sessionState":"s-1"}"#;
 
         let out = decode(vec![Ok(Message::text(frame.to_string()))]).await;
 
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0], Err(crate::Error::ResponseDecode(_))));
+        assert!(matches!(out[0], Err(crate::Error::WebSocketClosed)));
     }
 
     /// The point of the correlation map: a caller can send over the

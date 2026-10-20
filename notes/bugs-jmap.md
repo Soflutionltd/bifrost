@@ -17,105 +17,6 @@ Filed from the October 2026 defect hunt: the jmap protocol scope, the jmap
 account scope, and the net and sync adoption scopes where they reached JMAP.
 Severity labels are the hunters' own.
 
-## JMAP-001 - Session-level and account-level capability objects are confused
-
-Hunter severity: P1. Scope: jmap protocol.
-
-RFC 8621 s1.3.2 says the session-level `urn:ietf:params:jmap:submission`
-value "is an empty object"; `maxDelayedSend` and `submissionExtensions` live
-only in each account's `accountCapabilities`. RFC 8621 s1.3.1 (mail), RFC 9661
-(sieve) and RFC 9670 (principals, principals:owner) split the same way. The
-crate reads all of them from the session-level map.
-
-**Submission: a conformant server loses send entirely.**
-
-- `SubmissionCapabilities` (`crates/jmap/src/email/mod.rs`) makes
-  `maxDelayedSend` mandatory with no container default, so a conformant
-  session-level `{}` fails to parse and lands in `Capabilities::Malformed`.
-- `resolve_optional_families` (`crates/jmap/src/sync/factory.rs`) reads
-  `session.submission_capability_state()`, gets `Malformed`, and drops the
-  submission handle. Send, draft send, identities and `scheduled_send` all go
-  off, with a warning that blames the server.
-- `max_delayed_send` is also read from the session map, so a server that does
-  send a non-empty session block has its real per-account window ignored.
-- The test `a_submission_block_without_max_delayed_send_disables_the_family`
-  pins the RFC-conformant `{}` as malformed: the test encodes the bug.
-- `reference/jmap.md` ("Capabilities advertised": scheduled_send is true iff
-  the Submission block is present, parseable and advertises
-  `maxDelayedSend > 0`; a block omitting the mandatory member lands in the
-  malformed lane) and the doc comment on `SubmissionCapabilities` restate the
-  misreading.
-- Claim broken: RFC 8621 submission is implemented and `pim_methods`
-  advertises send, drafts and identities; against a server that follows the
-  RFC to the letter every one is off.
-- Fix shape from the hunter: treat the session-level block as an opaque
-  presence marker and read `SubmissionCapabilities` from
-  `session.account(primary_submission_id).capability(URI)`.
-  `Account::account_capabilities` already goes through `try_cap!`, so the
-  typed value is already there. Apply the Absent/Malformed/Present lane rule
-  to the account-level object.
-
-**Principals: RSVP alias discovery never runs on conformant servers.**
-
-- `fetch_self_emails` (`crates/jmap/src/sync/factory.rs`) reads
-  `currentUserPrincipalId` from `session.principals_capabilities()` and
-  `principalId` from `session.principals_owner_capabilities()`, both
-  session-level.
-- RFC 9670 puts `currentUserPrincipalId` in the account-level `principals`
-  object, and `principals:owner` is account-level only.
-- Against a conformant server both return `None`, so the `Principal/get` alias
-  resolution `reference/jmap.md` promises ("RSVP resolves authenticated email
-  aliases from Basic credentials and RFC 9670 Principal/get when available")
-  silently never happens. RSVP falls back to the single non-owner attendee or
-  `Unsupported`.
-- Fixtures in `crates/jmap/src/tests.rs` put these fields at session level, so
-  tests pass against a shape the RFC does not produce.
-
-**The same misplacement elsewhere (latent: nothing reads these yet).**
-
-- `MailCapabilities` (`maxMailboxDepth`, `maxSizeMailboxName` and the rest),
-  `SieveCapabilities` (`max_script_name_size()` falls back to 512 because the
-  session value is always empty), and `CalendarsCapabilities` /
-  `ContactsCapabilities` (`mayCreateCalendar` / `mayCreateAddressBook` read
-  `false`) are modelled session-level. Every reader would get defaults; the
-  accessors claim to report server limits.
-- Structural recommendation: make `SessionCapabilities` presence-only for
-  everything except `core` and `websocket`, put typed per-account objects on
-  `session::Account`, and route every "what does this account allow" question
-  through the account about to be used. Foreign accounts benefit too, since
-  their limits can differ from the primary's.
-
-## JMAP-002 - Blob upload and download run under the 10-second total API deadline
-
-Hunter severity: P2. Scopes: jmap protocol; also net adoption.
-
-- `ReqwestTransport::send_once` (`crates/jmap/src/transport_reqwest.rs`)
-  applies `request.timeout(self.timeout)` to every door, `upload` and
-  `download` included, and the account spec also sets
-  `spec.request_timeout = Some(timeout)`. That is bifrost-net's TOTAL request
-  deadline (as opposed to `without_timeout`, which keeps only the inactivity
-  bounds). The default is `DEFAULT_TIMEOUT_MS = 10_000`
-  (`crates/jmap/src/client.rs`), which the factory keeps unless the consumer
-  sets `timeout`.
-- Whole-message (`open_raw_rfc822`), attachment and blob reads, and attachment
-  uploads, are bounded by the same 10 s as a small JSON call. A 25 MB
-  attachment needs about 20 Mbit/s sustained. With `set_bandwidth_cap` engaged
-  (a documented `Account` control), `MeteredStream` and net admission pace the
-  body, so any blob larger than roughly `10 s * cap` is guaranteed to fail.
-- The failure is `Timeout { Acknowledged }` -> `Protocol(PartialResponse)`,
-  which recovery retries, so the same download replays into the same wall
-  until the budget runs out.
-- Claims broken: `open_blob` / `open_raw_rfc822` / attachment upload are
-  advertised; the bandwidth cap is advertised as throttling. `reference/jmap.md`
-  documents the SSE door suppressing the ordinary deadline "while retaining
-  response-header and body inactivity bounds", the right shape applied only to
-  the stream door. `reference/net.md` keeps the total deadline distinct from
-  inactivity bounds so a slow but progressing response stays distinct from a
-  stalled one, and google and graph set no `request_timeout` for that reason.
-- Fix shape: give blob doors their own deadline policy (`without_timeout()`
-  keeping inactivity bounds, or a deadline scaled to size and the active cap);
-  keep the 10 s total deadline for the `/api` door only.
-
 ## JMAP-003 - Blob downloads are fully buffered with no streaming path
 
 Lateral, from jmap protocol and net adoption.
@@ -126,89 +27,13 @@ own and goes through net's buffered `send`, so a message or attachment above
 `download_stream` exists in net and JMAP does not use it. Together with
 JMAP-002, large-blob reads are both memory-bound and deadline-bound.
 
-## JMAP-004 - URL templates let `.` and `..` through as path navigation
+## JMAP-004 - The EventSource template still lets `.` and `..` through
 
-Scope: net adoption.
-
-- Claim broken: `reference/net.md` URL helpers: the path encoder
-  "double-escapes a complete `.` or `..` component so the WHATWG parser cannot
-  resolve it as navigation"; "The HTTP protocol crates name the grammar at
-  every call site".
-- JMAP does not use `bifrost_net::url`. `crates/jmap/src/core/session.rs`
-  `TEMPLATE_VALUE` keeps `.` unreserved (correct per RFC 6570, which is why
-  net's hardening is needed on top). `crates/jmap/src/blob/download.rs`
-  substitutes `{name}` from the attachment filename, which is
-  sender-controlled. An attachment named `..` or `.` turns
-  `/download/{accountId}/{blobId}/{name}` into a URL the parser collapses to a
-  different path, so the GET addresses some other resource on the JMAP server
-  with the account's credential. Ids are base64url on a well-behaved server, so
-  `{name}` is the practical vector.
-- Fix: substitute with `encode_path_component` for path variables and
-  `encode_query_value` for query variables (the template parser already knows
-  which side of `?` each `URLPart` is on). Same for upload and EventSource
-  templates.
-
-## JMAP-005 - `draft_send` reports a committed send as failed when the cache refresh after it fails
-
-Hunter severity: P1. Scope: jmap account.
-
-`pim.rs::draft_send`: after `EmailSubmission/set` returns `created` (the
-message is submitted and `onSuccessUpdateEmail` already moved the draft to
-Sent), it runs
-`mutation::probe_email_state(&mail).await.map_err(to_acct_err(DraftSend))?`
-only to refresh `email_states`. If the probe fails (transport blip, 5xx, rate
-limit), `draft_send` returns `Err` although the send went through. The error
-class is retryable, so a consumer or engine retrying the "failed" `DraftSend`
-submits the same email id again: a duplicate send.
-
-Claim broken: `Account::draft_send` returns `Ok(ObjectId)` for a send that
-happened; a cache refresh must never decide the outcome. Fix: make the probe
-best-effort (log, or invalidate the cache entry) and return `Ok` once
-`created` is confirmed. `send_message` gets this right by using the `Email/set`
-`newState` it already has; `draft_send` could add an `Email/get ids: []` to
-the same request, or just drop the cache entry.
-
-## JMAP-006 - `reschedule_send` is not the double-send guard its comment claims, and can lose a scheduled message
-
-Hunter severity: P1. Scope: jmap account.
-
-`pim.rs::reschedule_send` sends the cancel of the old submission and the create
-of the new one in ONE `EmailSubmission/set`. RFC 8620 s5.3 processes create,
-then update, then destroy, so the new submission is created BEFORE the cancel
-is tried:
-
-- If the cancel is refused (`cannotUnsend`, relay already released), the new
-  submission exists and is live, and the code returns `Err`. The in-code
-  comment calls this "the double-send guard", but the double send is already
-  committed and the caller is told nothing went through. The comment admits
-  "the new submission, if any, is left in place".
-- When the original send used `save_to_sent == Some(false)`, `send_message`
-  attached `onSuccessDestroyEmail`, which fires when the scheduled submission
-  is created, destroying the email object at once. A later `reschedule_send`
-  creates against a destroyed `emailId` and fails, then the update cancels the
-  original. The scheduled message is cancelled, nothing replaces it, and the
-  caller gets `Err`: the message is lost.
-
-Fix: cancel in its own call and confirm `updated`, then create in a second call
-(or create first and destroy on failure, whichever ordering the product
-wants). For the destroy-on-success shape, refuse reschedule up front or do not
-destroy the email for a scheduled submission until delivery.
-
-## JMAP-007 - Failed sends leave orphan drafts behind
-
-Hunter severity: P1/P2. Scope: jmap account.
-
-`send_message` and `send_raw_message` put the `Email/set` create (or
-`Email/import`) and the `EmailSubmission/set` in one request. When the
-submission is refused (`forbiddenFrom`, `invalidRecipients`,
-`tooManyRecipients`, quota) while the email create succeeded, the function
-returns `Err` and the created message stays in Drafts with `$draft`. Every
-retry adds another. Nothing destroys it, and the `ObjectId` is not returned, so
-the caller has no handle to clean up with.
-
-Claim broken: `send_message` is a single send; on `Err` the caller may assume
-nothing was persisted. Fix: on submission failure with a created email, issue a
-best-effort `Email/set destroy`, or carry the draft id in the error.
+Scope: net adoption. Residue: upload and download templates now use
+context-aware encoding (`encode_template_value_at`) that protects dot-only path
+values; `crates/jmap/src/event_source/stream.rs` still substitutes without it,
+so a `{types}`-style or path variable of `.` / `..` navigates. Use the same
+helper there.
 
 ## JMAP-008 - Email inventory livelocks on any mailbox that receives mail faster than one walk takes
 
@@ -242,59 +67,6 @@ Fix: drop the `queryState` pin for the unfiltered walk and let `anchorNotFound`
 be the only "coverage unprovable" signal; optionally make the anchor a
 resumable checkpoint. The legacy `inMailbox`-filtered walk has the same
 livelock and remedy, since membership moves are covered by the change cursor.
-
-## JMAP-009 - Push health events sent before `push_stream()` subscribes are lost, and push then looks alive forever
-
-Hunter severity: P2. Scope: jmap account.
-
-`push.rs`: `WsState::spawn` starts `reader_loop` inside `open()`. Events go out
-on a `broadcast` channel, which delivers only to receivers existing at send
-time. `push_stream()` subscribes only when the engine's push forwarder calls
-it, after attach (`sync/src/engine/attach.rs`). So:
-
-- If the first handshake fails terminally (auth lost, subprotocol refused ->
-  `CapabilityChanged`), `WatchEvent::Terminated` goes to zero receivers and is
-  dropped; the reader then breaks out of `reader_loop`.
-- Every later `push_stream()` gets a receiver on a channel whose sender
-  (`WsState::tx`) is alive, so `recv` never returns `Closed`. The stream is
-  silent for the account's life: the "dead push the engine cannot tell apart
-  from a quiet mailbox" state the keepalive machinery exists to prevent.
-- A subscriber arriving after the reader terminated later in life (engine
-  forwarder reconnect, a consumer's own `push_stream`) gets the same silence.
-- `Lagged` can drop a `Terminated` in the overwritten window; it is degraded
-  to a `Coalesced/Unknown` hint, which is not terminal.
-
-Claim broken: `WatchEvent::Terminated` is the reader's terminal health signal
-(`ReaderStep::Terminal` doc: "emit `Terminated` and stop the reader so the
-engine can reopen the account"). Fix: latch terminal state (or current health)
-in a `watch` inside `WsState`; `push::stream` replays the latched `Terminated`
-on subscribe and ends, and a lagged receiver re-reads the latch. `Reconnected`
-before the first subscriber is lost the same way, but the reconciler's
-reconnect-is-Unknown rule makes that cheap.
-
-Related shapes in other crates, filed separately: IMAP-020 (IMAP push events
-lost before subscribe), GOOG-017 (Google `Lagged` drops health edges).
-
-## JMAP-010 - One unrecognised WebSocket frame permanently kills push
-
-Hunter severity: P2. Scope: jmap account.
-
-`client_ws::decode_frame` turns an unknown `@type` into a `serde_json::Error`
-(-> `Error::ResponseDecode`), and a binary frame into `Error::NotParsable`.
-Both reach `push.rs::reader_pass` as `Err`, which `into_account_error`
-classifies as `Protocol(ParseFailed)` -> `ProviderContractViolation`, and
-`is_terminal()` is true. The reader emits `Terminated` and stops for good.
-
-Triggers: a `calendars`-off build (the `jmap-calendars-off` /
-`jmap-no-default` sweeps are promised to consumers) whose server sends
-`CalendarAlert`; any server extension frame type; one malformed `StateChange`.
-RFC 8887 servers may add frame types. Combined with JMAP-009, push can be
-silently dead from first contact.
-
-Fix: treat a frame-decode error as skip-and-continue (log), or at worst a
-transient reconnect; keep terminal classification for real connection
-failures. Skipping unknown `@type` in `frame_stream` fixes it for every
-consumer.
 
 ## JMAP-011 - `scope_lifecycle` dies for good on a conforming `cannotCalculateChanges`
 
@@ -344,18 +116,6 @@ the combination.
 Fix: pin the whole draft lifecycle to one account (the submission account when
 it exists), or qualify `DraftHandle` with its owning account the way foreign
 object ids are qualified.
-
-## JMAP-013 - Scheduled sends are created with `undoStatus: final` while cancel and reschedule are advertised
-
-Hunter severity: P2. Scope: jmap account.
-
-`send_message` and `reschedule_send` set `undo_status(UndoStatus::Final)` on
-every created submission, scheduled ones included. RFC 8621 s7 makes
-`undoStatus` server-set on create, so a strict server can answer
-`invalidProperties`; a lenient one that honours it is told the submission
-cannot be recalled, contradicting `scheduled_send` / `cancel_scheduled_send` /
-`reschedule_send` (which rely on `pending` -> `canceled`). Fix: omit
-`undoStatus` on create.
 
 ## JMAP-014 - Primary `EmailDelivery` (or any unmapped type) push entry triggers a full-account `Unknown` repoll
 
@@ -449,23 +209,6 @@ SAME call id after the `EmailSubmission/set` response. It works because `get`
 takes the first match, but the implicit `Email/set` carries the post-move
 `newState`, which `pim.rs` never feeds into `state_cache`; only the earlier
 explicit state is advanced, so the cache is one state behind after every send.
-
-## JMAP-021 - The `NoPrimaryAccount` guard refuses methods that carry no accountId
-
-Hunter severity: P3. Scope: jmap protocol.
-
-`Request::call` refuses any method when the request account id is empty, on
-the claim (code comment and `reference/jmap.md`) that "every method this crate
-defines carries an `accountId`". `PushSubscription` declares
-`requires_account_id() == false`, and RFC 8620 s7.2 gives
-`PushSubscription/get` and `/set` no `accountId`. On a session with no
-`primaryAccounts` those calls are refused for a reason that does not apply.
-The guard should check `O::requires_account_id()` (or the method's own
-serialized `accountId`).
-
-Related smell: `SessionState::derive` maps "no primaryAccounts" to
-`AccountId::new("")`, a sentinel recovered by `is_empty()` in `Request::call`;
-`Option<AccountId>` would carry the state the comment already describes.
 
 ## JMAP-022 - `Request::new` reads the session twice
 
@@ -563,6 +306,20 @@ Smells, jmap account.
   comment or a rename to `latest_known_state`.
 - `reconcile_hydration` reports both `notFound` and the unanswered lane per
   submitted occurrence, and duplicate ids go on the wire as duplicates.
+
+## JMAP-035 - Smaller observations from the send-path fixes
+
+- Cancel-first `reschedule_send` has a window: if the cancel succeeds and the
+  replacement create fails, the old send is cancelled with nothing in its place.
+  No test covers replacement-create failure.
+- A test in `sync/capabilities.rs` still sets `UndoStatus::Final` on a synthetic
+  scheduled create, contradicting the production shape.
+- `Email::take_id()` yields an empty id when a created response omits `id`;
+  send cleanup then skips the destroy and a successful send could return an
+  empty `ObjectId`.
+- In the send paths, an extraction failure for the preceding Email create or
+  import returns before the submission result in the same response is
+  examined, which can obscure a committed send.
 
 ## JMAP-034 - Design proposals from the jmap account hunter
 

@@ -67,15 +67,18 @@ capability errors leave the connection reusable.
 A timed-out or cancelled command is a third case: the driver is
 cancellation-safe and keeps executing the command after the caller's
 `tokio::time::timeout` fires, so the connection is neither dead nor idle.
-Every submit helper holds an `InFlightGuard` that marks the connection
-`abandoned` when its future is dropped before the driver's result arrives,
+Each submit helper arms its `InFlightGuard` only after `cmd_tx.send` succeeds.
+A future dropped while the bounded channel is full never submitted a command
+and therefore does not abandon the connection. After submission, dropping the
+future before the driver's result arrives marks the connection `abandoned`,
 and `PooledConn::drop` parks only a member that `is_reusable()` (alive AND
 not abandoned). Without this, the next checkout queues behind the still
 running command and times out in turn, so one slow command cascades into a
 run of spurious timeouts on the same connection. IDLE is tracked the same
-way: a DONE handshake that times out, or an `idle()` future dropped once the
-command was submitted, leaves the connection abandoned, while token
-cancellation that completes DONE leaves it reusable (push re-IDLEs on it).
+way: its guard is armed after its command send, so a DONE handshake that times
+out or an `idle()` future dropped after submission leaves the connection
+abandoned, while token cancellation that completes DONE leaves it reusable
+(push re-IDLEs on it).
 
 An abandoned connection's LAST handle aborts its driver (`ImapConnection`'s
 `Drop`). The driver is still inside an exchange whose caller is gone; closing
@@ -93,14 +96,21 @@ drain against a stalled or half-open peer would leak the task and its
 socket for the process lifetime - the same hazard the IDLE DONE handshake
 bounds. On timeout the transport is dropped without the graceful exchange.
 
-An untagged `* BYE` is fatal in every driver read loop - regular command,
-APPEND command, pipeline batch, IDLE's wait for its `+` grant, IDLE (and its
-drain), literal continuation wait, and best-effort LOGOUT. Regular and APPEND
-commands use one response loop parameterized by continuation policy. Every one
-of these loops routes every untagged response through one prologue, `process_untagged_prefix`, which
-emits critical response-code events and only then applies the BYE guard - that
-order is what keeps an `ALERT` carried on a `* BYE` from being lost when the
-error unwinds the command. `short_circuit_on_bye` is private to the driver
+An untagged `* BYE` is fatal in every driver read loop except single-command
+dispatch while servicing LOGOUT. RFC 3501 Section 6.1.3 requires that BYE
+before LOGOUT's tagged OK, so dispatch passes it to `LogoutConsumer` and keeps
+reading for the tagged completion. A missing BYE on tagged OK remains
+`ProtocolMissing`; a tagged NO/BAD remains the server's refusal. BYE stays
+fatal for APPEND, pipeline batches, IDLE's wait for its `+` grant, IDLE (and
+its drain), literal continuation waits, and the terminal best-effort LOGOUT
+drain. Regular and APPEND commands use one response loop parameterized by
+continuation policy. Every untagged response still passes through one
+prologue, `process_untagged_prefix`, which emits critical response-code events
+before applying the BYE guard. The command kind is supplied by single-command
+dispatch (including APPEND), which is the only path allowed to accept LOGOUT's
+expected BYE.
+That order keeps an `ALERT` carried on a fatal `* BYE` from being lost when
+the error unwinds the command. `short_circuit_on_bye` is private to the driver
 module and reachable only through that prologue, so no read loop can re-derive
 the ordering and get it wrong. The loops that have no consumer to route to
 (IDLE and its `+` grant wait, the post-DONE IDLE drain, the best-effort LOGOUT drain, and the
@@ -125,10 +135,13 @@ before the short-circuit fires. The prologue takes the `TransmissionState` of
 the command the loop is serving and stamps it on the BYE error. Every read loop
 reads only after writing, so each passes `InFlight`: a BYE does not complete the
 active command, and an unstamped BYE read as `Unsent`, which let a non-idempotent
-command the server may have executed be retried blind. The best-effort LOGOUT
-drain states the phase too, though its errors are discarded at teardown. Command results are published to the state
-watch channel *before* the caller's oneshot is answered, so a caller that
-observes the result always sees the matching snapshot.
+command the server may have executed be retried blind. Single-command dispatch
+passes its kind to the prologue; only LOGOUT suppresses the short-circuit and
+routes the BYE to its consumer. Other loops supply no such exception. The
+best-effort LOGOUT drain states the phase too, though its errors are discarded
+at teardown. Command results are published to the state watch channel *before*
+the caller's oneshot is answered, so a caller that observes the result always
+sees the matching snapshot.
 
 A pipelined batch is admitted before anything happens to it: `run_pipeline`
 refuses, over the whole original command vector and before grouping or any
@@ -317,6 +330,20 @@ Internal `AuthMechanism`: PLAIN, LOGIN, XOAUTH2, OAUTHBEARER, CRAM-MD5, SCRAM-SH
 SCRAM and CRAM-MD5 computation (`scram_client_final` / `verify_server_final`
 transitions, per-hash proofs, CRAM-MD5 response) lives in the private
 `bifrost-sasl` crate; the dispatch consumers (`AuthenticateScramConsumer`, `AuthenticateCramMd5Consumer`) drive the `+` continuation flow and map `bifrost_sasl::SaslError` into the IMAP error model at the boundary.
+
+If a continuation consumer returns a non-fatal error, dispatch answers the
+outstanding SASL challenge with `*` and reads through the command's tagged
+`NO` before returning its failure. If the continuation error is an auth
+error, a structured authentication code from the tagged response takes
+precedence when present; otherwise the error from the SASL continuation is
+preserved. The tagged completion closes the exchange, so an authentication
+refusal can keep its auth error class without leaving the next command to be
+parsed as a SASL response. Errors already
+classified as connection-fatal retire the stream immediately; another
+continuation or a non-`NO` completion after cancellation is a protocol error.
+`Error::Auth` does not currently carry an attempt field, so preserving its
+auth error class also means the acknowledged cancellation phase is not stored
+on that error.
 
 `AuthPolicy` TLS-gates cleartext mechanisms by default: PLAIN/LOGIN refuse over plaintext unless `allow_cleartext_without_tls` is set. CRAM-MD5 is opt-in (`with_cram_md5`) AND TLS-gated (a MITM can pick the challenge and brute-force `HMAC-MD5(password, challenge)` offline). LOGIN-the-IMAP-command is opt-in (`with_login`).
 
@@ -529,7 +556,7 @@ describe what each mint closure decides, not a second copy of the accounting.
 
 `bulk_set_flags` and `bulk_destroy` partition targets by cached MODSEQ: cache hits go out under `STORE UNCHANGEDSINCE <modseq>`, misses fall back to unprotected STORE, and protected batches run first so their success updates the cache before the unprotected pass.
 
-- The MODSEQ cache is populated from inventory, get, changes, mutation SELECT data, and push IDLE FETCH events; cleared by successful flag mutations, expunges, VANISHED, moves, and folder delete/rename. It is bounded per folder (50k entries, pruned back to 40k): inventory walks every UID in a mailbox, and an opportunistic cache must not grow with mailbox size. Eviction keeps the highest UIDs - arrival order is the cheap stand-in for "most likely to be mutated" - and a miss costs exactly what a cold cache costs, an unprotected STORE.
+- The MODSEQ cache is populated from inventory, get, changes, mutation SELECT data, and push IDLE FETCH events; cleared by successful flag mutations, expunges, VANISHED, moves, and folder delete/rename. A tolerated server MODSEQ value of zero is ignored: it cannot guard a later STORE and the opportunistic cache must not turn it into a failed sync or mutation. A zero UIDVALIDITY is also ignored because, although the response parser tolerates it from some servers, it is not a usable cache epoch. The cache is bounded per folder (50k entries, pruned back to 40k): inventory walks every UID in a mailbox, and an opportunistic cache must not grow with mailbox size. Eviction keeps the highest UIDs - arrival order is the cheap stand-in for "most likely to be mutated" - and a miss costs exactly what a cold cache costs, an unprotected STORE.
 - `bulk_destroy` partial-failure accounting separates conflicts (UNCHANGEDSINCE rejected) from expunge failures; an expunge failure applies only to that round's UIDs, not the whole batch.
 - A two-sided `FlagOp::Patch` (non-empty add and remove) is two STOREs, and every id is accounted per UID across both. The guard rides the first (add) STORE; UIDs it rejects with `MODIFIED` are `Failed(ConcurrencyConflict)` and are excluded from the second STORE. Only the add-applied subset receives the unguarded remove, and only that subset may report `Succeeded(Applied)` - a second STORE that errors or comes back non-applied never reports success for those ids: transmission evidence decides the lane (`InFlight` evidence is `Uncertain`, an `Unsent` or server-acknowledged failure is `Failed`), per the mutation error-lane rule below. A wire error on the first STORE is confined to its own MODSEQ group: outcomes already established for earlier groups survive it and are never downgraded by the folder-level error path.
 - `bulk_move` validates the destination mailbox NAME once (syntax via `MailboxName::new`), before any source folder is opened; a syntactically invalid destination fails every target `Request(Malformed)` up front. Existence and selectability are not preflighted: a well-formed but nonexistent destination flows into the per-folder path and surfaces as per-item outcomes from the server's `NO [TRYCREATE]`.
@@ -757,7 +784,10 @@ one absolute exchange deadline that includes admission, unsolicited responses,
 and (for STARTTLS) the handshake and post-upgrade CAPABILITY. Each exchange also
 has a cumulative peer-wait allowance: admitted I/O spends it, admission does
 not, and individual reads cannot reset it. The allowance is shared across
-stream upgrades and charges cancelled pending I/O as well.
+stream upgrades and charges cancelled pending I/O as well. Bootstrap creates
+one peer budget before reading the greeting and reuses it for an initial
+CAPABILITY fetch and STARTTLS, including the TLS handshake and post-upgrade
+CAPABILITY. Re-entering a setup phase cannot reset the allowance.
 ManageSieve places a cumulative peer-read allowance below `MeteredStream`,
 covering one whole line or literal while excluding admission waits. Explicit
 command deadlines still bound the whole operation, including admission.
@@ -828,7 +858,7 @@ Two registry rules keep the shared tagging (and therefore the owner and the righ
 - **Overlap precedence** (`shared_overrides_personal`, pure). RFC 2342 leaves `LIST "" "*"` free to include the non-personal namespaces and several servers do, so the same path can arrive from both the personal LIST and its own namespace LIST. `ingest_shared` lets the namespace candidate WIN that overlap when its path actually lies under its non-empty NAMESPACE prefix - the server's own declaration that the path is not personal. Skipping the overlap (the prior rule) left the folder registered bare: no owner, no `Shared` namespace, and `Container::rights == None` for a folder whose MYRIGHTS had been parsed and then discarded. A candidate NOT under its prefix is still skipped, which is what stops a reference-ignoring server from demoting a real personal INBOX.
 - **Personal-only refresh** (`FolderRegistry::replace_personal`). A mid-session re-LIST after a create / rename / move / delete enumerates only the personal root, so `refresh_folders` must not `replace_all`: clearing the map would drop every shared entry, its owner tag, and its rights, blanking the shared half of `containers_list` until the next reopen. The refresh is also IN PLACE for the personal half, on the same reasoning as `apply_mailbox_event`: a personal folder whose name survives the re-LIST keeps its existing `Arc<FolderEntry>` with only `refresh_listing` applied, so its cursor and 50k-entry MODSEQ cache are not zeroed on every folder CRUD and no concurrently held entry is orphaned mid-run. Only names the re-LIST no longer reports are removed, and only names it newly reports are added.
 
-Revocation quarantines, not escalates. A shared-folder SELECT permission denial (in `inventory.rs` establish and the three `changes.rs` strategy runners) routes through `error::shared_folder_error` to `SyncState(ScopeRevoked)` scoped to `Cursor(Folder(id))`, deriving `Engine(DisableScope(scope))`: the engine deletes that scope's cursor and broadcasts a scoped warning while siblings keep syncing. The same denial on a personal folder (`shared_owner == None`) stays the account-level terminal `NoPermission`. ACL rights are advisory (gate discovery only); `NO [ACL]` stays authoritative per-mutation.
+Revocation quarantines, not escalates. A shared-folder SELECT permission denial in the inventory, changes, and mutation preparation paths routes through `error::shared_folder_error` to `SyncState(ScopeRevoked)` scoped to `Cursor(Folder(id))`, deriving `Engine(DisableScope(scope))`: the engine deletes that scope's cursor and broadcasts a scoped warning while siblings keep syncing. Mutation reports the denied folder's submitted ids as per-item failures and continues to later folders. The same denial on a personal folder (`shared_owner == None`) stays the account-level terminal `NoPermission`. ACL rights are advisory (gate discovery only); `NO [ACL]` stays authoritative per-mutation.
 
 ## Error model
 
@@ -908,13 +938,15 @@ Mutation error lanes follow transmission evidence. An `InFlight` attempt makes t
 
 ### Per-folder mutation failure contract
 
-`mutate::mutation_stream` emits no trailing global `SyncEvent::Terminated` when a folder fails mid-batch: a per-folder fatal after per-item emissions surfaces as a per-item outcome for every remaining target in that folder (carrying the classified `AccountError`; `Uncertain` on `InFlight` transmission evidence, `Failed` otherwise), and the loop continues to the next folder. Stream-level `Terminated` is reserved for failures that prevent any further folder attempt (auth lost, schema/capability break); `stream_terminating` is the gate. The decoded ids are moved into `run_folder_mutation`, not cloned per batch: every failure it can raise (`FolderMutationFailure`) happens in `open_folder_for_mutation`, before a single outcome is minted, so the error hands the whole id vector back and the fallback lane mints from that. Once the folder is open, the per-group paths are infallible by type - they return outcomes, not `Result` - which is what makes moving the ids in safe.
+`mutate::mutation_stream` emits no trailing global `SyncEvent::Terminated` for a recoverable folder failure: a preparation failure surfaces as one per-item outcome for every target in that folder (carrying the classified `AccountError`; `Uncertain` on `InFlight` evidence, `Failed` otherwise), and the loop continues to the next folder. Preparation-command evidence is restamped `Unsent` relative to the mutation, since the STORE / MOVE / EXPUNGE has not been sent. Shared-folder permission denials are first converted to scoped `ScopeRevoked`, so they remain per-folder failures. Stream-level `Terminated` is reserved for failures that prevent any further folder attempt (personal authorization loss, schema/capability break); `stream_terminating` is the gate. The decoded ids are moved into `run_folder_mutation`, not cloned per batch: every failure it can raise (`FolderMutationFailure`) happens in `open_folder_for_mutation`, before a single outcome is minted, so the error hands the whole id vector back and the fallback lane mints from that. Once the folder is open, the per-group paths are infallible by type - they return outcomes, not `Result` - which is what makes moving the ids in safe.
 
 ### Mutation batch shape
 
-Every `mutation_stream` outcome rides a batch sized by the same
+Every per-item `mutation_stream` outcome rides a batch sized by the same
 `TARGET_BUFFER_ITEMS` window, on all three lanes; no lane emits one batch per
-id. The grouped lane flushes one batch per folder group per window. The two
+id. A stream-level `Terminated` is the account-wide exception described
+above: it ends the stream before later groups or input windows can be answered.
+The grouped lane flushes one batch per folder group per window. The two
 lanes that never reach a folder are accumulated to the same window and flushed
 through `flush_items`: ids rejected by `validated_move_destination` (a bulk move
 whose destination is not a folder scope, refused before any source folder is
@@ -937,6 +969,8 @@ Every streaming task (`inventory_stream`, `changes_stream`, `get_stream`, `open_
 ### Terminated-event helper
 
 `account/mod.rs` exposes one `terminated_event::<T, _>(cause)` helper for surfacing fatal stream causes as `SyncEvent::Terminated`. It accepts any `Into<TerminatedCause>`: a pre-built `AccountError` (UIDVALIDITY change, modseq reset, pre-classified failures - including the shared-folder `ScopeRevoked`), or an `(Error, ImapErrorContext)` pair to classify on the way out (the `fatal_event(err, ctx)` alias). Callers do not choose a lane.
+
+`SyncEvent::Terminated` ends the stream, so it is never followed by `Done`. Statically unsupported blob streams emit that single terminal event.
 
 ## Module layout
 

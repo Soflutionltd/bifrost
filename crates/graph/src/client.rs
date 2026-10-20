@@ -1435,7 +1435,7 @@ impl GraphClient {
     /// server would see. A test scripting both must therefore list its
     /// responses in the order the requests actually go out.
     #[cfg(test)]
-    fn script_wire(
+    pub(crate) fn script_wire(
         &self,
         canned: impl IntoIterator<Item = bifrost_net::test_support::Canned>,
         retry: RetryPolicy,

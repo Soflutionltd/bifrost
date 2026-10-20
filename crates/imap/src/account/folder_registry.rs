@@ -418,17 +418,17 @@ impl FolderEntry {
         modseq: u64,
     ) -> Result<(), crate::Error> {
         if uidvalidity == 0 {
-            return Err(crate::Error::Protocol(
-                "MODSEQ cache update missing UIDVALIDITY".into(),
-            ));
+            // The response-code decoder tolerates UIDVALIDITY 0 from some
+            // servers. It is not a usable cache epoch, so do not cache it or
+            // turn that tolerated response into a sync failure.
+            return Ok(());
         }
-        if uid == 0 {
-            return Err(crate::Error::Protocol(
-                "MODSEQ cache update missing UID".into(),
-            ));
-        }
+        debug_assert_ne!(uid, 0, "MODSEQ cache update needs UID");
         if modseq == 0 {
-            return Err(crate::Error::Protocol("FETCH returned MODSEQ 0".into()));
+            // The decoder tolerates MODSEQ 0 from servers as a sentinel. The
+            // cache only informs a later STORE guard, so this value has no
+            // useful protection to record and must not fail the sync walk.
+            return Ok(());
         }
         let mut modseqs = self
             .modseq_by_uid
@@ -1125,13 +1125,15 @@ mod tests {
         let entry = FolderEntry::from_mailbox(info);
 
         entry.record_modseq(11, 7, 99).expect("valid modseq");
-        assert!(entry.record_modseq(0, 7, 100).is_err());
-        assert!(entry.record_modseq(11, 0, 100).is_err());
-        assert!(entry.record_modseq(11, 8, 0).is_err());
+        entry
+            .record_modseq(0, 8, 100)
+            .expect("zero UIDVALIDITY is not a cacheable epoch");
+        entry
+            .record_modseq(11, 8, 0)
+            .expect("zero MODSEQ is ignored by the opportunistic cache");
 
         assert_eq!(entry.modseq(11, 7), Some(99));
-        assert_eq!(entry.modseq(0, 7), None);
-        assert_eq!(entry.modseq(11, 0), None);
+        assert_eq!(entry.modseq(0, 8), None);
         assert_eq!(entry.modseq(11, 8), None);
         assert_eq!(entry.modseq(12, 7), None);
 

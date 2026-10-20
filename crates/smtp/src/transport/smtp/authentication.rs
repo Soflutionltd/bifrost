@@ -549,8 +549,9 @@ pub(crate) fn resolve_scram_binding(
 /// Next client line a [`ScramExchange::step`] produces.
 #[derive(Debug)]
 pub(crate) enum ScramStep {
-    /// Base64 client line to write back to the server.
-    Reply(String),
+    /// Base64 client line to write back to the server, kept zeroizing until the
+    /// connection writes it.
+    Reply(Secret),
     /// Server-final verified; the caller sends an empty continuation line and
     /// expects the tagged success reply.
     Complete,
@@ -611,7 +612,7 @@ pub(crate) struct ScramExchange {
     /// discovered after the server-first message.
     password: bifrost_sasl::ScramPassword,
     client_nonce: String,
-    client_first_bare: String,
+    client_first_bare: Zeroizing<String>,
     expected_server_signature: Option<Vec<u8>>,
     state: ScramExchangeState,
 }
@@ -624,10 +625,8 @@ impl ScramExchange {
         password: bifrost_sasl::Secret,
     ) -> Result<ScramExchange, Error> {
         let client_nonce = generate_scram_nonce()?;
-        let client_first_bare = format!(
-            "n={},r={client_nonce}",
-            bifrost_sasl::prepare_scram_username(username)?
-        );
+        let username = Zeroizing::new(bifrost_sasl::prepare_scram_username(username)?);
+        let client_first_bare = Zeroizing::new(format!("n={},r={client_nonce}", username.as_str()));
         let password = bifrost_sasl::prepare_scram_password(password.as_str())?;
         Ok(ScramExchange {
             mechanism_name: hash.mechanism_name(binding.binding()),
@@ -645,12 +644,13 @@ impl ScramExchange {
     /// already base64-encoded: `base64(gs2_header || client_first_bare)`. The
     /// GS2 header comes from the binding so it can never desync from the `c=`
     /// value computed in `scram_client_final`.
-    pub(crate) fn client_first(&self) -> String {
-        crate::base64::encode(format!(
+    pub(crate) fn client_first(&self) -> Secret {
+        let client_first = Zeroizing::new(format!(
             "{}{}",
             self.binding.gs2_header(),
-            self.client_first_bare
-        ))
+            self.client_first_bare.as_str()
+        ));
+        Secret::from(crate::base64::encode_zeroizing(client_first.as_bytes()))
     }
 
     /// Advance the exchange given a decoded (UTF-8) server continuation.
@@ -661,16 +661,16 @@ impl ScramExchange {
                     self.hash,
                     &self.password,
                     &self.client_nonce,
-                    &self.client_first_bare,
+                    self.client_first_bare.as_str(),
                     server_line,
                     &self.binding,
                 )
                 .map_err(|e| named_sasl_error(self.mechanism_name, e))?;
                 self.expected_server_signature = Some(server_signature);
                 self.state = ScramExchangeState::AwaitServerFinal;
-                Ok(ScramStep::Reply(crate::base64::encode(
-                    client_final.as_bytes(),
-                )))
+                // bifrost-sasl returns the already-base64 client line. Keep
+                // its framing and zeroizing owner through the SMTP write.
+                Ok(ScramStep::Reply(client_final))
             }
             ScramExchangeState::AwaitServerFinal => {
                 let expected = self.expected_server_signature.take().ok_or_else(|| {
@@ -703,8 +703,8 @@ pub(crate) fn decode_auth_challenge(
     decode_scram_payload(response)
 }
 
-/// Decode the base64 SASL payload carried in a reply's first word, regardless
-/// of the reply code.
+/// Decode the base64 SASL payload on the reply's first line, regardless of the
+/// reply code. A leading enhanced status code is skipped when present.
 ///
 /// Used for the SCRAM server-final, which RFC 4954 carries on a `334`
 /// continuation but which some servers (field-observed) fold directly onto the
@@ -713,9 +713,24 @@ pub(crate) fn decode_auth_challenge(
 pub(crate) fn decode_scram_payload(
     response: &crate::transport::smtp::response::Response,
 ) -> Result<String, Error> {
-    let encoded = response
-        .first_word()
+    let line = response
+        .first_line()
         .ok_or_else(|| error::parse("could not read SCRAM challenge"))?;
+    let mut words = line.split_whitespace();
+    let first = words
+        .next()
+        .ok_or_else(|| error::parse("could not read SCRAM challenge"))?;
+    // ENHANCEDSTATUSCODES puts a status token before the SASL payload on the
+    // same line (for example `235 2.7.0 <base64>`). Skip it only when it is
+    // the valid enhanced status parsed from this response.
+    let enhanced = response.enhanced_status_code().map(|code| code.to_string());
+    let encoded = if enhanced.as_deref() == Some(first) {
+        words
+            .next()
+            .ok_or_else(|| error::parse("could not read SCRAM challenge"))?
+    } else {
+        first
+    };
     let decoded = crate::base64::decode(encoded).map_err(error::parse)?;
     String::from_utf8(decoded).map_err(error::parse)
 }
@@ -1040,8 +1055,9 @@ mod test {
             ScramExchange::new(hash, ScramChannelBinding::None, "user", "pencil".into()).unwrap();
 
         // client-first decodes to `n,,n=user,r=<nonce>`.
+        let client_first = exchange.client_first();
         let decoded =
-            String::from_utf8(crate::base64::decode(exchange.client_first()).unwrap()).unwrap();
+            String::from_utf8(crate::base64::decode(client_first.as_bytes()).unwrap()).unwrap();
         assert!(decoded.starts_with("n,,n=user,r="), "got: {decoded}");
         let nonce = decoded.rsplit("r=").next().unwrap().to_owned();
 
@@ -1097,8 +1113,9 @@ mod test {
             "pw".into(),
         )
         .unwrap();
+        let client_first = exchange.client_first();
         let decoded =
-            String::from_utf8(crate::base64::decode(exchange.client_first()).unwrap()).unwrap();
+            String::from_utf8(crate::base64::decode(client_first.as_bytes()).unwrap()).unwrap();
         assert!(
             decoded.starts_with("p=tls-server-end-point,,n="),
             "got: {decoded}"
@@ -1128,8 +1145,9 @@ mod test {
         let hash = scram_hash(Mechanism::ScramSha256).unwrap();
         let mut exchange =
             ScramExchange::new(hash, ScramChannelBinding::None, "user", "pencil".into()).unwrap();
+        let client_first = exchange.client_first();
         let decoded =
-            String::from_utf8(crate::base64::decode(exchange.client_first()).unwrap()).unwrap();
+            String::from_utf8(crate::base64::decode(client_first.as_bytes()).unwrap()).unwrap();
         let nonce = decoded.rsplit("r=").next().unwrap().to_owned();
         let server_first = format!("r={nonce}srvextra,s=QSXCR+Q6sek8bf92,i=4096");
         assert!(matches!(
@@ -1152,8 +1170,9 @@ mod test {
         let hash = scram_hash(Mechanism::ScramSha256).unwrap();
         let mut exchange =
             ScramExchange::new(hash, ScramChannelBinding::None, "user", "pencil".into()).unwrap();
+        let client_first = exchange.client_first();
         let decoded =
-            String::from_utf8(crate::base64::decode(exchange.client_first()).unwrap()).unwrap();
+            String::from_utf8(crate::base64::decode(client_first.as_bytes()).unwrap()).unwrap();
         let nonce = decoded.rsplit("r=").next().unwrap().to_owned();
         let server_first = format!("r={nonce}srvextra,s=QSXCR+Q6sek8bf92,i=4096");
         assert!(matches!(
@@ -1193,8 +1212,9 @@ mod test {
             "pencil".into(),
         )
         .unwrap();
+        let client_first = exchange.client_first();
         let decoded =
-            String::from_utf8(crate::base64::decode(exchange.client_first()).unwrap()).unwrap();
+            String::from_utf8(crate::base64::decode(client_first.as_bytes()).unwrap()).unwrap();
         let nonce = decoded.rsplit("r=").next().unwrap().to_owned();
         let server_first = format!("r={nonce}srvextra,s=QSXCR+Q6sek8bf92,i=4096");
         assert!(matches!(
@@ -1242,15 +1262,13 @@ mod test {
         );
 
         // Field-observed shape: server-final folded onto the 235 success reply.
-        // The 334-only decoder rejects it (the spurious parse error this fix
-        // removes); the code-agnostic decoder accepts it.
         let success = Response::new(
             Code {
                 severity: Severity::PositiveCompletion,
                 category: Category::Unspecified3,
                 detail: Detail::Five,
             },
-            vec![payload],
+            vec![format!("2.7.0 {payload}")],
         );
         assert!(decode_auth_challenge(&success).is_err());
         assert_eq!(

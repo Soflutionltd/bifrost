@@ -83,6 +83,10 @@ impl WireReader {
         self.metering.peer_timeout = timeout.map(PeerBudget::new);
     }
 
+    pub(super) fn set_peer_budget(&mut self, budget: Option<PeerBudget>) {
+        self.metering.peer_timeout = budget;
+    }
+
     pub(in crate::connection) fn peer_budget(&self) -> Option<PeerBudget> {
         self.metering.peer_timeout.clone()
     }
@@ -370,7 +374,7 @@ impl WireReader {
 pub(in crate::connection) struct PeerBudget(Arc<Mutex<Duration>>);
 
 impl PeerBudget {
-    fn new(timeout: Duration) -> Self {
+    pub(in crate::connection) fn new(timeout: Duration) -> Self {
         Self(Arc::new(Mutex::new(timeout)))
     }
 }

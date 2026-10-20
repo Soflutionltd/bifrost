@@ -438,7 +438,7 @@ struct OptionalFamilies<Tr: HttpTransport> {
     contacts: Option<JmapMailAccount<Tr>>,
     calendars: Option<JmapMailAccount<Tr>>,
     /// RFC 8621 `maxDelayedSend`, in seconds. Non-zero only when the
-    /// Submission block is present AND parseable AND advertises a window.
+    /// selected account's Submission block is parseable and advertises a window.
     max_delayed_send: usize,
 }
 
@@ -449,10 +449,8 @@ struct OptionalFamilies<Tr: HttpTransport> {
 /// the capability and then described it wrongly, and a family that
 /// silently vanishes from a session which does advertise its URI leaves
 /// nobody anything to debug. `Absent` is deliberately NOT refused here.
-/// A session that names a primary account for a URI it omits from
-/// `capabilities` is a separate question from one that names it and
-/// then describes it wrongly, and answering it in this function would
-/// silently drop families off servers that work today.
+/// A missing block is kept distinct from a malformed one. Submission
+/// without an account block has no delayed-send window to advertise.
 fn family_block_is_usable<T>(
     state: crate::core::session::CapabilityState<'_, T>,
     uri: &str,
@@ -465,7 +463,7 @@ fn family_block_is_usable<T>(
             tracing::warn!(
                 capability = uri,
                 family,
-                "JMAP session advertises this capability with an unparseable object; \
+                "JMAP account advertises this capability with an unparseable object; \
                  the family is not advertised and its methods refuse as unsupported"
             );
             false
@@ -557,35 +555,29 @@ fn resolve_optional_families<Tr: HttpTransport>(client: &Client<Tr>) -> Optional
 
 fn account_advertises_submission(session: &crate::core::session::Session, id: &str) -> bool {
     session.account(id).is_some_and(|account| {
-        account
-            .capabilities()
-            .any(|uri| uri.as_str() == <capability::Submission as Capability>::URI)
+        // Foreign accounts describe their own submission limits too. A key
+        // alone must not resurrect a family whose account object is invalid.
+        family_block_is_usable(
+            account.submission_capability_state(),
+            <capability::Submission as Capability>::URI,
+            "foreign submission",
+        ) && account.submission_capabilities().is_some()
     })
 }
 
-async fn fetch_self_emails(client: &Client, credentials: &JmapCredentials) -> Vec<String> {
+async fn fetch_self_emails<Tr: HttpTransport>(
+    client: &Client<Tr>,
+    credentials: &JmapCredentials,
+) -> Vec<String> {
     let mut emails = Vec::new();
     if let Some(email) = credentials.configured_email() {
         push_email_alias(&mut emails, email);
     }
 
-    let Some(principal_id) = client
-        .session()
-        .principals_capabilities()
-        .and_then(|capabilities| capabilities.current_user_principal_id().cloned())
-        .or_else(|| {
-            client
-                .session()
-                .principals_owner_capabilities()
-                .and_then(|capabilities| capabilities.principal_id().cloned())
-        })
-    else {
+    let Some((principals, principal_id)) = self_principal_lookup(client) else {
         return emails;
     };
 
-    let Some(principals) = principal_account(client) else {
-        return emails;
-    };
     let Ok(response) = principals
         .call(PrincipalGet::new().ids([principal_id]))
         .await
@@ -605,15 +597,37 @@ async fn fetch_self_emails(client: &Client, credentials: &JmapCredentials) -> Ve
     emails
 }
 
-fn principal_account(
-    client: &Client,
-) -> Option<crate::account::Account<crate::transport_reqwest::ReqwestTransport>> {
-    client
-        .session()
-        .principals_owner_capabilities()
-        .and_then(|capabilities| capabilities.account_id_for_principal().cloned())
-        .map(|account_id| crate::account::Account::new(client.clone(), account_id))
-        .or_else(|| client.primary_account::<capability::Principals>().ok())
+// The owner extension belongs to the account whose mail we opened; it
+// need not (and normally does not) have a primaryAccounts entry of its own.
+fn primary_mail_owner(
+    session: &crate::core::session::Session,
+) -> Option<&crate::core::session::PrincipalsOwnerCapabilities> {
+    let id = session
+        .primary_accounts()
+        .find(|(uri, _)| uri.as_str() == <capability::Mail as Capability>::URI)?
+        .1;
+    session.account(id)?.principals_owner_capabilities()
+}
+
+fn self_principal_lookup<Tr: HttpTransport>(
+    client: &Client<Tr>,
+) -> Option<(crate::account::Account<Tr>, crate::principal::PrincipalId)> {
+    let session = client.session();
+    if let Some(id) = session
+        .principals_capabilities()
+        .and_then(|capabilities| capabilities.current_user_principal_id().cloned())
+    {
+        // The id and its containing account are one lookup identity. An
+        // owner extension on the mail account may name a different account.
+        return Some((client.primary_account::<capability::Principals>().ok()?, id));
+    }
+    let owner = primary_mail_owner(&session)?;
+    let id = owner.principal_id()?.clone();
+    let account = owner
+        .account_id_for_principal()
+        .map(|account_id| crate::account::Account::new(client.clone(), account_id.clone()))
+        .or_else(|| client.primary_account::<capability::Principals>().ok())?;
+    Some((account, id))
 }
 
 fn push_email_alias(emails: &mut Vec<String>, email: &str) {
@@ -1292,12 +1306,21 @@ mod tests {
         });
         let map = capabilities.as_object_mut().expect("object");
         for (key, value) in blocks.as_object().expect("blocks is an object") {
-            map.insert(key.clone(), value.clone());
+            map.insert(
+                key.clone(),
+                if key == "urn:ietf:params:jmap:quota" {
+                    value.clone()
+                } else {
+                    json!({})
+                },
+            );
         }
+        let mut account_capabilities = blocks;
+        account_capabilities["urn:ietf:params:jmap:mail"] = json!({});
         serde_json::from_value(json!({
             "capabilities": capabilities,
             "accounts": {
-                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false, "accountCapabilities": account_capabilities}
             },
             "primaryAccounts": {
                 "urn:ietf:params:jmap:mail": "primary",
@@ -1316,6 +1339,89 @@ mod tests {
             "state": "session-1"
         }))
         .expect("test session parses")
+    }
+
+    #[tokio::test]
+    async fn principal_aliases_come_from_account_capabilities() {
+        for use_owner in [false, true] {
+            let mut doc =
+                serde_json::to_value(session_with_family_blocks(well_formed_family_blocks()))
+                    .unwrap();
+            let uri = "urn:ietf:params:jmap:principals";
+            doc["capabilities"][uri] = json!({});
+            doc["primaryAccounts"][uri] = json!("primary");
+            doc["accounts"]["primary"]["accountCapabilities"][uri] = if use_owner {
+                json!({})
+            } else {
+                json!({"currentUserPrincipalId": "self"})
+            };
+            doc["accounts"]["primary"]["accountCapabilities"]["urn:ietf:params:jmap:principals:owner"] =
+                json!({"principalId": "owner", "accountIdForPrincipal": "owner-target"});
+            doc["accounts"]["owner-target"] = json!({
+                "name": "Principals", "isPersonal": true, "isReadOnly": false,
+                "accountCapabilities": {uri: {}}
+            });
+            let account_id = if use_owner { "owner-target" } else { "primary" };
+            let principal_id = if use_owner { "owner" } else { "self" };
+            let response = method_reply(vec![json!(["Principal/get", {
+                "accountId": account_id, "state": "p1",
+                "list": [{"id": principal_id, "email": "Self@Example.Test", "aliases": ["alias@example.test"]}],
+                "notFound": []
+            }, "s0"])]).for_account(account_id);
+            let client =
+                scripted_client_with_session(serde_json::from_value(doc).unwrap(), [response]);
+            let emails = fetch_self_emails(&client, &JmapCredentials::bearer("token")).await;
+            assert_eq!(emails, ["self@example.test", "alias@example.test"]);
+            let requests = client.transport().requests.lock().unwrap();
+            assert_eq!(
+                requests[0]["methodCalls"][0][1]["ids"],
+                json!([principal_id])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_account_mail_limits_refuse_before_probes() {
+        let mut doc = serde_json::to_value(session()).unwrap();
+        doc["accounts"]["primary"]["accountCapabilities"]["urn:ietf:params:jmap:mail"] =
+            json!("invalid");
+        let client = scripted_client_with_session(serde_json::from_value(doc).unwrap(), []);
+        let mail = JmapMailAccount::new(client.clone(), JmapAccountId::new("primary"));
+        let error = validate_and_seed(&client, &mail)
+            .await
+            .err()
+            .expect("invalid account block");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation,
+            )
+        );
+        assert!(client.transport().requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn submission_window_is_selected_by_account_not_session() {
+        let mut doc =
+            serde_json::to_value(session_with_family_blocks(well_formed_family_blocks())).unwrap();
+        let uri = "urn:ietf:params:jmap:submission";
+        doc["capabilities"][uri] = json!({"maxDelayedSend": 9999});
+        doc["accounts"]["other"] = json!({"name": "Other", "isPersonal": false, "isReadOnly": false, "accountCapabilities": {uri: {"maxDelayedSend": 17}}});
+        doc["primaryAccounts"][uri] = json!("other");
+        let client = scripted_client_with_session(serde_json::from_value(doc).unwrap(), []);
+        let families = resolve_optional_families(&client);
+        assert!(families.submission.is_some());
+        assert_eq!(families.max_delayed_send, 17);
+        assert_eq!(
+            client
+                .session()
+                .account("primary")
+                .unwrap()
+                .submission_capabilities()
+                .unwrap()
+                .max_delayed_send(),
+            3600
+        );
     }
 
     /// Every optional family block in its well-formed shape.
@@ -1404,7 +1510,7 @@ mod tests {
     /// dark - a malformed optional block degrading as a silently
     /// different VALUE, which the lane rule forbids.
     #[test]
-    fn a_submission_block_without_max_delayed_send_disables_the_family() {
+    fn an_account_submission_block_without_max_delayed_send_disables_the_family() {
         let mut blocks = well_formed_family_blocks();
         blocks["urn:ietf:params:jmap:submission"] = json!({});
         let client = scripted_client_with_session(session_with_family_blocks(blocks), []);

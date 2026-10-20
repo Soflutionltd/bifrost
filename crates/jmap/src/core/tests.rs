@@ -572,8 +572,12 @@ mod envelope {
             Err(TransportError::new("stub transport does not upload"))
         }
 
-        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("stub transport does not download"))
+        async fn download(&self, url: &str) -> Result<Bytes, TransportError> {
+            self.sent
+                .lock()
+                .expect("stub sent lock")
+                .push(json!({"downloadUrl": url}));
+            Ok(Bytes::from_static(b"blob"))
         }
 
         async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
@@ -663,6 +667,51 @@ mod envelope {
         )
         .expect("stub client builds");
         Stub { client, sent }
+    }
+
+    #[cfg(feature = "blob")]
+    #[tokio::test]
+    async fn download_dot_filenames_preserve_the_resource_path() {
+        let stub = stub(mail_primary(), []);
+        for (name, encoded) in [
+            (".", "%252E"),
+            ("..", "%252E%252E"),
+            ("a/b?x#+", "a%2Fb%3Fx%23%2B"),
+        ] {
+            let blob = crate::blob::BlobRef::new(
+                crate::core::id::AccountId::new("A1"),
+                crate::core::id::BlobId::new("B1"),
+            )
+            .with_name(name)
+            .with_content_type("text/plain");
+            stub.client.download(&blob).await.unwrap();
+            let request = stub.request(stub.request_count() - 1);
+            let parsed = reqwest::Url::parse(request["downloadUrl"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                parsed.path(),
+                format!("/download/A1/B1/{encoded}/text%2Fplain")
+            );
+        }
+    }
+
+    #[test]
+    fn accountless_methods_work_without_primary_accounts() {
+        let stub = stub(json!({}), []);
+        let mut request = stub.client.build();
+        request
+            .call(crate::push_subscription::PushSubscriptionGet::new())
+            .unwrap();
+        request
+            .call(crate::push_subscription::PushSubscriptionSet::new())
+            .unwrap();
+        let encoded = serde_json::to_value(&request).unwrap();
+        for call in encoded["methodCalls"].as_array().unwrap() {
+            assert!(call[1].get("accountId").is_none());
+        }
+        assert!(matches!(
+            request.call(TestGet::new()),
+            Err(crate::Error::NoPrimaryAccount { .. })
+        ));
     }
 
     fn mail_primary() -> Value {
