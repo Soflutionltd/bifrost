@@ -20,6 +20,7 @@
 //! not unused API. This module opts back in so the compiler reports one.
 #![warn(dead_code)]
 
+#[cfg(test)]
 use std::time::Duration;
 
 use bifrost_net::{NetErrorContext, into_account_error as net_into_account_error};
@@ -951,6 +952,26 @@ pub(crate) fn shared_scope_error(
 
 // ---- internal helpers --------------------------------------------------
 
+pub(crate) fn internal_invariant(
+    operation: AccountOperation,
+    message: impl Into<String>,
+) -> AccountError {
+    let kind = AccountErrorKind::Internal(InternalErrorKind::InvariantViolated);
+    let detail = DiagnosticText::support_only(message.into());
+    let context = JmapErrorContext::new(operation);
+    build(
+        kind,
+        Cause::Internal(InternalCause::new(
+            InternalErrorKind::InvariantViolated,
+            Some(detail.clone()),
+        )),
+        &context,
+    )
+    .text(detail)
+    .try_build()
+    .expect("valid internal invariant error")
+}
+
 fn build(kind: AccountErrorKind, primary: Cause, ctx: &JmapErrorContext) -> AccountErrorBuilder {
     build_with(ctx, kind, primary)
 }
@@ -1070,8 +1091,7 @@ fn convert_problem(
     let status_u16 = status_u32.and_then(|s| u16::try_from(s).ok());
     let retry_hint = transport
         .as_ref()
-        .and_then(|t| retry_after_from_net(t.net.as_ref()))
-        .map(RetryHint::After);
+        .and_then(|t| retry_after_from_net(t.net.as_ref()));
 
     let (kind, primary) = match (details.error(), status_u16) {
         (ProblemType::JMAP(JMAPError::Limit), _) => (
@@ -1233,35 +1253,29 @@ fn status_from_net(net: Option<&bifrost_net::Error>) -> Option<u32> {
 
 /// The server's retry hint for a problem-details response.
 ///
-/// Where the hint lives depends on which net error shape carried the
-/// body here, and the terminal-status shape is the common one: a 4xx
-/// bifrost-net does not retry arrives as `Error::Status`, which holds
-/// the response headers but no parsed hint, so the `Retry-After` has to
-/// be read off the header. A retried 429 / 5xx arrives as
-/// `RateLimited` / `RetryBudgetExhausted` with the final attempt's hint
-/// already parsed and capped by the retry policy; fall back to that
-/// response's own header when the loop recorded none.
-fn retry_after_from_net(net: Option<&bifrost_net::Error>) -> Option<Duration> {
-    match net? {
+/// Read the final response first: transport durations may be capped or
+/// originate from an earlier attempt and cannot preserve an absolute date.
+fn retry_after_from_net(net: Option<&bifrost_net::Error>) -> Option<RetryHint> {
+    match net?.terminal() {
         bifrost_net::Error::Status { headers, .. } => retry_after_header(headers),
         bifrost_net::Error::RateLimited {
             retry_after,
             final_response,
-        } => retry_after.or_else(|| retry_after_header(&final_response.headers)),
+        } => retry_after_header(&final_response.headers)
+            .or_else(|| retry_after.map(RetryHint::After)),
         bifrost_net::Error::RetryBudgetExhausted {
             final_response,
             retry_after_history,
-        } => retry_after_history.last().copied().or_else(|| {
-            final_response
-                .as_ref()
-                .and_then(|response| retry_after_header(&response.headers))
-        }),
+        } => final_response
+            .as_ref()
+            .and_then(|response| retry_after_header(&response.headers))
+            .or_else(|| retry_after_history.last().copied().map(RetryHint::After)),
         _ => None,
     }
 }
 
-fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    bifrost_net::parse_retry_after(headers.get(reqwest::header::RETRY_AFTER))
+fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<RetryHint> {
+    bifrost_net::request::parse_retry_after_hint(headers.get(reqwest::header::RETRY_AFTER))
 }
 
 fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext) -> AccountError {
@@ -1808,6 +1822,26 @@ mod tests {
             Some(bifrost_types::RetryHint::After(Duration::from_secs(120))),
             "the server's Retry-After must survive the problem-details path"
         );
+    }
+
+    #[test]
+    fn elapsed_retry_after_date_survives_problem_classification() {
+        let date = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let at = std::time::UNIX_EPOCH + Duration::from_secs(784111777);
+        let err = into_account_error(
+            from_net(bifrost_net::Error::Status {
+                code: reqwest::StatusCode::BAD_REQUEST,
+                body: bytes::Bytes::from_static(
+                    br#"{"type":"urn:ietf:params:jmap:error:limit","limit":"maxObjectsInGet"}"#,
+                ),
+                headers: retry_after_headers(date),
+            }),
+            JmapErrorContext::new(AccountOperation::SyncChanges),
+        );
+        let RecoveryClass::Retry(advice) = err.recovery() else {
+            panic!("expected retry");
+        };
+        assert_eq!(advice.retry_hint, Some(RetryHint::At(at)));
     }
 
     /// A 429 is retried, so it reaches the JMAP boundary as

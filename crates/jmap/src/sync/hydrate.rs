@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bifrost_types::{
     AccountStream, Batch, BatchItemId, BatchSuccess, HydratedObject, HydratedObjectKind,
@@ -15,6 +15,69 @@ use super::capabilities::CoreLimits;
 use super::inventory::{email_to_inventory, inventory_properties};
 
 type MailAccount<T> = crate::account::Account<T>;
+
+// JMAP advertises this same `max_wait` through its BatchingPolicy. Hydration
+// receives CoreLimits, which currently carries only the wire object limits;
+// keep the timer local rather than widening account construction and every
+// CoreLimits fixture just to pass this one value.
+const ROUTE_MAX_WAIT: Duration = Duration::from_millis(100);
+
+struct PendingHydration {
+    ids: Vec<ObjectId>,
+    first_touch: tokio::time::Instant,
+    last_touch: tokio::time::Instant,
+}
+
+impl PendingHydration {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            ids: Vec::new(),
+            first_touch: now,
+            last_touch: now,
+        }
+    }
+
+    fn push(&mut self, id: ObjectId, now: tokio::time::Instant) {
+        self.ids.push(id);
+        self.last_touch = now;
+    }
+
+    /// The policy has one duration, so a quiet route flushes after that idle
+    /// period and a busy route still flushes no later than that duration from
+    /// its first item. Tracking both ends prevents a steady trickle from
+    /// resetting the maximum wait forever.
+    fn deadline(&self, max_wait: Duration) -> tokio::time::Instant {
+        (self.last_touch + max_wait).min(self.first_touch + max_wait)
+    }
+
+    fn due_at(&self, now: tokio::time::Instant, max_wait: Duration) -> bool {
+        now >= self.deadline(max_wait)
+    }
+}
+
+/// Drain routes whose object cap or wait deadline has arrived, in stable
+/// primary-then-account-id order. Hydration has no local rejection lane, so
+/// its buffers do not need mutation's owner registration queue.
+fn take_ready_routes(
+    buffers: &mut HashMap<HydrationRoute, PendingHydration>,
+    now: tokio::time::Instant,
+    max_items: usize,
+    max_wait: Duration,
+    flush_all: bool,
+) -> Vec<(HydrationRoute, Vec<ObjectId>)> {
+    let mut ready: Vec<_> = buffers
+        .iter()
+        .filter(|(_, buffer)| {
+            flush_all || buffer.ids.len() >= max_items || buffer.due_at(now, max_wait)
+        })
+        .map(|(route, _)| route.clone())
+        .collect();
+    ready.sort_by(|left, right| flush_order(left).cmp(&flush_order(right)));
+    ready
+        .into_iter()
+        .filter_map(|route| buffers.remove(&route).map(|buffer| (route, buffer.ids)))
+        .collect()
+}
 
 /// Which JMAP account an incoming hydration id routes to.
 ///
@@ -77,18 +140,52 @@ pub(crate) fn stream<T: HttpTransport>(
         let limit = limits.max_objects_in_get.max(1);
         // One buffer per routing target: ids for the primary account and
         // ids for each foreign account cannot ride in the same
-        // `Email/get`, because the call is accountId-scoped.
-        let mut buffers: HashMap<HydrationRoute, Vec<ObjectId>> = HashMap::new();
-        while let Some(id) = ids.next().await {
-            let route = route_for_id(&id, |account| foreign_mail.contains_key(account));
-            let full = {
-                let buffer = buffers.entry(route.clone()).or_default();
-                buffer.push(id);
-                buffer.len() >= limit
+        // `Email/get`, because the call is accountId-scoped. Unlike the
+        // mutation RouteBuffers, this path must flush on elapsed time while
+        // `ids.next()` is pending; mutation's `last_touch` is an input-count
+        // fairness bound and does not implement BatchingPolicy.max_wait.
+        let mut buffers: HashMap<HydrationRoute, PendingHydration> = HashMap::new();
+        loop {
+            let deadline = buffers
+                .values()
+                .map(|buffer| buffer.deadline(ROUTE_MAX_WAIT))
+                .min();
+            let input = tokio::select! {
+                biased;
+                _ = async {
+                    if let Some(deadline) = deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => None,
+                input = ids.next() => Some(input),
             };
-            if full {
-                let mut drained = buffers.get_mut(&route).map(std::mem::take).unwrap_or_default();
-                match fetch_route(&mail, &foreign_mail, &route, projection, &mut drained).await {
+            let now = tokio::time::Instant::now();
+            let (ready, at_end) = match input {
+                None => (
+                    take_ready_routes(&mut buffers, now, limit, ROUTE_MAX_WAIT, false),
+                    false,
+                ),
+                Some(Some(id)) => {
+                    let route = route_for_id(&id, |account| foreign_mail.contains_key(account));
+                    buffers
+                        .entry(route)
+                        .or_insert_with(|| PendingHydration::new(now))
+                        .push(id, now);
+                    (
+                        take_ready_routes(&mut buffers, now, limit, ROUTE_MAX_WAIT, false),
+                        false,
+                    )
+                }
+                Some(None) => (
+                    take_ready_routes(&mut buffers, now, limit, ROUTE_MAX_WAIT, true),
+                    true,
+                ),
+            };
+
+            for (route, mut batch) in ready {
+                match fetch_route(&mail, &foreign_mail, &route, projection, &mut batch).await {
                     Ok(Some(batch)) => yield SyncEvent::Batch(batch),
                     Ok(None) => {}
                     Err(err) => {
@@ -100,30 +197,9 @@ pub(crate) fn stream<T: HttpTransport>(
                     }
                 }
             }
-        }
 
-        // Flush the trailing buffers in a deterministic order - primary
-        // first, then foreign accounts by id. The buffers live in a
-        // `HashMap`, whose iteration order would otherwise make the
-        // batch GROUPING across routing targets vary run to run
-        // (per-item outcomes are unaffected; only the order the final
-        // partial batches emit in).
-        let mut trailing: Vec<(HydrationRoute, Vec<ObjectId>)> = buffers.into_iter().collect();
-        trailing.sort_by(|(a, _), (b, _)| flush_order(a).cmp(&flush_order(b)));
-        for (route, mut buffer) in trailing {
-            if buffer.is_empty() {
-                continue;
-            }
-            match fetch_route(&mail, &foreign_mail, &route, projection, &mut buffer).await {
-                Ok(Some(batch)) => yield SyncEvent::Batch(batch),
-                Ok(None) => {}
-                Err(err) => {
-                    yield super::error::terminated_from_jmap(
-                        err,
-                        super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Hydrate),
-                    );
-                    return;
-                }
+            if at_end {
+                break;
             }
         }
 
@@ -384,7 +460,84 @@ fn properties_for_projection(projection: Projection) -> Vec<Property> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use bytes::Bytes;
+    use serde_json::{Value, json};
+
     use super::*;
+    use crate::core::transport::{HttpTransport, TransportError};
+
+    struct HydrationTransport {
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl HttpTransport for HydrationTransport {
+        async fn api_request(&self, _url: &str, body: Vec<u8>) -> Result<Bytes, TransportError> {
+            let request: Value = serde_json::from_slice(&body)
+                .map_err(|error| TransportError::with_source("request is not JSON", error))?;
+            self.requests
+                .lock()
+                .expect("request log")
+                .push(request.clone());
+            let call = &request["methodCalls"][0];
+            let args = &call[1];
+            let list: Vec<Value> = args["ids"]
+                .as_array()
+                .expect("Email/get ids")
+                .iter()
+                .map(|id| json!({ "id": id, "keywords": { "$seen": true } }))
+                .collect();
+            let response = json!({
+                "sessionState": "session-1",
+                "methodResponses": [[
+                    call[0],
+                    {
+                        "accountId": args["accountId"],
+                        "state": "mail-state-2",
+                        "list": list,
+                        "notFound": []
+                    },
+                    call[2]
+                ]]
+            });
+            Ok(Bytes::from(response.to_string()))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<Bytes, TransportError> {
+            Err(TransportError::new("hydration test does not upload"))
+        }
+
+        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
+            Err(TransportError::new("hydration test does not download"))
+        }
+
+        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
+            Err(TransportError::new(
+                "hydration test does not refresh session",
+            ))
+        }
+    }
+
+    fn hydration_session() -> crate::core::session::Session {
+        serde_json::from_value(json!({
+            "capabilities": {},
+            "accounts": {},
+            "primaryAccounts": {},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/api",
+            "downloadUrl": "https://example.test/dl/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/es",
+            "state": "session-1"
+        }))
+        .expect("session fixture parses")
+    }
 
     #[test]
     fn foreign_id_routes_to_the_foreign_account_and_strips_to_native() {
@@ -441,6 +594,68 @@ mod tests {
             HydrationRoute::Foreign("acct-9".to_string()),
             HydrationRoute::Foreign("acct-7".to_string())
         );
+    }
+
+    #[test]
+    fn later_items_do_not_reset_a_routes_max_wait_deadline() {
+        let first = tokio::time::Instant::now();
+        let max_wait = Duration::from_millis(100);
+        let mut buffer = PendingHydration::new(first);
+        buffer.push(
+            ObjectId("m1".to_string()),
+            first + Duration::from_millis(80),
+        );
+
+        assert_eq!(buffer.deadline(max_wait), first + max_wait);
+        assert!(buffer.due_at(first + max_wait, max_wait));
+    }
+
+    /// A single partial route must flush while its producer is still open.
+    /// Paused Tokio time advances to the policy deadline without wall-clock
+    /// sleeping, and the request remains scoped to the foreign account.
+    #[tokio::test(start_paused = true)]
+    async fn a_partial_route_flushes_at_max_wait_while_input_is_pending() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = crate::client::Client::with_transport(
+            HydrationTransport {
+                requests: Arc::clone(&requests),
+            },
+            hydration_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let mail = crate::account::Account::new(client.clone(), "primary");
+        let foreign_mail = Arc::new(HashMap::from([(
+            "shared".to_string(),
+            crate::account::Account::new(client, "shared"),
+        )]));
+        let foreign_id = ObjectId(super::super::foreign::encode_object("shared", "M1"));
+        let yielded_id = foreign_id.clone();
+        let input: AccountStream<ObjectId> = Box::pin(
+            futures::stream::once(async move { yielded_id }).chain(futures::stream::pending()),
+        );
+        let mut events = stream(
+            mail,
+            foreign_mail,
+            CoreLimits {
+                max_objects_in_get: 2,
+                max_objects_in_set: 2,
+            },
+            input,
+            Projection::FlagsOnly,
+        );
+
+        let event = events.next().await.expect("timed batch is emitted");
+        let SyncEvent::Batch(batch) = event else {
+            panic!("the timed route should produce a batch, got {event:?}");
+        };
+        assert_eq!(batch.items.len(), 1);
+        assert_eq!(outcome_id(&batch.items[0]), foreign_id.0.as_str());
+
+        let requests = requests.lock().expect("request log");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["methodCalls"][0][1]["accountId"], "shared");
+        assert_eq!(requests[0]["methodCalls"][0][1]["ids"], json!(["M1"]));
     }
 
     fn email(id: &str) -> crate::email::Email {

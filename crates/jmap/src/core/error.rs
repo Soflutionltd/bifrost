@@ -7,6 +7,7 @@ use serde::Deserialize;
 #[non_exhaustive]
 pub(crate) struct ProblemDetails {
     #[serde(rename = "type")]
+    #[serde(default = "default_problem_type")]
     p_type: ProblemType,
     status: Option<u32>,
     title: Option<String>,
@@ -37,6 +38,11 @@ pub(crate) enum JMAPError {
 pub(crate) enum ProblemType {
     JMAP(JMAPError),
     Other(String),
+}
+
+fn default_problem_type() -> ProblemType {
+    // RFC 7807 §3.1 assigns `about:blank` when the member is absent.
+    ProblemType::Other("about:blank".to_string())
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -233,5 +239,31 @@ impl Display for ProblemDetails {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProblemDetails, ProblemType};
+
+    #[test]
+    fn a_problem_without_type_defaults_to_about_blank_and_keeps_its_text() {
+        let problem: ProblemDetails = serde_json::from_value(serde_json::json!({
+            "status": 429,
+            "title": "Slow down",
+            "detail": "The account is over its request limit"
+        }))
+        .expect("RFC 7807 permits an omitted type");
+
+        assert!(matches!(
+            problem.error(),
+            ProblemType::Other(value) if value == "about:blank"
+        ));
+        assert_eq!(problem.status(), Some(429));
+        assert_eq!(problem.title(), Some("Slow down"));
+        assert_eq!(
+            problem.detail(),
+            Some("The account is over its request limit")
+        );
     }
 }

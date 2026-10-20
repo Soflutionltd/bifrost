@@ -261,6 +261,13 @@ pub fn response_read_error(
 
 /// Classify a non-2xx status the server answered.
 ///
+/// DAV deliberately overrides generic HTTP conflicts: 409, conditional-write
+/// 412, and lock refusal 423 require a state refresh. A 410 is cursor invalid
+/// only on sync-collection; that caller interprets it before this generic
+/// resource ladder. A 400/422 remains malformed and 408/502/503/504 unavailable,
+/// matching the shared HTTP classification. Synthetic member statuses pass an
+/// empty header map because a 207 member has no separate HTTP headers.
+///
 /// Every status here is one the server sent - on the response line, or as the
 /// member status of a 207 whose every response failed - so the error carries an
 /// ACKNOWLEDGED attempt, the transmission evidence `bifrost-net` stamps on the
@@ -270,11 +277,14 @@ pub fn response_read_error(
 /// and support exports, which claimed the request never left the process.
 #[must_use]
 pub fn status_error(
+    headers: &reqwest::header::HeaderMap,
     operation: AccountOperation,
     status: StatusCode,
     body: String,
     protocol: DavProtocol,
 ) -> AccountError {
+    let retry_hint =
+        bifrost_net::request::parse_retry_after_hint(headers.get(reqwest::header::RETRY_AFTER));
     let resource = protocol.resource();
     let kind = if status == StatusCode::UNAUTHORIZED {
         AccountErrorKind::Authentication(bifrost_types::AuthErrorKind::ReauthorizationRequired)
@@ -289,10 +299,12 @@ pub fn status_error(
         AccountErrorKind::ConcurrencyConflict
     } else if status == StatusCode::TOO_MANY_REQUESTS {
         AccountErrorKind::Server(ServerErrorKind::RateLimited)
-    } else if status == StatusCode::SERVICE_UNAVAILABLE {
+    } else if matches!(status.as_u16(), 408 | 502 | 503 | 504) {
         AccountErrorKind::Server(ServerErrorKind::Unavailable)
     } else if status == StatusCode::INSUFFICIENT_STORAGE {
         AccountErrorKind::Server(ServerErrorKind::QuotaExhausted)
+    } else if matches!(status.as_u16(), 400 | 422) {
+        AccountErrorKind::Request(RequestErrorKind::Malformed)
     } else {
         AccountErrorKind::Server(ServerErrorKind::Error {
             status: Some(status.as_u16()),
@@ -315,11 +327,16 @@ pub fn status_error(
     {
         Cause::State(StateCause::ConcurrencyConflict)
     } else if status == StatusCode::TOO_MANY_REQUESTS {
-        Cause::Server(ServerCause::RateLimited { retry_hint: None })
-    } else if status == StatusCode::SERVICE_UNAVAILABLE {
-        Cause::Server(ServerCause::Unavailable { retry_hint: None })
+        Cause::Server(ServerCause::RateLimited { retry_hint })
+    } else if matches!(status.as_u16(), 408 | 502 | 503 | 504) {
+        Cause::Server(ServerCause::Unavailable { retry_hint })
     } else if status == StatusCode::INSUFFICIENT_STORAGE {
-        Cause::Server(ServerCause::QuotaExhausted { retry_hint: None })
+        Cause::Server(ServerCause::QuotaExhausted { retry_hint })
+    } else if matches!(status.as_u16(), 400 | 422) {
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some(protocol.field()),
+            message: None,
+        })
     } else {
         Cause::Server(ServerCause::Error {
             status: Some(status.as_u16()),
@@ -333,6 +350,9 @@ pub fn status_error(
         .protocol(protocol.protocol())
         .operation(operation)
         .status(Some(status.as_u16()));
+    if matches!(status.as_u16(), 429 | 507) {
+        builder = builder.throttle_scope(bifrost_types::ThrottleScope::Account);
+    }
     let body = body.trim();
     if !body.is_empty() {
         builder = builder.text(DiagnosticText::support_only(body.to_string()));
@@ -342,6 +362,16 @@ pub fn status_error(
         .expect("valid account error classification")
 }
 
+// This is a DAV aggregation policy, not a general ordering of engine actions.
+// Its production inputs are multiget, filtered-query and directory-query legs:
+// HTTP failures, malformed XML, and member statuses. Cursor invalidation is
+// minted only by CalDAV sync_events, a single sync-collection REPORT whose
+// error propagates directly to the account; it never enters this fold. Neither
+// these legs nor their net context (which has no cursor scope) mint DisableScope.
+// Moving this policy onto RecoveryClass would imply an ordering valid for
+// unrelated engine directives without a reachable mixed-leg case to define it.
+// If a cursor-bearing leg is added, preserve its scope/action explicitly rather
+// than assuming this local severity table can order restart and termination.
 /// Keep whichever of two errors a consumer most needs to act on.
 ///
 /// A multi-leg REPORT can fail several ways at once; the surviving error is the
@@ -518,14 +548,106 @@ pub fn should_fallback_discovery(error: &AccountError, protocol: DavProtocol) ->
 mod tests {
     use super::*;
 
+    #[test]
+    fn status_headers_preserve_retry_timing_and_account_throttle_scope() {
+        use bifrost_types::{RetryHint, ThrottleScope};
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "300".parse().expect("valid header"),
+        );
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            for status in [429, 503, 507, 408, 502, 504] {
+                let error = status_error(
+                    &headers,
+                    AccountOperation::EventGet,
+                    StatusCode::from_u16(status).expect("valid status"),
+                    String::new(),
+                    protocol,
+                );
+                let hint = Some(RetryHint::After(std::time::Duration::from_secs(300)));
+                assert!(error.chain().iter().any(|cause| matches!(cause,
+                    Cause::Server(ServerCause::RateLimited { retry_hint }
+                        | ServerCause::Unavailable { retry_hint }
+                        | ServerCause::QuotaExhausted { retry_hint }) if *retry_hint == hint)));
+                let RecoveryClass::Retry(advice) = error.recovery() else {
+                    panic!("temporary/quota status must retain retry advice: {error:?}");
+                };
+                assert_eq!(advice.retry_hint, hint);
+                if matches!(status, 429 | 507) {
+                    assert_eq!(advice.throttle_scope, Some(ThrottleScope::Account));
+                }
+            }
+            for status in [400, 422] {
+                assert_eq!(
+                    status_error(
+                        &headers,
+                        AccountOperation::EventGet,
+                        StatusCode::from_u16(status).expect("valid status"),
+                        String::new(),
+                        protocol
+                    )
+                    .recovery(),
+                    &RecoveryClass::ClientBug
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn status_headers_preserve_absolute_and_elapsed_retry_dates() {
+        use bifrost_types::RetryHint;
+        // Fixed dates keep this independent of the wall clock. Both must stay At,
+        // even when the date has elapsed, rather than being dropped or relativized.
+        for (value, seconds) in [
+            ("Thu, 01 Jan 1970 00:00:00 GMT", 0),
+            ("Fri, 01 Jan 2100 00:00:00 GMT", 4_102_444_800),
+        ] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::RETRY_AFTER,
+                value.parse().expect("valid header"),
+            );
+            let hint = Some(RetryHint::At(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+            ));
+            for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+                for status in [429, 503, 507, 408, 502, 504] {
+                    let error = status_error(
+                        &headers,
+                        AccountOperation::EventGet,
+                        StatusCode::from_u16(status).expect("valid status"),
+                        String::new(),
+                        protocol,
+                    );
+                    assert!(error.chain().iter().any(|cause| matches!(cause,
+                        Cause::Server(ServerCause::RateLimited { retry_hint }
+                            | ServerCause::Unavailable { retry_hint }
+                            | ServerCause::QuotaExhausted { retry_hint }) if *retry_hint == hint)));
+                    let RecoveryClass::Retry(advice) = error.recovery() else {
+                        panic!("temporary/quota status must retain retry advice: {error:?}");
+                    };
+                    assert_eq!(advice.retry_hint, hint);
+                }
+            }
+        }
+    }
+
     /// Migrated from both crates, which each pinned it for one dialect. The
     /// probe falls back on "not a discovery endpoint" answers and only those: a
     /// credential refusal must still fail the open.
     #[test]
     fn discovery_falls_back_on_not_found_405_and_a_refused_redirect() {
         for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
-            let status =
-                |status| status_error(AccountOperation::Discover, status, String::new(), protocol);
+            let status = |status| {
+                status_error(
+                    &reqwest::header::HeaderMap::new(),
+                    AccountOperation::Discover,
+                    status,
+                    String::new(),
+                    protocol,
+                )
+            };
 
             assert!(!should_fallback_discovery(
                 &status(StatusCode::UNAUTHORIZED),
@@ -637,6 +759,7 @@ mod tests {
                 StatusCode::INSUFFICIENT_STORAGE,
             ] {
                 let error = status_error(
+                    &reqwest::header::HeaderMap::new(),
                     AccountOperation::EventCreate,
                     status,
                     String::new(),
@@ -674,6 +797,7 @@ mod tests {
             )));
 
             let unavailable = status_error(
+                &reqwest::header::HeaderMap::new(),
                 AccountOperation::EventCreate,
                 StatusCode::SERVICE_UNAVAILABLE,
                 String::new(),
@@ -685,6 +809,7 @@ mod tests {
                 unavailable.recovery()
             );
             let missing = status_error(
+                &reqwest::header::HeaderMap::new(),
                 AccountOperation::EventCreate,
                 StatusCode::NOT_FOUND,
                 String::new(),
@@ -699,6 +824,7 @@ mod tests {
     #[test]
     fn discovery_fallback_reads_the_dialects_own_not_found() {
         let contact_missing = status_error(
+            &reqwest::header::HeaderMap::new(),
             AccountOperation::Discover,
             StatusCode::NOT_FOUND,
             String::new(),
@@ -763,6 +889,7 @@ mod tests {
                 StatusCode::LOCKED,
             ] {
                 let error = status_error(
+                    &reqwest::header::HeaderMap::new(),
                     AccountOperation::EventUpdate,
                     status,
                     String::new(),
@@ -783,6 +910,7 @@ mod tests {
         for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
             let kind = |status| {
                 status_error(
+                    &reqwest::header::HeaderMap::new(),
                     AccountOperation::EventUpdate,
                     status,
                     String::new(),
@@ -807,6 +935,7 @@ mod tests {
     #[test]
     fn status_error_names_the_dialects_own_resource() {
         let calendar = status_error(
+            &reqwest::header::HeaderMap::new(),
             AccountOperation::EventGet,
             StatusCode::NOT_FOUND,
             String::new(),
@@ -817,6 +946,7 @@ mod tests {
             AccountErrorKind::NotFound(ResourceKind::Calendar)
         ));
         let contact = status_error(
+            &reqwest::header::HeaderMap::new(),
             AccountOperation::ContactGet,
             StatusCode::NOT_FOUND,
             String::new(),
@@ -898,6 +1028,7 @@ mod tests {
         for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
             let error = |status| {
                 status_error(
+                    &reqwest::header::HeaderMap::new(),
                     AccountOperation::EventSearch,
                     status,
                     "refused".to_string(),

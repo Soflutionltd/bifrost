@@ -171,6 +171,10 @@ pub(crate) async fn update(
                 .expect("valid account error classification"),
         );
     }
+    // This public door has no expected-version input. The fetched etag only
+    // guards the interval between this GET and PATCH; it cannot detect a
+    // caller's stale read from before this method began. Graph omitting an
+    // etag still leaves this write unconditional.
     let current = get(account.clone(), contact.clone()).await?;
     let etag = current.etag.clone();
     let prefix = account.client.api_path_prefix();
@@ -194,6 +198,8 @@ pub(crate) async fn delete(account: GraphAccount, contact: ContactId) -> Result<
             AccountOperation::ContactDelete,
         ));
     }
+    // Delete has no caller-version input either, so its conditional write
+    // covers only the GET-to-DELETE interval when Graph supplied an etag.
     let current = get(account.clone(), contact.clone()).await?;
     let prefix = account.client.api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&contact.0);
@@ -1345,6 +1351,62 @@ mod tests {
         let account =
             GraphAccount::new_for_tests(client.clone(), super::super::PushMode::GraphSubscriptions);
         (client, account)
+    }
+
+    /// The account API has no expected-etag parameter for contact writes, so
+    /// each operation can only condition its write on the etag from its own
+    /// preflight read. This pins both update and delete to that narrow guard.
+    #[tokio::test]
+    async fn contact_update_and_delete_use_their_immediate_read_etag() {
+        let client = crate::client::GraphClient::new("token");
+        client.script_rest([
+            crate::client::ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                serde_json::json!({
+                    "id": "contact-1",
+                    "@odata.etag": "W/\"update-version\""
+                }),
+            ),
+            crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+            crate::client::ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                serde_json::json!({
+                    "id": "contact-1",
+                    "@odata.etag": "W/\"delete-version\""
+                }),
+            ),
+            crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+        ]);
+        let account =
+            GraphAccount::new_for_tests(client.clone(), super::super::PushMode::GraphSubscriptions);
+        let contact = ContactId("contact-1".to_string());
+
+        update(
+            account.clone(),
+            contact.clone(),
+            ContactPatch {
+                display_name: Some(Some("Ada".to_string())),
+                ..ContactPatch::default()
+            },
+        )
+        .await
+        .expect("contact update");
+        delete(account, contact).await.expect("contact delete");
+
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[1].method, "PATCH");
+        assert_eq!(
+            requests[1].if_match.as_deref(),
+            Some("W/\"update-version\"")
+        );
+        assert_eq!(requests[2].method, "GET");
+        assert_eq!(requests[3].method, "DELETE");
+        assert_eq!(
+            requests[3].if_match.as_deref(),
+            Some("W/\"delete-version\"")
+        );
     }
 
     /// The token leak: a caller's page cursor naming another origin was

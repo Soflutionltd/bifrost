@@ -555,36 +555,6 @@ pub(super) async fn move_messages(
     submit_write_batch_with_targets(account, requests, &targets, false, operation).await
 }
 
-pub(super) async fn destroy_messages(
-    account: &GraphAccount,
-    ids: &[ObjectId],
-    operation: AccountOperation,
-) -> Result<(), AccountError> {
-    let values = message_values_for_ids(account, ids, "id,changeKey").await?;
-    let mut requests = Vec::new();
-    let mut targets = Vec::new();
-    // Route each permanentDelete by the caller-supplied (possibly foreign-encoded)
-    // routing id `ids[i]`, paired with its fetched etag `values[i]`.
-    for (index, (id, value)) in ids.iter().zip(values.iter()).enumerate() {
-        let mut headers = HashMap::new();
-        if let Some(etag) = graph_etag(value) {
-            headers.insert("If-Match".to_string(), etag);
-        }
-        requests.push(BatchRequestItem {
-            id: index.to_string(),
-            // This helper also serves delete_thread's already-in-Trash arm.
-            // Plain DELETE only advances mail into recoverable storage;
-            // permanentDelete is Graph's expunge action (retention still applies).
-            method: "POST".to_string(),
-            url: message_batch_url(account, id, "/permanentDelete", operation)?,
-            body: None,
-            headers: (!headers.is_empty()).then_some(headers),
-        });
-        targets.push(id.clone());
-    }
-    submit_write_batch_with_targets(account, requests, &targets, true, operation).await
-}
-
 pub(super) async fn message_values_for_ids(
     account: &GraphAccount,
     ids: &[ObjectId],

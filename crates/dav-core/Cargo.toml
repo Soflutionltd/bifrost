@@ -21,6 +21,7 @@ bifrost-types = { path = "../types" }
 bytes = { workspace = true }
 futures = { workspace = true }
 quick-xml = "0.42.0"
+tokio = { workspace = true, features = ["time"] }
 reqwest = { workspace = true, features = ["native-tls"] }
 
 [features]
@@ -32,4 +33,4 @@ test-support = ["bifrost-net/test-support"]
 # feature-gated for consumers and `cfg(test)`-enabled here; the seam it fronts
 # lives behind `bifrost-net/test-support`.
 bifrost-net = { path = "../net", features = ["test-support"] }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

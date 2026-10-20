@@ -277,6 +277,10 @@ pub(crate) fn send_message(
     request: SendRequest,
 ) -> AccountFuture<Result<ObjectId, AccountError>> {
     Box::pin(async move {
+        let _send_gate = account.send_gate.read().await;
+        if account.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(op_err(AccountOperation::Send)(Error::closed()));
+        }
         // Graph-style shared-mailbox send routing is not modeled over
         // SMTP (a shared-mailbox send is `request.from` + relay
         // authorization). Reject a `send_as` before the submission check
@@ -328,6 +332,10 @@ pub(crate) fn send_raw_message(
     save_to_sent: Option<bool>,
 ) -> AccountFuture<Result<ObjectId, AccountError>> {
     Box::pin(async move {
+        let _send_gate = account.send_gate.read().await;
+        if account.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(op_err(AccountOperation::Send)(Error::closed()));
+        }
         let Some(submission) = account.submission.clone() else {
             return Err(super::error::unsupported(AccountOperation::Send));
         };
@@ -357,6 +365,10 @@ pub(crate) fn draft_send(
     draft: DraftHandle,
 ) -> AccountFuture<Result<ObjectId, AccountError>> {
     Box::pin(async move {
+        let _send_gate = account.send_gate.read().await;
+        if account.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(op_err(AccountOperation::DraftSend)(Error::closed()));
+        }
         let Some(submission) = account.submission.clone() else {
             return Err(super::error::unsupported(AccountOperation::DraftSend));
         };

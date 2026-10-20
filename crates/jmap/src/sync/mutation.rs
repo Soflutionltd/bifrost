@@ -143,6 +143,14 @@ impl PendingRoute {
 
 /// Per-owner batching for one bulk mutation stream.
 ///
+/// This stays mutation-specific. Its `last_touch` is an input-count fairness
+/// bound, and each owner carries both wire targets and locally rejected
+/// outcomes. Hydration has no rejection lane and must wake on elapsed
+/// `BatchingPolicy.max_wait` while its input is pending; sharing would turn
+/// this helper into a timer-driven generic queue and change mutation's
+/// batching semantics. Keep the hydration timer local until the policy is
+/// carried through both account paths.
+///
 /// Two properties the flat `HashMap` + `Vec<String>` it replaced did not
 /// have, both of which only bite on multi-account (shared-mailbox) input:
 ///

@@ -1,5 +1,10 @@
 //! Google Calendar list, range, search, and event CRUD.
 //!
+//! The Account adapter does not select these futures against its shutdown
+//! token, so close cannot interrupt an active request. The adapter must wrap
+//! these futures with its token, or the token must be threaded into this
+//! module's operation boundaries.
+//!
 //! Audit boundary: the 2026-07 google bug sweep did NOT line-audit this
 //! module; it was skipped as already test-dense. A later auditor should read
 //! it fresh rather than assuming that sweep covered it.
@@ -7,12 +12,15 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+#[cfg(test)]
 use bifrost_types::{
-    AccountErrorBuilder, AccountErrorKind, AttemptCause, AttendeeRole, Calendar, CalendarEvent,
-    CalendarId, CalendarProvenance, Cause, DiagnosticText, EventAttendee, EventAvailability,
-    EventCreate, EventId, EventOrganizer, EventPatch, EventRange, EventRecurrence,
-    EventSearchRequest, EventStatus, EventTime, EventVisibility, Page, Protocol, ProtocolErrorKind,
-    ProtocolKind, RsvpStatus, TransmissionState, WireCause,
+    AccountErrorKind, Cause, Protocol, ProtocolErrorKind, TransmissionState, WireCause,
+};
+use bifrost_types::{
+    AttendeeRole, Calendar, CalendarEvent, CalendarId, CalendarProvenance, DiagnosticText,
+    EventAttendee, EventAvailability, EventCreate, EventId, EventOrganizer, EventPatch, EventRange,
+    EventRecurrence, EventSearchRequest, EventStatus, EventTime, EventVisibility, Page,
+    ProtocolKind, RsvpStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -246,7 +254,7 @@ pub(crate) fn update(
             .map_err(|error| {
                 let error = event_error(error, AccountOperation::EventUpdate, target_event_id);
                 if moved {
-                    event_move_patch_error(&error)
+                    event_move_patch_error(error)
                 } else {
                     error
                 }
@@ -860,19 +868,20 @@ fn is_blank_time(time: &EventTime) -> bool {
 // nothing applied, and that is an honest outcome on a create or a plain field
 // patch. It is NOT on an update that also moves the event to another
 // calendar: `events.move` has already succeeded when the field patch is
-// rejected, and the failure surfaces as `Protocol(PartialResponse)` with a
-// move that cannot be replayed. Since this guard runs before the move, the
-// shape rules below (a bare `YYYY-MM-DD` date for an all-day value, a full
-// RFC 3339 timestamp with an offset or a local date-time plus a `timezone`
-// for a timed one) turn the common bad-input cases into a refusal that strands
-// nothing.
+// rejected. The destination-scoped second-leg error retains its own recovery
+// class and carries support text recording the move. Since this guard runs
+// before the move, the shape rules below (a bare `YYYY-MM-DD` date for an
+// all-day value, a full RFC 3339 timestamp with an offset or a local
+// date-time plus a `timezone` for a timed one) turn the common bad-input cases
+// into a refusal that strands nothing.
 //
 // Accepted limit: the `timezone` NAME is not validated (that would need a
 // time-zone database this crate does not carry, and a false refusal is worse
 // than Google's 400), and neither are calendar-valid corner cases beyond what
 // the date and timestamp parsers reject. An unknown zone name combined with a
-// calendar move can therefore still end as a `PartialResponse`; that is
-// documented in `reference/google.md`, not duplicated validation.
+// calendar move can therefore still leave the event moved with a failed
+// destination patch; the second-leg error retains its classification and
+// names the successful move in support diagnostics.
 //
 // `is_all_day` is the write's all-day flag when it states one; when it does
 // not (a patch that leaves it unset) each value is judged by its own shape,
@@ -1048,75 +1057,28 @@ fn event_move_url(
     )
 }
 
-// Reclassify a destination-side PATCH failure that followed a
-// successful `events.move`. The primary kind changes, so the error
-// model requires a fresh builder rather than `into_builder`, which is
-// a decoration path only. Everything a consumer or a support export
-// would otherwise lose is copied across by hand: the scope (which now
-// names the event in its destination calendar), the provenance, the
-// transport diagnostics, the tagged diagnostic text, and the whole
-// original cause chain as secondary evidence. A `Reconcile` directive
-// that does not say what to reconcile is barely better than the silent
-// partial write it replaces.
-//
-// The non-atomicity itself is accepted, not open: Google exposes the move
-// and the field PATCH as two separate requests, so there is no atomic
-// composite to call. No compensating move back to the source calendar is
-// attempted either - that is another blind write (these calendar mutations
-// carry no `If-Match`) with its own partial-failure window, and its own
-// failure would leave the consumer with a less legible story than the
-// `Protocol(PartialResponse)` plus acknowledged first-leg evidence it gets
-// here. It would change only if Google published an atomic move-and-patch.
-// See "Google Calendar" in `reference/google.md`.
-fn event_move_patch_error(error: &AccountError) -> AccountError {
-    let consented = error.support_consented();
-    let telemetry = &consented.telemetry;
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: telemetry.protocol.unwrap_or(Protocol::Gmail),
-            detail: Some(DiagnosticText::support_only(
-                "event move succeeded but the destination field patch failed",
-            )),
-        }),
-    )
-    .protocol(telemetry.protocol.unwrap_or(Protocol::Gmail))
-    .operation(AccountOperation::EventUpdate)
-    // The generic known-id EventUpdate is an absolute-state write and is
-    // idempotent. This composite path has already completed events.move,
-    // however, so replaying the whole request would apply a second move.
-    .idempotency_override(false)
-    .status(telemetry.status)
-    .push_cause(Cause::Attempt(AttemptCause::new(
-        TransmissionState::Acknowledged,
-    )));
-    if let Some(scope) = consented.scope {
-        builder = builder.scope(scope.clone());
-    }
-    if let Some(provider) = telemetry.provider {
-        builder = builder.provider(provider);
-    }
-    if let Some(request_id) = telemetry.request_id {
-        builder = builder.request_id(request_id);
-    }
-    if let Some(trace_id) = telemetry.trace_id {
-        builder = builder.trace_id(trace_id);
-    }
-    if let Some(native_code) = telemetry.native_code {
-        builder = builder.native_code(native_code);
-    }
-    for text in &consented.user_safe_text {
-        builder = builder.text(DiagnosticText::user_safe(*text));
-    }
-    for text in &consented.support_text {
-        builder = builder.text(DiagnosticText::support_only(*text));
-    }
-    for cause in error.chain().iter() {
-        builder = builder.push_cause(cause.clone());
-    }
-    builder
+// Record the successful first leg as support context while preserving the
+// second leg's classification. Replacing it with PartialResponse would change
+// recovery, turning a permanent 403 into reconciliation and discarding a 429
+// retry deadline. `event_error` already scopes the PATCH failure to the event
+// in its destination calendar. The public diagnostic supplies the continuation:
+// retry recovery applies to that destination PATCH, not the original composite
+// operation. Passing the destination id with the original patch skips the move.
+// Keep identifiers in the typed scope rather than diagnostic text.
+fn event_move_patch_error(error: AccountError) -> AccountError {
+    error
+        .into_builder()
+        .text(DiagnosticText::user_safe(
+            "The calendar move is already committed, but the field update failed. \
+             If recovery permits retrying, call event_update with the destination event id \
+             in this error's Calendar scope and the original patch. Do not retry with the \
+             original source event id. Retry advice and timing apply to the destination patch.",
+        ))
+        .text(DiagnosticText::support_only(
+            "event move succeeded but the destination field patch failed",
+        ))
         .try_build()
-        .expect("valid Calendar move partial-response classification")
+        .expect("valid decorated Calendar move error")
 }
 
 fn event_patch_has_non_move_fields(patch: &EventPatch) -> bool {
@@ -1485,7 +1447,7 @@ struct GoogleAttendee {
 mod tests {
     use bifrost_net::test_support::{Canned, ScriptedDispatch};
     use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource};
-    use bifrost_types::{ReconcileReason, RecoveryClass};
+    use bifrost_types::RecoveryClass;
     use bytes::Bytes;
     use reqwest::StatusCode;
 
@@ -2202,31 +2164,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_patch_after_move_reports_partial_completion() {
+    async fn failed_patch_after_move_keeps_its_classification_and_records_the_move() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::HeaderName::from_static("x-goog-request-id"),
             reqwest::header::HeaderValue::from_static("req-77"),
         );
+        let denied_body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "error": {
+                    "code": 403,
+                    "message": "denied",
+                    "errors": [{"reason": "forbidden", "message": "denied"}]
+                }
+            }))
+            .expect("fixture serializes"),
+        );
+        let denied = || Canned::Response {
+            status: StatusCode::FORBIDDEN,
+            headers: headers.clone(),
+            body: denied_body.clone(),
+        };
         let (client, script) = scripted_client(vec![
             canned_json(StatusCode::OK, json!({"id": "event-1"})),
-            Canned::Response {
-                status: StatusCode::FORBIDDEN,
-                headers,
-                body: Bytes::from(
-                    serde_json::to_vec(&json!({
-                        "error": {
-                            "code": 403,
-                            "message": "denied",
-                            "errors": [{"reason": "forbidden", "message": "denied"}]
-                        }
-                    }))
-                    .expect("fixture serializes"),
-                ),
-            },
+            denied(),
         ]);
+        let (direct_client, direct_script) = scripted_client(vec![denied()]);
         let patch = EventPatch {
             calendar_id: Some(CalendarId("destination".to_string())),
+            title: Some(Some("Updated".to_string())),
+            ..EventPatch::default()
+        };
+        let direct_patch = EventPatch {
             title: Some(Some("Updated".to_string())),
             ..EventPatch::default()
         };
@@ -2234,35 +2203,35 @@ mod tests {
         let error = update(client, EventId("source::event-1".to_string()), patch)
             .await
             .expect_err("destination patch fails");
+        let direct_error = update(
+            direct_client,
+            EventId("destination::event-1".to_string()),
+            direct_patch,
+        )
+        .await
+        .expect_err("the same patch fails without a move");
 
         assert!(matches!(
             error.kind(),
-            AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
+            AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PermissionDenied)
         ));
-        assert!(matches!(
-            error.recovery(),
-            RecoveryClass::Reconcile(advice)
-                if advice.reason == ReconcileReason::PartialCompletionSignal
-        ));
+        assert_eq!(error.kind(), direct_error.kind());
+        assert_eq!(error.recovery(), direct_error.recovery());
+        assert_eq!(error.message_key(), direct_error.message_key());
         assert!(error.chain().iter().any(|cause| matches!(
             cause,
             Cause::Attempt(attempt)
                 if attempt.transmission_state == TransmissionState::Acknowledged
         )));
 
-        // The whole value of the PartialResponse classification is that
-        // the consumer can act on it: the scope must name the moved
-        // event where it now lives, not the composite id it arrived
-        // under.
         assert_eq!(
             error.scope(),
             Some(&bifrost_types::ErrorScope::Calendar {
                 id: ("destination::event-1".to_string()).into()
             })
         );
+        assert_eq!(error.scope(), direct_error.scope());
 
-        // The reclassification must not discard the underlying
-        // transport evidence.
         let telemetry = error.telemetry_fields();
         assert_eq!(telemetry.status, Some(403));
         assert_eq!(telemetry.request_id, Some("req-77"));
@@ -2275,11 +2244,17 @@ mod tests {
                 .support_text
                 .iter()
                 .any(|text| text.contains("denied")),
-            "the provider's own diagnostic text must survive reclassification"
+            "the provider's own diagnostic text must survive decoration"
+        );
+        assert!(
+            error
+                .support_consented()
+                .support_text
+                .iter()
+                .any(|text| text.contains("event move succeeded")),
+            "support diagnostics record the completed first leg"
         );
 
-        // The original failure survives as secondary evidence rather
-        // than being replaced by the reclassification.
         assert!(
             error
                 .chain()
@@ -2291,6 +2266,127 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].method, reqwest::Method::POST);
         assert_eq!(requests[1].method, reqwest::Method::PATCH);
+        assert_eq!(direct_script.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_after_move_continues_at_destination_without_repeating_move() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("42"),
+        );
+        let rate_limited = Canned::Response {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            headers,
+            body: Bytes::from(
+                serde_json::to_vec(&json!({
+                    "error": {
+                        "code": 429,
+                        "message": "rate limited",
+                        "errors": [{"reason": "rateLimitExceeded", "message": "slow down"}]
+                    }
+                }))
+                .expect("fixture serializes"),
+            ),
+        };
+        let (client, script) = scripted_client(vec![
+            canned_json(StatusCode::OK, json!({"id": "event-1"})),
+            rate_limited,
+            canned_json(StatusCode::OK, json!({"id": "event-1"})),
+        ]);
+        let patch = EventPatch {
+            calendar_id: Some(CalendarId("destination".to_string())),
+            title: Some(Some("Updated".to_string())),
+            ..EventPatch::default()
+        };
+
+        let error = update(
+            std::sync::Arc::clone(&client),
+            EventId("source::event-1".to_string()),
+            patch.clone(),
+        )
+        .await
+        .expect_err("destination patch is rate limited");
+
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Server(bifrost_types::ServerErrorKind::RateLimited)
+        ));
+        let RecoveryClass::Retry(advice) = error.recovery() else {
+            panic!("the failed second leg retains retry recovery");
+        };
+        assert!(matches!(
+            advice.retry_hint,
+            Some(bifrost_types::RetryHint::At(_))
+        ));
+        assert!(
+            error
+                .support_consented()
+                .support_text
+                .iter()
+                .any(|text| text.contains("event move succeeded")),
+            "the move context is added without replacing the retry hint"
+        );
+        assert_eq!(
+            advice.disposition,
+            bifrost_types::RetryDisposition::SameRequest
+        );
+        assert!(error.user_safe_text().any(|text| {
+            text.contains("already committed")
+                && text.contains("destination event id")
+                && text.contains("Do not retry")
+        }));
+        let Some(bifrost_types::ErrorScope::Calendar { id }) = error.scope() else {
+            panic!("continuation must name the destination event");
+        };
+        assert_eq!(id.0, "destination::event-1");
+        // Follow the public continuation with the ORIGINAL patch, including
+        // calendar_id. This must send only PATCH, never another events.move.
+        update(client, EventId(id.0.clone()), patch)
+            .await
+            .expect("destination continuation succeeds");
+        let requests = script.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].method, reqwest::Method::POST);
+        assert_eq!(requests[1].method, reqwest::Method::PATCH);
+        assert_eq!(requests[2].method, reqwest::Method::PATCH);
+        assert_eq!(requests[1].url, requests[2].url);
+        assert_eq!(requests[1].body, requests[2].body);
+    }
+
+    #[tokio::test]
+    async fn auth_failure_after_move_keeps_auth_recovery_and_public_continuation() {
+        let (client, script) = scripted_client(vec![
+            canned_json(StatusCode::OK, json!({"id": "event-1"})),
+            canned_json(
+                StatusCode::UNAUTHORIZED,
+                json!({"error": {"code": 401, "message": "authentication required"}}),
+            ),
+            canned_json(
+                StatusCode::UNAUTHORIZED,
+                json!({"error": {"code": 401, "message": "authentication required"}}),
+            ),
+        ]);
+        let patch = EventPatch {
+            calendar_id: Some(CalendarId("destination".to_string())),
+            title: Some(Some("Updated".to_string())),
+            ..EventPatch::default()
+        };
+        let error = update(client, EventId("source::event-1".to_string()), patch)
+            .await
+            .expect_err("destination patch requires authentication");
+        assert!(
+            matches!(error.recovery(), RecoveryClass::AuthLost),
+            "expected terminal auth recovery, got {:?} for {:?} with {:?}",
+            error.recovery(),
+            error.kind(),
+            error.chain()
+        );
+        assert!(error.user_safe_text().any(|text| {
+            text.contains("already committed") && text.contains("destination event id")
+        }));
+        assert_eq!(script.requests().len(), 3);
     }
 
     /// Local patch validation is purely a function of the patch, so it
@@ -2931,9 +3027,8 @@ mod tests {
     }
 
     /// The reason the shape check exists: with a calendar move in the same
-    /// update, Google's own 400 would arrive AFTER `events.move` succeeded
-    /// and surface as a non-replayable `PartialResponse`. Fails if the shape
-    /// check is removed: the move request would be issued.
+    /// update, Google's own 400 would arrive AFTER `events.move` succeeded.
+    /// Fails if the shape check is removed: the move request would be issued.
     #[tokio::test]
     async fn update_with_a_malformed_end_and_a_move_is_refused_before_the_move() {
         let (client, script) = scripted_client(Vec::new());

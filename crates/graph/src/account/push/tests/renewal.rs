@@ -366,6 +366,70 @@ async fn a_vanished_subscription_is_recreated_and_reconnected_on_the_next_tick()
     account.shutdown.cancel();
 }
 
+/// If the folder disappeared with the old subscription, replacement creation
+/// returns 404. That error is terminal: retain the stale row for teardown,
+/// mark it terminated, and do not repeat the doomed POST on later ticks.
+#[tokio::test(start_paused = true)]
+async fn a_missing_resource_on_recreate_terminates_the_subscription_row() {
+    let client = GraphClient::new("token");
+    let not_found = || {
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "error": { "code": "ResourceNotFound", "message": "resource is gone" }
+            }),
+        )
+    };
+    client.script_rest([not_found(), not_found()]);
+    let mut account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    account.push_endpoint = Some(PushEndpoint {
+        webhook_url: "https://example.test/hook".to_string(),
+        client_state: "secret".to_string(),
+    });
+    let mut events = account.push_tx.subscribe();
+    let handle = SubscriptionHandle("h".to_string());
+    let resource = "/me/mailFolders/deleted-folder/messages";
+    account.graph_subscriptions.write().await.insert(
+        handle.clone(),
+        GraphSubscriptionGroup::live(vec![expiring("stale", resource)]),
+    );
+
+    ensure_graph_worker(account.clone()).await;
+    for _ in 0..64 {
+        let terminated = account
+            .graph_subscriptions
+            .read()
+            .await
+            .get(&handle)
+            .is_some_and(|group| group.subscriptions[0].terminated);
+        if terminated {
+            break;
+        }
+        tokio::time::advance(RENEWAL_CHECK_INTERVAL + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+    }
+
+    {
+        let groups = account.graph_subscriptions.read().await;
+        let group = groups.get(&handle).expect("stale row stays for teardown");
+        assert_eq!(group.subscriptions.len(), 1);
+        assert_eq!(group.subscriptions[0].server_id, "stale");
+        assert!(group.subscriptions[0].terminated);
+    }
+    let Ok(WatchEvent::Terminated(error)) = events.try_recv() else {
+        panic!("a terminal recreate refusal reaches the push stream");
+    };
+    assert!(error.recovery().is_terminal());
+    assert_eq!(client.wire_attempts(), 2, "one PATCH and one failed create");
+
+    tokio::time::advance(RENEWAL_CHECK_INTERVAL + Duration::from_secs(1)).await;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(client.wire_attempts(), 2, "terminated rows are not retried");
+    account.shutdown.cancel();
+}
+
 /// One `Reconnected` per TICK, not per recreated subscription.
 ///
 /// `Reconnected` is account-wide: the engine's push reconciler answers it

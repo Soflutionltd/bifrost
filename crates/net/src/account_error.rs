@@ -22,7 +22,7 @@ use reqwest::{
 };
 
 use crate::error::{Error, FinalResponse, RangeFailureKind};
-use crate::request::parse_retry_after;
+use crate::request::parse_retry_after_hint;
 
 #[derive(Clone, Debug)]
 pub struct NetErrorContext {
@@ -41,6 +41,12 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
             may_have_committed,
         } => {
             let terminal = into_account_error(*source, ctx.clone());
+            let rejected_unauthorized: Vec<_> = attempts
+                .iter()
+                .map(|attempt| {
+                    matches!(attempt, Error::Status { code, .. } if *code == StatusCode::UNAUTHORIZED)
+                })
+                .collect();
             let previous: Vec<_> = attempts
                 .into_iter()
                 .map(|error| into_account_error(error, ctx.clone()))
@@ -59,12 +65,26 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
                 _ => None,
             });
             let inflight = may_have_committed || states.contains(&TransmissionState::InFlight);
-            let acknowledged = states.contains(&TransmissionState::Acknowledged);
+            let acknowledged_may_have_committed = previous.iter().zip(&rejected_unauthorized).any(
+                |(error, rejected_unauthorized)| {
+                    // A 401 rejects this attempt before authentication. Its
+                    // auth cause remains in the chain, but it cannot make a
+                    // later local or token-refresh failure ambiguous about
+                    // the mutation.
+                    !*rejected_unauthorized
+                        && error.chain().iter().any(|cause| {
+                            matches!(cause, Cause::Attempt(a)
+                                if a.transmission_state == TransmissionState::Acknowledged)
+                        })
+                },
+            ) || terminal_state
+                == Some(TransmissionState::Acknowledged);
             // A later auth, policy, or admission failure cannot establish the
             // outcome of an earlier mutation. PartialResponse is the existing
             // reconcile-required lane for an incomplete logical exchange.
-            let reclassified =
-                inflight || (acknowledged && terminal_state == Some(TransmissionState::Unsent));
+            let reclassified = inflight
+                || (acknowledged_may_have_committed
+                    && terminal_state == Some(TransmissionState::Unsent));
             let mut builder = if reclassified {
                 partial_response(
                     &ctx,
@@ -78,14 +98,24 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
                 .into_builder()
             } else {
                 let builder = terminal.clone().into_builder();
-                if acknowledged && terminal_state.is_none() {
+                if acknowledged_may_have_committed && terminal_state.is_none() {
                     push_attempt(builder, TransmissionState::Acknowledged)
                 } else {
                     builder
                 }
             };
-            for error in &previous {
+            for (error, rejected_unauthorized) in previous.iter().zip(&rejected_unauthorized) {
                 for cause in error.chain().iter() {
+                    // Keep the rejected-auth cause, but do not attach an
+                    // acknowledged transmission to a later transport retry:
+                    // the builder correctly refuses to classify a transport
+                    // failure with acknowledged transmission evidence.
+                    if *rejected_unauthorized
+                        && matches!(cause, Cause::Attempt(a)
+                            if a.transmission_state == TransmissionState::Acknowledged)
+                    {
+                        continue;
+                    }
                     builder = builder.push_cause(cause.clone());
                 }
             }
@@ -412,14 +442,12 @@ fn rate_limited(
     retry_after: Option<Duration>,
     final_response: &FinalResponse,
 ) -> AccountError {
-    let retry_after =
-        retry_after.or_else(|| parse_retry_after(final_response.headers.get(RETRY_AFTER)));
+    let retry_hint = parse_retry_after_hint(final_response.headers.get(RETRY_AFTER))
+        .or_else(|| retry_after.map(RetryHint::After));
     let mut builder = base_builder(
         ctx,
         AccountErrorKind::Server(ServerErrorKind::RateLimited),
-        Cause::Server(ServerCause::RateLimited {
-            retry_hint: retry_after.map(RetryHint::After),
-        }),
+        Cause::Server(ServerCause::RateLimited { retry_hint }),
     );
     builder = push_attempt(builder, TransmissionState::Acknowledged);
     builder = response_diagnostics(
@@ -442,8 +470,9 @@ fn status_error(
     retry_hint_param: Option<Duration>,
 ) -> AccountError {
     let code = status.as_u16();
-    let retry_after = retry_hint_param.or_else(|| parse_retry_after(headers.get(RETRY_AFTER)));
-    let (kind, cause, throttle) = status_kind_cause(ctx, code, body, retry_after);
+    let retry_hint = parse_retry_after_hint(headers.get(RETRY_AFTER))
+        .or_else(|| retry_hint_param.map(RetryHint::After));
+    let (kind, cause, throttle) = status_kind_cause(ctx, code, body, retry_hint);
     let mut builder = base_builder(ctx, kind, cause);
     builder = push_attempt(builder, TransmissionState::Acknowledged);
     builder = response_diagnostics(builder, status, headers, body);
@@ -457,7 +486,7 @@ fn status_kind_cause(
     ctx: &NetErrorContext,
     code: u16,
     body: &Bytes,
-    retry_after: Option<Duration>,
+    retry_hint: Option<RetryHint>,
 ) -> (AccountErrorKind, Cause, bool) {
     match code {
         400 | 422 => {
@@ -504,23 +533,17 @@ fn status_kind_cause(
         410 => server_error(code),
         408 | 502 | 503 | 504 => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable {
-                retry_hint: retry_after.map(RetryHint::After),
-            }),
+            Cause::Server(ServerCause::Unavailable { retry_hint }),
             false,
         ),
         429 => (
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited {
-                retry_hint: retry_after.map(RetryHint::After),
-            }),
+            Cause::Server(ServerCause::RateLimited { retry_hint }),
             true,
         ),
         507 => (
             AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-            Cause::Server(ServerCause::QuotaExhausted {
-                retry_hint: retry_after.map(RetryHint::After),
-            }),
+            Cause::Server(ServerCause::QuotaExhausted { retry_hint }),
             true,
         ),
         500..=599 => server_error(code),
@@ -844,9 +867,8 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
             retry_after,
             final_response,
         } => Some(Cause::Server(ServerCause::RateLimited {
-            retry_hint: (*retry_after)
-                .or_else(|| parse_retry_after(final_response.headers.get(RETRY_AFTER)))
-                .map(RetryHint::After),
+            retry_hint: parse_retry_after_hint(final_response.headers.get(RETRY_AFTER))
+                .or_else(|| retry_after.map(RetryHint::After)),
         })),
         Error::RetryBudgetExhausted {
             final_response: Some(response),
@@ -889,13 +911,62 @@ fn server_cause_from_status(
     retry_after_header: Option<&reqwest::header::HeaderValue>,
     retry_hint_param: Option<Duration>,
 ) -> Option<Cause> {
-    let retry_after = retry_hint_param.or_else(|| parse_retry_after(retry_after_header));
-    let retry_hint = retry_after.map(RetryHint::After);
+    let retry_hint = parse_retry_after_hint(retry_after_header)
+        .or_else(|| retry_hint_param.map(RetryHint::After));
     match code {
         408 | 502 | 503 | 504 => Some(Cause::Server(ServerCause::Unavailable { retry_hint })),
         429 => Some(Cause::Server(ServerCause::RateLimited { retry_hint })),
         507 => Some(Cause::Server(ServerCause::QuotaExhausted { retry_hint })),
         500..=599 => Some(Cause::Server(ServerCause::Error { status: Some(code) })),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod retry_hint_tests {
+    use super::*;
+    use bifrost_types::RecoveryClass;
+
+    #[test]
+    fn final_http_date_survives_status_and_exhausted_errors() {
+        let date = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let at = httpdate::parse_http_date(date).expect("fixed HTTP-date");
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, reqwest::header::HeaderValue::from_static(date));
+        let response = FinalResponse {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            headers: headers.clone(),
+            body: Bytes::new(),
+        };
+        let errors = [
+            Error::Status {
+                code: StatusCode::SERVICE_UNAVAILABLE,
+                headers,
+                body: Bytes::new(),
+            },
+            Error::RateLimited {
+                retry_after: Some(Duration::from_secs(1)),
+                final_response: response.clone(),
+            },
+            Error::RetryBudgetExhausted {
+                retry_after_history: vec![Duration::from_secs(1)],
+                final_response: Some(response),
+            },
+        ];
+        for error in errors {
+            let error = into_account_error(
+                error,
+                NetErrorContext {
+                    provider: None,
+                    protocol: Protocol::Jmap,
+                    operation: AccountOperation::SyncChanges,
+                    scope: None,
+                },
+            );
+            let RecoveryClass::Retry(advice) = error.recovery() else {
+                panic!("expected retry: {:?}", error.recovery());
+            };
+            assert_eq!(advice.retry_hint, Some(RetryHint::At(at)));
+        }
     }
 }

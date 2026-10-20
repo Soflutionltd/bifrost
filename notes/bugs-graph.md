@@ -41,66 +41,22 @@ at risk: event scopes are advertised as delta-synced ("event deltas per
 
 ## GRAPH-006 - Contact and calendar `If-Match` protects nothing the caller can see
 
-`contacts.rs update` / `delete` and `calendar.rs` update / delete GET the
-object, then immediately send `If-Match` with the fetched etag, covering only
-the milliseconds between GET and PATCH. A caller doing read-modify-write from
-an older read (the normal UI flow, and the echo pattern the reference describes
-for events) overwrites a concurrent server edit with no conflict; when the
-fetch returns no etag the write goes unconditional silently. The reference
-calls this "fetch-then-`If-Match`", but the module summary sells "`If-Match`
-etag mutations", and the mail lane gets real optimistic concurrency from the
-cached etag. Either thread the caller's version (`ContactCard` /
-`CalendarEvent` etag) through, or drop the concurrency-protection claim.
+Needs an API ruling. Contact and calendar writes still fetch the object and
+condition the write on that fresh read, which covers only the milliseconds
+between GET and PATCH; the public methods accept no caller version and delete
+takes only an id. Real optimistic concurrency means threading the caller's etag
+(`ContactCard` / `CalendarEvent`) through the shared patch types and `Account`
+methods. The limit is documented in code and `reference/graph.md`.
 
-## GRAPH-008 - Renewal recreate treats a 404 for a missing resource as "subscription gone"
+## GRAPH-011 - Two delta observations that need an engine contract
 
-`subscription_is_gone` treats any 404 or 410 on `PATCH /subscriptions/{id}` as
-recreate. A recreate POST for a resource whose folder was deleted then 404s
-too, surfacing as `phase = "recreate"`, `Server(Error 404)` or
-`NotFound(Mailbox)`, terminal or retry-forever depending on mapping. If
-retryable, the worker issues a doomed PATCH plus POST every tick until reopen,
-because the stale row is kept deliberately. Pin the folder-deleted recreate as
-terminal (with `mark_subscription_terminated`) with a test.
+- `changes_stream` reports every non-removed delta value as `Updated` with
+  `ScopeChange::Added`, never `Created`: Graph delta cannot tell create from
+  update and the account holds no per-scope id set to compare. Documented, with
+  a test pinning the shape. `reference/sync.md` does not say how a consumer
+  treats `Updated` for an unknown id; settle that.
+- Inventory drops `@removed` values apart from mail etag eviction, so a removal
+  between pages of a resumed inventory reaches the engine only if the following
+  delta repeats it. Forwarding removals needs a shared inventory event and an
+  engine contract that can represent them.
 
-## GRAPH-009 - A mid-inventory cursor with its outer marker cleared reseeds the whole account
-
-`cursor.rs decode_cursor` makes the outer `ChangeCursor::advanced_through`
-authoritative, including clearing it. `inventory_stream_from` then sees
-`inventory_in_progress = true` with no marker and terminates with
-`CursorError::SchemaIncompatible`, which per the v2 comment "derives
-`Engine(SchemaIncompatible)`: the engine drops every durable cursor". One
-scope's ambiguous position wipes every scope on the account. `changes_stream`
-uses `InventoryInProgress` (scoped restart) for the sibling case, and
-`CursorError`'s own doc for that variant says scope-local restart is the point;
-use it (or another scope-local arm) here. The sibling-arm shape from AGENTS.md;
-compare SYNC-004 for the engine's own scope-less schema reset.
-
-## GRAPH-011 - Smaller graph observations
-
-- `changes_stream` emits `ObjectChange::Updated` plus `ScopeChange::Added` for
-  every non-removed delta value, including items new to the scope, and never
-  `Created`. If the engine treats `Updated` on an unknown id differently from
-  creation, new mail reads as an update; check against `reference/sync.md`'s
-  `ObjectChangeKind` semantics.
-- `inventory_stream_from` ignores `@removed` values except for etag eviction.
-  On a RESUMED inventory (v4 page cursor) a removal between pages never reaches
-  the engine during inventory and relies on the following delta walk to repeat
-  it, which Graph does not guarantee for an item the enumeration already
-  reported as removed.
-- `changes.rs` stores the BARE id as `last_seen_id` in the page marker while
-  inventory stores the encoded id. Documented as deliberate and unread for
-  resume, but one field name with two encodings in one persisted type will bite
-  its first reader.
-- `client.rs` `execute_wire` sets `Content-Type` on every request, including
-  bodyless GET and DELETE. Google's `execute` has an explicit comment that this
-  "announced a JSON body on bodyless GET and DELETE requests" and was removed
-  there; Graph still does it. (From net adoption.)
-- `delete_thread` applies the caller's container-based decision to every
-  conversation member, so a thread destroyed from Trash can permanently delete
-  members that live elsewhere (compare the JMAP thread-destroy entry).
-- A destroy subresponse with status 404 reports `Skipped` but leaves the cached
-  etags for that id in `etag_index`.
-- The shared-thread test's failure diagnostic indexes `shared_requests[4]` after
-  asserting only three requests.
-- Calendar update still sends the raw `current.change_key` as `If-Match`, the
-  bare form the mail etag cache no longer uses; wrap it the same way.

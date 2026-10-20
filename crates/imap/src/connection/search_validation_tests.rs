@@ -269,3 +269,72 @@ fn plain_criteria_need_no_capability() {
             .is_ok()
     );
 }
+
+#[tokio::test]
+async fn queued_search_uses_capabilities_received_by_preceding_command() {
+    use crate::connection::test_support::{
+        driver_pair, preauth_greeting, read_line, respond, select_inbox, tag_of,
+    };
+    use std::time::Duration;
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    select_inbox(&conn, &mut server).await;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+    let script = tokio::spawn(async move {
+        let noop = read_line(&mut server).await;
+        let noop_tag = tag_of(&noop).to_owned();
+        ready_tx.send(()).unwrap();
+        queued_rx.await.unwrap();
+        respond(
+            &mut server,
+            &format!("* CAPABILITY IMAP4rev1 WITHIN\r\n{noop_tag} OK done\r\n"),
+        )
+        .await;
+        let search = read_line(&mut server).await;
+        assert!(search.contains("UID SEARCH OLDER 1"));
+        let search_tag = tag_of(&search).to_owned();
+        respond(
+            &mut server,
+            &format!("* SEARCH 1\r\n{search_tag} OK done\r\n"),
+        )
+        .await;
+    });
+    let search = async {
+        ready_rx.await.unwrap();
+        queued_tx.send(()).unwrap();
+        conn.uid_search("OLDER 1", Duration::from_secs(5)).await
+    };
+    let (noop, search) = tokio::join!(conn.noop(Duration::from_secs(5)), search);
+    if search.is_err() {
+        script.abort();
+    }
+    noop.unwrap();
+    search.unwrap();
+    script.await.unwrap();
+}
+
+#[tokio::test]
+async fn literal_operand_uses_shared_framing_without_becoming_a_capability_key() {
+    use crate::connection::test_support::{
+        driver_pair, preauth_greeting, read_line, respond, select_inbox, tag_of,
+    };
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 LITERAL+")).await;
+    select_inbox(&conn, &mut server).await;
+    let script = async {
+        let command = read_line(&mut server).await;
+        assert!(command.ends_with("BODY {6+}\r\n"));
+        let tag = tag_of(&command).to_owned();
+        let mut payload = [0; 6];
+        server.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"MODSEQ");
+        assert_eq!(read_line(&mut server).await, "\r\n");
+        respond(&mut server, &format!("* SEARCH 1\r\n{tag} OK done\r\n")).await;
+    };
+    let (search, ()) = tokio::join!(
+        conn.uid_search("BODY {0006+}\r\nMODSEQ", Duration::from_secs(5)),
+        script,
+    );
+    search.unwrap();
+}

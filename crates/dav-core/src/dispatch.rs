@@ -19,19 +19,26 @@
 //!   origin discovery never admitted is refused locally.
 //! - Bearer injection is opted out with `without_bearer_auth`. The credential
 //!   has to pass the origin gate before it is minted, which is a decision this
-//!   crate makes and the transport cannot.
+//!   crate makes and the transport cannot. A 401 is refreshed once here with
+//!   the exact rejected token, under the same total deadline as every hop.
+//!
+//! Keeping this walk local also keeps the dialect target guard and MOVE
+//! Destination rebasing together. A transport credential callback alone would
+//! not replace those policies; adding one is unnecessary for these contracts.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine as _;
 use bifrost_net::{
-    AccountNet, AccountSpec, Error as NetError, FollowRedirects, MalformedRedirectKind, Net,
-    NetErrorContext, TokenSource, into_account_error,
+    AccessToken, AccountNet, AccountSpec, Error as NetError, FollowRedirects,
+    MalformedRedirectKind, Net, NetErrorContext, TokenSource, into_account_error,
 };
 use bifrost_types::{AccountError, AccountId, AccountOperation};
 use bytes::Bytes;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
+use tokio::time::Instant;
 
 /// The WebDAV `Destination` header, lowercased so it is both a valid
 /// `HeaderName::from_static` argument and the key `HeaderMap` stores it under.
@@ -283,6 +290,8 @@ impl DavDispatch {
 
     /// Build the per-request auth headers.
     ///
+    /// Standalone header minting is bounded by the DAV request timeout. Request
+    /// wrappers leave minting to `send_raw_request` so it shares their deadline.
     /// The bearer token is read from the shared source on every call, so a
     /// token rotated mid-sync is honored on the next DAV request without
     /// reopening the account.
@@ -301,6 +310,24 @@ impl DavDispatch {
         url: &str,
         operation: AccountOperation,
     ) -> Result<HeaderMap, AccountError> {
+        tokio::time::timeout(DAV_CLIENT_TIMEOUT, self.mint_auth(url, operation))
+            .await
+            .unwrap_or_else(|_| {
+                Err(self.redirect_error(
+                    NetError::Timeout {
+                        transmission_state: bifrost_types::TransmissionState::Unsent,
+                    },
+                    operation,
+                ))
+            })
+            .map(|(headers, _)| headers)
+    }
+
+    async fn mint_auth(
+        &self,
+        url: &str,
+        operation: AccountOperation,
+    ) -> Result<(HeaderMap, Option<AccessToken>), AccountError> {
         if !self.is_trusted_url(url) {
             return Err(local_error(
                 operation,
@@ -309,6 +336,7 @@ impl DavDispatch {
             ));
         }
         let mut headers = HeaderMap::new();
+        let mut used = None;
         // A header-invalid byte in a credential (e.g. a stray `\n` from a
         // sloppy config file) must fail loudly here. Swallowing it sent the
         // request UNAUTHENTICATED and surfaced as a mystifying 401 instead
@@ -343,9 +371,10 @@ impl DavDispatch {
                         )
                     })?;
                 headers.insert(AUTHORIZATION, value);
+                used = Some(token);
             }
         }
-        Ok(headers)
+        Ok((headers, used))
     }
 
     /// Classify a `TokenSource::current()` failure.
@@ -420,10 +449,10 @@ impl DavDispatch {
     /// here, fall back to copy-then-delete", and a conditional PUT reads 412.
     /// The net retry loop turns every 4xx and 5xx into `Err` before a response
     /// surfaces, so a terminal `Error::Status` is reconstituted here rather than
-    /// classified. Everything else - an exhausted retry budget, a rate limit
-    /// past its budget, a transport failure - is left to
-    /// `bifrost_net::into_account_error`, which classifies with the retry hints
-    /// and transmission evidence the DAV status ladder does not carry.
+    /// classified, as is exhausted 501 for MOVE fallback. Exhausted retry and
+    /// rate-limit budgets and transport failures keep the shared funnel, which
+    /// preserves their retry history and transmission evidence. The DAV status
+    /// ladder receives headers for statuses interpreted outside that funnel.
     ///
     /// One narrowing worth knowing: a reconstituted body is capped at
     /// `bifrost_net::STATUS_BODY_CAP`, where the previous DAV transport buffered
@@ -434,6 +463,7 @@ impl DavDispatch {
         &self,
         request: &DavRequest,
         operation: AccountOperation,
+        deadline: Instant,
     ) -> Result<DavResponse, AccountError> {
         // A header the record could not carry, and a header value the transport
         // cannot express as text, are the same failure seen one layer apart:
@@ -450,7 +480,8 @@ impl DavDispatch {
         let mut builder = self
             .net
             .request(request.method.clone(), &request.url)
-            .without_bearer_auth();
+            .without_bearer_auth()
+            .timeout(deadline.saturating_duration_since(Instant::now()));
         for (name, value) in &request.headers {
             let Ok(value) = value.to_str() else {
                 return Err(local_error(
@@ -482,6 +513,21 @@ impl DavDispatch {
         // forever.
         self.wire_outcome(request, operation, builder.send().await)
             .map_err(|error| {
+                let error = if matches!(
+                    error.kind(),
+                    bifrost_types::AccountErrorKind::Server(
+                        bifrost_types::ServerErrorKind::RateLimited
+                            | bifrost_types::ServerErrorKind::QuotaExhausted
+                    )
+                ) {
+                    error
+                        .into_builder()
+                        .throttle_scope(bifrost_types::ThrottleScope::Account)
+                        .try_build()
+                        .expect("valid DAV throttle scope")
+                } else {
+                    error
+                };
                 if request.idempotent == Some(false) {
                     return error
                         .into_builder()
@@ -504,12 +550,21 @@ impl DavDispatch {
     ) -> Result<DavResponse, AccountError> {
         match outcome {
             Err(error @ NetError::AttemptHistory { .. }) => {
-                // A replayable DAV request can use its terminal response as
-                // data (notably DELETE -> 404 means done). Unreplayable
-                // histories must reach the shared reconciliation classifier.
+                // Status refusals do not make a MOVE or create ambiguous. In
+                // particular 429/503 -> 405/412 must retain DAV fallback/conflict
+                // semantics. A prior transport drop or other status can have
+                // committed a mutation and must keep the shared classifier.
+                let refused_only = match &error {
+                    NetError::AttemptHistory { attempts, .. } => attempts.iter().all(|attempt| {
+                        matches!(attempt, NetError::Status { code, .. }
+                            if matches!(code.as_u16(), 401 | 429 | 503 | 501))
+                    }),
+                    _ => false,
+                };
                 if request
                     .idempotent
                     .unwrap_or_else(|| request.method.is_idempotent())
+                    || refused_only
                 {
                     let response = match error.terminal() {
                         NetError::Status {
@@ -524,7 +579,9 @@ impl DavDispatch {
                         | NetError::RateLimited {
                             final_response: response,
                             ..
-                        } => Some((response.status, &response.headers, &response.body)),
+                        } if response.status == StatusCode::NOT_IMPLEMENTED => {
+                            Some((response.status, &response.headers, &response.body))
+                        }
                         _ => None,
                     };
                     if let Some((status, headers, body)) = response {
@@ -571,24 +628,17 @@ impl DavDispatch {
                 body: decode_body(&body),
                 url: request.url.clone(),
             }),
-            // A retry budget spent against a status-bearing response, or a 429
-            // past its budget, still ends in a response the server sent. The
-            // DAV ladder classifies it exactly as it did before this crate had
-            // any retry at all - the difference is only that the server got
-            // asked more than once first, which is the capability dav-B9 was
-            // about. A budget exhausted with no final response (every attempt
-            // failed below the status line) has nothing to classify and falls
-            // through to the transport mapping.
-            Err(
-                NetError::RetryBudgetExhausted {
-                    final_response: Some(final_response),
-                    ..
-                }
-                | NetError::RateLimited { final_response, .. },
-            ) => Ok(DavResponse {
-                status: final_response.status,
-                headers: final_response.headers,
-                body: decode_body(&final_response.body),
+            // MOVE consumes 501 as data even after net exhausts its 5xx
+            // retry budget. Other exhausted statuses keep their complete retry
+            // history in the shared funnel instead of being rebuilt as a bare
+            // response and losing Retry-After evidence.
+            Err(NetError::RetryBudgetExhausted {
+                final_response: Some(response),
+                ..
+            }) if response.status == StatusCode::NOT_IMPLEMENTED => Ok(DavResponse {
+                status: response.status,
+                headers: response.headers,
+                body: decode_body(&response.body),
                 url: request.url.clone(),
             }),
             // A body past the buffered ceiling is acknowledged but unreadable:
@@ -625,16 +675,56 @@ impl DavDispatch {
         request: DavRequest,
         operation: AccountOperation,
     ) -> Result<DavResponse, AccountError> {
+        let unreplayable = request.idempotent == Some(false);
+        let deadline = Instant::now() + DAV_CLIENT_TIMEOUT;
+        let sent = AtomicBool::new(false);
+        tokio::time::timeout(
+            DAV_CLIENT_TIMEOUT,
+            self.send_raw_until(request, operation, deadline, &sent),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(self.redirect_error(
+                NetError::Timeout {
+                    transmission_state: if sent.load(Ordering::Relaxed) {
+                        bifrost_types::TransmissionState::InFlight
+                    } else {
+                        bifrost_types::TransmissionState::Unsent
+                    },
+                },
+                operation,
+            ))
+        })
+        .map_err(|error| {
+            if unreplayable {
+                error
+                    .into_builder()
+                    .idempotency_override(false)
+                    .try_build()
+                    .expect("valid unreplayable DAV request classification")
+            } else {
+                error
+            }
+        })
+    }
+
+    async fn send_raw_until(
+        &self,
+        request: DavRequest,
+        operation: AccountOperation,
+        deadline: Instant,
+        sent: &AtomicBool,
+    ) -> Result<DavResponse, AccountError> {
         // The named shared constant, not `RedirectPolicy::default().max_hops`:
         // DAV has no per-account redirect config, and laundering the cap
         // through a type Default hid the coupling (changing the default
         // silently changed DAV behavior).
         let max_hops = usize::from(bifrost_net::DEFAULT_MAX_HOPS);
         // The first hop is gated here, before anything is sent, exactly as
-        // every later hop is gated below. Every in-workspace caller already
-        // credentials its URL through `auth_headers`, the same gate, but
-        // `DavRequest::new` and this method are public, so an external caller
-        // can hand over a URL nobody checked. Checking only the final answer
+        // every later hop is gated below. Wrappers build unauthenticated
+        // requests so credential minting happens only here, inside the total
+        // deadline. `DavRequest::new` and this method are public, so callers
+        // can also hand over a URL nobody checked. Checking only the final answer
         // protected nothing - the request had already gone out - and as a
         // debug assertion it panicked a downstream debug build while
         // returning the response silently in release.
@@ -650,6 +740,9 @@ impl DavDispatch {
         }
         let mut request = request;
         let mut hops = 0usize;
+        let (auth, mut used) = self.mint_auth(&request.url, operation).await?;
+        request.headers.extend(auth);
+        let mut refreshed = false;
         loop {
             // Check both the source and the current Destination on EVERY hop.
             // Redirect rebasing below has already produced this hop's final
@@ -662,7 +755,37 @@ impl DavDispatch {
                         error
                     }
                 })?;
-            let response = self.dispatch_once(&request, operation).await?;
+            sent.store(true, Ordering::Relaxed);
+            let response = self.dispatch_once(&request, operation, deadline).await?;
+            if response.status == StatusCode::UNAUTHORIZED
+                && !refreshed
+                && let (DavCredentials::Bearer { token_source }, Some(token)) =
+                    (&self.credentials, used.take())
+            {
+                // The 401 is a refusal, so replaying the owned byte body is
+                // safe even for MOVE/conditional create. Use the token actually
+                // rejected, not a second current() read that could race rotation.
+                let token = token_source
+                    .refresh_if_unchanged(token)
+                    .await
+                    .map_err(|error| self.token_read_error(error, operation))?;
+                let value =
+                    HeaderValue::from_str(&format!("Bearer {}", token.as_str())).map_err(|_| {
+                        local_error(
+                            operation,
+                            "bearer token contains header-invalid bytes",
+                            self.protocol,
+                        )
+                    })?;
+                request.headers.insert(AUTHORIZATION, value);
+                used = Some(token);
+                refreshed = true;
+                continue;
+            }
+            // Preserve DAV methods on endpoint relocation: GET cannot stand
+            // in for a PROPFIND/REPORT XML query or a conditional mutation.
+            // A 303 asks for a different operation, so surface it to the caller
+            // instead of silently accepting a GET representation as DAV data.
             let redirect = matches!(
                 response.status,
                 StatusCode::MOVED_PERMANENTLY
@@ -720,7 +843,9 @@ impl DavDispatch {
                 )));
             }
             // Fresh credentials for the target origin.
-            let auth = self.auth_headers(next.as_str(), operation).await?;
+            let (auth, token) = self.mint_auth(next.as_str(), operation).await?;
+            used = token;
+            refreshed = false;
             let mut headers = request.headers.clone();
             headers.remove(AUTHORIZATION);
             for (name, value) in &auth {
@@ -801,6 +926,7 @@ impl DavDispatch {
             Ok(())
         } else {
             Err(status_error(
+                &response.headers,
                 operation,
                 response.status,
                 response.body,
@@ -821,7 +947,6 @@ impl DavDispatch {
         let request = DavRequest::new(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .header("Depth", depth)
-            .headers(self.auth_headers(url, operation).await?)
             // A read: replaying after a dropped connection cannot change state.
             .idempotent(true)
             .body(body.to_string());
@@ -846,7 +971,6 @@ impl DavDispatch {
         let request = DavRequest::new(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .header("Depth", depth)
-            .headers(self.auth_headers(url, operation).await?)
             .idempotent(true)
             .body(body.to_string());
         self.send_raw_request(request, operation).await
@@ -884,13 +1008,13 @@ impl DavDispatch {
         url: &str,
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
-        let request =
-            DavRequest::new(Method::DELETE, url).headers(self.auth_headers(url, operation).await?);
+        let request = DavRequest::new(Method::DELETE, url);
         let response = self.send_raw_request(request, operation).await?;
         if response.status.is_success() || delete_target_already_gone(response.status) {
             Ok(())
         } else {
             Err(status_error(
+                &response.headers,
                 operation,
                 response.status,
                 response.body,
@@ -934,7 +1058,6 @@ impl DavDispatch {
         let request = DavRequest::new(method, from)
             .header(DESTINATION, destination)
             .header("Overwrite", "F")
-            .headers(self.auth_headers(from, operation).await?)
             // `MOVE` is an extension method, so `bifrost-net` never replays it
             // on the wire - but the CLASSIFICATION of a mid-flight drop is
             // decided by the `AccountOperation` table, and a relocate runs
@@ -957,6 +1080,7 @@ impl DavDispatch {
             return Ok(false);
         }
         Err(status_error(
+            &response.headers,
             operation,
             response.status,
             response.body,
@@ -1058,7 +1182,6 @@ fn response_read_error_with_history(
 
 #[cfg(test)]
 mod tests {
-    use bifrost_net::AccessToken;
     use bifrost_net::test_support::Canned;
     use bifrost_types::{
         AccountErrorKind, AuthErrorKind, ProtocolErrorKind, ReconcileAction, RecoveryClass,
@@ -1492,6 +1615,295 @@ mod tests {
             !acknowledged(&first_hop),
             "nothing was sent before a first-hop refusal: {first_hop:?}"
         );
+    }
+
+    struct RotatingTokenSource {
+        refreshes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TokenSource for RotatingTokenSource {
+        fn current(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
+            // Deliberately remains stale: the dispatcher must use the refresh
+            // return value, not assume a simple source stores it in current().
+            Box::pin(async { Ok(AccessToken::new("old", None)) })
+        }
+
+        fn refresh(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
+            self.refreshes.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(AccessToken::new("fresh", None)) })
+        }
+
+        fn refresh_if_unchanged(
+            &self,
+            used: AccessToken,
+        ) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
+            assert_eq!(
+                used.as_str(),
+                "old",
+                "refresh uses the token sent on the wire"
+            );
+            self.refresh()
+        }
+    }
+
+    fn answer(status: StatusCode) -> Canned {
+        Canned::Response {
+            status,
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bearer_401_refreshes_once_and_replays_the_exact_body() {
+        for terminal in [StatusCode::CREATED, StatusCode::UNAUTHORIZED] {
+            let script = dav_script([answer(StatusCode::UNAUTHORIZED), answer(terminal)]);
+            let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let dispatch = DavDispatch::with_account_net(
+                scripted_dav_net(&script),
+                BASE,
+                DavCredentials::Bearer {
+                    token_source: Arc::new(RotatingTokenSource {
+                        refreshes: Arc::clone(&refreshes),
+                    }),
+                },
+                DavProtocol::CalDav,
+            );
+            let result = dispatch
+                .send_status_request(
+                    DavRequest::new(Method::PUT, format!("{BASE}/one.ics"))
+                        .idempotent(false)
+                        .body("calendar bytes"),
+                    AccountOperation::EventCreate,
+                )
+                .await;
+            if terminal.is_success() {
+                result.expect("refresh recovers the request");
+            } else {
+                assert_eq!(
+                    result.expect_err("second 401 is terminal").recovery(),
+                    &RecoveryClass::AuthLost
+                );
+            }
+            assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+            let sent = transcripts(&script);
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[0].headers[AUTHORIZATION], "Bearer old");
+            assert_eq!(sent[1].headers[AUTHORIZATION], "Bearer fresh");
+            assert_eq!(sent[0].body, "calendar bytes");
+            assert_eq!(sent[1].body, sent[0].body);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_status_retry_preserves_move_fallback_and_create_conflicts() {
+        for refused in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let script = dav_script([answer(refused), answer(StatusCode::METHOD_NOT_ALLOWED)]);
+            let dispatch = scripted_dispatch(scripted_dav_net(&script));
+            assert!(
+                !dispatch
+                    .move_resource(
+                        &format!("{BASE}/a.ics"),
+                        &format!("{BASE}/b.ics"),
+                        AccountOperation::EventUpdate,
+                    )
+                    .await
+                    .expect("405 still signals copy/delete fallback")
+            );
+            assert_eq!(transcripts(&script).len(), 2);
+
+            let script = dav_script([answer(refused), answer(StatusCode::PRECONDITION_FAILED)]);
+            let dispatch = scripted_dispatch(scripted_dav_net(&script));
+            let error = dispatch
+                .send_status_request(
+                    DavRequest::new(Method::PUT, format!("{BASE}/new.ics"))
+                        .idempotent(false)
+                        .header("If-None-Match", "*")
+                        .body("calendar"),
+                    AccountOperation::EventCreate,
+                )
+                .await
+                .expect_err("a refused create stays a conflict");
+            assert_eq!(error.kind(), &AccountErrorKind::ConcurrencyConflict);
+            assert_eq!(transcripts(&script).len(), 2);
+        }
+    }
+
+    #[test]
+    fn an_ambiguous_prior_attempt_cannot_be_hidden_by_a_terminal_status() {
+        let dispatch = scripted_dispatch(scripted_dav_net(&dav_script_empty()));
+        let request = DavRequest::new(Method::PUT, format!("{BASE}/new.ics")).idempotent(false);
+        let error = dispatch
+            .wire_outcome(
+                &request,
+                AccountOperation::EventCreate,
+                Err(NetError::AttemptHistory {
+                    source: Box::new(NetError::Status {
+                        code: StatusCode::PRECONDITION_FAILED,
+                        headers: HeaderMap::new(),
+                        body: Bytes::new(),
+                    }),
+                    attempts: vec![NetError::Network {
+                        message: "lost response".into(),
+                        transmission_state: TransmissionState::InFlight,
+                        source: None,
+                    }],
+                    may_have_committed: true,
+                }),
+            )
+            .expect_err("an ambiguous create must reconcile");
+        assert!(reconciles(&error));
+    }
+
+    struct AdvancingTokenSource;
+
+    impl TokenSource for AdvancingTokenSource {
+        fn current(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
+            Box::pin(async {
+                tokio::time::advance(std::time::Duration::from_secs(2)).await;
+                Ok(AccessToken::new("token", None))
+            })
+        }
+
+        fn refresh(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
+            self.current()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn redirect_hops_use_the_remaining_logical_request_deadline() {
+        let script = dav_script([
+            dav_redirect(StatusCode::TEMPORARY_REDIRECT, "/next"),
+            answer(StatusCode::OK),
+        ]);
+        let dispatch = DavDispatch::with_account_net(
+            scripted_dav_net(&script),
+            BASE,
+            DavCredentials::Bearer {
+                token_source: Arc::new(AdvancingTokenSource),
+            },
+            DavProtocol::CalDav,
+        );
+        let sent = AtomicBool::new(false);
+        // Model twenty seconds already spent reading credentials or prior hops.
+        let remaining = std::time::Duration::from_secs(10);
+        dispatch
+            .send_raw_until(
+                DavRequest::new(Method::GET, format!("{BASE}/start")),
+                AccountOperation::EventGet,
+                Instant::now() + remaining,
+                &sent,
+            )
+            .await
+            .expect("both hops complete inside the remaining budget");
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].timeout, Some(std::time::Duration::from_secs(8)));
+        assert_eq!(requests[1].timeout, Some(std::time::Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn exhausted_retry_history_keeps_a_hint_absent_from_the_final_response() {
+        let dispatch = scripted_dispatch(scripted_dav_net(&dav_script_empty()));
+        let request = DavRequest::new(Method::GET, BASE);
+        let error = dispatch
+            .wire_outcome(
+                &request,
+                AccountOperation::EventGet,
+                Err(NetError::RetryBudgetExhausted {
+                    final_response: Some(bifrost_net::FinalResponse {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        headers: HeaderMap::new(),
+                        body: Bytes::new(),
+                    }),
+                    retry_after_history: vec![std::time::Duration::from_secs(300)],
+                }),
+            )
+            .expect_err("exhaustion keeps its retry history");
+        assert!(error.chain().iter().any(|cause| matches!(cause,
+            bifrost_types::Cause::Server(bifrost_types::ServerCause::Unavailable {
+                retry_hint: Some(bifrost_types::RetryHint::After(delay)),
+            }) if *delay == std::time::Duration::from_secs(300))));
+    }
+
+    struct PendingTokenSource;
+
+    impl TokenSource for PendingTokenSource {
+        fn current(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
+            Box::pin(std::future::pending())
+        }
+        fn refresh(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
+            self.current()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn credential_wait_is_inside_the_logical_deadline() {
+        let script = dav_script_empty();
+        let dispatch = DavDispatch::with_account_net(
+            scripted_dav_net(&script),
+            BASE,
+            DavCredentials::Bearer {
+                token_source: Arc::new(PendingTokenSource),
+            },
+            DavProtocol::CalDav,
+        );
+        let start = Instant::now();
+        let error = dispatch
+            .send_raw_request(
+                DavRequest::new(Method::GET, BASE),
+                AccountOperation::EventGet,
+            )
+            .await
+            .expect_err("stalled credential read times out without wire traffic");
+        assert_eq!(start.elapsed(), DAV_CLIENT_TIMEOUT);
+        assert!(script.requests().is_empty());
+        assert!(!acknowledged(&error));
+        assert!(!reconciles(&error));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn public_wrappers_bound_pending_credentials_before_dispatch() {
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            for wrapper in 0..5 {
+                let script = dav_script_empty();
+                let dispatch = DavDispatch::with_account_net(
+                    scripted_dav_net(&script),
+                    BASE,
+                    DavCredentials::Bearer {
+                        token_source: Arc::new(PendingTokenSource),
+                    },
+                    protocol,
+                );
+                let start = Instant::now();
+                let operation = AccountOperation::Discover;
+                let result = match wrapper {
+                    0 => dispatch
+                        .propfind_raw(BASE, "0", "", operation)
+                        .await
+                        .map(|_| ()),
+                    1 => dispatch
+                        .report_raw_response(BASE, "1", "", operation)
+                        .await
+                        .map(|_| ()),
+                    2 => dispatch.delete_resource(BASE, operation).await,
+                    3 => dispatch
+                        .move_resource(BASE, &format!("{BASE}/target"), operation)
+                        .await
+                        .map(|_| ()),
+                    _ => dispatch.auth_headers(BASE, operation).await.map(|_| ()),
+                };
+                let error = result.expect_err("pending credentials must time out");
+                assert_eq!(start.elapsed(), DAV_CLIENT_TIMEOUT);
+                assert!(script.requests().is_empty());
+                assert!(!acknowledged(&error));
+                assert!(!reconciles(&error));
+                assert!(matches!(error.kind(), AccountErrorKind::Transport(_)));
+            }
+        }
     }
 
     /// A token source that always fails, with the error the case under test

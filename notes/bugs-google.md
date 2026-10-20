@@ -21,32 +21,6 @@ little. Gmail's read-back of trashed and partial-flag outcomes is SYNC-008;
 lifecycle and renewer recovery triage is SHARED-012 / SHARED-013; the private
 address parser is SHARED-004; the Retry-After parser copy is SHARED-006.
 
-## GOOG-016 - Some read streams and futures ignore the shutdown token
-
-Hunter severity: P3.
-
-`repair_inventory`, `open_blob`, `open_raw_rfc822`, `discover_memberships` and
-every PIM, contacts and calendar future ignore `shutdown`. The reference's
-rationale for cancelling the read streams ("a stream that outlived `close()`
-kept calling Gmail through a deregistered `AccountNet` - unmetered, and
-reporting the result as a transport fault rather than as a closed account")
-applies to `repair_inventory` just as much. The reference names only four
-streams, so no claim is broken; it is the same hole one stream over. Relatedly,
-`scope_lifecycle_stream` selects on shutdown only during the wait: an in-flight
-`labels.list` (possibly waiting for admission behind a long project hold) holds
-the stream open after `close()`.
-
-## GOOG-018 - Unbounded 404 bisection cost, and a possible label-id 404 misattribution
-
-Hunter severity: P3.
-
-When many ids in a batch are gone (a mass delete raced by a bulk move), the
-404 bisection can issue on the order of 2n `batchModify` calls at 50 quota
-units each with no budget cap, up to about 100k units for one 1000-id batch.
-Unconfirmed related risk: if Gmail answers 404 for an unknown LABEL id, the
-bisection would blame every message as `NotFound(Message)`. Worth pinning with
-a captured transcript.
-
 ## GOOG-023 - Event create and update still map `Delegated` and `Unknown` attendee status to `needsAction`
 
 Lateral from the RSVP fix. `google_attendee` reuses the RSVP status mapper for
@@ -62,18 +36,42 @@ The write-side miss is still open: a fresh cache can lack a caller-supplied
 `mutation.rs` declares it unsupported without one forced, serialized refresh and
 retry.
 
-## GOOG-025 - Calendar update replaces a failed second leg with `PartialResponse`
-
-Lateral from the contact-update fix, which stopped doing this because it
-overrode the original recovery class (a permanent 403 became a retry, auth loss
-and rate-limit timing were lost). The calendar update path reclassifies the
-identical shape (move succeeded, patch failed) as `Protocol(PartialResponse)`
-with `Acknowledged` evidence, and `reference/google.md` justifies it at length.
-Check whether it has the same recovery-class defect and, if so, decorate
-instead of replacing.
-
 ## GOOG-024 - `update_contact_photo` HTTP method is unverified
 
 Lateral. The wave fixer reports `contacts::update_contact_photo` sends POST
 while the People API reference specifies PATCH. Unconfirmed; check the
 documented method for `:updateContactPhoto` before changing anything.
+
+## GOOG-016 - The account adapter does not wrap several read streams and PIM futures with the shutdown token
+
+Residue: `scope_lifecycle_stream` now cancels during an in-flight `labels.list`.
+`repair_inventory`, `open_blob`, `open_raw_rfc822`, `discover_memberships` and
+every PIM, contacts and calendar future still ignore `close()`; a stream that
+outlives it keeps calling Gmail through a deregistered `AccountNet`. They take
+no token of their own, so the wrapping belongs in the account adapter
+(`account/mod.rs`) or the token has to be threaded through.
+
+## GOOG-018 - A 404 on a label id may be misattributed to every message
+
+Residue: the 404 bisection is now capped by a shared 128-call budget (it was
+about 2n calls and up to roughly 100k quota units for one 1000-id body). Still
+unconfirmed: whether Gmail answers 404 for an unknown LABEL id, in which case
+the bisection would blame every message as `NotFound(Message)`. Needs a captured
+provider response; the ambiguity is documented in code and the reference.
+
+## GOOG-026 - The `httpdate` dependency looks unused
+
+Lateral from the shared Retry-After parser migration: Google's local parser was
+deleted, so `httpdate` in `crates/google/Cargo.toml` may no longer be used.
+Confirm and remove.
+
+## GOOG-027 - The error model has no typed continuation for a failure after a committed first leg
+
+Needs a ruling. A calendar update that moves an event and then fails its
+destination PATCH now keeps the original recovery class and carries diagnostic
+text telling a person to retry from the destination id. An automated caller
+acting on `Retry(SameRequest)` without reading the diagnostic can still replay
+the source request, where the event no longer lives. A typed continuation
+carrier (the rewritten target request or id) in the shared error model would let
+the engine do it correctly; the same shape applies to the contact update's
+second leg.

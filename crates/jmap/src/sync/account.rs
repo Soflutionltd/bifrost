@@ -588,12 +588,18 @@ impl Account for JmapAccount {
                     );
                 }
             }
-            Ok(bifrost_types::PushSubscription::new(
+            bifrost_types::PushSubscription::new(
                 Some(handle),
                 outcomes
                     .finalize(&expected)
                     .expect("every requested push scope is accounted for once"),
-            ))
+            )
+            .map_err(|failure| {
+                super::error::internal_invariant(
+                    AccountOperation::PushSubscribe,
+                    format!("JMAP push subscription invariant failed: {failure}"),
+                )
+            })
         })
     }
 

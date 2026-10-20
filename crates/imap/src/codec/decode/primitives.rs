@@ -356,6 +356,11 @@ pub(super) fn literal(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
     let (input, _) = char('}').parse(input)?;
     let (input, _) = crlf(input)?;
     let (input, data) = take(count).parse(input)?;
+    // The parser accepts borrowed slices and string/nstring as well as FETCH
+    // response fields own Vec<u8>. Freezing WireReader's buffer alone cannot
+    // make these zero-copy: that requires changing those response types and
+    // threading the backing Bytes through the parser. It also would not emit
+    // a section until the complete response has been framed and parsed.
     Ok((input, data.to_vec()))
 }
 

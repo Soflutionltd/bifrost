@@ -64,6 +64,11 @@ use crate::types::FetchResponse;
 pub(crate) trait Consumer: Send {
     type Output: Send + 'static;
 
+    /// Remaining literal octets allowed in the next response.
+    fn literal_budget(&self) -> Option<usize> {
+        None
+    }
+
     /// Called by the dispatcher for each untagged response that
     /// `classify` routed to this command. The response is either
     /// `OnlySolicited` or `Either`  -  the dispatcher never delivers

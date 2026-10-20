@@ -593,6 +593,18 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             t.attempt = Some(TransmissionState::Acknowledged);
             t
         }
+        Error::FetchLiteralLimit { estimated, limit } => {
+            let mut t = Translation::new(
+                AccountErrorKind::Request(RequestErrorKind::Malformed),
+                Cause::Request(RequestCause::Malformed {
+                    detail: DiagnosticText::support_only(format!(
+                        "FETCH literal bytes {estimated} exceed caller budget {limit}"
+                    )),
+                }),
+            );
+            t.attempt = Some(TransmissionState::Acknowledged);
+            t
+        }
         Error::SearchResultTruncated { returned, omitted } => {
             let mut t = Translation::new(
                 AccountErrorKind::Request(RequestErrorKind::Malformed),

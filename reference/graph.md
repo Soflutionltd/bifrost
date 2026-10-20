@@ -80,7 +80,8 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
     subscriptions, recreates a vanished one (`replace_gone_subscription`, which
     hands `create_and_install_replacement` to a spawned task, and
     `install_replacement`), emits Disconnected/Reconnected/Terminated on
-    renewal failure, and retires its own worker slot.
+    renewal failure, keeps a terminally failed row for teardown, and retires
+    its own worker slot.
   - `push/ews.rs` - the EWS streaming arm: `ews_subscribable_folder_id`, the
     `restId` -> `ewsId` translation (`translation_input_chunks` /
     `reconcile_translated_ews_scopes`), and the `EwsSubscriptionState`
@@ -144,8 +145,8 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   - `pim/messages.rs` - per-message writes (add-to-container, category,
     extended property, read flag, importance) and the shared `$batch`
     write pipeline: `resolve_target_ids` / `resolve_target_values`,
-    `message_batch_url`, `patch_messages` / `move_messages` /
-    `destroy_messages`, `submit_write_batch(_with_targets)`, etag caching.
+    `message_batch_url`, `patch_messages` / `move_messages`,
+    `submit_write_batch(_with_targets)`, etag caching.
   - `pim/send.rs` - `send_message` / `send_raw_message`, send-as stamping,
     the deferred-send-time property, and the scheduled-send handle codec
     with `cancel_scheduled_send` / `reschedule_send`.
@@ -232,6 +233,10 @@ bodies are serialized by the funnel rather than by `RequestBuilder::json`
 funnel is non-generic and the one non-JSON body can share it; `post_mime`
 previously built its own request on `AccountNet` and was the one wire path the
 seam could not see.
+
+The funnel sends `Content-Type` only when a request has a body: JSON writes use
+`application/json`, and raw MIME import uses `text/plain`. Bodyless GET, DELETE,
+and POST requests carry no content type.
 
 Responses are scripted at the WIRE, not at the funnel.
 `script_rest` / `script_aux` install a `bifrost_net::test_support::
@@ -401,9 +406,15 @@ as `Request(Malformed)` with field `event`. A server-derived organizer, a
 non-`Confirmed` status, and an RSVP value Graph has no action for stay
 `Unsupported`. `responseStatus` maps to
 `self_response`; RSVP uses native `accept`/`decline`/`tentativelyAccept`.
-Calendar/contact update/delete fetch-then-`If-Match` and send sparse PATCH
-(scalar clears as null; contacts emit `null`/`[]` for emptied buckets). Event
-organizer/status are server-derived. Event search uses the Graph Search API for
+Calendar/contact update/delete fetch the current object and use its etag for
+`If-Match` when Graph supplies one. Contacts pass the returned `@odata.etag`;
+calendar change keys are wrapped as the weak entity-tag `W/"<changeKey>"`.
+Without an etag, the write is unconditional. These account methods accept no
+expected-version token from the caller, so the condition only covers the
+interval between their GET and write; it cannot detect that the caller's
+earlier read is stale. Updates send sparse PATCH (scalar clears as null;
+contacts emit `null`/`[]` for emptied buckets). Event organizer/status are
+server-derived. Event search uses the Graph Search API for
 unscoped non-empty default-mailbox searches, else local; composite `EventId`s
 embed the calendar (`{calendar}::{event}`), Search hits use the `$mailbox`
 sentinel routed through `/me/events/{id}`. `EventSearchRequest::include_cancelled`
@@ -835,9 +846,10 @@ mailboxes always install.
 - A bounded LRU `etag_index` of mail HTTP entity-tags (powering `If-Match`; mutation
   preflight reads refresh recency, `MESSAGE_SELECT` explicitly requests
   `changeKey`; the shared JSON projection prefers `@odata.etag` and otherwise
-  wraps the raw change key as `W/"<changeKey>"`. Successful writes record a returned etag or evict when Graph
-  returns none, 412 responses evict before retry, and moves, tombstones, and
-  confirmed destroys evict their old-id keys). It is
+  wraps the raw change key as `W/"<changeKey>"`. Successful writes record a
+  returned etag or evict when Graph returns none, 412 responses evict before
+  retry, and moves, tombstones, 404 destroy skips, and confirmed destroys evict
+  their old-id keys). It is
   a `HashMap<Arc<str>, _>` paired with a `BTreeMap<u64, Arc<str>>` of recency
   tickets, so insert / hit / evict are each one hash lookup plus a couple of
   tree nodes and never a scan: the write lock is taken once per hydrated page
@@ -1017,6 +1029,10 @@ at all, and a marker the engine never acknowledged must not pick the resume
 URL). Overriding on presence but deferring on absence gave one field two
 sources with a silent precedence; `encode_cursor` writes both from the same
 value, so honoring the outer unconditionally loses nothing.
+When an in-progress inventory payload has no outer marker, the inventory walk
+returns `CursorError::InventoryInProgress`, which derives a restart of that
+scope. The engine acknowledged no page position, so this does not clear every
+scope as a schema reset would.
 `changes_stream` cross-checks that payload kind projects back to
 `cursor.scope`; mismatches terminate with `SyncState(SchemaIncompatible)`.
 `establish_initial_cursor` accepts delta-eligible `FolderType` scopes (email,
@@ -1096,13 +1112,20 @@ state defensively. A page with neither link is a contract violation, never a
 successful cursor-less completion.
 `@removed` entries are skipped and evict their cached change key; harvested
 etags fold into the bounded LRU `account.etag_index` for the next `If-Match`.
+Inventory batches have no per-object removal event, so an inventory tombstone
+is not projected as a delete; the delta change stream emits `ScopeChange::Removed`
+for tombstones it sees there. Preserving a tombstone seen during inventory
+requires a shared inventory event and engine contract change.
 
 `changes_stream(cursor)` decodes the payload, asserts `scope_matches_payload`,
 and walks `delta_link` (or `advanced_through.next_link` on resume). Each
 non-removed entry emits `ObjectChange { Updated }` + `ScopeChange { Added }`
 (Graph delta has no created/updated split); `@removed` emits one `ScopeChange
-{ Removed }`. Page batches checkpoint `advanced_through` at the next link; the
-final page checkpoints the fresh `delta_link`, `advanced_through` cleared.
+{ Removed }`. Its page marker's `last_seen_id` uses the same projected id form
+as inventory markers, including calendar composites and foreign mailbox tags;
+the id is diagnostic, and resume follows only `next_link`. Page batches
+checkpoint `advanced_through` at the next link; the final page checkpoints the
+fresh `delta_link`, `advanced_through` cleared.
 
 `get_stream` chunks ids into `batching_policy.max_items` blocks, fires one
 `/$batch` per chunk, and returns exactly one per-id `ItemOutcome<HydratedObject>`:
@@ -1854,9 +1877,15 @@ Destroy uses Graph's
 [`permanentDelete` action](https://learn.microsoft.com/en-us/graph/api/message-permanentdelete?view=graph-rest-1.0),
 never plain message `DELETE`, which moves mail to Deleted Items or recoverable storage. The permanent action
 removes it from normal mailbox inventory but can retain it in Purges under
-server retention policy. The separate `pim/messages.rs destroy_messages`
-helper uses the same action for `delete_thread`'s already-in-Trash branch;
-threads deleted elsewhere still move to the owning mailbox's Trash.
+server retention policy. `delete_thread` uses the same action in its
+already-in-Trash branch. That branch selects conversation members by their
+`parentFolderId` and `changeKey` together, permanently deleting only those
+whose folder exactly matches the resolved Trash id. It sends `If-Match` with
+the etag from that same read, so a folder change before the batch rejects the
+destroy. The caller's `current` container identifies the branch but is not
+evidence that every conversation member is in Trash. Copies in Sent, Inbox, or
+another folder survive. Threads deleted elsewhere still move to the owning
+mailbox's Trash.
 
 `bulk_set_flags` translates `FlagOp` to a PATCH body (`isRead`,
 `flag.flagStatus`, sorted `categories`); `Set`
@@ -2169,8 +2198,10 @@ per id because routing headers can differ by folder.
 `move_thread` calls Graph move directly (the destination is the container id
 the consumer already holds, which is owner-qualified for a shared folder).
 `delete_thread` resolves and caches Trash via `deletedItems` IN THE THREAD'S
-OWN MAILBOX (Trash source destroys, else moves to Trash), and fails rather
-than guessing when that lookup does not resolve; see the foreign-mailbox
+OWN MAILBOX, and fails rather than guessing when that lookup does not resolve.
+If the caller says the thread is already in Trash, only members whose
+`parentFolderId` exactly matches that resolved Trash id are permanently
+deleted; otherwise every member is moved to Trash. See the foreign-mailbox
 section for why both halves of that operation are owner-scoped.
 `apply_label`/`remove_label` inherit the trait default (Graph provenance ->
 `set_category`, `(Folder, non-Graph)` ->
@@ -2568,3 +2599,7 @@ exhausted" without them.
 - Inbox rules are conjunction-shaped (`And` -> conditions, `Not` -> exceptions);
   `Or`, date ranges, remove-label, mark-unread, star, keyword, reject actions
   are rejected by local validation.
+
+### Push failure routing
+
+The EWS streaming worker retries locally only for `RecoveryClass::Retry`, at Subscribe, HTTP stream, and classified frame failures. Every other classification is forwarded as `WatchEvent::Terminated` so the sync reconciler can act on engine directives and reconciliation.

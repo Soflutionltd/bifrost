@@ -173,9 +173,14 @@ physical attempt evidence. This is the existing reconcile-required lane for
 an incomplete logical exchange, including when the later failure is auth or
 redirect policy. It prevents replaying a committed POST after its redirected
 GET times out during token lookup, or when a quota retry wait exceeds the
-total deadline. Histories containing only unsent attempts keep the terminal
-classification. Ordinary acknowledged idempotent auth and policy failures
-also retain their terminal classification.
+total deadline. A target `401` does not count as a possibly committed attempt:
+it rejects the request before authentication. If token refresh then fails
+before a replacement dispatch, the terminal refresh failure keeps its own
+retry classification and the authentication cause remains in the chain.
+Commit evidence from an earlier non-`401` response or an in-flight attempt
+remains sticky across later attempts. Histories containing only unsent attempts
+keep the terminal classification. Ordinary acknowledged idempotent auth and
+policy failures also retain their terminal classification.
 Protocol consumers that read statuses as data must inspect `terminal()` while
 retaining the complete error for failure classification. DAV reconstitutes a
 terminal response from a replayable request (including DELETE followed by 404)
@@ -410,6 +415,21 @@ feeds the per-account meter and the bandwidth-cap throttle.
   the *final* response's `Retry-After` and pushes it onto
   `retry_after_history` before surfacing, so consumers see the
   server's last hint.
+
+`bifrost_net::request::parse_retry_after_hint` is the shared syntax-preserving
+parser: delta-seconds produce `RetryHint::After`, and HTTP-dates produce
+`RetryHint::At`, including elapsed deadlines. Net, Graph, JMAP, Google and DAV use
+this parser for error evidence. The `retry_hint` fields on
+`ServerCause::{Unavailable, RateLimited, QuotaExhausted}` and `RetryAdvice`
+carry the hint. Error classification prefers the final response header over
+the transport's capped duration history. Google resolves deltas once when
+observing the response for its provider hold.
+
+The existing `bifrost_net::parse_retry_after` keeps its
+`Option<Duration>` signature for transport waits and existing consumers.
+It resolves dates against the current clock and returns `None` for elapsed
+dates, preserving its compatibility behavior. Retry waits still apply
+`honor_retry_after_cap`; that cap does not rewrite server evidence.
 
 ### Replay safety
 
@@ -1061,7 +1081,17 @@ with no way to restore it, so a followed cross-origin hop would arrive
 unauthenticated. They therefore attach with `FollowRedirects::Disabled` and walk
 every hop themselves in `DavDispatch::send_raw_request`, re-minting credentials
 for each target origin against the set authenticated discovery admitted. The hop
-cap they apply is the exported `DEFAULT_MAX_HOPS` constant, read by name rather
+walk has one 30-second total deadline covering token reads, forced refresh,
+retries and every hop; each `RequestBuilder::timeout` receives only the time
+remaining. DAV wrappers defer credential minting to this timed walk rather than
+reading tokens before it; standalone `auth_headers` calls are bounded too.
+DAV replaces bearer injection's 401 recovery locally by calling
+`refresh_if_unchanged` once with the token actually rejected and replaying its
+owned byte body with the returned token. Its status ladder accepts response
+headers and uses `request::parse_retry_after_hint`, preserving absolute dates
+including elapsed dates; exhausted rate/retry failures retain this
+crate's history-aware error conversion (501 remains data for MOVE fallback).
+The cap they apply is the exported `DEFAULT_MAX_HOPS` constant, read by name rather
 than through `RedirectPolicy::default().max_hops`: DAV carries no per-account
 redirect config, and laundering the cap through a type `Default` hid the
 coupling, so changing that default silently changed DAV behavior.

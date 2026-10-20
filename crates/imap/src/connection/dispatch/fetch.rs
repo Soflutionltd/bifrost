@@ -90,6 +90,11 @@ impl FetchConsumer {
 impl Consumer for FetchConsumer {
     type Output = Vec<FetchResponse>;
 
+    fn literal_budget(&self) -> Option<usize> {
+        self.hard_limit
+            .map(|limit| limit.saturating_sub(self.estimated_bytes))
+    }
+
     fn on_response(
         &mut self,
         resp: UntaggedResponse,
@@ -108,7 +113,7 @@ impl Consumer for FetchConsumer {
                 self.limit_exceeded.get_or_insert(Error::FetchLimit {
                     estimated: self.estimated_bytes,
                     limit,
-                    seq: fr.seq,
+                    seq: Some(fr.seq),
                     uid: fr.uid,
                 });
                 return;
@@ -263,13 +268,25 @@ impl<T: Send + 'static> BoundedStreamingPipe<T> {
 /// reaches the server.
 pub(crate) struct BoundedStreamingFetchConsumer {
     pipe: BoundedStreamingPipe<FetchResponse>,
+    remaining_literal_bytes: Option<usize>,
     ambiguous_buffer: Vec<UntaggedResponse>,
 }
 
 impl BoundedStreamingFetchConsumer {
     pub(crate) fn new(tx: tokio::sync::mpsc::Sender<Result<FetchResponse, Error>>) -> Self {
+        // Channel capacity bounds responses in flight, not their octets.
+        // Account-side post-decode budgets cannot protect this reader; callers
+        // with an octet ceiling must use the budgeted streaming entry point.
+        Self::with_budget(tx, None)
+    }
+
+    pub(crate) fn with_budget(
+        tx: tokio::sync::mpsc::Sender<Result<FetchResponse, Error>>,
+        budget: Option<usize>,
+    ) -> Self {
         Self {
             pipe: BoundedStreamingPipe::new(tx),
+            remaining_literal_bytes: budget,
             ambiguous_buffer: Vec::new(),
         }
     }
@@ -278,6 +295,10 @@ impl BoundedStreamingFetchConsumer {
 impl Consumer for BoundedStreamingFetchConsumer {
     type Output = ();
 
+    fn literal_budget(&self) -> Option<usize> {
+        self.remaining_literal_bytes
+    }
+
     fn on_response(
         &mut self,
         resp: UntaggedResponse,
@@ -285,6 +306,19 @@ impl Consumer for BoundedStreamingFetchConsumer {
         _ctx: &ConsumerContext,
     ) {
         if let UntaggedResponse::Fetch(fr) = resp {
+            if let Some(remaining) = &mut self.remaining_literal_bytes {
+                let octets = fr
+                    .body_sections
+                    .iter()
+                    .map(|section| section.data.as_ref().map_or(0, Vec::len))
+                    .chain(
+                        fr.binary_sections
+                            .iter()
+                            .map(|section| section.data.as_ref().map_or(0, Vec::len)),
+                    )
+                    .fold(0usize, usize::saturating_add);
+                *remaining = remaining.saturating_sub(octets);
+            }
             self.pipe.push(*fr);
         } else {
             self.ambiguous_buffer.push(resp);

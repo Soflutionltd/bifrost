@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use bifrost_types::AccountOperation;
 use bytes::Bytes;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
+use reqwest::header::{HeaderMap, HeaderName, RETRY_AFTER};
 use serde::Deserialize;
 
 const MAX_BODY_EXCERPT_BYTES: usize = 4096;
@@ -57,7 +57,13 @@ impl GmailResponseHeaders {
     }
 
     pub(crate) fn from_headers_at(headers: &HeaderMap, now: SystemTime) -> Self {
-        let retry_after = parse_retry_after_value(headers.get(RETRY_AFTER));
+        // Keep the private quota carrier while sharing all header parsing.
+        let retry_after = bifrost_net::request::parse_retry_after_hint(headers.get(RETRY_AFTER))
+            .and_then(|hint| match hint {
+                bifrost_types::RetryHint::After(delta) => Some(RetryAfter::Delta(delta)),
+                bifrost_types::RetryHint::At(at) => Some(RetryAfter::At(at)),
+                _ => None,
+            });
         Self {
             retry_at: retry_after.and_then(|hint| hint.resolve(now)),
             retry_after,
@@ -85,14 +91,6 @@ impl RetryAfter {
             Self::At(at) => Some(at),
         }
     }
-}
-
-fn parse_retry_after_value(value: Option<&HeaderValue>) -> Option<RetryAfter> {
-    let raw = value?.to_str().ok()?.trim();
-    raw.parse::<u64>()
-        .ok()
-        .map(|seconds| RetryAfter::Delta(Duration::from_secs(seconds)))
-        .or_else(|| httpdate::parse_http_date(raw).ok().map(RetryAfter::At))
 }
 
 fn first_header(headers: &HeaderMap, names: &[&str]) -> Option<String> {
@@ -569,6 +567,27 @@ pub(crate) fn parse_gmail_envelope(body: &[u8]) -> Option<GmailErrorEnvelope> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_retry_parser_preserves_syntax_and_resolves_once() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(784111777);
+        let now = at + Duration::from_secs(60);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        let parsed = GmailResponseHeaders::from_headers_at(&headers, now);
+        assert_eq!(parsed.retry_after, Some(RetryAfter::At(at)));
+        assert_eq!(parsed.retry_at, Some(at));
+        headers.insert(RETRY_AFTER, reqwest::header::HeaderValue::from_static("30"));
+        let parsed = GmailResponseHeaders::from_headers_at(&headers, now);
+        assert_eq!(
+            parsed.retry_after,
+            Some(RetryAfter::Delta(Duration::from_secs(30)))
+        );
+        assert_eq!(parsed.retry_at, Some(now + Duration::from_secs(30)));
+    }
 
     #[test]
     fn parses_gmail_error_envelope() {

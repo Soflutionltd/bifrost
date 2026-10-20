@@ -28,7 +28,7 @@ authors = ["folk@folk.wtf"]
 tokio = { version = "1.47", default-features = false }
 tokio-util = "0.7"
 tokio-native-tls = "0.3"
-futures = { version = "0.3", default-features = false }
+futures = { version = "0.3", default-features = false, features = ["async-await", "std"] }
 async-stream = "0.3"
 
 # Networking and TLS

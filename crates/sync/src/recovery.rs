@@ -200,18 +200,19 @@ pub(crate) fn restart_scope_error(scope: CursorScope, operation: AccountOperatio
 /// exhausts its reopen budget on purely engine-level errors would
 /// broadcast no `SyncEvent::Terminated` - only the operator warning -
 /// violating the documented "after three failures broadcast
-/// `Terminated(last_error)`" contract. Classified as
-/// `SyncState(CursorInvalid)` (the engine could not establish or persist
-/// the scope's cursor); the carried scope lets consumers route the
-/// termination to the affected scope.
+/// `Terminated(last_error)`" contract. Operator attention is required:
+/// emitting CursorInvalid here would instruct consumers to restart the scope
+/// whose automatic recovery budget the engine has just exhausted.
 #[must_use]
 pub(crate) fn establish_failure_error(
     scope: CursorScope,
     operation: AccountOperation,
 ) -> AccountError {
     AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-        Cause::State(StateCause::CursorInvalid),
+        AccountErrorKind::SyncState(SyncStateErrorKind::OperatorOverrideNeeded),
+        Cause::State(StateCause::OperatorOverrideNeeded {
+            reason: "automatic re-establishment retry budget exhausted".into(),
+        }),
     )
     .scope(ErrorScope::Cursor(scope))
     .operation(operation)
@@ -915,6 +916,21 @@ mod tests {
             err.recovery(),
             RecoveryClass::Engine(EngineDirective::RestartScope(got)) if *got == scope
         ));
+    }
+
+    #[test]
+    fn exhausted_establishment_requires_operator_attention() {
+        for scope in [
+            CursorScope::Account,
+            CursorScope::Folder(bifrost_types::FolderId("inbox".into())),
+        ] {
+            let err = establish_failure_error(scope.clone(), AccountOperation::EstablishCursor);
+            assert!(matches!(
+                err.recovery(),
+                RecoveryClass::Engine(EngineDirective::OperatorOverrideRequired { .. })
+            ));
+            assert_eq!(err.scope(), Some(&ErrorScope::Cursor(scope)));
+        }
     }
 
     #[test]

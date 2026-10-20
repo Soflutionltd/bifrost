@@ -2,70 +2,25 @@
 use super::*;
 
 impl ImapConnection {
-    /// RFC 7162 Section 3.1.5 defines `MODSEQ` as a SEARCH extension key, so
-    /// SEARCH-family commands must not use it until CONDSTORE or QRESYNC is
-    /// available. SORT and THREAD inherit the same search criteria grammar.
-    fn require_condstore_for_modseq_criterion(&self, criteria: &str) -> Result<(), Error> {
-        if Self::search_criteria_contains_atom(criteria, "MODSEQ") {
-            self.require_condstore()?;
-        }
-        Ok(())
-    }
-
-    /// Validate SEARCH-family extension criteria against negotiated
-    /// capabilities before sending the command.
-    ///
-    /// RFC 7162 Section 3.1.5 defines `MODSEQ` as a SEARCH extension key,
-    /// while RFC 5032 Sections 2 and 3 add `OLDER` and `YOUNGER` only for
-    /// servers that advertise the WITHIN capability. RFC 8514 Sections 4.1,
-    /// 4.3, and 5 likewise add `SAVEDBEFORE`, `SAVEDON`, `SAVEDSINCE`, and
-    /// `SAVEDATESUPPORTED` only for servers that advertise `SAVEDATE`.
-    /// RFC 8474 Sections 6 and 7 likewise add the `EMAILID` and `THREADID`
-    /// SEARCH keys only for servers that advertise `OBJECTID`.
-    /// RFC 5182 Sections 2.1 and 3 extend SEARCH-family criteria with the
-    /// `$` marker only when SEARCHRES (or `IMAP4rev2`, RFC 9051 Appendix E)
-    /// is available.
-    /// SEARCH RETURN, SORT, and THREAD all reuse the SEARCH criteria grammar,
-    /// so the same gates apply to every SEARCH-family command.
-    pub(super) fn validate_search_criteria_capabilities(
-        &self,
-        criteria: &str,
-    ) -> Result<(), Error> {
-        self.require_condstore_for_modseq_criterion(criteria)?;
-
+    // Capability checks belong to the live encoder, including for commands
+    // queued behind CAPABILITY or ENABLE. Keep this test adapter on that same
+    // path rather than a second implementation of the gates.
+    #[cfg(test)]
+    fn validate_search_criteria_capabilities(&self, criteria: &str) -> Result<(), Error> {
         let snap = self.state_rx.borrow();
-
-        if (Self::search_criteria_contains_atom(criteria, "OLDER")
-            || Self::search_criteria_contains_atom(criteria, "YOUNGER"))
-            && !super::auth::snapshot_supports(&snap, &Capability::Within)
-        {
-            return Err(Error::MissingCapability("WITHIN".into()));
-        }
-
-        if ["SAVEDBEFORE", "SAVEDON", "SAVEDSINCE", "SAVEDATESUPPORTED"]
-            .into_iter()
-            .any(|atom| Self::search_criteria_contains_atom(criteria, atom))
-            && !super::auth::snapshot_supports(&snap, &Capability::SaveDate)
-        {
-            return Err(Error::MissingCapability("SAVEDATE".into()));
-        }
-
-        if ["EMAILID", "THREADID"]
-            .into_iter()
-            .any(|atom| Self::search_criteria_contains_atom(criteria, atom))
-            && !super::auth::snapshot_supports(&snap, &Capability::ObjectId)
-        {
-            return Err(Error::MissingCapability("OBJECTID".into()));
-        }
-
-        // Drop the borrow before calling require_searchres (which borrows again).
-        drop(snap);
-
-        if Self::search_criteria_contains_atom(criteria, "$") {
-            self.require_searchres()?;
-        }
-
-        Ok(())
+        crate::codec::encode::encode_command(
+            "test",
+            &Command::Search {
+                criteria: criteria.into(),
+            },
+            &crate::codec::encode::EncodeOptions {
+                utf8_mode: false,
+                literal_mode: crate::codec::encode::LiteralMode::LiteralPlus,
+                capabilities: snap.capabilities.clone(),
+                enabled: snap.enabled.clone(),
+            },
+        )
+        .map(|_| ())
     }
 
     /// Returns `true` when `criteria` contains the given search-key atom
@@ -80,7 +35,7 @@ impl ImapConnection {
     /// `BODY {12}\r\nhello MODSEQ`, and `BODY MODSEQ` do not trigger extension
     /// capability checks just because their data happens to equal a gated
     /// search-key atom.
-    fn search_criteria_contains_atom(criteria: &str, atom: &str) -> bool {
+    pub(crate) fn search_criteria_contains_atom(criteria: &str, atom: &str) -> bool {
         let bytes = criteria.as_bytes();
         let mut i = 0usize;
 
@@ -115,38 +70,15 @@ impl ImapConnection {
     /// When scanning criteria for extension atoms, the literal payload must be
     /// skipped verbatim so its contents are not mistaken for syntax.
     fn search_criteria_literal_end(bytes: &[u8], pos: usize) -> Option<usize> {
-        if bytes.get(pos) != Some(&b'{') {
+        use super::literals::{LiteralMarker, literal_marker_at};
+        let LiteralMarker::Counted {
+            data_start, size, ..
+        } = literal_marker_at(bytes, pos)
+        else {
             return None;
-        }
-
-        let mut j = pos + 1;
-        let digits_start = j;
-        while j < bytes.len() && bytes[j].is_ascii_digit() {
-            j += 1;
-        }
-        if j == digits_start {
-            return None;
-        }
-
-        let digits_end = j;
-        if j < bytes.len() && bytes[j] == b'+' {
-            j += 1;
-        }
-
-        if j + 2 >= bytes.len()
-            || bytes[j] != b'}'
-            || bytes[j + 1] != b'\r'
-            || bytes[j + 2] != b'\n'
-        {
-            return None;
-        }
-
-        let size = std::str::from_utf8(&bytes[digits_start..digits_end])
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())?;
-        let data_start = j + 3;
-        let data_end = data_start.checked_add(size)?;
-        (data_end <= bytes.len()).then_some(data_end)
+        };
+        let end = data_start.checked_add(usize::try_from(size).ok()?)?;
+        (end <= bytes.len()).then_some(end)
     }
 
     /// RFC 3501 Section 6.4.4 / RFC 9051 Section 6.4.4: SEARCH keys are

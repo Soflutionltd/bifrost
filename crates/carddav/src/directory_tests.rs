@@ -350,6 +350,11 @@ async fn directory_partial_failure_identifies_gateway_and_all_failed_is_error() 
                 multistatus(&card("one.vcf", "EMAIL:one@example.test")),
             )
         });
+        if all_failed {
+            // DAV retries one bearer-authenticated 401 after refreshing the
+            // token. The second 401 is the terminal gateway error.
+            steps.push(answer(StatusCode::UNAUTHORIZED, "expired"));
+        }
         let script = dav_script(steps);
         let account = CardDavAccount::open_with_client(CardDavClient::with_account_net(
             BASE,

@@ -76,6 +76,8 @@ impl ScramHash {
 pub enum ScramChannelBinding {
     /// No binding: GS2 header `n,,`, `c=biws`.
     None,
+    /// Binding is available but the server did not advertise PLUS: `y,,`, `c=eSws`.
+    SupportedButNotAdvertised,
     /// `tls-server-end-point` binding: GS2 header
     /// `p=tls-server-end-point,,`, `c=` over that header plus the raw
     /// [`crate::tls_server_end_point`] bytes.
@@ -90,6 +92,7 @@ impl ScramChannelBinding {
     pub fn gs2_header(&self) -> &'static str {
         match self {
             Self::None => "n,,",
+            Self::SupportedButNotAdvertised => "y,,",
             Self::TlsServerEndPoint(_) => "p=tls-server-end-point,,",
         }
     }
@@ -98,10 +101,43 @@ impl ScramChannelBinding {
     /// name via [`ScramHash::mechanism_name`].
     pub fn binding(&self) -> ChannelBinding {
         match self {
-            Self::None => ChannelBinding::None,
+            Self::None | Self::SupportedButNotAdvertised => ChannelBinding::None,
             Self::TlsServerEndPoint(_) => ChannelBinding::TlsServerEndPoint,
         }
     }
+}
+
+/// Select one advertised SCRAM rung and its GS2 input (RFC 5802 section 6).
+///
+/// Call in preference order; `plus` identifies the requested rung. An advertised
+/// PLUS suppresses its unbound counterpart even if local binding is unavailable.
+/// `binding_data` is present only when binding is usable on this connection.
+/// Certificate parsing errors must be propagated before calling this helper.
+pub fn select_scram_rung(
+    hash: ScramHash,
+    plus: bool,
+    advertised: impl Fn(&str) -> bool,
+    binding_data: Option<&[u8]>,
+) -> Option<(ScramHash, ScramChannelBinding)> {
+    let offers_plus = advertised(hash.mechanism_name(ChannelBinding::TlsServerEndPoint));
+    let binding = if plus {
+        if !offers_plus {
+            return None;
+        }
+        ScramChannelBinding::TlsServerEndPoint(binding_data?.to_vec())
+    } else {
+        if offers_plus || !advertised(hash.mechanism_name(ChannelBinding::None)) {
+            return None;
+        }
+        // RFC 5802 section 6: `n` would conceal a stripped PLUS advertisement.
+        // `y` lets a binding-capable server detect it; no binding bytes accompany y.
+        if binding_data.is_some() {
+            ScramChannelBinding::SupportedButNotAdvertised
+        } else {
+            ScramChannelBinding::None
+        }
+    };
+    Some((hash, binding))
 }
 
 /// base64-decode a SASL continuation payload to its UTF-8 text form.
@@ -233,8 +269,8 @@ pub fn scram_client_final(
     }
 
     // RFC 5802 Section 6: the `c=` attribute is base64(gs2-header || cbind-data).
-    // For no binding the GS2 header is `n,,` and there is no cbind-data, so the
-    // value is the well-known `biws`. For tls-server-end-point the header is
+    // Without binding data the header is `n,,` (`biws`) or `y,,` (`eSws`).
+    // For tls-server-end-point the header is
     // `p=tls-server-end-point,,` followed by the raw binding bytes.
     let mut cbind = binding.gs2_header().as_bytes().to_vec();
     if let ScramChannelBinding::TlsServerEndPoint(data) = binding {
@@ -399,6 +435,70 @@ fn xor_bytes(a: &[u8], b: &[u8]) -> Zeroizing<Vec<u8>> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn negotiated_binding_headers_and_client_final_attributes() {
+        use base64::Engine;
+
+        for hash in [ScramHash::Sha1, ScramHash::Sha256] {
+            for (offers_plus, available, plus, header, c_input) in [
+                (false, false, false, "n,,", b"n,,".as_slice()),
+                (false, true, false, "y,,", b"y,,".as_slice()),
+                (
+                    true,
+                    true,
+                    true,
+                    "p=tls-server-end-point,,",
+                    b"p=tls-server-end-point,,data".as_slice(),
+                ),
+            ] {
+                let advertised = |name: &str| {
+                    name == hash.mechanism_name(ChannelBinding::None)
+                        || (offers_plus
+                            && name == hash.mechanism_name(ChannelBinding::TlsServerEndPoint))
+                };
+                let (selected, binding) = select_scram_rung(
+                    hash,
+                    plus,
+                    advertised,
+                    available.then_some(b"data".as_slice()),
+                )
+                .unwrap();
+                assert_eq!(selected, hash);
+                assert_eq!(binding.gs2_header(), header);
+                let (message, _) = scram_client_final(
+                    hash,
+                    &pw("pencil"),
+                    "nonce",
+                    "n=user,r=nonce",
+                    "r=nonceserver,s=QSXCR+Q6sek8bf92,i=4096",
+                    &binding,
+                )
+                .unwrap();
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(message.as_str())
+                    .unwrap();
+                let decoded = String::from_utf8(decoded).unwrap();
+                assert_eq!(
+                    decoded.split(',').next().unwrap(),
+                    format!(
+                        "c={}",
+                        base64::engine::general_purpose::STANDARD.encode(c_input)
+                    )
+                );
+            }
+            for available in [false, true] {
+                let advertised = |name: &str| name.starts_with("SCRAM-");
+                assert!(
+                    select_scram_rung(hash, false, advertised, available.then_some(&[][..]))
+                        .is_none()
+                );
+            }
+            assert!(select_scram_rung(hash, true, |_| true, None).is_none());
+            assert!(select_scram_rung(hash, true, |_| false, Some(&[])).is_none());
+            assert!(select_scram_rung(hash, false, |_| false, Some(&[])).is_none());
+        }
+    }
 
     fn pw(password: &str) -> ScramPassword {
         prepare_scram_password(password).expect("test password prepares")

@@ -174,36 +174,6 @@ ends with `try_build().unwrap_or_else(|_| first.error.clone())`.
   first failure is promoted verbatim - it is already classified" is false
   whenever the primary lacks one of those causes.
 
-## SHARED-006 - Retry-After: four parsers, three answers for an HTTP-date
-
-Scopes: types adoption and net adoption.
-
-- `bifrost_net::parse_retry_after` (`crates/net/src/request.rs`) resolves an
-  HTTP-date against `SystemTime::now()` at parse time and returns
-  `Option<Duration>`; an elapsed date returns `None` (`duration_since` errs), so
-  the hint vanishes.
-- Graph's `parse_retry_after_header` (`graph_error.rs`) delegates and wraps in
-  `RetryHint::After`. Its doc says elapsed dates "collapse to `Duration::ZERO`,
-  which is the engine's signal to retry immediately": false, they become
-  `None`.
-- JMAP (`sync/error.rs`, `retry_after_header`) delegates likewise.
-- Google (`crates/google/src/error.rs`) keeps its own `parse_retry_after_value`
-  that retains the syntax (`Delta` / `At`) and emits `RetryHint::At`, so an
-  elapsed date stays a past deadline (min delay zero).
-
-`RetryHint::At(SystemTime)` exists in the types crate for the HTTP-date form,
-and only Google uses it. The collapse to `After` also re-anchors the hint to
-when the consumer reads it rather than the instant the server named. The shared
-parser should return a `RetryHint` (or a structured form `parse_retry_after`
-projects from), and Google's copy should go. DAV does not read Retry-After at
-all (DAV-004).
-
-The net doc on `parse_retry_after` is also stale against the types crate: it
-names "the `retry_after` field on `ServerCause::{...}` and the `not_before`
-field on `RetryAdvice`". Neither exists; both are `retry_hint:
-Option<RetryHint>` (the error model calls the split `not_before` field the
-side-channel bug the convergence rewrite removed).
-
 ## SHARED-007 - Two idempotency authorities
 
 Scope: types adoption. Weaker finding.
@@ -312,59 +282,23 @@ flipping, and fix it there if it is too aggressive for a long-period poll.
 SYNC-002 (the lifecycle reader never revived after termination) and JMAP-011
 (JMAP's terminal `cannotCalculateChanges`) sit on the same path.
 
-## SHARED-013 - Push readers swallow engine directives, and IMAP never reports a push failure at all
+## SHARED-006 - Net OAuth refresh and the DAV status ladder still use the duration projection of Retry-After
 
-Scopes: sync adoption and imap account (both reported the IMAP part).
+Residue: `bifrost_net::request::parse_retry_after_hint` returns a `RetryHint`
+that keeps the HTTP-date syntax, and graph, jmap and google use it. Net OAuth
+refresh failure still goes through the duration-only `parse_retry_after`, which
+loses an elapsed date, and so does dav-core's status ladder. `refresh_failed` in
+`crates/net/src/account_error.rs` also drops its own `retry_after` argument when
+the nested cause carries no hint. Once no caller is left, the duration form can
+be retired (a removal, so it needs the owner).
 
-The push reconciler (`crates/sync/src/push/reconciler.rs`,
-`WatchEvent::Terminated` arm) routes `RecoveryPlan::Engine(directive)` to the
-reopen channel, but providers mostly never let a directive reach it:
-- JMAP `reader_pass` (`crates/jmap/src/sync/push.rs`): handshake and read-loop
-  errors check only `is_terminal()`, so an `Engine(_)` class (capability
-  changed, session changed, restart-account) is a transient reconnect retried
-  forever.
-- Graph EWS (`crates/graph/src/account/ews_stream.rs`) and the Google renewer
-  (`crates/google/src/account/push.rs`, renewal failure arm) use the same
-  `is_terminal()`-only test.
-- IMAP (`crates/imap/src/account/push.rs`, `idle_loop`): `dial_idle` and
-  `select` errors are discarded with `Err(_)`, unclassified, so `NONEXISTENT` or
-  `NOPERM` cannot be told from a network failure, and the worker redials on
-  backoff. IMAP emits no `WatchEvent::Terminated` anywhere. A subscribed folder
-  that was deleted, renamed or ACL-revoked makes its worker emit
-  `WatchEvent::Disconnected` (which bifrost-sync turns into the account-scoped
-  "push transport disconnected" warning), then dial, authenticate and SELECT
-  again every 5 to 300 s for the account's life; each retry is a full connect,
-  which providers with connection-rate limits punish. A later successful round
-  emits `Reconnected`, which the engine turns into an account-wide
-  `HintPayload::Unknown` reconcile. Because `Disconnected` and `Reconnected`
-  are account-level signals multiplexed from per-worker state, worker B can
-  emit `Reconnected` while worker A is still down. A deleted folder chosen by
-  `choose_idle_folder` is re-selected forever. Auth loss and capability breaks
-  take the same endless loop.
+## SHARED-013 - Push health after the directive fix
 
-Claims broken: the reconciler's documented directive routing;
-`reference/error-model.md`'s rule that recovery classes are acted on
-centrally; for IMAP, the push section's premise that `Disconnected` means the
-transport went away. Fix: providers forward any non-`Retry` classification as
-`Terminated` (IMAP must classify at all); transient retry can stay local, only
-for `Retry`.
+Residue of the push-reader fix (every reader now forwards non-Retry
+classifications as `Terminated`, and IMAP classifies and parks):
+- IMAP health edges are still per worker, so `Reconnected` from worker B does
+  not mean the account is healthy while worker A is down.
+- Graph and Google push health streams are broadcast-only and can lose a
+  terminal event for a late or lagged subscriber, the shape JMAP closed with a
+  latch.
 
-## SHARED-015 - `PushSubscription::new` does not enforce its own invariant
-
-Scope: types adoption (lateral in bifrost-types).
-
-The type doc says "the handle is absent when no requested scope was accepted",
-and the error model says the handle covers exactly the succeeded lane.
-`new(handle, outcomes)` accepts `Some(handle)` with an empty succeeded lane and
-`None` with a non-empty one. Graph had to add `no_subscribable_push_scopes`
-because an arm produced the handle-less all-failed shape; the constructor could
-reject it.
-
-## SHARED-017 - IMAP's `scope_lifecycle_stream` comment is false
-
-Scope: sync adoption (lateral).
-
-`crates/imap/src/account/mod.rs` says `scope_lifecycle_stream` "streams folder
-lifecycle events from push state". The implementation in
-`crates/imap/src/account/scopes.rs` never yields and ends at shutdown, and
-`reference/imap.md` says IMAP emits no scope-lifecycle events.

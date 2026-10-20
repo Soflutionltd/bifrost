@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use serde::ser::{SerializeStruct, SerializeTuple};
 use serde::{Serialize, Serializer};
 
-use crate::client::Client;
+use crate::client::{Client, SessionState};
 use crate::core::transport::HttpTransport;
 
 use super::capability::Capability;
@@ -116,6 +116,7 @@ impl CallLimit {
 /// A JMAP request batch.
 pub(crate) struct Request<'x, T: HttpTransport = crate::transport_reqwest::ReqwestTransport> {
     client: &'x Client<T>,
+    session_state: std::sync::Arc<SessionState>,
     account_id: AccountId,
     pub(crate) using: Vec<&'static str>,
     pub(crate) method_calls: Vec<RawMethodCall>,
@@ -138,15 +139,26 @@ impl<T: HttpTransport> Serialize for Request<'_, T> {
 
 impl<'x, T: HttpTransport> Request<'x, T> {
     pub(crate) fn new(client: &'x Client<T>) -> Self {
-        let max_calls = CallLimit::read(&client.session());
+        let session_state = client.session_state();
+        let max_calls = CallLimit::read(session_state.session());
         Request {
             using: vec!["urn:ietf:params:jmap:core"],
             method_calls: Vec::new(),
             created_ids: None,
-            account_id: client.default_account_id(),
+            account_id: session_state.default_account_id().clone(),
             client,
+            session_state,
             max_calls,
         }
+    }
+
+    /// Session-derived values used to build this request. Holding the
+    /// snapshot through send keeps its account, limits, and API endpoint
+    /// together if another task refreshes the client meanwhile. WebSocket
+    /// encoding must use this accessor too rather than re-reading Client's
+    /// current session.
+    pub(crate) fn session_state(&self) -> &SessionState {
+        &self.session_state
     }
 
     pub(crate) fn account_id(mut self, account_id: impl Into<AccountId>) -> Self {

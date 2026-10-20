@@ -175,12 +175,11 @@ Internal modules:
   `AccountError` is decorated through `into_builder` with support-only
   text recording the abandoned session - decoration only, so kind,
   message key and `RecoveryClass` are unchanged, and the pre-authenticated
-  session URI is deliberately kept out of that text. The failure is NOT
-  reclassified to `Protocol(PartialResponse)` / `Acknowledged` the way the
-  cross-calendar event move is: Drive publishes no file until the upload
-  completes, so there is no target for a `CheckTarget` /
-  `DedupeByClientId` directive to name, and the reclassification would
-  demote a transient transport drop out of its retry lane. A link-step
+  session URI is deliberately kept out of that text. The failure is not
+  reclassified to `Protocol(PartialResponse)` / `Acknowledged`: Drive publishes
+  no file until the upload completes, so there is no target for a `CheckTarget`
+  / `DedupeByClientId` directive to name, and the reclassification would demote
+  a transient transport drop out of its retry lane. A link-step
   failure after a completed upload leaves an uploaded-but-unlinked file
   and no session, so it takes no cleanup path. Accepted residual: a caller
   who drops the future mid-upload gets no cancel, because `Drop` cannot
@@ -323,8 +322,8 @@ account-scoped clone attached to `bifrost-net` under the engine
   re-check after taking the lock. Container listing still fetches the latest
   server view, but its write uses the same lock. Lifecycle diff state is
   private to each lifecycle stream and never reads this cache.
-- `shutdown: CancellationToken` for the watch actor and the
-  lifecycle stream.
+- `shutdown: CancellationToken` for the watch actor and cancellable account
+  streams.
 - `set_priority` / `set_bandwidth_cap` delegate to the underlying `AccountNet`.
 
 Clients (`from_access_token` or `from_token_source`) retain their parent
@@ -360,7 +359,12 @@ one thing a dropped close future cannot guarantee is the remote half: Gmail
 may keep delivering until the 7-day watch expires.
 `Drop` also cancels and detaches as a fallback when a consumer omits
 `close()`. The watch actor and `push_stream` both select on
-`shutdown.cancelled()` and retire cleanly.
+`shutdown.cancelled()` and retire cleanly. The scope lifecycle stream selects
+on it during both its polling wait and an in-flight `labels.list` request, and
+stops before emitting queued lifecycle events. The token is also threaded
+through inventory, changes, hydration and mutations. `repair_inventory`,
+membership discovery, blob reads, and the PIM, contacts and Calendar operations
+do not currently receive it, so `close()` cannot interrupt those calls.
 
 ## Capabilities
 
@@ -706,11 +710,14 @@ The same guard checks the SHAPE of every non-empty start and end, as
 classifies as the caller's malformed input with nothing sent in error, and that
 is honest on a create or a plain field patch. The local check exists for the
 update that also moves the calendar: `events.move` has already succeeded when
-the field patch is rejected, which surfaces as a non-replayable
-`Protocol(PartialResponse)`. Accepted limit: the `timezone` NAME is not
-validated (no time-zone database is carried, and a false refusal is worse than
-Google's 400), so an unknown zone combined with a calendar move can still end
-as `PartialResponse`. RSVP patches only `attendees` and re-sends no time.
+the field patch is rejected, so the common malformed time shapes are refused
+before the first leg. Accepted limit: the `timezone` NAME is not validated (no
+time-zone database is carried, and a false refusal is worse than Google's
+400), so an unknown zone combined with a calendar move can still leave the
+event moved with a failed destination patch. That PATCH error retains its
+original classification and receives a user-safe continuation naming the
+destination scope as the retry target, plus support-only move context.
+RSVP patches only `attendees` and re-sends no time.
 Projection failures are per item, not per page. `page_from_events` routes a
 refused event onto `Page::failed_ids` under its composite native id and
 serves the rest of the page, matching how bifrost-jmap and bifrost-caldav
@@ -727,17 +734,21 @@ calendar, then applies any remaining field patch against the destination.
 Patch-local validation runs before the move, so a patch that could never
 be applied cannot strand the event in the destination calendar.
 That provider operation is non-atomic. If the move succeeds and the field
-PATCH fails, the returned error is `Protocol(PartialResponse)` with an
-acknowledged attempt cause, which directs the consumer to reconcile the moved
-event. Because the primary kind changes, the reclassification builds a
-fresh `AccountErrorBuilder` rather than taking the `into_builder`
-decoration path, and copies across by hand everything a consumer or a
-support export would otherwise lose: the `ErrorScope::Calendar` naming
-the event under its *destination* calendar, the provider and protocol,
-the HTTP status, request and trace ids, native code, the tagged
-diagnostic text, and the entire original cause chain as secondary
-evidence. There is no compensating move because that would add another
-blind write and another partial-failure window.
+PATCH fails, the returned error preserves the PATCH's original kind, recovery
+class and retry hint. Its `ErrorScope::Calendar` names the event under its
+*destination* calendar, and support-only text records the successful move.
+A user-safe diagnostic states that the move is already committed and tells
+the caller to continue with `event_update(destination_event_id, original_patch)`
+using the id from that scope, only when recovery permits retrying. The original
+source id must not be replayed. The destination id matches `patch.calendar_id`,
+so continuation skips `events.move` and sends only the field PATCH. Retry
+advice (including `SameRequest`) describes that destination PATCH; it does not
+authorize replay of the original composite call. This preserves permanent
+authorization failures, authentication recovery and rate-limit deadlines.
+The error model has no typed continuation field; callers must use the scoped
+id together with this public diagnostic.
+There is no compensating move because that would add another blind write and
+another partial-failure window.
 A present `EventPatch.recurrence` always writes the `recurrence` key; an
 empty `EventRecurrence` sends `[]` (the Google idiom for clearing
 RRULE/RDATE/EXDATE), while an absent recurrence patch omits the key.
@@ -1149,12 +1160,13 @@ There is no renewer handle for another task to clear or restart. Its renewal arm
   hot renewal loop.
 - Re-issues `users.watch` and replaces history id and expiration together in one
   state transition.
-- On failure: classifies via
-  `error::into_account_error(_, GmailErrorContext::push_subscribe())`
-  and routes on `RecoveryClass::is_terminal()`. Terminal classes
-  (auth lost, policy block, account disabled, schema break) emit
+- On failure, the actor classifies through
+  `error::into_account_error(_, GmailErrorContext::push_subscribe())`. The
+  context scopes the error to `CursorScope::Account` because the watch covers
+  that cursor. The actor retries locally only for `RecoveryClass::Retry`. Every other class,
+  including engine directives and reconciliation, emits
   `WatchEvent::Terminated(AccountError)` and returns to `Unwatched`, so a later
-  subscribe command starts a fresh watch and renewal schedule. Transient classes
+  subscribe command starts a fresh watch and renewal schedule. Retry classes
   emit a structured
   `WatchEvent::Warning` per failure (support-only text carrying the
   message key) plus `WatchEvent::Disconnected` (once) and retry after
@@ -1458,6 +1470,17 @@ Flag canonicalization in `flags.rs`:
   given request does not name, so applying every body to each surviving
   id converges on the same final label set. An account under the cap -
   nearly all of them - still emits exactly one request.
+  Once a multi-id 404 starts recovery, that request and all later
+  `batchModify` calls in the mutation batch share a 128-request budget (6,400
+  quota units). This leaves room for a 100-body patch and a single missing id
+  in a full-size batch while stopping mass-delete fanout. Reaching the budget
+  emits `Internal(LimitExceeded)` with acknowledged evidence, preserves
+  outcomes already resolved, and leaves unvisited ids unreported. The cap is
+  finite because the input batch is already bounded at 1000 ids: a one-body
+  all-404 split would otherwise issue at most 1,999 calls (99,950 units). The
+  detector sees HTTP status only, and batchModify supplies no per-id result,
+  so it cannot distinguish a missing message from a missing label if Gmail
+  uses 404 for either resource.
 - `DRAFT` and `SENT` are read-only projections: Gmail answers 400 for either id
   in `addLabelIds` or in `removeLabelIds`, so neither ever reaches the wire from
   any reverse translation path, including a crafted `$gmail-label:SENT:...`
@@ -1643,19 +1666,18 @@ Assessed and deliberately left as they are. These are decisions, not gaps,
 and each is also stated at the code it describes.
 
 - **Cross-calendar event update is non-atomic.** Google exposes the move and the
-  field PATCH as separate requests. A second-leg failure returns
-  `Protocol(PartialResponse)` scoped to the event in its DESTINATION calendar
-  (the caller's `source::` composite id no longer addresses it), carrying
-  provider, protocol, HTTP status, request and trace ids, native code, both
-  diagnostic tiers and the whole original cause chain as secondary evidence,
-  with `Attempt(Acknowledged)` pushed first so `derive` reads it. No
-  compensating move is attempted - that adds another blind write and another
-  partial-failure window. Note that a reclassification must carry the evidence
-  the consumer needs to act: a `Reconcile` directive that does not name its
-  target is barely better than the silent partial write it replaces. Because
-  `into_builder` is decoration-only and exposes no kind-changing path, a fresh
-  builder plus hand-copied evidence is the contract-correct route here, not a
-  shortcut.
+  field PATCH as separate requests. If the move succeeds and the destination
+  PATCH fails, the returned error keeps the PATCH's original kind, recovery
+  class, retry hint, scope, telemetry, and cause chain. It is scoped to the
+  event in its DESTINATION calendar because the caller's `source::` composite
+  id no longer addresses it, and carries support-only text recording that the
+  move succeeded. A user-safe diagnostic exposes partial commitment and the
+  continuation: when recovery allows, pass the destination-scoped event id
+  and original patch to `event_update`; never replay the source id. This
+  skips the already completed move. Retry advice applies to the destination
+  PATCH, preserving terminal/auth classes and a 429's deadline. The model
+  has no typed continuation carrier. No compensating move is attempted,
+  since that adds another blind write and another partial-failure window.
 - **A `close()` future dropped mid-`users.stop` leaves the Gmail-side watch
   running until it expires.** The local half is cancellation-safe at every await
   - `closed` and `shutdown.cancel()` happen synchronously before the future

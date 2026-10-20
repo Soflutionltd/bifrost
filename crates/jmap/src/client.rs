@@ -245,6 +245,10 @@ impl SessionState {
 pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
     transport: T,
     state: std::sync::Mutex<Arc<SessionState>>,
+    /// Session fetch and install are one serialized operation. Without this
+    /// gate, an earlier GET that completes last can overwrite a newer
+    /// session fetched by an overlapping refresh.
+    refresh_gate: futures::lock::Mutex<()>,
     session_url: String,
     session_updated: AtomicBool,
     /// Wakes the account layer's scope-lifecycle poller when a response
@@ -456,6 +460,7 @@ impl ClientBuilder {
             tally: None,
             inner: Arc::new(ClientInner {
                 state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
+                refresh_gate: futures::lock::Mutex::new(()),
                 session_url,
                 session_updated: true.into(),
                 #[cfg(feature = "tokio")]
@@ -489,10 +494,14 @@ fn well_known_session_url(url: &str) -> String {
 
 #[cfg(test)]
 mod session_state_tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use bytes::Bytes;
     use serde_json::json;
+    use tokio::sync::{Notify, Semaphore};
 
     use super::{Client, Session, well_known_session_url};
     use crate::core::transport::{HttpTransport, TransportError};
@@ -818,6 +827,189 @@ mod session_state_tests {
         }
     }
 
+    struct RequestSnapshotTransport {
+        requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        refreshed_session: String,
+    }
+
+    impl HttpTransport for RequestSnapshotTransport {
+        async fn api_request(&self, url: &str, body: Vec<u8>) -> Result<Bytes, TransportError> {
+            let request = serde_json::from_slice(&body).expect("request body is JSON");
+            self.requests
+                .lock()
+                .expect("request log")
+                .push((url.to_string(), request));
+            Err(TransportError::new(
+                "snapshot test does not need a response",
+            ))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<Bytes, TransportError> {
+            Err(TransportError::new("snapshot test does not upload"))
+        }
+
+        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
+            Err(TransportError::new("snapshot test does not download"))
+        }
+
+        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
+            Ok(Bytes::from(self.refreshed_session.clone()))
+        }
+    }
+
+    struct GatedRefreshTransport {
+        calls: Arc<AtomicUsize>,
+        first_started: Arc<Notify>,
+        release_first: Arc<Semaphore>,
+    }
+
+    impl HttpTransport for GatedRefreshTransport {
+        async fn api_request(&self, _url: &str, _body: Vec<u8>) -> Result<Bytes, TransportError> {
+            Err(TransportError::new(
+                "refresh test does not send API requests",
+            ))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<Bytes, TransportError> {
+            Err(TransportError::new("refresh test does not upload"))
+        }
+
+        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
+            Err(TransportError::new("refresh test does not download"))
+        }
+
+        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.first_started.notify_one();
+                self.release_first
+                    .acquire()
+                    .await
+                    .expect("refresh release semaphore remains open")
+                    .forget();
+                Ok(Bytes::from(session_json("middle", "B2", "session-2")))
+            } else {
+                Ok(Bytes::from(session_json("latest", "C3", "session-3")))
+            }
+        }
+    }
+
+    fn session_with_call_limit(tag: &str, account: &str, state: &str, max_calls: usize) -> String {
+        let mut session: serde_json::Value =
+            serde_json::from_str(&session_json(tag, account, state)).expect("fixture parses");
+        session["capabilities"]["urn:ietf:params:jmap:core"] = json!({
+            "maxSizeUpload": 1000,
+            "maxConcurrentUpload": 2,
+            "maxSizeRequest": 100_000,
+            "maxConcurrentRequests": 3,
+            "maxCallsInRequest": max_calls,
+            "maxObjectsInGet": 256,
+            "maxObjectsInSet": 256,
+            "collationAlgorithms": []
+        });
+        session.to_string()
+    }
+
+    /// A Request must keep one session view for its default account, call
+    /// limit, and API URL. Refreshing after construction used to splice the
+    /// old call limit and account together with the new endpoint.
+    #[cfg(feature = "mail")]
+    #[tokio::test]
+    async fn a_request_keeps_its_session_snapshot_through_refresh_and_send() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let old_session = session_with_call_limit("old", "A1", "session-1", 1);
+        let new_session = session_with_call_limit("new", "B2", "session-2", 2);
+        let client = Client::with_transport(
+            RequestSnapshotTransport {
+                requests: Arc::clone(&requests),
+                refreshed_session: new_session,
+            },
+            serde_json::from_str(&old_session).expect("session parses"),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+
+        let mut request = client.build();
+        request
+            .call(crate::mailbox::MailboxGet::new())
+            .expect("first method fits the original limit");
+        client.refresh_session().await.expect("refresh succeeds");
+
+        assert!(matches!(
+            request.call(crate::mailbox::MailboxGet::new()),
+            Err(crate::Error::RequestCallLimit { max: 1 })
+        ));
+        let encoded: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&request).expect("request encodes"))
+                .expect("request is JSON");
+        assert_eq!(
+            encoded["methodCalls"]
+                .as_array()
+                .expect("methodCalls is an array")
+                .len(),
+            1
+        );
+        assert_eq!(encoded["methodCalls"][0][1]["accountId"], "A1");
+
+        let _ = client.send_request(&request).await;
+        let requests = requests.lock().expect("request log");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "https://old.example.test/api");
+        assert_eq!(requests[0].1["methodCalls"][0][1]["accountId"], "A1");
+    }
+
+    /// An earlier session fetch can finish after a later one unless refreshes
+    /// serialize the fetch as well as the install. The second refresh must
+    /// wait, then observe and install the later server session.
+    #[tokio::test]
+    async fn overlapping_refreshes_do_not_install_an_older_session_last() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_started = Arc::new(Notify::new());
+        let release_first = Arc::new(Semaphore::new(0));
+        let client = Client::with_transport(
+            GatedRefreshTransport {
+                calls: Arc::clone(&calls),
+                first_started: Arc::clone(&first_started),
+                release_first: Arc::clone(&release_first),
+            },
+            serde_json::from_str(&session_json("old", "A1", "session-1")).expect("session parses"),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+
+        let started = first_started.notified();
+        let first_client = client.clone();
+        let first = tokio::spawn(async move { first_client.refresh_session().await });
+        started.await;
+
+        let second_client = client.clone();
+        let second = tokio::spawn(async move { second_client.refresh_session().await });
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        release_first.add_permits(1);
+        first
+            .await
+            .expect("first refresh task joins")
+            .expect("first refresh");
+        second
+            .await
+            .expect("second refresh task joins")
+            .expect("second refresh");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(client.session().state(), "session-3");
+    }
+
     /// Records every API concurrency bound the client hands it, and serves a
     /// refreshed session advertising a different one.
     struct LimitRecordingTransport {
@@ -1015,6 +1207,7 @@ impl<T: HttpTransport> Client<T> {
             tally: None,
             inner: Arc::new(ClientInner {
                 state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
+                refresh_gate: futures::lock::Mutex::new(()),
                 session_url,
                 session_updated: true.into(),
                 #[cfg(feature = "tokio")]
@@ -1073,11 +1266,10 @@ impl<T: HttpTransport> Client<T> {
         request: &request::Request<'_, T>,
     ) -> crate::Result<response::Response> {
         let body = serde_json::to_vec(request).map_err(crate::Error::RequestEncode)?;
-        let state = self.session_state();
         let (bytes, bytes_in) = self
             .inner
             .transport
-            .api_request_measured(state.api_url(), body)
+            .api_request_measured(request.session_state().api_url(), body)
             .await
             .map_err(crate::Error::from)?;
         self.record_bytes_in(bytes_in);
@@ -1127,6 +1319,7 @@ impl<T: HttpTransport> Client<T> {
     /// in `reference/jmap.md` rather than deleted - an audit finding it
     /// uncalled has found a recorded state, not dead code.
     pub(crate) async fn refresh_session(&self) -> crate::Result<()> {
+        let _refresh = self.inner.refresh_gate.lock().await;
         let bytes = self
             .inner
             .transport
@@ -1142,8 +1335,8 @@ impl<T: HttpTransport> Client<T> {
         let mut installed = self.inner.state.lock().expect("session mutex poisoned");
         *installed = state;
         self.inner.transport.set_api_concurrency(limit);
-        drop(installed);
         self.inner.session_updated.store(true, Ordering::Release);
+        drop(installed);
         Ok(())
     }
 

@@ -80,34 +80,17 @@ fn validate_search_criteria_crlf(
 
     while i < bytes.len() {
         if bytes[i] == b'{' {
-            let mut j = i + 1;
-            let digits_start = j;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-            }
-
-            let has_plus = j > digits_start && j < bytes.len() && bytes[j] == b'+';
-            if has_plus {
-                j += 1;
-            }
-
-            if j > digits_start
-                && j + 2 < bytes.len()
-                && bytes[j] == b'}'
-                && bytes[j + 1] == b'\r'
-                && bytes[j + 2] == b'\n'
+            use crate::connection::literals::{LiteralMarker, literal_marker_at};
+            if let LiteralMarker::Counted {
+                data_start,
+                size,
+                synchronizing,
+            } = literal_marker_at(bytes, i)
             {
-                let size = std::str::from_utf8(
-                    &bytes[digits_start..j - usize::from(bytes[j - 1] == b'+')],
-                )
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .ok_or_else(|| {
-                    crate::Error::InvalidInput(format!(
-                        "{context} contains an invalid literal octet count \
-                             (RFC 3501 Section 4.3)"
-                    ))
+                let size = usize::try_from(size).map_err(|_| {
+                    crate::Error::InvalidInput(format!("{context} literal count exceeds usize"))
                 })?;
+                let has_plus = !synchronizing;
                 // A non-synchronizing literal the caller wrote is well-formed;
                 // what is missing is the server's LITERAL+ (or LITERAL- for
                 // this size), so both refusals are capability gaps.
@@ -130,7 +113,6 @@ fn validate_search_criteria_crlf(
                         LiteralMode::LiteralMinus | LiteralMode::LiteralPlus => {}
                     }
                 }
-                let data_start = j + 3;
                 let data_end = data_start.checked_add(size).ok_or_else(|| {
                     crate::Error::InvalidInput(format!(
                         "{context} literal length overflows usize \

@@ -389,7 +389,14 @@ pub(crate) fn push_subscribe(
         let handle = response
             .await
             .unwrap_or_else(|_| Err(closed_error(AccountOperation::PushSubscribe)))?;
-        Ok(bifrost_types::PushSubscription::new(Some(handle), outcomes))
+        bifrost_types::PushSubscription::new(Some(handle), outcomes).map_err(|failure| {
+            error::into_account_error(
+                crate::error::Error::internal(format!(
+                    "gmail push subscription invariant failed: {failure}"
+                )),
+                error::GmailErrorContext::push_subscribe(),
+            )
+        })
     })
 }
 
@@ -604,7 +611,9 @@ async fn watch_actor(
                         let account_error = error::into_account_error(
                             err, error::GmailErrorContext::push_subscribe(),
                         );
-                        if account_error.recovery().is_terminal() {
+                        // Only Retry belongs to this reconnect loop. Engine and Reconcile
+                        // must reach the sync reconciler through Terminated too.
+                        if !account_error.recovery().is_retryable() {
                             let _ = health_tx.send(WatchEvent::Terminated(account_error));
                             lifecycle = WatchLifecycle::Unwatched;
                             retry_after = None;
@@ -1418,6 +1427,78 @@ mod tests {
             if matches!(
                 health.recv().await.expect("health event"),
                 WatchEvent::Terminated(_)
+            ) {
+                break;
+            }
+        }
+
+        push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
+            .await
+            .expect("subscribe after terminal renewal restarts the lifecycle");
+        tokio::time::advance(MIN_RENEW_DELAY + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        pubsub.shutdown.cancel();
+        assert_eq!(
+            script.requests().len(),
+            4,
+            "the replacement watch must itself renew",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn engine_directive_from_renewal_stops_local_retry_and_can_resubscribe() {
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis();
+        let watch_body = |history_id| {
+            format!("{{\"historyId\":\"{history_id}\",\"expiration\":\"{now_millis}\"}}")
+        };
+        let stable_expiration = now_millis + Duration::from_secs(7 * 24 * 60 * 60).as_millis();
+        let (client, script) = scripted_client([
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from(watch_body("1").into_bytes()),
+            },
+            Canned::Response {
+                status: StatusCode::BAD_REQUEST,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from_static(
+                    br#"{"error":{"errors":[{"reason":"pubsubSubscriptionDeleted"}]}}"#,
+                ),
+            },
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from(watch_body("2").into_bytes()),
+            },
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from(
+                    format!("{{\"historyId\":\"3\",\"expiration\":\"{stable_expiration}\"}}")
+                        .into_bytes(),
+                ),
+            },
+        ]);
+        let shutdown = CancellationToken::new();
+        let pubsub = Arc::new(PubSubControl::new(
+            Arc::clone(&client),
+            Some(PubSubConfig::new("projects/p/topics/t")),
+            shutdown,
+            "terminal-renewal@push.test",
+        ));
+        let mut health = pubsub.health_tx.subscribe();
+
+        push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
+            .await
+            .expect("subscribe issues the watch");
+        tokio::time::advance(MIN_RENEW_DELAY + Duration::from_secs(1)).await;
+        loop {
+            if matches!(
+                health.recv().await.expect("health event"),
+                WatchEvent::Terminated(ref error) if error.recovery().requires_engine_action()
             ) {
                 break;
             }

@@ -1021,13 +1021,16 @@ impl SmtpConnection {
             return self.auth_legacy(mechanism, credentials);
         }
 
-        let plus_candidate = mechanisms.iter().any(|mechanism| {
+        let scram_candidate = mechanisms.iter().any(|mechanism| {
             matches!(
                 mechanism,
-                Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus
+                Mechanism::ScramSha1Plus
+                    | Mechanism::ScramSha256Plus
+                    | Mechanism::ScramSha1
+                    | Mechanism::ScramSha256
             ) && self.server_info.supports_auth_mechanism(*mechanism)
         });
-        let binding = if plus_candidate {
+        let binding = if scram_candidate {
             self.resolve_scram_binding()?
         } else {
             None
@@ -1039,7 +1042,37 @@ impl SmtpConnection {
                 self.auth_scram(chosen, binding, credentials)
             }
             Mechanism::ScramSha1 | Mechanism::ScramSha256 => {
-                self.auth_scram(chosen, ScramChannelBinding::None, credentials)
+                self.auth_scram(
+                    chosen,
+                    {
+                        // Preserve the shared GS2 downgrade signal when PLUS was not advertised.
+                        let hash = if chosen == Mechanism::ScramSha1 {
+                            bifrost_sasl::ScramHash::Sha1
+                        } else {
+                            bifrost_sasl::ScramHash::Sha256
+                        };
+                        let data = match &binding {
+                            Some(ScramChannelBinding::TlsServerEndPoint(data)) => {
+                                Some(data.as_slice())
+                            }
+                            _ => None,
+                        };
+                        bifrost_sasl::select_scram_rung(
+                            hash,
+                            false,
+                            |name| {
+                                mechanisms.iter().any(|candidate| {
+                                    candidate.name() == name
+                                        && self.server_info.supports_auth_mechanism(*candidate)
+                                })
+                            },
+                            data,
+                        )
+                        .expect("selected SCRAM rung remains advertised")
+                        .1
+                    },
+                    credentials,
+                )
             }
             _ => self.auth_legacy(chosen, credentials),
         }
@@ -1047,11 +1080,11 @@ impl SmtpConnection {
 
     /// Resolve the `tls-server-end-point` channel binding for the live
     /// connection: fetch the peer certificate DER (already cached on the TLS
-    /// stream, no wire I/O) and hash it. `None` when the DER is absent
-    /// (plaintext) or [`bifrost_sasl::tls_server_end_point`] errors (`EdDSA`
-    /// leaf. Absence means there is no TLS certificate; malformed or
-    /// unsupported certificate algorithms remain typed errors and cannot
-    /// silently downgrade authentication.
+    /// stream, no wire I/O) and hash it. Returns `Ok(None)` only when the DER
+    /// is absent (plaintext). If a certificate is present but
+    /// [`bifrost_sasl::tls_server_end_point`] cannot process it (for example,
+    /// an `EdDSA` leaf, malformed DER, or an unsupported signature algorithm),
+    /// its typed error propagates and cannot silently downgrade authentication.
     fn resolve_scram_binding(&self) -> Result<Option<ScramChannelBinding>, Error> {
         let der = self.peer_certificate_der();
         resolve_scram_binding(der.as_deref())

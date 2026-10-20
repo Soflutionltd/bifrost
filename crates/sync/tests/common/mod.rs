@@ -749,9 +749,10 @@ impl Account for StubAccount {
             if let Some(gate) = park {
                 gate.notified().await;
             }
-            Ok(bifrost_types::PushSubscription::all_succeeded(
-                handle, &scopes,
-            ))
+            Ok(
+                bifrost_types::PushSubscription::all_succeeded(handle, &scopes)
+                    .expect("test push subscription covers every requested scope"),
+            )
         })
     }
 

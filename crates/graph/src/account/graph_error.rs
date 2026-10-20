@@ -9,7 +9,7 @@
 //! `GraphSignal`. No path in this module looks at `error.message` text
 //! for control flow.
 
-use bifrost_net::{NetErrorContext, parse_retry_after};
+use bifrost_net::NetErrorContext;
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText,
@@ -1107,16 +1107,9 @@ fn body_diagnostic(body: &bytes::Bytes) -> Option<DiagnosticText> {
     )))
 }
 
-/// Parse the `Retry-After` header into a structured `RetryHint`.
-/// Microsoft Graph emits both integer-seconds and HTTP-date forms;
-/// `bifrost_net::request::parse_retry_after` already handles both, so
-/// we delegate and wrap the resulting `Duration` in
-/// `RetryHint::After`. HTTP-date values that have already elapsed
-/// (clock skew, slow client) collapse to `Duration::ZERO`, which is
-/// the engine's signal to retry immediately.
+/// Preserve absolute HTTP-dates, including elapsed deadlines, for recovery.
 fn parse_retry_after_header(headers: &HeaderMap) -> Option<RetryHint> {
-    let value = headers.get(RETRY_AFTER)?;
-    parse_retry_after(Some(value)).map(RetryHint::After)
+    bifrost_net::request::parse_retry_after_hint(headers.get(RETRY_AFTER))
 }
 
 /// Note the deliberate asymmetry with IMAP, which DOES read a folder id out of
@@ -2121,6 +2114,22 @@ mod tests {
             }
             other => panic!("expected Retry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn elapsed_retry_after_date_survives_classification() {
+        let date = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(784111777);
+        let err = classify(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"code":"TooManyRequests"}}"#,
+            graph_ctx(AccountOperation::SyncChanges),
+            &[("retry-after", date)],
+        );
+        let RecoveryClass::Retry(advice) = err.recovery() else {
+            panic!("expected retry");
+        };
+        assert_eq!(advice.retry_hint, Some(RetryHint::At(at)));
     }
 
     #[test]

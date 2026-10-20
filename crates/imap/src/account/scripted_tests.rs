@@ -2513,7 +2513,8 @@ async fn open_raw_rfc822_emits_chunks_before_the_tagged_completion() {
 /// Without one, a corrupt or adversarial server can answer a single
 /// `BODY.PEEK[]` with an unbounded number of octets and this lane forwards
 /// all of them. The budget is exercised at 3 bytes against a 5-byte body;
-/// the command still drains to its tagged OK so the stream stays framed.
+/// the reader refuses it at the literal marker before materializing the body;
+/// the connection is retired because the unread literal cannot be skipped.
 #[tokio::test]
 async fn a_raw_message_read_stops_at_its_byte_budget() {
     let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;

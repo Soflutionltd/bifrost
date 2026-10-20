@@ -201,7 +201,9 @@ async fn run_worker<E: EwsExecute>(account: GraphAccount, ews: E) {
                     error,
                     GraphErrorContext::ews(AccountOperation::PushSubscribe),
                 );
-                if account_error.recovery().is_terminal() {
+                // Only Retry belongs to this reconnect loop. Engine and Reconcile
+                // must reach the sync reconciler through Terminated too.
+                if !account_error.recovery().is_retryable() {
                     let _ = account.push_tx.send(WatchEvent::Terminated(account_error));
                     return;
                 }
@@ -576,7 +578,7 @@ async fn run_get_events_loop<E: EwsExecute>(
                     error,
                     GraphErrorContext::ews(AccountOperation::PushStream),
                 );
-                if account_error.recovery().is_terminal() {
+                if !account_error.recovery().is_retryable() {
                     return StreamLoopExit::Terminated(account_error);
                 }
                 let telemetry = account_error.telemetry_fields();
@@ -795,12 +797,16 @@ async fn consume_streaming_events(
 /// `ErrorAccessDenied` inside the stream derives `NoPermission`, which
 /// nothing in this worker can fix, so reconnecting forever would burn a
 /// subscribe against the mailbox quota every few seconds and never report
-/// the failure. Terminal classifications exit through
-/// `WatchEvent::Terminated` exactly as the HTTP-error path does.
+/// the failure. All non-Retry classifications, including engine directives,
+/// exit through `WatchEvent::Terminated` as the HTTP-error path does.
 fn classify_frame_failure(error: EwsError) -> StreamLoopExit {
     let account_error =
         ews_error_to_account_error(error, GraphErrorContext::ews(AccountOperation::PushStream));
-    if account_error.recovery().is_terminal() {
+    classified_push_failure(account_error)
+}
+
+fn classified_push_failure(account_error: bifrost_types::AccountError) -> StreamLoopExit {
+    if !account_error.recovery().is_retryable() {
         StreamLoopExit::Terminated(account_error)
     } else {
         StreamLoopExit::Disconnected
@@ -983,6 +989,46 @@ mod tests {
     use super::super::PushMode;
     use super::super::push::EwsSubscriptionState;
     use super::*;
+
+    #[test]
+    fn engine_directives_leave_the_stream_worker() {
+        use bifrost_types::{
+            AccountErrorBuilder, AccountErrorKind, Cause, StateCause, SyncStateErrorKind,
+        };
+        let error = AccountErrorBuilder::new(
+            AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
+            Cause::State(StateCause::CapabilityChanged { delta: None }),
+        )
+        .operation(AccountOperation::PushStream)
+        .protocol(bifrost_types::Protocol::Ews)
+        .try_build()
+        .expect("capability error");
+        assert!(error.recovery().requires_engine_action());
+        assert!(matches!(
+            classified_push_failure(error),
+            StreamLoopExit::Terminated(_)
+        ));
+    }
+
+    #[test]
+    fn frame_failures_only_reconnect_for_retry() {
+        use crate::ews::SoapFaultCode;
+        for (code, retry) in [
+            (SoapFaultCode::ErrorStreamingSubscriptionInvalid, true),
+            (SoapFaultCode::ErrorAccessDenied, false),
+            (SoapFaultCode::ErrorNonExistentMailbox, false),
+        ] {
+            let result = classify_frame_failure(EwsError::SoapFault {
+                code,
+                detail: DiagnosticText::support_only("scripted fault"),
+            });
+            if retry {
+                assert!(matches!(result, StreamLoopExit::Disconnected));
+            } else {
+                assert!(matches!(result, StreamLoopExit::Terminated(_)));
+            }
+        }
+    }
 
     #[test]
     fn reconnect_backoff_grows_and_caps_with_bounded_jitter() {
@@ -1613,6 +1659,7 @@ mod tests {
 
     enum ScriptStep {
         Respond(String),
+        Fail(EwsError),
         /// A long poll with nothing to say: the request is reported to the
         /// test and the future then never resolves, exactly like a hanging
         /// `GetStreamingEvents`. The worker leaves it via its `select!`
@@ -1652,6 +1699,7 @@ mod tests {
             let _ = self.request_tx.send(body_xml.to_string());
             match step {
                 ScriptStep::Respond(xml) => Ok(xml),
+                ScriptStep::Fail(error) => Err(error),
                 ScriptStep::Hang => std::future::pending().await,
             }
         }
@@ -1667,6 +1715,27 @@ mod tests {
         account
             .ews_topology
             .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    #[tokio::test]
+    async fn an_uncertain_subscribe_is_forwarded_for_reconciliation() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
+        let mut events = account.push_tx.subscribe();
+        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
+        let (scripted, mut requests) = scripted(vec![ScriptStep::Fail(EwsError::Transport(
+            bifrost_net::Error::Network {
+                message: "lost subscribe response".to_owned(),
+                transmission_state: bifrost_types::TransmissionState::InFlight,
+                source: None,
+            },
+        ))]);
+        run_worker(account.clone(), scripted).await;
+        assert!(requests.recv().await.is_some());
+        match events.try_recv().expect("termination") {
+            WatchEvent::Terminated(error) => assert!(error.recovery().requires_reconciliation()),
+            other => panic!("expected reconciliation termination, got {other:?}"),
+        }
     }
 
     /// The registration that starts the worker bumps the topology BEFORE

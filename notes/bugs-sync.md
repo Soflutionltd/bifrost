@@ -43,30 +43,6 @@ transport disconnected" warning is lost. A sticky "needs full reconcile" flag
 drained by the reconciler would replace both the timeout and the unbounded
 queue: lossless, bounded, no worse than the coalesced event.
 
-## SYNC-011 - `Terminated` events carry non-terminal recovery classes
-
-Scope: sync engine.
-
-`recovery::establish_failure_error` is byte-for-byte `restart_scope_error`:
-`SyncState(CursorInvalid)` -> `Engine(RestartScope(scope))`. It is broadcast as
-`SyncEvent::Terminated` when a scope's re-establishment budget or the account
-restart budget is exhausted (`re_establish_scope_with_backoff`,
-`restart_account`). A consumer dispatching on the `RecoveryClass` is told
-"restart this scope" about a scope the engine abandoned, and for
-`restart_account` `RestartScope(Account)` about an account now paused with
-`RetryBudgetExhausted`. The doc says the synthetic error honours "after three
-failures broadcast `Terminated(last_error)`"; it honours the event, not the
-meaning. It needs a classification deriving terminal or operator-attention.
-
-## SYNC-014 - Contract-violation `Terminated` sends bypass the drive-generation fence
-
-Scope: sync engine.
-
-`drive_changes_stream`'s three contract-violation paths send `Terminated` on
-the raw sender with no `publish_if_drive_generation` fence, so a drive fenced
-out by a reattach can still broadcast a scope `Terminated` for the old handle's
-misbehaviour after the cutover.
-
 ## SYNC-015 - `handle_schema_incompatible` resets only registered scopes
 
 Scope: sync engine.
@@ -100,4 +76,19 @@ Lateral from the multiplexer fixes. When a resumed inventory's declared
 capability and its stream disagree, the engine recovers through the
 account-wide schema reset, the blast radius the bad-checkpoint fix removed for
 fresh checkpoints. Scope it to the cursor.
+
+## SYNC-009 - Push ingress can still lose or unboundedly queue control events
+
+Needs a ruling. The 100 ms coalesced-send timeout can drop an invalidation and
+the per-registration ingress is still unbounded. A sticky needs-full-reconcile
+flag keeps the invalidation intent but cannot carry warning payloads,
+termination classifications or their ordering, so a bounded lossless ingress
+needs a control-event overflow policy or an API change. Reasoning is at both
+code sites and a test shows the semantic loss.
+
+## SYNC-020 - Exhaustion tails in `engine/reattach.rs` broadcast provider errors verbatim
+
+Lateral: after the engine abandons a scope, the error it broadcasts can still
+carry the provider's retry advice. It should be re-derived as terminal or
+operator-attention like the other synthetic exhaustion errors.
 

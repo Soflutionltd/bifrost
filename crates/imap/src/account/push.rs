@@ -33,6 +33,7 @@ pub(crate) struct PushState {
     /// and awaiting the notification misses the wake and parks forever. A
     /// `watch` generation latches, so both readings are safe.
     resubscribe: tokio::sync::watch::Sender<u64>,
+    terminal: tokio::sync::watch::Sender<Option<AccountError>>,
     next_id: AtomicU64,
 }
 
@@ -46,6 +47,7 @@ impl PushState {
             supports_notify,
             idle_budget: idle_budget.max(1),
             resubscribe: tokio::sync::watch::Sender::new(0),
+            terminal: tokio::sync::watch::Sender::new(None),
             next_id: AtomicU64::new(1),
         }
     }
@@ -173,6 +175,9 @@ pub(crate) fn push_subscribe(
         // Nudge an already-running IDLE loop so a scope added after it
         // parked on another folder is reconsidered without waiting for the
         // current IDLE connection to break.
+        if !accepted.is_empty() {
+            account.push.terminal.send_replace(None);
+        }
         account.push.bump_generation();
         let outcomes = outcomes.finalize(&expected).map_err(|error| {
             account_error_with(
@@ -183,10 +188,15 @@ pub(crate) fn push_subscribe(
         // No handle when nothing was accepted: a handle bifrost-sync records
         // would claim coverage this account is not providing, and there is
         // nothing for the matching unsubscribe to tear down.
-        Ok(bifrost_types::PushSubscription::new(
-            (!accepted.is_empty()).then_some(handle),
-            outcomes,
-        ))
+        bifrost_types::PushSubscription::new((!accepted.is_empty()).then_some(handle), outcomes)
+            .map_err(|failure| {
+                account_error_with(
+                    crate::Error::Internal(format!(
+                        "IMAP push subscription invariant failed: {failure}"
+                    )),
+                    ImapErrorContext::operation(AccountOperation::PushSubscribe),
+                )
+            })
     })
 }
 
@@ -259,8 +269,12 @@ pub(crate) fn push_unsubscribe(
 }
 
 pub(crate) fn push_stream(account: ImapAccount) -> AccountStream<WatchEvent> {
-    let mut rx = account.push.tx.subscribe();
-    let shutdown = account.shutdown.clone();
+    push_event_stream(&account.push, account.shutdown.clone())
+}
+
+fn push_event_stream(push: &PushState, shutdown: CancellationToken) -> AccountStream<WatchEvent> {
+    let mut rx = push.tx.subscribe();
+    let mut terminal = push.terminal.subscribe();
     let (tx, out) = tokio::sync::mpsc::channel(128);
     // Detached rather than `guarded_receiver_stream`, deliberately: this
     // forwarder holds no pool checkout and issues no IMAP command, only a
@@ -269,7 +283,15 @@ pub(crate) fn push_stream(account: ImapAccount) -> AccountStream<WatchEvent> {
     // account's connection - cannot arise from it.
     tokio::spawn(async move {
         loop {
+            let failure = { terminal.borrow_and_update().clone() };
+            if let Some(error) = failure {
+                let _ = tx.send(WatchEvent::Terminated(error)).await;
+                break;
+            }
             tokio::select! {
+                changed = terminal.changed() => {
+                    if changed.is_err() { break; }
+                }
                 () = shutdown.cancelled() => break,
                 result = rx.recv() => {
                     match result {
@@ -347,6 +369,9 @@ async fn sleep_backoff(
 }
 
 async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize) {
+    // These transport health edges remain per worker: a sibling's recovery
+    // does not prove that every IDLE session is healthy. Aggregating them
+    // requires account-wide worker health state, separate from error routing.
     // Track whether the consumer has seen a `Disconnected` since the last
     // `Reconnected`. The very first successful connect must NOT emit
     // `Reconnected` (there was no prior disconnect): the reconciler treats
@@ -355,7 +380,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
     let mut was_disconnected = false;
     let mut backoff = INITIAL_REDIAL_BACKOFF;
     let mut resubscribe = account.push.resubscribe.subscribe();
-    loop {
+    'worker: loop {
         if cancel.is_cancelled() || account.shutdown.is_cancelled() {
             break;
         }
@@ -381,7 +406,11 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
         };
         let conn = match account.pool.dial_idle().await {
             Ok(conn) => conn,
-            Err(_) => {
+            Err(error) => {
+                if report_idle_failure(&account.push, error, &folder) {
+                    wait_for_push_reconfigure(&account, &cancel, &mut resubscribe).await;
+                    continue;
+                }
                 if !was_disconnected {
                     let _ = account.push.tx.send(WatchEvent::Disconnected);
                 }
@@ -397,7 +426,12 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
             .await
         {
             Ok(selected) => selected,
-            Err(_) => {
+            Err(error) => {
+                drop(conn);
+                if report_idle_failure(&account.push, error, &folder) {
+                    wait_for_push_reconfigure(&account, &cancel, &mut resubscribe).await;
+                    continue;
+                }
                 if !was_disconnected {
                     let _ = account.push.tx.send(WatchEvent::Disconnected);
                 }
@@ -417,7 +451,18 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                 .expect("push scopes lock poisoned");
             subscribed_idle_folders(&scopes)
         };
-        let registered = register_notify(&conn, &folder, &watched, account.command_timeout()).await;
+        let registered =
+            match register_notify(&conn, &folder, &watched, account.command_timeout()).await {
+                Ok(registered) => registered,
+                Err(error) => {
+                    if report_idle_failure(&account.push, error, &folder) {
+                        drop(conn);
+                        wait_for_push_reconfigure(&account, &cancel, &mut resubscribe).await;
+                        continue 'worker;
+                    }
+                    false
+                }
+            };
         signal_notify_coverage_loss(&account.push, registered);
         if was_disconnected {
             let _ = account.push.tx.send(WatchEvent::Reconnected);
@@ -526,7 +571,20 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                         subscribed_idle_folders(&scopes)
                     };
                     let registered =
-                        register_notify(&conn, &folder, &watched, account.command_timeout()).await;
+                        match register_notify(&conn, &folder, &watched, account.command_timeout())
+                            .await
+                        {
+                            Ok(registered) => registered,
+                            Err(error) => {
+                                if report_idle_failure(&account.push, error, &folder) {
+                                    drop(conn);
+                                    wait_for_push_reconfigure(&account, &cancel, &mut resubscribe)
+                                        .await;
+                                    continue 'worker;
+                                }
+                                false
+                            }
+                        };
                     signal_notify_coverage_loss(&account.push, registered);
                 }
                 Ok(event) => {
@@ -539,6 +597,23 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                     // rather than reporting an `Unknown` invalidation and
                     // spinning `idle()` on a dead socket until it errors.
                     if event_closes_connection(&event) {
+                        // BYE can carry a permanent response code too. Preserve
+                        // that evidence before treating an ordinary EOF as Retry.
+                        if let IdleEvent::Bye { code, text } = &event
+                            && report_idle_failure(
+                                &account.push,
+                                crate::Error::Bye {
+                                    code: code.clone(),
+                                    text: text.clone(),
+                                    attempt: None,
+                                },
+                                &folder,
+                            )
+                        {
+                            drop(conn);
+                            wait_for_push_reconfigure(&account, &cancel, &mut resubscribe).await;
+                            break;
+                        }
                         let _ = account.push.tx.send(WatchEvent::Disconnected);
                         was_disconnected = true;
                         session_died = true;
@@ -551,7 +626,12 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                         let _ = account.push.tx.send(event);
                     }
                 }
-                Err(_) => {
+                Err(error) => {
+                    if report_idle_failure(&account.push, error, &folder) {
+                        drop(conn);
+                        wait_for_push_reconfigure(&account, &cancel, &mut resubscribe).await;
+                        break;
+                    }
                     let _ = account.push.tx.send(WatchEvent::Disconnected);
                     was_disconnected = true;
                     session_died = true;
@@ -562,6 +642,39 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
         if session_died && !sleep_backoff(&account, &cancel, &mut backoff).await {
             break;
         }
+    }
+}
+
+// A failed mailbox is not a dead transport. Only Retry may redial locally;
+// folder disappearance, ACL changes and engine directives belong to recovery.
+// Latch the error so a late or lagged push reader cannot miss the directive.
+fn report_idle_failure(
+    push: &PushState,
+    error: crate::Error,
+    folder: &crate::types::MailboxName,
+) -> bool {
+    let error = account_error_with(
+        error,
+        ImapErrorContext::operation(AccountOperation::PushStream).with_folder_scope(folder),
+    );
+    if error.recovery().is_retryable() {
+        return false;
+    }
+    push.terminal.send_replace(Some(error));
+    true
+}
+
+// Keep the worker slot alive for a replacement subscription, but never retry a
+// permanent failure on the timer. Recovery owns changing the subscribed set.
+async fn wait_for_push_reconfigure(
+    account: &ImapAccount,
+    cancel: &CancellationToken,
+    resubscribe: &mut tokio::sync::watch::Receiver<u64>,
+) {
+    tokio::select! {
+        () = cancel.cancelled() => {}
+        () = account.shutdown.cancelled() => {}
+        _ = resubscribe.changed() => {}
     }
 }
 
@@ -690,8 +803,9 @@ fn subscribed_idle_folders(
 /// discovery and inventory have just run.
 ///
 /// Returns whether every watched folder is covered. A server without
-/// NOTIFY, or one that rejects the registration, leaves the loop watching
-/// only the selected mailbox - the pre-NOTIFY behaviour. The caller feeds
+/// NOTIFY leaves the loop watching only the selected mailbox. A rejected
+/// registration returns the error so the caller can forward non-Retry
+/// recovery; a retryable failure retains selected-only coverage and feeds
 /// that answer to `signal_notify_coverage_loss`, which turns a collapse on
 /// a NOTIFY-advertising account into a coarse invalidation rather than
 /// silence, because the subscribe outcome already reported those folders
@@ -731,14 +845,14 @@ async fn register_notify(
     selected: &crate::types::MailboxName,
     watched: &[crate::types::MailboxName],
     timeout: std::time::Duration,
-) -> bool {
+) -> Result<bool, crate::Error> {
     let others: Vec<String> = watched
         .iter()
         .filter(|folder| folder.as_str() != selected.as_str())
         .map(|folder| folder.as_str().to_owned())
         .collect();
     if others.is_empty() {
-        return true;
+        return Ok(true);
     }
     if !conn.server_profile().supports_notify() {
         tracing::warn!(
@@ -747,17 +861,17 @@ async fn register_notify(
             "server does not advertise NOTIFY (RFC 5465); IDLE push covers only the \
              selected mailbox and the other subscribed folders will not be pushed"
         );
-        return false;
+        return Ok(false);
     }
     match conn.notify_set(notify_params(others), timeout).await {
-        Ok(()) => true,
+        Ok(()) => Ok(true),
         Err(err) => {
             tracing::warn!(
                 error = %err,
                 selected = selected.as_str(),
                 "NOTIFY SET rejected; IDLE push covers only the selected mailbox"
             );
-            false
+            Err(err)
         }
     }
 }
@@ -888,6 +1002,70 @@ fn invalidated(payload: HintPayload) -> WatchEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn permanent_idle_failure_terminates_late_and_lagged_readers() {
+        use futures::StreamExt as _;
+        let push = PushState::new(false, 1);
+        let mut lagged = push_event_stream(&push, CancellationToken::new());
+        for _ in 0..256 {
+            let _ = push.tx.send(WatchEvent::Disconnected);
+        }
+        let folder = crate::types::MailboxName::new("gone").expect("mailbox");
+        assert!(report_idle_failure(
+            &push,
+            crate::Error::No {
+                text: "gone".to_owned(),
+                code: Some(crate::types::ResponseCode::NonExistent),
+                attempt: None,
+            },
+            &folder
+        ));
+        let mut late = push_event_stream(&push, CancellationToken::new());
+        for stream in [&mut lagged, &mut late] {
+            // The forwarder checks terminal health before queued hints.
+            let event = stream.next().await.expect("terminal push event");
+            assert!(matches!(event, WatchEvent::Terminated(_)));
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[test]
+    fn idle_failures_classify_before_deciding_to_redial() {
+        let folder = crate::types::MailboxName::new("deleted").expect("mailbox");
+        for code in [
+            crate::types::ResponseCode::NonExistent,
+            crate::types::ResponseCode::NoPerm,
+            crate::types::ResponseCode::Closed,
+        ] {
+            let push = PushState::new(false, 1);
+            assert!(report_idle_failure(
+                &push,
+                crate::Error::No {
+                    text: "folder unavailable".to_owned(),
+                    code: Some(code),
+                    attempt: None,
+                },
+                &folder
+            ));
+            let terminal = push.terminal.subscribe();
+            let error = terminal.borrow();
+            let error = error.as_ref().expect("failure survives late subscription");
+            assert!(!error.recovery().is_retryable());
+        }
+        let push = PushState::new(false, 1);
+        assert!(!report_idle_failure(
+            &push,
+            crate::Error::Io {
+                source: std::sync::Arc::new(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionReset
+                )),
+                attempt: None,
+            },
+            &folder
+        ));
+        assert!(push.terminal.borrow().is_none());
+    }
 
     #[test]
     fn bye_and_server_termination_close_the_connection() {

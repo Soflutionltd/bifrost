@@ -36,12 +36,22 @@ inside the protocol consumers, never the other way around.
   channel-binding dimension, orthogonal to `ScramHash`, so the proof math stays
   hash-parameterized.
 - `ScramChannelBinding` - `#[non_exhaustive]` data-carrying enum
-  `{ None, TlsServerEndPoint(Vec<u8>) }`: the GS2 channel-binding input to
+  `{ None, SupportedButNotAdvertised, TlsServerEndPoint(Vec<u8>) }`: the GS2 channel-binding input to
   `scram_client_final`. `gs2_header()` returns the GS2 header string
-  (`"n,,"` / `"p=tls-server-end-point,,"`); `binding()` returns the matching
+  (`"n,,"` / `"y,,"` / `"p=tls-server-end-point,,"`); `binding()` returns the matching
   `ChannelBinding`. A data-carrying enum, not a discriminant-plus-data struct,
   so the GS2 header and the `c=` value never desync. A PLUS consumer MUST build
   its client-first header from `gs2_header()`, not a literal.
+- `select_scram_rung(hash, plus, advertised, binding_data)` - shared RFC 5802
+  Section 6 selection of one advertised rung and its `ScramChannelBinding`.
+  Protocol callers supply their advertised set and walk their own preference
+  order. PLUS requires binding data; an advertised PLUS suppresses its unbound
+  counterpart. An unbound rung with usable local binding sends `y,,` and
+  `c=eSws`, allowing a binding-capable server to detect stripped PLUS
+  advertisements. Without usable binding it sends `n,,` and `c=biws`.
+  Certificate parsing errors propagate before selection; they are not treated
+  as absent binding. Direct IMAP calls that explicitly choose unbound SCRAM
+  without mechanism negotiation retain `n,,`, per RFC 5802 Section 6.
 - `tls_server_end_point(cert_der) -> Result<Vec<u8>, SaslError>` - RFC 5929
   Section 4 `tls-server-end-point` binding data: the hash of the whole
   DER-encoded certificate, using the hash named by the cert's own
@@ -123,6 +133,10 @@ correct:
 - RFC 5802 SHA-1 client-final + server signature (`scram.rs`), now passing
   `ScramChannelBinding::None` - proves the `None` path stays byte-identical to
   the old `c=biws`.
+- Shared SCRAM negotiation (`scram.rs`): both hashes select `n`, `y`, and `p`
+  with the exact GS2 header and `c=` bytes; unavailable, unadvertised, and
+  suppressed rungs are rejected. IMAP and SMTP consumer tests independently
+  pin client-first headers and client-final `c=` values for all three states.
 - RFC 2195 CRAM-MD5 vector (`cram.rs`).
 - SCRAM-PLUS construction (`scram.rs`): a constructed deterministic pin (no
   published RFC 5802 PLUS vector exists) that the `c=` field equals
@@ -171,8 +185,8 @@ advertised, and enforce RFC 5802 Section 6 downgrade protection (see
 `ScramHash` / `ScramChannelBinding` / `scram_client_final` /
 `verify_server_final` via `ScramExchange`. OAuth (XOAUTH2 / OAUTHBEARER)
 payload construction now lives here (`xoauth2_payload` / `oauthbearer_payload`),
-collapsing the formerly duplicated IMAP and SMTP builders. The crate still
-exposes no selection function - selection policy lives in each protocol crate.
+collapsing the formerly duplicated IMAP and SMTP builders. The crate owns SCRAM rung eligibility and GS2 selection via
+`select_scram_rung`; protocol crates retain preference order and retry policy.
 EdDSA leaf-cert channel binding is deliberately a hard error until an
 evidence-driven vector pins the binding hash a real server uses.
 
@@ -197,8 +211,9 @@ when OAuth credentials are configured the SCRAM ladder does not apply. RFC 5802
 Section 6 downgrade protection drops the unbound `SCRAM-SHA-N` rung whenever
 `SCRAM-SHA-N-PLUS` is advertised. A PLUS rung is skipped only when TLS has no
 peer certificate. A present certificate whose binding computation fails is a
-hard protocol error and cannot fall through to PLAIN. The selection function lives per-protocol and
-the two shapes deliberately differ: IMAP's `password_mechanism_ladder` returns an ordered
+hard protocol error and cannot fall through to PLAIN. Binding availability is
+resolved for unbound SCRAM too, so absence of PLUS still produces the required
+`y` signal when binding is usable. The protocol ladder shapes deliberately differ: IMAP's `password_mechanism_ladder` returns an ordered
 `Attempt`/`Reject` list because its driver walks past locally rejected rungs, while SMTP's
 `password_mechanism` returns exactly one mechanism because SMTP never retries after a wire
 rejection - descending to an unbound mechanism or PLAIN on a 535 would be the very downgrade the

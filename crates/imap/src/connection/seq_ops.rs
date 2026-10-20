@@ -155,7 +155,6 @@ impl ImapConnection {
     ) -> Result<SearchResult, Error> {
         let criteria = criteria.as_ref();
         self.search_impl(
-            criteria,
             Command::Search {
                 criteria: criteria.to_owned(),
             },
@@ -183,7 +182,6 @@ impl ImapConnection {
     ) -> Result<EsearchResponse, Error> {
         let criteria = criteria.as_ref();
         self.search_esearch_impl(
-            criteria,
             Command::SearchReturn {
                 criteria: criteria.to_owned(),
                 return_opts: return_opts.iter().map(|s| (*s).to_owned()).collect(),
@@ -244,7 +242,7 @@ impl ImapConnection {
     /// (RFC 5182 Section 2).
     pub(super) async fn search_save_impl(
         &self,
-        criteria: &str,
+        _criteria: &str,
         cmd: Command,
         timeout: Duration,
     ) -> Result<(), Error> {
@@ -252,7 +250,6 @@ impl ImapConnection {
         // RFC 6855 Section 6: SEARCH RETURN (SAVE) remains part of the SEARCH
         // command family and must be rejected until UTF8=ACCEPT is enabled.
         self.check_utf8_only_enforced()?;
-        self.validate_search_criteria_capabilities(criteria)?;
         // RFC 5182 Section 2: SEARCHRES capability is required.
         self.require_searchres()?;
         tokio::time::timeout(

@@ -32,7 +32,7 @@ SyncEngine
     CursorRegistry (scope -> cursor; membership index)
     LaneGate (per account; the backfill bound's wait plus its admission)
     CheckpointStore (consumer-provided; InMemoryCheckpointStore for tests)
-    InvalidationSinkInner (DashMap<AccountId, mpsc::Sender<WatchEvent>>)
+    InvalidationSinkInner (per-account ingress senders)
     SubscriptionRegistry (per-engine push subscription handles)
 ```
 
@@ -1781,10 +1781,15 @@ Partition SEQUENCING is not the orchestrator's; `ScopeWalkDriver` in
 `backfill/scope_walk.rs` owns it, so a barrier stops the enclosing scope walk
 rather than only the partition that hit it. See "A barrier taints the walk".
 
+Contract-violation terminations from live changes drives use the same account
+and scope generation fence as ordinary publications. A malformed batch or
+checkpoint returned by an obsolete handle produces neither a termination
+broadcast nor a recovery outcome for the replacement.
+
 ## Push
 
-`InvalidationSinkInner` is a `DashMap<AccountId,
-mpsc::Sender<WatchEvent>>` plus a drop counter. `attach` calls
+`InvalidationSinkInner` maps each account to an ordered ingress sender
+(or a direct bounded sender off-runtime), plus a drop counter. `attach` calls
 `register(account, watch_tx)` with the per-account bounded mpsc
 (capacity `MultiplexerConfig::watch_capacity`, default 256) that
 the reconciler reads; `detach` calls `unregister`. The drop
@@ -1793,8 +1798,13 @@ counter is exposed as `bifrost_sync_push_dropped_total`.
 Implements `bifrost_types::InvalidationSink::push`:
 `try_send` first; on `Full`, increment the drop counter only for
 coalescible invalidations and connection-health transitions. They are
-coalesced into one `HintPayload::Unknown` send with a 100ms bound.
-`Terminated` and `Warning` are lossless control information. Each
+coalesced into one `HintPayload::Unknown` send with a 100ms bound. If the
+reconciler stays busy past that deadline, the reconcile request itself is
+lost until a later hint or poll; the counter therefore measures delivery
+loss as well as payload coarsening. Connection-health transitions can also
+lose their warning when replaced by an invalidation.
+`Terminated` and `Warning` are lossless control information on the runtime
+forwarder path. Each
 registration made on a Tokio runtime creates one ordered forwarder on that
 runtime and stores its unbounded ingress sender, so calls from receiver
 threads outside Tokio do not depend on whichever account registered first
@@ -1802,6 +1812,13 @@ and later events cannot bypass an event waiting for bounded queue space. A
 registration made outside Tokio is explicitly a direct, non-waiting fallback;
 a full queue drops and counts every event. `Closed` (account detached
 mid-push) is silently ignored.
+
+The ingress queue remains unbounded. A sticky full-reconcile bit would bound
+invalidation storage and avoid the timeout loss, but cannot retain arbitrary
+warning payloads, termination classifications, or their ordering. Bounding
+this synchronous sink's entire mixed event ingress requires an explicit
+control-event overflow policy or a backpressure-capable API. The bounded
+`watch_capacity` applies to the reconciler channel, not total sink storage.
 
 The in-process push forwarder spawned in `attach` runs the same
 overflow policy against its per-account `tx`: redundant invalidations
@@ -3325,7 +3342,11 @@ exhaustion tail - another attempt cannot repair it. After the budget
 is spent (or short-circuited terminal) the engine
 broadcasts `SyncEvent::Terminated(last_error)` for the affected
 scope (per-scope re-establishment) or for the account
-(`RestartAccount`), then publishes
+(`RestartAccount`). When the last failure is engine-internal and has no
+account error, the synthetic error derives
+`Engine(OperatorOverrideRequired)` and retains the affected cursor scope;
+it does not request another automatic scope restart. Provider-authored last
+errors retain their original classification. Account exhaustion then publishes
 `AccountControl::Pause(PauseReason::RetryBudgetExhausted)` and
 flips the boundary to `Pause` so workers park. Consumers subscribe
 to the per-account `AccountControl` broadcast via
@@ -3623,7 +3644,7 @@ crates/sync/src/
                           // a barrier stops the whole scope walk
   push/
     mod.rs                // InvalidationSinkInner
-                          // (DashMap<AccountId, mpsc>) + coalesced_event
+                          // (per-account ingress) + coalesced_event
     reconciler.rs         // hint -> scope -> changes_stream;
                           // warning_event on Disconnected/Reconnected
     subscription.rs       // SubscriptionRegistry (per-engine DashMap)

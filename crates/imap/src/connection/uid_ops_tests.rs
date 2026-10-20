@@ -264,14 +264,40 @@ async fn thread_requires_the_matching_algorithm_capability() {
     }
 }
 
-#[tokio::test]
-async fn sort_and_thread_inherit_the_search_criteria_gates() {
-    let conn = selected(vec![Capability::Imap4Rev2, Capability::Sort]);
-    // MODSEQ in the criteria still needs CONDSTORE, even under SORT.
-    assert!(matches!(
-        conn.sort("DATE", "UTF-8", "MODSEQ 5", T).await,
-        Err(Error::MissingCapability(_))
-    ));
+#[test]
+fn sort_and_thread_inherit_the_search_criteria_gates() {
+    use crate::codec::encode::{EncodeOptions, LiteralMode, encode_command};
+    use crate::types::Command;
+
+    let opts = EncodeOptions {
+        utf8_mode: false,
+        literal_mode: LiteralMode::Synchronizing,
+        capabilities: vec![
+            Capability::Imap4Rev1,
+            Capability::Sort,
+            Capability::Thread("ORDEREDSUBJECT".to_owned()),
+        ],
+        enabled: Vec::new(),
+    };
+    // The criteria gate runs at encoding, where queued commands see the
+    // capability snapshot that is current when they reach the wire.
+    for command in [
+        Command::Sort {
+            sort_criteria: "DATE".to_owned(),
+            charset: "UTF-8".to_owned(),
+            criteria: "MODSEQ 5".to_owned(),
+        },
+        Command::Thread {
+            algorithm: "ORDEREDSUBJECT".to_owned(),
+            charset: "UTF-8".to_owned(),
+            criteria: "MODSEQ 5".to_owned(),
+        },
+    ] {
+        assert!(matches!(
+            encode_command("A001", &command, &opts),
+            Err(Error::MissingCapability(_))
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------

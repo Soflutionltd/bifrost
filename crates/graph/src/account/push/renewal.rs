@@ -178,6 +178,11 @@ pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
                         );
                     }
                     if account_error.recovery().is_terminal() {
+                        // A 404 from the replacement create is a permanent
+                        // refusal for this resource (for example, its folder
+                        // was deleted). Keep the old row reachable by
+                        // teardown, but stop the worker from issuing the same
+                        // doomed PATCH and POST on every tick.
                         // Flagged, not removed: renewing stops, but teardown
                         // must still be able to DELETE it.
                         mark_subscription_terminated(&account, &handle, &server_id).await;

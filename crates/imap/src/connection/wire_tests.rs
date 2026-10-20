@@ -697,3 +697,54 @@ async fn bandwidth_cancelled_peer_io_keeps_its_spent_time() {
     ));
     assert_eq!(start.elapsed(), Duration::from_millis(100));
 }
+
+#[tokio::test]
+async fn literal_budget_refuses_a_marker_without_reading_its_payload() {
+    let (mut reader, mut peer) = memory_reader();
+    peer.write_all(b"* 1 FETCH (UID 7 BODY[] {1025}\r\n")
+        .await
+        .unwrap();
+    peer.shutdown().await.unwrap();
+    // Without the pre-read ceiling this is Closed, after trying to read the
+    // absent payload. The marker itself must suffice for the refusal.
+    assert!(matches!(
+        reader.read_one_limited(false, Some(1024)).await,
+        Err(Error::FetchLiteralLimit {
+            estimated: 1025,
+            limit: 1024
+        })
+    ));
+}
+
+#[tokio::test]
+async fn literal_budget_counts_sections_together_and_skips_payload_syntax() {
+    let (mut reader, mut peer) = memory_reader();
+    peer.write_all(b"* 1 FETCH (BODY[1] {5}\r\n{99}x BODY[2] ~{4}\r\n")
+        .await
+        .unwrap();
+    peer.shutdown().await.unwrap();
+    assert!(matches!(
+        reader.read_one_limited(false, Some(8)).await,
+        Err(Error::FetchLiteralLimit {
+            estimated: 9,
+            limit: 8
+        })
+    ));
+}
+
+#[tokio::test]
+async fn literal_budget_accepts_exact_payload_and_does_not_charge_next_response() {
+    let (mut reader, mut peer) = memory_reader();
+    peer.write_all(b"* 1 FETCH (BODY[] {3}\r\nabc)\r\n* 2 FETCH (BODY[] {4}\r\ndefg)\r\n")
+        .await
+        .unwrap();
+    assert!(reader.read_one_limited(false, Some(3)).await.is_ok());
+    assert!(reader.read_one_limited(false, Some(4)).await.is_ok());
+}
+
+#[tokio::test]
+async fn status_braces_do_not_spend_the_literal_budget() {
+    let (mut reader, mut peer) = memory_reader();
+    peer.write_all(b"* OK limit {999}\r\n").await.unwrap();
+    assert!(reader.read_one_limited(false, Some(0)).await.is_ok());
+}

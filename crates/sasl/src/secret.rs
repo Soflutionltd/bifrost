@@ -88,8 +88,9 @@ mod tests {
     fn eq_compares_content_including_length_mismatch() {
         assert_eq!(Secret::from("hunter2"), Secret::from("hunter2"));
         assert_ne!(Secret::from("hunter2"), Secret::from("hunter3"));
-        // The length difference is folded into the accumulator, so a
-        // prefix does not compare equal.
+        // A prefix compares unequal; `subtle` short-circuits on the length
+        // mismatch, whose timing leak is accepted because secret lengths are
+        // not sensitive here.
         assert_ne!(Secret::from("hunter2"), Secret::from("hunter2x"));
         assert_ne!(Secret::from("hunter2"), Secret::from(""));
         assert_eq!(Secret::default(), Secret::from(""));

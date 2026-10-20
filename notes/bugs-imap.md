@@ -28,35 +28,6 @@ authentication failure raised mid-exchange cannot be stamped although the
 AUTHENTICATE line and client-first are on the wire. Documented at the code site
 and in `reference/imap.md`; the error type itself was outside the fix's files.
 
-## IMAP-004 - Per-response body memory is unbounded; FETCH budgets run only after the literal is buffered twice
-
-Live. Scope: imap protocol.
-
-`connection/wire.rs` `read_one` / `buffer_may_contain_complete_response`,
-`codec/decode/primitives.rs` `literal` (`data.to_vec()`),
-`connection/dispatch/fetch.rs` (`FetchConsumer::with_limit`,
-`BoundedStreamingFetchConsumer`). The framing pre-check accepts any literal
-count up to `i64::MAX` and reads until the octets arrive; `BytesMut` grows
-without limit. `literal()` then copies into a new `Vec<u8>`, so the peak is
-about twice the literal. `FetchConsumer`'s `hard_limit` and the account's
-`RAW_FETCH_BUDGET` / `HYDRATION_FETCH_BUDGET` are checked only in
-`on_response`, after full parse.
-
-Claims broken: `reference/imap.md` blob section ("Like every other body path it
-carries a client-side byte budget ... the unbudgeted buffered read this path
-used to do could be made arbitrarily large by a corrupt or adversarial peer");
-the budget limits the total across responses, not the single response a peer
-controls. Its "each body section is emitted as its own `Bytes` page as it comes
-off the socket" also overstates: emission happens after the whole FETCH
-response is buffered and copied.
-
-Fix direction (structural): a per-command octet ceiling in the reader (handed
-down from the consumer's budget), failing with `FetchLimit` / `Parse` once a
-declared literal count would exceed it, before reading the octets, and
-retiring the connection. Separately, decode literals as `Bytes` slices split
-off the `BytesMut` instead of `to_vec()`, halving the peak and making the page
-claim true.
-
 ## IMAP-005 - Mailbox identity is decoded lossily and never round-trips
 
 Live. Scope: imap protocol.
@@ -85,55 +56,6 @@ back when the name came from the server.
 Latent sibling: `gmail_label` (`codec/decode/envelope_fetch.rs`) always runs
 `decode_utf7`, even in UTF-8 mode. Gmail advertises `UTF8=ACCEPT`; the account
 layer does not ENABLE it today.
-
-## IMAP-006 - The "one literal marker parser" claim is false
-
-Latent. Scope: imap protocol.
-
-`reference/imap.md`: `literal_marker_at` (`connection/literals.rs`) "is shared
-by the read side's framing pre-check and the encoder's walk over caller-written
-SEARCH / SORT / THREAD criteria". Two more independent `{n[+]}\r\n` parsers
-exist: `codec/encode/mod.rs` `validate_search_criteria_crlf` (parses the count
-as `usize`, no `number64` ceiling, handles `+` its own way; it is the validator
-`write_criteria` relies on, "The validator has already proven the payload is
-inside `criteria`"), and `connection/search_validation.rs`
-`search_criteria_literal_end` (the handle-side capability-gate scanner). They
-agree on every traced input, but `write_criteria` correctness rests on
-validator and writer agreeing, and the reference promises one parser. Route
-both through `literal_marker_at`, or correct the reference.
-
-## IMAP-007 - SEARCH criteria capability gates run against the handle snapshot, not live state
-
-Latent. Scope: imap protocol.
-
-`connection/search_validation.rs` `validate_search_criteria_capabilities` reads
-`state_rx` (the handle's snapshot). `reference/imap.md`: "Every decision the
-wire bytes depend on is made here [prepare_command], at the moment the command
-reaches the head of the queue ... capability gates". MODSEQ, WITHIN, SAVEDATE,
-OBJECTID and SEARCHRES checks for free-form criteria are stale-snapshot
-decisions. They are refusals, so the worst case is a spurious
-`MissingCapability` or a server BAD, but they are a second gate site the "one
-command path" story says does not exist.
-
-## IMAP-017 - `Account::close()` is not cancellation-safe or concurrency-safe, and leaves SMTP submission open
-
-Scope: imap account.
-
-`close.rs`.
-- `closed.swap(true)` comes first. If the close future is dropped after the
-  swap and before `pool.close().await` finishes (the drain awaits LOGOUT under
-  a timeout), every later `close()` returns `Ok(())` at once while sessions
-  remain connected; a concurrent second `close()` also returns `Ok(())` while
-  the first is still draining. Both break `reference/imap.md`
-  ("`Account::close()` therefore means no session owned by that account is
-  still connected when it returns"). Standing-lesson shape: a teardown flag
-  set before teardown is done.
-- `submission: Option<Arc<SubmissionTransport>>` is never closed. The SMTP
-  transport is pooled (`SmtpSubmissionConfig::with_pool`), so its sessions
-  outlive `close()`, and `send_message` / `send_raw_message` / `draft_send`
-  never check `closed`. After `close()` they still dial SMTP and deliver; only
-  the Sent APPEND fails, logged only, so the caller gets `Ok` with a fallback
-  `imapmsgid1:` id.
 
 ## IMAP-020 - Push events broadcast before a `push_stream` receiver exists are lost
 
@@ -203,3 +125,24 @@ authorization error and its text says STARTTLS is "not supported by server",
 though a PREAUTH greeting refuses STARTTLS even when the capability is
 advertised. Fix the wording and check the classification in
 `crates/imap/src/error.rs`.
+
+## IMAP-004 - FETCH budget handoff and copy-free literals
+
+Residue of the per-command literal ceiling (the reader now checks cumulative
+literal declarations against the budget before reading payload, and a breach is
+a fatal `Parse`). Still open:
+- `account/blob.rs` must call `uid_fetch_stream_budgeted` with its existing
+  budget; until then raw-message streaming checks its budget only after
+  decoding.
+- FETCH response fields in `crates/types` (`fetch.rs`) own `Vec<u8>`, so the
+  literal is still copied and nothing is emitted incrementally; splitting the
+  `BytesMut` alone cannot change that.
+- Non-literal syntax and parser overhead are outside the literal ceiling.
+
+## IMAP-017 - `close()` still cannot await a dial that is inside authentication
+
+Residue: account close now has shared completion, protected pool teardown, send
+gating and SMTP submission shutdown. IMAP dials still inside authentication are
+not registered with the pool, so `close()` cannot wait for them (needs
+`account/pool.rs`), and closing the pool directly is still not
+cancellation-safe; only the account-level close is protected.

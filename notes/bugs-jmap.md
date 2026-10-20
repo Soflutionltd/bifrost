@@ -35,33 +35,6 @@ values; `crates/jmap/src/event_source/stream.rs` still substitutes without it,
 so a `{types}`-style or path variable of `.` / `..` navigates. Use the same
 helper there.
 
-## JMAP-015 - Hydration repeats the route-starvation bug the mutation pipeline already fixed
-
-Hunter severity: P3. Scope: jmap account.
-
-`hydrate.rs::stream` buffers ids per route and flushes only at
-`max_objects_in_get` or end of input. `mutation.rs::RouteBuffers` documents and
-fixes exactly this ("an owner that trickles could be starved indefinitely by an
-owner that streams") with `last_touch`. With foreign and primary ids mixed in a
-long input, the foreign partial batch waits for end of input; with a slow
-input a single route's partial batch never flushes, although the advertised
-`BatchingPolicy::max_wait` is 100 ms. Fix: share `RouteBuffers` between the two
-pipelines, with idle and `max_wait` flushing driven by `BatchingPolicy` so the
-capability is honoured by construction.
-
-## JMAP-017 - `delete_thread` with `current == Trash` destroys messages that are not in Trash
-
-Hunter severity: P3. Scope: jmap account.
-
-`pim.rs::delete_thread`: when `current` is Trash it resolves the WHOLE thread
-via `Thread/get` and `Email/set destroy`s every member, including members in
-Inbox, Sent or elsewhere. The non-trash branch moves only by membership patch.
-Destroying the user's Sent copy and live Inbox messages is irreversible loss
-beyond what the call names. If the cross-provider contract means "destroy the
-whole thread", it belongs in the reference; otherwise filter the destroy to
-ids whose `mailboxIds` contain Trash. Compare GRAPH-001 (Graph's
-destroy-if-in-Trash rests on a soft delete).
-
 ## JMAP-020 - Implicit `Email/set` responses exist, contradicting the "no multiple responses" claim, and leave the state cache one behind
 
 Hunter severity: P3. Scope: jmap protocol.
@@ -75,40 +48,6 @@ SAME call id after the `EmailSubmission/set` response. It works because `get`
 takes the first match, but the implicit `Email/set` carries the post-move
 `newState`, which `pim.rs` never feeds into `state_cache`; only the earlier
 explicit state is advanced, so the cache is one state behind after every send.
-
-## JMAP-022 - `Request::new` reads the session twice
-
-Hunter severity: P3 (latent while `refresh_session` is unwired). Scope: jmap
-protocol.
-
-`CallLimit::read(&client.session())` and `client.default_account_id()` each
-take their own `session_state()` snapshot, contradicting `SessionState`'s
-purpose ("Hold the returned `Arc` for the duration of a URL build so a
-concurrent refresh cannot splice two sessions into one request"). A refresh
-between them pairs one session's `maxCallsInRequest` with another's account.
-`encode_ws_request` likewise reads `self.session()` for `maxSizeRequest`
-independently of the request's snapshot. Take one snapshot and keep it on
-`Request`.
-
-## JMAP-023 - Overlapping session refreshes can install the older session last
-
-Hunter severity: P3 (latent). Scope: jmap protocol.
-
-`refresh_session` fetches without the lock and installs unconditionally. If
-two refreshes overlap and the earlier GET returns later, the client ends on
-the older session with `session_updated = true`. The comment protects
-state/limit pairing, not recency. The method is unwired but deliberately kept
-(per `reference/jmap.md`), so it should be correct: serialize refreshes or
-compare a fetch generation.
-
-## JMAP-024 - ProblemDetails without `type` is not recognised
-
-Hunter severity: P3. Scope: jmap protocol.
-
-`ProblemDetails.p_type` is mandatory, but RFC 7807 s3.1 says an absent `type`
-means `"about:blank"`. A problem document with only `status` / `title` /
-`detail` falls through to `Error::Transport`, losing its explanation to the
-problem-details mapping `reference/jmap.md` describes. Default it.
 
 ## JMAP-027 - `connect_ws` bypasses bifrost-net and reads the raw token source
 
@@ -194,6 +133,21 @@ blob id, and blob ids are scoped to the account that received the upload
 (RFC 8620 s6.3 transfers across accounts with `Blob/copy`). A send-as through a
 foreign account that reuses a handle uploaded to the primary account addresses a
 blob the target account cannot see.
+
+## JMAP-022 - The WebSocket encoder reads the live session for `maxSizeRequest`
+
+Residue: `Request::new` now holds one session snapshot through the send and
+session refreshes are serialized. `encode_ws_request` in `client_ws.rs` still
+reads `self.session()` for `maxSizeRequest`, so a refresh can pair a request
+snapshot with a newer frame-size limit.
+
+## JMAP-037 - Thread destroy from Trash is not chunked to `maxObjectsInSet`
+
+Lateral from the thread-delete fix: all selected Trash members still go in one
+`Email/set`, which a very large thread could push past `maxObjectsInSet`. The
+existing test `a_foreign_thread_already_in_the_shares_trash_is_destroyed_in_the_share`
+(`sync/factory.rs`) scripts `Email/set` straight after `Thread/get` and needs the
+new `Email/get` membership read.
 
 ## JMAP-034 - Design proposals from the jmap account hunter
 

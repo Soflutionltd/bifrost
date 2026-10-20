@@ -158,19 +158,18 @@ pub(crate) fn changes_stream(
                 }
             };
             let mut changes = Vec::new();
-            // Diagnostic page marker only: the bare Graph id of the last
-            // value seen (including `@removed` values), captured before
-            // foreign encoding. Resume never reads it - `next_link` alone
-            // drives resumption - so it deliberately differs from the
-            // inventory walk's marker, which records the encoded id of the
-            // last surviving entry.
+            // Diagnostic page marker only: the last value's id after the
+            // same scope projection used for emitted changes. Resume never
+            // reads it - `next_link` alone drives resumption - but the
+            // persisted field uses one id encoding across inventory and
+            // changes page markers.
             let mut last_seen_id = None;
             let mut etags = Vec::new();
             let mut removed_etag_ids = Vec::new();
             let mut idless_value = false;
             for value in page.value {
-                if let Some(id) = value.get("id").and_then(Value::as_str).map(str::to_string) {
-                    last_seen_id = Some(id);
+                if let Some(id) = value.get("id").and_then(Value::as_str) {
+                    last_seen_id = Some(super::inventory::sync_object_id(&scope, id).0);
                 }
                 if is_removed(&value) {
                     if let Some(id) = removed_id(&value) {
@@ -202,6 +201,10 @@ pub(crate) fn changes_stream(
                         && let Some(etag) = graph_etag(&value) {
                         etags.push((object_id.0.clone(), etag));
                     }
+                    // Graph delta has no created/updated discriminator, and
+                    // this account keeps no complete per-scope id set to diff
+                    // against. Report a refresh as Updated; Added below names
+                    // current membership, not object creation.
                     changes.push(Change::ObjectChange(ObjectChange {
                         id: object_id.clone(),
                         kind: ObjectChangeKind::Updated,
@@ -708,6 +711,95 @@ mod tests {
         assert!(
             primary.take_rest_requests().is_empty(),
             "the primary client must not see a foreign-scope request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_delta_value_uses_updated_when_graph_does_not_identify_creation() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "value": [{ "id": "new-to-this-scope" }],
+                "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta?token=next"
+            }),
+        )]);
+        let account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
+        let scope = email_scope("inbox");
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&scope).expect("email scope maps"),
+            &crate::origin::AdmittedUrl::for_tests(
+                "https://graph.microsoft.com/v1.0/delta?token=old",
+            ),
+            None,
+        );
+        let cursor = encode_cursor(scope, payload).expect("cursor encodes");
+
+        let mut stream = changes_stream(account, cursor);
+        let Some(SyncEvent::Batch(batch)) = stream.next().await else {
+            panic!("the delta value is emitted");
+        };
+        assert!(matches!(
+            batch.items.as_slice(),
+            [
+                Change::ObjectChange(ObjectChange {
+                    id,
+                    kind: ObjectChangeKind::Updated
+                }),
+                Change::ScopeChange(ScopeChange {
+                    id: membership_id,
+                    kind: ScopeChangeKind::Added,
+                    ..
+                })
+            ] if id.0 == "new-to-this-scope" && membership_id == id
+        ));
+    }
+
+    #[tokio::test]
+    async fn foreign_delta_page_markers_use_the_projected_object_id() {
+        let mailbox = "shared@contoso.com";
+        let primary = GraphClient::new("primary-token");
+        primary.script_rest([]);
+        let shared = GraphClient::new("shared-token").for_shared_mailbox(mailbox);
+        shared.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "value": [{ "id": "m1" }],
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/users/shared%40contoso.com/delta?$skiptoken=p2"
+            }),
+        )]);
+        let account = GraphAccount::new_for_tests_with_shared_clients(
+            primary,
+            PushMode::GraphSubscriptions,
+            HashMap::from([(mailbox.to_string(), shared)]),
+        );
+        let scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign(mailbox, "AAMk"),
+            ty: ObjectType::Email,
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&scope).expect("email scope maps"),
+            &crate::origin::AdmittedUrl::for_tests(
+                "https://graph.microsoft.com/v1.0/users/shared%40contoso.com/delta",
+            ),
+            None,
+        );
+        let cursor = encode_cursor(scope, payload).expect("cursor encodes");
+
+        let mut stream = changes_stream(account, cursor);
+        let Some(SyncEvent::Batch(batch)) = stream.next().await else {
+            panic!("the delta page is emitted");
+        };
+        let Some(Checkpoint::Change(cursor)) = batch.checkpoint else {
+            panic!("the next page checkpoint is present");
+        };
+        let marker = decode_cursor(&cursor)
+            .expect("page cursor decodes")
+            .advanced_through
+            .expect("page marker is present");
+        assert_eq!(
+            marker.last_seen_id.as_deref(),
+            Some("shared@contoso.com\u{1f}m1")
         );
     }
 

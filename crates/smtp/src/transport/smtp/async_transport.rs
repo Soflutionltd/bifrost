@@ -1745,6 +1745,43 @@ mod tests {
             transcript.assert_exhausted();
         }
 
+        #[tokio::test(crate = "tokio", start_paused = true)]
+        async fn cancelled_shutdown_and_concurrent_shutdown_wait_for_idle_abort() {
+            let transcript = Transcript::new("220 smtp.example\r\n")
+                .expect("EHLO client.example\r\n", "250 smtp.example\r\n")
+                .stall_shutdown();
+            let conn =
+                AsyncSmtpConnection::from_transcript(transcript.clone(), &hello(), Protocol::Smtp)
+                    .await
+                    .unwrap();
+            let pool = Pool::new(
+                PoolConfig::new().max_size(1).test_on_checkout(false),
+                AsyncSmtpClient::<TokioExecutor> {
+                    info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+                    marker_: PhantomData,
+                },
+            );
+            pool.park_for_test(conn).await;
+            let mut first = Box::pin(pool.shutdown());
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            tokio::task::yield_now().await;
+            let mut second = Box::pin(pool.shutdown());
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            drop(first);
+            assert!(
+                pool.connection()
+                    .await
+                    .err()
+                    .expect("closed pool")
+                    .is_transport_shutdown()
+            );
+            // Virtual time advances to the abort ceiling; the second caller
+            // cannot report success merely because the idle list was taken.
+            second.await;
+            pool.shutdown().await;
+            transcript.assert_exhausted();
+        }
+
         /// `max_size` is enforced by a semaphore, so a checkout blocked on
         /// admission is only reachable through that semaphore. `shutdown()`
         /// must therefore close it: otherwise the waiter parks forever, and if

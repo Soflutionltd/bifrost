@@ -569,6 +569,50 @@ mod tests {
     /// discovered in `scram_client_final`, after the server-first message,
     /// as a connection-fatal `Protocol` error blaming the server.
     #[test]
+    fn scram_consumer_gs2_and_c_attribute_agree() {
+        for (binding, header, c_value) in [
+            (ScramChannelBinding::None, "n,,", "biws"),
+            (
+                ScramChannelBinding::SupportedButNotAdvertised,
+                "y,,",
+                "eSws",
+            ),
+            (
+                ScramChannelBinding::TlsServerEndPoint(vec![1, 2, 3, 4]),
+                "p=tls-server-end-point,,",
+                "cD10bHMtc2VydmVyLWVuZC1wb2ludCwsAQIDBA==",
+            ),
+        ] {
+            let mut consumer = AuthenticateScramConsumer::new(
+                ScramHash::Sha256,
+                "user".to_owned(),
+                "pencil".to_owned().into(),
+                "nonce".to_owned(),
+                true,
+                binding,
+            )
+            .unwrap();
+            assert_eq!(decode_initial(&consumer), format!("{header}n=user,r=nonce"));
+            let cont = ContinuationRequest {
+                code: None,
+                data: base64::engine::general_purpose::STANDARD
+                    .encode("r=nonceserver,s=QSXCR+Q6sek8bf92,i=4096"),
+            };
+            let reply = consumer.on_continuation(cont, &context()).unwrap();
+            let ContinuationReply::Write(bytes) = reply;
+            let encoded = std::str::from_utf8(&bytes).unwrap().trim();
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap();
+            let final_message = String::from_utf8(decoded).unwrap();
+            assert_eq!(
+                final_message.split(',').next().unwrap(),
+                format!("c={c_value}")
+            );
+        }
+    }
+
+    #[test]
     fn a_password_that_fails_saslprep_is_refused_before_authenticate() {
         let Err(err) = AuthenticateScramConsumer::new(
             ScramHash::Sha256,

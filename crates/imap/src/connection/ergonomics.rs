@@ -159,9 +159,11 @@ impl ImapConnection {
     ///
     /// The budget is enforced in the FETCH consumer: responses beyond the
     /// budget are not retained, and the method returns [`Error::FetchLimit`]
-    /// after the tagged completion. The driver still drains the command to
-    /// keep the IMAP stream synchronized, so callers that need strict
-    /// back-pressure should use [`uid_fetch_each`](Self::uid_fetch_each).
+    /// after the tagged completion. A literal declaration larger than the
+    /// remaining budget returns [`Error::FetchLiteralLimit`] before its
+    /// payload is read and retires the connection, because the unread literal
+    /// cannot be skipped safely. Callers that need strict back-pressure should
+    /// use [`uid_fetch_each`](Self::uid_fetch_each).
     ///
     /// Direct API counterpart to Account get/blob streams for buffered callers.
     pub async fn uid_fetch_limited(

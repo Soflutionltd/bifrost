@@ -7,8 +7,11 @@ Current Stage 4 standalone CalDAV account implementation.
 - `CalDavCredentials` - Basic or bearer credentials. `bearer(token)`
   wraps a raw string; `bearer_source(Arc<dyn TokenSource>)` takes a
   shared rotation source. The bearer token is read via `current().await`
-  per DAV request (in `auth_headers`), so a token rotated mid-sync is
-  honored on the next request without reopen. `Clone` only, hand-written
+  per DAV request (inside the timed dispatcher), so a token rotated mid-sync is
+  honored on the next request without reopen. A target 401 forces one
+  `refresh_if_unchanged` with the exact rejected token and replays the owned
+  request body using the returned token; a second 401 is `AuthLost`. Basic
+  credentials are not refreshed. `Clone` only, hand-written
   `Debug` redacting the source; no `PartialEq`/`Eq`.
 - `CalDavConfig` - base URL plus credentials (`Debug`/`Clone`, no
   `PartialEq`/`Eq`).
@@ -94,6 +97,36 @@ is pinned once, for both dialects, in dav-core:
 included), `a_probe_naming_the_principal_ends_the_walk`,
 `a_refused_credential_on_the_probe_fails_the_open` and
 `the_base_leg_fails_on_what_the_probe_would_have_survived`.
+
+The DAV dispatcher bounds a complete logical request to 30 seconds, including
+its credential read, one-shot 401 refresh, retries and redirect hops. Wrappers
+build requests without reading credentials first; the dispatcher mints them
+inside that deadline. Standalone `auth_headers` calls have the same bound. Each net
+send receives only the remaining time; a new hop cannot restart the clock.
+The local walk retains DAV's origin gate, dialect target checks and MOVE
+Destination rebasing. A transport credential callback alone would not replace
+those policies.
+
+Status classification receives the HTTP response headers and uses
+`bifrost_net::request::parse_retry_after_hint`, preserving HTTP dates as
+`RetryHint::At`, including elapsed dates. Rate-limit and quota errors carry account
+throttle scope as DAV's conservative scheduling policy. Exhausted retry and
+rate-limit errors retain net's complete retry history, except 501, which MOVE
+must read as an unsupported-method answer. A non-idempotent request can also
+read its terminal status after earlier explicit 401/429/503/501 refusals;
+a history containing transport ambiguity keeps reconciliation. Conditional
+412 and locked 423 remain DAV conflicts; 400/422 are malformed requests and
+408/502/503/504 are unavailable. Cursor-invalid 410 is interpreted only by the
+sync-collection caller before the generic resource ladder.
+
+The local multi-leg error ranking is a DAV aggregation policy. Its inputs are
+multiget, filtered-query and directory-query failures. CalDAV's expired-token
+error is produced only by its single sync-collection REPORT and propagates
+directly, outside these folds; neither the legs nor their cursor-free net
+context produce scope restart or disable directives. There is no reachable
+mixed cursor-invalidation/terminal-leg case justifying a universal ordering of
+engine actions. Adding a cursor-bearing leg would require explicitly preserving
+its scope and action.
 
 ## Module layout
 

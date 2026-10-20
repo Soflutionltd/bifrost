@@ -2997,7 +2997,8 @@ fn rejected_push_scopes_are_not_treated_as_covered() {
         builder
             .finalize(&expected)
             .expect("complete scope accounting"),
-    );
+    )
+    .expect("the handle covers the succeeded scope");
 
     assert_eq!(accepted_push_scopes(&result), vec![accepted]);
 }

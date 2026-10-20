@@ -150,6 +150,7 @@ pub(super) enum UpgradePayload {
 /// The blanket impl below bridges any `Consumer` whose `Output` is
 /// `Send + 'static` into this trait by boxing the output.
 pub(super) trait ConsumerErased: Send {
+    fn literal_budget(&self) -> Option<usize>;
     /// Forwards to [`Consumer::on_response`].
     fn on_response(
         &mut self,
@@ -200,6 +201,10 @@ impl<C: Consumer + 'static> ConsumerErased for C
 where
     C::Output: 'static,
 {
+    fn literal_budget(&self) -> Option<usize> {
+        <C as Consumer>::literal_budget(self)
+    }
+
     fn on_response(
         &mut self,
         resp: UntaggedResponse,
@@ -272,6 +277,14 @@ pub(super) enum DriverConsumer {
 }
 
 impl DriverConsumer {
+    fn literal_budget(&self) -> Option<usize> {
+        match self {
+            Self::Regular(c) => c.literal_budget(),
+            Self::StreamingRegular(c) => c.literal_budget(),
+            Self::WithContinuations(c) => c.literal_budget(),
+        }
+    }
+
     /// Forwards to [`ConsumerErased::on_response`].
     fn on_response(
         &mut self,
@@ -762,7 +775,7 @@ async fn dispatch_response_loop(
             .await
             .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
         let resp = wire_reader
-            .read_one(utf8)
+            .read_one_limited(utf8, consumer.literal_budget())
             .await
             .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
         let digest = state.apply_side_effects(&resp);

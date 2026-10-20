@@ -95,6 +95,8 @@ pub(crate) struct ImapAccountInner {
     pub(crate) supports_notify: bool,
     pub(crate) shutdown: CancellationToken,
     pub(crate) closed: AtomicBool,
+    pub(crate) close_completion: std::sync::OnceLock<close::Completion>,
+    pub(crate) send_gate: tokio::sync::RwLock<()>,
     pub(crate) priority: AtomicU8,
     pub(crate) bandwidth_budget: bifrost_net::BandwidthBudget,
     pub(crate) push: push::PushState,
@@ -148,6 +150,8 @@ impl ImapAccount {
                 supports_notify: parts.supports_notify,
                 shutdown: CancellationToken::new(),
                 closed: AtomicBool::new(false),
+                close_completion: std::sync::OnceLock::new(),
+                send_gate: tokio::sync::RwLock::new(()),
                 priority: AtomicU8::new(Priority::Normal as u8),
                 bandwidth_budget: parts.bandwidth_budget,
                 push,
@@ -441,7 +445,8 @@ impl Account for ImapAccount {
         scopes::discover_memberships(self.clone())
     }
 
-    // Account: streams folder lifecycle events from push state; direct users consume IDLE/NOTIFY.
+    // IMAP emits no folder lifecycle events. This stream waits for shutdown;
+    // folder discovery is an open-time snapshot, not an IDLE/NOTIFY feed.
     fn scope_lifecycle_stream(&self) -> AccountStream<bifrost_types::ScopeLifecycleEvent> {
         scopes::scope_lifecycle_stream(self.clone())
     }

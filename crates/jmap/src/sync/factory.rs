@@ -3631,10 +3631,18 @@ mod tests {
             .for_account("shared"),
             thread_get_reply("shared", "T9", &["M9"]).for_account("shared"),
             method_reply(vec![json!([
+                "Email/get",
+                {"accountId": "shared", "state": "membership-state", "list": [
+                    {"id": "M9", "mailboxIds": {"shared-trash": true}}
+                ], "notFound": []},
+                "s0"
+            ])])
+            .for_account("shared"),
+            method_reply(vec![json!([
                 "Email/set",
                 {
                     "accountId": "shared",
-                    "oldState": "shared-state",
+                    "oldState": "membership-state",
                     "newState": "shared-next",
                     "destroyed": ["M9"],
                     "notDestroyed": {}
@@ -3661,7 +3669,7 @@ mod tests {
         .expect("the share destroys its own trashed thread");
 
         let requests = client.transport().requests();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         for request in &requests {
             assert_eq!(
                 request["methodCalls"][0][1]["accountId"], "shared",
@@ -3669,7 +3677,10 @@ mod tests {
             );
         }
         assert_eq!(requests[1]["methodCalls"][0][1]["ids"][0], "T9");
-        let set_args = &requests[2]["methodCalls"][0][1];
+        assert_eq!(requests[2]["methodCalls"][0][0], "Email/get");
+        assert_eq!(requests[2]["methodCalls"][0][1]["ids"][0], "M9");
+        let set_args = &requests[3]["methodCalls"][0][1];
+        assert_eq!(set_args["ifInState"], "membership-state");
         assert_eq!(set_args["destroy"][0], "M9");
         assert!(
             set_args.get("update").is_none(),

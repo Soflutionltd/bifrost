@@ -489,7 +489,12 @@ impl CardDavClient {
             return if filter_unsupported(response.status, &response.body) {
                 HrefLeg::FilterUnsupported
             } else {
-                HrefLeg::Failed(status_error(operation, response.status, response.body))
+                HrefLeg::Failed(status_error(
+                    &response.headers,
+                    operation,
+                    response.status,
+                    response.body,
+                ))
             };
         }
         let mut listing = match parse_propfind_contacts(&response.body) {
@@ -536,7 +541,7 @@ impl CardDavClient {
                     .try_build()
                     .expect("valid answered filter refusal")
             } else {
-                status_error(operation, response.status, response.body)
+                status_error(&response.headers, operation, response.status, response.body)
             });
         }
         let (report, truncated) =
@@ -564,10 +569,7 @@ impl CardDavClient {
         url: &str,
         operation: AccountOperation,
     ) -> Result<CardDavFetchedVCard, AccountError> {
-        let request = self
-            .dav
-            .request(Method::GET, url)
-            .headers(self.dav.auth_headers(url, operation).await?);
+        let request = self.dav.request(Method::GET, url);
         let response = self.dav.send_raw_request(request, operation).await?;
         let status = response.status;
         let etag = response
@@ -582,7 +584,12 @@ impl CardDavClient {
                 data: response.body,
             })
         } else {
-            Err(status_error(operation, status, response.body))
+            Err(status_error(
+                &response.headers,
+                operation,
+                status,
+                response.body,
+            ))
         }
     }
 
@@ -598,7 +605,6 @@ impl CardDavClient {
             .dav
             .request(Method::PUT, url)
             .header(CONTENT_TYPE, "text/vcard; charset=utf-8")
-            .headers(self.dav.auth_headers(url, operation).await?)
             .body(body);
         match condition {
             // Twin of `bifrost-caldav`'s `put_vcard` conditional; see there for
@@ -644,10 +650,7 @@ impl CardDavClient {
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
         self.refuse_directory_access(url, operation)?;
-        let request = self
-            .dav
-            .request(Method::DELETE, url)
-            .headers(self.dav.auth_headers(url, operation).await?);
+        let request = self.dav.request(Method::DELETE, url);
         let response = self.dav.send_raw_request(request, operation).await?;
         if bifrost_dav_core::delete_target_already_gone(response.status) {
             return Ok(None);
@@ -660,7 +663,12 @@ impl CardDavClient {
         if response.status.is_success() {
             Ok(etag)
         } else {
-            Err(status_error(operation, response.status, response.body))
+            Err(status_error(
+                &response.headers,
+                operation,
+                response.status,
+                response.body,
+            ))
         }
     }
 
@@ -686,7 +694,12 @@ impl CardDavClient {
         if response.status.is_success() {
             Ok(etag)
         } else {
-            Err(status_error(operation, response.status, response.body))
+            Err(status_error(
+                &response.headers,
+                operation,
+                response.status,
+                response.body,
+            ))
         }
     }
 
@@ -881,6 +894,7 @@ fn complete_failure_error(
                 .and_then(|code| StatusCode::from_u16(code).ok())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             Some(status_error(
+                &reqwest::header::HeaderMap::new(),
                 operation,
                 code,
                 format!("multi-status body reported failure for all {failed} resources"),
@@ -912,11 +926,12 @@ pub(crate) fn transport_error(
 }
 
 pub(crate) fn status_error(
+    headers: &reqwest::header::HeaderMap,
     operation: AccountOperation,
     status: reqwest::StatusCode,
     body: String,
 ) -> AccountError {
-    bifrost_dav_core::status_error(operation, status, body, DAV)
+    bifrost_dav_core::status_error(headers, operation, status, body, DAV)
 }
 
 pub(crate) fn contact_scope(id: impl Into<String>) -> ErrorScope {
@@ -1024,6 +1039,7 @@ mod tests {
     fn every_error_this_crate_mints_is_stamped_carddav() {
         let errors = [
             status_error(
+                &reqwest::header::HeaderMap::new(),
                 AccountOperation::ContactGet,
                 StatusCode::NOT_FOUND,
                 String::new(),
@@ -1041,6 +1057,7 @@ mod tests {
             );
         }
         let missing = status_error(
+            &reqwest::header::HeaderMap::new(),
             AccountOperation::ContactGet,
             StatusCode::NOT_FOUND,
             String::new(),
@@ -2586,12 +2603,16 @@ mod tests {
     /// result treated as truth is a downstream deletion.
     #[tokio::test]
     async fn unauthorized_report_classifies_as_reauthorization() {
-        let script = dav_script([DavResponse {
+        // A bearer 401 gets one refresh and replay before the terminal
+        // reauthorization error. Script both wire answers so this exercises
+        // that path rather than exhausting the transport double.
+        let unauthorized = || DavResponse {
             status: StatusCode::UNAUTHORIZED,
             headers: HeaderMap::new(),
             body: "<html><body>401 Unauthorized</body></html>".to_string(),
             url: String::new(),
-        }]);
+        };
+        let script = dav_script([unauthorized(), unauthorized()]);
         let client =
             CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
@@ -2732,6 +2753,7 @@ mod tests {
     #[test]
     fn a_refused_leg_after_a_usable_one_keeps_the_cards_and_the_recovery_class() {
         let refusal = status_error(
+            &reqwest::header::HeaderMap::new(),
             AccountOperation::ContactSearch,
             StatusCode::UNAUTHORIZED,
             "refused".to_string(),
@@ -2750,6 +2772,7 @@ mod tests {
     #[test]
     fn a_refused_leg_with_nothing_usable_stays_an_error() {
         let refusal = status_error(
+            &reqwest::header::HeaderMap::new(),
             AccountOperation::ContactSearch,
             StatusCode::UNAUTHORIZED,
             "refused".to_string(),

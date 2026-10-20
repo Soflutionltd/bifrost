@@ -301,6 +301,9 @@ pub(crate) async fn update(
     }
     let (event_calendar_id, native_event_id) = split_event_id(&event.0, operation)?;
     reject_calendar_move(&patch, &event_calendar_id)?;
+    // This public door has no expected-version input. The fetched change key
+    // only guards the interval between this GET and PATCH; it cannot detect a
+    // caller's stale read from before this method began.
     let current = fetch_graph_event(&account, &event_calendar_id, &native_event_id).await?;
     let series = CurrentSeries {
         recurrence: current.recurrence.as_ref(),
@@ -308,7 +311,15 @@ pub(crate) async fn update(
     };
     let body = graph_event_from_patch(&patch, series)?;
     let path = event_url(&account, &event_calendar_id, &native_event_id);
-    let result = if let Some(etag) = current.change_key.as_deref() {
+    // `changeKey` is the opaque payload of Graph's weak entity-tag, not an
+    // HTTP entity-tag by itself.
+    let etag = current
+        .change_key
+        .as_deref()
+        .map(super::inventory::graph_change_key_etag);
+    // Without a change key there is no conditional version to send, so keep
+    // the provider's current unconditional-write behavior.
+    let result = if let Some(etag) = etag.as_deref() {
         account
             .client
             .patch_if_match(Resource::Outlook, &path, etag, &body)
@@ -336,6 +347,8 @@ fn reject_calendar_move(patch: &EventPatch, event_calendar_id: &str) -> Result<(
 
 pub(crate) async fn delete(account: GraphAccount, event: EventId) -> Result<(), AccountError> {
     public::reject_event(&event, AccountOperation::EventDelete)?;
+    // Delete accepts no caller version either. It uses the entity-tag from
+    // this immediate GET when Graph supplied a change key.
     let current = get(account.clone(), event.clone()).await?;
     let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventDelete)?;
     let path = event_url(&account, &calendar_id, &event_id);
@@ -631,7 +644,10 @@ fn event_from_graph(calendar_id: String, event: GraphEvent) -> CalendarEvent {
         calendar_id: CalendarId(calendar_id.clone()),
         native_id: native.clone(),
         uid: Some(event.id.clone()),
-        etag: event.change_key.clone(),
+        etag: event
+            .change_key
+            .as_deref()
+            .map(super::inventory::graph_change_key_etag),
         provenance: CalendarProvenance {
             provider: ProtocolKind::Graph,
             native,
@@ -3403,6 +3419,14 @@ mod tests {
         let requests = script.requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].method, reqwest::Method::PATCH);
+        assert_eq!(
+            requests[1]
+                .headers
+                .get("if-match")
+                .and_then(|value| value.to_str().ok()),
+            Some("W/\"ck1\""),
+            "Graph changeKey must be sent as its weak HTTP entity-tag"
+        );
         let body: Value =
             serde_json::from_slice(requests[1].body.as_ref().expect("patch carries a body"))
                 .expect("patch body is json");
@@ -3411,6 +3435,28 @@ mod tests {
         // RFC 5545's default week start, written explicitly because Graph's
         // own default is Sunday.
         assert_eq!(body["recurrence"]["pattern"]["firstDayOfWeek"], "monday");
+    }
+
+    #[tokio::test]
+    async fn delete_uses_the_change_key_as_an_http_entity_tag() {
+        let (account, script) =
+            scripted_search_account_pages(vec![json!({"id":"e1", "changeKey":"ck1"}), json!({})]);
+
+        delete(account, EventId("calendar::e1".to_string()))
+            .await
+            .expect("delete succeeds");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, reqwest::Method::GET);
+        assert_eq!(requests[1].method, reqwest::Method::DELETE);
+        assert_eq!(
+            requests[1]
+                .headers
+                .get("if-match")
+                .and_then(|value| value.to_str().ok()),
+            Some("W/\"ck1\"")
+        );
     }
 
     fn timed(value: &str) -> EventTime {

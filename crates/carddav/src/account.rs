@@ -460,6 +460,7 @@ impl CardDavAccount {
                     .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
                 {
                     Some(status) => bifrost_dav_core::status_error(
+                        &reqwest::header::HeaderMap::new(),
                         operation,
                         status,
                         format!("inventory member refused: {}", failure.href),
@@ -3037,6 +3038,7 @@ mod tests {
     #[test]
     fn a_degraded_leg_becomes_a_skipped_contact_collection_scope() {
         let error = crate::client::status_error(
+            &reqwest::header::HeaderMap::new(),
             AccountOperation::ContactSearch,
             reqwest::StatusCode::UNAUTHORIZED,
             "refused".to_string(),

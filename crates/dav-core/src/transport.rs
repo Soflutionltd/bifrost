@@ -173,6 +173,7 @@ pub fn settle_body(
         })
     } else {
         Err(crate::error::status_error(
+            &response.headers,
             operation,
             response.status,
             response.body,

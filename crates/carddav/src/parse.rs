@@ -341,7 +341,7 @@ impl MultiStatusSink for MultigetSink {
             self.directory_request_url.as_deref(),
             parts.href(),
             parts.response_status(),
-        ) && status.split_whitespace().nth(1) == Some("507")
+        ) && bifrost_net::status_line_code(status) == Some(507)
             && bifrost_dav_core::same_dav_url(base, &resolve_href(base, href))
         {
             self.truncated = true;
@@ -398,6 +398,38 @@ pub(crate) fn parse_collection_ctag(xml: &str) -> Result<Option<String>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_truncation_accepts_protocol_less_507_status() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/contacts/</D:href>
+    <D:status>507 Insufficient Storage</D:status>
+  </D:response>
+</D:multistatus>"#;
+
+        let (_, truncated) =
+            parse_directory_report(xml, "https://dav.example.test/contacts/").expect("valid XML");
+
+        assert!(truncated);
+    }
+
+    #[test]
+    fn directory_truncation_does_not_scan_past_an_invalid_status_token() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/contacts/</D:href>
+    <D:status>Status 507 Insufficient Storage</D:status>
+  </D:response>
+</D:multistatus>"#;
+
+        let (_, truncated) =
+            parse_directory_report(xml, "https://dav.example.test/contacts/").expect("valid XML");
+
+        assert!(!truncated);
+    }
 
     #[test]
     fn hrefs_resolve_against_the_request_uri() {

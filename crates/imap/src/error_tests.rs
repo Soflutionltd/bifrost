@@ -351,8 +351,12 @@ fn all_variants_are_distinguishable() {
         Error::FetchLimit {
             estimated: 2,
             limit: 1,
-            seq: 3,
+            seq: Some(3),
             uid: Some(4),
+        },
+        Error::FetchLiteralLimit {
+            estimated: 2,
+            limit: 1,
         },
         Error::SearchResultTruncated {
             returned: 1,
@@ -391,6 +395,7 @@ fn all_variants_are_distinguishable() {
             Error::MissingCapability(_) => "capability",
             Error::AppendLimit { .. } => "appendlimit",
             Error::FetchLimit { .. } => "fetchlimit",
+            Error::FetchLiteralLimit { .. } => "fetchliterallimit",
             Error::SearchResultTruncated { .. } => "searchresulttruncated",
             Error::InvalidAppendDate(_) => "invalidappenddate",
             Error::Internal(_) => "internal",

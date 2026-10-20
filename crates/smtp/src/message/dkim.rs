@@ -102,7 +102,10 @@ impl StdError for DkimSigningKeyError {
     }
 }
 
-/// Describe a signing key to be carried by [`DkimConfig`] struct
+/// Signing key carried by [`DkimConfig`].
+///
+/// Existing RSA private keys and Ed25519 key pairs convert with `From`;
+/// [`DkimSigningKey::new`] parses a PKCS#1 PEM or a base64-encoded seed.
 #[derive(Debug)]
 pub struct DkimSigningKey(InnerDkimSigningKey);
 
@@ -125,6 +128,7 @@ impl From<KeyPair> for DkimSigningKey {
 }
 
 impl DkimSigningKey {
+    /// Parse a PKCS#1 PEM RSA key or a base64-encoded 32-byte Ed25519 seed.
     pub fn new(
         private_key: &str,
         algorithm: DkimSigningAlgorithm,
@@ -162,7 +166,7 @@ pub struct DkimConfig {
     selector: String,
     /// The domain for which we sign the message
     domain: String,
-    /// The private key in PKCS1 string format
+    /// Signing key for the selected RSA or Ed25519 algorithm.
     private_key: DkimSigningKey,
     /// A list of header names to be included in the signature. Signing of more than one
     /// header with the same name is not supported

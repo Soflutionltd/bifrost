@@ -39,11 +39,15 @@ pub(crate) trait JmapMethod: Serialize + Send {
 
 Adding a new method: define a struct, use `define_get_method!` / `define_set_method!` etc. Zero central files touched.
 
-`Request` snapshots the session's `maxCallsInRequest` when it is constructed and
-refuses the first call that would exceed it, before serializing or appending
-that method. The guard covers tuple batches, explicit result-reference flows,
-and WebSocket requests through the same `call` door, so no call site can
-accidentally put an oversized method batch on the wire.
+`Request` takes one `SessionState` snapshot when it is constructed. Its
+`maxCallsInRequest` guard, default account id, and HTTP `apiUrl` all come from
+that snapshot, which remains attached through send. It refuses the first call
+that would exceed the limit, before serializing or appending that method. The
+guard covers tuple batches, explicit result-reference flows, and WebSocket
+requests through the same `call` door. The WebSocket encoder's separate
+`maxSizeRequest` check still reads the client's current session at encode time,
+so a refresh between request construction and WebSocket encoding can pair the
+request snapshot with the newer frame-size limit.
 
 The snapshot is a three-state `CallLimit`, not a number: `Unadvertised` (no
 `urn:ietf:params:jmap:core` block, or a block that omits `maxCallsInRequest`),
@@ -192,6 +196,8 @@ existing `JmapAccount` has already frozen limits, capability flags, primary and
 foreign account routing, and push topology from the old session. The watch wakes
 the lifecycle poll pause immediately, so stale derived URLs are not used for
 another poll interval after divergence.
+Concurrent `refresh_session` calls serialize their fetch and install, so the
+first fetch cannot finish last and overwrite a later fetched session.
 `refresh_session` exists but no sync path calls it - the flag latches false for
 the life of a client, and a fresh client (with a freshly fetched session) is
 what clears it.
@@ -438,7 +444,9 @@ The crate-internal JMAP error type uses structured variants. No
 `Error::Internal(String)`:
 
 - `Transport(TransportError)` - wraps transport errors. `From<TransportError>` parses a carried body as ProblemDetails and, when it parses, produces `Problem { details, transport }` instead, keeping the transport error for its status and retry evidence.
-- `Problem { .. }` - an RFC 7807 problem-details response.
+- `Problem { .. }` - an RFC 7807 problem-details response. An omitted `type`
+  decodes as `about:blank`, as RFC 7807 §3.1 requires, while retaining its
+  status, title and detail.
 - `Method(MethodError)` - JMAP method-level errors. `Set(SetError)` - per-object set errors.
 - Local request refusals: `RequestEncode`, `RequestCallLimit { max }`, `RequestSizeLimit { max, size }`, `NoPrimaryAccount { capability }`.
 - Response-shape failures: `ResponseDecode`, `CallNotFound`, `UnexpectedMethodResponse`, `IdNotFound`, `NotParsable`.
@@ -561,7 +569,7 @@ Every change-stream batch carries a `Checkpoint::Change(ChangeCursor)` whose sta
 
 The CAS is exact: an expected state advances only an entry containing that state. It cannot initialize an absent or explicitly empty entry. Only an advance with no expected state may initialize those shapes.
 
-`get_stream` (hydration) supports `Projection::FlagsOnly` and `Metadata` for Email; raw-MIME projections fatal-unsupported (whole-message raw is `open_raw_rfc822`: one `Email/get` for `blobId` then `client.download`). Batches size at `max_objects_in_get`. Hydrated emails emit `ItemOutcome::Succeeded`; locally-invalid ids or transport-drop ambiguity flow through `Failed` / `Uncertain` rather than terminating the stream. A foreign-qualified id's `Metadata` entry is qualified exactly as the foreign inventory mints it - memberships re-encoded `Folder(encode_foreign(accountId, mailboxId))` plus the `Mailbox(accountId)` owner tag, entry and blob ids in the object namespace. This is the attribution channel for foreign changes: the account-level change stream emits only qualified ids, and hydration is where the consumer learns which shared folder a message sits in.
+`get_stream` (hydration) supports `Projection::FlagsOnly` and `Metadata` for Email; raw-MIME projections fatal-unsupported (whole-message raw is `open_raw_rfc822`: one `Email/get` for `blobId` then `client.download`). Batches size at `max_objects_in_get` and partial route buffers flush after the JMAP batching policy's 100 ms maximum wait, even while the input stream remains open. Hydrated emails emit `ItemOutcome::Succeeded`; locally-invalid ids or transport-drop ambiguity flow through `Failed` / `Uncertain` rather than terminating the stream. A foreign-qualified id's `Metadata` entry is qualified exactly as the foreign inventory mints it - memberships re-encoded `Folder(encode_foreign(accountId, mailboxId))` plus the `Mailbox(accountId)` owner tag, entry and blob ids in the object namespace. This is the attribution channel for foreign changes: the account-level change stream emits only qualified ids, and hydration is where the consumer learns which shared folder a message sits in.
 
 Each `Email/get` answer is reconciled against the ids the batch submitted (`hydrate::reconcile_hydration`, pure and unit-pinned), so every submitted id leaves on exactly one lane. Repeated submitted ids remain repeated submissions: reconciliation drives from the submitted slice, and one correlated response object supplies one outcome for every occurrence. `notFound` alone cannot carry that: an absent `notFound` decodes as empty (see "`/get` response leniency"), and a present one can still omit an id the server also left out of `list`. Outcomes are keyed by the id the CALLER submitted - a response object whose id was not requested, was already answered, or is missing entirely is discarded rather than minted into an outcome. Ids named in `notFound` emit `Failed` with `NotFound(Message)`; ids answered in neither list emit `Failed` with `Protocol(PartialResponse)` + `Attempt(Acknowledged)`, which the shared recovery mapping retries rather than dropping (a terminal contract violation would lose the id for a condition the next `Email/get` usually clears). `contacts::get_cards` reconciles the same way, routing both classes into `Page::failed_ids` so the consumer preserves the row instead of reading absence as a deletion.
 
@@ -689,7 +697,7 @@ locally-rejected targets emits them without probing Email state.
 
 ### PIM primitives and conveniences
 
-`pim.rs` is the Stage 1 unified mail surface. Message/thread mutation resolves `MutationTarget::Thread` via `Thread/get`, then uses `Email/set` patches against `mailboxIds`/`keywords`/`$seen` without account-wide `ifInState`; the patch names the requested fields and preserves other properties, while an unrelated Email change cannot reject it. The email state cache still advances compare-and-swap style from the response. Gmail labels, Graph categories/extended properties return `Unsupported`. `Thread.emailIds` decodes as optional, because a `/get` may project it away; both readers (`thread_hydrate` and the mutation-target expansion) reject a response that omits an explicitly requested `emailIds` rather than treating it as an empty thread. That expansion failure is reported under the MUTATION's `AccountOperation`, not `HydrateThread` - the thread lookup is an implementation detail of the mutation, and the operation drives the recovery class the engine derives.
+`pim.rs` is the Stage 1 unified mail surface. Message/thread field mutations resolve `MutationTarget::Thread` via `Thread/get`, then use `Email/set` patches against `mailboxIds`/`keywords`/`$seen` without account-wide `ifInState`; the patch names the requested fields and preserves other properties, while an unrelated Email change cannot reject it. The already-in-Trash `delete_thread` branch is the exception: it reads member `mailboxIds`, then sends `Email/set destroy` with the first read's Email state in `ifInState`, so a membership change during a multi-get walk or before the destroy refuses the destructive request. Because Email state is account-wide, an unrelated Email change can also reject the set; retry reads membership again. The email state cache still advances compare-and-swap style from the response. Gmail labels, Graph categories/extended properties return `Unsupported`. `Thread.emailIds` decodes as optional, because a `/get` may project it away; both readers (`thread_hydrate` and the mutation-target expansion) reject a response that omits an explicitly requested `emailIds` rather than treating it as an empty thread. That expansion failure is reported under the MUTATION's `AccountOperation`, not `HydrateThread` - the thread lookup is an implementation detail of the mutation, and the operation drives the recovery class the engine derives.
 
 `patch_mailbox_membership` (`add_to_container` / `remove_from_container`, and
 the two legs of `move_thread` / `delete_thread`) applies the same owner check
@@ -715,7 +723,7 @@ Container CRUD is `Mailbox/get`/`set`. Mailboxes surface as `ContainerKind::Fold
 
 Settings use `Identity/get`/`set`, `VacationResponse/get`/`set` (`singleton` id), and `Quota/get`. `identity_update` supports name/signatures/reply-to; default-identity selection is unsupported.
 
-`thread_hydrate` does `Thread/get` then `Email/get` in order. `message_hydrate` selects headers / preview / full projections and returns blob handles without pre-downloading. `move_thread`/`delete_thread` add-to-target then remove-from-source; deleting from Trash destroys the emails. The thread is expanded ONCE, before either leg, and both legs run over that fixed id set (`patch_mailbox_membership_of`); the cross-account container check runs for both containers before the resolve. Each leg used to run its own `Thread/get`, so a message delivered to the thread between the two resolves was removed from the source having never been added to the target - it lost its source membership and gained nothing. The two-leg non-atomicity itself is the documented cross-provider shape and remains; the window is now one `Email/set` pair over a fixed set.
+`thread_hydrate` does `Thread/get` then `Email/get` in order. `message_hydrate` selects headers / preview / full projections and returns blob handles without pre-downloading. `move_thread` and `delete_thread` from elsewhere add-to-target then remove-from-source. When the caller says the thread is already in Trash, `delete_thread` expands the thread and reads each member's active `mailboxIds`; only members present in the resolved Trash mailbox are destroyed, so Sent, Inbox, and other copies survive. The move path resolves the thread once and both membership legs use that fixed id set (`patch_mailbox_membership_of`); the cross-account container check runs for both containers before the resolve. Each leg used to run its own `Thread/get`, so a message delivered to the thread between the two resolves was removed from the source having never been added to the target - it lost its source membership and gained nothing. The two-leg non-atomicity itself is the documented cross-provider shape and remains; the window is now one `Email/set` pair over a fixed set.
 
 ### PIM page cursors
 
@@ -1214,3 +1222,7 @@ a whole new share still waits for reopen.
   SENT rather than trusted, and a nonempty page that claims to have served
   past its own `total` is refused rather than read as a finished walk. See
   "PIM page cursors".
+
+### Push failure routing
+
+The WebSocket push reader retries locally only for `RecoveryClass::Retry`. Handshake, subscription write, ping and read errors are classified as `PushStream`; every other recovery class ends the reader with `WatchEvent::Terminated`, preserving engine directives for the sync reconciler.

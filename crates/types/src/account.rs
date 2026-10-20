@@ -66,7 +66,9 @@ use crate::settings::{Identity, IdentityPatch, QuotaInfo, VacationConfig};
 ///
 /// Only scopes in `outcomes`' succeeded lane are covered by `handle`.
 /// Failed scopes remain available to the consumer's polling path. The handle
-/// is absent when no requested scope was accepted.
+/// is present exactly when at least one requested scope was accepted.
+/// Constructors validate this relationship; consumers that mutate the public
+/// fields must preserve it themselves.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct PushSubscription {
@@ -74,18 +76,48 @@ pub struct PushSubscription {
     pub outcomes: crate::error::BatchOutcome<CursorScope>,
 }
 
+/// A mismatch between a push subscription handle and its succeeded scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PushSubscriptionBuildError {
+    /// A handle cannot cover an empty succeeded lane.
+    #[error("a push handle requires at least one succeeded scope")]
+    HandleWithoutSucceededScopes,
+    /// Succeeded scopes must be covered by a subscription handle.
+    #[error("succeeded push scopes require a subscription handle")]
+    SucceededScopesWithoutHandle,
+    /// The common constructor could not close its internally built outcome ledger.
+    #[error("push subscription outcome ledger violated its accounting invariant")]
+    OutcomeLedgerInvariant,
+}
+
 impl PushSubscription {
-    #[must_use]
+    /// Build a result only when the handle agrees with the succeeded lane.
     pub fn new(
         handle: Option<SubscriptionHandle>,
         outcomes: crate::error::BatchOutcome<CursorScope>,
-    ) -> Self {
-        Self { handle, outcomes }
+    ) -> Result<Self, PushSubscriptionBuildError> {
+        match (handle.is_some(), !outcomes.succeeded().is_empty()) {
+            (true, false) => Err(PushSubscriptionBuildError::HandleWithoutSucceededScopes),
+            (false, true) => Err(PushSubscriptionBuildError::SucceededScopesWithoutHandle),
+            (false, false) => {
+                // No accepted scope means no handle. An all-failed ledger is
+                // still a valid value; Account implementations may promote
+                // that whole-request condition to Err at their policy seam.
+                Ok(Self { handle, outcomes })
+            }
+            (true, true) => Ok(Self { handle, outcomes }),
+        }
     }
 
     /// Build the common result where one handle covers every requested scope.
-    #[must_use]
-    pub fn all_succeeded(handle: SubscriptionHandle, scopes: &[CursorScope]) -> Self {
+    ///
+    /// An empty scope list is rejected because it cannot have a succeeded
+    /// scope for the handle to cover.
+    pub fn all_succeeded(
+        handle: SubscriptionHandle,
+        scopes: &[CursorScope],
+    ) -> Result<Self, PushSubscriptionBuildError> {
         let expected: Vec<_> = (0..scopes.len())
             .map(|index| crate::error::BatchItemId(index.to_string()))
             .collect();
@@ -93,12 +125,10 @@ impl PushSubscription {
         for (item, scope) in expected.iter().cloned().zip(scopes.iter().cloned()) {
             builder.push_succeeded(item, scope);
         }
-        Self {
-            handle: Some(handle),
-            outcomes: builder
-                .finalize(&expected)
-                .expect("all push scopes are accounted for exactly once"),
-        }
+        let outcomes = builder
+            .finalize(&expected)
+            .map_err(|_| PushSubscriptionBuildError::OutcomeLedgerInvariant)?;
+        Self::new(Some(handle), outcomes)
     }
 }
 
@@ -1412,4 +1442,70 @@ fn unsupported_error(op: AccountOperation) -> AccountError {
     .operation(op)
     .try_build()
     .expect("valid account error classification")
+}
+
+#[cfg(test)]
+mod push_subscription_tests {
+    use super::*;
+    use crate::error::{BatchItemId, BatchOutcome, BatchOutcomeBuilder};
+
+    fn outcomes_with_success() -> BatchOutcome<CursorScope> {
+        let item = BatchItemId("0".to_string());
+        let mut builder = BatchOutcomeBuilder::new();
+        builder.push_succeeded(item.clone(), CursorScope::Account);
+        builder.finalize(&[item]).expect("complete outcomes")
+    }
+
+    fn outcomes_with_failure() -> BatchOutcome<CursorScope> {
+        let operation = AccountOperation::PushSubscribe;
+        let error = AccountErrorBuilder::new(
+            AccountErrorKind::Unsupported(operation),
+            Cause::Request(RequestCause::Unsupported { operation }),
+        )
+        .try_build()
+        .expect("valid unsupported error");
+        let item = BatchItemId("0".to_string());
+        let mut builder = BatchOutcomeBuilder::new();
+        builder.push_failed(item.clone(), error);
+        builder.finalize(&[item]).expect("complete outcomes")
+    }
+
+    fn empty_outcomes() -> BatchOutcome<CursorScope> {
+        BatchOutcomeBuilder::new()
+            .finalize(&[])
+            .expect("empty outcomes")
+    }
+
+    #[test]
+    fn new_rejects_mismatched_handle_and_success_lanes() {
+        let with_handle = PushSubscription::new(
+            Some(SubscriptionHandle("handle".to_string())),
+            empty_outcomes(),
+        );
+        assert_eq!(
+            with_handle.unwrap_err(),
+            PushSubscriptionBuildError::HandleWithoutSucceededScopes
+        );
+
+        let without_handle = PushSubscription::new(None, outcomes_with_success());
+        assert_eq!(
+            without_handle.unwrap_err(),
+            PushSubscriptionBuildError::SucceededScopesWithoutHandle
+        );
+    }
+
+    #[test]
+    fn new_accepts_a_handleless_all_failed_outcome() {
+        let result = PushSubscription::new(None, outcomes_with_failure());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn all_succeeded_rejects_an_empty_scope_list() {
+        let result = PushSubscription::all_succeeded(SubscriptionHandle("handle".to_string()), &[]);
+        assert_eq!(
+            result.unwrap_err(),
+            PushSubscriptionBuildError::HandleWithoutSucceededScopes
+        );
+    }
 }

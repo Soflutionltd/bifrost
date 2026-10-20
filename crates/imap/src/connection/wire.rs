@@ -122,9 +122,17 @@ impl WireReader {
     /// Section 3) has been enabled or `IMAP4rev2` is active (RFC 9051
     /// Section 7).
     pub(crate) async fn read_one(&mut self, utf8_mode: bool) -> Result<Response, Error> {
+        self.read_one_limited(utf8_mode, None).await
+    }
+
+    pub(crate) async fn read_one_limited(
+        &mut self,
+        utf8_mode: bool,
+        limit: Option<usize>,
+    ) -> Result<Response, Error> {
         loop {
             // Try to parse a complete response from the buffer.
-            if let Some(resp) = self.try_parse_response_inner(utf8_mode)? {
+            if let Some(resp) = self.try_parse_response_limited(utf8_mode, limit)? {
                 return Ok(resp);
             }
             // Need more data from the wire.
@@ -326,7 +334,11 @@ impl WireReader {
     /// Uses `parse_response_utf8` in UTF-8 mode when the caller indicates
     /// `UTF8=ACCEPT` (RFC 6855 Section 3) or `IMAP4rev2` is active
     /// (RFC 9051 Section 7: quoted-strings carry raw UTF-8).
-    fn try_parse_response_inner(&mut self, utf8_mode: bool) -> Result<Option<Response>, Error> {
+    fn try_parse_response_limited(
+        &mut self,
+        utf8_mode: bool,
+        limit: Option<usize>,
+    ) -> Result<Option<Response>, Error> {
         if self.buf.is_empty() {
             return Ok(Option::None);
         }
@@ -338,7 +350,7 @@ impl WireReader {
         //
         // Every IMAP response ends with \r\n. If the buffer doesn't contain
         // \r\n at all, the first response is definitely incomplete.
-        if !buffer_may_contain_complete_response(&self.buf)? {
+        if !buffer_may_contain_complete_response_limited(&self.buf, limit)? {
             return Ok(Option::None);
         }
 
@@ -484,6 +496,33 @@ impl WireMetering {
 /// not worth the dependency so far, because the fatal lane is guarded by an
 /// explicit threshold rather than by inference.
 pub(super) fn buffer_may_contain_complete_response(buf: &[u8]) -> Result<bool, Error> {
+    buffer_may_contain_complete_response_limited(buf, None)
+}
+
+fn buffer_may_contain_complete_response_limited(
+    buf: &[u8],
+    limit: Option<usize>,
+) -> Result<bool, Error> {
+    // Bound literal payloads before asking for more octets. A response can
+    // chain literals, so charge their sum, not just the largest one. Syntax
+    // and the consumer's retained-object estimate are separate quantities.
+    let mut literal_bytes = 0usize;
+    let mut charge = |size: usize| -> Result<(), Error> {
+        literal_bytes = literal_bytes.saturating_add(size);
+        if let Some(limit) = limit
+            && literal_bytes > limit
+        {
+            // This is a client limit, not malformed provider data. The
+            // dedicated fatal variant keeps that distinction while retiring
+            // the connection, since unread literal octets prevent framing the
+            // next response safely.
+            return Err(Error::FetchLiteralLimit {
+                estimated: literal_bytes,
+                limit,
+            });
+        }
+        Ok(())
+    };
     // Fast path: no \r\n means definitely incomplete.
     let Some(first_crlf) = buf.windows(2).position(|w| w == b"\r\n") else {
         return Ok(false);
@@ -558,6 +597,7 @@ pub(super) fn buffer_may_contain_complete_response(buf: &[u8]) -> Result<bool, E
     {
         // Skip past the first literal body and iteratively check
         // for additional literals (e.g., multi-body FETCH).
+        charge(literal_len)?;
         let mut pos = advance_past_literal(first_crlf, 2, literal_len)?;
         loop {
             if pos > buf.len() {
@@ -570,6 +610,7 @@ pub(super) fn buffer_may_contain_complete_response(buf: &[u8]) -> Result<bool, E
             };
             // Check if there's another literal marker at this CRLF.
             if let Some(next_literal_len) = try_parse_literal_marker(remaining, next_crlf)? {
+                charge(next_literal_len)?;
                 // Another literal  -  skip past it and continue.
                 pos = advance_past_literal(pos, next_crlf + 2, next_literal_len)?;
                 continue;

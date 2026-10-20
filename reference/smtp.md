@@ -710,7 +710,7 @@ Batch builders: `MultiPart::multiparts(...)` and `.singleparts(...)`.
 
 ## DKIM
 
-Default canonicalization is `relaxed/relaxed`. Signing keys: `From<rsa::RsaPrivateKey>` and `From<ed25519_dalek::SigningKey>` on `DkimSigningKey`. SHA-2 via `sha2` 0.10 to match `rsa` 0.9 digest traits.
+Default canonicalization is `relaxed/relaxed`. `DkimSigningKey` implements `From<rsa::RsaPrivateKey>` and `From<ed25519_compact::KeyPair>`; `new` also parses an RSA PKCS#1 PEM or a base64-encoded Ed25519 seed. RSA signing passes `sha2::Sha256` to `rsa::pkcs1v15::Pkcs1v15Sign::new`, so compatibility follows the digest traits required by that API rather than a fixed pair of crate versions.
 
 Canonicalization follows RFC 6376 for empty bodies and missing final CRLFs. Relaxed headers are normalized iteratively, and `DKIM-Signature` is folded before `b=` before hashing so simple header canonicalization signs the exact emitted bytes. The signer intentionally does not support the `l=` body-length tag because it enables content-append attacks.
 
@@ -728,6 +728,14 @@ is bounded by the connection's operation timeout or the teardown cap, whichever
 is smaller (see "Connection lifecycle"). The cap is what makes this a bound at
 all for a transport built with `timeout(None)`: `shutdown()` waits for the
 closes it starts, so one unresponsive TLS peer would otherwise hang it.
+
+Async shutdown stores one shared completion and runs idle-connection aborts and
+worker termination in an owned task. Dropping a shutdown caller does not cancel
+those aborts; concurrent and later callers await the same completion. Admission
+and idle checkout close before that task starts. Checked-out connections still
+belong to their callers and are hard-dropped when returned to the closed pool;
+shutdown does not wait for their sends. An account that needs send completion
+must serialize its own sends with shutdown.
 
 The admission gate participates in shutdown. Because `max_size` is enforced by a
 semaphore (async) and a live counter plus condvar (blocking), a checkout blocked

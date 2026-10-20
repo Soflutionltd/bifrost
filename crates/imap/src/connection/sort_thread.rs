@@ -26,7 +26,6 @@ impl ImapConnection {
         let criteria = criteria.as_ref();
         self.check_utf8_only_enforced()?;
         self.require_state(crate::types::CommandKind::Sort)?;
-        self.validate_search_criteria_capabilities(criteria)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::Sort) {
@@ -62,7 +61,6 @@ impl ImapConnection {
         let criteria = criteria.as_ref();
         self.check_utf8_only_enforced()?;
         self.require_state(crate::types::CommandKind::Sort)?;
-        self.validate_search_criteria_capabilities(criteria)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::Sort) {
@@ -105,7 +103,6 @@ impl ImapConnection {
         let criteria = criteria.as_ref();
         self.check_utf8_only_enforced()?;
         self.require_state(crate::types::CommandKind::Thread)?;
-        self.validate_search_criteria_capabilities(criteria)?;
         {
             let snap = self.state_rx.borrow();
             if !snap
@@ -149,7 +146,6 @@ impl ImapConnection {
         let criteria = criteria.as_ref();
         self.check_utf8_only_enforced()?;
         self.require_state(crate::types::CommandKind::Thread)?;
-        self.validate_search_criteria_capabilities(criteria)?;
         {
             let snap = self.state_rx.borrow();
             if !snap

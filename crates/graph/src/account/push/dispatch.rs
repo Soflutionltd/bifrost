@@ -94,7 +94,14 @@ pub(super) async fn subscribe_eligible(
     let Some(handle) = handle else {
         return Err(no_subscribable_push_scopes(outcomes.failed()));
     };
-    Ok(bifrost_types::PushSubscription::new(Some(handle), outcomes))
+    bifrost_types::PushSubscription::new(Some(handle), outcomes).map_err(|failure| {
+        into_account_error(
+            GraphError::Internal {
+                message: format!("push subscription invariant failed: {failure}"),
+            },
+            GraphErrorContext::graph(AccountOperation::PushSubscribe),
+        )
+    })
 }
 
 /// Positional ids for one `push_subscribe` request's scopes. The lanes are

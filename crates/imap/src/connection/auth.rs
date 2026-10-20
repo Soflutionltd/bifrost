@@ -116,6 +116,29 @@ impl ImapConnection {
                                 ));
                                 continue;
                             };
+                            let data = match &resolved {
+                                bifrost_sasl::ScramChannelBinding::TlsServerEndPoint(data) => {
+                                    data.as_slice()
+                                }
+                                _ => unreachable!("certificate resolver returns bound data"),
+                            };
+                            let Some((_, resolved)) = bifrost_sasl::select_scram_rung(
+                                hash,
+                                true,
+                                |name| {
+                                    profile
+                                        .auth_mechanisms
+                                        .iter()
+                                        .any(|m| m.eq_ignore_ascii_case(name))
+                                },
+                                Some(data),
+                            ) else {
+                                rejected.push(AuthMechanismRejection::new(
+                                    mechanism,
+                                    AuthMechanismRejectionReason::ChannelBindingUnavailable,
+                                ));
+                                continue;
+                            };
                             self.authenticate_scram_with_binding(
                                 username,
                                 password.as_str(),
@@ -126,13 +149,47 @@ impl ImapConnection {
                             )
                             .await
                         }
-                        AuthMechanism::ScramSha256 => {
-                            self.authenticate_scram_sha256(username, password.as_str(), timeout)
-                                .await
-                        }
-                        AuthMechanism::ScramSha1 => {
-                            self.authenticate_scram_sha1(username, password.as_str(), timeout)
-                                .await
+                        AuthMechanism::ScramSha256 | AuthMechanism::ScramSha1 => {
+                            let hash = if mechanism == AuthMechanism::ScramSha1 {
+                                bifrost_sasl::ScramHash::Sha1
+                            } else {
+                                bifrost_sasl::ScramHash::Sha256
+                            };
+                            // Binding must be checked even without a PLUS advertisement:
+                            // RFC 5802 section 6 then requires y, not n.
+                            let available = self.resolve_scram_binding().await?;
+                            let data = match &available {
+                                Some(bifrost_sasl::ScramChannelBinding::TlsServerEndPoint(
+                                    data,
+                                )) => Some(data.as_slice()),
+                                _ => None,
+                            };
+                            let Some((_, binding)) = bifrost_sasl::select_scram_rung(
+                                hash,
+                                false,
+                                |name| {
+                                    profile
+                                        .auth_mechanisms
+                                        .iter()
+                                        .any(|m| m.eq_ignore_ascii_case(name))
+                                },
+                                data,
+                            ) else {
+                                rejected.push(AuthMechanismRejection::new(
+                                    mechanism,
+                                    AuthMechanismRejectionReason::ChannelBindingUnavailable,
+                                ));
+                                continue;
+                            };
+                            self.authenticate_scram_with_binding(
+                                username,
+                                password.as_str(),
+                                hash,
+                                bifrost_sasl::ChannelBinding::None,
+                                Some(binding),
+                                timeout,
+                            )
+                            .await
                         }
                         AuthMechanism::Plain => {
                             self.authenticate_plain(username, password.as_str(), timeout)
@@ -630,9 +687,10 @@ impl ImapConnection {
                     ))
                 })?,
             },
-            // `ChannelBinding` is `#[non_exhaustive]`; `None` and any future
-            // unbound dimension carry no GS2 binding data.
-            _ => ScramChannelBinding::None,
+            // Negotiated unbound SCRAM carries the helper's y flag in `resolved`.
+            // Direct calls explicitly selecting unbound SCRAM do not negotiate
+            // mechanisms and retain n (RFC 5802 section 6).
+            _ => resolved.unwrap_or(ScramChannelBinding::None),
         };
 
         let has_sasl_ir = {
@@ -1010,9 +1068,6 @@ fn password_mechanism_ladder(
     use crate::error::{AuthMechanismRejection, AuthMechanismRejectionReason};
     use crate::types::AuthMechanism;
 
-    let server_offers_sha256_plus = profile.supports_sasl_auth(AuthMechanism::ScramSha256Plus);
-    let server_offers_sha1_plus = profile.supports_sasl_auth(AuthMechanism::ScramSha1Plus);
-
     let order = [
         AuthMechanism::ScramSha256Plus,
         AuthMechanism::ScramSha1Plus,
@@ -1034,12 +1089,27 @@ fn password_mechanism_ladder(
             continue;
         }
 
-        // RFC 5802 Section 6: refuse the unbound SCRAM-SHA-N rung when the
-        // matching PLUS variant was advertised. This is purely a function of
-        // the advertised set, so it lives in the pure helper.
-        let downgrade_forbidden = (mechanism == AuthMechanism::ScramSha256
-            && server_offers_sha256_plus)
-            || (mechanism == AuthMechanism::ScramSha1 && server_offers_sha1_plus);
+        // Shared SASL policy owns PLUS suppression as well as the y header.
+        // Binding availability for PLUS itself is resolved by the live caller.
+        let unbound_hash = match mechanism {
+            AuthMechanism::ScramSha256 => Some(bifrost_sasl::ScramHash::Sha256),
+            AuthMechanism::ScramSha1 => Some(bifrost_sasl::ScramHash::Sha1),
+            _ => None,
+        };
+        let downgrade_forbidden = unbound_hash.is_some_and(|hash| {
+            bifrost_sasl::select_scram_rung(
+                hash,
+                false,
+                |name| {
+                    profile
+                        .auth_mechanisms
+                        .iter()
+                        .any(|m| m.eq_ignore_ascii_case(name))
+                },
+                None,
+            )
+            .is_none()
+        });
         if downgrade_forbidden {
             ladder.push(PasswordCandidate::Reject(AuthMechanismRejection::new(
                 mechanism,

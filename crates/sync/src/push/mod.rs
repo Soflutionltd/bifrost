@@ -60,6 +60,13 @@ impl InvalidationSinkInner {
             // every out-of-process event. In particular, once one event has
             // to wait for bounded queue space, a later push cannot bypass it
             // through a successful `try_send`.
+            // A sticky full-reconcile bit can replace invalidation payloads,
+            // but cannot encode arbitrary Warning or Terminated payloads or
+            // preserve their order. This synchronous, non-blocking sink has
+            // no backpressure result: making ingress bounded requires an
+            // explicit control-event overflow policy or a different API.
+            // Retain the queue until that policy is chosen; a bit alone would
+            // silently discard control information this path promises to keep.
             let (ingress_tx, ingress_rx) = mpsc::unbounded_channel();
             let drops = Arc::clone(&self.drop_counter);
             handle.spawn(forward_events(ingress_rx, sender, drops, None));
@@ -97,13 +104,9 @@ async fn forward_events(
                 let delivery = if lossless {
                     rejected
                 } else {
-                    // The drop counter counts PAYLOAD loss, not delivery
-                    // loss: the rejected event's specific payload is gone
-                    // the moment it is replaced by the coarser coalesced
-                    // form, even when that replacement is then delivered.
-                    // (Pinned by full_sink_counts_a_coalesced_invalidation_
-                    // as_dropped, which receives the coalesced event AND
-                    // expects dropped == 1.)
+                    // Count payload coarsening immediately, even if the
+                    // replacement is delivered. A later timeout can also
+                    // lose delivery; the metric cannot distinguish the two.
                     drops.fetch_add(1, Ordering::Relaxed);
                     coalesced_event(rejected)
                 };
@@ -115,6 +118,13 @@ async fn forward_events(
                         break;
                     }
                 } else {
+                    // This timeout can lose the reconcile request itself,
+                    // not merely its specific payload. Removing it alone
+                    // would let one stalled reconciler retain an unlimited
+                    // ingress backlog. A durable pending bit needs a wakeup
+                    // owned by the reconciler as well as a control-event
+                    // overflow policy; it is not a replacement for this whole
+                    // mixed event queue.
                     let deadline = tokio::time::Duration::from_millis(100);
                     let _ = tokio::time::timeout(deadline, sender.send(delivery)).await;
                 }
@@ -332,6 +342,24 @@ mod tests {
             rx.try_recv().is_err(),
             "nothing could redeliver the warning"
         );
+    }
+
+    #[test]
+    fn full_reconcile_cannot_represent_control_events() {
+        let warning = WatchEvent::Warning(Warning::user_safe(WarningKind::Other, "diagnostic"));
+        let terminated = WatchEvent::Terminated(crate::recovery::restart_scope_error(
+            CursorScope::Account,
+            AccountOperation::SyncChanges,
+        ));
+        for control in [warning, terminated] {
+            assert!(requires_lossless_delivery(&control));
+            // The only state a full-reconcile bit can regenerate has lost
+            // both the diagnostic and the recovery classification.
+            assert!(matches!(
+                coalesced_event(control),
+                WatchEvent::Invalidated { .. }
+            ));
+        }
     }
 
     #[test]

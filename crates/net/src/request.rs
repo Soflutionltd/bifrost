@@ -1157,7 +1157,11 @@ pub(crate) async fn send_streaming_inner(
                 .and_then(std::convert::identity);
             let response = match dispatched {
                 Ok(r) => {
-                    may_have_committed |= !replayable;
+                    // A 401 explicitly rejects the request before
+                    // authentication, so it cannot be evidence that this
+                    // non-idempotent attempt committed. Keep any earlier
+                    // commit evidence sticky across redirects and retries.
+                    may_have_committed |= !replayable && r.status() != StatusCode::UNAUTHORIZED;
                     pending_response = Some(FinalResponse {
                         status: r.status(),
                         headers: r.headers().clone(),
@@ -1859,22 +1863,33 @@ fn backoff_for(policy: &RetryPolicy, attempt: u32) -> Duration {
     half.saturating_add(jitter).min(policy.max_backoff)
 }
 
-/// Parse a `Retry-After` header. Either delta-seconds (an integer) or
-/// an HTTP-date per RFC 9110 section 10.2.3.
-///
-/// Public so protocol crates that read `Retry-After` on responses they
-/// handle themselves (without going through `bifrost-net::Error::Status`)
-/// share a single parser. The companion shape on `AccountError` is the
-/// `retry_after` field on `ServerCause::{Unavailable, RateLimited,
-/// QuotaExhausted}` and the `not_before` field on `RetryAdvice`.
-pub fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
-    let v = value?.to_str().ok()?.trim();
-    if let Ok(secs) = v.parse::<u64>() {
-        return Some(Duration::from_secs(secs));
+/// Parse a server hint without resolving an HTTP-date against the local clock.
+/// Delta-seconds become `RetryHint::After`; HTTP-dates remain `RetryHint::At`,
+/// including elapsed dates. Invalid or absent values return `None`.
+/// The `retry_hint` fields on server causes and retry advice carry this value.
+/// Retry policy caps belong to the transport wait, not the server evidence.
+pub fn parse_retry_after_hint(value: Option<&HeaderValue>) -> Option<bifrost_types::RetryHint> {
+    let raw = value?.to_str().ok()?.trim();
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Some(bifrost_types::RetryHint::After(Duration::from_secs(
+            seconds,
+        )));
     }
-    let when = httpdate::parse_http_date(v).ok()?;
-    let now = std::time::SystemTime::now();
-    when.duration_since(now).ok()
+    httpdate::parse_http_date(raw)
+        .ok()
+        .map(bifrost_types::RetryHint::At)
+}
+
+/// Compatibility duration projection of [`parse_retry_after_hint`].
+///
+/// HTTP-dates are resolved against the clock here. As before, elapsed dates
+/// return `None`. Error classification should retain the structured hint instead.
+pub fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
+    match parse_retry_after_hint(value)? {
+        bifrost_types::RetryHint::After(delay) => Some(delay),
+        bifrost_types::RetryHint::At(at) => at.duration_since(std::time::SystemTime::now()).ok(),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2929,6 +2944,29 @@ mod tests {
             assert!(wait >= Duration::from_millis(100), "got {wait:?}");
             assert!(wait <= Duration::from_millis(200), "got {wait:?}");
         }
+    }
+
+    #[test]
+    fn retry_hint_preserves_syntax_and_elapsed_dates() {
+        use bifrost_types::RetryHint;
+        let date = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let at = httpdate::parse_http_date(date).expect("fixed HTTP-date");
+        assert_eq!(
+            parse_retry_after_hint(Some(&hv(date))),
+            Some(RetryHint::At(at))
+        );
+        assert_eq!(
+            parse_retry_after_hint(Some(&hv(" 30 "))),
+            Some(RetryHint::After(Duration::from_secs(30)))
+        );
+        assert_eq!(
+            RetryHint::At(at).min_delay(at + Duration::from_secs(60)),
+            Duration::ZERO
+        );
+        for invalid in ["", "-5", "soon", "1.5"] {
+            assert_eq!(parse_retry_after_hint(Some(&hv(invalid))), None);
+        }
+        assert_eq!(parse_retry_after_hint(None), None);
     }
 
     // ---- parse_retry_after -------------------------------------------

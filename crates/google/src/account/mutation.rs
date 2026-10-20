@@ -36,6 +36,15 @@ use super::flags;
 use super::flags::{LABEL_TRASH, LabelPatch, translate_flag_op};
 use super::scopes::{ScopeCache, labels_for_flags};
 
+/// `batchModify` costs 50 quota units per call. With 1000 ids, a fully
+/// 404-producing binary split has a finite worst case of 2n - 1 calls
+/// (99,950 units), but that is still too much amplification for one mutation.
+/// Once the first multi-id 404 starts recovery, cap that request and all later
+/// `batchModify` calls at 128 (6,400 units). This leaves room for a 100-body
+/// patch and a single missing id in a full-size batch while stopping mass-
+/// delete fanout.
+const MAX_404_BISECTION_REQUESTS: usize = 128;
+
 #[cfg(test)]
 pub(crate) fn bulk_set_flags(
     client: Arc<GmailClient>,
@@ -664,6 +673,7 @@ async fn apply_label_patch_tracked(
         };
     }
     let mut live_ids = ids.to_vec();
+    let mut bisection_budget = NotFoundBisectionBudget::new(MAX_404_BISECTION_REQUESTS);
     for (body_index, body) in batch_modify_bodies(ids, &patch).into_iter().enumerate() {
         if live_ids.is_empty() {
             break;
@@ -678,6 +688,7 @@ async fn apply_label_patch_tracked(
                 unsupported: &patch.unsupported_flags,
                 body_index,
                 progress: &progress,
+                bisection_budget: &mut bisection_budget,
             },
         )
         .await
@@ -709,6 +720,59 @@ struct LabelPatchBodyContext<'a> {
     unsupported: &'a [String],
     body_index: usize,
     progress: &'a Arc<Mutex<MutationProgress>>,
+    bisection_budget: &'a mut NotFoundBisectionBudget,
+}
+
+/// Shared by the label bodies of one input batch. Calls before any 404 are
+/// ordinary patch work; after a multi-id 404, count the root response and cap
+/// all further `batchModify` calls so multiple label chunks cannot restart the
+/// same expensive bisection budget.
+struct NotFoundBisectionBudget {
+    limit: usize,
+    requests: usize,
+    active: bool,
+}
+
+impl NotFoundBisectionBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            requests: 0,
+            active: false,
+        }
+    }
+
+    fn before_request(&mut self) -> bool {
+        !self.active || self.charge_request()
+    }
+
+    fn start_after_not_found(&mut self) -> bool {
+        if self.active {
+            true
+        } else {
+            self.active = true;
+            self.charge_request()
+        }
+    }
+
+    fn charge_request(&mut self) -> bool {
+        if self.requests >= self.limit {
+            return false;
+        }
+        self.requests += 1;
+        true
+    }
+}
+
+fn bisection_budget_error(operation: AccountOperation, limit: usize) -> AccountError {
+    // Every request sent before this local stop already returned a response,
+    // so this limit error carries acknowledged rather than in-flight evidence.
+    account_error::into_account_error(
+        GmailError::limit_exceeded_after_response(format!(
+            "gmail batchModify 404 recovery exceeded its {limit}-request budget"
+        )),
+        GmailErrorContext::mutation(operation),
+    )
 }
 
 async fn apply_label_patch_body(
@@ -723,6 +787,7 @@ async fn apply_label_patch_body(
         unsupported,
         body_index,
         progress,
+        bisection_budget,
     } = context;
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -735,6 +800,9 @@ async fn apply_label_patch_body(
             add_label_ids: template.add_label_ids.clone(),
             remove_label_ids: template.remove_label_ids.clone(),
         };
+        if !bisection_budget.before_request() {
+            return Err(bisection_budget_error(operation, bisection_budget.limit));
+        }
         progress
             .lock()
             .expect("mutation progress lock poisoned")
@@ -752,6 +820,9 @@ async fn apply_label_patch_body(
                     .lock()
                     .expect("mutation progress lock poisoned")
                     .end_request(&part);
+                if !bisection_budget.start_after_not_found() {
+                    return Err(bisection_budget_error(operation, bisection_budget.limit));
+                }
                 let midpoint = part.len() / 2;
                 pending.push(part[midpoint..].to_vec());
                 pending.push(part[..midpoint].to_vec());
@@ -828,6 +899,11 @@ fn is_not_found(error: &GmailError) -> bool {
     // roughly 2n requests without establishing which id was malformed. Until
     // Gmail gives item-specific evidence or documents a local id grammar, a
     // generic 400 stays a batch failure.
+    // A status-only 404 still cannot distinguish an absent message from an
+    // absent label: batchModify supplies no per-id result, so singleton
+    // classification can be wrong if Gmail uses 404 for either resource.
+    // Keep this ambiguity visible until a provider contract or captured
+    // response establishes a safe way to distinguish them.
     account_error::response_parts(error).is_some_and(|(status, _)| status == 404)
 }
 
@@ -1385,6 +1461,63 @@ mod tests {
                     .as_slice()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn not_found_bisection_stops_at_its_request_budget() {
+        let ids = vec![
+            ObjectId("absent".to_string()),
+            ObjectId("unresolved".to_string()),
+        ];
+        let (client, script) = scripted_client(vec![
+            canned(StatusCode::NOT_FOUND),
+            canned(StatusCode::NOT_FOUND),
+        ]);
+        let progress = Arc::new(Mutex::new(MutationProgress::new(&ids, 1)));
+        let mut budget = NotFoundBisectionBudget::new(2);
+        let template = BatchModifyRequest {
+            ids: Vec::new(),
+            add_label_ids: vec!["INBOX".to_string()],
+            remove_label_ids: Vec::new(),
+        };
+
+        let error = apply_label_patch_body(
+            client.as_ref(),
+            &ids,
+            &template,
+            &test_key(17),
+            LabelPatchBodyContext {
+                operation: AccountOperation::BulkMove,
+                unsupported: &[],
+                body_index: 0,
+                progress: &progress,
+                bisection_budget: &mut budget,
+            },
+        )
+        .await
+        .expect_err("the third request exceeds the injected two-request budget");
+
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Internal(
+                bifrost_types::InternalErrorKind::LimitExceeded
+            )
+        ));
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Attempt(attempt)
+                if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
+        )));
+        assert_eq!(script.requests().len(), 2, "no request follows the cap");
+
+        let accounted = progress
+            .lock()
+            .expect("mutation progress lock poisoned")
+            .terminal_outcomes(&error);
+        assert!(matches!(
+            accounted.as_slice(),
+            [ItemOutcome::Failed(failure)] if failure.item.0 == "absent"
+        ));
     }
 
     #[tokio::test]

@@ -1737,7 +1737,8 @@ pub(crate) fn delete_thread<T: HttpTransport>(
     current: Option<ContainerId>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let trash = role_mailbox(&mail, FolderRole::Trash, AccountOperation::BulkDestroy).await?;
+        let trash_mailbox =
+            role_mailbox(&mail, FolderRole::Trash, AccountOperation::BulkDestroy).await?;
         // `role_mailbox` ran against the account the thread id routed to,
         // so it answered a NATIVE mailbox id in that account. Every other
         // container id crossing this boundary - the caller's `current`, the
@@ -1747,8 +1748,10 @@ pub(crate) fn delete_thread<T: HttpTransport>(
         // namespace so the comparison sees one account, not a bare id that
         // reads as primary.
         let trash = match super::foreign::owner_of(&thread.0) {
-            Some(owner) => ContainerId(super::foreign::encode_foreign(owner, trash.as_str()).0),
-            None => ContainerId(trash.into_string()),
+            Some(owner) => {
+                ContainerId(super::foreign::encode_foreign(owner, trash_mailbox.as_str()).0)
+            }
+            None => ContainerId(trash_mailbox.as_str().to_string()),
         };
         // JMAP mailbox ids are server-issued opaque strings and RFC
         // 8620 leaves case-sensitivity to the server, but two
@@ -1767,11 +1770,28 @@ pub(crate) fn delete_thread<T: HttpTransport>(
                 AccountOperation::BulkDestroy,
             )
             .await?;
-            destroy_emails(
+            // `current` identifies the container through which the caller
+            // found this thread; it does not prove that every Email in the
+            // conversation belongs to Trash. Read the member-level
+            // mailboxIds and expunge only the emails actually present in
+            // this account's resolved Trash mailbox. The destroy is also
+            // guarded by that read's Email state, so a concurrent membership
+            // change cannot turn the selected ids stale before the set. Email
+            // state is account-wide, so an unrelated Email change may also
+            // refuse the set; a retry re-reads membership before destroying.
+            let (ids, read_state) = resolve_thread_emails_in_mailbox(
+                &mail,
+                &ids,
+                &trash_mailbox,
+                AccountOperation::BulkDestroy,
+            )
+            .await?;
+            destroy_thread_emails_if_unchanged(
                 &mail,
                 &email_states,
                 &account_id,
                 ids,
+                read_state,
                 AccountOperation::BulkDestroy,
             )
             .await
@@ -1812,6 +1832,109 @@ pub(crate) fn delete_thread<T: HttpTransport>(
             Ok(())
         }
     })
+}
+
+async fn resolve_thread_emails_in_mailbox<T: HttpTransport>(
+    mail: &MailAccount<T>,
+    ids: &[EmailId],
+    mailbox: &MailboxId,
+    op: AccountOperation,
+) -> Result<(Vec<EmailId>, Option<String>), AccountError> {
+    if ids.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+
+    // A conversation can exceed maxObjectsInGet; keep every Email/get
+    // within the account's advertised per-call bound.
+    let batch_size = super::factory::max_objects_in_get(&mail.client().session());
+    let mut in_mailbox = Vec::new();
+    let mut selected = HashSet::new();
+    let mut read_state = None;
+    for chunk in ids.chunks(batch_size) {
+        let response = mail
+            .call(
+                EmailGet::new()
+                    .ids(chunk.iter().cloned())
+                    .properties([EmailProperty::Id, EmailProperty::MailboxIds]),
+            )
+            .await
+            .map_err(to_acct_err(op))?;
+        if read_state.is_none() {
+            read_state = Some(response.state().to_string());
+        }
+
+        let requested = chunk.iter().cloned().collect::<HashSet<_>>();
+        let mut answered = HashSet::new();
+        for email in response.list() {
+            let Some(id) = email.id() else {
+                continue;
+            };
+            if !requested.contains(id) {
+                continue;
+            }
+            answered.insert(id.clone());
+            if email
+                .mailbox_ids()
+                .iter()
+                .any(|member| member.as_str() == mailbox.as_str())
+                && selected.insert(id.clone())
+            {
+                in_mailbox.push(id.clone());
+            }
+        }
+
+        // A notFound answer means the thread member disappeared between the
+        // expansion and this read, so there is no extant Email to destroy. An
+        // id in neither response lane makes membership unknowable; fail closed
+        // before sending any permanent-delete request.
+        for id in chunk {
+            if !answered.contains(id) && !response.not_found().contains(id) {
+                return Err(super::error::get_id_unanswered(
+                    id.as_str(),
+                    super::error::JmapErrorContext::new(op),
+                ));
+            }
+        }
+    }
+
+    Ok((in_mailbox, read_state))
+}
+
+async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
+    mail: &MailAccount<T>,
+    email_states: &StateMap,
+    account_id: &str,
+    ids: Vec<EmailId>,
+    read_state: Option<String>,
+    op: AccountOperation,
+) -> Result<(), AccountError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let read_state = read_state.ok_or_else(|| {
+        to_acct_err(op)(crate::Error::NotParsable(
+            "Trash membership read returned no Email state".to_string(),
+        ))
+    })?;
+    let ids_for_set = ids.clone();
+    let prior_state = state_cache::get(email_states, account_id).await;
+    let mut response = mail
+        .call(EmailSet::new().if_in_state(read_state).destroy(ids_for_set))
+        .await
+        .map_err(to_acct_err(op))?;
+    if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
+        state_cache::advance(
+            email_states,
+            account_id,
+            prior_state.as_deref(),
+            new_state.to_string(),
+        )
+        .await;
+    }
+    for id in &ids {
+        response.destroyed(id).map_err(to_acct_err(op))?;
+    }
+    Ok(())
 }
 
 async fn patch_mailbox_membership<T: HttpTransport>(
@@ -6268,5 +6391,177 @@ mod tests {
             vec!["EmailSubmission/get", "Email/get"]
         );
         assert!(transport.calls("EmailSubmission/set").is_empty());
+    }
+
+    #[derive(Clone)]
+    struct DeleteThreadTransport {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl DeleteThreadTransport {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn calls(&self) -> Vec<serde_json::Value> {
+            self.calls.lock().expect("calls").clone()
+        }
+    }
+
+    impl crate::core::transport::HttpTransport for DeleteThreadTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: serde_json::Value = serde_json::from_slice(&body).expect("request json");
+            let call = request["methodCalls"][0].clone();
+            self.calls.lock().expect("calls").push(call.clone());
+            let method = call[0].as_str().expect("method name").to_string();
+            let call_id = call[2].clone();
+            let account_id = call[1]["accountId"].clone();
+            let arguments = match method.as_str() {
+                "Mailbox/get" => serde_json::json!({
+                    "accountId": account_id,
+                    "state": "mailbox-state",
+                    "list": [{ "id": "trash-id", "name": "Trash", "role": "trash" }],
+                    "notFound": []
+                }),
+                "Thread/get" => serde_json::json!({
+                    "accountId": account_id,
+                    "state": "thread-state",
+                    "list": [{
+                        "id": "thread-1",
+                        "emailIds": ["sent-copy", "inbox-copy", "trash-copy"]
+                    }],
+                    "notFound": []
+                }),
+                "Email/get" => {
+                    let requested = call[1]["ids"]
+                        .as_array()
+                        .expect("Email/get ids")
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<HashSet<_>>();
+                    let list = vec![
+                        serde_json::json!({
+                            "id": "trash-copy",
+                            "mailboxIds": { "trash-id": true, "sent-id": false }
+                        }),
+                        serde_json::json!({
+                            "id": "sent-copy",
+                            "mailboxIds": { "sent-id": true }
+                        }),
+                        serde_json::json!({
+                            "id": "inbox-copy",
+                            "mailboxIds": { "inbox-id": true }
+                        }),
+                    ]
+                    .into_iter()
+                    .filter(|email| {
+                        email["id"]
+                            .as_str()
+                            .is_some_and(|id| requested.contains(id))
+                    })
+                    .collect::<Vec<_>>();
+                    serde_json::json!({
+                        "accountId": account_id,
+                        "state": "email-state",
+                        "list": list,
+                        "notFound": []
+                    })
+                }
+                "Email/set" => serde_json::json!({
+                    "accountId": account_id,
+                    "oldState": "email-state",
+                    "newState": "email-next",
+                    "destroyed": call[1]["destroy"],
+                    "notDestroyed": {}
+                }),
+                other => panic!("unexpected method {other}"),
+            };
+            let response = serde_json::json!({
+                "sessionState": "session-1",
+                "methodResponses": [[method, arguments, call_id]]
+            });
+            Ok(bytes::Bytes::from(response.to_string()))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no upload"))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no download"))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no session"))
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_thread_from_trash_destroys_only_members_in_trash() {
+        let transport = DeleteThreadTransport::new();
+        let mut session = serde_json::to_value(search_session()).expect("session serializes");
+        session["capabilities"]["urn:ietf:params:jmap:core"]["maxObjectsInGet"] =
+            serde_json::json!(2);
+        let client = crate::client::Client::with_transport(
+            transport.clone(),
+            serde_json::from_value(session).expect("session parses"),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let mail = crate::account::Account::new(client, "primary");
+        let states: StateMap = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        delete_thread(
+            mail,
+            states,
+            "primary".to_string(),
+            ThreadId("thread-1".to_string()),
+            Some(ContainerId("trash-id".to_string())),
+        )
+        .await
+        .expect("only the Trash copy is destroyed");
+
+        let calls = transport.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call[0].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "Mailbox/get",
+                "Thread/get",
+                "Email/get",
+                "Email/get",
+                "Email/set"
+            ]
+        );
+        assert_eq!(calls[2][1]["ids"].as_array().unwrap().len(), 2);
+        assert_eq!(calls[3][1]["ids"].as_array().unwrap().len(), 1);
+        for get in [&calls[2], &calls[3]] {
+            assert_eq!(
+                get[1]["properties"],
+                serde_json::json!(["id", "mailboxIds"])
+            );
+        }
+        assert_eq!(calls[4][1]["destroy"], serde_json::json!(["trash-copy"]));
+        assert_eq!(calls[4][1]["ifInState"], "email-state");
+        assert!(calls[4][1].get("update").is_none());
     }
 }

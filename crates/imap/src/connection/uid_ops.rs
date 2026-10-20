@@ -283,6 +283,25 @@ impl ImapConnection {
         ),
         Error,
     > {
+        self.uid_fetch_stream_budgeted(sequence_set, items, capacity, None, timeout)
+    }
+
+    /// Streaming variant whose caller budget reaches the reader before decoding.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn uid_fetch_stream_budgeted<'a>(
+        &'a self,
+        sequence_set: &'a SequenceSet,
+        items: &'a [FetchAttr],
+        capacity: usize,
+        budget: Option<usize>,
+        timeout: Duration,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Receiver<Result<FetchResponse, Error>>,
+            impl std::future::Future<Output = Result<(), Error>> + Send + 'a,
+        ),
+        Error,
+    > {
         self.validate_requested_fetch_items(items)?;
         if sequence_set.as_str().contains('$') {
             self.require_searchres()?;
@@ -294,7 +313,18 @@ impl ImapConnection {
             changed_since: None,
             vanished: false,
         };
-        let fut = self.fetch_stream_bounded_impl(cmd, tx, timeout);
+        let fut = async move {
+            self.require_state(cmd.kind())?;
+            tokio::time::timeout(
+                timeout,
+                self.submit_streaming(
+                    cmd,
+                    dispatch::BoundedStreamingFetchConsumer::with_budget(tx, budget),
+                ),
+            )
+            .await
+            .map_err(|_| Error::timeout_inflight())?
+        };
         Ok((rx, fut))
     }
 
@@ -361,7 +391,6 @@ impl ImapConnection {
     ) -> Result<SearchResult, Error> {
         let criteria = criteria.as_ref();
         self.search_impl(
-            criteria,
             Command::UidSearch {
                 criteria: criteria.to_owned(),
             },
@@ -374,7 +403,6 @@ impl ImapConnection {
     /// Shared implementation for SEARCH and UID SEARCH (RFC 3501 Section 6.4.4).
     pub(super) async fn search_impl(
         &self,
-        criteria: &str,
         cmd: Command,
         _label: &str,
         timeout: Duration,
@@ -383,7 +411,6 @@ impl ImapConnection {
         // RFC 6855 Section 6: SEARCH criteria are free-form strings, so a
         // UTF8=ONLY server requires ENABLE UTF8=ACCEPT before SEARCH.
         self.check_utf8_only_enforced()?;
-        self.validate_search_criteria_capabilities(criteria)?;
         tokio::time::timeout(
             timeout,
             self.submit_regular(cmd, dispatch::SearchConsumer::new()),
@@ -410,7 +437,6 @@ impl ImapConnection {
     ) -> Result<EsearchResponse, Error> {
         let criteria = criteria.as_ref();
         self.search_esearch_impl(
-            criteria,
             Command::UidSearchReturn {
                 criteria: criteria.to_owned(),
                 return_opts: return_opts.iter().map(|s| (*s).to_owned()).collect(),
@@ -428,7 +454,6 @@ impl ImapConnection {
     /// running `IMAP4rev2` (RFC 9051 Section 6.4.4).
     pub(super) async fn search_esearch_impl(
         &self,
-        criteria: &str,
         cmd: Command,
         _label: &str,
         timeout: Duration,
@@ -437,7 +462,6 @@ impl ImapConnection {
         // RFC 6855 Section 6: ESEARCH is an extended SEARCH form and uses the
         // same free-form criteria strings, so it must honor UTF8=ONLY too.
         self.check_utf8_only_enforced()?;
-        self.validate_search_criteria_capabilities(criteria)?;
         {
             let snap = self.state_rx.borrow();
             // ESEARCH is a base feature in IMAP4rev2 (RFC 9051 Section 6.4.4).

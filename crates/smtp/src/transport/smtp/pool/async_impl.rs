@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::FutureExt;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::{
@@ -24,6 +25,8 @@ pub(crate) struct Pool<E: Executor> {
     available: Notify,
     client: AsyncSmtpClient<E>,
     handle: OnceLock<E::Handle>,
+    worker_completion: OnceLock<tokio::sync::watch::Receiver<()>>,
+    shutdown_completion: OnceLock<futures::future::Shared<futures::future::BoxFuture<'static, ()>>>,
 }
 
 struct ParkedConnection {
@@ -50,6 +53,8 @@ impl<E: SmtpExecutor> Pool<E> {
             available: Notify::new(),
             client,
             handle: OnceLock::new(),
+            worker_completion: OnceLock::new(),
+            shutdown_completion: OnceLock::new(),
         });
 
         if pool.config.min_idle > 0 {
@@ -59,7 +64,15 @@ impl<E: SmtpExecutor> Pool<E> {
             let idle_timeout = pool_.config.idle_timeout;
             let pool = Arc::downgrade(&pool_);
 
+            // Sender lifetime covers the entire worker future, including a
+            // future aborted before its first poll. No values are ever sent.
+            let (worker_lifetime, worker_completion) = tokio::sync::watch::channel(());
+            pool_
+                .worker_completion
+                .set(worker_completion)
+                .expect("worker not started");
             let handle = E::spawn(async move {
+                let _worker_lifetime = worker_lifetime;
                 loop {
                     #[cfg(feature = "tracing")]
                     tracing::trace!("running cleanup tasks");
@@ -163,31 +176,52 @@ impl<E: SmtpExecutor> Pool<E> {
         pool
     }
 
-    pub(crate) async fn shutdown(&self) {
-        // Close the admission gate BEFORE taking the idle set. `max_size` is a
-        // semaphore, so a checkout parked in `acquire_owned` is only reachable
-        // through the semaphore itself: closing it fails those waits with
-        // `transport_shutdown` instead of leaving them parked until a permit
-        // that will never be released arrives. `notify_waiters` covers the
-        // other arm of the checkout `select!`. Without both, a checked-out
-        // connection returned after shutdown would release its permit, hand it
-        // to a waiter, and let that waiter dial a NEW connection against a pool
-        // that is already closed.
-        self.admission.close();
-        self.available.notify_waiters();
+    pub(crate) async fn shutdown(self: &Arc<Self>) {
+        let completion = self
+            .shutdown_completion
+            .get_or_init(|| {
+                // The idle set must stay owned until its aborts finish, even when
+                // the caller is dropped. Concurrent shutdowns await that same work.
+                self.admission.close();
+                self.available.notify_waiters();
+                let connections = self
+                    .connections
+                    .lock()
+                    .expect("connection pool lock")
+                    .take();
+                let pool = Arc::clone(self);
+                let (done, mut completed) = tokio::sync::watch::channel(false);
+                E::spawn(async move {
+                    pool.shutdown_inner(connections).await;
+                    let _ = done.send(true);
+                });
+                async move {
+                    while !*completed.borrow_and_update() {
+                        assert!(
+                            completed.changed().await.is_ok(),
+                            "SMTP teardown task exited without completing"
+                        );
+                    }
+                }
+                .boxed()
+                .shared()
+            })
+            .clone();
+        completion.await;
+    }
 
-        let connections = {
-            self.connections
-                .lock()
-                .expect("connection pool lock")
-                .take()
-        };
+    async fn shutdown_inner(&self, connections: Option<Vec<ParkedConnection>>) {
         if let Some(connections) = connections {
             abort_concurrent(connections.into_iter().map(ParkedConnection::unpark)).await;
         }
 
         if let Some(handle) = self.handle.get() {
             handle.shutdown().await;
+            if let Some(completed) = self.worker_completion.get() {
+                // Executor shutdown requests cancellation; sender drop proves
+                // the worker has actually released its connections and dials.
+                let _ = completed.clone().changed().await;
+            }
         }
     }
 

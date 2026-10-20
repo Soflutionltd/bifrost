@@ -191,6 +191,10 @@ impl GmailErrorContext {
 
     pub(crate) fn push_subscribe() -> Self {
         let mut ctx = Self::base(AccountOperation::PushSubscribe);
+        // A Gmail watch covers the account cursor. If renewal reports a
+        // deleted or expired subscription, CursorInvalid needs this coordinate
+        // to derive RestartScope(Account) instead of failing error construction.
+        ctx.scope = Some(ErrorScope::Cursor(CursorScope::Account));
         ctx.resource = Some(GmailResource::PubSubWatch);
         ctx
     }

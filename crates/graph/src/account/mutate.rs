@@ -384,7 +384,11 @@ async fn update_etag_cache_from_responses(
         let Some(id) = request_ids.get(*index) else {
             continue;
         };
+        // A 404 means there is no object version left to condition a future
+        // write on. Destroy maps that response to Skipped, but it still has
+        // to evict the cached etag for the same id.
         if response.status == 412
+            || response.status == 404
             || ((200..300).contains(&response.status)
                 && matches!(kind, MutationKind::Move(_) | MutationKind::Destroy))
         {
@@ -1083,6 +1087,33 @@ mod tests {
             &MutationKind::SetFlags(FlagOp::Set(HashSet::new())),
         )
         .await;
+        assert_eq!(account.etag_index.write().await.get("m0"), None);
+    }
+
+    #[tokio::test]
+    async fn a_destroy_404_evicts_the_cached_etag_for_the_skipped_item() {
+        let account = shared_account();
+        account
+            .etag_index
+            .write()
+            .await
+            .insert("m0".to_string(), "old".to_string());
+        let ids = [ObjectId("m0".to_string())];
+        let responses = vec![crate::types::BatchResponseItem {
+            id: "0".to_string(),
+            status: 404,
+            headers: None,
+            body: None,
+        }];
+
+        update_etag_cache_from_responses(
+            &account,
+            &ids,
+            &resolve_batch_responses(&ids, responses),
+            &MutationKind::Destroy,
+        )
+        .await;
+
         assert_eq!(account.etag_index.write().await.get("m0"), None);
     }
 

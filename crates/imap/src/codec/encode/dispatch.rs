@@ -38,6 +38,39 @@ pub(crate) fn encode_command(
     command: &Command,
     opts: &EncodeOptions,
 ) -> Result<WireCommand, crate::Error> {
+    // Check criteria at encoding: a queued command's handle snapshot may
+    // predate a CAPABILITY/ENABLE update, including inside a pipeline.
+    match command {
+        Command::Search { criteria }
+        | Command::UidSearch { criteria }
+        | Command::SearchReturn { criteria, .. }
+        | Command::UidSearchReturn { criteria, .. }
+        | Command::SearchSave { criteria }
+        | Command::UidSearchSave { criteria }
+        | Command::Sort { criteria, .. }
+        | Command::UidSort { criteria, .. }
+        | Command::Thread { criteria, .. }
+        | Command::UidThread { criteria, .. } => {
+            for (atoms, capability) in [
+                (&["MODSEQ"][..], Capability::Condstore),
+                (&["OLDER", "YOUNGER"][..], Capability::Within),
+                (
+                    &["SAVEDBEFORE", "SAVEDON", "SAVEDSINCE", "SAVEDATESUPPORTED"][..],
+                    Capability::SaveDate,
+                ),
+                (&["EMAILID", "THREADID"][..], Capability::ObjectId),
+                (&["$"][..], Capability::SearchRes),
+            ] {
+                if atoms.iter().any(|atom| {
+                    crate::connection::ImapConnection::search_criteria_contains_atom(criteria, atom)
+                }) && !opts.has_capability(&capability)
+                {
+                    return Err(crate::Error::MissingCapability(capability.to_string()));
+                }
+            }
+        }
+        _ => {}
+    }
     let mut w = CommandWriter::new(opts);
     let utf8 = opts.utf8_mode;
     match command {

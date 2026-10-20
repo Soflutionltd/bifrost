@@ -147,6 +147,9 @@ pub(crate) fn discover_memberships(
     client: Arc<GmailClient>,
     cache: ScopeCache,
 ) -> AccountStream<SyncEvent<MembershipScope>> {
+    // This Account operation receives no shutdown token. A token created here
+    // would never observe close(); the account adapter must wrap this stream
+    // with its token or pass that token through to interrupt a refresh.
     Box::pin(
         stream::once(async move {
             let started = Instant::now();
@@ -196,17 +199,23 @@ pub(crate) fn scope_lifecycle_stream(
     };
     Box::pin(stream::unfold(state, |mut state| async move {
         loop {
-            if let Some(event) = state.pending.pop_front() {
-                return Some((ScopeLifecycleEvent::Lifecycle(event), state));
-            }
+            // Do not drain a queued diff after account closure.
             if state.shutdown.is_cancelled() {
                 return None;
+            }
+            if let Some(event) = state.pending.pop_front() {
+                return Some((ScopeLifecycleEvent::Lifecycle(event), state));
             }
             if !state.await_next_poll().await {
                 return None;
             }
 
-            match fetch_scope_snapshot(&state.client).await {
+            let snapshot = tokio::select! {
+                biased;
+                () = state.shutdown.cancelled() => return None,
+                result = fetch_scope_snapshot(&state.client) => result,
+            };
+            match snapshot {
                 Ok(new) => {
                     state.note_poll_succeeded();
                     state.pending = record_lifecycle_snapshot(&mut state.last_emitted, new).into();
@@ -452,6 +461,22 @@ mod tests {
         assert!(script.requests().is_empty());
         shutdown.cancel();
         assert!(next.await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_during_label_lifecycle_request_drops_the_request() {
+        let (client, script) = scripted_client(vec![Canned::Pending]);
+        let shutdown = CancellationToken::new();
+        let mut lifecycle = scope_lifecycle_stream(client, shutdown.clone());
+        let next = tokio::spawn(async move { lifecycle.next().await });
+
+        while script.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        shutdown.cancel();
+
+        assert!(next.await.expect("lifecycle task joins").is_none());
+        assert_eq!(script.requests().len(), 1);
     }
 
     fn ok_json(value: serde_json::Value) -> Canned {

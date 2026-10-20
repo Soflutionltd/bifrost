@@ -603,8 +603,8 @@ fn push_set_error(err: crate::Error) -> AccountError {
 enum ReaderStep {
     /// Shutdown was requested. Stop without emitting anything further.
     Stop,
-    /// Terminal classification: emit `Terminated` and stop the reader so
-    /// the engine can reopen the account.
+    /// Non-Retry classification: emit `Terminated` and stop the reader so
+    /// the engine can apply the classified recovery.
     Terminal(AccountError),
     /// Transient: emit `Disconnected` and back off. `reset_backoff` is
     /// set only when the pass actually read a message off the connection,
@@ -612,6 +612,18 @@ enum ReaderStep {
     /// should start over. Merely reaching the read loop is not: the
     /// push-enable rejection arrives there as a `RequestError`.
     Retry { reset_backoff: bool },
+}
+
+fn classified_reader_failure(error: crate::Error, reset_backoff: bool) -> ReaderStep {
+    let error = super::error::into_account_error(
+        error,
+        super::error::JmapErrorContext::new(AccountOperation::PushStream),
+    );
+    if error.recovery().is_retryable() {
+        ReaderStep::Retry { reset_backoff }
+    } else {
+        ReaderStep::Terminal(error)
+    }
 }
 
 /// Await `future` under the reader's shutdown token and a wall-clock
@@ -706,23 +718,8 @@ async fn reader_pass<T: PushTransport>(
 ) -> ReaderStep {
     let mut ws = match bounded(shutdown, policy.connect_timeout, transport.connect_push()).await {
         None => return interrupted(shutdown),
-        Some(Err(err)) => {
-            // Pre-handshake failure (`Error::WebSocketHandshake` or any
-            // other connect-time error). Classify so terminal classes
-            // (auth lost, etc.) surface as `Terminated` instead of an
-            // endless silent reconnect.
-            let acct = super::error::into_account_error(
-                err,
-                super::error::JmapErrorContext::new(AccountOperation::PushStream),
-            );
-            return if acct.recovery().is_terminal() {
-                ReaderStep::Terminal(acct)
-            } else {
-                ReaderStep::Retry {
-                    reset_backoff: false,
-                }
-            };
-        }
+        // Only Retry is local; the reconciler must receive engine directives.
+        Some(Err(err)) => return classified_reader_failure(err, false),
         Some(Ok(ws)) => ws,
     };
 
@@ -735,14 +732,8 @@ async fn reader_pass<T: PushTransport>(
     // then fall silent: a dead-push state the engine cannot tell apart
     // from a quiet mailbox. Drop the connection and reconnect.
     //
-    // Terminality is not consulted, because nothing this call can fail
-    // with here is terminal. `connect_ws` installs the new sink before it
-    // returns and nothing ever uninstalls one, so `WebSocketNotConnected`
-    // cannot occur after a successful handshake. What remains is a failed
-    // sink write (`WebSocketSend`, a transient `Transport(Network)`) and
-    // encoding the frame, which cannot fail for a data-type list and an
-    // optional string. A genuinely terminal condition surfaces as such at
-    // the next handshake.
+    // Classify even setup writes: only Retry is safe to keep local. The
+    // transport seam can also report capability or session failures here.
     match bounded(
         shutdown,
         policy.connect_timeout,
@@ -751,11 +742,7 @@ async fn reader_pass<T: PushTransport>(
     .await
     {
         None => return interrupted(shutdown),
-        Some(Err(_)) => {
-            return ReaderStep::Retry {
-                reset_backoff: false,
-            };
-        }
+        Some(Err(err)) => return classified_reader_failure(err, false),
         Some(Ok(())) => {}
     }
 
@@ -795,8 +782,8 @@ async fn reader_pass<T: PushTransport>(
                 match bounded(shutdown, policy.connect_timeout, transport.ping_push()).await {
                     None => return interrupted(shutdown),
                     // A ping that cannot even be written means the sink is
-                    // already gone; same transient handling.
-                    Some(Err(_)) => break,
+                    // already gone; classify before deciding to retry.
+                    Some(Err(err)) => return classified_reader_failure(err, saw_traffic),
                     Some(Ok(())) => {}
                 }
                 awaiting_pong = true;
@@ -842,7 +829,7 @@ async fn reader_pass<T: PushTransport>(
                     err,
                     super::error::JmapErrorContext::new(AccountOperation::PushStream),
                 );
-                if acct.recovery().is_terminal() {
+                if !acct.recovery().is_retryable() {
                     return ReaderStep::Terminal(acct);
                 }
                 break;
@@ -1382,6 +1369,67 @@ mod tests {
         async fn ping_push(&self) -> crate::Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn capability_failure_in_a_push_frame_reaches_engine_recovery() {
+        let (tx, _) = broadcast::channel(8);
+        let transport = FramePushTransport {
+            frames: StdMutex::new(Some(vec![Err(crate::Error::from_subprotocol(
+                "push capability changed",
+            ))])),
+        };
+        let step = reader_pass(
+            &transport,
+            &tx,
+            &Arc::new(Mutex::new(HashSet::new())),
+            &Arc::new(Mutex::new(None)),
+            &CancellationToken::new(),
+            ReconnectPolicy::default(),
+            &routing(),
+        )
+        .await;
+        match step {
+            ReaderStep::Terminal(error) => assert!(error.recovery().requires_engine_action()),
+            _ => panic!("a capability failure must leave the reconnect loop"),
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_failure_in_reenable_is_not_retried() {
+        fn capability_changed() -> crate::Error {
+            crate::Error::from_subprotocol("push capability changed")
+        }
+        let transport = FailingPushSetTransport {
+            error: capability_changed,
+        };
+        let (tx, _) = broadcast::channel(8);
+        let step = reader_pass(
+            &transport,
+            &tx,
+            &Arc::new(Mutex::new(HashSet::new())),
+            &Arc::new(Mutex::new(None)),
+            &CancellationToken::new(),
+            ReconnectPolicy::default(),
+            &routing(),
+        )
+        .await;
+        match step {
+            ReaderStep::Terminal(error) => assert!(error.recovery().requires_engine_action()),
+            _ => panic!("re-enable must forward the engine directive"),
+        }
+    }
+
+    #[test]
+    fn capability_failure_at_setup_is_not_a_local_retry() {
+        match classified_reader_failure(crate::Error::from_subprotocol("changed"), false) {
+            ReaderStep::Terminal(error) => assert!(error.recovery().requires_engine_action()),
+            _ => panic!("setup must forward the engine directive"),
+        }
+        assert!(matches!(
+            classified_reader_failure(crate::Error::WebSocketClosed, false),
+            ReaderStep::Retry { .. }
+        ));
     }
 
     #[tokio::test]

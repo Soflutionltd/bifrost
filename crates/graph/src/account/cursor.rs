@@ -22,10 +22,11 @@ pub(crate) enum CursorError {
     /// A calendarView cursor's fixed end bound is too near. It must be
     /// reseeded so Graph mints a delta link over a fresh window.
     CalendarWindowExpired,
-    /// A mid-inventory page cursor was handed to the changes walk, which
-    /// has no delta link to resume from. The cursor itself is well formed,
-    /// so this restarts the one scope rather than declaring the stored
-    /// schema incompatible account-wide.
+    /// A cursor claims inventory is in progress but has no acknowledged page
+    /// URL, or a mid-inventory cursor was handed to the changes walk, which
+    /// has no delta link. The cursor envelope is understood, so this restarts
+    /// the one scope rather than declaring the stored schema incompatible
+    /// account-wide.
     InventoryInProgress,
     /// A persisted foreign scope refers to a shared mailbox no longer
     /// configured on this account.
@@ -247,6 +248,9 @@ pub(crate) fn cap_live_ids(ids: Vec<String>, cap: usize) -> Option<Vec<String>> 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GraphPageMarker {
     pub(crate) next_link: String,
+    /// Projected Graph object id, including the same calendar/contact/shared
+    /// mailbox encoding inventory and changes expose. Diagnostic only; resume
+    /// follows `next_link` and does not read this field.
     pub(crate) last_seen_id: Option<String>,
 }
 

@@ -21,7 +21,7 @@ pub enum SaslError {
     #[error("SASL credential rejected: {0}")]
     InvalidCredential(String),
     /// The server reported an error in its SCRAM server-final message
-    /// (the `e=` field), or server-signature verification failed.
+    /// (the `e=` field). A server-signature mismatch is a `Protocol` error.
     #[error("SCRAM authentication failed: {0}")]
     AuthFailed(String),
 }

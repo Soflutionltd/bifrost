@@ -1,7 +1,7 @@
 //! Private shared SASL/SCRAM computation layer for the bifrost protocol crates.
 //!
 //! This crate is private to bifrost. It is computation-only: no I/O, no async,
-//! no protocol command flow. The protocol crates (`bifrost-imap`, and later
+//! no protocol command flow. The protocol crates (`bifrost-imap` and
 //! `bifrost-smtp`) own the wire sequencing - driving `+` continuations, framing
 //! commands - and call into the pure transition functions here.
 //!
@@ -25,6 +25,7 @@ pub use error::SaslError;
 pub use oauth::{oauthbearer_payload, xoauth2_payload};
 pub use scram::{
     ChannelBinding, ScramChannelBinding, ScramHash, ScramPassword, decode_continuation,
-    prepare_scram_password, prepare_scram_username, scram_client_final, verify_server_final,
+    prepare_scram_password, prepare_scram_username, scram_client_final, select_scram_rung,
+    verify_server_final,
 };
 pub use secret::Secret;

@@ -125,3 +125,63 @@ async fn uid_fetch_each_gives_up_when_the_server_stalls_after_an_early_consumer_
     let _ = release_tx.send(());
     script.await.unwrap();
 }
+
+#[tokio::test]
+async fn limited_fetch_retires_connection_on_oversized_literal_declaration() {
+    use crate::connection::test_support::select_inbox;
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    select_inbox(&conn, &mut server).await;
+    let script = async {
+        let command = read_line(&mut server).await;
+        assert!(command.contains("UID FETCH"));
+        respond(&mut server, "* 1 FETCH (UID 1 BODY[] {1025}\r\n").await;
+        tokio::io::AsyncWriteExt::shutdown(&mut server)
+            .await
+            .unwrap();
+    };
+    let uids = UidSet::parse("1").unwrap();
+    let attrs = [FetchAttr::BodySection {
+        peek: true,
+        section: None,
+        partial: None,
+    }];
+    let (result, ()) = tokio::join!(
+        conn.uid_fetch_limited(&uids, &attrs, 1024, Duration::from_secs(5)),
+        script,
+    );
+    assert!(matches!(result, Err(Error::FetchLiteralLimit { .. })));
+    assert!(!conn.is_alive());
+}
+
+#[tokio::test]
+async fn budgeted_fetch_stream_rejects_payload_before_channel_delivery() {
+    use crate::connection::test_support::select_inbox;
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    select_inbox(&conn, &mut server).await;
+    let uids = UidSet::parse("1").unwrap();
+    let attrs = [FetchAttr::BodySection {
+        peek: true,
+        section: None,
+        partial: None,
+    }];
+    let (mut rx, fetch) = conn
+        .uid_fetch_stream_budgeted(
+            uids.as_sequence_set(),
+            &attrs,
+            1,
+            Some(2),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let script = async {
+        let _ = read_line(&mut server).await;
+        respond(&mut server, "* 1 FETCH (BODY[] {3}\r\n").await;
+        tokio::io::AsyncWriteExt::shutdown(&mut server)
+            .await
+            .unwrap();
+    };
+    let (result, ()) = tokio::join!(fetch, script);
+    assert!(matches!(result, Err(Error::FetchLiteralLimit { .. })));
+    assert!(rx.recv().await.is_none());
+    assert!(!conn.is_alive());
+}

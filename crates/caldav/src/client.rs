@@ -349,7 +349,12 @@ impl CalDavClient {
             return if filter_unsupported(response.status, &response.body) {
                 HrefLeg::FilterUnsupported
             } else {
-                HrefLeg::Failed(status_error(operation, response.status, response.body))
+                HrefLeg::Failed(status_error(
+                    &response.headers,
+                    operation,
+                    response.status,
+                    response.body,
+                ))
             };
         }
         let mut listing = match parse_propfind_events(&response.body) {
@@ -509,7 +514,7 @@ impl CalDavClient {
             return Err(cursor_invalid_error(calendar_url, status, body));
         }
         if !status.is_success() {
-            return Err(status_error(operation, status, body));
+            return Err(status_error(&response.headers, operation, status, body));
         }
         let mut report = parse_sync_collection_report(&body).map_err(|error| {
             parse_error(AccountOperation::SyncChanges, format!("sync: {error}"))
@@ -524,10 +529,7 @@ impl CalDavClient {
         url: &str,
         operation: AccountOperation,
     ) -> Result<CalDavFetchedEvent, AccountError> {
-        let request = self
-            .dav
-            .request(Method::GET, url)
-            .headers(self.dav.auth_headers(url, operation).await?);
+        let request = self.dav.request(Method::GET, url);
         let response = self.dav.send_raw_request(request, operation).await?;
         let status = response.status;
         let etag = response_etag(&response.headers);
@@ -539,7 +541,7 @@ impl CalDavClient {
                 data: body,
             })
         } else {
-            Err(status_error(operation, status, body))
+            Err(status_error(&response.headers, operation, status, body))
         }
     }
 
@@ -554,7 +556,6 @@ impl CalDavClient {
             .dav
             .request(Method::PUT, url)
             .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
-            .headers(self.dav.auth_headers(url, operation).await?)
             .body(body);
         match condition {
             // A create-PUT is the one PUT a replay cannot repair. HTTP calls
@@ -583,7 +584,7 @@ impl CalDavClient {
         if status.is_success() {
             Ok(etag)
         } else {
-            Err(status_error(operation, status, body))
+            Err(status_error(&response.headers, operation, status, body))
         }
     }
 
@@ -625,11 +626,6 @@ impl CalDavClient {
             .dav
             .request(Method::POST, outbox_url)
             .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
-            .headers(
-                self.dav
-                    .auth_headers(outbox_url, AccountOperation::EventRsvp)
-                    .await?,
-            )
             .header("Originator", schedule_address(originator).as_str())
             .header("Recipient", schedule_address(recipient).as_str())
             .body(body);
@@ -859,6 +855,7 @@ fn complete_failure_error(
                 .and_then(|code| StatusCode::from_u16(code).ok())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             Some(status_error(
+                &reqwest::header::HeaderMap::new(),
                 operation,
                 code,
                 format!("multi-status body reported failure for all {failed} resources"),
@@ -894,11 +891,12 @@ pub(crate) fn transport_error(
 }
 
 pub(crate) fn status_error(
+    headers: &reqwest::header::HeaderMap,
     operation: AccountOperation,
     status: StatusCode,
     body: String,
 ) -> AccountError {
-    bifrost_dav_core::status_error(operation, status, body, DAV)
+    bifrost_dav_core::status_error(headers, operation, status, body, DAV)
 }
 
 /// The scope for a failure on ONE event resource.
@@ -983,6 +981,7 @@ mod tests {
     fn every_error_this_crate_mints_is_stamped_caldav() {
         let errors = [
             status_error(
+                &reqwest::header::HeaderMap::new(),
                 AccountOperation::EventGet,
                 StatusCode::NOT_FOUND,
                 String::new(),
@@ -1001,6 +1000,7 @@ mod tests {
             );
         }
         let missing = status_error(
+            &reqwest::header::HeaderMap::new(),
             AccountOperation::EventGet,
             StatusCode::NOT_FOUND,
             String::new(),
@@ -2751,12 +2751,16 @@ mod tests {
     /// a consumer treats "no events" as truth.
     #[tokio::test]
     async fn unauthorized_report_classifies_as_reauthorization() {
-        let script = dav_script([DavResponse {
+        // The DAV bearer wrapper refreshes and replays once after a 401. Keep
+        // both responses in the scripted wire transcript so the test reaches
+        // the terminal reauthorization classification.
+        let unauthorized = || DavResponse {
             status: StatusCode::UNAUTHORIZED,
             headers: HeaderMap::new(),
             body: "<html><body>401 Unauthorized</body></html>".to_string(),
             url: String::new(),
-        }]);
+        };
+        let script = dav_script([unauthorized(), unauthorized()]);
         let client =
             CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
@@ -3154,6 +3158,7 @@ mod tests {
     #[test]
     fn a_refused_leg_after_a_usable_one_keeps_the_events_and_the_recovery_class() {
         let refusal = status_error(
+            &reqwest::header::HeaderMap::new(),
             AccountOperation::EventSearch,
             StatusCode::UNAUTHORIZED,
             "refused".to_string(),
@@ -3172,6 +3177,7 @@ mod tests {
     #[test]
     fn a_refused_leg_with_nothing_usable_stays_an_error() {
         let refusal = status_error(
+            &reqwest::header::HeaderMap::new(),
             AccountOperation::EventSearch,
             StatusCode::UNAUTHORIZED,
             "refused".to_string(),

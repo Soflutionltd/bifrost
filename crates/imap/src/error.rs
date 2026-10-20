@@ -214,14 +214,21 @@ pub(crate) enum Error {
     #[error("message size {size} exceeds server APPENDLIMIT of {limit}")]
     AppendLimit { size: u64, limit: u64 },
 
-    /// A buffered FETCH exceeded the caller's configured memory budget.
+    /// A FETCH exceeded the caller's configured retained-byte budget after
+    /// its response was parsed.
     #[error("estimated FETCH response size {estimated} exceeds caller limit of {limit}")]
     FetchLimit {
         estimated: usize,
         limit: usize,
-        seq: u32,
+        seq: Option<u32>,
         uid: Option<u32>,
     },
+
+    /// A FETCH literal declaration exceeds the caller's byte budget before
+    /// its payload can be read. The connection is retired because unread
+    /// literal octets prevent the next response from being framed safely.
+    #[error("FETCH literal bytes {estimated} exceed caller limit of {limit}")]
+    FetchLiteralLimit { estimated: usize, limit: usize },
 
     /// ESEARCH UID ranges could not be expanded without dropping results.
     ///
@@ -415,6 +422,16 @@ impl PartialEq for Error {
                 },
             ) => e1 == e2 && l1 == l2 && s1 == s2 && u1 == u2,
             (
+                Self::FetchLiteralLimit {
+                    estimated: e1,
+                    limit: l1,
+                },
+                Self::FetchLiteralLimit {
+                    estimated: e2,
+                    limit: l2,
+                },
+            ) => e1 == e2 && l1 == l2,
+            (
                 Self::SearchResultTruncated {
                     returned: r1,
                     omitted: o1,
@@ -452,6 +469,7 @@ impl Error {
                 | Self::Bye { .. }
                 | Self::Protocol(_)
                 | Self::Parse(_)
+                | Self::FetchLiteralLimit { .. }
                 | Self::Closed { .. }
                 | Self::DriverPanicked { .. }
                 | Self::DriverGone { .. }

@@ -496,9 +496,6 @@ pub(crate) fn password_mechanism(
     advertised: &ServerInfo,
     binding_available: bool,
 ) -> Result<Mechanism, Error> {
-    let offers_sha256_plus = advertised.supports_auth_mechanism(Mechanism::ScramSha256Plus);
-    let offers_sha1_plus = advertised.supports_auth_mechanism(Mechanism::ScramSha1Plus);
-
     let mut skipped_plus_for_binding = false;
     for &mechanism in MECHANISM_PREFERENCE {
         if !allowed.contains(&mechanism) {
@@ -507,21 +504,26 @@ pub(crate) fn password_mechanism(
         if !advertised.supports_auth_mechanism(mechanism) {
             continue;
         }
-        // RFC 5802 Section 6: never offer the unbound SCRAM-SHA-N rung when
-        // the matching PLUS variant is advertised, so a MITM cannot strip the
-        // channel binding by forcing the unbound fallback.
-        let downgrade_forbidden = (mechanism == Mechanism::ScramSha256 && offers_sha256_plus)
-            || (mechanism == Mechanism::ScramSha1 && offers_sha1_plus);
-        if downgrade_forbidden {
-            continue;
-        }
-        let is_plus = matches!(
-            mechanism,
-            Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus
-        );
-        if is_plus && !binding_available {
-            skipped_plus_for_binding = true;
-            continue;
+        if let Some(hash) = scram_hash(mechanism) {
+            let plus = matches!(
+                mechanism,
+                Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus
+            );
+            if bifrost_sasl::select_scram_rung(
+                hash,
+                plus,
+                |name| {
+                    MECHANISM_PREFERENCE.iter().any(|candidate| {
+                        candidate.name() == name && advertised.supports_auth_mechanism(*candidate)
+                    })
+                },
+                binding_available.then_some(&[][..]),
+            )
+            .is_none()
+            {
+                skipped_plus_for_binding |= plus && !binding_available;
+                continue;
+            }
         }
         return Ok(mechanism);
     }
@@ -1137,6 +1139,46 @@ mod test {
         };
         assert_eq!(err.kind(), &ErrorKind::InvalidInput);
         assert_eq!(err.phase(), None);
+    }
+
+    #[test]
+    fn scram_exchange_gs2_and_c_attribute_agree() {
+        use super::{ScramExchange, ScramStep};
+        use bifrost_sasl::{ScramChannelBinding, ScramHash};
+        for (binding, header, c_value) in [
+            (ScramChannelBinding::None, "n,,", "biws"),
+            (
+                ScramChannelBinding::SupportedButNotAdvertised,
+                "y,,",
+                "eSws",
+            ),
+            (
+                ScramChannelBinding::TlsServerEndPoint(vec![1, 2, 3, 4]),
+                "p=tls-server-end-point,,",
+                "cD10bHMtc2VydmVyLWVuZC1wb2ludCwsAQIDBA==",
+            ),
+        ] {
+            let mut exchange =
+                ScramExchange::new(ScramHash::Sha256, binding, "user", "pencil".into()).unwrap();
+            let first = String::from_utf8(
+                crate::base64::decode(exchange.client_first().as_bytes()).unwrap(),
+            )
+            .unwrap();
+            assert!(first.starts_with(&format!("{header}n=user,r=")));
+            let nonce = first.rsplit("r=").next().unwrap();
+            let reply = exchange
+                .step(&format!("r={nonce}server,s=QSXCR+Q6sek8bf92,i=4096"))
+                .unwrap();
+            let ScramStep::Reply(reply) = reply else {
+                panic!("expected client-final")
+            };
+            let final_message =
+                String::from_utf8(crate::base64::decode(reply.as_bytes()).unwrap()).unwrap();
+            assert_eq!(
+                final_message.split(',').next().unwrap(),
+                format!("c={c_value}")
+            );
+        }
     }
 
     #[test]

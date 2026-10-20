@@ -527,9 +527,10 @@ impl Account for HealAccount {
         let handle = SubscriptionHandle(format!("generation-{}", self.generation));
         let scopes = scopes.to_vec();
         Box::pin(async move {
-            Ok(bifrost_types::PushSubscription::all_succeeded(
-                handle, &scopes,
-            ))
+            Ok(
+                bifrost_types::PushSubscription::all_succeeded(handle, &scopes)
+                    .expect("test push subscription covers every requested scope"),
+            )
         })
     }
 

@@ -112,7 +112,6 @@ pub async fn drive_changes_stream(
     control: Option<SyncControl>,
     registry_generation: Option<crate::cursor::DriveGeneration>,
 ) -> Result<ChangesEvent, Error> {
-    let changes_tx = delivery.sender();
     let _activity = match &control {
         Some(control) => match control.begin_activity() {
             Some(activity) => Some(activity),
@@ -148,12 +147,15 @@ pub async fn drive_changes_stream(
                 bifrost_types::AccountOperation::SyncChanges,
                 &scope,
             );
-            let _ = changes_tx.send(MultiplexerEvent {
-                scope: scope.clone(),
-                event: Arc::new(SyncEvent::Terminated(error.clone())),
-                checkpoint: None,
-                publication: None,
-            });
+            if !publish_contract_termination(
+                &cursors,
+                &delivery,
+                &scope,
+                registry_generation,
+                &error,
+            ) {
+                return Ok(ChangesEvent::Done);
+            }
             return Ok(ChangesEvent::Terminated(error));
         }
         let checkpoint = checkpoint_for(&event).cloned();
@@ -175,12 +177,15 @@ pub async fn drive_changes_stream(
                 bifrost_types::AccountOperation::SyncChanges,
                 &scope,
             );
-            let _ = changes_tx.send(MultiplexerEvent {
-                scope: scope.clone(),
-                event: Arc::new(SyncEvent::Terminated(error.clone())),
-                checkpoint: None,
-                publication: None,
-            });
+            if !publish_contract_termination(
+                &cursors,
+                &delivery,
+                &scope,
+                registry_generation,
+                &error,
+            ) {
+                return Ok(ChangesEvent::Done);
+            }
             return Ok(ChangesEvent::Terminated(error));
         }
         if let Some(Checkpoint::Change(cursor)) = &checkpoint
@@ -191,12 +196,15 @@ pub async fn drive_changes_stream(
                 bifrost_types::AccountOperation::SyncChanges,
                 &scope,
             );
-            let _ = changes_tx.send(MultiplexerEvent {
-                scope: scope.clone(),
-                event: Arc::new(SyncEvent::Terminated(error.clone())),
-                checkpoint: None,
-                publication: None,
-            });
+            if !publish_contract_termination(
+                &cursors,
+                &delivery,
+                &scope,
+                registry_generation,
+                &error,
+            ) {
+                return Ok(ChangesEvent::Done);
+            }
             return Err(Error::Account(error));
         }
         let is_done = matches!(&event, SyncEvent::Done(_));
@@ -377,6 +385,35 @@ fn published_outcome(
     terminated
         .map(ChangesEvent::Terminated)
         .or_else(|| post_publish_boundary(request, has_checkpoint))
+}
+
+/// Contract failures belong to the account incarnation that produced them.
+/// Fence the diagnostic and its recovery outcome together, just like batches:
+/// an obsolete drive must neither terminate nor request recovery of its successor.
+fn publish_contract_termination(
+    cursors: &CursorRegistry,
+    delivery: &ChangeDelivery,
+    scope: &CursorScope,
+    generation: Option<crate::cursor::DriveGeneration>,
+    error: &AccountError,
+) -> bool {
+    let publish = || {
+        let _ = delivery.sender().send(MultiplexerEvent {
+            scope: scope.clone(),
+            event: Arc::new(SyncEvent::Terminated(error.clone())),
+            checkpoint: None,
+            publication: None,
+        });
+    };
+    match generation {
+        Some(generation) => cursors
+            .publish_if_drive_generation(None, scope, generation, publish)
+            .is_some(),
+        None => {
+            publish();
+            true
+        }
+    }
 }
 
 fn post_publish_boundary(request: BoundaryRequest, has_checkpoint: bool) -> Option<ChangesEvent> {
@@ -717,6 +754,101 @@ fn checkpoint_for(event: &SyncEvent<Change>) -> Option<&Checkpoint> {
 mod tests {
     use super::{ChangesEvent, post_publish_boundary, refused_activity_outcome};
     use crate::cancel::BoundaryRequest;
+
+    // Exercise the real drive with an Account double. The hook cuts over
+    // after generation capture but before the malformed event is consumed.
+    #[tokio::test]
+    async fn contract_failures_publish_only_for_the_current_drive() {
+        use crate::test_common::{StubAccount, cursor_for};
+        use bifrost_types::{
+            BackfillCheckpoint, BackfillProgress, Batch, Checkpoint, CursorScope, PageBoundary,
+            Partition, SyncEvent,
+        };
+        use std::sync::Arc;
+
+        for violation in 0..3 {
+            // Current, replaced account, and deleted scope fences.
+            for cutover in 0..3 {
+                let scope = CursorScope::Account;
+                let cursors = Arc::new(crate::cursor::CursorRegistry::new());
+                let initial = cursor_for(&scope, b"initial");
+                cursors.put(initial.clone());
+                let generation = cursors.drive_generation(&scope);
+                let changed = Arc::clone(&cursors);
+                let mut account = StubAccount::new(vec![scope.clone()]);
+                account.changes_hook = Some(Arc::new(move |cursor| {
+                    match cutover {
+                        1 => {
+                            let replacement = crate::cursor::CursorRegistry::new();
+                            replacement.put(cursor.clone());
+                            changed.replace_topology_preserving_cursors(&replacement);
+                        }
+                        2 => changed.delete(&cursor.scope),
+                        _ => {}
+                    }
+                    let mut invalid = cursor.clone();
+                    invalid.envelope_version = u32::MAX;
+                    let checkpoint = if violation == 1 {
+                        Checkpoint::Backfill(BackfillCheckpoint {
+                            scope: cursor.scope.clone(),
+                            partition: Partition(vec![]),
+                            progress_marker: None,
+                            progress: BackfillProgress {
+                                items_done: 0,
+                                items_estimated: None,
+                            },
+                            envelope_version: 1,
+                        })
+                    } else if violation == 2 {
+                        Checkpoint::Change(invalid)
+                    } else {
+                        Checkpoint::Change(cursor.clone())
+                    };
+                    vec![SyncEvent::Batch(Batch {
+                        items: vec![],
+                        page_boundary: if violation == 0 {
+                            PageBoundary::Partial
+                        } else {
+                            PageBoundary::Final
+                        },
+                        server_latency: std::time::Duration::ZERO,
+                        bytes_in: 0,
+                        checkpoint: Some(checkpoint),
+                    })]
+                }));
+                let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+                let delivery = Arc::new(crate::multiplexer::ChangeDelivery::new(tx));
+                let (_boundary, view) = crate::cancel::Boundary::new();
+                let result = super::drive_changes_stream(
+                    &account,
+                    scope,
+                    initial,
+                    cursors,
+                    delivery,
+                    view,
+                    None,
+                    Some(generation),
+                )
+                .await;
+                if cutover == 0 {
+                    assert!(matches!(
+                        rx.try_recv().expect("current termination").event.as_ref(),
+                        SyncEvent::Terminated(_)
+                    ));
+                    assert!(matches!(
+                        result,
+                        Ok(ChangesEvent::Terminated(_)) | Err(crate::error::Error::Account(_))
+                    ));
+                } else {
+                    assert!(matches!(result, Ok(ChangesEvent::Done)));
+                    assert!(
+                        rx.try_recv().is_err(),
+                        "obsolete diagnostic escaped its fence"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn published_termination_wins_over_every_boundary() {

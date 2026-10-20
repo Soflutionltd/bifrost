@@ -187,9 +187,11 @@ pub(super) async fn run_fetch(
     };
     let attrs = [attr];
     let connection = conn.connection();
-    let (mut rx, fetch_fut) = connection.uid_fetch_stream(
+    let (mut rx, fetch_fut) = connection.uid_fetch_stream_budgeted(
         uid_set.as_sequence_set(),
         &attrs,
+        super::STREAM_CAPACITY,
+        Some(budget),
         account.command_timeout(),
     )?;
     // Forward each body section as it comes off the socket. The bounded
@@ -217,7 +219,7 @@ pub(super) async fn run_fetch(
                     outcome = Err(BlobError::Imap(crate::Error::FetchLimit {
                         estimated: streamed,
                         limit: budget,
-                        seq,
+                        seq: Some(seq),
                         uid,
                     }));
                     break;
@@ -250,6 +252,21 @@ pub(super) async fn run_fetch(
     // caller rather than the server.
     let (fetch_result, drain_result) = tokio::join!(fetch_fut, drain);
     drain_result?;
-    fetch_result?;
+    match fetch_result {
+        Err(crate::Error::FetchLiteralLimit { estimated, limit }) => {
+            // The response was stopped at its literal marker, before parsing
+            // could recover the server's sequence number or UID. This lane
+            // requested exactly one UID, so retain that identity while
+            // reporting the caller's byte limit through the established
+            // FetchLimit variant.
+            return Err(BlobError::Imap(crate::Error::FetchLimit {
+                estimated,
+                limit,
+                seq: None,
+                uid: Some(uid),
+            }));
+        }
+        other => other?,
+    }
     Ok(())
 }

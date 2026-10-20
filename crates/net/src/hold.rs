@@ -747,7 +747,37 @@ mod tests {
             .await
             .err()
             .expect("replacement token timed out");
-        final_review_reconciles(error);
+        if status == StatusCode::UNAUTHORIZED {
+            let error = crate::into_account_error(
+                error,
+                crate::NetErrorContext {
+                    operation: AccountOperation::Send,
+                    provider: Some(Provider::Gmail),
+                    protocol: Protocol::Gmail,
+                    scope: None,
+                },
+            );
+            assert!(
+                matches!(
+                    error.recovery(),
+                    bifrost_types::RecoveryClass::Retry(advice)
+                        if advice.disposition == bifrost_types::RetryDisposition::SameRequest
+                ),
+                "a rejected POST followed by a refresh timeout remains retryable: {:?}",
+                error.recovery()
+            );
+            assert!(error.chain().iter().any(|cause| matches!(
+                cause,
+                Cause::Auth(bifrost_types::AuthCause::ReauthorizationRequired)
+            )));
+            assert!(!error.chain().iter().any(|cause| matches!(
+                cause,
+                Cause::Attempt(attempt)
+                    if attempt.transmission_state == TransmissionState::Acknowledged
+            )));
+        } else {
+            final_review_reconciles(error);
+        }
         assert_eq!(script.requests().len(), 1);
     }
 
@@ -757,7 +787,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn final_review_post_auth_refresh_deadline_reconciles() {
+    async fn final_review_post_auth_refresh_deadline_retries() {
         final_review_token_deadline(StatusCode::UNAUTHORIZED).await;
     }
 

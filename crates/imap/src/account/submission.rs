@@ -165,6 +165,10 @@ pub(crate) struct SubmissionTransport {
 }
 
 impl SubmissionTransport {
+    pub(crate) async fn shutdown(&self) {
+        bifrost_smtp::AsyncTransport::shutdown(&self.transport).await;
+    }
+
     pub(crate) fn default_from(&self) -> &bifrost_types::Address {
         &self.default_from
     }
@@ -390,6 +394,65 @@ mod tests {
     use super::*;
     use bifrost_net::StaticTokenSource;
     use bifrost_smtp::transport::smtp::extension::{FutureReleaseParameter, MailParameter};
+
+    #[tokio::test(start_paused = true)]
+    async fn account_close_shuts_down_the_owned_submission_pool() {
+        use crate::account::test_support::scripted_account_parts;
+        use crate::connection::test_support::{driver_pair, preauth_greeting};
+        use bifrost_smtp::transport::smtp::{ScriptedConnector, Transcript};
+        use bifrost_types::Account;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dials = Arc::new(AtomicUsize::new(0));
+        let dial_count = Arc::clone(&dials);
+        let connector = ScriptedConnector::new(move || {
+            dial_count.fetch_add(1, Ordering::SeqCst);
+            let hello = format!(
+                "EHLO {}\r\n",
+                bifrost_smtp::transport::smtp::extension::ClientId::default()
+            );
+            Transcript::new("220 peer\r\n")
+                .expect(&hello, "250-peer\r\n250 AUTH PLAIN\r\n")
+                .expect("AUTH PLAIN AHVzZXIAcGFzcw==\r\n", "235 authenticated\r\n")
+                .expect(&hello, "250 peer\r\n")
+                .expect("MAIL FROM:<user@example.com>\r\n", "250 sender\r\n")
+                .expect("RCPT TO:<to@example.com>\r\n", "250 recipient\r\n")
+                .expect("DATA\r\n", "354 send\r\n")
+                .expect("Subject: test\r\n\r\nbody\r\n", "")
+                .expect(".\r\n", "250 delivered\r\n")
+        });
+        let cfg = SmtpSubmissionConfig::new(
+            "smtp.invalid",
+            SubmissionTls::Plaintext,
+            bifrost_types::Address::bare("user@example.com"),
+        );
+        let submission = Arc::new(
+            SubmissionTransport::build_with_connector(
+                &cfg,
+                &Credentials::password("user", "pass"),
+                None,
+                bifrost_net::BandwidthBudget::default(),
+                Some(connector),
+            )
+            .unwrap(),
+        );
+        let envelope = SubmissionEnvelope {
+            from: bifrost_types::Address::bare("user@example.com"),
+            recipients: vec![bifrost_types::Address::bare("to@example.com")],
+        };
+        let raw = b"Subject: test\r\n\r\nbody\r\n";
+        submission.send_rfc5322(&envelope, raw, None).await.unwrap();
+        let (conn, peer) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+        drop(peer);
+        let mut parts = scripted_account_parts(conn, 1);
+        parts.submission = Some(Arc::clone(&submission));
+        let account = super::super::ImapAccount::new(parts);
+        account.close().await.unwrap();
+        // Bypass the account send gate to prove that close shut down SMTP
+        // itself, rather than only making the submission unreachable.
+        assert!(submission.send_rfc5322(&envelope, raw, None).await.is_err());
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn submission_budget_tracks_account_cap_updates() {

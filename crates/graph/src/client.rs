@@ -187,6 +187,7 @@ pub(crate) struct RestRequest {
     pub(crate) url: String,
     pub(crate) if_match: Option<String>,
     pub(crate) prefer: Option<String>,
+    /// The sent Content-Type value, or empty when the request has no body.
     pub(crate) content_type: String,
     /// The JSON body as sent, when the call sent one. `None` for a
     /// bodiless call and for the raw-MIME call, whose bytes land in
@@ -1104,11 +1105,6 @@ impl GraphClient {
             builder = builder.concurrency_claim(limit, weight);
         }
 
-        builder = builder.header(
-            "Content-Type",
-            body.as_ref()
-                .map_or(JSON_CONTENT_TYPE, |body| body.content_type),
-        );
         if eventual {
             builder = builder.header("ConsistencyLevel", "eventual");
         }
@@ -1119,8 +1115,12 @@ impl GraphClient {
             builder = builder.header("Prefer", prefer);
         }
 
+        // Content-Type describes the representation carried by the body.
+        // Bodyless GET and DELETE requests must not announce a JSON body.
         if let Some(body) = body {
-            builder = builder.body(body.bytes);
+            builder = builder
+                .header("Content-Type", body.content_type)
+                .body(body.bytes);
         }
 
         let counter = bifrost_net::RequestByteCounter::new();
@@ -1417,9 +1417,7 @@ impl GraphClient {
             url: url.to_string(),
             if_match: if_match.map(str::to_string),
             prefer: prefer.map(str::to_string),
-            content_type: body
-                .map_or(JSON_CONTENT_TYPE, |body| body.content_type)
-                .to_string(),
+            content_type: body.map_or("", |body| body.content_type).to_string(),
             body: body.filter(|_| is_json).map(|body| {
                 serde_json::from_slice(body.bytes.as_ref()).expect("Graph JSON body round-trips")
             }),
@@ -2468,6 +2466,54 @@ mod tests {
         let response = ScriptedRestResponse::empty(reqwest::StatusCode::TOO_MANY_REQUESTS)
             .with_header("Retry-After", "5");
         assert_eq!(response.headers["retry-after"], "5");
+    }
+
+    #[tokio::test]
+    async fn bodyless_rest_requests_omit_content_type() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(reqwest::StatusCode::OK, serde_json::json!({"id":"m1"})),
+            ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+            ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::CREATED,
+                serde_json::json!({"id":"m2"}),
+            ),
+        ]);
+
+        let _: serde_json::Value = client
+            .get_json(Resource::Outlook, "/me/messages/m1")
+            .await
+            .expect("GET");
+        client
+            .delete(Resource::Outlook, "/me/messages/m1")
+            .await
+            .expect("DELETE");
+        client
+            .post_empty(Resource::Outlook, "/me/messages/m1/accept")
+            .await
+            .expect("bodyless POST");
+        let _: serde_json::Value = client
+            .post(
+                Resource::Outlook,
+                "/me/messages",
+                &serde_json::json!({"subject":"created"}),
+            )
+            .await
+            .expect("JSON POST");
+
+        let requests = client.rest_requests();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].headers.get("content-type").is_none());
+        assert!(requests[1].headers.get("content-type").is_none());
+        assert!(requests[2].headers.get("content-type").is_none());
+        assert_eq!(
+            requests[3]
+                .headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
     }
 
     /// Issue one GET against a scripted status and return what the

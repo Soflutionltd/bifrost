@@ -88,7 +88,11 @@ fn inventory_stream_from(
                     .map(|url| (url, payload.calendar_window_end)),
                 None => {
                     yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
-                        super::cursor::CursorError::SchemaIncompatible,
+                        // The envelope and payload are understood. The
+                        // engine acknowledged no outer page marker, so this
+                        // is a scope-local restart, not an account-wide
+                        // schema reset.
+                        super::cursor::CursorError::InventoryInProgress,
                         sync_ctx,
                     ));
                     return;
@@ -175,6 +179,12 @@ fn inventory_stream_from(
             let mut removed_etag_ids = Vec::new();
             for value in page.value {
                 if is_removed(&value) {
+                    // InventoryEvent batches carry live InventoryEntry values,
+                    // not per-object removals. A tombstone cannot be encoded
+                    // as a live entry without asserting the deleted object is
+                    // present; ScopeChange::Removed belongs to changes_stream.
+                    // Forwarding inventory tombstones needs a shared event and
+                    // engine contract that can represent them.
                     if is_mail_scope(&scope)
                         && let Some(id) = value.get("id").and_then(Value::as_str) {
                         removed_etag_ids.push(super::foreign::encode_message_id(&scope, id).0);
@@ -424,8 +434,14 @@ pub(crate) fn graph_etag(value: &Value) -> Option<String> {
             value
                 .get("changeKey")
                 .and_then(Value::as_str)
-                .map(|key| format!("W/\"{key}\""))
+                .map(graph_change_key_etag)
         })
+}
+
+/// Turn Graph's opaque change key into the weak HTTP entity-tag used by
+/// `If-Match` when the provider omitted its `@odata.etag` annotation.
+pub(crate) fn graph_change_key_etag(change_key: &str) -> String {
+    format!("W/\"{change_key}\"")
 }
 
 pub(crate) fn is_removed(value: &Value) -> bool {
@@ -957,9 +973,56 @@ mod tests {
             ty: ObjectType::Email,
         };
         let mut stream = inventory_stream(account.clone(), scope);
-        let _ = stream.next().await;
+        let Some(bifrost_types::InventoryEvent::Batch(batch)) = stream.next().await else {
+            panic!("the tombstone page still completes inventory");
+        };
+        assert!(
+            batch.items.is_empty(),
+            "a tombstone is not a live inventory entry"
+        );
         let _ = stream.next().await;
         assert_eq!(account.etag_index.write().await.get("gone"), None);
+    }
+
+    #[tokio::test]
+    async fn an_inventory_cursor_without_its_outer_marker_restarts_only_its_scope() {
+        let client = GraphClient::new("token");
+        client.script_rest([]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let payload = GraphCursorPayload::inventory_page(
+            kind_for_scope(&scope).expect("email scope maps"),
+            GraphPageMarker {
+                next_link: "https://graph.microsoft.com/v1.0/next?page=2".to_string(),
+                last_seen_id: Some("m1".to_string()),
+            },
+            None,
+        );
+        let mut cursor = encode_cursor(scope.clone(), payload).expect("cursor encodes");
+        // The outer field is authoritative even when the payload copy has a
+        // marker: an unacknowledged page position must not be resumed.
+        cursor.advanced_through = None;
+
+        let mut stream = resume_inventory_stream(account, cursor).expect("inventory cursor");
+        let Some(bifrost_types::InventoryEvent::Terminated(error)) = stream.next().await else {
+            panic!("a cleared in-progress cursor must terminate for scoped restart");
+        };
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::SyncState(
+                bifrost_types::SyncStateErrorKind::CursorInvalid
+            )
+        ));
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::Engine(
+                bifrost_types::EngineDirective::RestartScope(restarted)
+            ) if restarted == &scope
+        ));
+        assert_eq!(client.wire_attempts(), 0, "no cursor URL is followed");
     }
 
     #[test]

@@ -1240,13 +1240,16 @@ impl AsyncSmtpConnection {
             return self.auth_legacy(mechanism, credentials).await;
         }
 
-        let plus_candidate = mechanisms.iter().any(|mechanism| {
+        let scram_candidate = mechanisms.iter().any(|mechanism| {
             matches!(
                 mechanism,
-                Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus
+                Mechanism::ScramSha1Plus
+                    | Mechanism::ScramSha256Plus
+                    | Mechanism::ScramSha1
+                    | Mechanism::ScramSha256
             ) && self.server_info.supports_auth_mechanism(*mechanism)
         });
-        let binding = if plus_candidate {
+        let binding = if scram_candidate {
             self.resolve_scram_binding()?
         } else {
             None
@@ -1258,8 +1261,38 @@ impl AsyncSmtpConnection {
                 self.auth_scram(chosen, binding, credentials).await
             }
             Mechanism::ScramSha1 | Mechanism::ScramSha256 => {
-                self.auth_scram(chosen, ScramChannelBinding::None, credentials)
-                    .await
+                self.auth_scram(
+                    chosen,
+                    {
+                        // Preserve the shared GS2 downgrade signal when PLUS was not advertised.
+                        let hash = if chosen == Mechanism::ScramSha1 {
+                            bifrost_sasl::ScramHash::Sha1
+                        } else {
+                            bifrost_sasl::ScramHash::Sha256
+                        };
+                        let data = match &binding {
+                            Some(ScramChannelBinding::TlsServerEndPoint(data)) => {
+                                Some(data.as_slice())
+                            }
+                            _ => None,
+                        };
+                        bifrost_sasl::select_scram_rung(
+                            hash,
+                            false,
+                            |name| {
+                                mechanisms.iter().any(|candidate| {
+                                    candidate.name() == name
+                                        && self.server_info.supports_auth_mechanism(*candidate)
+                                })
+                            },
+                            data,
+                        )
+                        .expect("selected SCRAM rung remains advertised")
+                        .1
+                    },
+                    credentials,
+                )
+                .await
             }
             _ => self.auth_legacy(chosen, credentials).await,
         }

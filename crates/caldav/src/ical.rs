@@ -556,6 +556,28 @@ impl From<WriteError> for ReplyError {
     }
 }
 
+fn reply_sequence(current: &CalendarEvent) -> Option<String> {
+    // CalendarEvent does not project SEQUENCE. Read it from the selected
+    // source VEVENT with the same parser and selection rules as the projection.
+    let raw_ical = current.raw_ical.as_deref()?;
+    let blocks = parse_vevents(raw_ical).ok()?;
+    let index = select_block_index(&blocks, current.recurrence.recurrence_id.as_deref()).ok()?;
+    let value = blocks[index]
+        .props
+        .iter()
+        .find(|prop| prop.name == "SEQUENCE")?
+        .value
+        .trim();
+    let digits = value.strip_prefix('+').unwrap_or(value);
+    if digits.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || digits.bytes().all(|byte| byte == b'0')
+    {
+        return None;
+    }
+    Some(digits.to_string())
+}
+
 pub(crate) fn rsvp_reply_ical(
     current: &CalendarEvent,
     status: RsvpStatus,
@@ -582,13 +604,16 @@ pub(crate) fn rsvp_reply_ical(
         "METHOD:REPLY".to_string(),
         "BEGIN:VEVENT".to_string(),
         format!("UID:{}", text_value("uid", uid)?),
-        format!(
-            "DTSTAMP:{}",
-            Offset::UTC
-                .to_datetime(Timestamp::now())
-                .strftime("%Y%m%dT%H%M%SZ")
-        ),
     ];
+    if let Some(sequence) = reply_sequence(current) {
+        lines.push(format!("SEQUENCE:{sequence}"));
+    }
+    lines.push(format!(
+        "DTSTAMP:{}",
+        Offset::UTC
+            .to_datetime(Timestamp::now())
+            .strftime("%Y%m%dT%H%M%SZ")
+    ));
     push_start(&mut lines, &current.start, current.is_all_day)?;
     if let Some(end) = &current.end {
         push_end(&mut lines, end, current.is_all_day)?;
@@ -2710,10 +2735,45 @@ mod tests {
 
         assert!(unfolded.contains("METHOD:REPLY"));
         assert!(unfolded.contains("UID:u1"));
+        assert!(!unfolded.contains("SEQUENCE:"));
         assert!(unfolded.contains("ORGANIZER;CN=Owner:mailto:owner@example.test"));
         assert!(unfolded.contains(
             "ATTENDEE;CN=Ada;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:ada@example.test"
         ));
+    }
+
+    #[test]
+    fn rsvp_reply_ical_carries_a_nonzero_sequence() {
+        let current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSEQUENCE:12\r\nORGANIZER:mailto:owner@example.test\r\nDTSTART:20260602T120000Z\r\nATTENDEE:mailto:ada@example.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        let body = rsvp_reply_ical(&current, RsvpStatus::Accepted, "ada@example.test")
+            .expect("itip reply");
+        let unfolded = LineReader::from_slice(body.as_bytes())
+            .map(|line| line.expect("the reply is UTF-8").as_str().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(unfolded.contains("SEQUENCE:12"));
+    }
+
+    #[test]
+    fn rsvp_reply_ical_omits_a_zero_sequence() {
+        let current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSEQUENCE:0\r\nORGANIZER:mailto:owner@example.test\r\nDTSTART:20260602T120000Z\r\nATTENDEE:mailto:ada@example.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        let body = rsvp_reply_ical(&current, RsvpStatus::Accepted, "ada@example.test")
+            .expect("itip reply");
+
+        assert!(!body.contains("SEQUENCE:"));
     }
 
     #[test]

@@ -188,7 +188,9 @@ async fn raw_mime_import_posts_the_base64_octets_as_text_plain() {
     );
     assert!(requests[0].url.ends_with("/me/messages"));
     assert!(requests[1].url.ends_with("/me/messages/draft-1/send"));
-    assert_eq!(requests[1].content_type, "application/json");
+    assert!(requests[1].content_type.is_empty());
+    assert_eq!(requests[1].body, None);
+    assert_eq!(requests[1].raw_body, None);
 }
 
 #[tokio::test]
@@ -1232,7 +1234,13 @@ async fn deleting_a_shared_thread_resolves_trash_in_the_owner_mailbox() {
         // 1. the conversation members
         ScriptedRestResponse::json(
             reqwest::StatusCode::OK,
-            json!({ "value": [{ "id": "AAMkmsg" }] }),
+            json!({
+                "value": [{
+                    "id": "AAMkmsg",
+                    "parentFolderId": "InboxId",
+                    "changeKey": "CK0"
+                }]
+            }),
         ),
         // 2. The shared mailbox's own Trash id. Deliberately different
         // from any primary folder id: the primary's would name nothing.
@@ -1271,7 +1279,7 @@ async fn deleting_a_shared_thread_resolves_trash_in_the_owner_mailbox() {
             .url
             .ends_with("/users/shared%40contoso.com/mailFolders/deletedItems?$select=id"),
         "Trash is resolved against the owner's own well-known folders: {}",
-        shared_requests[4].url
+        shared_requests[1].url
     );
 
     // The primary carried the `/$batch` envelope and nothing else. The
@@ -2116,13 +2124,15 @@ async fn deleting_a_thread_from_trash_permanently_deletes_in_its_owner_mailbox()
         owner_root.script_rest([
             ScriptedRestResponse::json(
                 reqwest::StatusCode::OK,
-                json!({ "value": [{ "id": "message" }] }),
+                json!({
+                    "value": [{
+                        "id": "message",
+                        "parentFolderId": "TrashId",
+                        "changeKey": "version"
+                    }]
+                }),
             ),
             ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "TrashId" })),
-            ScriptedRestResponse::json(
-                reqwest::StatusCode::OK,
-                json!({ "id": "message", "@odata.etag": "W/\"version\"" }),
-            ),
         ]);
         primary.script_rest([ScriptedRestResponse::json(
             reqwest::StatusCode::OK,
@@ -2155,8 +2165,8 @@ async fn deleting_a_thread_from_trash_permanently_deletes_in_its_owner_mailbox()
             .await
             .expect("thread expunged");
         let reads = owner_root.take_rest_requests();
-        assert_eq!(reads.len(), if shared { 3 } else { 4 });
-        for request in &reads[..3] {
+        assert_eq!(reads.len(), if shared { 2 } else { 3 });
+        for request in &reads[..2] {
             assert!(
                 request.url.contains(&format!("{prefix}/")),
                 "{}",
@@ -2166,7 +2176,7 @@ async fn deleting_a_thread_from_trash_permanently_deletes_in_its_owner_mailbox()
         let envelopes = if shared {
             primary.take_rest_requests()
         } else {
-            reads[3..].to_vec()
+            reads[2..].to_vec()
         };
         assert_eq!(envelopes.len(), 1);
         let sub = &envelopes[0].body.as_ref().expect("batch body")["requests"][0];
@@ -2178,4 +2188,61 @@ async fn deleting_a_thread_from_trash_permanently_deletes_in_its_owner_mailbox()
         assert_eq!(sub["headers"]["If-Match"], "W/\"version\"");
         assert!(sub.get("body").is_none_or(Value::is_null));
     }
+}
+
+#[tokio::test]
+async fn deleting_a_thread_from_trash_only_destroys_members_in_trash() {
+    let client = GraphClient::new("token");
+    client.script_rest([
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "value": [
+                    {
+                        "id": "sent-copy",
+                        "parentFolderId": "SentId",
+                        "changeKey": "sent-etag"
+                    },
+                    {
+                        "id": "inbox-copy",
+                        "parentFolderId": "InboxId",
+                        "changeKey": "inbox-etag"
+                    },
+                    {
+                        "id": "trash-copy",
+                        "parentFolderId": "TrashId",
+                        "changeKey": "trash-etag"
+                    }
+                ]
+            }),
+        ),
+        ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "id": "TrashId" })),
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "responses": [{ "id": "0", "status": 204 }] }),
+        ),
+    ]);
+    let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+
+    delete_thread(
+        account,
+        ThreadId("conversation".to_string()),
+        Some(ContainerId("TrashId".to_string())),
+    )
+    .await
+    .expect("only the Trash copy is permanently deleted");
+
+    let requests = client.take_rest_requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].url.contains("/me/messages?"));
+    assert!(requests[0].url.contains("parentFolderId"));
+    assert!(requests[0].url.contains("changeKey"));
+    let batch = requests[2].body.as_ref().expect("batch body");
+    let items = batch["requests"].as_array().expect("batch items");
+    assert_eq!(items.len(), 1, "Sent and Inbox copies stay untouched");
+    assert_eq!(items[0]["headers"]["If-Match"], "W/\"trash-etag\"");
+    assert_eq!(
+        items[0]["url"],
+        json!("/me/messages/trash-copy/permanentDelete")
+    );
 }
