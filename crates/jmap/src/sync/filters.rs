@@ -36,6 +36,13 @@ fn require_sieve<T: HttpTransport>(
     account.ok_or_else(|| unsupported(op, "JMAP Sieve capability not available"))
 }
 
+// Production requests, including the per-filter script-body downloads, are
+// metered and bandwidth-limited by AccountNet independently of ByteTally.
+// This passthrough returns values directly rather than emitting scope-stream
+// batches, so it carries no Batch.bytes_in attribution - no passthrough door
+// on any provider does. Revisit if a consumer needs per-call byte attribution
+// for passthrough operations, or a production transport bypasses AccountNet
+// without equivalent accounting and bandwidth admission.
 pub(crate) fn list<T: HttpTransport>(
     sieve: Option<SieveAccount<T>>,
 ) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
