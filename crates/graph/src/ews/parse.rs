@@ -49,6 +49,7 @@ pub(crate) struct EwsEffectiveRights {
 
 #[derive(Debug, Clone)]
 pub(crate) struct EwsItem {
+    pub(crate) wire_kind: String,
     pub(crate) item_id: String,
     pub(crate) change_key: Option<String>,
     pub(crate) subject: Option<String>,
@@ -417,6 +418,7 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
     let mut item_depth: i32 = 0;
     let mut items_depth: Option<i32> = None;
 
+    let mut wire_kind = String::new();
     let mut item_id = String::new();
     let mut change_key: Option<String> = None;
     let mut subject: Option<String> = None;
@@ -457,6 +459,7 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                 if is_item_tag(local) && !in_item {
                     in_item = true;
                     item_depth = depth;
+                    wire_kind = local.to_string();
                     item_id.clear();
                     change_key = None;
                     subject = None;
@@ -548,6 +551,7 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                 if is_item_tag(local) && in_item && depth == item_depth {
                     if !item_id.is_empty() {
                         items.push(EwsItem {
+                            wire_kind: wire_kind.clone(),
                             item_id: item_id.clone(),
                             change_key: change_key.clone(),
                             subject: subject.clone(),
@@ -606,6 +610,7 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
     let mut depth: i32 = 0;
     let mut item_depth: i32 = 0;
 
+    let mut wire_kind = String::new();
     let mut item_id = String::new();
     let mut change_key: Option<String> = None;
     let mut subject: Option<String> = None;
@@ -648,6 +653,7 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                 if is_item_tag(local) && !in_item {
                     in_item = true;
                     item_depth = depth;
+                    wire_kind = local.to_string();
                 }
                 if in_item && local == "Attachments" {
                     in_attachments = true;
@@ -813,6 +819,7 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
     }
 
     Ok(EwsItem {
+        wire_kind,
         item_id,
         change_key,
         subject,
@@ -953,7 +960,17 @@ fn is_folder_tag(local: &str) -> bool {
 /// (from an `IPF.Task` folder, classified by `is_folder_tag`) is not
 /// collected yet - a named follow-on.
 fn is_item_tag(local: &str) -> bool {
-    matches!(local, "Message" | "CalendarItem" | "Contact")
+    matches!(
+        local,
+        "Item"
+            | "Message"
+            | "CalendarItem"
+            | "Contact"
+            | "MeetingRequest"
+            | "MeetingResponse"
+            | "MeetingCancellation"
+            | "PostItem"
+    )
 }
 
 fn apply_effective_right(rights: &mut EwsEffectiveRights, tag: &str, value: &str) {
@@ -970,10 +987,20 @@ fn apply_effective_right(rights: &mut EwsEffectiveRights, tag: &str, value: &str
 }
 
 fn default_item_class(item_class: &str) -> String {
-    if item_class.is_empty() {
-        "IPM.Note".to_string()
-    } else {
-        item_class.to_string()
+    item_class.to_string()
+}
+
+impl EwsItem {
+    pub(crate) fn is_mail(&self) -> bool {
+        super::EwsItemKind::from_item_class(&self.item_class) == super::EwsItemKind::Mail
+            && matches!(
+                self.wire_kind.as_str(),
+                "Message"
+                    | "MeetingRequest"
+                    | "MeetingResponse"
+                    | "MeetingCancellation"
+                    | "PostItem"
+            )
     }
 }
 
@@ -1004,6 +1031,30 @@ fn push_ref(e: &quick_xml::events::BytesRef<'_>, buf: &mut String) -> Result<(),
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nc2a_meeting_wire_kinds_survive_both_parsers() {
+        for (tag, class) in [
+            ("MeetingRequest", "IPM.Schedule.Meeting.Request"),
+            ("MeetingResponse", "IPM.Schedule.Meeting.Resp.Pos"),
+            ("MeetingCancellation", "IPM.Schedule.Meeting.Canceled"),
+            ("PostItem", "IPM.Post"),
+        ] {
+            let item = format!(
+                r#"<t:{tag}><t:ItemId Id="meeting"/><t:ItemClass>{class}</t:ItemClass></t:{tag}>"#
+            );
+            let get = parse_get_item_response(&format!("<m:Items>{item}</m:Items>"))
+                .expect("GetItem parses");
+            assert_eq!(get.wire_kind, tag);
+            assert!(get.is_mail());
+            let find = parse_find_items_response(&format!(
+                r#"<m:RootFolder TotalItemsInView="1" IncludesLastItemInRange="true"><t:Items>{item}</t:Items></m:RootFolder>"#))
+                .expect("FindItem parses");
+            assert_eq!(find.items.len(), 1);
+            assert_eq!(find.items[0].wire_kind, tag);
+            assert!(find.items[0].is_mail());
+        }
+    }
 
     #[test]
     fn parse_find_folder_response_two_folders() {

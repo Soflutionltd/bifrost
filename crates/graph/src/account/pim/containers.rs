@@ -193,11 +193,11 @@ pub(super) fn content_class_from_folder_class(
     // The wire form is `IPF.Note`, `IPF.Note.Something`, `IPF.Appointment`,
     // ...; match on the leading segment so a subtype does not fall to Other.
     let normalized = class.trim().to_ascii_lowercase();
-    Some(if normalized.starts_with("ipf.note") {
+    Some(if crate::ews::is_subclass(&normalized, "ipf.note") {
         ContainerContentClass::Mail
-    } else if normalized.starts_with("ipf.appointment") {
+    } else if crate::ews::is_subclass(&normalized, "ipf.appointment") {
         ContainerContentClass::Calendar
-    } else if normalized.starts_with("ipf.contact") {
+    } else if crate::ews::is_subclass(&normalized, "ipf.contact") {
         ContainerContentClass::Contacts
     } else {
         ContainerContentClass::Other

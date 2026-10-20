@@ -102,7 +102,9 @@ pub(crate) fn routing_error(error: crate::error::GraphError) -> CursorError {
 /// v4: an acknowledged initial-inventory page has a next link but no delta
 /// link; the payload distinguishes that resumable inventory position from a
 /// live changes cursor so bifrost-sync can restart the right stream.
-pub(crate) const GRAPH_CURSOR_ENVELOPE_VERSION: u32 = 4;
+/// v5: public-folder baselines contain admitted mail only. Decode failures
+/// recover account-wide, so a payload-specific version cannot isolate recovery.
+pub(crate) const GRAPH_CURSOR_ENVELOPE_VERSION: u32 = 5;
 pub(crate) const CHANGE_CURSOR_ENVELOPE_VERSION: u32 =
     bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION;
 
@@ -461,6 +463,20 @@ pub(crate) fn decode_page_marker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nc2a_v4_public_folder_baseline_is_rejected() {
+        let mut cursor = encode_cursor(
+            CursorScope::Folder(FolderId("pf".to_string())),
+            GraphCursorPayload::public_folder(public_folder_cursor()),
+        )
+        .expect("encode");
+        cursor.server_state.envelope_version = 4;
+        assert!(matches!(
+            decode_cursor(&cursor),
+            Err(CursorError::SchemaIncompatible)
+        ));
+    }
 
     #[test]
     fn graph_cursor_round_trips() {

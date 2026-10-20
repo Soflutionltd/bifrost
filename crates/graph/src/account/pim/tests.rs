@@ -51,7 +51,7 @@ fn public_item_id_selects_the_ews_read_arm() {
 /// still sent them to `/me/messages/{native}`), and a message-shaped request
 /// for a contact is answered `ErrorInvalidPropertyRequest`.
 #[tokio::test]
-async fn the_single_id_hydration_door_asks_a_contact_for_a_class_safe_shape() {
+async fn nc2a_single_id_hydration_refuses_returned_contact_after_mail_cache_hit() {
     use bifrost_net::test_support::{Canned, ScriptedDispatch, scripted_account};
     use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource, TokenSource};
     use std::sync::Arc;
@@ -110,14 +110,17 @@ async fn the_single_id_hydration_door_asks_a_contact_for_a_class_safe_shape() {
         )
         .await;
     let mut item = ews_item();
-    item.item_class = "IPM.Contact".to_string();
+    item.item_class = "IPM.Note".to_string();
     account.record_public_item_classes(&folder, &[item]).await;
 
     let id = encode_public_item_id(&folder, "notice-1");
-    let message = message_hydrate(account, id.clone(), HydrationProjection::Full)
+    let error = message_hydrate(account, id.clone(), HydrationProjection::Full)
         .await
-        .expect("the class-safe request hydrates");
-    assert_eq!(message.id, id);
+        .expect_err("non-mail is refused");
+    assert!(matches!(
+        error.kind(),
+        bifrost_types::AccountErrorKind::Unsupported(AccountOperation::HydrateMessage)
+    ));
 
     let requests = script.requests();
     assert_eq!(requests.len(), 1);
@@ -130,8 +133,8 @@ async fn the_single_id_hydration_door_asks_a_contact_for_a_class_safe_shape() {
     )
     .expect("utf8 SOAP");
     assert!(
-        !body.contains("message:"),
-        "the single-id door asked a contact for message properties: {body}"
+        body.contains("message:"),
+        "cached mail shape was used: {body}"
     );
 }
 
@@ -241,6 +244,7 @@ async fn write_batch_drains_past_a_failure_to_evict_a_later_destroy_etag() {
 
 fn ews_item() -> crate::ews::EwsItem {
     crate::ews::EwsItem {
+        wire_kind: "Message".to_string(),
         item_id: "notice-1".to_string(),
         change_key: Some("CK1".to_string()),
         subject: Some("Notice".to_string()),

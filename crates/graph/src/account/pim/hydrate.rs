@@ -106,6 +106,14 @@ pub(super) async fn public_message_hydrate(
                 ),
             )
         })?;
+    if !item.is_mail() {
+        return Err(crate::account::graph_error::unsupported_item_error(
+            AccountOperation::HydrateMessage,
+            ErrorScope::Message {
+                id: id.0.clone().into(),
+            },
+        ));
+    }
     Ok(message_from_ews_item(id.clone(), &item, folder, projection))
 }
 

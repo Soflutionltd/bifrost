@@ -3,11 +3,9 @@
 //! Public folders have no `@odata.deltaLink`. The opaque cursor IS the
 //! sync state: a `DateTimeReceived` watermark drives the incremental
 //! timestamp poll, and a throttled full-id scan reconciles deletions the
-//! timestamp poll structurally cannot see (a deleted item simply stops
-//! appearing; old items sit below the watermark) and also picks up
-//! appearing items with no `DateTimeReceived` (some calendar/contact
-//! items), which the restricted poll can never surface. The authoritative
-//! live-id set rides inside the cursor so a cold resume reconstructs the
+//! timestamp poll structurally cannot see, including mail admission below
+//! the watermark. Every projection uses returned mail classes and wire kinds.
+//! The authoritative admitted-mail set rides inside the cursor for a cold
 //! deletion baseline with no engine-side side table - the one
 //! substantive departure from ratatoskr, which diffed against a SQLite
 //! table. The whole algorithm decomposes into the pure helpers below so
@@ -53,24 +51,21 @@
 //!   `live_ids` baseline emits `Added` exactly once - whether it surfaces
 //!   in the incremental poll or the full scan, and REGARDLESS of whether it
 //!   carries a timestamp (an unrestricted None-watermark scan is the only
-//!   entry point both for a contact/appointment with no `DateTimeReceived`
+//!   entry point both for mail with no `DateTimeReceived`
 //!   and for a timestamped item that first appears in the scan rather than
 //!   the poll). To stop it re-emitting next cycle it is folded into the
-//!   persisted baseline the SAME cycle: the untimestamped emissions of the
-//!   incremental poll are capped-and-folded (`extend_live_ids` + `capped_baseline`)
-//!   when no scan runs, and the full scan folds its own authoritative set
-//!   otherwise; either way an established id does not re-emit. The
-//!   same-cycle `emitted` set prevents the poll and the scan double-emitting
-//!   one id. Timestamped emissions are NOT folded (the advanced watermark /
-//!   boundary already stop them re-emitting, and folding them would bypass
-//!   the cap). The watermark stays `None` until a timestamped item appears
-//!   in an incremental poll; deletion reconcile still runs via the full scan.
+//!   persisted baseline the SAME cycle: all incremental admissions are
+//!   capped-and-folded when no scan runs; a complete scan installs its own
+//!   authoritative set otherwise. Timestamped admissions must be retained too,
+//!   so the next scan does not mistake them for sub-watermark additions.
+//!   The same-cycle `emitted` set prevents poll/scan duplicate emissions.
+//!   The watermark stays `None` until a timestamped item appears in a poll.
 //! - **(c) Degraded (over-cap) folder** (`degraded = true`, `live_ids`
 //!   empty): the deletion diff is skipped (no `Destroyed`) and the over-cap
 //!   `Warning` fires once, only on the transition into degraded mode. That
 //!   transition applies UNIFORMLY to whichever path grows the persisted
 //!   baseline past `PUBLIC_FOLDER_LIVE_IDS_CAP` - the full-scan reassignment
-//!   or the None-watermark incremental fold - through the shared `capped_baseline`.
+//!   or the incremental admission fold - through the shared `capped_baseline`.
 //!   Additions still flow while degraded: timestamped items via the
 //!   incremental poll, and (None watermark) new-to-baseline items via the
 //!   full scan. With an empty baseline the scan cannot dedupe, so it may
@@ -79,8 +74,10 @@
 //!   degraded (the baseline stays empty by contract). A recovery scan that
 //!   drops back below the cap re-installs the baseline and clears
 //!   `degraded`; new additions emit BEFORE the baseline is reassigned, so
-//!   recovery never silently absorbs them.
-//! - **(d) Page carrying unhandled item classes** (`Task`, `PostItem`,
+//!   recovery never silently absorbs them. Without a baseline, degraded mode
+//!   cannot promise deletions, class retirements, in-place edit detection,
+//!   sub-watermark timestamped admissions, or deduplication of scan additions.
+//! - **(d) Page carrying unhandled item classes** (`Task`,
 //!   ...): those rows are dropped from the item set (paging still advances
 //!   off the server's wire offset, never the parsed count), and their
 //!   class names surface as a single operator `Warning`. A class is
@@ -99,11 +96,8 @@
 //!   prevents permanently skipping later pages and prevents diffing the full
 //!   baseline against a partial scan.
 //!
-//! Out of scope (NOT blessed away by this contract): `DateTimeReceived`
-//! is not a change watermark, so an in-place edit that bumps the
-//! change-key without moving the received time sits below the watermark
-//! and is never re-emitted. This affects every class (Message included)
-//! and is tracked separately.
+//! In-place edits and domain transitions below the watermark surface on a
+//! complete scan. Over-cap mode cannot promise those transitions or deletions.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -387,35 +381,20 @@ pub(crate) fn page_walk_step(
 /// not (or could not) surface them. Emit an id genuinely new to the prior
 /// live-id baseline and not already emitted this cycle.
 ///
-/// The class filter is watermark-dependent (condition b):
-///
-/// - `watermark_none == true`: the incremental poll is UNRESTRICTED, so the
-///   scan is a peer entry point. Emit ANY new-to-baseline id regardless of
-///   timestamp. This is the only path for a contact/appointment with no
-///   `DateTimeReceived`, AND for a timestamped item that first appears in
-///   the scan rather than the (same-cycle, earlier-fetched) poll - without
-///   it that item would be installed into `live_ids` silently and then
-///   filtered as "known" on the next poll, never emitting (bug fix).
-/// - `watermark_none == false`: the restricted poll already bounds the
-///   timestamped emissions, so the scan only needs to cover items the `>=`
-///   restriction structurally cannot see - those lacking `received_at`.
-///   Timestamped additions are the poll's responsibility and are left
-///   untouched. The scan's separate change-key comparison still emits
-///   in-place updates whose `DateTimeReceived` did not move.
-///
-/// The same-cycle `emitted` set stops the scan double-emitting an id the
-/// incremental poll already emitted.
+/// Bounded baselines admit all new-to-baseline mail, including timestamps
+/// below the watermark. Degraded watermarked folders only scan untimestamped
+/// additions because an empty baseline cannot deduplicate timestamped rows.
 pub(crate) fn scan_additions(
     scan_items: &[EwsItem],
     prior_live: &[String],
     emitted: &std::collections::HashSet<String>,
-    watermark_none: bool,
+    include_timestamped: bool,
 ) -> Vec<String> {
     use std::collections::HashSet;
     let live: HashSet<&str> = prior_live.iter().map(String::as_str).collect();
     scan_items
         .iter()
-        .filter(|item| watermark_none || item.received_at.is_none())
+        .filter(|item| include_timestamped || item.received_at.is_none())
         .filter(|item| !live.contains(item.item_id.as_str()))
         .filter(|item| !emitted.contains(&item.item_id))
         .map(|item| item.item_id.clone())
@@ -503,7 +482,7 @@ pub(crate) fn extend_live_ids(mut live: Vec<String>, added: &[String]) -> Vec<St
 /// once). At/under the cap the candidate is kept and `degraded` clears; over
 /// the cap the baseline empties, `degraded` sets, and the transition flag is
 /// true only if the folder was not already degraded. Shared by the full-scan
-/// reassignment and the None-watermark incremental fold so both honor the
+/// reassignment and the incremental admission fold so both honor the
 /// cap and the one-warning-on-transition rule identically.
 ///
 /// The whole persisted baseline is produced here - ids, the `(id, change
@@ -650,8 +629,28 @@ pub(crate) fn readable_folders(folders: Vec<EwsFolder>) -> Vec<EwsFolder> {
         .collect()
 }
 
+/// Collect rejected parsed classes alongside classes the parser cannot decode.
+/// Each walk contributes a class once; the cursor suppresses repeat poll warnings.
+fn admit_mail(mut walk: ItemWalk) -> ItemWalk {
+    walk.items.retain(|item| {
+        if item.is_mail() {
+            return true;
+        }
+        let class = if item.item_class.is_empty() {
+            &item.wire_kind
+        } else {
+            &item.item_class
+        };
+        if !walk.unhandled_classes.contains(class) {
+            walk.unhandled_classes.push(class.clone());
+        }
+        false
+    });
+    walk
+}
+
 /// Build a scoped warning for item classes a poll returned that the parser
-/// does not yet collect (`Task`, `MeetingRequest`, `PostItem`, ...), so the
+/// or admission rejects (`Task`, `IPM.Contact`, ...), so the
 /// silent omission is visible to an operator. `None` when nothing was
 /// dropped.
 fn unhandled_classes_warning(folder_id: &str, unhandled: &[String]) -> Option<Warning> {
@@ -720,6 +719,7 @@ pub(crate) fn ews_client(account: &GraphAccount) -> Result<EwsClient, EwsError> 
 }
 
 /// The result of walking a folder's `FindItem` pages.
+#[derive(Clone)]
 struct ItemWalk {
     items: Vec<EwsItem>,
     /// Deduped item classes the parser does not collect, in source order.
@@ -1037,9 +1037,10 @@ async fn seed_and_scope(
             effective_rights: folder.effective_rights.clone(),
         },
     );
-    scope_policy
-        .syncs(&folder_id)
-        .then_some(CursorScope::Folder(folder_id))
+    (folder.folder_class.as_deref().is_some_and(|class| {
+        crate::ews::EwsItemKind::from_folder_class(class) == crate::ews::EwsItemKind::Mail
+    }) && scope_policy.syncs(&folder_id))
+    .then_some(CursorScope::Folder(folder_id))
 }
 
 /// Resolve a single public folder's content-mailbox routing: fetch its
@@ -1143,15 +1144,16 @@ pub(crate) fn public_folder_inventory_stream(
                 walk.incomplete_error(&folder.0), &scope, Some(&owner), ctx));
             return;
         }
-        let ItemWalk { items, unhandled_classes: unhandled, .. } = walk;
+        let ItemWalk { items, unhandled_classes: unhandled, .. } = admit_mail(walk.clone());
         // The walk parsed every item's `ItemClass`; retain it so hydration
         // can build a class-conditional `GetItem` for an id whose class no
         // amount of parsing the id could recover.
-        account.record_public_item_classes(&folder, &items).await;
+        account.record_public_item_classes(&folder, &walk.items).await;
         if let Some(warning) = unhandled_classes_warning(&folder.0, &unhandled) {
             yield bifrost_types::InventoryEvent::Warning(warning);
         }
 
+        let items: Vec<_> = items.into_iter().filter(EwsItem::is_mail).collect();
         let watermark = advance_watermark(None, &items);
         let scan_set: Vec<String> = items.iter().map(|i| i.item_id.clone()).collect();
         let entries: Vec<InventoryEntry> = items
@@ -1258,6 +1260,9 @@ fn reduce_public_folder_poll(
         return PollOutcome::Retry;
     }
 
+    let poll = admit_mail(poll.clone());
+    let scan = scan.cloned().map(admit_mail);
+
     let folder = FolderId(pf.folder_id.clone());
     let owner = MailboxId(pf.routing.anchor_mailbox.clone());
     let mut changes: Vec<Change> = Vec::new();
@@ -1287,32 +1292,12 @@ fn reduce_public_folder_poll(
         emitted.insert(id.clone());
         emit_item_added(&mut changes, id, &folder, &owner);
     }
-    // The UNTIMESTAMPED ids emitted this cycle (only ever non-empty in
-    // None-watermark mode, where the poll is unrestricted - a restricted
-    // `>=` poll never returns an item lacking `DateTimeReceived`). These
-    // are the ones the next unrestricted poll would re-emit, so they are
-    // folded into the persisted baseline below. Timestamped emissions are
-    // deliberately NOT folded: the advanced watermark/boundary already stop
-    // them re-emitting, and folding them would bypass the live-id cap.
-    let untimestamped_emitted: Vec<String> = {
-        let untimestamped: HashSet<&str> = poll
-            .items
-            .iter()
-            .filter(|i| i.received_at.is_none())
-            .map(|i| i.item_id.as_str())
-            .collect();
-        incremental_ids
-            .iter()
-            .filter(|id| untimestamped.contains(id.as_str()))
-            .cloned()
-            .collect()
-    };
     pf.watermark = advance_watermark(pf.watermark.take(), &poll.items);
     pf.boundary_ids = boundary_ids_at(pf.watermark.as_deref(), &poll.items);
 
     // 2. Throttled deletion reconcile (only when a scan was due + fetched).
     let mut degrade_transition = false;
-    if let Some(scan) = scan {
+    if let Some(scan) = scan.as_ref() {
         // (e) A PARTIAL scan would falsely emit the unvisited tail as
         // Destroyed and drop it from the baseline. Reject the whole poll.
         if !scan.complete {
@@ -1359,16 +1344,16 @@ fn reduce_public_folder_poll(
                 }));
             }
         }
-        // Additions the incremental poll did not cover. While the watermark
-        // is None the scan is a peer entry point and emits ANY new-to-baseline
-        // id regardless of timestamp (condition b - the fix for a timestamped
-        // item that first surfaces in the scan); once a watermark is set the
-        // restricted poll owns timestamped items, so the scan only covers the
-        // untimestamped ones. Runs REGARDLESS of `degraded` (condition c), and
-        // before the baseline is reassigned below, so a recovery scan never
-        // silently absorbs a new item. `pf.live_ids` here is still the prior
-        // baseline (the incremental fold happens only when no scan runs).
-        for added in scan_additions(&scan.items, &pf.live_ids, &emitted, pf.watermark.is_none()) {
+        // A complete scan admits any newly projected mail, even below the
+        // watermark. Degraded mode has no prior set and cannot distinguish
+        // old timestamped mail from new admissions; retain its additions-only
+        // behavior until a bounded baseline can be installed again.
+        for added in scan_additions(
+            &scan.items,
+            &pf.live_ids,
+            &emitted,
+            !pf.degraded || pf.watermark.is_none(),
+        ) {
             emitted.insert(added.clone());
             emit_item_added(&mut changes, &added, &folder, &owner);
         }
@@ -1381,18 +1366,17 @@ fn reduce_public_folder_poll(
         pf.degraded = baseline.degraded;
         degrade_transition = baseline.degrade_transition;
         pf.last_full_scan_at = Some(now);
-    } else if !pf.degraded && !untimestamped_emitted.is_empty() {
-        // No scan this cycle: persist the untimestamped emissions into the
-        // baseline so the next unrestricted poll does not re-emit them
-        // (condition b), applying the SAME cap/degrade transition the scan
-        // path uses. Skipped while degraded (the baseline stays empty by
-        // contract; only a full scan recovers from degraded).
-        let candidate = extend_live_ids(std::mem::take(&mut pf.live_ids), &untimestamped_emitted);
-        let baseline = capped_baseline(
-            candidate,
-            std::mem::take(&mut pf.live_versions),
-            pf.degraded,
-        );
+    } else if !pf.degraded && !incremental_ids.is_empty() {
+        // Persist every admission, including timestamped mail, so the next
+        // full scan can distinguish it from a sub-watermark class transition.
+        // Only a complete scan can recover a degraded baseline.
+        let candidate = extend_live_ids(std::mem::take(&mut pf.live_ids), &incremental_ids);
+        let mut versions = std::mem::take(&mut pf.live_versions);
+        for (id, version) in item_versions(&poll.items) {
+            versions.retain(|(prior, _)| prior != &id);
+            versions.push((id, version));
+        }
+        let baseline = capped_baseline(candidate, versions, pf.degraded);
         pf.live_ids = baseline.live_ids;
         pf.live_versions = baseline.live_versions;
         pf.degraded = baseline.degraded;
@@ -1597,10 +1581,166 @@ pub(crate) fn public_folder_changes_stream(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn nc2a_inventory_baseline_contains_only_returned_mail() {
+        use futures::StreamExt;
+        let account = account_with_ews_response(r#"<m:RootFolder TotalItemsInView="2" IncludesLastItemInRange="true"><t:Items>
+<t:MeetingRequest><t:ItemId Id="meeting" ChangeKey="mail-v"/><t:ItemClass>IPM.Schedule.Meeting.Request</t:ItemClass><t:DateTimeReceived>2026-01-01T00:00:00Z</t:DateTimeReceived></t:MeetingRequest>
+<t:Contact><t:ItemId Id="contact" ChangeKey="contact-v"/><t:ItemClass>IPM.Contact</t:ItemClass><t:DateTimeReceived>2026-12-01T00:00:00Z</t:DateTimeReceived></t:Contact>
+</t:Items></m:RootFolder>"#.to_string());
+        let folder = FolderId("pf".to_string());
+        account
+            .seed_public_folder_for_tests(
+                folder.clone(),
+                PublicFolderRouting {
+                    anchor_mailbox: "owner".to_string(),
+                    public_folder_mailbox: None,
+                },
+            )
+            .await;
+        // Wrong cached classes cannot alter inventory admission.
+        let mut cached = item("contact", None, false);
+        account
+            .record_public_item_classes(&folder, &[cached.clone()])
+            .await;
+        cached.item_id = "meeting".to_string();
+        cached.item_class = "IPM.Contact".to_string();
+        account.record_public_item_classes(&folder, &[cached]).await;
+        let mut stream = public_folder_inventory_stream(account, CursorScope::Folder(folder));
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::InventoryEvent::Warning(_))
+        ));
+        let Some(bifrost_types::InventoryEvent::Batch(batch)) = stream.next().await else {
+            panic!("inventory batch expected")
+        };
+        assert_eq!(batch.items.len(), 1);
+        let bifrost_types::PageCheckpoint::Advance(Checkpoint::Change(cursor)) = batch.checkpoint
+        else {
+            panic!("complete checkpoint expected")
+        };
+        let GraphCursorKind::PublicFolder(pf) = decode_cursor(&cursor).expect("decode").kind else {
+            panic!("public folder cursor expected")
+        };
+        assert_eq!(pf.live_ids, vec!["meeting"]);
+        assert_eq!(pf.boundary_ids, vec!["meeting"]);
+        assert_eq!(
+            pf.live_versions,
+            vec![("meeting".to_string(), "mail-v".to_string())]
+        );
+        assert_eq!(pf.watermark.as_deref(), Some("2026-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn nc2a_excluded_disappearance_is_silent() {
+        let mut excluded = item("excluded", Some("2026-12-01T00:00:00Z"), false);
+        excluded.item_class = "IPM.Contact".to_string();
+        excluded.wire_kind = "Contact".to_string();
+        let scan = walk(vec![excluded], &[], true);
+        let (changes, _, baseline) = unbox_apply(reduce_public_folder_poll(
+            cursor(None, None, &[]),
+            &scan,
+            Some(&scan),
+            1,
+        ));
+        assert!(changes.is_empty());
+        assert!(baseline.watermark.is_none());
+        assert!(baseline.live_ids.is_empty());
+        let empty = walk(Vec::new(), &[], true);
+        let (changes, _, _) =
+            unbox_apply(reduce_public_folder_poll(baseline, &empty, Some(&empty), 2));
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn nc2a_mail_projection_transitions() {
+        let empty = walk(Vec::new(), &[], true);
+        let mail = item("changing", Some("2026-01-01T00:00:00Z"), false);
+        let mut contact = mail.clone();
+        contact.item_class = "IPM.Contact".to_string();
+        contact.wire_kind = "Contact".to_string();
+        let pf = cursor(Some("2026-03-05T12:00:00Z"), None, &["changing"]);
+        let (changes, _, excluded) = unbox_apply(reduce_public_folder_poll(
+            pf,
+            &walk(vec![contact.clone()], &[], true),
+            Some(&walk(vec![contact.clone()], &[], true)),
+            1,
+        ));
+        assert_eq!(count_object_change(&changes, "changing", true), 1);
+        assert_eq!(changes.len(), 1);
+        assert!(excluded.live_ids.is_empty());
+        assert!(excluded.live_versions.is_empty());
+        assert!(excluded.boundary_ids.is_empty());
+        assert_eq!(excluded.watermark.as_deref(), Some("2026-03-05T12:00:00Z"));
+
+        // A non-mail item vanishes without ever becoming a mail deletion.
+        let (changes, _, _) = unbox_apply(reduce_public_folder_poll(
+            excluded.clone(),
+            &empty,
+            Some(&empty),
+            2,
+        ));
+        assert!(changes.is_empty());
+
+        // The same id becomes mail below the retained received-time watermark.
+        let (changes, _, admitted) = unbox_apply(reduce_public_folder_poll(
+            excluded,
+            &empty,
+            Some(&walk(vec![mail], &[], true)),
+            3,
+        ));
+        assert_eq!(count_object_change(&changes, "changing", false), 1);
+        assert_eq!(
+            changes.len(),
+            3,
+            "object plus folder and mailbox memberships"
+        );
+        assert_eq!(admitted.live_ids, vec!["changing"]);
+        assert_eq!(admitted.live_versions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn nc2a_pinned_non_mail_folders_remain_metadata_only() {
+        let account = GraphAccount::new_for_tests(
+            crate::client::GraphClient::new("token"),
+            super::super::PushMode::EwsStreaming,
+        );
+        for class in ["IPF.Contact", "IPF.Appointment", "IPF.NoteBook"] {
+            let mut entry = folder(class, true);
+            entry.folder_class = Some(class.to_string());
+            let id = FolderId(class.to_string());
+            let result = seed_and_scope(
+                &account,
+                &PublicFolderScope::pinned([id.clone()]),
+                &entry,
+                None,
+                PublicFolderRouting {
+                    anchor_mailbox: "owner".to_string(),
+                    public_folder_mailbox: None,
+                },
+            )
+            .await;
+            assert!(result.is_none(), "{class}");
+            assert_eq!(
+                account
+                    .public_folder_meta
+                    .read()
+                    .await
+                    .get(&id)
+                    .expect("hierarchy metadata")
+                    .folder_class
+                    .as_deref(),
+                Some(class)
+            );
+            assert!(account.public_folder_routing(&id).await.is_some());
+        }
+    }
+
     /// An account whose client has no attached transport cannot build an
     /// EWS client, and that is the client's own invariant: `Internal`, where
     /// every EWS lane used to mint a `Network(Unsent)` error the engine
     /// retried forever on the mistaken belief that a reopen was coming.
+
     #[test]
     fn an_unattached_account_has_no_ews_client_and_says_why() {
         use super::super::{GraphAccount, PushMode};
@@ -1769,6 +1909,7 @@ mod tests {
 
     fn item(id: &str, received: Option<&str>, is_read: bool) -> EwsItem {
         EwsItem {
+            wire_kind: "Message".to_string(),
             item_id: id.to_string(),
             change_key: Some(format!("ck-{id}")),
             subject: None,
@@ -2255,6 +2396,10 @@ mod tests {
     /// A bare account, enough to exercise the item-class cache. The scripted
     /// net is never driven here: the cache is pure account state.
     fn class_cache_account() -> super::super::GraphAccount {
+        account_with_ews_response("<Envelope/>".to_string())
+    }
+
+    fn account_with_ews_response(response: String) -> super::super::GraphAccount {
         use std::sync::Arc;
 
         use bifrost_net::test_support::{Canned, ScriptedDispatch, scripted_account};
@@ -2266,7 +2411,7 @@ mod tests {
         let script = ScriptedDispatch::new([Canned::Response {
             status: reqwest::StatusCode::OK,
             headers: reqwest::header::HeaderMap::new(),
-            body: bytes::Bytes::from_static(b"<Envelope/>"),
+            body: bytes::Bytes::from(response),
         }]);
         let token_source: Arc<dyn TokenSource> = Arc::new(StaticTokenSource::new("token", None));
         let net = scripted_account(
@@ -2604,20 +2749,64 @@ mod tests {
     }
 
     #[test]
-    fn some_watermark_scan_only_timestamped_id_stays_eligible_for_poll() {
-        // Reducer-level pin of condition (b)'s asymmetry: with a Some
-        // watermark the full scan is NOT a peer entry point for timestamped
-        // items (that is the incremental poll's job - the `>=` restriction
-        // will pick it up once its received time reaches the watermark).
-        // Only a genuinely-untimestamped scan-only id emits here; a
-        // timestamped scan-only id must NOT emit off the scan alone.
+    fn nc2a_posts_admitted_and_rejected_classes_warn_once() {
+        let mut post = item("post", None, false);
+        post.wire_kind = "PostItem".to_string();
+        post.item_class = "IPM.Post.Custom".to_string();
+        let mut rejected = item("contact", None, false);
+        rejected.wire_kind = "Contact".to_string();
+        rejected.item_class = "IPM.Contact".to_string();
+        let rows = walk(vec![post, rejected.clone(), rejected], &[], true);
+        let admitted = admit_mail(rows.clone());
+        assert_eq!(admitted.unhandled_classes, vec!["IPM.Contact"]);
+        assert_eq!(admitted.items.len(), 1);
+        let (changes, warnings, pf) = unbox_apply(reduce_public_folder_poll(
+            cursor(None, None, &[]),
+            &rows,
+            Some(&rows),
+            1,
+        ));
+        assert_eq!(changes.len(), 3);
+        assert_eq!(count_object_change(&changes, "post", false), 1);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(pf.warned_classes, vec!["IPM.Contact"]);
+        let (_, warnings, _) = unbox_apply(reduce_public_folder_poll(pf, &rows, None, 2));
+        assert!(warnings.is_empty());
+        assert_eq!(
+            crate::ews::EwsItemShape::from_item_class("IPM.Post.Custom"),
+            crate::ews::EwsItemShape::NonMessage
+        );
+    }
+
+    #[test]
+    fn nc2a_timestamped_poll_then_scan_emits_nothing() {
+        let pf = cursor(Some("2026-01-01T00:00:00Z"), Some(1), &[]);
+        let mail = item("arrival", Some("2026-02-01T00:00:00Z"), false);
+        let poll = walk(vec![mail.clone()], &[], true);
+        let (changes, _, pf) = unbox_apply(reduce_public_folder_poll(pf, &poll, None, 2));
+        assert_eq!(changes.len(), 3);
+        let scan = walk(vec![mail], &[], true);
+        let (changes, _, _) = unbox_apply(reduce_public_folder_poll(
+            pf,
+            &walk(Vec::new(), &[], true),
+            Some(&scan),
+            4000,
+        ));
+        assert!(
+            changes.is_empty(),
+            "previously delivered mail must not re-emit: {changes:?}"
+        );
+    }
+
+    #[test]
+    fn nc2a_some_watermark_scan_admits_sub_watermark_mail() {
         let pf = cursor(Some("2026-03-05T12:00:00Z"), None, &[]);
         // Empty poll leaves the watermark unchanged (still Some), so
         // `scan_additions` runs with `watermark_none = false`.
         let poll = walk(Vec::new(), &[], true);
         let scan = walk(
             vec![
-                item("ts_only", Some("2026-04-01T00:00:00Z"), false),
+                item("ts_only", Some("2026-01-01T00:00:00Z"), false),
                 item("plain_only", None, false),
             ],
             &[],
@@ -2627,8 +2816,8 @@ mod tests {
             unbox_apply(reduce_public_folder_poll(pf, &poll, Some(&scan), 3_000_000));
         assert_eq!(
             count_object_change(&changes, "ts_only", false),
-            0,
-            "a timestamped scan-only id under a Some watermark must not emit off the scan"
+            1,
+            "a sub-watermark mail admission must emit from the full scan"
         );
         assert_eq!(
             count_object_change(&changes, "plain_only", false),
@@ -2642,7 +2831,7 @@ mod tests {
     fn condition_a_boundary_and_timestamp_through_reducer() {
         // (a) full reducer: a watermarked folder emits new timestamped items,
         // skips the prior boundary second, advances the watermark and boundary,
-        // and (bug-1) does NOT fold timestamped ids into the baseline.
+        // and folds timestamped admissions into the baseline.
         let pf = PublicFolderCursor {
             folder_id: "AAMkPF=".to_string(),
             routing: PublicFolderRouting {
@@ -2681,8 +2870,8 @@ mod tests {
         assert_eq!(cursor1.boundary_ids, vec!["new".to_string()]);
         assert_eq!(
             cursor1.live_ids,
-            vec!["old".to_string()],
-            "timestamped ids are NOT folded into the baseline (bug 1)"
+            vec!["old".to_string(), "new".to_string()],
+            "timestamped admissions are folded into the capped baseline"
         );
     }
 

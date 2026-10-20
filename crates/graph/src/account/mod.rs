@@ -631,7 +631,7 @@ impl GraphAccount {
     /// an admission bound, not an eviction policy (see
     /// `record_public_item_classes`), so a churning folder whose dead
     /// entries fill the map locks every LATER item out of the cache and
-    /// silently demotes hydration to the folder-class tier for the rest of
+    /// silently demotes hydration to the neutral shape for the rest of
     /// the process. Pruning at the destroy site keeps the resident set
     /// proportional to the live set; the cap stays as the backstop for a
     /// folder that is genuinely that large.
@@ -647,13 +647,9 @@ impl GraphAccount {
 
     /// The `GetItem` property shape to request for a public-folder item.
     ///
-    /// Three tiers, most specific first: the class the inventory / poll pass
-    /// parsed for this exact item; else the folder's EWS `FolderClass`,
-    /// which discovery re-seeds on every attach and which is the right
-    /// answer for any folder that is not mixed-class; else the message
-    /// shape, which is byte-identical to the request this lane always made -
-    /// so an item of unknown class fails exactly as it did before, per item,
-    /// rather than being guessed into a shape.
+    /// The cache is a property-selection hint only. Without a cached item
+    /// class request common properties; folder class cannot establish the
+    /// domain of an item in a mixed folder.
     pub(crate) async fn public_item_shape(
         &self,
         id: &ObjectId,
@@ -662,13 +658,8 @@ impl GraphAccount {
         if let Some(shape) = self.public_item_classes.read().await.get(id) {
             return *shape;
         }
-        self.public_folder_meta
-            .read()
-            .await
-            .get(folder)
-            .and_then(|meta| meta.folder_class.as_deref())
-            .map(crate::ews::EwsItemShape::from_folder_class)
-            .unwrap_or_default()
+        let _ = folder;
+        crate::ews::EwsItemShape::default()
     }
 
     /// The owning shared-mailbox identity for a foreign scope, or `None`

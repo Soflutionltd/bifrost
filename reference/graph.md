@@ -868,9 +868,11 @@ cheap/`Poll`/fresh; invalid cursors reseed through inventory.
 
 ### Public-folder cursor (no delta token)
 
-`GraphCursorKind::PublicFolder(PublicFolderCursor)` was additive and needed
-no version bump of its own (a reader of the previous version never wrote
-it). The payload IS the sync state:
+Graph cursor envelope v5 invalidates the former public-folder baselines,
+which included non-mail items. The decoder maps payload decode failures to
+account-wide `SchemaIncompatible` recovery, so a payload-specific version
+would not isolate recovery. The shared version deliberately reseeds all
+Graph scopes. The payload IS the sync state:
 `folder_id`, `PublicFolderRouting` (the cold-resumable `X-AnchorMailbox` /
 `X-PublicFolderMailbox` pair), a `DateTimeReceived` `watermark`, the
 `last_full_scan_at` throttle clock, a `live_ids` deletion baseline, and a
@@ -878,10 +880,14 @@ it). The payload IS the sync state:
 `public_folder_changes_stream`: incremental `find_items` since the
 watermark (emit `Updated` + `Folder` and `Mailbox(content)` `Added` scope
 changes, matching the inventory pass's dual membership), then a deletion
-reconcile throttled to `FULL_SCAN_INTERVAL_SECS` (3600). The full item-shape
-scan emits `Updated` when a retained id's change key moved and `Destroyed` for
-ids absent from `live_ids`. The EWS item shape carries read state, flag status,
+reconcile throttled to `FULL_SCAN_INTERVAL_SECS` (3600). Every complete full scan reconciles the admitted mail projection: a retained
+id with a changed key emits `Updated`; a previously admitted item now absent
+or non-mail emits `Destroyed`; a newly admitted mail item emits the object
+and both memberships even below the watermark. An excluded item disappearing
+emits nothing. Incomplete walks cannot advance or reconcile this baseline. The EWS item shape carries read state, flag status,
 and categories through the same canonical token hash used by REST inventory.
+Incremental admissions, timestamped or not, join the capped id and version
+baseline before checkpointing, so a later scan does not re-emit them.
 `live_ids` is hard-capped at `PUBLIC_FOLDER_LIVE_IDS_CAP` (10_000); above
 it the snapshot empties and the folder degrades to additions-only with one
 scoped `Warning`. `DateTimeReceived` is not a modification signal, so an
@@ -1198,7 +1204,9 @@ failure still skips that subtree.
 `routing_map` (the content-mailbox routing the cursor payload carries) and
 `public_folder_meta` (display name, `FolderClass`, parent, effective rights,
 for the `containers_list` projection) - and emits a `CursorScope::Folder`
-only when the configured `PublicFolderScope` names the folder.
+only when the configured `PublicFolderScope` names a mail folder
+(`IPF.Note` or a dot-separated subclass). Non-mail folders remain in
+hierarchy metadata with their `ContainerContentClass`.
 `HierarchyOnly` emits none. Both maps are filled synchronously inside
 `SyncEngine::attach`'s discovery call, which is what makes them populated by
 the time `containers_list` runs; neither seeding may be deferred to a lazier
@@ -1926,63 +1934,32 @@ HTML body onto `body_text` / `body_html`, tags the containing folder as the
 only container, and carries `Importance::Normal` and no `thread_id` (EWS's
 message shape reports neither).
 
-The EWS `GetItem` body is CLASS-CONDITIONAL on both doors (`EwsItemShape`,
-threaded into `EwsClient::get_item`). The message shape requests
-`message:ToRecipients` / `CcRecipients` and is byte-identical to the body
-this lane always sent; the non-message shape drops them, because a real
-`Contact` or `CalendarItem` answers a `message:` field URI with
-`ErrorInvalidPropertyRequest` - which is how a mixed-class pinned public
-folder used to hydrate its mail correctly and fail PER ITEM on everything
-else. `NonMessage` deliberately collapses contacts and calendar items onto
-`item:Body` + `item:Attachments` (valid on every class) rather than
-requesting `contacts:` / `calendar:` fields: the projections read only body,
-preview and attachments, so a wider set would only add class-specific failure
-modes for data nothing consumes.
-Public-folder hydration also fans out one `GetItem` per item, because ids in
-one chunk can sit in different folders with different routing headers.
+The EWS domain kind (`EwsItemKind`) is separate from request shape
+(`EwsItemShape`). Class matching requires the exact class or a dot-separated
+subclass. `IPM.Note`, `IPM.Post` and `IPM.Schedule.Meeting` subclasses are Mail;
+`IPM.Appointment` is Calendar; `IPM.Contact` and `IPM.DistList` are Contact.
+All other classes, including unknown `IPM.*`, are Other.
+Missing classes are never invented as `IPM.Note`.
 
-### How the class reaches hydration
+The parser records the returned wire kind, including MeetingRequest,
+MeetingResponse, MeetingCancellation and PostItem. Mail admission requires
+both a Mail class and a message, meeting or PostItem wire kind. Posts are
+the native messages of public folders; they use the common GetItem shape
+because message recipient fields do not apply. Rejected parsed classes join
+the operator warning, deduplicated per walk and suppressed by the cursor
+after the first warning. Inventory and poll
+watermarks, boundaries, live ids and version baselines use only admitted
+items from the response. Enumeration uses the class-specific default shape
+plus common `item:` properties, never unconditional `message:` properties.
 
-`ObjectId` carries no class marker, so `GraphAccount::public_item_shape`
-resolves it in three tiers, most specific first:
-
-1. **`public_item_classes`** - `EwsItem.item_class` (the inventory `FindItem`
-   already requests `item:ItemClass`), recorded by
-   `record_public_item_classes` at every EWS walk: the inventory establish,
-   the incremental poll, and the throttled full scan. Keyed by the same
-   folder-qualified `ObjectId` the projections mint, bounded by
-   `PUBLIC_ITEM_CLASS_CACHE_CAP`. The cap is an ADMISSION bound on NEW ids,
-   not an eviction policy: a full map refuses new inserts and keeps its
-   oldest entries, so a recently recorded item is never the victim - it is
-   simply never admitted. An id already resident is always refreshed, cap or
-   no cap, since an overwrite does not grow the map - otherwise an item whose
-   `ItemClass` changed would keep the shape of its first sighting for the
-   account's lifetime. That only stays tenable because the poll frees slots:
-   `forget_public_item_classes`, called on the `Destroyed` ids the reduced
-   poll actually emitted (read off the changes by `destroyed_ids`, so the
-   degraded and incomplete-scan paths that emit no `Destroyed` prune
-   nothing), keeps the resident set proportional to the live set. Without
-   it a churning folder's dead entries would fill the map and lock every
-   later item down to the folder-class tier for the rest of the process.
-2. **The folder's EWS `FolderClass`** in `public_folder_meta`
-   (`EwsItemShape::from_folder_class`). This is the tier that SURVIVES A
-   REATTACH: discovery re-seeds `public_folder_meta` synchronously inside
-   every `attach`, so a consumer-held id hydrated before any inventory pass
-   has run in this process still gets a container-level answer, correct for
-   any folder that is not mixed-class.
-3. **The message shape**, when neither is known - byte-identical to the
-   historical request, so an item of unknown class fails exactly as it did
-   before, per item, carrying the server's own `ErrorInvalidPropertyRequest`.
-   Unknown is never guessed into a shape.
-
-Encoding the class into the `ObjectId` was considered and rejected: the
-poll's `Destroyed` ids are minted from the persisted `live_ids` baseline,
-which stores bare native item ids, so a class-bearing id would stop
-byte-matching the id the consumer stored unless the class were added to the
-cursor payload too (ticking its schema) - and ids consumers already hold
-would carry no class either way. The durable per-scope cursor state is not
-reachable from hydration (it is serialized into the engine's opaque cursor),
-which is why tier 2 rather than the cursor supplies the reattach answer.
+Both hydration doors check the returned item before projection, including
+`FlagsOnly` and cache hits. Non-mail is a scoped per-id
+`Unsupported(Hydrate)` or `Unsupported(HydrateMessage)` refusal. No empty
+Message is minted and no id silently disappears. The bounded class cache is
+only a request-shape hint, refreshed by walks and pruned on emitted destroys.
+Unknown items use a class-neutral GetItem request; the folder class never
+substitutes for the item's domain. Public-folder hydration issues one GetItem
+per id because routing headers can differ by folder.
 
 `move_thread` calls Graph move directly (the destination is the container id
 the consumer already holds, which is owner-qualified for a shared folder).
@@ -2365,14 +2342,13 @@ exhausted" without them.
   drafts) all route to the owning mailbox via the encoded message id, and
   the thread-keyed doors (`thread_hydrate`, `move_thread`, `delete_thread`,
   every `MutationTarget::Thread`) do the same via the encoded thread id.
-- Public folders are poll-only (no push) and side-table-free: the deletion
-  baseline rides in the cursor, capped at 10_000 items/folder (above:
-  additions-only). `CalendarItem` and `Contact` public folders sync at
-  identity level alongside `Message`; `Task`, `DistributionList`,
-  `PostItem`, and `MeetingRequest`/`Response`/`Cancellation` items are
-  dropped with a scoped operator warning. A `CheckpointStore`-backed
-  deletion baseline and support for those remaining item classes are named
-  follow-ups.
+- Public folders are poll-only (no push) and mail-only for sync.
+  Non-mail folders remain visible in hierarchy metadata. The admitted-mail
+  baseline is capped at 10_000 items; above it the folder is additions-only.
+  With no baseline it cannot promise deletions, mail-to-non-mail retirement,
+  sub-watermark non-mail-to-mail admission, in-place edits, or deduplication
+  of scan additions (including timestamped additions during recovery). A scan below the cap restores tracking.
+  Public contacts and calendars remain separate follow-ups.
 - EWS streaming requires EWS reachable with an accepted token; webhook mode
   needs a public HTTPS endpoint (else `Unsupported(PushSubscribe)`). EWS
   streaming currently supports primary-mailbox folders only: shared-mailbox

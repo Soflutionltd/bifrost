@@ -183,6 +183,15 @@ async fn fetch_ews_outcomes(
         // `ErrorInvalidPropertyRequest`.
         let shape = account.public_item_shape(id, folder).await;
         match ews.get_item(&native, shape, &routing.headers()).await {
+            Ok(item) if !item.is_mail() => outcomes.push(ItemOutcome::Failed(BatchFailure::new(
+                batch_id,
+                super::graph_error::unsupported_item_error(
+                    AccountOperation::Hydrate,
+                    ErrorScope::Message {
+                        id: id.0.clone().into(),
+                    },
+                ),
+            ))),
             Ok(item) => outcomes.push(ItemOutcome::Succeeded(BatchSuccess::new(
                 batch_id,
                 hydrated_from_ews_item(
@@ -857,6 +866,7 @@ mod tests {
 
     fn ews_item() -> crate::ews::EwsItem {
         crate::ews::EwsItem {
+            wire_kind: "Message".to_string(),
             item_id: "AAMkItem=".to_string(),
             change_key: Some("CK1".to_string()),
             subject: Some("Company Policy".to_string()),
@@ -1267,11 +1277,11 @@ mod tests {
         use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource, TokenSource};
         use std::sync::Arc;
 
-        let script = ScriptedDispatch::new([Canned::Response {
+        let script = ScriptedDispatch::new((0..2).map(|_| Canned::Response {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
             body: Bytes::from(response.to_string()),
-        }]);
+        }));
         let token_source: Arc<dyn TokenSource> = Arc::new(StaticTokenSource::new("token", None));
         let net = scripted_account(
             &script,
@@ -1308,17 +1318,47 @@ mod tests {
         }
 
         let id = super::super::foreign::encode_public_item_id(&folder, "AAMkItem=");
-        let outcomes = fetch_ews_outcomes(&account, &[(id, folder)], Projection::Metadata).await;
-        assert_eq!(outcomes.len(), 1, "one outcome per pulled id");
-        let succeeded = matches!(outcomes[0], ItemOutcome::Succeeded(_));
+        let mut outcomes = Vec::new();
+        for projection in [Projection::Metadata, Projection::FlagsOnly] {
+            outcomes.extend(
+                fetch_ews_outcomes(&account, &[(id.clone(), folder.clone())], projection).await,
+            );
+        }
+        for outcome in &outcomes {
+            if let ItemOutcome::Failed(failure) = outcome {
+                assert!(matches!(
+                    failure.error.kind(),
+                    bifrost_types::AccountErrorKind::Unsupported(AccountOperation::Hydrate)
+                ));
+            }
+        }
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "one outcome per pulled id and projection"
+        );
+        let succeeded = outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, ItemOutcome::Succeeded(_)));
 
         let requests = script.requests();
-        assert_eq!(requests.len(), 1, "one GetItem per item");
+        assert_eq!(requests.len(), 2, "one GetItem per item and projection");
         let body = requests[0].body.clone().expect("GetItem carries a body");
         (
             String::from_utf8(body.to_vec()).expect("utf8 SOAP"),
             succeeded,
         )
+    }
+
+    #[tokio::test]
+    async fn nc2a_flags_only_refuses_returned_contact_after_mail_cache_hit() {
+        let (_, succeeded) = ews_hydrate_request_body(
+            Some("IPF.Note"),
+            Some(ews_item_of_class("AAMkItem=", "IPM.Note")),
+            &get_item_soap("Contact", "IPM.Contact"),
+        )
+        .await;
+        assert!(!succeeded);
     }
 
     /// The defect this closes: a `Contact` in a MIXED public folder (the
@@ -1338,7 +1378,7 @@ mod tests {
             !body.contains("message:"),
             "a contact was asked for message properties: {body}"
         );
-        assert!(succeeded, "the class-safe request hydrates the contact");
+        assert!(!succeeded, "non-mail must be a per-id refusal");
     }
 
     /// The mail path is untouched: same folder, same door, the historical
@@ -1362,33 +1402,24 @@ mod tests {
         assert!(succeeded);
     }
 
-    /// The reattach tier: nothing is known about the item (a consumer-held
-    /// id hydrated before any inventory pass ran in this process), but the
-    /// folder's EWS `FolderClass` is re-seeded by discovery on every attach,
-    /// so a contacts public folder still gets a class-safe request.
+    /// An unknown item uses common properties even in a mail folder.
     #[tokio::test]
-    async fn an_unknown_item_falls_back_to_the_folder_class() {
+    async fn nc2a_unknown_item_uses_neutral_shape_in_mail_folder() {
         let (body, succeeded) = ews_hydrate_request_body(
-            Some("IPF.Contact"),
+            Some("IPF.Note"),
             None,
             &get_item_soap("Contact", "IPM.Contact"),
         )
         .await;
         assert!(!body.contains("message:"), "{body}");
-        assert!(succeeded);
+        assert!(!succeeded);
     }
 
-    /// And with NOTHING known - no per-item class, no folder class - the
-    /// request is the historical message-shaped one. An unknown item is
-    /// never guessed into a shape: it fails exactly as it did before, per
-    /// item, with the server's own `ErrorInvalidPropertyRequest`.
+    /// Without any class hint the request remains class-neutral.
     #[tokio::test]
-    async fn an_entirely_unknown_class_keeps_the_historical_request() {
+    async fn an_entirely_unknown_class_uses_a_neutral_request() {
         let (body, _) =
             ews_hydrate_request_body(None, None, &get_item_soap("Message", "IPM.Note")).await;
-        assert!(
-            body.contains(r#"FieldURI="message:ToRecipients""#),
-            "{body}"
-        );
+        assert!(!body.contains("message:"), "{body}");
     }
 }

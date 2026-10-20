@@ -71,17 +71,13 @@ public-folder containers, EWS public-folder hydration, allowlisted public-folder
 scopes). Each was deliberately out of that brick's scope; none blocks the
 container projection itself.
 
-- **nc-2a (graph, filed while landing nc-2, not fixed)** A non-mail
-  public-folder item now HYDRATES (the `GetItem` request is class-safe), but
-  both projections are still mail-shaped: `hydrated_from_ews_item` reuses
-  `item_to_inventory_entry` and `message_from_ews_item` mints a `Message`. A
-  contact's `<t:DisplayName>` is not a subject and does not land anywhere, so
-  a hydrated `IPM.Contact` is a near-empty `Message` carrying only its id,
-  change key and memberships. Evidence: `ews::parse` fills `EwsItem` from a
-  `<t:Contact>` with `item_id` / `change_key` / `item_class` and nothing else
-  (`parse_get_item_response_contact`). Whether non-mail public-folder items
-  should project onto a contact/event type at all is a product decision, not
-  a defect - hence filed rather than built.
+- **nc-2a (graph, remaining stages)** Stage B: public Contacts folders on
+  `address_books_list` / `contacts_list` / `contact_get` / `contact_search`
+  through a tagged public collection codec. Read-only: every write door is
+  `Unsupported`; missing routing must never become a REST request.
+  Stage C: public Calendar folders through EWS CalendarView with
+  window-splitting continuation, classified failure on unpageable density,
+  and per-occurrence ids resolvable by `event_get`. Read-only, including RSVP.
 
 ## Open items folded in from the bug-hunt ledgers (2026-08-23)
 
@@ -126,19 +122,6 @@ PUBLISHED SURFACE fence apply.
   probe settles it; if Google rejects the combination, every production
   range read fails, a top-severity defect hiding behind a green suite. The
   only ledger item of the wave left open as a possible defect.
-
-- **jmap-C4. `filters_list` blob traffic is invisible to any accounting
-  surface.** Filed while closing jmap-C1 (2026-09-06). `sync::filters::list`
-  downloads one sieve script body per filter (fanned out at
-  `api_request_concurrency`), and those bodies can be large, but the door
-  returns `Vec<ServerFilter>` rather than a `Batch`, so there is no
-  `bytes_in` field to report into - the metering contract has nothing to
-  violate here, and the traffic simply never appears. `Client::download`
-  now records into the tally, so a metered handle would count it; what is
-  missing is a place to put the number. This is a shape question about the
-  `filters_list` return type, i.e. a published-surface decision, so it is
-  filed rather than fixed. Same shape applies to `pim`'s upload paths, but
-  those are outbound and the tally is inbound-only.
 
 ## Notes
 

@@ -68,17 +68,10 @@ impl EwsClient {
     /// `headers` carries the folder's `X-AnchorMailbox` /
     /// `X-PublicFolderMailbox` routing pair.
     ///
-    /// The requested property set is CLASS-CONDITIONAL (`shape`), because
-    /// EWS validates it against the item's real class: the message shape
-    /// asks for `message:ToRecipients`/`CcRecipients`, which a
-    /// `<t:Contact>` or `<t:CalendarItem>` answers with
-    /// `ErrorInvalidPropertyRequest`. The caller supplies the class it
-    /// learned from the inventory/poll pass (`EwsItem.item_class`, which
-    /// `FindItem` requests) or from the folder's `FolderClass`;
-    /// `EwsItemShape::Message` is the fallback when nothing is known, so an
-    /// unknown item behaves exactly as it did before the shape existed
-    /// rather than being guessed into a shape it may not have. The parser
-    /// tolerates all three classes (see `parse_get_item_response`).
+    /// Cached classes select additional properties only. Unknown classes use
+    /// the neutral shape; callers must verify the returned domain before
+    /// projecting it. Default supplies properties appropriate to the actual
+    /// wire type without imposing message field URIs on non-mail items.
     pub(crate) async fn get_item(
         &self,
         item_id: &str,
@@ -171,13 +164,11 @@ fn find_items_body(folder_id: &str, since: Option<&str>, offset: u32, max_entrie
     format!(
         r#"<m:FindItem Traversal="Shallow">
   <m:ItemShape>
-    <t:BaseShape>IdOnly</t:BaseShape>
+    <t:BaseShape>Default</t:BaseShape>
     <t:AdditionalProperties>
       <t:FieldURI FieldURI="item:Subject"/>
       <t:FieldURI FieldURI="item:DateTimeReceived"/>
-      <t:FieldURI FieldURI="message:From"/>
       <t:FieldURI FieldURI="item:Preview"/>
-      <t:FieldURI FieldURI="message:IsRead"/>
       <t:FieldURI FieldURI="item:Flag"/>
       <t:FieldURI FieldURI="item:Categories"/>
       <t:FieldURI FieldURI="item:ItemClass"/>
@@ -215,6 +206,7 @@ fn get_item_body(item_id: &str, shape: super::EwsItemShape) -> String {
   <m:ItemShape>
     <t:BaseShape>Default</t:BaseShape>
     <t:AdditionalProperties>
+      <t:FieldURI FieldURI="item:ItemClass"/>
       <t:FieldURI FieldURI="item:Body"/>
       <t:FieldURI FieldURI="item:Attachments"/>{message_properties}
     </t:AdditionalProperties>
@@ -245,6 +237,48 @@ fn get_attachment_body(attachment_id: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nc2a_subclass_boundaries_and_domains() {
+        use super::super::{EwsItemKind as Kind, EwsItemShape as Shape};
+        for class in [
+            "IPM.NoteBook",
+            "IPM.Contactless",
+            "IPM.AppointmentBook",
+            "IPM.DistListing",
+            "IPM.Schedule.Meetingish",
+            "IPM.Unknown",
+            "",
+        ] {
+            assert_eq!(Kind::from_item_class(class), Kind::Other, "{class}");
+            assert_eq!(Shape::from_item_class(class), Shape::NonMessage, "{class}");
+        }
+        for class in [
+            "IPM.Note",
+            "IPM.Note.SMIME",
+            "IPM.Schedule.Meeting.Request",
+            "IPM.Schedule.Meeting.Resp.Pos",
+            "IPM.Schedule.Meeting.Canceled",
+        ] {
+            assert_eq!(Kind::from_item_class(class), Kind::Mail, "{class}");
+        }
+        assert_eq!(Kind::from_item_class("IPM.Contact.Custom"), Kind::Contact);
+        assert_eq!(Kind::from_item_class("IPM.DistList"), Kind::Contact);
+        assert_eq!(
+            Kind::from_item_class("IPM.Appointment.Custom"),
+            Kind::Calendar
+        );
+        assert_eq!(Kind::from_folder_class("IPF.Note.Custom"), Kind::Mail);
+        assert_eq!(Kind::from_folder_class("IPF.NoteBook"), Kind::Other);
+    }
+
+    #[test]
+    fn nc2a_mixed_inventory_requests_no_message_properties() {
+        let body = find_items_body("folder", None, 0, 50);
+        assert!(!body.contains("message:"));
+        assert!(body.contains("item:ItemClass"));
+        assert!(body.contains("<t:BaseShape>Default</t:BaseShape>"));
+    }
 
     #[test]
     fn find_items_body_includes_datetime_restriction() {
@@ -291,6 +325,7 @@ mod tests {
   <m:ItemShape>
     <t:BaseShape>Default</t:BaseShape>
     <t:AdditionalProperties>
+      <t:FieldURI FieldURI="item:ItemClass"/>
       <t:FieldURI FieldURI="item:Body"/>
       <t:FieldURI FieldURI="item:Attachments"/>
       <t:FieldURI FieldURI="message:ToRecipients"/>
@@ -310,7 +345,7 @@ mod tests {
         // whose class hydration could not learn behaves as it always did.
         assert_eq!(
             super::super::EwsItemShape::default(),
-            super::super::EwsItemShape::Message
+            super::super::EwsItemShape::NonMessage
         );
     }
 
@@ -332,28 +367,29 @@ mod tests {
 
     #[test]
     fn item_and_folder_classes_map_onto_shapes() {
-        use super::super::EwsItemShape as Shape;
-        for mail in ["IPM.Note", "IPM.Note.SMIME", "IPM.Whatever", ""] {
+        use super::super::{EwsItemKind as Kind, EwsItemShape as Shape};
+        for mail in ["IPM.Note", "IPM.Note.SMIME", "IPM.Schedule.Meeting.Request"] {
             assert_eq!(Shape::from_item_class(mail), Shape::Message, "{mail}");
         }
         for other in [
             "IPM.Contact",
             "IPM.DistList",
             "IPM.Appointment",
-            "IPM.Schedule.Meeting.Request",
+            "IPM.Whatever",
+            "",
             "IPM.Task",
             "IPM.StickyNote",
         ] {
             assert_eq!(Shape::from_item_class(other), Shape::NonMessage, "{other}");
         }
-        assert_eq!(Shape::from_folder_class("IPF.Note"), Shape::Message);
-        assert_eq!(Shape::from_folder_class(""), Shape::Message);
-        for other in ["IPF.Contact", "IPF.Appointment", "IPF.Task"] {
-            assert_eq!(
-                Shape::from_folder_class(other),
-                Shape::NonMessage,
-                "{other}"
-            );
+        assert_eq!(Kind::from_folder_class("IPF.Note"), Kind::Mail);
+        assert_eq!(Kind::from_folder_class(""), Kind::Other);
+        for (class, kind) in [
+            ("IPF.Contact", Kind::Contact),
+            ("IPF.Appointment", Kind::Calendar),
+            ("IPF.Task", Kind::Other),
+        ] {
+            assert_eq!(Kind::from_folder_class(class), kind, "{class}");
         }
     }
 
