@@ -637,6 +637,18 @@ WebSocket setup has the JMAP timeout, a User-Agent and one rejected-token-aware
 401 refresh retry. The WebSocket library uses direct TCP, refuses redirects,
 and does not inherit reqwest proxies or emit net's trace context.
 
+`TokenSource::snapshot()` returns `Result<auth::TokenSnapshot, Error>` without
+refreshing, polling async work, or waiting for a cache lock. The three snapshot
+states are `Usable(AccessToken)`, `RefreshRequired`, and `Contended`. Its default
+is `RefreshRequired`, preserving existing implementations without assuming that
+polling their futures is safe outside a runtime. Blocking SMTP uses this method.
+`OAuthRefresher` uses `try_lock` and its existing freshness, max-age and deferred
+refresh policy; active backoff retains the typed source error through the same
+projection as async lookup. Empty, stale and refreshing states require async
+resolution and remain unchanged. `StaticTokenSource` uses `try_read`, exposes
+live rotations, and requires async resolution for an expired token; contention
+is distinct from expiry. Snapshot support never starts a refresh driver.
+
 ### `StaticTokenSource`
 
 In-memory `TokenSource` for callers that hand bifrost already-minted
@@ -1310,10 +1322,11 @@ exists, preserves request / trace ids and capped body text from
 `Status`, `RateLimited`, and status-backed `RetryBudgetExhausted`,
 and leaves provider JSON interpretation to JMAP, Gmail, and Graph. The
 explicit throttle-scope entry point carries the caller's policy through net's
-generic status and local-hold mappings. Existing callers of
-`into_account_error` retain context-derived compatibility behavior until they
-migrate; provider funnels should choose their documented scope before net's
-legacy inference is retired.
+generic status and local-hold mappings. Graph, Google, JMAP and DAV funnels pass their documented scope explicitly.
+`into_account_error` retains context-derived compatibility behavior for external
+callers; workspace migration alone does not authorize changing that published
+contract. The duration-only Retry-After parser also remains a published
+compatibility helper; provider classification uses `parse_retry_after_hint`.
 
 ## Status-line helpers
 

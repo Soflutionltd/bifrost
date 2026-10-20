@@ -23,7 +23,9 @@
 #[cfg(test)]
 use std::time::Duration;
 
-use bifrost_net::{NetErrorContext, into_account_error as net_into_account_error};
+use bifrost_net::{
+    NetErrorContext, into_account_error_with_throttle_scope as net_into_account_error,
+};
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, BatchFailure, BatchItemId,
@@ -1062,6 +1064,7 @@ fn convert_transport(
                 operation: ctx.operation,
                 scope: ctx.scope,
             },
+            Some(ThrottleScope::Account),
         )
     } else {
         // Custom transport without bifrost-net evidence. No attempt
@@ -1710,6 +1713,22 @@ mod tests {
             reqwest::header::HeaderValue::from_static(seconds),
         );
         headers
+    }
+
+    #[test]
+    fn generic_throttle_without_provider_uses_account_scope() {
+        let error = into_account_error(
+            from_net(bifrost_net::Error::Status {
+                code: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                headers: reqwest::header::HeaderMap::new(),
+                body: bytes::Bytes::from_static(b"proxy throttle"),
+            }),
+            JmapErrorContext::new(AccountOperation::SyncChanges),
+        );
+        assert_eq!(
+            error.telemetry_fields().throttle_scope,
+            Some(ThrottleScope::Account)
+        );
     }
 
     /// Route a wire response through the same `TransportError` ->

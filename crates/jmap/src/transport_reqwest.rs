@@ -330,21 +330,11 @@ impl crate::blob::download::BlobTransport for ReqwestTransport {
             .await
             .map_err(transport_error_from_net)?;
         if !response.status().is_success() {
-            use futures::StreamExt;
-            let mut stream = response.body;
-            let mut body = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let Ok(chunk) = chunk else { break };
-                let remaining = PASSTHROUGH_BODY_CAP.saturating_sub(body.len());
-                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-                if body.len() == PASSTHROUGH_BODY_CAP {
-                    break;
-                }
-            }
+            let body = passthrough_excerpt(response.body).await;
             return Err(TransportError::from_net(bifrost_net::Error::Status {
                 code: response.status,
                 headers: response.headers,
-                body: Bytes::from(body),
+                body,
             }));
         }
         Ok(crate::blob::download::BlobDownload {
@@ -354,11 +344,31 @@ impl crate::blob::download::BlobTransport for ReqwestTransport {
     }
 }
 
-/// Ceiling on the passed-through 3xx body preserved by `open_sse`'s
-/// error path. Mirrors bifrost-net's own 4 KB status-body cap: enough
-/// for a provider's explanatory document, bounded against a hostile
-/// stream.
-const PASSTHROUGH_BODY_CAP: usize = 4096;
+// Collect one byte beyond the cap to distinguish exact-size EOF from truncation.
+// Read failure is independent evidence, not evidence that the cap was reached.
+async fn passthrough_excerpt<S, E>(mut stream: S) -> Bytes
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    use futures::StreamExt;
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                let remaining = (bifrost_net::STATUS_BODY_CAP + 1).saturating_sub(body.len());
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if body.len() > bifrost_net::STATUS_BODY_CAP {
+                    return bifrost_net::error::cap_status_body(Bytes::from(body));
+                }
+            }
+            Err(_) => {
+                body.extend_from_slice(b" ... (body read failed)");
+                return Bytes::from(body);
+            }
+        }
+    }
+    Bytes::from(body)
+}
 
 impl SseTransport for ReqwestTransport {
     type ByteStream = ReqwestByteStream;
@@ -420,21 +430,10 @@ impl SseTransport for ReqwestTransport {
         // account's body inactivity timeout and by the cap below, so a
         // hostile or stalled body cannot hang or bloat the failure
         // path.
-        let mut body_stream = response.body;
-        let mut body: Vec<u8> = Vec::new();
-        use futures::StreamExt;
-        while let Some(chunk) = body_stream.next().await {
-            let Ok(chunk) = chunk else { break };
-            let remaining = PASSTHROUGH_BODY_CAP.saturating_sub(body.len());
-            if chunk.len() >= remaining {
-                body.extend_from_slice(&chunk[..remaining]);
-                break;
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let body = passthrough_excerpt(response.body).await;
         Err(TransportError::from_net(bifrost_net::Error::Status {
             code: response.status,
-            body: Bytes::from(body),
+            body,
             headers: response.headers,
         }))
     }
@@ -762,5 +761,25 @@ mod tests {
             Some(&b"{\"why\":\"gone\"}"[..]),
             "the passed-through body must reach the error"
         );
+    }
+    #[tokio::test]
+    async fn passthrough_excerpt_distinguishes_eof_overflow_and_read_failure() {
+        let exact = Bytes::from(vec![b'x'; bifrost_net::STATUS_BODY_CAP]);
+        let eof = futures::stream::iter(vec![Ok::<_, ()>(exact.clone())]);
+        assert_eq!(passthrough_excerpt(eof).await, exact);
+        let overflow = futures::stream::iter(vec![
+            Ok::<_, ()>(exact.clone()),
+            Ok(Bytes::from_static(b"y")),
+        ]);
+        let mut full = exact.to_vec();
+        full.push(b'y');
+        assert_eq!(
+            passthrough_excerpt(overflow).await,
+            bifrost_net::error::cap_status_body(Bytes::from(full))
+        );
+        let failed = futures::stream::iter(vec![Ok(exact.clone()), Err(())]);
+        let mut expected = exact.to_vec();
+        expected.extend_from_slice(b" ... (body read failed)");
+        assert_eq!(passthrough_excerpt(failed).await, Bytes::from(expected));
     }
 }

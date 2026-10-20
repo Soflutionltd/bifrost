@@ -44,7 +44,7 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
 /// mailbox, or only the current operation. This entry point lets them carry
 /// that decision through net's generic status and local-hold translation.
 /// The compatibility [`into_account_error`] entry point keeps its historical
-/// provider inference until its callers have migrated.
+/// provider inference for downstream callers of that published API.
 #[must_use]
 pub fn into_account_error_with_throttle_scope(
     error: Error,
@@ -281,13 +281,10 @@ pub fn into_account_error_with_throttle_scope(
             retry_after,
             final_response,
         } => rate_limited(&ctx, retry_after, &final_response, throttle_scope),
-        // KNOWN COARSE: `Cancelled` classifies as Transport(Network) +
-        // InFlight, which for a non-idempotent op derives
-        // Reconcile(TransportDropAfterSend) and a read-back even when the
-        // cancellation happened before dispatch. Today `Cancelled` is only
-        // minted inside `RefreshFailed.source`, so the arm is effectively
-        // unreachable; whoever first surfaces `Cancelled` directly should
-        // split it by whether dispatch had begun.
+        // Cancellation has no dispatch evidence. Google Drive upload shutdown
+        // returns this directly, including after a request may have left.
+        // Keep InFlight conservatively: a non-idempotent operation must read
+        // back rather than replay unless the caller supplies stronger evidence.
         Error::Cancelled => {
             let builder = base_builder(
                 &ctx,
@@ -864,8 +861,9 @@ fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
 /// Preserve the old context-derived behavior for callers of
 /// `into_account_error`. Generic translation has no account-specific identity;
 /// provider funnels should use `into_account_error_with_throttle_scope` and
-/// supply their own documented policy before this compatibility inference can
-/// be retired.
+/// supply their own documented policy. Workspace migration does not prove
+/// downstream callers no longer depend on this published entry point's behavior;
+/// removing the inference needs an explicit compatibility decision.
 fn legacy_throttle_scope(ctx: &NetErrorContext) -> Option<ThrottleScope> {
     if ctx.protocol == Protocol::Graph
         || ctx.provider == Some(Provider::Microsoft)

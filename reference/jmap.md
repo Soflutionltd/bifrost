@@ -1,5 +1,11 @@
 # bifrost-jmap reference
 
+Generic net throttles explicitly use account scope for every JMAP provider.
+The factory test transport parses Retry-After as a hint before resolving its bounded delay;
+absolute dates remain in response headers for error recovery. SSE redirect
+excerpts probe beyond the shared cap to identify truncation; read failures
+retain a separate marker, including when the prefix exactly fills the cap.
+
 The reqwest transport receives serialized bytes, not `AccountOperation`.
 Net conservatively refuses in-flight replay of API POSTs. A POST may batch
 reads with creates, sends and updates, so one enclosing operation label

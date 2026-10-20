@@ -7,7 +7,8 @@ use bytes::Bytes;
 use reqwest::header::{HeaderMap, HeaderName, RETRY_AFTER};
 use serde::Deserialize;
 
-const MAX_BODY_EXCERPT_BYTES: usize = 4096;
+#[cfg(test)]
+const MAX_BODY_EXCERPT_BYTES: usize = bifrost_net::STATUS_BODY_CAP;
 
 /// Result type for Gmail client operations.
 pub(crate) type Result<T> = std::result::Result<T, Error>;
@@ -386,7 +387,7 @@ pub(crate) enum Error {
     /// Gmail returned an unsuccessful HTTP response.
     ///
     /// The raw body bytes are preserved (capped at
-    /// `MAX_BODY_EXCERPT_BYTES`) along with the Gmail JSON envelope
+    /// `bifrost_net::STATUS_BODY_CAP`, plus a truncation marker) along with the Gmail JSON envelope
     /// (if parseable), so the account-side mapper can route on
     /// stable Gmail reason codes rather than substring matches.
     Response(Box<GmailResponseError>),
@@ -545,10 +546,7 @@ impl From<bifrost_net::Error> for Error {
 }
 
 fn body_excerpt(body: Bytes) -> Bytes {
-    if body.len() <= MAX_BODY_EXCERPT_BYTES {
-        return body;
-    }
-    body.slice(..MAX_BODY_EXCERPT_BYTES)
+    bifrost_net::error::cap_status_body(body)
 }
 
 /// Gmail wraps error responses under a top-level `error` object. This
@@ -635,6 +633,13 @@ mod tests {
         let Error::Response(resp) = err else {
             panic!("expected response error");
         };
-        assert_eq!(resp.body.len(), MAX_BODY_EXCERPT_BYTES);
+        assert_eq!(
+            resp.body,
+            bifrost_net::error::cap_status_body(Bytes::from(vec![
+                b'x';
+                MAX_BODY_EXCERPT_BYTES + 64
+            ]),)
+        );
+        assert!(resp.body.ends_with(b" ... (truncated)"));
     }
 }

@@ -49,29 +49,6 @@ request (operation, plus whether this request is a replayable leg). Related
 lateral: replaying a DAV conditional `If-Match` PUT whose first response was lost
 can turn a committed write into a 412 conflict.
 
-## SHARED-006 - One caller of the duration-only Retry-After parser is left
-
-Residue: OAuth refresh, graph, jmap, google and dav-core classification all use
-the `RetryHint` form. `crates/jmap/src/sync/factory.rs` still calls
-`bifrost_net::parse_retry_after`, so the duration function cannot be retired;
-once it migrates, retiring it is a removal that needs the owner.
-
-## SHARED-008 - Provider funnels still rely on net's built-in throttle policy
-
-Residue: net has `into_account_error_with_throttle_scope` so a provider can pass
-its own policy, but every funnel still calls `into_account_error`, so the
-hard-coded Graph, Microsoft, Gmail and Fastmail-JMAP inference stays. Migrate
-the funnels (Graph and Google with their documented policies, JMAP passing
-account scope for its generic throttles, DAV passing the scope its ladder
-applies), then drop the inference.
-
-## SHARED-011 - Provider crates still copy body-excerpt capping
-
-Residue: `bifrost_net::error::cap_status_body` is public and documented. Graph's
-general body diagnostic and Google's body excerpt can adopt it; JMAP's SSE
-passthrough drain has to detect truncation while collecting and handle read
-failures separately from the cap.
-
 ## SHARED-009 - The IMAP and SMTP wire meters stay private
 
 Residue: JMAP WebSocket and ManageSieve now record into the account meter
@@ -80,9 +57,13 @@ and carries peer-timeout state, and SMTP's also serves blocking I/O with
 runtime-independent admission, so they were kept with comments; collapsing them
 onto the shared stream needs those two behaviours to move into it.
 
-## SHARED-018 - A comment on net's `Error::Cancelled` mapping is stale
+## SHARED-008 - Net keeps its provider throttle inference, and SMTP still depends on it
 
-Lateral: it says direct production use is unreachable, but the Google Drive
-upload shutdown now returns it directly. The conservative `InFlight` mapping
-fits; the comment does not.
+Residue: the Graph, Google, JMAP and DAV funnels now pass explicit throttle
+policies through `into_account_error_with_throttle_scope`. Net's hard-coded
+Graph, Microsoft, Gmail and Fastmail-JMAP inference stays because SMTP still
+calls the compatibility function and downstream consumers may rely on the
+published behaviour. Migrate SMTP, then removing the inference (and retiring the
+duration-only `parse_retry_after`, which has no in-tree production caller left)
+is a removal that needs the owner.
 

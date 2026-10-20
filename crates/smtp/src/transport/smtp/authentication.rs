@@ -2,8 +2,8 @@
 
 use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 
+use bifrost_net::auth::TokenSnapshot;
 use bifrost_net::{AccessToken, NetErrorContext, StaticTokenSource, TokenSource};
 use bifrost_sasl::{ScramChannelBinding, ScramHash, Secret};
 
@@ -198,42 +198,32 @@ impl Credentials {
         }
     }
 
-    /// Resolve the OAuth identity and current access token without an
-    /// executor, by polling `current()` once. The blocking transport has
-    /// no async context to await a refresh in; a `StaticTokenSource` (and
-    /// an `OAuthRefresher` whose token is already fresh) resolves on the
-    /// first poll when its state lock is immediately available. This is not
-    /// safe for every `TokenSource`: an empty or stale `OAuthRefresher` can
-    /// start refresh work and call `tokio::spawn` during this first poll,
-    /// which panics without a runtime. The blocking transport can only use
-    /// this path while the source resolves immediately.
+    /// Resolve a cached OAuth token without an executor or refresh side effects.
+    /// Sources without synchronous snapshot support require the async transport.
     pub(crate) fn oauth2_token_blocking(&self) -> Result<(String, Zeroizing<String>), Error> {
         match self {
             Credentials::OAuth2 {
                 identity,
                 token_source,
             } => {
-                let mut future = token_source.current();
-                let waker = Waker::noop();
-                let mut cx = Context::from_waker(waker);
-                match future.as_mut().poll(&mut cx) {
-                    Poll::Ready(Ok(token)) => {
+                // Polling current() even once can spawn a refresh without a
+                // runtime. Only the explicit non-refreshing snapshot is safe.
+                match token_source.snapshot().map_err(oauth_token_error)? {
+                    TokenSnapshot::Usable(token) => {
                         Ok((identity.clone(), Zeroizing::new(token.as_str().to_owned())))
                     }
-                    Poll::Ready(Err(e)) => Err(oauth_token_error(e)),
-                    // `TokenSource::current` returns an opaque future. A
-                    // Pending poll does not tell us whether a fresh token is
-                    // behind OAuthRefresher's async mutex or whether the
-                    // source needs refresh work. `is_coordinating()` only
-                    // says that the source owns its cache semantics; it does
-                    // not expose a cached token or readiness. Polling again
-                    // can enter tokio::spawn without a runtime and leave the
-                    // refresher marked as Refreshing. A safe blocking decision
-                    // needs a non-refreshing synchronous snapshot from
-                    // bifrost-net distinguishing a usable cached token,
-                    // refresh required, and state-lock contention.
-                    Poll::Pending => Err(error::invalid_input(
-                        "OAuth token source is not immediately available; use the async SMTP transport",
+                    TokenSnapshot::Contended => Err(oauth_token_error(
+                        bifrost_net::Error::RefreshFailed {
+                            retry_after: None,
+                            source: Arc::new(bifrost_net::Error::Network {
+                                message: "OAuth token cache is busy; retry when ready".to_owned(),
+                                transmission_state: bifrost_types::TransmissionState::Unsent,
+                                source: None,
+                            }),
+                        },
+                    )),
+                    _ => Err(error::invalid_input(
+                        "OAuth token source requires refresh or async resolution; use the async SMTP transport",
                     )
                     .with_phase(SmtpCommandPhase::Auth { mechanism: None })),
                 }
@@ -786,6 +776,9 @@ fn generate_scram_nonce() -> Result<String, Error> {
 #[cfg(test)]
 mod test {
     use super::{Credentials, Mechanism, Zeroizing};
+    use bifrost_net::auth::TokenSnapshot;
+    use bifrost_net::{AccessToken, StaticTokenSource, TokenSource};
+    use std::sync::Arc;
 
     #[test]
     fn scram_mechanism_wire_tokens() {
@@ -864,7 +857,90 @@ mod test {
     }
 
     #[test]
-    fn blocking_oauth_rejects_a_pending_coordinating_source_without_repolling() {
+    fn blocking_oauth_empty_refresher_needs_async_resolution_without_a_runtime() {
+        let source = bifrost_net::OAuthRefresher::new(Arc::new(StaticTokenSource::new(
+            "issuer-token",
+            None,
+        )));
+        let credentials = Credentials::oauth2_source("alice", Arc::new(source));
+        let error = credentials.oauth2_token_blocking().unwrap_err();
+        assert!(error.is_invalid_input());
+        assert!(error.to_string().contains("use the async SMTP transport"));
+    }
+
+    #[test]
+    fn blocking_oauth_contended_snapshot_is_transient() {
+        use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
+        use bifrost_types::error::{AccountErrorKind, AuthErrorKind, Protocol};
+
+        struct BusySource;
+        impl TokenSource for BusySource {
+            fn snapshot(&self) -> Result<TokenSnapshot, bifrost_net::Error> {
+                Ok(TokenSnapshot::Contended)
+            }
+            fn current(
+                &self,
+            ) -> bifrost_net::AccountFuture<Result<AccessToken, bifrost_net::Error>> {
+                panic!("blocking resolution must never call current")
+            }
+            fn refresh(
+                &self,
+            ) -> bifrost_net::AccountFuture<Result<AccessToken, bifrost_net::Error>> {
+                panic!("blocking resolution must never refresh")
+            }
+        }
+        let credentials = Credentials::oauth2_source("alice", Arc::new(BusySource));
+        let error = credentials.oauth2_token_blocking().unwrap_err();
+        let account = into_account_error(error, SmtpErrorContext::send(Protocol::Smtp));
+        assert_eq!(
+            account.kind(),
+            &AccountErrorKind::Authentication(AuthErrorKind::RefreshTransient)
+        );
+    }
+
+    #[test]
+    fn blocking_oauth_static_snapshot_resolves_without_a_runtime() {
+        let credentials = Credentials::oauth2("alice", "cached");
+        let (identity, token) = credentials.oauth2_token_blocking().unwrap();
+        assert_eq!(identity, "alice");
+        assert_eq!(token.as_str(), "cached");
+    }
+
+    #[test]
+    fn blocking_oauth_snapshot_preserves_typed_source_errors() {
+        use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
+        use bifrost_types::error::{AccountErrorKind, AuthErrorKind, Protocol};
+
+        struct LostSource;
+        impl TokenSource for LostSource {
+            fn snapshot(&self) -> Result<TokenSnapshot, bifrost_net::Error> {
+                Err(bifrost_net::Error::AuthLost {
+                    transmission_state: None,
+                    final_response: None,
+                })
+            }
+            fn current(
+                &self,
+            ) -> bifrost_net::AccountFuture<Result<AccessToken, bifrost_net::Error>> {
+                panic!("blocking resolution must never call current")
+            }
+            fn refresh(
+                &self,
+            ) -> bifrost_net::AccountFuture<Result<AccessToken, bifrost_net::Error>> {
+                panic!("blocking resolution must never refresh")
+            }
+        }
+        let credentials = Credentials::oauth2_source("alice", Arc::new(LostSource));
+        let error = credentials.oauth2_token_blocking().unwrap_err();
+        let account = into_account_error(error, SmtpErrorContext::send(Protocol::Lmtp));
+        assert_eq!(
+            account.kind(),
+            &AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired)
+        );
+    }
+
+    #[test]
+    fn blocking_oauth_default_snapshot_never_polls_a_source() {
         use crate::transport::smtp::error::SmtpCommandPhase;
         use bifrost_net::{AccessToken, AccountFuture, Error as NetError, TokenSource};
         use std::sync::Arc;
@@ -903,12 +979,16 @@ mod test {
         let error = credentials.oauth2_token_blocking().unwrap_err();
 
         assert!(error.is_invalid_input());
-        assert!(error.to_string().contains("not immediately available"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires refresh or async resolution")
+        );
         assert_eq!(
             error.phase(),
             Some(SmtpCommandPhase::Auth { mechanism: None })
         );
-        assert_eq!(current_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(current_polls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

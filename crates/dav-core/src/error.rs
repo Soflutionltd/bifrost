@@ -1054,3 +1054,43 @@ mod tests {
         }
     }
 }
+
+/// Keep generic transport throttles on the same account budget as DAV statuses.
+pub(crate) fn net_account_error(
+    error: bifrost_net::Error,
+    ctx: bifrost_net::NetErrorContext,
+) -> AccountError {
+    bifrost_net::into_account_error_with_throttle_scope(
+        error,
+        ctx,
+        Some(bifrost_types::ThrottleScope::Account),
+    )
+}
+
+#[cfg(test)]
+mod net_policy_tests {
+    use super::*;
+
+    #[test]
+    fn generic_transport_throttle_matches_dav_status_policy() {
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            let error = net_account_error(
+                bifrost_net::Error::Status {
+                    code: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    headers: reqwest::header::HeaderMap::new(),
+                    body: bytes::Bytes::new(),
+                },
+                bifrost_net::NetErrorContext {
+                    provider: None,
+                    protocol: protocol.protocol(),
+                    operation: AccountOperation::Discover,
+                    scope: None,
+                },
+            );
+            assert_eq!(
+                error.telemetry_fields().throttle_scope,
+                Some(bifrost_types::ThrottleScope::Account)
+            );
+        }
+    }
+}

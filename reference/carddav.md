@@ -1,5 +1,8 @@
 # bifrost-carddav reference
 
+DAV generic net translation explicitly passes account throttle scope, matching
+the DAV status ladder.
+
 Request replay safety is not inferred from the enclosing operation.
 `ContactUpdate` includes relocation, whose MOVE and conditional create-PUT legs
 are explicitly unreplayable. The error overrides on those legs and on a

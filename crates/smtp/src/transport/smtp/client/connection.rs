@@ -799,11 +799,8 @@ impl SmtpConnection {
         let phase = SmtpCommandPhase::Auth {
             mechanism: Some(mechanism.name()),
         };
-        // The blocking transport has no async context, so it resolves the
-        // OAuth token by polling the source once (see
-        // `oauth2_token_blocking`): a `StaticTokenSource` or an
-        // already-fresh `OAuthRefresher` resolves immediately; a source
-        // needing a network refresh is rejected with a clear error.
+        // Resolve only a non-refreshing cache snapshot. A stale source requires
+        // the async transport; cache-lock contention remains a transient error.
         let oauth_token = if matches!(mechanism, Mechanism::Xoauth2 | Mechanism::OAuthBearer) {
             Some(try_smtp!(credentials.oauth2_token_blocking(), self, phase))
         } else {

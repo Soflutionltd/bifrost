@@ -46,7 +46,9 @@ pub(crate) mod trace;
 mod upload;
 pub mod url;
 
-pub use account_error::{NetErrorContext, into_account_error};
+pub use account_error::{
+    NetErrorContext, into_account_error, into_account_error_with_throttle_scope,
+};
 pub use auth::{AccessToken, OAuthRefresher, RefreshState, StaticTokenSource, TokenSource};
 pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink, MeterSinkHandle};
 pub use budget::{BandwidthBudget, BandwidthDirection, BandwidthRegistry, Reservation};

@@ -1,5 +1,8 @@
 # bifrost-graph reference
 
+Generic net translation receives `throttle_scope_for` explicitly for REST and EWS.
+Body diagnostics use net's shared byte cap and truncation marker.
+
 The HTTP wire funnel does not receive `AccountOperation`. Net uses its
 method default: PATCH and POST do not replay after an in-flight drop, even
 when logical recovery later permits retry of an idempotent update. Conditional

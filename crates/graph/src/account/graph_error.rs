@@ -236,7 +236,14 @@ fn net_to_account_error(net: bifrost_net::Error, ctx: &GraphErrorContext) -> Acc
         }
     }
     stamp_budget(
-        apply_idempotency_override(bifrost_net::into_account_error(net, ctx.to_net_ctx()), ctx),
+        apply_idempotency_override(
+            bifrost_net::into_account_error_with_throttle_scope(
+                net,
+                ctx.to_net_ctx(),
+                throttle_scope_for(ctx),
+            ),
+            ctx,
+        ),
         ctx,
     )
 }
@@ -317,9 +324,14 @@ fn apply_idempotency_override(error: AccountError, ctx: &GraphErrorContext) -> A
 pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext) -> AccountError {
     debug_assert!(matches!(ctx.protocol, Protocol::Ews));
     match error {
-        EwsError::Transport(net) => {
-            apply_idempotency_override(bifrost_net::into_account_error(net, ctx.to_net_ctx()), &ctx)
-        }
+        EwsError::Transport(net) => apply_idempotency_override(
+            bifrost_net::into_account_error_with_throttle_scope(
+                net,
+                ctx.to_net_ctx(),
+                throttle_scope_for(&ctx),
+            ),
+            &ctx,
+        ),
         EwsError::HttpStatus { status, body } => {
             // Wrap the raw HTTP failure as a Graph-style response so
             // the standard status-fallback classification applies,
@@ -1066,6 +1078,7 @@ const REQUEST_ID_HEADERS: &[&str] = &["request-id", "x-ms-request-id", "x-reques
 
 const SUPPORT_ONLY_HEADER_TEXT: &[&str] = &["x-ms-ags-diagnostic"];
 
+#[cfg(test)]
 use bifrost_net::STATUS_BODY_CAP;
 
 fn first_header(headers: &HeaderMap, names: &[&str]) -> Option<String> {
@@ -1095,13 +1108,8 @@ fn body_diagnostic(body: &bytes::Bytes) -> Option<DiagnosticText> {
     if body.is_empty() {
         return None;
     }
-    let capped = if body.len() > STATUS_BODY_CAP {
-        let mut buf = String::from_utf8_lossy(&body[..STATUS_BODY_CAP]).into_owned();
-        buf.push_str(" ... (truncated)");
-        buf
-    } else {
-        String::from_utf8_lossy(body).into_owned()
-    };
+    let capped = bifrost_net::error::cap_status_body(body.clone());
+    let capped = String::from_utf8_lossy(&capped);
     Some(DiagnosticText::support_only(format!(
         "response body: {capped}"
     )))

@@ -1128,9 +1128,13 @@ mod tests {
             }
             let policy = bifrost_net::RetryPolicy::default();
             if policy.statuses.contains(&status) || status.is_server_error() {
-                let retry_after =
-                    bifrost_net::parse_retry_after(headers.get(reqwest::header::RETRY_AFTER))
-                        .map(|hint| hint.min(policy.honor_retry_after_cap));
+                let retry_after = bifrost_net::request::parse_retry_after_hint(
+                    headers.get(reqwest::header::RETRY_AFTER),
+                )
+                .map(|hint| {
+                    hint.min_delay(std::time::SystemTime::now())
+                        .min(policy.honor_retry_after_cap)
+                });
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     return Err(TransportError::from_net(bifrost_net::Error::RateLimited {
                         retry_after,

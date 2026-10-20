@@ -60,6 +60,18 @@ fn failed_refresh_delay(consecutive: u32, terminal: bool) -> Duration {
         .min(MAX_FAILED_REFRESH_RETRY_DELAY)
 }
 
+/// Result of inspecting a token cache without refreshing or waiting for a lock.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TokenSnapshot {
+    /// Cached token usable under this source's freshness policy.
+    Usable(AccessToken),
+    /// Async resolution is required, or this source has no snapshot support.
+    RefreshRequired,
+    /// The cache state is temporarily locked by another caller.
+    Contended,
+}
+
 /// Source of OAuth bearer tokens. Implementations are responsible for
 /// holding the refresh token (or whatever provider-specific material
 /// is needed) and exchanging it for a fresh access token.
@@ -81,6 +93,14 @@ pub trait TokenSource: Send + Sync + 'static {
     /// raw provider adapters receive an OAuth refresher.
     fn is_coordinating(&self) -> bool {
         false
+    }
+
+    /// Inspect the cache synchronously without starting refresh work, polling
+    /// futures, or waiting for locks. Known source failures remain typed errors.
+    /// The safe default requires async resolution: even a single poll of an
+    /// arbitrary `current()` future may spawn work and require a runtime.
+    fn snapshot(&self) -> Result<TokenSnapshot, Error> {
+        Ok(TokenSnapshot::RefreshRequired)
     }
 
     /// Return the currently cached access token. Implementations must
@@ -165,6 +185,24 @@ impl TokenSource for StaticTokenSource {
         // This RwLock is the live token cache. Wrapping it would snapshot a
         // token that an external auth service can later replace with `set`.
         true
+    }
+
+    fn snapshot(&self) -> Result<TokenSnapshot, Error> {
+        match self.token.try_read() {
+            Ok(token)
+                if token_expiry(&token)
+                    .is_some_and(|expiry| tokio::time::Instant::now() >= expiry) =>
+            {
+                Ok(TokenSnapshot::RefreshRequired)
+            }
+            Ok(token) => Ok(TokenSnapshot::Usable(token.clone())),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(TokenSnapshot::Contended),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(Error::Network {
+                message: "static token lock poisoned".to_owned(),
+                transmission_state: bifrost_types::TransmissionState::Unsent,
+                source: None,
+            }),
+        }
     }
 
     fn current(&self) -> AccountFuture<Result<AccessToken, Error>> {
@@ -526,6 +564,31 @@ impl TokenSource for OAuthRefresher {
         true
     }
 
+    fn snapshot(&self) -> Result<TokenSnapshot, Error> {
+        // Never drive token_inner here: an empty or stale cache would spawn a
+        // refresh task, panicking on a blocking caller without a runtime.
+        let Ok(state) = self.state.try_lock() else {
+            return Ok(TokenSnapshot::Contended);
+        };
+        match &*state {
+            RefreshState::Fresh {
+                token,
+                refreshed_at,
+                refresh_not_before,
+            } if !needs_refresh(token, *refreshed_at, self.max_age)
+                || refresh_is_deferred(token, *refresh_not_before) =>
+            {
+                Ok(TokenSnapshot::Usable(token.clone()))
+            }
+            RefreshState::Backoff { error, retry_at }
+                if tokio::time::Instant::now() < *retry_at =>
+            {
+                Err(arc_err_to_error(Arc::clone(error)))
+            }
+            _ => Ok(TokenSnapshot::RefreshRequired),
+        }
+    }
+
     fn current(&self) -> AccountFuture<Result<AccessToken, Error>> {
         // Clone the source-bearing fields so the returned future is
         // `'static`. The trait return is `Pin<Box<...>>` for dyn
@@ -804,6 +867,79 @@ mod tests {
     use reqwest::header::{HeaderMap, HeaderValue, WWW_AUTHENTICATE};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Notify;
+
+    #[test]
+    fn synchronous_refresher_snapshot_never_starts_work_without_a_runtime() {
+        let refresher = OAuthRefresher::new(Arc::new(StaticTokenSource::new("issuer", None)));
+        assert!(matches!(
+            refresher.snapshot().unwrap(),
+            TokenSnapshot::RefreshRequired
+        ));
+        let mut state = refresher.state.try_lock().unwrap();
+        *state = RefreshState::Fresh {
+            token: AccessToken::new("cached", None),
+            refreshed_at: tokio::time::Instant::now(),
+            refresh_not_before: None,
+        };
+        assert!(matches!(
+            refresher.snapshot().unwrap(),
+            TokenSnapshot::Contended
+        ));
+        drop(state);
+        let TokenSnapshot::Usable(token) = refresher.snapshot().unwrap() else {
+            panic!("fresh cache must resolve");
+        };
+        assert_eq!(token.as_str(), "cached");
+        let mut state = refresher.state.try_lock().unwrap();
+        *state = RefreshState::Fresh {
+            token: AccessToken::new("expired", Some(Instant::now())),
+            refreshed_at: tokio::time::Instant::now(),
+            refresh_not_before: None,
+        };
+        drop(state);
+        assert!(matches!(
+            refresher.snapshot().unwrap(),
+            TokenSnapshot::RefreshRequired
+        ));
+        assert!(matches!(
+            *refresher.state.try_lock().unwrap(),
+            RefreshState::Fresh { .. }
+        ));
+    }
+
+    #[test]
+    fn synchronous_snapshot_preserves_backoff_auth_loss() {
+        let refresher = OAuthRefresher::new(Arc::new(StaticTokenSource::new("issuer", None)));
+        *refresher.state.try_lock().unwrap() = RefreshState::Backoff {
+            error: Arc::new(Error::AuthLost {
+                transmission_state: None,
+                final_response: None,
+            }),
+            retry_at: tokio::time::Instant::now() + Duration::from_secs(60),
+        };
+        assert!(matches!(refresher.snapshot(), Err(Error::AuthLost { .. })));
+    }
+
+    #[test]
+    fn static_snapshot_distinguishes_contention_rotation_and_expiry() {
+        let source = StaticTokenSource::new("first", None);
+        let guard = source.token.write().unwrap();
+        assert!(matches!(
+            source.snapshot().unwrap(),
+            TokenSnapshot::Contended
+        ));
+        drop(guard);
+        source.set(AccessToken::new("second", None));
+        let TokenSnapshot::Usable(token) = source.snapshot().unwrap() else {
+            panic!("rotated token must resolve");
+        };
+        assert_eq!(token.as_str(), "second");
+        source.set(AccessToken::new("expired", Some(Instant::now())));
+        assert!(matches!(
+            source.snapshot().unwrap(),
+            TokenSnapshot::RefreshRequired
+        ));
+    }
 
     struct ControlledRefreshSource {
         calls: AtomicUsize,

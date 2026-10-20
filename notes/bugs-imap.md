@@ -62,9 +62,9 @@ stream). Still open:
 - Weak pool registration cannot track a healthy driver's detached graceful
   shutdown after its last connection handle drops, so account close cannot
   wait for it.
-- Role-folder selection and the quota fallback break ties only by display name,
-  so which of two folders sharing a display name is picked can vary; add the
-  wire octets and mode as the final tie-break.
+- `account/mutate.rs` sorts all mutation groups by display name only, so equal
+  display names leave the processing order dependent on map iteration.
+- The LIST-STATUS consumer takes the first unpaired display-name match.
 - Direct `connect_config_metered` callers keep a cancellation gap during the
   post-spawn keepalive setup; pool dials no longer have it.
 

@@ -26,12 +26,13 @@
 //! Destination rebasing together. A transport credential callback alone would
 //! not replace those policies; adding one is unnecessary for these contracts.
 
+use crate::error::net_account_error as into_account_error;
 use std::sync::Arc;
 
 use base64::Engine as _;
 use bifrost_net::{
     AccessToken, AccountNet, AccountSpec, Error as NetError, FollowRedirects,
-    MalformedRedirectKind, Net, NetErrorContext, TokenSource, into_account_error,
+    MalformedRedirectKind, Net, NetErrorContext, TokenSource,
 };
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, AccountOperation, AttemptCause,

@@ -1981,9 +1981,12 @@ fn role_folder_from_entries(
             let left_rank = u8::from(folder_role_from_attributes(&left.attributes()) != Some(role));
             let right_rank =
                 u8::from(folder_role_from_attributes(&right.attributes()) != Some(role));
+            // Distinct wire addresses can decode to the same display name.
+            // Use the stable mailbox order last so registry iteration cannot
+            // decide which address represents the role.
             left_rank
                 .cmp(&right_rank)
-                .then_with(|| left.name.as_str().cmp(right.name.as_str()))
+                .then_with(|| left.name.cmp_account_order(&right.name))
         })
         .map(|entry| entry.name.clone())
 }
@@ -1999,7 +2002,9 @@ fn first_selectable_folder(
     entries
         .into_iter()
         .filter(|entry| entry.selectable())
-        .min_by(|left, right| left.name.as_str().cmp(right.name.as_str()))
+        // `entries()` comes from a HashMap, and distinct mailbox identities
+        // can share a display name. Keep the fallback stable across rebuilds.
+        .min_by(|left, right| left.name.cmp_account_order(&right.name))
         .map(|entry| entry.name.clone())
 }
 
@@ -3000,9 +3005,21 @@ body text\r\n";
         delimiter: Option<char>,
         attributes: Vec<MailboxAttribute>,
     ) -> std::sync::Arc<crate::account::folder_registry::FolderEntry> {
+        role_entry_with_name(
+            MailboxName::new(name).expect("valid mailbox"),
+            delimiter,
+            attributes,
+        )
+    }
+
+    fn role_entry_with_name(
+        name: MailboxName,
+        delimiter: Option<char>,
+        attributes: Vec<MailboxAttribute>,
+    ) -> std::sync::Arc<crate::account::folder_registry::FolderEntry> {
         std::sync::Arc::new(crate::account::folder_registry::FolderEntry::from_mailbox(
             MailboxInfo {
-                name: MailboxName::new(name).expect("valid mailbox"),
+                name,
                 delimiter,
                 attributes,
                 ..Default::default()
@@ -3036,6 +3053,64 @@ body text\r\n";
                 .map(MailboxName::as_str),
             Some("Archive"),
         );
+    }
+
+    #[test]
+    fn role_folder_ties_use_wire_octets_and_mode_after_display_name() {
+        let canonical = MailboxName::new("a").expect("valid mailbox");
+        let noncanonical = MailboxName::from_wire("a".into(), b"&AGE-", false);
+        for names in [
+            [canonical.clone(), noncanonical.clone()],
+            [noncanonical.clone(), canonical.clone()],
+        ] {
+            let selected = role_folder_from_entries(
+                names
+                    .into_iter()
+                    .map(|name| role_entry_with_name(name, Some('/'), vec![MailboxAttribute::Sent]))
+                    .collect(),
+                FolderRole::Sent,
+            )
+            .expect("a Sent folder");
+            assert_eq!(selected, noncanonical);
+        }
+
+        // The same malformed octets can decode to the same replacement
+        // character in either mode. The mode is the final identity tie-break.
+        let legacy = MailboxName::from_wire("\u{fffd}".into(), b"\xff", false);
+        let utf8 = MailboxName::from_wire("\u{fffd}".into(), b"\xff", true);
+        for names in [
+            [utf8.clone(), legacy.clone()],
+            [legacy.clone(), utf8.clone()],
+        ] {
+            let selected = role_folder_from_entries(
+                names
+                    .into_iter()
+                    .map(|name| role_entry_with_name(name, Some('/'), vec![MailboxAttribute::Sent]))
+                    .collect(),
+                FolderRole::Sent,
+            )
+            .expect("a Sent folder");
+            assert_eq!(selected, legacy);
+        }
+    }
+
+    #[test]
+    fn quota_fallback_ties_use_wire_identity_after_display_name() {
+        let canonical = MailboxName::new("a").expect("valid mailbox");
+        let noncanonical = MailboxName::from_wire("a".into(), b"&AGE-", false);
+        for names in [
+            [canonical.clone(), noncanonical.clone()],
+            [noncanonical.clone(), canonical.clone()],
+        ] {
+            let selected = first_selectable_folder(
+                names
+                    .into_iter()
+                    .map(|name| role_entry_with_name(name, Some('/'), Vec::new()))
+                    .collect(),
+            )
+            .expect("a selectable folder");
+            assert_eq!(selected, noncanonical);
+        }
     }
 
     #[test]

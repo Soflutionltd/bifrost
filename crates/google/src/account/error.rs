@@ -581,7 +581,7 @@ fn translate_net_error(net_error: bifrost_net::Error, ctx: &GmailErrorContext) -
     if let bifrost_net::Error::LocalHold { ref key, .. } = net_error {
         let budget = (ctx.surface == crate::quota::ApiSurface::Gmail)
             .then(|| bifrost_types::ThrottleBudget::new(key.clone()));
-        let error = bifrost_net::into_account_error(
+        let error = bifrost_net::into_account_error_with_throttle_scope(
             net_error,
             bifrost_net::NetErrorContext {
                 provider: Some(Provider::Gmail),
@@ -589,6 +589,7 @@ fn translate_net_error(net_error: bifrost_net::Error, ctx: &GmailErrorContext) -
                 operation: ctx.operation,
                 scope: ctx.scope.clone(),
             },
+            ctx.throttle_scope.or(Some(ThrottleScope::Account)),
         );
         let mut builder = error.into_builder();
         if let Some(budget) = budget {
@@ -629,7 +630,11 @@ fn translate_net_error(net_error: bifrost_net::Error, ctx: &GmailErrorContext) -
         operation: ctx.operation,
         scope: ctx.scope.clone(),
     };
-    bifrost_net::into_account_error(net_error, net_ctx)
+    bifrost_net::into_account_error_with_throttle_scope(
+        net_error,
+        net_ctx,
+        ctx.throttle_scope.or(Some(ThrottleScope::Account)),
+    )
 }
 
 fn try_refine_net_with_final_response(
@@ -1431,6 +1436,24 @@ mod tests {
         format!(
             r#"{{"error":{{"code":429,"message":"x","errors":[{{"domain":"usageLimits","reason":"{reason}"}}]}}}}"#
         )
+    }
+
+    #[test]
+    fn generic_throttle_honors_context_scope() {
+        let mut ctx = GmailErrorContext::inventory();
+        ctx.throttle_scope = Some(ThrottleScope::Mailbox);
+        let error = translate_net_error(
+            bifrost_net::Error::Status {
+                code: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                headers: reqwest::header::HeaderMap::new(),
+                body: bytes::Bytes::from_static(b"proxy throttle"),
+            },
+            &ctx,
+        );
+        assert_eq!(
+            error.telemetry_fields().throttle_scope,
+            Some(ThrottleScope::Mailbox)
+        );
     }
 
     #[test]

@@ -827,11 +827,18 @@ fn choose_idle_folder(account: &ImapAccount, slot: usize) -> Option<crate::types
     if slot != 0 {
         return None;
     }
-    account
-        .folders
-        .entries()
+    first_inbox_folder(account.folders.entries())
+}
+
+fn first_inbox_folder(
+    entries: Vec<std::sync::Arc<super::folder_registry::FolderEntry>>,
+) -> Option<crate::types::MailboxName> {
+    entries
         .into_iter()
-        .find(|entry| entry.name.as_str().eq_ignore_ascii_case("INBOX"))
+        .filter(|entry| entry.name.as_str().eq_ignore_ascii_case("INBOX"))
+        // Registry order is unspecified. Prefer a stable mailbox identity
+        // when multiple entries match the case-insensitive INBOX role.
+        .min_by(|left, right| left.name.cmp_account_order(&right.name))
         .map(|entry| entry.name.clone())
 }
 
@@ -1100,6 +1107,29 @@ mod tests {
                 }
             } if folder.0 == "INBOX"
         ));
+    }
+
+    #[test]
+    fn inbox_fallback_choice_is_stable_across_registry_order() {
+        let upper = crate::types::MailboxName::new("INBOX").expect("valid mailbox");
+        let lower = crate::types::MailboxName::new("inbox").expect("valid mailbox");
+        let entry = |name| {
+            std::sync::Arc::new(super::super::folder_registry::FolderEntry::from_mailbox(
+                crate::types::MailboxInfo {
+                    name,
+                    ..Default::default()
+                },
+            ))
+        };
+
+        for names in [
+            [lower.clone(), upper.clone()],
+            [upper.clone(), lower.clone()],
+        ] {
+            let selected = first_inbox_folder(names.into_iter().map(entry).collect())
+                .expect("an INBOX folder");
+            assert_eq!(selected, upper);
+        }
     }
 
     #[tokio::test]

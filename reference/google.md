@@ -1,5 +1,9 @@
 # bifrost-google reference
 
+Generic net translation receives the context throttle scope, falling back to
+account scope, just like the provider status ladder. Response excerpts use
+net's shared byte cap and truncation marker.
+
 The shared HTTP funnel does not receive `AccountOperation`. Net uses its
 method default, conservatively refusing in-flight replay of PATCH and POST.
 Logical error recovery can still permit retry of an idempotent update. A
