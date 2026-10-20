@@ -1138,3 +1138,10 @@ crates/imap/src/
 - Internal raw protocol operations take an explicit `Duration` or document the timeout policy.
 - Public enums/structs are limited to the factory/config surface and are `#[non_exhaustive]` absent a strong reason.
 - Credentials and SASL intermediate strings use `Zeroizing` and redact under `Debug`; malformed SASL mechanism names are rejected before any wire write.
+
+## Unsupported error construction
+
+Local refusal helpers use `AccountError::unsupported` through the shared error
+funnel, retaining their provider, scope and diagnostic decoration.
+`Account::protocol` returns `Protocol::Imap`, including for inherited
+default-method refusals.

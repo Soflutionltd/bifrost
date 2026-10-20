@@ -293,7 +293,7 @@ pub(crate) fn send_message(
         };
 
         // The shared assembler is provider-neutral and leaves the protocol
-        // unstamped; attribute it to IMAP here so a "no recipient" /
+        // unknown; attribute it to IMAP here so a "no recipient" /
         // "uploaded attachments" rejection carries the right protocol.
         let rendered = bifrost_types::send_request_to_rfc5322(&request, submission.default_from())
             .map_err(stamp_imap_protocol)?;

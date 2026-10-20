@@ -1756,3 +1756,10 @@ and each is also stated at the code it describes.
   `InventoryObligation` on the batch and completion coverage reports (see the
   inventory section above) and repaid through `repair_inventory` - not
   surfaced per item, and no longer a reason to terminate the walk.
+
+## Unsupported error construction
+
+Local refusal helpers use `AccountError::unsupported` through the shared error
+funnel, retaining their provider, scope and diagnostic decoration.
+`Account::protocol` returns `Protocol::Gmail`, including for inherited
+default-method refusals.

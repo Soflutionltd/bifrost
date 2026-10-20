@@ -73,14 +73,7 @@ impl DavProtocol {
 
 #[must_use]
 pub fn unsupported_error(operation: AccountOperation, protocol: DavProtocol) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(operation),
-        Cause::Request(RequestCause::Unsupported { operation }),
-    )
-    .protocol(protocol.protocol())
-    .operation(operation)
-    .try_build()
-    .expect("valid account error classification")
+    AccountError::unsupported(operation, protocol.protocol())
 }
 
 /// The server answered, and what it answered says the resource named by `id`

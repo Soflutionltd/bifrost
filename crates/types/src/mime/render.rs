@@ -577,13 +577,9 @@ fn sanitize_msg_id_domain(domain: &str) -> String {
 }
 
 fn unsupported(operation: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(operation),
-        Cause::Request(RequestCause::Unsupported { operation }),
-    )
-    .operation(operation)
-    .try_build()
-    .expect("valid account error classification")
+    // Rendering has no account identity. The consuming account stamps its
+    // protocol at the boundary, just as it does for malformed render inputs.
+    AccountError::unsupported(operation, crate::Protocol::Unknown)
 }
 
 // Provider-neutral: this assembler is shared (IMAP today, any future

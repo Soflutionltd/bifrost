@@ -2636,3 +2636,10 @@ exhausted" without them.
 ### Push failure routing
 
 The EWS streaming worker retries locally only for `RecoveryClass::Retry`, at Subscribe, HTTP stream, and classified frame failures. Every other classification is forwarded as `WatchEvent::Terminated` so the sync reconciler can act on engine directives and reconciliation.
+
+## Unsupported error construction
+
+Local refusal helpers use `AccountError::unsupported` through the shared error
+funnel, retaining their provider, scope and diagnostic decoration.
+`Account::protocol` returns `Protocol::Graph`, including for inherited
+default-method refusals.

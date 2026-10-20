@@ -1370,3 +1370,10 @@ duplication count is not an argument that can settle a published-surface
 question. The private shared crate was taken instead, on the `bifrost-sasl`
 precedent: it kills the drift without either crate's contract moving. Reopening
 that choice is a repository-owner decision, not an engineering conclusion.
+
+## Unsupported error construction
+
+Local refusal helpers use `AccountError::unsupported` through the shared error
+funnel, retaining their provider, scope and diagnostic decoration.
+`Account::protocol` returns `Protocol::CalDav`, including for inherited
+default-method refusals.

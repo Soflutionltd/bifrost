@@ -1218,13 +1218,9 @@ fn provider_fault(
 fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountError {
     match local {
         GmailLocalError::Unsupported { operation, detail } => {
-            let mut builder = AccountErrorBuilder::new(
-                AccountErrorKind::Unsupported(operation),
-                Cause::Request(RequestCause::Unsupported { operation }),
-            )
-            .provider(Provider::Gmail)
-            .protocol(Protocol::Gmail)
-            .operation(operation);
+            let mut builder = AccountError::unsupported(operation, Protocol::Gmail)
+                .into_builder()
+                .provider(Provider::Gmail);
             if let Some(scope) = ctx.scope.clone() {
                 builder = builder.scope(scope);
             }
@@ -1295,18 +1291,13 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             TransmissionState::Acknowledged,
         ),
         GmailLocalError::BlobRangeUnsupported { blob_id } => {
-            let mut builder = AccountErrorBuilder::new(
-                AccountErrorKind::Unsupported(AccountOperation::OpenBlobRange),
-                Cause::Request(RequestCause::Unsupported {
-                    operation: AccountOperation::OpenBlobRange,
-                }),
-            )
-            .provider(Provider::Gmail)
-            .protocol(Protocol::Gmail)
-            .operation(AccountOperation::OpenBlobRange)
-            .text(DiagnosticText::support_only(format!(
-                "gmail blob {blob_id} does not support range reads"
-            )));
+            let mut builder =
+                AccountError::unsupported(AccountOperation::OpenBlobRange, Protocol::Gmail)
+                    .into_builder()
+                    .provider(Provider::Gmail)
+                    .text(DiagnosticText::support_only(format!(
+                        "gmail blob {blob_id} does not support range reads"
+                    )));
             if let Some(scope) = ctx.scope.clone() {
                 builder = builder.scope(scope);
             }
@@ -2334,6 +2325,27 @@ mod tests {
         assert_eq!(
             gmail_scope_for(AccountOperation::PushUnsubscribe),
             "gmail.readonly"
+        );
+    }
+}
+
+#[cfg(test)]
+mod unsupported_constructor_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_constructor_stamps_protocol_and_kind() {
+        let operation = bifrost_types::AccountOperation::Send;
+        let protocol = bifrost_types::Protocol::Gmail;
+        let error = into_account_error(
+            crate::error::Error::unsupported(operation),
+            GmailErrorContext::base(operation),
+        );
+        assert_eq!(error.protocol(), Some(protocol));
+        assert_eq!(error.operation(), Some(operation));
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(operation)
         );
     }
 }

@@ -10,35 +10,29 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bifrost_types::{
-    Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountFuture, AccountOperation, AccountStream, AddressBook, AddressBookId, AttachmentHandle,
-    Batch, BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Calendar, CalendarEvent, Cause,
-    Change, ChangeCursor, CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch,
-    ContactSearchRequest, ContainerId, ContainerKind, ContainerList, ConvenienceShape, CostClass,
-    CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope, DirectoryCard,
-    DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch, EventCreate,
-    EventId, EventPatch, EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp,
+    Account, AccountCapabilities, AccountError, AccountErrorKind, AccountFuture, AccountOperation,
+    AccountStream, AddressBook, AddressBookId, AttachmentHandle, Batch, BatchingPolicy, BlobHandle,
+    BlobRangeSupport, ByteRange, Calendar, CalendarEvent, Change, ChangeCursor, CloudUploadMeta,
+    ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest, ContainerId,
+    ContainerKind, ContainerList, ConvenienceShape, CostClass, CursorDescriptor,
+    CursorEstablishment, CursorFreshness, CursorScope, DirectoryCard, DirectoryGroup,
+    DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch, EventCreate, EventId,
+    EventPatch, EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp,
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
     IdentityPatch, Importance, InventoryEntry, InventoryEvent, ItemOutcome, MembershipScope,
     Message, MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
     MutationTarget, ObjectId, Page, PageBoundary, PimMethodSupport, Priority, Projection,
-    PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
-    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
-    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy,
-    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RsvpStatus, ScopeLifecycleEvent,
+    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
+    ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId,
+    VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream;
 
 fn unsupported(op: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(op),
-        Cause::Request(RequestCause::Unsupported { operation: op }),
-    )
-    .operation(op)
-    .try_build()
-    .expect("valid account error classification")
+    AccountError::unsupported(op, bifrost_types::Protocol::Imap)
 }
 
 /// Arguments observed by the directory forwarding test.
@@ -165,6 +159,10 @@ fn sentinel_change_batch() -> SyncEvent<Change> {
 }
 
 impl Account for StubAccount {
+    fn protocol(&self) -> bifrost_types::Protocol {
+        bifrost_types::Protocol::Imap
+    }
+
     fn capabilities(&self) -> &AccountCapabilities {
         &self.caps
     }
@@ -779,5 +777,37 @@ mod mdn_tests {
             &AccountErrorKind::Unsupported(AccountOperation::MarkMdnSent)
         );
         assert!(stub.last_set_keyword.lock().expect("stub mutex").is_none());
+    }
+}
+
+#[cfg(test)]
+mod unsupported_default_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unsupported_constructor_default_uses_account_protocol() {
+        let account = StubAccount::with_capabilities(stub_capabilities());
+        let error = account
+            .mark_mdn_sent(ObjectId("m1".into()))
+            .await
+            .expect_err("unsupported");
+        assert_eq!(error.protocol(), Some(bifrost_types::Protocol::Imap));
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Unsupported(AccountOperation::MarkMdnSent)
+        );
+        let mut stream = account.inventory_partition_stream(
+            CursorScope::Account,
+            bifrost_types::InventoryPartition::Uid { from: 1, to: 2 },
+        );
+        let Some(InventoryEvent::Terminated(error)) = stream.next().await else {
+            panic!("expected inventory refusal");
+        };
+        assert_eq!(error.protocol(), Some(bifrost_types::Protocol::Imap));
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Unsupported(AccountOperation::SyncInventory)
+        );
+        assert!(stream.next().await.is_none());
     }
 }

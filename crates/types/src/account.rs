@@ -43,10 +43,7 @@ use crate::cursor::{
     ScopeLifecycleEvent,
 };
 use crate::directory::{DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember};
-use crate::error::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, ItemOutcome,
-    MutationSuccess, RequestCause,
-};
+use crate::error::{AccountError, AccountOperation, ItemOutcome, MutationSuccess};
 use crate::events::{
     Change, InventoryEvent, InventoryPartition, InventoryPartitioning, Priority, SyncEvent,
     WatchEvent,
@@ -180,20 +177,23 @@ pub type AccountFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// continue at all: a consumer reading last-event-wins saw success, one reading
 /// first-event-wins saw failure.
 ///
-/// `scope` is retained in the signature because the refusal is about a
-/// particular scope and callers already have it to hand; nothing is derived
-/// from it now.
+/// This compatibility entry point has no account from which to obtain a
+/// protocol. Account implementations use `unsupported_inventory_stream_with_protocol`.
+/// The scope is retained for compatibility; no completeness claim is made.
 pub fn unsupported_inventory_stream(
     _scope: CursorScope,
     operation: AccountOperation,
 ) -> AccountStream<InventoryEvent> {
-    let error = AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(operation),
-        Cause::Request(RequestCause::Unsupported { operation }),
-    )
-    .operation(operation)
-    .try_build()
-    .expect("valid account error classification");
+    unsupported_inventory_stream_with_protocol(_scope, operation, crate::Protocol::Unknown)
+}
+
+/// An inventory refusal stamped with the account's protocol.
+pub fn unsupported_inventory_stream_with_protocol(
+    _scope: CursorScope,
+    operation: AccountOperation,
+    protocol: crate::Protocol,
+) -> AccountStream<InventoryEvent> {
+    let error = AccountError::unsupported(operation, protocol);
     Box::pin(futures::stream::once(async move {
         InventoryEvent::Terminated(error)
     }))
@@ -205,6 +205,12 @@ pub fn unsupported_inventory_stream(
 /// side via an `AccountFactory`; the engine owns the open
 /// `Arc<dyn Account>` and calls the factory on reopen.
 pub trait Account: Send + Sync {
+    /// Protocol used to stamp default-method refusals. Implementations should
+    /// override this; `Unknown` preserves compatibility for existing accounts.
+    fn protocol(&self) -> crate::Protocol {
+        crate::Protocol::Unknown
+    }
+
     /// Read-once snapshot of the account's capabilities. Mid-session
     /// transitions are signaled by ending streams with
     /// a capability-change error that causes an account reopen, never through
@@ -215,7 +221,9 @@ pub trait Account: Send + Sync {
     fn category_definitions_list(
         &self,
     ) -> AccountFuture<Result<Vec<CategoryDefinition>, AccountError>> {
-        Box::pin(async { Err(unsupported_error(AccountOperation::CategoryDefinitionsList)) })
+        let error =
+            AccountError::unsupported(AccountOperation::CategoryDefinitionsList, self.protocol());
+        Box::pin(async move { Err(error) })
     }
 
     /// Read reaction state. Providers preserving per-item failures override this.
@@ -223,7 +231,9 @@ pub trait Account: Send + Sync {
         &self,
         _ids: &[ObjectId],
     ) -> AccountFuture<Result<crate::BatchOutcome<MessageReactionState>, AccountError>> {
-        Box::pin(async { Err(unsupported_error(AccountOperation::MessageReactionsRead)) })
+        let error =
+            AccountError::unsupported(AccountOperation::MessageReactionsRead, self.protocol());
+        Box::pin(async move { Err(error) })
     }
 
     /// Apply the engine's current priority hint to this account.
@@ -365,7 +375,11 @@ pub trait Account: Send + Sync {
     ) -> AccountStream<InventoryEvent> {
         match partition {
             InventoryPartition::Full => self.inventory_stream(scope),
-            _ => unsupported_inventory_stream(scope, AccountOperation::SyncInventory),
+            _ => unsupported_inventory_stream_with_protocol(
+                scope,
+                AccountOperation::SyncInventory,
+                self.protocol(),
+            ),
         }
     }
 
@@ -407,16 +421,9 @@ pub trait Account: Send + Sync {
         requests: AccountStream<InventoryRepairRequest>,
     ) -> AccountStream<InventoryRepairEvent> {
         use futures::StreamExt;
-        Box::pin(requests.map(|request| {
-            let error = AccountErrorBuilder::new(
-                AccountErrorKind::Unsupported(AccountOperation::SyncInventory),
-                Cause::Request(RequestCause::Unsupported {
-                    operation: AccountOperation::SyncInventory,
-                }),
-            )
-            .operation(AccountOperation::SyncInventory)
-            .try_build()
-            .expect("valid account error classification");
+        let protocol = self.protocol();
+        Box::pin(requests.map(move |request| {
+            let error = AccountError::unsupported(AccountOperation::SyncInventory, protocol);
             InventoryRepairEvent::Outcome(InventoryRepairOutcome::Deferred {
                 attempt: request.attempt,
                 error,
@@ -721,7 +728,8 @@ pub trait Account: Send + Sync {
         save_to_sent: Option<bool>,
     ) -> AccountFuture<Result<ObjectId, AccountError>> {
         let _ = (raw, save_to_sent);
-        Box::pin(async { Err(unsupported_error(AccountOperation::Send)) })
+        let error = AccountError::unsupported(AccountOperation::Send, self.protocol());
+        Box::pin(async move { Err(error) })
     }
 
     /// Streaming upload of an attachment. Returns a handle the
@@ -1127,7 +1135,8 @@ pub trait Account: Send + Sync {
         _target: ContainerId,
         _source: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported_error(AccountOperation::MoveThread)) })
+        let error = AccountError::unsupported(AccountOperation::MoveThread, self.protocol());
+        Box::pin(async move { Err(error) })
     }
 
     /// Apply a label to `target`. Dispatches by `label.provenance`
@@ -1190,7 +1199,9 @@ pub trait Account: Send + Sync {
                 self.set_category(target, STARRED_KEYWORD.to_string(), starred)
             }
             StarredFlagShape::None => {
-                Box::pin(async { Err(unsupported_error(AccountOperation::SetStarred)) })
+                let error =
+                    AccountError::unsupported(AccountOperation::SetStarred, self.protocol());
+                Box::pin(async move { Err(error) })
             }
         }
     }
@@ -1216,7 +1227,9 @@ pub trait Account: Send + Sync {
                 Some(PR_LAST_VERB_REPLIED.to_string()),
             );
         }
-        Box::pin(async { Err(unsupported_error(AccountOperation::MarkReplied)) })
+
+        let error = AccountError::unsupported(AccountOperation::MarkReplied, self.protocol());
+        Box::pin(async move { Err(error) })
     }
 
     /// Mark a message as forwarded. Same dispatch shape as
@@ -1237,7 +1250,9 @@ pub trait Account: Send + Sync {
                 Some(PR_LAST_VERB_FORWARDED.to_string()),
             );
         }
-        Box::pin(async { Err(unsupported_error(AccountOperation::MarkForwarded)) })
+
+        let error = AccountError::unsupported(AccountOperation::MarkForwarded, self.protocol());
+        Box::pin(async move { Err(error) })
     }
 
     /// Persist that an MDN (read receipt) was dispatched for `message`, by
@@ -1251,7 +1266,9 @@ pub trait Account: Send + Sync {
         if self.capabilities().conveniences.mdn_sent_via_keyword {
             return self.set_keyword(target, MDN_SENT_KEYWORD.to_string(), true);
         }
-        Box::pin(async { Err(unsupported_error(AccountOperation::MarkMdnSent)) })
+
+        let error = AccountError::unsupported(AccountOperation::MarkMdnSent, self.protocol());
+        Box::pin(async move { Err(error) })
     }
 
     /// Contact autocomplete convenience for recipient and attendee
@@ -1296,7 +1313,8 @@ pub trait Account: Send + Sync {
         _thread: ThreadId,
         _current: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported_error(AccountOperation::DeleteThread)) })
+        let error = AccountError::unsupported(AccountOperation::DeleteThread, self.protocol());
+        Box::pin(async move { Err(error) })
     }
 
     /// Graceful local-handle teardown. IMAP `LOGOUT` + pool drain,
@@ -1429,25 +1447,13 @@ fn dispatch_label<T: Account + ?Sized>(
     }
 }
 
-/// Construct a canonical `AccountError` for an unsupported operation.
-///
-/// Used by default impls that have no provider-specific context. The
-/// `AccountOperation` narrows the error so the engine and consumer know
-/// which operation was rejected without having to infer it from the call site.
-fn unsupported_error(op: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(op),
-        Cause::Request(RequestCause::Unsupported { operation: op }),
-    )
-    .operation(op)
-    .try_build()
-    .expect("valid account error classification")
-}
-
 #[cfg(test)]
 mod push_subscription_tests {
     use super::*;
-    use crate::error::{BatchItemId, BatchOutcome, BatchOutcomeBuilder};
+    use crate::error::{
+        AccountErrorBuilder, AccountErrorKind, BatchItemId, BatchOutcome, BatchOutcomeBuilder,
+        Cause, RequestCause,
+    };
 
     fn outcomes_with_success() -> BatchOutcome<CursorScope> {
         let item = BatchItemId("0".to_string());

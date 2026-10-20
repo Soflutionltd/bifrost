@@ -1030,3 +1030,10 @@ crates/smtp/src/
 - `#[non_exhaustive]` on `Error`, `ErrorKind`, DKIM enums, `CertificateStore`.
 - `AsyncTransport` requires `Sync` so borrowed methods return `Send` futures.
 - Async traits use native `impl Future + Send` return types; no `async-trait`.
+
+## Unsupported error construction
+
+Local refusal helpers use `AccountError::unsupported` through the shared error
+funnel, retaining their provider, scope and diagnostic decoration.
+SMTP and LMTP final assembly use the shared constructor for unsupported
+classifications, retaining the transport protocol and transmission evidence.

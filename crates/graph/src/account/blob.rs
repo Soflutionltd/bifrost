@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use bifrost_types::{
-    AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream, Batch,
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream, Batch,
     BlobCapabilities, BlobEncoding, BlobHandle, BlobId, ByteRange, Cause, Checkpoint,
     DiagnosticText, ErrorScope, ObjectId, PageBoundary, Protocol, ProtocolErrorKind, Provider,
-    RequestCause, SyncEvent, WireCause,
+    SyncEvent, WireCause,
 };
 
 use super::GraphAccount;
@@ -465,18 +465,12 @@ impl From<crate::error::GraphError> for BlobFetchError {
 /// item/reference attachment, or any EWS attachment - `GetAttachment` has no
 /// byte-range form).
 fn unsupported_range_error() -> bifrost_types::AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(AccountOperation::OpenBlobRange),
-        Cause::Request(RequestCause::Unsupported {
-            operation: AccountOperation::OpenBlobRange,
-        }),
-    )
-    .operation(AccountOperation::OpenBlobRange)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
-    .scope(ErrorScope::Account)
-    .try_build()
-    .expect("valid account error classification")
+    AccountError::unsupported(AccountOperation::OpenBlobRange, Protocol::Graph)
+        .into_builder()
+        .provider(Provider::Microsoft)
+        .scope(ErrorScope::Account)
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn decode_locator(handle: &BlobHandle) -> Result<GraphBlobLocator, String> {

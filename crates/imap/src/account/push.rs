@@ -3,9 +3,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFuture, AccountOperation,
-    AccountStream, BatchItemId, BatchOutcomeBuilder, Cause, CursorScope, HintPayload,
-    InvalidationHint, PushSource, RequestCause, SubscriptionHandle, WatchEvent,
+    AccountError, AccountFuture, AccountOperation, AccountStream, BatchItemId, BatchOutcomeBuilder,
+    CursorScope, HintPayload, InvalidationHint, PushSource, SubscriptionHandle, WatchEvent,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -243,14 +242,11 @@ pub(crate) fn push_subscribe(
 /// scope-shape refusal need different operator action even though they carry
 /// the same recovery class - bifrost-sync keeps polling either way.
 fn rejected_scope_error(detail: &'static str) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(AccountOperation::PushSubscribe),
-        Cause::Request(RequestCause::Unsupported {
-            operation: AccountOperation::PushSubscribe,
-        }),
+    AccountError::unsupported(
+        AccountOperation::PushSubscribe,
+        bifrost_types::Protocol::Imap,
     )
-    .operation(AccountOperation::PushSubscribe)
-    .protocol(bifrost_types::Protocol::Imap)
+    .into_builder()
     .text(bifrost_types::DiagnosticText::user_safe(detail))
     .try_build()
     .expect("valid push scope error")

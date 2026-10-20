@@ -343,13 +343,9 @@ pub(crate) fn unsupported_error(
     scope: Option<ErrorScope>,
     message: impl Into<String>,
 ) -> AccountError {
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(operation),
-        Cause::Request(RequestCause::Unsupported { operation }),
-    )
-    .protocol(Protocol::Jmap)
-    .operation(operation)
-    .text(DiagnosticText::support_only(message));
+    let mut builder = AccountError::unsupported(operation, Protocol::Jmap)
+        .into_builder()
+        .text(DiagnosticText::support_only(message));
     if let Some(scope) = scope {
         builder = builder.scope(scope);
     }
@@ -983,9 +979,13 @@ fn build_with(
     kind: AccountErrorKind,
     primary: Cause,
 ) -> AccountErrorBuilder {
-    let mut builder = AccountErrorBuilder::new(kind, primary)
-        .protocol(Protocol::Jmap)
-        .operation(ctx.operation);
+    let mut builder = match kind {
+        AccountErrorKind::Unsupported(operation) => {
+            AccountError::unsupported(operation, Protocol::Jmap).into_builder()
+        }
+        _ => AccountErrorBuilder::new(kind, primary).protocol(Protocol::Jmap),
+    }
+    .operation(ctx.operation);
     if let Some(provider) = ctx.provider {
         builder = builder.provider(provider);
     }
@@ -2846,5 +2846,27 @@ mod tests {
                 "{operation:?} must not absorb a notFound"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unsupported_constructor_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_constructor_stamps_protocol_and_kind() {
+        let operation = bifrost_types::AccountOperation::Send;
+        let protocol = bifrost_types::Protocol::Jmap;
+        let error = unsupported_error(
+            operation,
+            Some(bifrost_types::ErrorScope::Account),
+            "unavailable",
+        );
+        assert_eq!(error.protocol(), Some(protocol));
+        assert_eq!(error.operation(), Some(operation));
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(operation)
+        );
     }
 }

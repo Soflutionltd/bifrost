@@ -14,8 +14,8 @@ captures the load-bearing shape and the invariants the table enforces.
 `AccountError` (`account_error.rs`) is an opaque
 `Arc<AccountErrorInner>` newtype: `Clone` is one Arc bump, so it rides
 through batch lanes, broadcast channels, and `Fatal` wrappers without
-deep copies. `#[non_exhaustive]`, no public fields, no public
-constructor - the only way in is `AccountErrorBuilder`. The inner
+deep copies. `#[non_exhaustive]`, no public fields; construction passes through
+`AccountErrorBuilder`. The inner
 struct carries `kind`, derived `recovery` / `remediation` /
 `message_key`, optional `scope` / `operation` / `provider` /
 `protocol`, the `DiagnosticInfo`, and the `CauseChain`.
@@ -48,6 +48,18 @@ Derived fields recompute on `try_build`. Builder overrides
 round-trip, as is a `ServerCause` retry hint because it lives in the
 chain. Reclassifying to a
 different primary kind/cause requires a fresh `AccountErrorBuilder::new`.
+
+`AccountError::unsupported(operation, protocol)` is the canonical local refusal
+constructor. It stamps kind, matching request cause, operation and protocol through
+`try_build`; `into_builder` adds provider, scope and diagnostics. Provider helpers
+retain their existing provider and scope choices. `Account::protocol` supplies the
+protocol for inherited default-method refusals; all six built-in account providers
+override it. Its compatibility default is `Protocol::Unknown` for downstream
+implementations that have not supplied an identity. The public
+`unsupported_inventory_stream` also uses `Unknown` because its signature carries
+no account identity; built-in accounts use `unsupported_inventory_stream_with_protocol`.
+The provider-neutral MIME renderer uses `Unknown` for unsupported inputs; its
+consuming account stamps the protocol at the boundary.
 
 ## AccountErrorBuilder funnel
 

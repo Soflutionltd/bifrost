@@ -491,6 +491,10 @@ fn describe_cursor_support(cursor: &ChangeCursor) -> CursorDescriptor {
 }
 
 impl Account for JmapAccount {
+    fn protocol(&self) -> bifrost_types::Protocol {
+        bifrost_types::Protocol::Jmap
+    }
+
     fn capabilities(&self) -> &AccountCapabilities {
         &self.caps
     }

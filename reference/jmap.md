@@ -1319,3 +1319,10 @@ a whole new share still waits for reopen.
 ### Push failure routing
 
 The WebSocket push reader retries locally only for `RecoveryClass::Retry`. Handshake, subscription write, ping and read errors are classified as `PushStream`; every other recovery class ends the reader with `WatchEvent::Terminated`, preserving engine directives for the sync reconciler.
+
+## Unsupported error construction
+
+Local refusal helpers use `AccountError::unsupported` through the shared error
+funnel, retaining their provider, scope and diagnostic decoration.
+`Account::protocol` returns `Protocol::Jmap`, including for inherited
+default-method refusals.

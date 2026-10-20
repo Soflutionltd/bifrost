@@ -22,19 +22,6 @@ DAV-003 to DAV-005, DAV-012, DAV-013, GOOG-005, GRAPH-011, JMAP-011, SYNC-008).
 What remains here spans crates or roots in a shared crate. Entries set aside as
 low value or awaiting a ruling are in `notes/bugs-deferred.md`.
 
-## SHARED-010 - Unsupported-error constructors duplicated in about a dozen places, stamping inconsistently
-
-Scope: types adoption. Weaker finding.
-
-`unsupported_error` / `unsupported` exist in jmap (four), imap, dav-core (plus
-caldav/carddav wrappers), graph (four), google (via its local error), smtp, and
-privately in `types/src/account.rs`. They agree on kind and cause (the funnel
-forces it) but not on stamping: Graph sets `provider`, others do not; some set
-scope, some never can. The types crate's own default-method errors
-(`unsupported_error`, `unsupported_inventory_stream`) carry no protocol, so a
-provider leaning on a default emits a protocol-less error while its overrides
-stamp one. A public `AccountError::unsupported(op, protocol)` unifies them.
-
 ## SHARED-007 - Replay safety needs request-level operation context
 
 Needs a design ruling. The two idempotency authorities (the

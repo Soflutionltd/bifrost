@@ -3,8 +3,7 @@
 //! subscription handle mint.
 
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
-    ErrorScope, Protocol, Provider, RequestCause, SubscriptionHandle,
+    AccountError, AccountOperation, CursorScope, ErrorScope, Protocol, Provider, SubscriptionHandle,
 };
 
 use crate::account::graph_error::{GraphErrorContext, into_account_error};
@@ -23,35 +22,23 @@ pub(crate) struct PushEndpoint {
 }
 
 pub(super) fn unsupported_push_error() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(AccountOperation::PushSubscribe),
-        Cause::Request(RequestCause::Unsupported {
-            operation: AccountOperation::PushSubscribe,
-        }),
-    )
-    .operation(AccountOperation::PushSubscribe)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
-    .try_build()
-    .expect("valid account error classification")
+    AccountError::unsupported(AccountOperation::PushSubscribe, Protocol::Graph)
+        .into_builder()
+        .provider(Provider::Microsoft)
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// The same refusal, correlated to the scope that caused it. A per-scope lane
 /// entry the caller cannot attribute is not a report it can act on: it would
 /// know a scope was declined without knowing which registration to drop.
 pub(super) fn unsupported_push_scope_error(scope: CursorScope) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(AccountOperation::PushSubscribe),
-        Cause::Request(RequestCause::Unsupported {
-            operation: AccountOperation::PushSubscribe,
-        }),
-    )
-    .operation(AccountOperation::PushSubscribe)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
-    .scope(ErrorScope::Cursor(scope))
-    .try_build()
-    .expect("valid account error classification")
+    AccountError::unsupported(AccountOperation::PushSubscribe, Protocol::Graph)
+        .into_builder()
+        .provider(Provider::Microsoft)
+        .scope(ErrorScope::Cursor(scope))
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// The whole-request refusal for a request whose scopes all died INSIDE an

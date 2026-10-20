@@ -39,6 +39,20 @@ struct AccountErrorInner {
 }
 
 impl AccountError {
+    /// Refuse an operation locally, with its protocol and canonical classification.
+    /// Add scope, provider, or diagnostics through [`Self::into_builder`].
+    #[must_use]
+    pub fn unsupported(operation: AccountOperation, protocol: Protocol) -> Self {
+        super::builder::AccountErrorBuilder::new(
+            AccountErrorKind::Unsupported(operation),
+            super::cause::Cause::Request(super::cause::RequestCause::Unsupported { operation }),
+        )
+        .operation(operation)
+        .protocol(protocol)
+        .try_build()
+        .expect("valid unsupported account error classification")
+    }
+
     pub(crate) fn from_parts(parts: AccountErrorParts) -> Self {
         Self {
             inner: Arc::new(AccountErrorInner {
@@ -504,5 +518,33 @@ mod tests {
                     && advice.retry_hint == Some(hint)
                     && advice.throttle_scope == Some(ThrottleScope::Account)
         ));
+    }
+}
+
+#[cfg(test)]
+mod unsupported_constructor_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_constructor_classifies_and_preserves_decoration() {
+        let operation = AccountOperation::Send;
+        let error = AccountError::unsupported(operation, Protocol::Graph)
+            .into_builder()
+            .scope(ErrorScope::Account)
+            .provider(Provider::Microsoft)
+            .try_build()
+            .expect("valid decorated refusal");
+        assert_eq!(error.kind(), &AccountErrorKind::Unsupported(operation));
+        assert_eq!(error.operation(), Some(operation));
+        assert_eq!(error.protocol(), Some(Protocol::Graph));
+        assert_eq!(error.scope(), Some(&ErrorScope::Account));
+        assert_eq!(error.provider(), Some(Provider::Microsoft));
+        assert_eq!(error.recovery(), &RecoveryClass::Unsupported(operation));
+        assert_eq!(error.message_key(), "unsupported.operation");
+        assert!(
+            matches!(error.chain().outermost(), super::super::cause::Cause::Request(
+            super::super::cause::RequestCause::Unsupported { operation: op }
+        ) if *op == operation)
+        );
     }
 }

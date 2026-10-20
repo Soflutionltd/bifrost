@@ -360,6 +360,10 @@ impl ImapAccount {
 }
 
 impl Account for ImapAccount {
+    fn protocol(&self) -> bifrost_types::Protocol {
+        bifrost_types::Protocol::Imap
+    }
+
     // Account: exposes the factory-built capability snapshot; direct users call server_profile().
     fn capabilities(&self) -> &bifrost_types::AccountCapabilities {
         &self.capabilities

@@ -504,6 +504,10 @@ pub(crate) enum CtagSource<'a> {
 }
 
 impl Account for CardDavAccount {
+    fn protocol(&self) -> bifrost_types::Protocol {
+        bifrost_types::Protocol::CardDav
+    }
+
     fn capabilities(&self) -> &AccountCapabilities {
         &self.capabilities
     }
@@ -661,9 +665,11 @@ impl Account for CardDavAccount {
     ) -> AccountStream<InventoryEvent> {
         match partition {
             InventoryPartition::Full => self.inventory_stream(scope),
-            _ => {
-                bifrost_types::unsupported_inventory_stream(scope, AccountOperation::SyncInventory)
-            }
+            _ => bifrost_types::account::unsupported_inventory_stream_with_protocol(
+                scope,
+                AccountOperation::SyncInventory,
+                self.protocol(),
+            ),
         }
     }
 

@@ -893,6 +893,10 @@ impl AccountFactory for GraphAccountFactory {
 }
 
 impl Account for GraphAccount {
+    fn protocol(&self) -> bifrost_types::Protocol {
+        bifrost_types::Protocol::Graph
+    }
+
     fn capabilities(&self) -> &AccountCapabilities {
         &self.capabilities
     }

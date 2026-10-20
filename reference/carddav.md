@@ -842,3 +842,10 @@ The IMAP account composes `bifrost-carddav` when configured with
 People, and Graph expose their own native contact primitives through
 their Account impls. Calendar DAV support is separate in
 `bifrost-caldav`; this crate remains contact-only.
+
+## Unsupported error construction
+
+Local refusal helpers use `AccountError::unsupported` through the shared error
+funnel, retaining their provider, scope and diagnostic decoration.
+`Account::protocol` returns `Protocol::CardDav`, including for inherited
+default-method refusals.

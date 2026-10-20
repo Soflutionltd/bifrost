@@ -1274,15 +1274,11 @@ pub(crate) fn ews_shared_scope_error(
 /// Build an `AccountError` for an operation this account does not support.
 #[must_use]
 pub(crate) fn unsupported_account_error(operation: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(operation),
-        Cause::Request(RequestCause::Unsupported { operation }),
-    )
-    .operation(operation)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
-    .try_build()
-    .expect("valid account error classification")
+    AccountError::unsupported(operation, Protocol::Graph)
+        .into_builder()
+        .provider(Provider::Microsoft)
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// Build an `AccountError` for ONE item a batch surface cannot address.
@@ -1296,16 +1292,12 @@ pub(crate) fn unsupported_item_error(
     operation: AccountOperation,
     scope: ErrorScope,
 ) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(operation),
-        Cause::Request(RequestCause::Unsupported { operation }),
-    )
-    .operation(operation)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
-    .scope(scope)
-    .try_build()
-    .expect("valid account error classification")
+    AccountError::unsupported(operation, Protocol::Graph)
+        .into_builder()
+        .provider(Provider::Microsoft)
+        .scope(scope)
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// Build an `AccountError` for malformed Account-level input.
@@ -2966,5 +2958,23 @@ mod tests {
         ));
         assert!(err.recovery().is_terminal());
         assert!(matches!(err.recovery(), RecoveryClass::NoPermission { .. }));
+    }
+}
+
+#[cfg(test)]
+mod unsupported_constructor_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_constructor_stamps_protocol_and_kind() {
+        let operation = bifrost_types::AccountOperation::Send;
+        let protocol = bifrost_types::Protocol::Graph;
+        let error = unsupported_account_error(operation);
+        assert_eq!(error.protocol(), Some(protocol));
+        assert_eq!(error.operation(), Some(operation));
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(operation)
+        );
     }
 }

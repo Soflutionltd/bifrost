@@ -274,7 +274,13 @@ fn build_basic(
     diagnostic: Option<&str>,
     extra: Option<Cause>,
 ) -> AccountError {
-    let mut builder = AccountErrorBuilder::new(kind, cause).protocol(ctx.protocol);
+    let mut builder = match kind {
+        // Classification tables return parts so they can retain wire evidence.
+        AccountErrorKind::Unsupported(operation) => {
+            AccountError::unsupported(operation, ctx.protocol).into_builder()
+        }
+        _ => AccountErrorBuilder::new(kind, cause).protocol(ctx.protocol),
+    };
     builder = apply_context(builder, ctx);
     if let Some(state) = attempt {
         builder = builder.push_cause(Cause::Attempt(AttemptCause::new(to_types_state(state))));
@@ -379,10 +385,15 @@ pub(crate) fn response_to_account_error(
     // throttle hint below cannot drift away from the kind it describes.
     let rate_or_quota = kind_is_rate_or_quota(&kind);
 
-    let mut builder = AccountErrorBuilder::new(kind, primary_cause)
-        .protocol(ctx.protocol)
-        .status(Some(status))
-        .native_code(native);
+    let mut builder = match kind {
+        // Classification tables return parts so they can retain wire evidence.
+        AccountErrorKind::Unsupported(operation) => {
+            AccountError::unsupported(operation, ctx.protocol).into_builder()
+        }
+        _ => AccountErrorBuilder::new(kind, primary_cause).protocol(ctx.protocol),
+    }
+    .status(Some(status))
+    .native_code(native);
     builder = apply_context(builder, ctx);
     builder = builder.push_cause(Cause::Wire(WireCause::Smtp(wire)));
     // Negative SMTP replies are by definition Acknowledged unless the caller
@@ -1672,5 +1683,24 @@ mod tests {
                 ..
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod unsupported_constructor_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_constructor_stamps_protocol_and_kind() {
+        let operation = bifrost_types::AccountOperation::Send;
+        for protocol in [Protocol::Smtp, Protocol::Lmtp] {
+            let error = into_account_error(
+                crate::transport::smtp::error::feature_unsupported("unavailable"),
+                SmtpErrorContext::send(protocol),
+            );
+            assert_eq!(error.protocol(), Some(protocol));
+            assert_eq!(error.operation(), Some(operation));
+            assert_eq!(error.kind(), &AccountErrorKind::Unsupported(operation));
+        }
     }
 }

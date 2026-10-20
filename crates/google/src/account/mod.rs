@@ -402,6 +402,10 @@ impl Drop for GoogleAccount {
 }
 
 impl Account for GoogleAccount {
+    fn protocol(&self) -> bifrost_types::Protocol {
+        bifrost_types::Protocol::Gmail
+    }
+
     fn throttle_keys(
         &self,
         _account: &AccountId,

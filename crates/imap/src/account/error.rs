@@ -177,9 +177,14 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
     // `ErrorScope::Mailbox { id }`.
     let scope_for_kind = ctx.scope.clone();
 
-    let mut builder = AccountErrorBuilder::new(kind, primary_cause)
-        .protocol(Protocol::Imap)
-        .operation(ctx.operation);
+    let mut builder = match kind {
+        // Classification tables return parts so they can retain wire evidence.
+        AccountErrorKind::Unsupported(operation) => {
+            AccountError::unsupported(operation, Protocol::Imap).into_builder()
+        }
+        _ => AccountErrorBuilder::new(kind, primary_cause).protocol(Protocol::Imap),
+    }
+    .operation(ctx.operation);
 
     if let Some(scope) = scope_for_kind {
         builder = builder.scope(scope);
@@ -242,14 +247,7 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
 /// operation. The PIM layer used to return `AccountError::Unsupported`;
 /// in the new contract every unsupported call is structured.
 pub(crate) fn unsupported(operation: AccountOperation) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(operation),
-        Cause::Request(RequestCause::Unsupported { operation }),
-    )
-    .protocol(Protocol::Imap)
-    .operation(operation)
-    .try_build()
-    .expect("valid account error classification")
+    AccountError::unsupported(operation, Protocol::Imap)
 }
 
 /// Build a fatal-stream error for UIDVALIDITY change on a folder cursor.
@@ -1304,3 +1302,21 @@ fn response_code_payload(code: &ResponseCode) -> Option<DiagnosticText> {
 #[cfg(test)]
 #[path = "error_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod unsupported_constructor_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_constructor_stamps_protocol_and_kind() {
+        let operation = bifrost_types::AccountOperation::Send;
+        let protocol = bifrost_types::Protocol::Imap;
+        let error = unsupported(operation);
+        assert_eq!(error.protocol(), Some(protocol));
+        assert_eq!(error.operation(), Some(operation));
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(operation)
+        );
+    }
+}
