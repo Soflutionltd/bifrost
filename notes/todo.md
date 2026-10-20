@@ -152,16 +152,6 @@ reviews left:
   Driving the built transport hermetically needs an in-memory test seam in
   `crates/smtp` (its transport internals are private and its executor is
   sealed); a P3 from the transport-legs review.
-- **Net bandwidth test gaps (P3s from the net budget review).** The
-  refused-stream test calls the classifier directly and never drives the
-  retry loop, so a retry that dropped or emptied the body would pass; the
-  Content-Length framing assertion checks a header `ScriptedDispatch`
-  synthesizes from the size hint rather than production framing (an
-  in-memory HTTP transcript would cover it); `ScriptedDispatch` now picks a
-  scripted outcome after draining the upload, so concurrent requests with
-  different admission delays can pair outcomes and snapshots out of order;
-  `BandwidthRegistry` scans every entry on each new identity, quadratic
-  over many simultaneously live ids.
 
 ## Notes
 

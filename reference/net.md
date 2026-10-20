@@ -345,7 +345,11 @@ rather than each completing before the next is polled, and it is a separate
 constructor because that interleaving change is observable - most tests want the
 deterministic immediate answer. Request snapshots record the initial exact
 body size hint and emitted byte count separately; the dispatcher checks their
-agreement and checks Content-Length against the emitted bytes. Both DAV crates use it to pin their multiget leg
+agreement and checks explicit Content-Length against the emitted bytes. It does
+not synthesize a Content-Length header. Production uses Body::wrap(UploadBody):
+the exact size hint is hyper's framing input; Body::wrap_stream would lose it.
+Outcomes are consumed at arrival under the snapshot lock, even when the dispatch
+is later cancelled. Both DAV crates use it to pin their multiget leg
 concurrency; ablating the bound reads 10 against a bound of 4.
 
 `AccountNet` exposes `get`, `post`, `put`, `patch`, `delete`, plus
@@ -867,7 +871,7 @@ polling inner I/O, so a timer implemented inside S starts after admission;
 a caller's timeout around the entire adapter includes admission waiting.
 
 `BandwidthRegistry` is an injected Arc-shared AccountId-to-Weak map. Lookup and
-insert share one lock. Inserts prune dead entries, and final budget teardown
+insert share one lock. Final budget teardown
 removes its own entry only if the pointer still matches, preserving any
 replacement. `Net::with_bandwidth_registry` injects it;
 `Net::bandwidth_registry` exposes it. `Net::new` creates a fresh private

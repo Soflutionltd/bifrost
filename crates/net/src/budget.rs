@@ -381,7 +381,6 @@ impl BandwidthRegistry {
         if let Some(inner) = budgets.get(&id).and_then(Weak::upgrade) {
             return BandwidthBudget { inner };
         }
-        budgets.retain(|_, budget| budget.strong_count() != 0);
         let budget = BandwidthBudget::with_owner(None, Some((Arc::downgrade(self), id.clone())));
         budgets.insert(id, Arc::downgrade(&budget.inner));
         budget
@@ -574,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_reuses_live_ids_prunes_dead_ids_and_checks_removal_identity() {
+    fn registry_reuses_live_ids_cleans_up_final_owner_and_checks_removal_identity() {
         let registry = Arc::new(BandwidthRegistry::new());
         let id = AccountId("same".into());
         let first = registry.budget(id.clone());
@@ -594,14 +593,25 @@ mod tests {
             &registry.budget(id.clone()).inner,
             &replacement.inner
         ));
-        registry
-            .budgets
-            .lock()
-            .expect("registry")
-            .insert(AccountId("dead".into()), Weak::new());
-        let live = registry.budget(AccountId("new".into()));
-        assert_eq!(registry.budgets.lock().expect("registry").len(), 2);
+        let live_id = AccountId("new".into());
+        let live = registry.budget(live_id.clone());
+        let last_owner = live.clone();
         drop(live);
+        assert!(
+            registry
+                .budgets
+                .lock()
+                .expect("registry")
+                .contains_key(&live_id)
+        );
+        drop(last_owner);
+        assert!(
+            !registry
+                .budgets
+                .lock()
+                .expect("registry")
+                .contains_key(&live_id)
+        );
         assert_eq!(registry.budgets.lock().expect("registry").len(), 1);
     }
 

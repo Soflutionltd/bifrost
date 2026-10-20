@@ -149,7 +149,8 @@ pub struct RequestSnapshot {
 }
 
 /// A wire dispatcher that answers from a fixed script and records
-/// every request it saw.
+/// every request it saw. Outcomes are consumed at arrival, paired with the
+/// snapshot in arrival order, even if the dispatch is later cancelled.
 ///
 /// An exhausted script panics rather than falling through to the
 /// network. A test that under-scripts is a test whose remaining
@@ -228,7 +229,8 @@ impl ScriptedDispatch {
     }
 
     /// How many scripted outcomes remain unconsumed. A test that
-    /// wants to prove the pipeline stopped early asserts on this.
+    /// wants to prove the pipeline stopped early asserts on this. An outcome is
+    /// consumed at arrival, including for a dispatch that is later cancelled.
     #[must_use]
     pub fn remaining(&self) -> usize {
         self.steps
@@ -266,18 +268,10 @@ impl Dispatch for ScriptedDispatch {
             // Consume the real Body so admission and framing are exercised
             // below the retry loop, just as they are by hyper.
             let mut body = request.body_mut().take();
-            let mut headers = request.headers().clone();
+            let headers = request.headers().clone();
             use http_body::Body as _;
             let body_size_hint = body.as_ref().and_then(|body| body.size_hint().exact());
-            if let Some(body) = &body {
-                use http_body::Body as _;
-                if let Some(len) = body.size_hint().exact() {
-                    headers
-                        .entry(reqwest::header::CONTENT_LENGTH)
-                        .or_insert_with(|| len.into());
-                }
-            }
-            let index = {
+            let (index, step) = {
                 let mut requests = requests.lock().expect("scripted request lock poisoned");
                 let index = requests.len();
                 requests.push(RequestSnapshot {
@@ -289,7 +283,12 @@ impl Dispatch for ScriptedDispatch {
                     emitted_body_bytes: 0,
                     timeout: request.timeout().copied(),
                 });
-                index
+                let step = steps
+                    .lock()
+                    .expect("scripted step lock poisoned")
+                    .pop_front()
+                    .expect("scripted dispatch exhausted");
+                (index, step)
             };
             let _in_flight = InFlightGuard::enter(&in_flight, &peak_in_flight);
             if let Some(ref mut body) = body {
@@ -324,11 +323,6 @@ impl Dispatch for ScriptedDispatch {
             if yield_before_answering {
                 tokio::task::yield_now().await;
             }
-            let step = steps
-                .lock()
-                .expect("scripted step lock poisoned")
-                .pop_front()
-                .expect("scripted dispatch exhausted");
             match step {
                 Canned::Response {
                     status,

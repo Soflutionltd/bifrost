@@ -3397,7 +3397,87 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn capped_upload_preserves_content_length_and_excludes_admission_from_headers_timeout() {
+    async fn refused_stream_post_replays_full_body_and_pays_admission_again() {
+        let script = ScriptedDispatch::new([
+            Canned::Error(Error::Network {
+                message: "remote REFUSED_STREAM".into(),
+                transmission_state: TransmissionState::Unsent,
+                source: None,
+            }),
+            canned(StatusCode::OK, b""),
+        ]);
+        let mut policy = two_attempts();
+        policy.initial_backoff = Duration::ZERO;
+        policy.max_backoff = Duration::ZERO;
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), policy);
+        account.set_bandwidth_cap(Some(10));
+        let payload = Bytes::from_static(b"01234567890123456789");
+        let started = tokio::time::Instant::now();
+        account
+            .post("https://upload.test/body")
+            .body(payload.clone())
+            .send()
+            .await
+            .expect("unsent POST retries");
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert_eq!(request.method, reqwest::Method::POST);
+            assert_eq!(request.body.as_ref(), Some(&payload));
+            assert_eq!(request.emitted_body_bytes, 20);
+        }
+        assert_eq!(script.remaining(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scripted_outcomes_follow_arrival_when_shorter_upload_finishes_first() {
+        let script = ScriptedDispatch::new([
+            canned(StatusCode::OK, b"first"),
+            canned(StatusCode::OK, b"second"),
+        ]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+        account.set_bandwidth_cap(Some(10));
+        let mut first = Box::pin(
+            account
+                .post("https://upload.test/first")
+                .body(Bytes::from_static(b"012345678901234567890123456789"))
+                .send(),
+        );
+        use futures::FutureExt as _;
+        while script.requests().is_empty() {
+            assert!(first.as_mut().now_or_never().is_none());
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(script.requests().len(), 1);
+        assert_eq!(script.remaining(), 1);
+        let second = account
+            .post("https://upload.test/second")
+            .body(Bytes::from_static(b"x"))
+            .send();
+        let (first, second) = futures::future::join(first, async {
+            let response = second.await.expect("short upload");
+            assert_eq!(script.requests()[0].emitted_body_bytes, 0);
+            response
+        })
+        .await;
+        assert_eq!(
+            first.expect("long upload").body,
+            Bytes::from_static(b"first")
+        );
+        assert_eq!(second.body, Bytes::from_static(b"second"));
+        let requests = script.requests();
+        assert_eq!(requests[0].emitted_body_bytes, 30);
+        assert_eq!(requests[1].emitted_body_bytes, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capped_upload_preserves_body_length_and_excludes_admission_from_headers_timeout() {
         let script = ScriptedDispatch::new([canned(StatusCode::OK, b"")]);
         let mut spec = crate::AccountSpec::new(None);
         spec.response_headers_timeout = Some(Duration::from_millis(100));
@@ -3415,7 +3495,12 @@ mod tests {
             .expect("admission does not consume header timeout");
         assert_eq!(started.elapsed(), Duration::from_secs(3));
         let requests = script.requests();
-        assert_eq!(requests[0].headers[reqwest::header::CONTENT_LENGTH], "40");
+        // Body::wrap preserves UploadBody's exact hint for hyper framing;
+        // Body::wrap_stream would lose this body-length contract.
+        assert_eq!(
+            requests[0].body_size_hint,
+            Some(requests[0].emitted_body_bytes)
+        );
         assert_eq!(requests[0].body_size_hint, Some(40));
         assert_eq!(requests[0].emitted_body_bytes, 40);
         assert_eq!(requests[0].body.as_ref(), Some(&payload));
