@@ -92,6 +92,7 @@ async fn contact_page(
         get_page(&account, Resource::Outlook, &url, operation).await?;
     let next_cursor = link_cursor(admit_next(&account, &page, operation)?);
     Ok(Page {
+        truncated: false,
         items: page.value.into_iter().map(contact_from_graph).collect(),
         next_cursor,
         estimated_total: None,
@@ -269,6 +270,7 @@ pub(crate) async fn search(
                             .map(|next| crate::paging::encode_paged_cursor(next, 0))
                     };
                     return Ok(Page {
+                        truncated: false,
                         items,
                         next_cursor,
                         estimated_total: None,
@@ -286,6 +288,7 @@ pub(crate) async fn search(
         skip = 0;
     }
     Ok(Page {
+        truncated: false,
         items,
         next_cursor,
         estimated_total: None,
@@ -393,6 +396,7 @@ pub(crate) async fn directory_search(
                             .map(|next| crate::paging::encode_directory_cursor(next, 0, mode))
                     };
                     return Ok(Page {
+                        truncated: false,
                         items,
                         next_cursor,
                         estimated_total: None,
@@ -410,6 +414,7 @@ pub(crate) async fn directory_search(
         skip = 0;
     }
     Ok(Page {
+        truncated: false,
         items,
         next_cursor,
         estimated_total: None,

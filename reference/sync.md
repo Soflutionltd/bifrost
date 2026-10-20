@@ -3090,7 +3090,9 @@ stays in the window and is read as is, while a row of that older version
 carrying the new tag is corrupt (`Error::Other`), since no writer of it could
 have produced one. Version 5 adds the Event error resource and scope for typed
 public-calendar reads. Versions 3 and 4 still decode, but reject the new Event
-tags as corruption; existing tags and layouts are unchanged.
+tags as corruption; existing tags and layouts are unchanged. Version 6 adds
+`DirectoryGateway { url }` scope (tag 10), preserving versions 3 through 5
+without that tag and rejecting the tag in older-version rows.
 
 Decode VALIDATES, never heals: a duplicated entry, barrier or lineage key,
 trailing bytes, a lineage that is not flat (a parent naming itself or an entry

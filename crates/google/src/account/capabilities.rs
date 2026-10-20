@@ -98,6 +98,7 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
             contact_search: true,
             contact_autocomplete: true,
             directory_search: true,
+            directory_enumerate: true,
             // Google People has no directory-group surface (the Workspace
             // Directory API is a separate consent/product scope, and People
             // "contact groups" are the user's personal labels, not
@@ -213,6 +214,7 @@ mod tests {
         assert!(caps.pim_methods.contact_search);
         assert!(caps.pim_methods.contact_autocomplete);
         assert!(caps.pim_methods.directory_search);
+        assert!(caps.pim_methods.directory_enumerate);
     }
 
     #[test]

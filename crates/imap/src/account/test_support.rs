@@ -41,11 +41,20 @@ fn unsupported(op: AccountOperation) -> AccountError {
     .expect("valid account error classification")
 }
 
+/// Arguments observed by the directory forwarding test.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DirectoryCall {
+    pub(crate) query: String,
+    pub(crate) limit: Option<u32>,
+    pub(crate) cursor: Option<Vec<u8>>,
+}
+
 /// A configurable `Account` test double. Records whether each sync
 /// entry point was dispatched to it, and emits a fixed set of discovery
 /// scopes / a sentinel inventory batch / a sentinel change batch.
 pub(crate) struct StubAccount {
     caps: AccountCapabilities,
+    pub(crate) directory_call: std::sync::Mutex<Option<DirectoryCall>>,
     scopes: Vec<CursorScope>,
     pub(crate) inventory_called: AtomicBool,
     pub(crate) changes_called: AtomicBool,
@@ -71,6 +80,7 @@ impl StubAccount {
             establish_called: AtomicBool::new(false),
             describe_called: AtomicBool::new(false),
             last_set_keyword: std::sync::Mutex::new(None),
+            directory_call: std::sync::Mutex::new(None),
         }
     }
 
@@ -85,6 +95,7 @@ impl StubAccount {
             establish_called: AtomicBool::new(false),
             describe_called: AtomicBool::new(false),
             last_set_keyword: std::sync::Mutex::new(None),
+            directory_call: std::sync::Mutex::new(None),
         }
     }
 }
@@ -565,11 +576,36 @@ impl Account for StubAccount {
 
     fn directory_search(
         &self,
-        _query: String,
-        _limit: Option<u32>,
-        _page_cursor: Option<Vec<u8>>,
+        query: String,
+        limit: Option<u32>,
+        page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
-        Box::pin(async { Err(unsupported(AccountOperation::DirectorySearch)) })
+        *self.directory_call.lock().expect("lock") = Some(DirectoryCall {
+            query,
+            limit,
+            cursor: page_cursor,
+        });
+        if !self.caps.pim_methods.directory_search {
+            return Box::pin(async { Err(unsupported(AccountOperation::DirectorySearch)) });
+        }
+        Box::pin(async {
+            let mut page = Page::single(
+                vec![DirectoryCard {
+                    email: "directory-sentinel@example.test".into(),
+                    display_name: None,
+                    additional_emails: Vec::new(),
+                    phones: Vec::new(),
+                    company: None,
+                    title: None,
+                    department: None,
+                    provider: bifrost_types::ProtocolKind::CardDav,
+                }],
+                Vec::new(),
+                Vec::new(),
+            );
+            page.truncated = true;
+            Ok(page)
+        })
     }
 
     fn directory_groups_list(

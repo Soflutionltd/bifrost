@@ -1435,6 +1435,7 @@ async fn hydrated_event_page<K: Fn(&CalendarEvent) -> bool>(
     // in whatever order it likes.
     events.sort_by(|left, right| left.id.0.cmp(&right.id.0));
     Ok(Page {
+        truncated: false,
         items: events,
         next_cursor: slice.next_watermark.as_deref().map(encode_watermark_cursor),
         estimated_total: Some(total),

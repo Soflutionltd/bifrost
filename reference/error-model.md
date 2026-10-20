@@ -289,7 +289,10 @@ operation is treated idempotent). The rules at altitude (read
   `SchemaIncompatible` -> `SchemaIncompatible`; `CapabilityChanged` ->
   `RestartAccount`; `OperatorOverrideNeeded` ->
   `OperatorOverrideRequired { reason }`; `ScopeRevoked` ->
-  `DisableScope` (or `RestartAccount` if no scope).
+  `DisableScope` (or `RestartAccount` if no scope). CardDAV uses this for a
+  personal contact collection reclassified as a directory: no sync strategy is
+  eligible, so it retires the original cursor scope rather than retrying or
+  downgrading. The directory refusal's redirect evidence is preserved.
 - **ConcurrencyConflict** -> `Retry(AfterStateRefresh,
   ConcurrencyConflict)`.
 - **Request** (both subkinds) -> `ClientBug`.
@@ -538,7 +541,8 @@ reason/actions/throttle for reconcile, none for terminal) via the
 `scope.rs`. `ErrorScope` (`#[non_exhaustive]`, custom `Serialize`)
 locates the failure: `Account`, `Cursor(CursorScope)`, and id-bearing
 `Mailbox` / `Message` / `Thread` / `Calendar` / `Event` / `Contact` plus the
-collection variants. The id-bearing variants use the same typed ids as
+collection variants, plus `DirectoryGateway { url }` for a read-only directory
+endpoint that a multi-gateway lookup skipped. The id-bearing variants use the same typed ids as
 the account surface (`MailboxId`, `ObjectId`, `ThreadId`, `CalendarId`,
 `EventId`, `ContactId`) and serialize their inner strings for support exports.
 `scope_fields` is the single source for both the declared struct field
@@ -599,3 +603,13 @@ crates/types/src/error/
                    // Provider, Protocol
   warning.rs       // Warning + WarningKind (outside the error model)
 ```
+
+## Page completeness
+
+`Page::truncated` defaults to false at every constructor. It signals a result
+limit that left a terminal page non-exhaustive, independent of `failed_ids`
+(resources that could not materialize) and `skipped_scopes` (scopes that failed).
+A missing `next_cursor` means terminal, not necessarily complete. CardDAV
+directory gateways use this signal for collection-level 507 truncation and
+local overflow beyond the global caller limit. A skipped gateway uses
+`ErrorScope::DirectoryGateway { url }`, so its omission is identifiable.

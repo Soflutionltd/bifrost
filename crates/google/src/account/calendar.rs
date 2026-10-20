@@ -333,6 +333,7 @@ pub(crate) fn search(
             let remaining = limit.saturating_sub(items.len());
             if remaining == 0 {
                 return Ok(Page {
+                    truncated: false,
                     items,
                     next_cursor: Some(encode_cross_calendar_cursor(calendar_id, &[])),
                     estimated_total: None,
@@ -372,6 +373,7 @@ pub(crate) fn search(
             }
             if let Some(next_token) = next_token {
                 return Ok(Page {
+                    truncated: false,
                     items,
                     next_cursor: Some(encode_cross_calendar_cursor(calendar_id, &next_token)),
                     estimated_total: None,
@@ -382,6 +384,7 @@ pub(crate) fn search(
             index += 1;
             if items.len() >= limit {
                 return Ok(Page {
+                    truncated: false,
                     items,
                     next_cursor: calendar_ids
                         .get(index)
@@ -393,6 +396,7 @@ pub(crate) fn search(
             }
         }
         Ok(Page {
+            truncated: false,
             items,
             next_cursor: None,
             estimated_total: None,
@@ -475,6 +479,7 @@ fn page_from_events(
         }
     }
     Ok(Page {
+        truncated: false,
         items,
         next_cursor: response.next_page_token.map(String::into_bytes),
         estimated_total: None,

@@ -194,6 +194,7 @@ async fn page(
         .expect("serializable public contact position")
     });
     Ok(Page {
+        truncated: false,
         items,
         next_cursor,
         estimated_total: None,

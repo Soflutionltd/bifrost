@@ -10,14 +10,30 @@ use crate::ids::{MailboxId, ObjectId, ThreadId};
 pub enum ErrorScope {
     Account,
     Cursor(CursorScope),
-    Mailbox { id: MailboxId },
-    Message { id: ObjectId },
-    Thread { id: ThreadId },
-    Calendar { id: CalendarId },
-    Event { id: EventId },
+    Mailbox {
+        id: MailboxId,
+    },
+    Message {
+        id: ObjectId,
+    },
+    Thread {
+        id: ThreadId,
+    },
+    Calendar {
+        id: CalendarId,
+    },
+    Event {
+        id: EventId,
+    },
     CalendarCollection,
-    Contact { id: ContactId },
+    Contact {
+        id: ContactId,
+    },
     ContactCollection,
+    /// A read-only directory gateway, identified by its resolved URL.
+    DirectoryGateway {
+        url: String,
+    },
 }
 
 /// One serialized `(name, value)` pair. Every `ErrorScope` field is a
@@ -70,6 +86,9 @@ fn scope_fields(scope: &ErrorScope) -> ScopeFields<'_> {
         ErrorScope::CalendarCollection => fields.push("kind", "calendar_collection"),
         ErrorScope::Contact { id } => fields.push("kind", "contact").push("id", &id.0),
         ErrorScope::ContactCollection => fields.push("kind", "contact_collection"),
+        ErrorScope::DirectoryGateway { url } => {
+            fields.push("kind", "directory_gateway").push("url", url)
+        }
     }
 }
 
@@ -328,6 +347,15 @@ mod tests {
     fn scope_fields_pin_the_serialized_shape() {
         let cases: Vec<(ErrorScope, Vec<(&str, &str)>)> = vec![
             (ErrorScope::Account, vec![("kind", "account")]),
+            (
+                ErrorScope::DirectoryGateway {
+                    url: "https://dav.example.test/gal/".into(),
+                },
+                vec![
+                    ("kind", "directory_gateway"),
+                    ("url", "https://dav.example.test/gal/"),
+                ],
+            ),
             (
                 ErrorScope::CalendarCollection,
                 vec![("kind", "calendar_collection")],

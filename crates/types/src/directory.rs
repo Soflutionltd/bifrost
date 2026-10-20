@@ -4,7 +4,7 @@
 //! distinct corpus from the per-account address books `ContactCard`
 //! models. It is surfaced by `Account::directory_search` and backed by
 //! provider directory endpoints (Microsoft Graph `/users`, Google
-//! People `listDirectoryPeople` / `searchDirectoryPeople`).
+//! People `listDirectoryPeople` / `searchDirectoryPeople`, CardDAV gateways).
 
 use crate::cursor::ProtocolKind;
 
@@ -14,7 +14,7 @@ use crate::cursor::ProtocolKind;
 /// per-account address books `ContactCard` models. A `DirectoryCard` carries
 /// no engine-facing id, no etag, and no address-book membership, because no
 /// contact/mutation primitive operates on it: it is a lookup result, full
-/// stop. `email` is the stable key (both backends skip rows without one).
+/// stop. `email` is the stable key (providers skip rows without one).
 ///
 /// Not `#[non_exhaustive]`: like `ContactCard` and `Page`, protocol Account
 /// impls construct `DirectoryCard` values directly outside this crate, so a

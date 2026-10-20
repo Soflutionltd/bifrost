@@ -41,11 +41,6 @@ Filed 2026-10-19 while landing declared throttle keys and stamped budgets
 
 ## A9 (directory search) follow-ups
 
-- **a9-1 (carddav)** RFC 6352 directory-gateway leg. `directory_search`
-  is `Unsupported(DirectorySearch)` on CardDAV; a server may advertise an
-  optional read-only directory-gateway address book, but gateway discovery
-  is a substantial provider-specific unknown with no ratatoskr precedent.
-  Scoped out of A9 to keep the blast radius bounded.
 - **a9-2 residual: the alias `$select` may cost directory reach.** The
   projection itself landed 2026-09-07. What it left open is a consent question
   nobody can settle hermetically: `otherMails` and `proxyAddresses` sit outside

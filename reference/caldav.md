@@ -1040,6 +1040,17 @@ which script an EMPTY transport so a regression panics on an exhausted script.
 the dispatcher's `DavCredentials`, cloning the `Arc` so a bearer token is still
 read live from the shared source at every request.
 
+`DavDispatch` also supports an optional `DavRequestGuard` installed before
+sharing an account. The dispatcher invokes it before each hop, for the request
+URL and any Destination header after redirect rebasing. CardDAV uses this hook
+to refuse every method and operation inside its monotone directory set except
+a DirectorySearch REPORT to an exact admitted search gateway. This includes
+pre-fetch GETs and sync requests, redirected targets and rebased destinations.
+Later directory markers tighten the set without widening origin trust or
+search capabilities; CardDAV sync boundaries retire affected original scopes
+through ScopeRevoked / DisableScope.
+CalDAV installs no guard and retains its existing origin and redirect policy.
+
 **Which requests are declared unreplayable, and why it is a request-level
 declaration.** `DavRequest::idempotent(false)` is set at two call sites: the
 create-PUT (`If-None-Match: *`) in both crates' `put_event` / `put_vcard` - which
@@ -1273,7 +1284,7 @@ collection as a phantom card).
 
 **Any fix to shared-shape code in one crate must be checked against the other.**
 Where the asymmetry is real - CardDAV has no `sync-collection` path and
-discovers one property - it is design, not oversight. Where the fix is to
+discovers addressbook-home-set plus optional directory-gateway properties - it is design, not oversight. Where the fix is to
 something both crates route through, it belongs in `bifrost-dav-core` rather
 than in one `account.rs`.
 

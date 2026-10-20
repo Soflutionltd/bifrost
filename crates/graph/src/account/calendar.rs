@@ -114,6 +114,7 @@ pub(crate) async fn events_in_range(
         .map_err(|error| into_error(error, operation))?
         .map(|next| next.as_str().as_bytes().to_vec());
     Ok(Page {
+        truncated: false,
         items: page
             .value
             .into_iter()
@@ -487,6 +488,7 @@ async fn search_locally(
                             .map(|next| crate::paging::encode_paged_cursor(next, 0))
                     };
                     return Ok(Page {
+                        truncated: false,
                         items,
                         next_cursor,
                         estimated_total: None,
@@ -504,6 +506,7 @@ async fn search_locally(
         skip = 0;
     }
     Ok(Page {
+        truncated: false,
         items,
         next_cursor,
         estimated_total: None,
@@ -567,6 +570,7 @@ async fn search_with_graph_api(
     let next_cursor = (more_results && raw_len > 0)
         .then(|| search_api_cursor(from + u32::try_from(raw_len).unwrap_or(size)));
     Ok(Page {
+        truncated: false,
         items,
         next_cursor,
         estimated_total: None,

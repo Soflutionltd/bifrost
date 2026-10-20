@@ -125,7 +125,8 @@ pub(crate) fn build_capabilities(
             contact_delete: contact_pim.is_some_and(|p| p.contact_delete),
             contact_search: contact_pim.is_some_and(|p| p.contact_search),
             contact_autocomplete: contact_pim.is_some_and(|p| p.contact_autocomplete),
-            directory_search: false,
+            directory_search: contact_pim.is_some_and(|p| p.directory_search),
+            directory_enumerate: contact_pim.is_some_and(|p| p.directory_enumerate),
             directory_groups_list: false,
             directory_group_expand: false,
             calendars_list: calendar_pim.is_some_and(|p| p.calendars_list),
@@ -209,6 +210,23 @@ mod tests {
         assert!(caps.pim_methods.filter_update);
         assert!(caps.pim_methods.filter_delete);
         assert!(caps.pim_methods.filter_validate);
+    }
+
+    #[test]
+    fn directory_capabilities_copy_the_contact_backend_only() {
+        let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
+        for (search, enumerate) in [(false, false), (true, false), (true, true)] {
+            let mut sub = crate::account::test_support::stub_capabilities();
+            sub.pim_methods.directory_search = search;
+            sub.pim_methods.directory_enumerate = enumerate;
+            let caps = build_capabilities(&profile, &[], false, Some(&sub), None, false, false);
+            assert_eq!(caps.pim_methods.directory_search, search);
+            assert_eq!(caps.pim_methods.directory_enumerate, enumerate);
+            let calendar_only =
+                build_capabilities(&profile, &[], false, None, Some(&sub), false, false);
+            assert!(!calendar_only.pim_methods.directory_search);
+            assert!(!calendar_only.pim_methods.directory_enumerate);
+        }
     }
 
     /// Minimal capability snapshot for a composed sub-account, with all

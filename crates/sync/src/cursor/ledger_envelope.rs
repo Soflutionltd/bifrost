@@ -51,6 +51,7 @@
 //!
 //! Version 5 adds Event resource (tag 11) and scope (tag 9) to the error
 //! digest. Versions 3 and 4 remain readable without those tags.
+//! Version 6 adds DirectoryGateway scope (tag 10); older versions reject it.
 //!
 //! A `BarrierIncident::resume_from` nests a whole cursor envelope through
 //! `encode_envelope` / `decode_envelope` rather than re-deriving one: the
@@ -113,7 +114,7 @@ use crate::error::Error;
 /// Current ledger envelope version. Bumped whenever the layout below changes
 /// in a way an older decoder would misread, including a new tag in a
 /// vocabulary an older decoder would refuse.
-pub const LEDGER_ENVELOPE_VERSION: u32 = 5;
+pub const LEDGER_ENVELOPE_VERSION: u32 = 6;
 
 /// Lowest ledger envelope version still readable by this engine.
 ///
@@ -300,7 +301,7 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
 /// one.
 ///
 /// A no-op while every version in the readable window shares one layout
-/// (versions 4 and 5 only widened the error vocabulary). It exists as the
+/// (versions 4 through 6 only widened the error vocabulary). It exists as the
 /// named boundary anyway, for the same reason `migrate_change_cursor` does:
 /// the codec is the only place in the workspace that may hold ledger state in
 /// an older shape, so a fixup written anywhere else spreads knowledge of a dead
@@ -1105,6 +1106,10 @@ fn encode_error_scope(out: &mut Vec<u8>, scope: &ErrorScope) {
             write_string(out, &id.0);
         }
         ErrorScope::ContactCollection => out.push(8),
+        ErrorScope::DirectoryGateway { url } => {
+            out.push(10);
+            write_string(out, url);
+        }
         ErrorScope::Event { id } => {
             out.push(9);
             write_string(out, &id.0);
@@ -1137,6 +1142,9 @@ fn decode_error_scope(reader: &mut Reader<'_>) -> Result<ErrorScope, Error> {
         8 => ErrorScope::ContactCollection,
         9 if reader.version >= 5 => ErrorScope::Event {
             id: bifrost_types::EventId(reader.string()?),
+        },
+        10 if reader.version >= 6 => ErrorScope::DirectoryGateway {
+            url: reader.string()?,
         },
         other => return Err(unknown_tag("error scope", other)),
     })
@@ -1720,6 +1728,30 @@ mod tests {
         }
         let past_end = u8::try_from(super::OPERATIONS.len()).expect("table fits a u8 tag");
         assert!(super::decode_operation(past_end).is_err());
+    }
+
+    #[test]
+    fn directory_gateway_scope_digest_round_trips_and_requires_version_six() {
+        assert_eq!(
+            &encode_ledger(&DebtLedger::new())[4..8],
+            &6u32.to_le_bytes(),
+            "the new error-scope vocabulary requires a version-six header",
+        );
+        let scope = bifrost_types::ErrorScope::DirectoryGateway {
+            url: "https://dav.example.test/gal/".into(),
+        };
+        let mut bytes = Vec::new();
+        super::encode_error_scope(&mut bytes, &scope);
+        assert_eq!(
+            super::decode_error_scope(&mut super::Reader::new(&bytes, 6)).expect("scope"),
+            scope
+        );
+        for version in [3, 4, 5] {
+            assert!(super::decode_error_scope(&mut super::Reader::new(&bytes, version)).is_err());
+            let mut previous = encode_ledger(&DebtLedger::new());
+            previous[4..8].copy_from_slice(&version.to_le_bytes());
+            assert!(decode_ledger(&previous).is_ok());
+        }
     }
 
     #[test]

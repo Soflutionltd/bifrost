@@ -283,15 +283,13 @@ pub struct PimMethodSupport {
     pub contact_delete: bool,
     pub contact_search: bool,
     pub contact_autocomplete: bool,
-    /// Native organization-directory / Global Address List search
-    /// (`directory_search`). Microsoft Graph `/users`, Google People
-    /// `listDirectoryPeople` / `searchDirectoryPeople`. The directory corpus is
-    /// org-wide and read-only, distinct from the per-account address books
-    /// `contact_search` serves. `true` only on Graph and Gmail; `false` ->
-    /// `directory_search` returns `Unsupported(DirectorySearch)` (JMAP, IMAP,
-    /// CalDAV, CardDAV). Replaces ratatoskr's consumer-side `match provider`
-    /// in `handlers/gal.rs` (closes the A8 provider-identity leak A-2).
+    /// Provider-side directory lookup with a non-empty query. Independent of
+    /// enumeration support. CardDAV requires an admitted directory gateway.
     pub directory_search: bool,
+    /// Empty-query directory enumeration, via `directory_search`.
+    /// A provider without this flag returns classified Unsupported for an
+    /// empty query, even when non-empty lookups are supported.
+    pub directory_enumerate: bool,
     /// Mail-enabled directory-group listing (`directory_groups_list`):
     /// the org-directory groups the authenticated mailbox belongs to
     /// (Microsoft Graph `/me/memberOf` filtered to mail-enabled). `true`

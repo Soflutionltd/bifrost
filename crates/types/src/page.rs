@@ -1,6 +1,6 @@
 //! Generic paginated result envelope.
 //!
-//! Used by `Account::search` and `Account::search_messages` to return
+//! Used by account search, contact, directory and calendar primitives to return
 //! a slice of results plus an opaque cursor a follow-up call can pass
 //! back to fetch the next page. The cursor is protocol-owned bytes;
 //! the engine and consumers treat it as opaque the same way they
@@ -16,6 +16,9 @@ use crate::error::{AccountError, ErrorScope};
 /// question instead of silently defaulting it.
 #[derive(Debug, Clone)]
 pub struct Page<T> {
+    /// True when results were cut short without a continuation. A terminal
+    /// page can therefore be non-exhaustive. Independent of failed/skipped lanes.
+    pub truncated: bool,
     /// Items in this page.
     pub items: Vec<T>,
     /// Opaque cursor to pass to the next call to resume after the
@@ -74,6 +77,7 @@ impl<T> Page<T> {
         skipped_scopes: Vec<SkippedScope>,
     ) -> Self {
         Self {
+            truncated: false,
             items,
             next_cursor: None,
             estimated_total: None,
@@ -82,7 +86,8 @@ impl<T> Page<T> {
         }
     }
 
-    /// True iff the protocol indicated this page is the last.
+    /// True iff the protocol indicated this page is the last. Does not imply
+    /// exhaustive results: inspect `truncated` and the failure lanes.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         self.next_cursor.is_none()
@@ -97,5 +102,6 @@ mod tests {
     fn single_preserves_failed_ids() {
         let page = Page::<()>::single(vec![], vec!["bad".to_owned()], vec![]);
         assert_eq!(page.failed_ids, ["bad"]);
+        assert!(!page.truncated);
     }
 }

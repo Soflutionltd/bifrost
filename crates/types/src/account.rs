@@ -941,14 +941,18 @@ pub trait Account: Send + Sync {
 
     /// Search the organization directory (Global Address List). The directory
     /// is the org-wide, read-only address corpus - distinct from the per-account
-    /// address books `contact_search` serves. An empty `query` enumerates the
-    /// directory (page through `Page::next_cursor` to exhaust it); a non-empty
+    /// address books `contact_search` serves. When `directory_enumerate` is true,
+    /// an empty `query` enumerates the directory (page through
+    /// `Page::next_cursor` to exhaust it); a non-empty
     /// `query` is a provider-side lookup. `limit` caps the page; `page_cursor`
     /// resumes from a prior `Page::next_cursor`.
     ///
-    /// Gated by `capabilities().pim_methods.directory_search`. Accounts without
-    /// a directory (JMAP, IMAP, CalDAV, CardDAV) leave the flag `false` and
-    /// return `Unsupported(DirectorySearch)`.
+    /// Gated by `capabilities().pim_methods.directory_search` for non-empty
+    /// lookups. An empty query without `directory_enumerate` returns classified
+    /// `Unsupported(DirectorySearch)`. Accounts without directory support return
+    /// Unsupported before validating a cursor or performing I/O. A provider
+    /// without paging rejects a supplied cursor locally. Terminal results may
+    /// still be incomplete: inspect `Page::truncated` and the failure lanes.
     fn directory_search(
         &self,
         query: String,

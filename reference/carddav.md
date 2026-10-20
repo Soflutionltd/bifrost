@@ -15,7 +15,7 @@ Current Stage 3 W2 standalone CardDAV account implementation.
 - `CardDavAccountFactory` - implements `AccountFactory`.
 
 `CardDavAccountFactory::open(account_id)` discovers the CardDAV
-addressbook home, caches the default address book URL, and returns an
+addressbook home and directory gateways, caches the default personal address book URL, and returns an
 `Arc<dyn Account>` inside an `OpenedAccount` whose skip lane is always
 empty (single-principal surface). The raw DAV client and parser modules stay
 crate-private; consumers use only the factory and the shared `Account`
@@ -54,7 +54,7 @@ carries the same reasoning at length, and the twin must not drift from it.
 The walk is no longer a twin at all: it is
 `DavDispatch::discover_current_user_principal` in `bifrost-dav-core`
 (`discovery.rs`), shared with `bifrost-caldav`, and this crate's
-`discover_addressbook_home` calls it and keeps only the addressbook-home lookup
+`discover_addressbook_home` calls it and keeps the addressbook-home and directory-gateway lookup
 after the principal. `DavProtocol::well_known_service` names the well-known
 suffix. Inside the walk one private `discover_principal(root)` runs the PROPFIND
 and the `current-user-principal` decode together, returning
@@ -97,7 +97,7 @@ narrowed the predicate.
   `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so a completed
   non-idempotent mutation reconciles instead of replaying blindly.
   Credential-bearing requests are limited to the configured base origin plus
-  an addressbook-home origin delegated by an authenticated principal on that
+  an addressbook-home or directory-gateway origin delegated by an authenticated principal on that
   origin. Resource hrefs, consumer-provided native ids, and a cross-origin
   principal href cannot extend that internal origin set. A delegated origin
   may never weaken the transport guarantee the configured base URL
@@ -418,12 +418,135 @@ Supported contact primitives:
   a per-page set, not a running tally. Empty search takes the same walk
   `contacts_list` does - page the depth-1 listing, multiget only that page's
   hrefs - differing only in where the page size comes from, so match-all
-  behavior is preserved without re-hydrating the whole address book per page. This is the *personal* corpus only;
-  `directory_search` (org directory / GAL) returns
-  `Unsupported(DirectorySearch)` with the capability flag `false`. An RFC
-  6352 directory-gateway leg is a named follow-up: the
-  port evidence has no CardDAV directory impl, and gateway discovery is a
-  substantial provider-specific unknown.
+  behavior is preserved without re-hydrating the whole address book per page. This is the *personal* corpus only; the separate directory path below
+  never enumerates these books or filters matches locally.
+
+## Directory gateways
+
+`CARDDAV:directory-gateway` and the `CARDDAV:directory` resourcetype marker
+come from **draft-daboo-carddav-directory-gateway-02**, not RFC 6352.
+The principal PROPFIND requests `directory-gateway` alongside
+`addressbook-home-set`. The plural href extractor reads all successful
+property values, resolving them against the effective response URL. There is
+no context-root fallback. Discovery returns home plus gateway URLs without
+changing trust; `open_with_client` stages admission after authenticated
+discovery, then also recognizes directory-marked collections in the home
+listing. A listing marker never delegates an origin: it becomes searchable only
+when its origin is already trusted through the configured base or principal
+discovery. Only the principal's home-set and directory-gateway properties may
+extend the origin set. Principal-advertised directory exclusions are seeded
+before the first home listing. An admitted home inside such a directory is not
+enumerated: it contributes no personal book or default, while bounded directory
+lookup remains available. This does not bypass origin refusal for an unadmitted
+or downgraded home. HTTPS accounts refuse HTTP delegation, including gateways. Refused
+gateways do not enable `pim_methods.directory_search`. Admitted URLs are sorted
+and deduplicated by DAV URL identity, including equivalent encoded spellings.
+
+Gateways are read-only lookup scopes, never personal address books, defaults,
+or discovered sync scopes. Advertised gateway URLs and directory-marked
+collections are remembered for exclusion even when origin admission refused
+them. Origin trust, search gateways, capabilities, defaults and the candidate
+sync-scope URLs remain open-time snapshots. Scope discovery omits candidates
+that later join the monotone refusal set. The refusal set is MONOTONE: every
+advertised or marked directory at open, plus every successful directory marker
+observed in a later home listing. Markers can add exclusions but cannot remove
+one until reopen, even if a later listing omits the marker or collection.
+Tightening personal-read and write eligibility is safe live; widening credential
+trust or the searchable surface requires authenticated rediscovery on reopen.
+Later observations never admit origins or enable directory search.
+Create destinations, update sources, relocation destinations and delete
+targets inside a gateway return classified Unsupported before any request,
+including the GET preceding an update. Membership compares resolved URL
+ancestors by DAV identity (same origin and whole path segments), ignoring
+query strings; a similarly prefixed sibling path remains writable.
+
+`DavDispatch` invokes the `DavRequestGuard` hook before every wire hop,
+checking both the request target and any Destination header after redirect
+rebasing. CardDAV installs this hook when the client is constructed. It shares
+the monotone directory set with the Account preflight doors. EVERY method and
+operation targeting a known directory is refused by default. There is exactly
+one exemption: a `DirectorySearch` REPORT whose target is exactly an admitted
+search gateway from open. A GET, a gateway descendant, or a later-observed
+directory is not exempt, even under the DirectorySearch operation. New
+operations need no entry in a guard list to be protected. CalDAV installs no
+directory guard.
+
+This covers update pre-fetch GETs, personal reads, sync, discovery and writes,
+as well as redirected targets and rebased destinations. Ordinary refusals are
+Unsupported with `ErrorScope::DirectoryGateway { url }` identifying the refused
+target. A refused later hop preserves Acknowledged attempt evidence for the
+preceding answered redirect; the refused hop is never sent.
+
+At the establishment, inventory and changes boundaries, a directory refusal is
+translated to `SyncState(ScopeRevoked)` with the ORIGINAL cursor scope and
+operation, deriving `Engine(DisableScope(scope))`. The collection is no longer
+eligible for personal contact sync: retrying or downgrading a strategy cannot
+make directory enumeration appropriate. Quarantining that scope stops the
+walk without restarting the account or retrying forever. Inventory emits only
+Terminated, with no personal entries, coverage or checkpoint; changes emit no
+personal changes or checkpoint. Redirect evidence survives the translation,
+and a redirected directory URL never replaces the original scope being
+retired. The inventory/establishment snapshot preflights its collection before
+requesting the home, and the per-hop guard also catches a directory learned
+from that very home response before any member enumeration.
+
+Personal `contacts_list`, `contact_get` and `contact_search` reject known
+directory URLs with classified Unsupported before any request, using the same
+resolved URL ancestry rule. This includes cached/default ids after a marker.
+Directory results are available only through bounded `directory_search`.
+
+`directory_search` is enabled only with an admitted gateway. A false capability
+returns Unsupported before cursor validation or I/O. `directory_enumerate`
+stays false: empty or whitespace-only queries return Unsupported. A supplied
+cursor returns local `Request(Malformed)` because this endpoint has no paging.
+An omitted limit defaults to 250; zero returns an empty complete page locally.
+
+A non-empty query issues one depth-1 REPORT per gateway. RFC 6352 governs
+`addressbook-query`, `text-match` and truncation: the body requests
+`address-data`, has an `anyof` filter over FN, EMAIL, N and NICKNAME with
+`i;unicode-casemap` / `contains`, and sets `C:limit/C:nresults` to the caller's
+limit. Transport, XML escaping, effective-URL href resolution and vCard
+parsing are shared with the contact lanes. Filter refusals (400/405/501, or
+403 naming a filter precondition) return Unsupported; other refusals retain
+normal status classification. There is no enumerate-and-match fallback and no
+`contact_matches` pass.
+
+A response-level 507 for the REPORT request-URI inside a 207 is consumed before
+ordinary per-resource classification, with or without
+`DAV:number-of-matches-within-limits`: rows survive and `Page::truncated` is
+true, never QuotaExhausted for that collection marker. A resource-level 507
+still follows ordinary classification. Local overflow beyond the global limit
+also sets `truncated`. Every result has `next_cursor: None` and
+`estimated_total: None`; terminal does not imply exhaustive. Unparseable cards,
+missing address-data and refused resources use `failed_ids`; email-less cards
+are skipped.
+
+Directory projection is dedicated to `DirectoryCard` with provider CardDav.
+The preferred non-empty email is the key (lowest valid v4 PREF, or v3 preferred
+flag, with provider order breaking ties); extra non-empty emails and phones
+remain in provider order. Title is the first non-empty parsed TITLE in wire
+order; later TITLE lines in the same organization do not replace it. Personal
+contacts retain their existing last-TITLE selection per organization: their
+single-title field has no first-title contract, so the directory lookup policy
+does not change that established projection.
+Company is the first structured ORG component;
+department joins later non-empty components with `; `. Escaped semicolons stay
+inside their original component. The personal `ContactOrganization.name`
+projection still joins components into its single string field, and its writer
+still cannot distinguish a literal semicolon from a structural separator.
+That existing personal-contact representation is unchanged by this directory
+path, which retains the original components separately.
+
+Gateway fan-out uses ordered buffering with at most four REPORTs in flight per
+call. Merge order is lexical gateway URL, then response order; first wins.
+Deduplication uses only the primary email after trimming and Rust Unicode
+lowercasing; aliases do not deduplicate distinct rows. The limit is global.
+One failed gateway produces a `SkippedScope` naming
+`ErrorScope::DirectoryGateway { url }` while other successful gateways remain
+usable (even an empty successful gateway counts). If all gateways fail, the
+worst recovery error is returned. Skipped scopes and failed ids independently
+signal missing observations; `truncated` specifically signals a result limit.
+
 
 CardDAV maps ADR postal addresses through the shared `ContactAddress`
 model and inline PHOTO data through shared `ContactPhoto`, accepting both
@@ -584,7 +707,7 @@ of a CalDAV test of the same name.
 The 207 parser and the polling cursor were both collapsed into that shared crate
 too; `reference/caldav.md`, "The 207 parser, collapsed" and "The polling cursor,
 collapsed", is the description. What this crate supplies is two `PropSet`
-implementations - `AddressBookProps` (`<addressbook/>`, the privilege markers,
+implementations - `AddressBookProps` (`<addressbook/>`, `<directory/>`, the privilege markers,
 `displayname`, `getctag`) and `ContactProps` (`<collection/>`, `getetag`,
 `getcontenttype`, `address-data`) - plus its entry constructors. Every listing
 lane runs through `bifrost_dav_core::parse_multistatus`: address-book discovery,

@@ -846,10 +846,13 @@ impl Account for ImapAccount {
 
     fn directory_search(
         &self,
-        _query: String,
-        _limit: Option<u32>,
-        _page_cursor: Option<Vec<u8>>,
+        query: String,
+        limit: Option<u32>,
+        page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
+        if let Some(contacts) = &self.contacts {
+            return contacts.directory_search(query, limit, page_cursor);
+        }
         unsupported_future(AccountOperation::DirectorySearch)
     }
 
@@ -1750,6 +1753,42 @@ mod guarded_stream_tests {
         assert!(
             reclaimed.is_ok(),
             "the reclaimed connection must still be checkout-able",
+        );
+    }
+}
+
+#[cfg(test)]
+mod directory_forwarding_tests {
+    use super::test_support::{
+        DirectoryCall, StubAccount, scripted_account_parts, stub_capabilities,
+    };
+    use super::*;
+    use crate::connection::test_support::{driver_pair, preauth_greeting};
+
+    #[tokio::test]
+    async fn directory_search_forwards_arguments_and_page_from_carddav() {
+        let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+        drop(server);
+        let mut caps = stub_capabilities();
+        caps.pim_methods.directory_search = true;
+        let sub = Arc::new(StubAccount::with_capabilities(caps));
+        let account = ImapAccount::new(ImapAccountParts {
+            contacts: Some(Arc::clone(&sub) as Arc<dyn Account>),
+            ..scripted_account_parts(conn, 1)
+        });
+        let page = account
+            .directory_search("needle".into(), Some(17), Some(vec![4, 2]))
+            .await
+            .expect("forward");
+        assert_eq!(page.items[0].email, "directory-sentinel@example.test");
+        assert!(page.truncated);
+        assert_eq!(
+            *sub.directory_call.lock().expect("lock"),
+            Some(DirectoryCall {
+                query: "needle".into(),
+                limit: Some(17),
+                cursor: Some(vec![4, 2]),
+            })
         );
     }
 }

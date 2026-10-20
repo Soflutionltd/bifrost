@@ -45,6 +45,7 @@ pub(crate) async fn directory_groups_list(
         get_page(&account, Resource::Unmetered, &url, operation).await?;
     let next_cursor = link_cursor(admit_next(&account, &page, operation)?);
     Ok(Page {
+        truncated: false,
         items: page.value.into_iter().filter_map(classify_group).collect(),
         next_cursor,
         estimated_total: None,
@@ -67,6 +68,7 @@ pub(crate) async fn directory_group_expand(
         get_page(&account, Resource::Unmetered, &url, operation).await?;
     let next_cursor = link_cursor(admit_next(&account, &page, operation)?);
     Ok(Page {
+        truncated: false,
         items: page.value.into_iter().filter_map(member_to_row).collect(),
         next_cursor,
         estimated_total: None,

@@ -31,6 +31,7 @@ pub(crate) async fn search(
         }
     }
     Ok(Page {
+        truncated: false,
         items: threads,
         next_cursor: page.next_cursor,
         estimated_total: page.estimated_total,
@@ -45,6 +46,7 @@ pub(crate) async fn search_messages(
 ) -> Result<Page<ObjectId>, AccountError> {
     let page = search_message_rows(&account, request).await?;
     Ok(Page {
+        truncated: false,
         items: page.items.into_iter().map(|row| row.id).collect(),
         next_cursor: page.next_cursor,
         estimated_total: page.estimated_total,
@@ -164,6 +166,7 @@ pub(super) async fn search_message_rows(
                     // complete, minus the quarantined scopes it reports.
                     None => {
                         return Ok(Page {
+                            truncated: false,
                             items: Vec::new(),
                             next_cursor: None,
                             estimated_total: None,
@@ -210,6 +213,7 @@ pub(super) async fn search_message_rows(
             .map(|owner| encode_search_cursor(account, Some(&owner), None)),
     };
     Ok(Page {
+        truncated: false,
         items: rows,
         next_cursor,
         estimated_total: None,

@@ -768,6 +768,7 @@ pub(crate) fn search<T: HttpTransport>(
         let page = search_email_ids(routed, request, true, owner, op).await?;
         if page.items.is_empty() {
             return Ok(Page {
+                truncated: false,
                 items: Vec::new(),
                 next_cursor: page.next_cursor,
                 estimated_total: page.estimated_total,
@@ -805,6 +806,7 @@ pub(crate) fn search<T: HttpTransport>(
             .map(|id| qualify(owner, id))
             .collect();
         Ok(Page {
+            truncated: false,
             items,
             next_cursor: page.next_cursor,
             estimated_total: page.estimated_total,
@@ -886,6 +888,7 @@ pub(crate) fn search_messages<T: HttpTransport>(
         let owner = owner.as_deref();
         let page = search_email_ids(routed, request, false, owner, op).await?;
         Ok(Page {
+            truncated: false,
             items: page
                 .items
                 .into_iter()
@@ -2484,6 +2487,7 @@ async fn search_email_ids<T: HttpTransport>(
     let next_cursor = more.then(|| encode_position(next_position, &query_state, owner));
 
     Ok(Page {
+        truncated: false,
         items: ids,
         next_cursor,
         estimated_total: total,

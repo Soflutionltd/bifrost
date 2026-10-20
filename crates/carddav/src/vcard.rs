@@ -19,6 +19,8 @@ pub(crate) struct ParsedVCard {
     pub(crate) emails: Vec<ContactEmail>,
     pub(crate) phones: Vec<ContactPhone>,
     pub(crate) organizations: Vec<ContactOrganization>,
+    /// Raw structured ORG components, before personal-contact flattening.
+    organization_components: Vec<Vec<String>>,
     pub(crate) addresses: Vec<ContactAddress>,
     pub(crate) notes: Option<String>,
     pub(crate) photo_url: Option<String>,
@@ -54,6 +56,59 @@ pub(crate) fn contact_from_vcard(
         photo_url: parsed.photo_url,
         photo: parsed.photo,
     })
+}
+
+/// Dedicated read-only directory projection: no personal-contact identity or
+/// corpus, and ORG components are read before the personal model flattens them.
+pub(crate) fn directory_from_vcard(
+    data: &str,
+) -> Result<Option<bifrost_types::DirectoryCard>, VCardParseError> {
+    let parsed = parse_vcard_for(data, true)?;
+    let primary = parsed
+        .emails
+        .iter()
+        .position(|e| e.is_primary && !e.value.trim().is_empty())
+        .or_else(|| {
+            parsed
+                .emails
+                .iter()
+                .position(|e| !e.value.trim().is_empty())
+        });
+    let Some(primary) = primary else {
+        return Ok(None);
+    };
+    let components = parsed.organization_components.first();
+    let company = components
+        .and_then(|c| c.first())
+        .filter(|s| !s.is_empty())
+        .cloned();
+    // ORG's remaining components are nested organizational units, in order.
+    let department = components
+        .map(|c| {
+            c.iter()
+                .skip(1)
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .filter(|s| !s.is_empty());
+    Ok(Some(bifrost_types::DirectoryCard {
+        email: parsed.emails[primary].value.trim().to_string(),
+        additional_emails: parsed
+            .emails
+            .into_iter()
+            .enumerate()
+            .filter(|(index, e)| *index != primary && !e.value.trim().is_empty())
+            .map(|(_, e)| e.value)
+            .collect(),
+        display_name: parsed.display_name,
+        phones: parsed.phones.into_iter().map(|p| p.value).collect(),
+        company,
+        department,
+        title: parsed.organizations.iter().find_map(|o| o.title.clone()),
+        provider: ProtocolKind::CardDav,
+    }))
 }
 
 /// A consumer value the writers refuse to put on the wire.
@@ -548,11 +603,16 @@ fn group_prefix(group: Option<&str>) -> String {
 }
 
 fn parse_vcard(data: &str) -> Result<ParsedVCard, VCardParseError> {
+    parse_vcard_for(data, false)
+}
+
+fn parse_vcard_for(data: &str, directory: bool) -> Result<ParsedVCard, VCardParseError> {
     let mut parsed = ParsedVCard {
         display_name: None,
         emails: Vec::new(),
         phones: Vec::new(),
         organizations: Vec::new(),
+        organization_components: Vec::new(),
         addresses: Vec::new(),
         notes: None,
         photo_url: None,
@@ -581,7 +641,7 @@ fn parse_vcard(data: &str) -> Result<ParsedVCard, VCardParseError> {
             "N" if !raw_value.is_empty() => {
                 structured_name = Some(display_name_from_n(raw_value));
             }
-            "EMAIL" if !value.is_empty() => {
+            "EMAIL" if !value.is_empty() && (!directory || !value.trim().is_empty()) => {
                 parsed.emails.push(ContactEmail {
                     value,
                     kind: type_from_params(&content.params),
@@ -598,6 +658,9 @@ fn parse_vcard(data: &str) -> Result<ParsedVCard, VCardParseError> {
                 phone_preferences.push(preference_ordinal(&content.params));
             }
             "ORG" if !value.is_empty() => {
+                parsed
+                    .organization_components
+                    .push(split_components(raw_value));
                 if let Some(org) = pending_org.take() {
                     parsed.organizations.push(org);
                 }
@@ -622,7 +685,14 @@ fn parse_vcard(data: &str) -> Result<ParsedVCard, VCardParseError> {
                 // deleted by the next `organizations` patch, which strips
                 // every ORG/TITLE line and re-emits only what the model holds.
                 match pending_org.as_mut() {
-                    Some(org) => org.title = Some(value),
+                    Some(org) => {
+                        // Directory projection promises the first title. Personal
+                        // contacts retain their existing last-title selection in
+                        // the shared single-title organization slot.
+                        if !directory || org.title.is_none() {
+                            org.title = Some(value);
+                        }
+                    }
                     None => {
                         pending_org = Some(ContactOrganization {
                             name: String::new(),

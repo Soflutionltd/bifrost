@@ -66,6 +66,17 @@ fn dav_account_spec() -> AccountSpec {
     spec
 }
 
+/// Dialect policy checked before every wire hop, for its target and any
+/// Destination header after redirect rebasing. Origin trust remains separate.
+pub trait DavRequestGuard: Send + Sync {
+    fn check_target(
+        &self,
+        method: &Method,
+        url: &str,
+        operation: AccountOperation,
+    ) -> Result<(), AccountError>;
+}
+
 /// A DAV client's transport half: the account handle, credentials, and the set
 /// of origins those credentials may reach.
 #[derive(Clone)]
@@ -75,6 +86,7 @@ pub struct DavDispatch {
     credentials: DavCredentials,
     trusted_origins: Vec<String>,
     protocol: DavProtocol,
+    request_guard: Option<Arc<dyn DavRequestGuard>>,
 }
 
 impl DavDispatch {
@@ -141,7 +153,32 @@ impl DavDispatch {
             credentials,
             trusted_origins,
             protocol,
+            request_guard: None,
         }
+    }
+
+    /// Install a dialect policy before sharing the account. The policy may
+    /// maintain monotone exclusions shared by cloned dispatchers.
+    pub fn set_request_guard(&mut self, guard: Arc<dyn DavRequestGuard>) {
+        self.request_guard = Some(guard);
+    }
+
+    fn check_request_targets(
+        &self,
+        request: &DavRequest,
+        operation: AccountOperation,
+    ) -> Result<(), AccountError> {
+        if let Some(guard) = &self.request_guard {
+            guard.check_target(&request.method, &request.url, operation)?;
+            if let Some(destination) = request
+                .headers
+                .get(DESTINATION)
+                .and_then(|v| v.to_str().ok())
+            {
+                guard.check_target(&request.method, destination, operation)?;
+            }
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -614,6 +651,17 @@ impl DavDispatch {
         let mut request = request;
         let mut hops = 0usize;
         loop {
+            // Check both the source and the current Destination on EVERY hop.
+            // Redirect rebasing below has already produced this hop's final
+            // destination, so dialect policy cannot be bypassed by a redirect.
+            self.check_request_targets(&request, operation)
+                .map_err(|error| {
+                    if hops > 0 {
+                        refused_after_answered_hop(error)
+                    } else {
+                        error
+                    }
+                })?;
             let response = self.dispatch_once(&request, operation).await?;
             let redirect = matches!(
                 response.status,
@@ -920,15 +968,11 @@ impl DavDispatch {
 /// Stamp a local refusal raised partway through the redirect walk with the
 /// transmission evidence it is owed.
 ///
-/// The refusal itself stays this client's decision - `Request(Malformed)`, the
-/// kind `should_fallback_discovery` reads a refused well-known redirect by - but
-/// it is not the refusal of an UNSENT request: the previous hop went out and
-/// the server answered it with the redirect being refused. With no attempt
-/// cause it read as `Unsent` in telemetry and support exports, claiming nothing
-/// had left the process. `Acknowledged` is the honest state: the server
-/// answered, and a 3xx is an answer that did not act on the request. It moves
-/// no recovery class (`derive` reads a `Request` kind as `ClientBug` whatever
-/// the attempt says).
+/// The classification stays this client's decision: `Request(Malformed)` for
+/// origin refusal (which discovery's fallback predicate reads), or Unsupported
+/// for a dialect policy refusal. The previous hop was sent and answered, so
+/// this is not an UNSENT exchange. `Acknowledged` records that evidence without
+/// changing either refusal's recovery class. The refused next hop is not sent.
 fn refused_after_answered_hop(error: AccountError) -> AccountError {
     error
         .into_builder()

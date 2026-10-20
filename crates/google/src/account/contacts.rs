@@ -403,6 +403,7 @@ pub(crate) fn search(
             .map(|result| contact_from_person(result.person, ContactCorpus::Main))
             .collect();
         Ok(Page {
+            truncated: false,
             items,
             next_cursor: response.next_page_token.map(String::into_bytes),
             estimated_total: None,
@@ -483,6 +484,7 @@ pub(crate) fn directory_search(
             .filter_map(person_to_directory_card)
             .collect();
         Ok(Page {
+            truncated: false,
             items,
             next_cursor: response.next_page_token.map(String::into_bytes),
             estimated_total: None,
@@ -675,6 +677,7 @@ fn page_from_people(
     corpus: ContactCorpus,
 ) -> Page<ContactCard> {
     Page {
+        truncated: false,
         items: people
             .into_iter()
             .filter(|person| person_in_group(person, group_filter))

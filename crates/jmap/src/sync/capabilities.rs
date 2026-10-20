@@ -304,6 +304,7 @@ pub(crate) fn build(
             contact_search: support.contacts,
             contact_autocomplete: support.contacts,
             directory_search: false,
+            directory_enumerate: false,
             directory_groups_list: false,
             directory_group_expand: false,
             calendars_list: support.calendar,

@@ -1884,6 +1884,7 @@ fn page_from_items<T: Clone>(
     let page_items = items.get(offset..end).unwrap_or(&[]).to_vec();
     let next_cursor = (end < items.len()).then(|| end.to_string().into_bytes());
     Ok(Page {
+        truncated: false,
         items: page_items,
         next_cursor,
         estimated_total: Some(u64::try_from(items.len()).unwrap_or(u64::MAX)),

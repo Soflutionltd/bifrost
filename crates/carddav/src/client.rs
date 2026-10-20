@@ -17,6 +17,12 @@ use crate::parse::{
     parse_propfind_contacts, resolve_href,
 };
 
+#[derive(Debug)]
+pub(crate) struct AddressBookDiscovery {
+    pub(crate) home: String,
+    pub(crate) gateways: Vec<String>,
+}
+
 const MULTIGET_BATCH_SIZE: usize = 50;
 
 /// In-flight REPORT legs a single multiget or text search may hold open.
@@ -42,6 +48,91 @@ pub(crate) struct CardDavClient {
     /// Transport, credentials, origin gate and the generic WebDAV verbs, all
     /// shared with `bifrost-caldav` through `bifrost-dav-core`.
     dav: DavDispatch,
+    directory_urls: std::sync::Arc<DirectoryGuard>,
+}
+
+/// Monotone directory exclusions shared by the Account doors and dav-core's
+/// per-hop guard. Observing a marker may tighten access, never delegate trust
+/// or add a searchable gateway; those decisions remain open-time snapshots.
+#[derive(Default)]
+struct DirectoryGuard {
+    urls: std::sync::RwLock<Vec<String>>,
+    search_gateways: std::sync::OnceLock<Vec<String>>,
+}
+
+impl DirectoryGuard {
+    fn observe(&self, urls: impl IntoIterator<Item = String>) {
+        let mut known = self.urls.write().expect("directory lock poisoned");
+        for url in urls {
+            if !known
+                .iter()
+                .any(|old| bifrost_dav_core::same_dav_url(old, &url))
+            {
+                known.push(url);
+            }
+        }
+    }
+
+    fn contains_url(&self, url: &str) -> bool {
+        let Ok(mut url) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        // Queries do not change collection membership. Compare whole ancestor
+        // URLs so percent-encoded unreserved characters use the same identity
+        // rule as DAV discovery, without treating an encoded slash as a boundary.
+        url.set_query(None);
+        self.urls
+            .read()
+            .expect("directory lock poisoned")
+            .iter()
+            .any(|gateway| {
+                let Ok(mut gateway) = reqwest::Url::parse(gateway) else {
+                    return false;
+                };
+                gateway.set_query(None);
+                let mut ancestor = url.clone();
+                loop {
+                    if bifrost_dav_core::same_dav_url(ancestor.as_str(), gateway.as_str()) {
+                        return true;
+                    }
+                    let path = ancestor.path().trim_end_matches('/');
+                    let Some((parent, _)) = path.rsplit_once('/') else {
+                        return false;
+                    };
+                    let parent = format!("{parent}/");
+                    if ancestor.path() == parent {
+                        return false;
+                    }
+                    ancestor.set_path(&parent);
+                }
+            })
+    }
+}
+
+impl bifrost_dav_core::DavRequestGuard for DirectoryGuard {
+    fn check_target(
+        &self,
+        method: &Method,
+        url: &str,
+        operation: AccountOperation,
+    ) -> Result<(), AccountError> {
+        if !self.contains_url(url) {
+            return Ok(());
+        }
+        // The only exemption. New methods and operations are refused by
+        // default, including pre-fetch GETs and every sync request.
+        if operation == AccountOperation::DirectorySearch
+            && method.as_str() == "REPORT"
+            && self.search_gateways.get().is_some_and(|gateways| {
+                gateways
+                    .iter()
+                    .any(|gateway| bifrost_dav_core::same_dav_url(gateway, url))
+            })
+        {
+            return Ok(());
+        }
+        Err(directory_refusal(operation, url))
+    }
 }
 
 impl fmt::Debug for CardDavClient {
@@ -61,14 +152,22 @@ impl CardDavClient {
         let net = net
             .cloned()
             .unwrap_or_else(bifrost_net::Net::shared_default);
+        Self::with_dispatch(DavDispatch::on_net(
+            &net,
+            account_id,
+            &config.base_url,
+            config.credentials.to_shared(),
+            DAV,
+        ))
+    }
+
+    fn with_dispatch(mut dav: DavDispatch) -> Self {
+        let directory_urls = std::sync::Arc::new(DirectoryGuard::default());
+        dav.set_request_guard(std::sync::Arc::clone(&directory_urls)
+            as std::sync::Arc<dyn bifrost_dav_core::DavRequestGuard>);
         Self {
-            dav: DavDispatch::on_net(
-                &net,
-                account_id,
-                &config.base_url,
-                config.credentials.to_shared(),
-                DAV,
-            ),
+            dav,
+            directory_urls,
         }
     }
 
@@ -79,14 +178,12 @@ impl CardDavClient {
 
     #[cfg(test)]
     pub(crate) fn with_account_net(base_url: &str, net: AccountNet) -> Self {
-        Self {
-            dav: DavDispatch::with_account_net(
-                net,
-                base_url,
-                crate::CardDavCredentials::bearer("token").to_shared(),
-                DAV,
-            ),
-        }
+        Self::with_dispatch(DavDispatch::with_account_net(
+            net,
+            base_url,
+            crate::CardDavCredentials::bearer("token").to_shared(),
+            DAV,
+        ))
     }
 
     /// The principal walk (well-known probe, fallback predicate, configured
@@ -95,7 +192,9 @@ impl CardDavClient {
     /// the walk is the one that once diverged, parsing the probe body outside
     /// the lookup so a probe answering `200 text/html` never reached the
     /// fallback predicate.
-    pub(crate) async fn discover_addressbook_home(&self) -> Result<String, AccountError> {
+    pub(crate) async fn discover_addressbook_home(
+        &self,
+    ) -> Result<AddressBookDiscovery, AccountError> {
         let principal = self.dav.discover_current_user_principal().await?;
         self.addressbook_home_for_principal(principal).await
     }
@@ -103,7 +202,7 @@ impl CardDavClient {
     async fn addressbook_home_for_principal(
         &self,
         principal: String,
-    ) -> Result<String, AccountError> {
+    ) -> Result<AddressBookDiscovery, AccountError> {
         let response = self
             .dav
             .propfind_raw(
@@ -113,7 +212,7 @@ impl CardDavClient {
                 AccountOperation::Discover,
             )
             .await?;
-        extract_href_property(&response.text, "addressbook-home-set")
+        let home = extract_href_property(&response.text, "addressbook-home-set")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
             .map(|href| resolve_href(&response.url, &href))
             .ok_or_else(|| {
@@ -122,7 +221,17 @@ impl CardDavClient {
                     "missing addressbook-home-set",
                     DAV,
                 )
-            })
+            })?;
+        // CARDDAV:directory-gateway is draft-daboo-carddav-directory-gateway-02,
+        // not RFC 6352. There is no context-root directory fallback.
+        let mut gateways =
+            bifrost_dav_core::extract_href_properties(&response.text, "directory-gateway")
+                .map_err(|error| parse_error(AccountOperation::Discover, error))?
+                .into_iter()
+                .map(|href| resolve_href(&response.url, &href))
+                .collect::<Vec<_>>();
+        dedup_directory_urls(&mut gateways);
+        Ok(AddressBookDiscovery { home, gateways })
     }
 
     pub(crate) async fn list_addressbooks(
@@ -147,6 +256,12 @@ impl CardDavClient {
         for collection in &mut collections {
             collection.resolve_href(&response.url);
         }
+        self.directory_urls.observe(
+            collections
+                .iter()
+                .filter(|c| c.is_directory)
+                .map(|c| c.href.clone()),
+        );
         Ok(collections)
     }
 
@@ -396,6 +511,43 @@ impl CardDavClient {
         }
     }
 
+    /// Directory queries never enumerate or locally narrow the server's answer.
+    pub(crate) async fn query_directory(
+        &self,
+        url: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<(CardDavMultigetReport, bool), AccountError> {
+        let operation = AccountOperation::DirectorySearch;
+        let body = directory_query_body(query, limit);
+        let response = self
+            .dav
+            .report_raw_response(url, "1", &body, operation)
+            .await?;
+        if !response.status.is_success() {
+            return Err(if filter_unsupported(response.status, &response.body) {
+                unsupported_error(operation)
+                    .into_builder()
+                    .push_cause(bifrost_types::Cause::Attempt(
+                        bifrost_types::AttemptCause::new(
+                            bifrost_types::TransmissionState::Acknowledged,
+                        ),
+                    ))
+                    .try_build()
+                    .expect("valid answered filter refusal")
+            } else {
+                status_error(operation, response.status, response.body)
+            });
+        }
+        let (report, truncated) =
+            crate::parse::parse_directory_report(&response.body, &response.url)
+                .map_err(|error| parse_error(operation, error))?;
+        if let Some(error) = multiget_failure(&report, operation) {
+            return Err(error);
+        }
+        Ok((report, truncated))
+    }
+
     /// Fetch one vCard resource with a plain `GET`, reading the validator from
     /// the `ETag` response header.
     ///
@@ -441,6 +593,7 @@ impl CardDavClient {
         condition: PutCondition<'_>,
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
+        self.refuse_directory_access(url, operation)?;
         let mut request = self
             .dav
             .request(Method::PUT, url)
@@ -474,6 +627,8 @@ impl CardDavClient {
         to: &str,
         operation: AccountOperation,
     ) -> Result<bool, AccountError> {
+        self.refuse_directory_access(from, operation)?;
+        self.refuse_directory_access(to, operation)?;
         self.dav.move_resource(from, to, operation).await
     }
 
@@ -488,6 +643,7 @@ impl CardDavClient {
         url: &str,
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
+        self.refuse_directory_access(url, operation)?;
         let request = self
             .dav
             .request(Method::DELETE, url)
@@ -534,13 +690,60 @@ impl CardDavClient {
         }
     }
 
+    pub(crate) fn observe_directories(&self, urls: impl IntoIterator<Item = String>) {
+        self.directory_urls.observe(urls);
+    }
+
+    pub(crate) fn initialize_directories(
+        &mut self,
+        urls: impl IntoIterator<Item = String>,
+        search_gateways: Vec<String>,
+    ) {
+        self.directory_urls.observe(urls);
+        self.directory_urls
+            .search_gateways
+            .set(search_gateways)
+            .expect("search gateways are frozen once at open");
+    }
+
+    pub(crate) fn is_directory_url(&self, url: &str) -> bool {
+        self.directory_urls.contains_url(&self.resolve_url(url))
+    }
+
+    pub(crate) fn refuse_directory_access(
+        &self,
+        url: &str,
+        operation: AccountOperation,
+    ) -> Result<(), AccountError> {
+        if self.is_directory_url(url) {
+            return Err(directory_refusal(operation, &self.resolve_url(url)));
+        }
+        Ok(())
+    }
+
     pub(crate) fn resolve_url(&self, href: &str) -> String {
         self.dav.resolve_url(href)
+    }
+
+    pub(crate) fn is_trusted_url(&self, url: &str) -> bool {
+        self.dav.is_trusted_url(url)
     }
 
     pub(crate) fn admit_discovered_urls(&mut self, urls: impl IntoIterator<Item = String>) {
         self.dav.admit_discovered_urls(urls);
     }
+}
+
+/// Identify a directory refusal structurally so sync boundaries can retire
+/// their original scope without confusing an unrelated Unsupported response.
+fn directory_refusal(operation: AccountOperation, url: &str) -> AccountError {
+    unsupported_error(operation)
+        .into_builder()
+        .scope(ErrorScope::DirectoryGateway {
+            url: url.to_string(),
+        })
+        .try_build()
+        .expect("directory scope preserves Unsupported classification")
 }
 
 /// Whether a URL's scheme carries an authenticated, encrypted transport.
@@ -738,10 +941,39 @@ pub(crate) fn not_found_error(error: AccountError, id: impl Into<String>) -> Acc
         .expect("adding a scope cannot invalidate a classified error")
 }
 
+/// Sort once for stable merge precedence, then dedup by DAV URL identity even
+/// when equivalent encoded spellings were not adjacent in lexical order.
+pub(crate) fn dedup_directory_urls(urls: &mut Vec<String>) {
+    urls.sort();
+    let mut unique = Vec::new();
+    for url in urls.drain(..) {
+        if !unique
+            .iter()
+            .any(|old: &String| bifrost_dav_core::same_dav_url(old, &url))
+        {
+            unique.push(url);
+        }
+    }
+    *urls = unique;
+}
+
+/// RFC 6352 addressbook-query, text-match and result-limit grammar. Gateway
+/// discovery itself is draft-daboo-carddav-directory-gateway-02, not that RFC.
+fn directory_query_body(query: &str, limit: u32) -> String {
+    let query = escape_xml(query);
+    let filters = ["FN", "EMAIL", "N", "NICKNAME"].map(|name| format!(
+        "<C:prop-filter name=\"{name}\"><C:text-match collation=\"i;unicode-casemap\" match-type=\"contains\">{query}</C:text-match></C:prop-filter>"
+    )).join("");
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?><C:addressbook-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:prop><D:resourcetype/><C:address-data/></D:prop><C:filter test=\"anyof\">{filters}</C:filter><C:limit><C:nresults>{limit}</C:nresults></C:limit></C:addressbook-query>"
+    )
+}
+
 const PROPFIND_ADDRESSBOOK_HOME: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <D:propfind xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\">\n\
   <D:prop>\n\
     <C:addressbook-home-set/>\n\
+    <C:directory-gateway/>\n\
   </D:prop>\n\
 </D:propfind>";
 
@@ -1567,7 +1799,8 @@ mod tests {
         let home = client
             .discover_addressbook_home()
             .await
-            .expect("base fallback discovers home");
+            .expect("base fallback discovers home")
+            .home;
 
         assert_eq!(home, "https://dav.example.test/books/ada/");
         let urls = transcripts(&script)
@@ -1664,7 +1897,8 @@ mod tests {
         let home = client
             .discover_addressbook_home()
             .await
-            .expect("an index page at the origin root is not a discovery answer");
+            .expect("an index page at the origin root is not a discovery answer")
+            .home;
 
         assert_eq!(home, "https://dav.example.test/books/ada/");
         let urls = transcripts(&script)
@@ -1712,7 +1946,8 @@ mod tests {
         let home = client
             .discover_addressbook_home()
             .await
-            .expect("base fallback discovers home");
+            .expect("base fallback discovers home")
+            .home;
 
         assert_eq!(home, "https://dav.example.test/books/ada/");
         let urls = transcripts(&script)
@@ -1761,7 +1996,8 @@ mod tests {
         let home = client
             .discover_addressbook_home()
             .await
-            .expect("cross-origin home is discovered");
+            .expect("cross-origin home is discovered")
+            .home;
         assert_eq!(home, "https://books.example.test/homes/ada/");
         client.admit_discovered_urls(std::iter::once(home.clone()));
         client
@@ -1953,7 +2189,8 @@ mod tests {
         let home = client
             .discover_addressbook_home()
             .await
-            .expect("home href is still reported");
+            .expect("home href is still reported")
+            .home;
         assert_eq!(home, "http://books.example.test/homes/ada/");
         client.admit_discovered_urls(std::iter::once(home.clone()));
         client
@@ -2523,5 +2760,171 @@ mod tests {
             .expect("nothing usable came back");
 
         assert_eq!(error.recovery(), &RecoveryClass::AuthLost);
+    }
+}
+
+#[cfg(test)]
+mod directory_guard_contract_tests {
+    use super::*;
+    use bifrost_dav_core::DavResponse;
+    use bifrost_dav_core::test_support::{dav_script, scripted_dav_net, transcripts};
+
+    #[tokio::test]
+    async fn directory_round_three_every_account_operation_is_guarded_by_default() {
+        // Check the typed matrix against the authoritative enum source, so a
+        // newly added operation cannot silently fall outside this test.
+        let operations = [
+            AccountOperation::CategoryDefinitionsList,
+            AccountOperation::MessageReactionsRead,
+            AccountOperation::Discover,
+            AccountOperation::EstablishCursor,
+            AccountOperation::DiscoverCursorScopes,
+            AccountOperation::DiscoverMemberships,
+            AccountOperation::ScopeLifecycle,
+            AccountOperation::SyncInventory,
+            AccountOperation::SyncChanges,
+            AccountOperation::Hydrate,
+            AccountOperation::HydrateThread,
+            AccountOperation::HydrateMessage,
+            AccountOperation::OpenBlob,
+            AccountOperation::OpenBlobRange,
+            AccountOperation::OpenRawRfc822,
+            AccountOperation::PushSubscribe,
+            AccountOperation::PushUnsubscribe,
+            AccountOperation::PushStream,
+            AccountOperation::UpdateFlags,
+            AccountOperation::SetStarred,
+            AccountOperation::MarkReplied,
+            AccountOperation::MarkForwarded,
+            AccountOperation::MarkMdnSent,
+            AccountOperation::BulkMove,
+            AccountOperation::BulkDestroy,
+            AccountOperation::MoveThread,
+            AccountOperation::DeleteThread,
+            AccountOperation::AddToContainer,
+            AccountOperation::RemoveFromContainer,
+            AccountOperation::SetKeyword,
+            AccountOperation::SetLabelMembership,
+            AccountOperation::SetCategory,
+            AccountOperation::SetExtendedProperty,
+            AccountOperation::SetImportance,
+            AccountOperation::SetIsRead,
+            AccountOperation::Send,
+            AccountOperation::AttachmentUpload,
+            AccountOperation::HostAttachment,
+            AccountOperation::DraftCreate,
+            AccountOperation::DraftUpdate,
+            AccountOperation::DraftDiscard,
+            AccountOperation::DraftSend,
+            AccountOperation::CancelScheduledSend,
+            AccountOperation::RescheduleSend,
+            AccountOperation::Search,
+            AccountOperation::SearchMessages,
+            AccountOperation::ContainersList,
+            AccountOperation::ContainerCreate,
+            AccountOperation::ContainerRename,
+            AccountOperation::ContainerMove,
+            AccountOperation::ContainerDelete,
+            AccountOperation::IdentitiesList,
+            AccountOperation::IdentityUpdate,
+            AccountOperation::VacationGet,
+            AccountOperation::VacationSet,
+            AccountOperation::QuotaGet,
+            AccountOperation::FiltersList,
+            AccountOperation::FilterCreate,
+            AccountOperation::FilterUpdate,
+            AccountOperation::FilterDelete,
+            AccountOperation::FilterValidate,
+            AccountOperation::AddressBooksList,
+            AccountOperation::ContactsList,
+            AccountOperation::ContactGet,
+            AccountOperation::ContactCreate,
+            AccountOperation::ContactUpdate,
+            AccountOperation::ContactDelete,
+            AccountOperation::ContactSearch,
+            AccountOperation::ContactAutocomplete,
+            AccountOperation::DirectorySearch,
+            AccountOperation::DirectoryGroupsList,
+            AccountOperation::DirectoryGroupExpand,
+            AccountOperation::CalendarsList,
+            AccountOperation::EventsInRange,
+            AccountOperation::EventGet,
+            AccountOperation::EventCreate,
+            AccountOperation::EventUpdate,
+            AccountOperation::EventDelete,
+            AccountOperation::EventRsvp,
+            AccountOperation::EventSearch,
+            AccountOperation::EventAutocomplete,
+            AccountOperation::Close,
+            AccountOperation::Expunge,
+        ];
+        let source = include_str!("../../types/src/error/scope.rs");
+        let declared = source
+            .split("pub enum AccountOperation {")
+            .nth(1)
+            .expect("enum")
+            .split("\n}")
+            .next()
+            .expect("enum body")
+            .lines()
+            .filter_map(|line| line.trim().strip_suffix(','))
+            .filter(|name| {
+                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations
+                .iter()
+                .map(|op| format!("{op:?}"))
+                .collect::<Vec<_>>(),
+            declared
+        );
+        let script = dav_script([DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: Default::default(),
+            body: String::new(),
+            url: String::new(),
+        }]);
+        let mut client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let gateway = "https://dav.example.test/directory/";
+        client.initialize_directories([gateway.to_string()], vec![gateway.to_string()]);
+        client
+            .directory_urls
+            .observe(["https://dav.example.test/later/".to_string()]);
+        for operation in operations {
+            for verb in [
+                "GET", "HEAD", "OPTIONS", "PROPFIND", "REPORT", "PUT", "DELETE", "MOVE", "FUTURE",
+            ] {
+                let method = Method::from_bytes(verb.as_bytes()).expect("method");
+                for url in [
+                    gateway,
+                    "https://dav.example.test/directory/sub/",
+                    "https://dav.example.test/later/",
+                ] {
+                    let result = client
+                        .dav
+                        .send_raw_request(DavRequest::new(method.clone(), url), operation)
+                        .await;
+                    if operation == AccountOperation::DirectorySearch
+                        && verb == "REPORT"
+                        && url == gateway
+                    {
+                        assert!(result.is_ok(), "only the search gateway REPORT is exempt");
+                    } else {
+                        let error = result
+                            .expect_err("all other directory requests are refused before dispatch");
+                        assert!(
+                            matches!(error.kind(), bifrost_types::AccountErrorKind::Unsupported(op) if *op == operation),
+                            "{operation:?} {verb} {url}: {error:?}"
+                        );
+                    }
+                }
+            }
+        }
+        let sent = transcripts(&script);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].method.as_str(), "REPORT");
+        assert_eq!(sent[0].url, gateway);
     }
 }

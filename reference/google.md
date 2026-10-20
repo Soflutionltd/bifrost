@@ -591,6 +591,11 @@ image bytes, not a URL. Raw `ContactPatch.photo` updates call
 `updateContactPhoto` (its field mask travels in the body, not the URL), and
 clearing that field calls `deleteContactPhoto`.
 
+Both `pim_methods.directory_search` (non-empty lookup) and
+`pim_methods.directory_enumerate` (empty-query enumeration) are true.
+Directory pages default to `truncated: false`; continuation remains in
+`next_cursor`.
+
 `directory_search` (organization directory / GAL, distinct from the personal
 `contact_search` corpus) returns `Page<DirectoryCard>`. An empty query
 enumerates via `people:listDirectoryPeople` (no warmup); a non-empty query runs

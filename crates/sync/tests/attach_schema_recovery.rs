@@ -908,6 +908,7 @@ impl Account for HealAccount {
         // through - the DAV shape xc-5 was filed from.
         Box::pin(async {
             Ok(Page {
+                truncated: false,
                 items: Vec::new(),
                 next_cursor: None,
                 estimated_total: None,

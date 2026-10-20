@@ -113,6 +113,7 @@ pub(crate) fn events_in_range<T: HttpTransport>(
             .filter(|event| event_in_range(event, &range.start, &range.end))
             .collect::<Vec<_>>();
         Ok(Page {
+            truncated: false,
             items: events,
             next_cursor,
             estimated_total: total,
@@ -357,6 +358,7 @@ pub(crate) fn search<T: HttpTransport>(
             })
             .collect();
         Ok(Page {
+            truncated: false,
             items: events,
             next_cursor,
             estimated_total: reported_total,

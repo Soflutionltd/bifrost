@@ -97,6 +97,7 @@ pub(crate) fn list<T: HttpTransport>(
         )
         .await?;
         Ok(Page {
+            truncated: false,
             items: hydrated.cards,
             next_cursor,
             estimated_total: total,
@@ -272,6 +273,7 @@ pub(crate) fn search<T: HttpTransport>(
         )
         .await?;
         Ok(Page {
+            truncated: false,
             items: hydrated.cards,
             next_cursor,
             estimated_total: total,

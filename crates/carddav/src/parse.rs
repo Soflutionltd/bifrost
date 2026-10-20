@@ -78,6 +78,7 @@ pub(crate) struct AddressBookCollection {
     /// used to advertise writable unconditionally, so a consumer's capability
     /// gate passed a PUT the server was always going to 403.
     pub(crate) can_edit: Option<bool>,
+    pub(crate) is_directory: bool,
 }
 
 impl AddressBookCollection {
@@ -134,6 +135,7 @@ impl CardDavMultigetReport {
 #[derive(Default)]
 struct AddressBookProps {
     is_addressbook: bool,
+    is_directory: bool,
     privilege_seen: bool,
     write_seen: bool,
     display_name: Option<String>,
@@ -143,6 +145,7 @@ struct AddressBookProps {
 impl PropSet for AddressBookProps {
     fn commit_from(&mut self, staged: Self) {
         self.is_addressbook |= staged.is_addressbook;
+        self.is_directory |= staged.is_directory;
         self.privilege_seen |= staged.privilege_seen;
         self.write_seen |= staged.write_seen;
         commit_if_present(&mut self.display_name, staged.display_name);
@@ -203,6 +206,11 @@ impl MultiStatusSink for AddressBookSink {
         if name == "addressbook" && stack.iter().any(|item| item == "resourcetype") {
             parts.marker_mut().is_addressbook = true;
         }
+        // Directory resourcetype is defined by
+        // draft-daboo-carddav-directory-gateway-02, not RFC 6352.
+        if name == "directory" && stack.iter().any(|item| item == "resourcetype") {
+            parts.marker_mut().is_directory = true;
+        }
         if name == "privilege" {
             parts.marker_mut().privilege_seen = true;
         }
@@ -229,7 +237,7 @@ impl MultiStatusSink for AddressBookSink {
 
     fn finish_response(&mut self, parts: &ResponseParts<Self::Props>) {
         let props = parts.props();
-        if !props.is_addressbook {
+        if !props.is_addressbook && !props.is_directory {
             return;
         }
         let Some(href) = parts.href() else {
@@ -240,6 +248,7 @@ impl MultiStatusSink for AddressBookSink {
             display_name: props.display_name.clone(),
             ctag: props.ctag.clone(),
             can_edit: props.privilege_seen.then_some(props.write_seen),
+            is_directory: props.is_directory,
         });
     }
 }
@@ -299,6 +308,8 @@ pub(crate) fn parse_propfind_contacts(xml: &str) -> Result<CardDavContactListing
 #[derive(Default)]
 struct MultigetSink {
     report: CardDavMultigetReport,
+    directory_request_url: Option<String>,
+    truncated: bool,
 }
 
 impl MultiStatusSink for MultigetSink {
@@ -323,6 +334,19 @@ impl MultiStatusSink for MultigetSink {
     }
 
     fn finish_response(&mut self, parts: &ResponseParts<Self::Props>) {
+        // RFC 6352 section 6.3.2: a response-level 507 for the request-URI
+        // is truncation, whether or not number-of-matches-within-limits appears.
+        // Consume it before ordinary per-resource quota/error classification.
+        if let (Some(base), Some(href), Some(status)) = (
+            self.directory_request_url.as_deref(),
+            parts.href(),
+            parts.response_status(),
+        ) && status.split_whitespace().nth(1) == Some("507")
+            && bifrost_dav_core::same_dav_url(base, &resolve_href(base, href))
+        {
+            self.truncated = true;
+            return;
+        }
         if let Some((href, data)) = parts.fetched() {
             self.report.cards.push(CardDavFetchedVCard {
                 uri: href.to_string(),
@@ -344,6 +368,19 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<CardDavMultigetReport, 
     let mut sink = MultigetSink::default();
     parse_multistatus(xml, &mut sink)?;
     Ok(sink.report)
+}
+
+pub(crate) fn parse_directory_report(
+    xml: &str,
+    request_url: &str,
+) -> Result<(CardDavMultigetReport, bool), String> {
+    let mut sink = MultigetSink {
+        directory_request_url: Some(request_url.to_string()),
+        ..Default::default()
+    };
+    parse_multistatus(xml, &mut sink)?;
+    sink.report.resolve_hrefs(request_url);
+    Ok((sink.report, sink.truncated))
 }
 
 /// Extract the collection `getctag` value from a depth-0 PROPFIND
@@ -837,6 +874,7 @@ END:VCARD</C:address-data>
         assert_eq!(
             books,
             vec![AddressBookCollection {
+                is_directory: false,
                 href: "/contacts/personal/".to_string(),
                 display_name: Some("Personal".to_string()),
                 ctag: Some("42".to_string()),

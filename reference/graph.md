@@ -1946,6 +1946,11 @@ filter onto `$search`/KQL (`kql_filter`), AND-combining any `provider_query`;
 `In` + From/To is `Request(Malformed)` (no KQL folder property). No-sender
 searches keep the `$filter` path.
 
+Both `pim_methods.directory_search` (non-empty lookup) and
+`pim_methods.directory_enumerate` (empty-query enumeration) are true.
+Directory pages default to `truncated: false`; continuation remains in
+`next_cursor`.
+
 `directory_search` (organization directory / GAL, distinct from the personal
 `/contacts` corpus `contact_search` scans) queries `/users` with a
 `displayName,mail,otherMails,proxyAddresses,businessPhones,companyName,jobTitle,department`

@@ -36,7 +36,7 @@ pub mod test_support;
 mod transport;
 mod xml;
 
-pub use dispatch::{DavCredentials, DavDispatch, delete_target_already_gone};
+pub use dispatch::{DavCredentials, DavDispatch, DavRequestGuard, delete_target_already_gone};
 
 pub use error::{
     DavProtocol, filter_unsupported, local_error, missing_field_error, not_found_error,

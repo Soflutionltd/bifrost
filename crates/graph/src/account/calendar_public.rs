@@ -272,6 +272,7 @@ pub(super) async fn range(
         Some(serde_json::to_vec(&pos).expect("serializable CalendarView cursor"))
     };
     Ok(Page {
+        truncated: false,
         items,
         next_cursor,
         estimated_total: None,
@@ -502,6 +503,7 @@ pub(super) async fn search(
         Some(serde_json::to_vec(&pos).expect("serializable public event search cursor"))
     };
     Ok(Page {
+        truncated: false,
         items,
         failed_ids,
         next_cursor,

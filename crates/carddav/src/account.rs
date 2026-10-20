@@ -66,6 +66,7 @@ pub(crate) struct CardDavAccount {
     client: Arc<CardDavClient>,
     capabilities: AccountCapabilities,
     addressbook_home: String,
+    directory_gateways: Vec<String>,
     /// The collection a call that names no address book routes to, and `None`
     /// when the home enumerated no collections.
     ///
@@ -99,6 +100,7 @@ impl CardDavAccount {
         Self {
             client,
             capabilities: carddav_capabilities(),
+            directory_gateways: Vec::new(),
             addressbook_home: default_addressbook_url.to_string(),
             default_addressbook_url: Some(default_addressbook_url.to_string()),
             addressbook_urls: std::iter::once(default_addressbook_url.to_string())
@@ -116,6 +118,7 @@ impl CardDavAccount {
         Self {
             client,
             capabilities: carddav_capabilities(),
+            directory_gateways: Vec::new(),
             addressbook_home: home.to_string(),
             default_addressbook_url: None,
             addressbook_urls: Vec::new(),
@@ -138,17 +141,50 @@ impl CardDavAccount {
     /// `CardDavConfig` and so cannot take one. Twin of
     /// `bifrost-caldav`'s `open_with_client`.
     pub(crate) async fn open_with_client(mut client: CardDavClient) -> Result<Self, AccountError> {
-        let addressbook_home = client.discover_addressbook_home().await?;
-        client.admit_discovered_urls(std::iter::once(addressbook_home.clone()));
-        let collections = client.list_addressbooks(&addressbook_home).await?;
+        let discovery = client.discover_addressbook_home().await?;
+        let addressbook_home = discovery.home;
+        // Principal-advertised directories are known before the home listing,
+        // not only after the account is published.
+        client.observe_directories(discovery.gateways.iter().cloned());
+        client.admit_discovered_urls(
+            std::iter::once(addressbook_home.clone()).chain(discovery.gateways.iter().cloned()),
+        );
+        let mut collections = if client.is_trusted_url(&addressbook_home)
+            && client.is_directory_url(&addressbook_home)
+        {
+            // An advertised directory cannot be enumerated as a personal home.
+            // Keep origin refusal intact for an unadmitted/downgraded home.
+            Vec::new()
+        } else {
+            client.list_addressbooks(&addressbook_home).await?
+        };
+        let mut gateways = discovery.gateways;
+        gateways.extend(
+            collections
+                .iter()
+                .filter(|c| c.is_directory)
+                .map(|c| c.href.clone()),
+        );
+        // Listing markers classify collections but cannot delegate origins.
+        // Seed monotone exclusions, including refused origins. Later markers
+        // can only tighten access; only origins already trusted at open may
+        // participate in the frozen directory search surface.
+        let excluded_directories = gateways.clone();
+        gateways.retain(|url| client.is_trusted_url(url));
+        crate::client::dedup_directory_urls(&mut gateways);
+        client.initialize_directories(excluded_directories, gateways.clone());
+        collections.retain(|c| !c.is_directory && !client.is_directory_url(&c.href));
         let default_addressbook_url = default_collection_url(&collections);
         let addressbook_urls = discovered_collection_urls(&collections);
+        let mut capabilities = carddav_capabilities();
+        capabilities.pim_methods.directory_search = !gateways.is_empty();
         Ok(Self {
             client: Arc::new(client),
-            capabilities: carddav_capabilities(),
+            capabilities,
             addressbook_home,
             default_addressbook_url,
             addressbook_urls,
+            directory_gateways: gateways,
         })
     }
 
@@ -212,6 +248,8 @@ impl CardDavAccount {
                 .or(default_addressbook_url)
                 .ok_or_else(|| no_default_addressbook(operation))?,
         };
+        client.refuse_directory_access(&addressbook, operation)?;
+        client.refuse_directory_access(&client.resolve_url(&contact.0), operation)?;
         let card = Self::fetch_contact_resource(&client, &contact, operation).await?;
         contact_from_vcard(
             card.uri,
@@ -371,6 +409,7 @@ impl CardDavAccount {
         // multiget answers in whatever order it likes.
         cards.sort_by(|left, right| left.native_id.cmp(&right.native_id));
         Ok(Page {
+            truncated: false,
             items: cards,
             next_cursor: slice.next_watermark.as_deref().map(encode_watermark_cursor),
             estimated_total: Some(estimated_total(total)),
@@ -399,6 +438,7 @@ impl CardDavAccount {
         addressbook: &str,
         operation: AccountOperation,
     ) -> Result<ContactSnapshot, AccountError> {
+        client.refuse_directory_access(addressbook, operation)?;
         let ctag = match ctag {
             CtagSource::Home(home) => client
                 .list_addressbooks_for_operation(home, operation)
@@ -461,6 +501,7 @@ impl Account for CardDavAccount {
         let scopes = self
             .addressbook_urls
             .iter()
+            .filter(|url| !self.client.is_directory_url(url))
             .cloned()
             .map(|url| CursorScope::Folder(bifrost_types::FolderId(url)))
             .collect();
@@ -506,7 +547,8 @@ impl Account for CardDavAccount {
                 &addressbook,
                 AccountOperation::EstablishCursor,
             )
-            .await?;
+            .await
+            .map_err(|error| directory_sync_error(error, &scope))?;
             Ok(CursorEstablishment::Ready(cursor_from_snapshot(
                 scope, &snapshot,
             )))
@@ -530,7 +572,7 @@ impl Account for CardDavAccount {
                 let mut events = Vec::new();
                 if let Err(error) = validate_contact_scope(&scope, AccountOperation::SyncInventory)
                 {
-                    events.push(SyncEvent::Terminated(error));
+                    events.push(SyncEvent::Terminated(directory_sync_error(error, &scope)));
                     return events;
                 }
                 let addressbook = match collection_url_for_scope(
@@ -541,7 +583,7 @@ impl Account for CardDavAccount {
                 ) {
                     Ok(addressbook) => addressbook,
                     Err(error) => {
-                        events.push(SyncEvent::Terminated(error));
+                        events.push(SyncEvent::Terminated(directory_sync_error(error, &scope)));
                         return events;
                     }
                 };
@@ -556,7 +598,7 @@ impl Account for CardDavAccount {
                 {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
-                        events.push(SyncEvent::Terminated(error));
+                        events.push(SyncEvent::Terminated(directory_sync_error(error, &scope)));
                         return events;
                     }
                 };
@@ -616,7 +658,10 @@ impl Account for CardDavAccount {
                 let previous = match decode_cursor_snapshot(&cursor) {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
-                        events.push(SyncEvent::Terminated(error));
+                        events.push(SyncEvent::Terminated(directory_sync_error(
+                            error,
+                            &cursor.scope,
+                        )));
                         return events;
                     }
                 };
@@ -646,7 +691,10 @@ impl Account for CardDavAccount {
                 {
                     Ok(ctag) => ctag,
                     Err(error) => {
-                        events.push(SyncEvent::Terminated(error));
+                        events.push(SyncEvent::Terminated(directory_sync_error(
+                            error,
+                            &cursor.scope,
+                        )));
                         return events;
                     }
                 };
@@ -682,7 +730,10 @@ impl Account for CardDavAccount {
                 {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
-                        events.push(SyncEvent::Terminated(error));
+                        events.push(SyncEvent::Terminated(directory_sync_error(
+                            error,
+                            &cursor.scope,
+                        )));
                         return events;
                     }
                 };
@@ -998,6 +1049,7 @@ impl Account for CardDavAccount {
             let collections = client.list_addressbooks(&home).await?;
             let mut books = collections
                 .into_iter()
+                .filter(|c| !c.is_directory && !client.is_directory_url(&c.href))
                 .map(Self::map_addressbook)
                 .collect::<Vec<_>>();
             // An address book home that enumerates zero addressbook
@@ -1030,13 +1082,14 @@ impl Account for CardDavAccount {
         let default_addressbook_url = self.default_addressbook_url.clone();
         Box::pin(async move {
             let operation = AccountOperation::ContactsList;
-            let watermark = decode_contact_page_cursor(page_cursor, operation)?;
             let addressbook = Self::addressbook_url(
                 &client,
                 default_addressbook_url.as_deref(),
                 address_book,
                 operation,
             )?;
+            client.refuse_directory_access(&addressbook, operation)?;
+            let watermark = decode_contact_page_cursor(page_cursor, operation)?;
             let candidates = Self::listing_candidates(&client, &addressbook, operation).await?;
             // No request limit: the trait's `contacts_list` takes an address
             // book and a cursor and nothing else, so the page size is fixed
@@ -1084,6 +1137,7 @@ impl Account for CardDavAccount {
                 contact.address_book_id.clone(),
                 AccountOperation::ContactCreate,
             )?;
+            client.refuse_directory_access(&addressbook, AccountOperation::ContactCreate)?;
             let id = format!("{}.vcf", Uuid::new_v4());
             let url = append_path(&addressbook, &id);
             let data = vcard_from_create(&contact, &id)
@@ -1122,6 +1176,16 @@ impl Account for CardDavAccount {
         let client = Arc::clone(&self.client);
         let default_addressbook_url = self.default_addressbook_url.clone();
         Box::pin(async move {
+            client.refuse_directory_access(
+                &client.resolve_url(&contact.0),
+                AccountOperation::ContactUpdate,
+            )?;
+            if let Some(target) = &patch.address_book_id {
+                client.refuse_directory_access(
+                    &client.resolve_url(&target.0),
+                    AccountOperation::ContactUpdate,
+                )?;
+            }
             // The contact's own collection is the first answer; the default is
             // only reached for a native id whose parent cannot be derived.
             let addressbook = match contact_addressbook_url(&client, &contact) {
@@ -1198,11 +1262,15 @@ impl Account for CardDavAccount {
         let client = Arc::clone(&self.client);
         let default_addressbook_url = self.default_addressbook_url.clone();
         Box::pin(async move {
-            let watermark = decode_contact_page_cursor(
-                request.page_cursor.clone(),
-                AccountOperation::ContactSearch,
-            )?;
             let operation = AccountOperation::ContactSearch;
+            let addressbook = Self::addressbook_url(
+                &client,
+                default_addressbook_url.as_deref(),
+                request.address_book_id.clone(),
+                operation,
+            )?;
+            client.refuse_directory_access(&addressbook, operation)?;
+            let watermark = decode_contact_page_cursor(request.page_cursor.clone(), operation)?;
             let needle = request.query.to_lowercase();
             // A zero limit is honored as an empty exhausted page, not clamped
             // up to one. Clamping silently served a contact the caller had
@@ -1221,12 +1289,6 @@ impl Account for CardDavAccount {
             let page_size = request.limit.map_or(CONTACT_PAGE_SIZE, |limit| {
                 usize::try_from(limit).unwrap_or(usize::MAX)
             });
-            let addressbook = Self::addressbook_url(
-                &client,
-                default_addressbook_url.as_deref(),
-                request.address_book_id.clone(),
-                operation,
-            )?;
             // Both lanes page the same way: candidate hrefs, sliced at the
             // watermark, and a multiget of only the page. They differ only in
             // where the candidates come from - a server-side text-match for a
@@ -1264,11 +1326,94 @@ impl Account for CardDavAccount {
 
     fn directory_search(
         &self,
-        _query: String,
-        _limit: Option<u32>,
-        _page_cursor: Option<Vec<u8>>,
+        query: String,
+        limit: Option<u32>,
+        page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
-        unsupported_future(AccountOperation::DirectorySearch)
+        let operation = AccountOperation::DirectorySearch;
+        if !self.capabilities.pim_methods.directory_search
+            || (query.trim().is_empty() && !self.capabilities.pim_methods.directory_enumerate)
+        {
+            return unsupported_future(operation);
+        }
+        let client = Arc::clone(&self.client);
+        let gateways = self.directory_gateways.clone();
+        Box::pin(async move {
+            if page_cursor.is_some() {
+                return Err(local_error(
+                    operation,
+                    "CardDAV directory search has no paging",
+                ));
+            }
+            let limit = limit
+                .unwrap_or(u32::try_from(CONTACT_PAGE_SIZE).expect("fixed page size fits u32"));
+            if limit == 0 {
+                return Ok(Page::single(Vec::new(), Vec::new(), Vec::new()));
+            }
+            // Ordered bounded fan-out: lexical gateway URL order, then wire
+            // response order within each gateway. The first duplicate wins.
+            let legs = gateways
+                .iter()
+                .cloned()
+                .map(|url| {
+                    let client = Arc::clone(&client);
+                    let query = query.clone();
+                    async move { client.query_directory(&url, &query, limit).await }
+                })
+                .collect::<Vec<_>>();
+            let mut legs = stream::iter(legs).buffered(4);
+            let mut page = Page::single(Vec::new(), Vec::new(), Vec::new());
+            let mut seen = HashSet::new();
+            let mut succeeded = false;
+            let mut worst = None;
+            let mut index = 0;
+            while let Some(result) = legs.next().await {
+                let url = &gateways[index];
+                index += 1;
+                match result {
+                    Err(error) => {
+                        let error = error
+                            .into_builder()
+                            .scope(ErrorScope::DirectoryGateway { url: url.clone() })
+                            .try_build()
+                            .expect("adding gateway scope preserves classification");
+                        worst = worse_recovery(worst, error.clone());
+                        page.skipped_scopes.push(SkippedScope {
+                            scope: ErrorScope::DirectoryGateway { url: url.clone() },
+                            error,
+                        });
+                    }
+                    Ok((report, truncated)) => {
+                        succeeded = true;
+                        page.truncated |= truncated;
+                        page.failed_ids
+                            .extend(report.failed.into_iter().map(|f| f.href));
+                        page.failed_ids.extend(report.missing_data);
+                        for raw in report.cards {
+                            match crate::vcard::directory_from_vcard(&raw.data) {
+                                Ok(Some(card)) => {
+                                    // Directory identity folds the trimmed primary email
+                                    // using Rust Unicode lowercase; aliases never dedup.
+                                    if seen.insert(card.email.trim().to_lowercase()) {
+                                        if page.items.len() < limit as usize {
+                                            page.items.push(card);
+                                        } else {
+                                            page.truncated = true;
+                                        }
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(_) => page.failed_ids.push(raw.uri),
+                            }
+                        }
+                    }
+                }
+            }
+            if !succeeded {
+                return Err(worst.expect("at least one admitted gateway"));
+            }
+            Ok(page)
+        })
     }
 
     fn directory_groups_list(
@@ -1584,6 +1729,36 @@ fn discovered_collection_urls(collections: &[AddressBookCollection]) -> Vec<Stri
         .iter()
         .map(|collection| collection.href.clone())
         .collect()
+}
+
+/// A collection reclassified as a directory is no longer a personal sync
+/// scope. Disable the original scope, rather than retry or try another sync
+/// strategy. Keep redirect transmission evidence from the guard's refusal.
+fn directory_sync_error(error: AccountError, scope: &CursorScope) -> AccountError {
+    let Some(ErrorScope::DirectoryGateway { url }) = error.scope() else {
+        return error;
+    };
+    if !matches!(error.kind(), AccountErrorKind::Unsupported(_)) {
+        return error;
+    }
+    let mut builder = AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::ScopeRevoked),
+        Cause::State(bifrost_types::StateCause::ScopeRevoked),
+    )
+    .protocol(Protocol::CardDav)
+    .scope(ErrorScope::Cursor(scope.clone()))
+    .text(DiagnosticText::support_only(format!(
+        "personal sync scope targets a directory: {url}"
+    )));
+    if let Some(operation) = error.operation() {
+        builder = builder.operation(operation);
+    }
+    for cause in error.chain().iter().cloned() {
+        builder = builder.push_cause(cause);
+    }
+    builder
+        .try_build()
+        .expect("valid directory scope retirement")
 }
 
 /// A call that names no address book cannot be routed, because the addressbook
@@ -2516,6 +2691,7 @@ mod tests {
     #[test]
     fn a_read_only_address_book_is_not_advertised_as_writable() {
         let read_only = CardDavAccount::map_addressbook(AddressBookCollection {
+            is_directory: false,
             href: "https://dav.example.test/contacts/shared/".to_string(),
             display_name: None,
             ctag: None,
@@ -2536,6 +2712,7 @@ mod tests {
 
     fn collection(href: &str) -> AddressBookCollection {
         AddressBookCollection {
+            is_directory: false,
             href: href.to_string(),
             display_name: None,
             ctag: None,
@@ -3125,3 +3302,7 @@ mod tests {
         assert!(contact_matches(&contact, &needle));
     }
 }
+
+#[cfg(test)]
+#[path = "directory_tests.rs"]
+mod directory_tests;

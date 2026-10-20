@@ -272,6 +272,7 @@ pub(crate) fn search(
         // zero limit must short-circuit locally to mean "return nothing".
         if max == 0 {
             return Ok(Page {
+                truncated: false,
                 items: Vec::new(),
                 next_cursor: None,
                 estimated_total: None,
@@ -284,6 +285,7 @@ pub(crate) fn search(
             .await
             .map_err(|e| account_error_for(e, error::GmailErrorContext::search()))?;
         Ok(Page {
+            truncated: false,
             items: threads
                 .into_iter()
                 .map(|thread| ThreadId(thread.id))
@@ -311,6 +313,7 @@ pub(crate) fn search_messages(
         // zero limit must short-circuit locally to mean "return nothing".
         if max == 0 {
             return Ok(Page {
+                truncated: false,
                 items: Vec::new(),
                 next_cursor: None,
                 estimated_total: None,
@@ -323,6 +326,7 @@ pub(crate) fn search_messages(
             .await
             .map_err(|e| account_error_for(e, error::GmailErrorContext::search_messages()))?;
         Ok(Page {
+            truncated: false,
             items: messages
                 .into_iter()
                 .map(|message| ObjectId(message.id))
