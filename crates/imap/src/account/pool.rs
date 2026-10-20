@@ -135,6 +135,9 @@ impl Pool {
 
     /// Dial the dedicated connection used exclusively by the long-lived IDLE
     /// loop. Ordinary account operations must use a checkout method instead.
+    /// This does not acquire a data permit: push admission bounds its own
+    /// sessions separately. Holding data permits for permanent IDLE workers
+    /// would starve checkouts; `pool_cap` is not a shared physical-session cap.
     pub(crate) async fn dial_idle(&self) -> Result<Arc<ImapConnection>, Error> {
         self.inner.dial().await
     }

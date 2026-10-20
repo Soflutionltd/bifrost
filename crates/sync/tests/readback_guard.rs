@@ -1577,7 +1577,7 @@ async fn a_read_back_holds_admission_against_a_second_campaign() {
         },
         // One attempt only, so the campaign's single target ends in the
         // pending-retry lane and reaches the read-back guard.
-        mutation_max_retries: 1,
+        mutation_max_retries: 0,
         ..bifrost_sync::EngineConfig::default()
     };
     let engine = Arc::new(
@@ -1666,9 +1666,11 @@ async fn detach_abandons_a_parked_campaign() {
     state.submitted.notified().await;
     control.pause().await.expect("pause");
     engine.detach(&account_id).await.expect("detach");
+    let counters = campaign.await.expect("campaign task").expect("accounting");
+    assert_eq!(counters.pending_retry, 1);
     assert!(matches!(
-        campaign.await.expect("campaign task"),
-        Err(Error::ShuttingDown)
+        counters.error.as_deref(),
+        Some(Error::ShuttingDown)
     ));
     assert_eq!(state.submissions.load(Ordering::SeqCst), 1);
 }
@@ -1896,7 +1898,8 @@ async fn cohort_retry_allowance_is_shared_campaign_wide() {
         assert!(calls.iter().all(|(ids, _, _)| ids.len() == 1));
     }
     assert_eq!(counters.applied, 1);
-    assert_eq!(counters.failed_terminal, 2);
+    assert_eq!(counters.failed_terminal, 0);
+    assert_eq!(counters.pending_retry, 2);
     engine.detach(&account).await.expect("detach");
 }
 
@@ -1904,10 +1907,10 @@ async fn cohort_retry_allowance_is_shared_campaign_wide() {
 async fn cohort_error_observes_submitted_siblings_and_excludes_unsent() {
     let state = cohort_state(COHORT_ERROR_IN_SECOND);
     let (engine, account) = cohort_engine(&state, 10).await;
-    assert!(matches!(
-        cohort_run(&engine, &account, &["a", "b", "c"]).await,
-        Err(Error::Account(_))
-    ));
+    let counters = cohort_run(&engine, &account, &["a", "b", "c"])
+        .await
+        .expect("campaign accounting");
+    assert!(matches!(counters.error.as_deref(), Some(Error::Account(_))));
     let mut reads = state.observations.lock().expect("reads").clone();
     reads.sort_by_key(|ids| ids[0].0.clone());
     assert_eq!(
@@ -1932,11 +1935,15 @@ async fn cohort_counters_derive_from_per_object_observations() {
         .await
         .expect("campaign");
     assert_eq!(
-        counters.failed_terminal, 3,
+        counters.pending_retry, 3,
         "duplicate observations cannot inflate accounting: {counters:?}"
     );
     assert_eq!(
-        counters.pending_retry + counters.applied + counters.skipped + counters.blocked_by_engine,
+        counters.failed_terminal
+            + counters.applied
+            + counters.skipped
+            + counters.blocked_by_engine
+            + counters.downgraded,
         0
     );
     engine.detach(&account).await.expect("detach");

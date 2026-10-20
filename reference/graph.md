@@ -832,9 +832,10 @@ mailboxes always install.
 - `HashMap<SubscriptionHandle, GraphSubscriptionGroup>` (webhook) +
   `HashMap<SubscriptionHandle, EwsSubscriptionState>` (EWS) + worker join slots
   and a `CancellationToken`.
-- A bounded LRU `etag_index` of change keys (powering `If-Match`; mutation
+- A bounded LRU `etag_index` of mail HTTP entity-tags (powering `If-Match`; mutation
   preflight reads refresh recency, `MESSAGE_SELECT` explicitly requests
-  `changeKey`, successful writes record a returned etag or evict when Graph
+  `changeKey`; the shared JSON projection prefers `@odata.etag` and otherwise
+  wraps the raw change key as `W/"<changeKey>"`. Successful writes record a returned etag or evict when Graph
   returns none, 412 responses evict before retry, and moves, tombstones, and
   confirmed destroys evict their old-id keys). It is
   a `HashMap<Arc<str>, _>` paired with a `BTreeMap<u64, Arc<str>>` of recency
@@ -952,7 +953,7 @@ invalidation is exactly what `PushSource::Coalesced` exists for.
   `EwsStreaming` -> `InProcess` (the EWS worker forwards `Invalidated` on
   `push_stream`; `push_in_process()` true).
 - `mutation.concurrency: StateBased`. Every non-`Destroy` mutation sends
-  `If-Match: <changeKey>`; the cached etag comes from inventory/changes/get,
+  `If-Match: <entity-tag>`; the cached etag comes from inventory/changes/get,
   refreshed from `messages/{id}?$select=id` on a cold cache.
 - `mutation.replay_safety: None`. No client-mintable replay token; the read-back
   guard is the lost-update net.
@@ -1189,7 +1190,13 @@ Graph JSON is not assembled RFC822, so body-bearing projections degrade to
 `select_for_projection` returns message-shaped `$select` lists for every
 projection - deliberately, even though this account also establishes
 `ObjectType::Event` and `ObjectType::Contact` cursor scopes and mints their
-inventory entries and change ids through the same generic pipeline.
+inventory entries and change ids through the same generic pipeline. Event
+inventory entries and changes (including removals) use `{calendar}::{event}`,
+the same identity accepted by the typed calendar doors. Contact ids remain
+native Graph contact ids. Only email scopes populate or evict the mail etag
+cache. Foreign event/contact scopes are refused before fetching: the typed
+non-mail doors currently read the primary mailbox and cannot consume a shared
+mailbox identity safely.
 
 The determination, from the engine: `bifrost-sync` never routes event or
 contact scope ids into `get_stream`. Its only internal callers are the
@@ -1821,7 +1828,7 @@ formats may disagree". A miss still degrades to `HintPayload::Unknown`
 per-id lookup that marks them hot, not a clone of the whole map) and
 refreshes missing `SetFlags`/`Move` etags via
 `GET /messages/{id}?$select=id` (`Destroy` needs none), (2) builds one `BatchRequestItem` per id - `PATCH` /
-`POST .../move` / `POST .../permanentDelete` - attaching `If-Match: <changeKey>` (mandatory
+`POST .../move` / `POST .../permanentDelete` - attaching `If-Match: <entity-tag>` (mandatory
 for `SetFlags`/`Move`, opportunistic for `Destroy`), (3) sends `/$batch`,
 status driving `mutation_item_outcome`.
 

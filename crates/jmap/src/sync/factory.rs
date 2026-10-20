@@ -2017,15 +2017,11 @@ mod tests {
         assert_eq!(requests[4]["methodCalls"][0][1]["anchor"], "M2");
     }
 
-    /// A result set that moves mid-walk must end the walk WITHOUT a `Done`,
-    /// because a `Done` is a complete-coverage claim and the remaining pages
-    /// were never read. It must also not end terminally: one delivered
-    /// message advances `queryState`, so a terminal class here would let
-    /// ordinary mail delivery permanently kill the scope's inventory. The
-    /// honest answer is `SyncState(CursorInvalid)` on the cursor scope, which
-    /// the shared recovery table maps to `RestartScope`.
+    /// Email inventory anchors each page on the last queried id. Its immutable
+    /// sort key and the change cursor seeded before inventory make ordinary
+    /// queryState movement safe to continue through.
     #[tokio::test]
-    async fn a_query_state_that_moves_mid_walk_restarts_the_scope_instead_of_claiming_done() {
+    async fn email_inventory_continues_from_its_anchor_when_query_state_moves() {
         let client = scripted_client([
             method_reply(vec![json!([
                 "Email/query",
@@ -2045,6 +2041,19 @@ mod tests {
                 {"accountId": "primary", "queryState": "q2", "position": 1, "ids": ["M2"]},
                 "s0"
             ])]),
+            method_reply(vec![json!([
+                "Email/get",
+                {"accountId": "primary", "state": "email-s", "list": [
+                    {"id": "M2", "blobId": "B2", "threadId": "T2", "size": 12,
+                     "mailboxIds": {"inbox": true}, "keywords": {}}
+                ], "notFound": []},
+                "s0"
+            ])]),
+            method_reply(vec![json!([
+                "Email/query",
+                {"accountId": "primary", "queryState": "q3", "position": 2, "ids": []},
+                "s0"
+            ])]),
         ]);
         let primary = client
             .primary_account::<capability::Mail>()
@@ -2059,33 +2068,24 @@ mod tests {
             None,
         );
 
+        for expected in ["M1", "M2"] {
+            match stream.next().await {
+                Some(bifrost_types::SyncEvent::Batch(batch)) => {
+                    assert_eq!(batch.items.len(), 1);
+                    assert_eq!(batch.items[0].id.0, expected);
+                }
+                other => panic!("expected an anchored inventory batch, got {other:?}"),
+            }
+        }
         assert!(matches!(
             stream.next().await,
-            Some(bifrost_types::SyncEvent::Batch(_))
+            Some(bifrost_types::SyncEvent::Done(None))
         ));
-        let scope = CursorScope::Type(ObjectType::Email);
-        match stream.next().await {
-            Some(bifrost_types::SyncEvent::Terminated(err)) => {
-                assert_eq!(
-                    err.kind(),
-                    &bifrost_types::AccountErrorKind::SyncState(
-                        bifrost_types::SyncStateErrorKind::CursorInvalid
-                    )
-                );
-                let recovery = err.recovery();
-                assert!(
-                    matches!(
-                        &recovery,
-                        bifrost_types::RecoveryClass::Engine(
-                            bifrost_types::EngineDirective::RestartScope(restarted)
-                        ) if *restarted == scope
-                    ),
-                    "a superseded walk must restart its scope, got {recovery:?}"
-                );
-            }
-            other => panic!("expected a superseded-walk termination, got {other:?}"),
-        }
-        assert!(stream.next().await.is_none());
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[0]["methodCalls"][0][1]["position"], 0);
+        assert_eq!(requests[2]["methodCalls"][0][1]["anchor"], "M1");
+        assert_eq!(requests[2]["methodCalls"][0][1]["anchorOffset"], 1);
     }
 
     /// A positional partition cannot inherit the preceding partition's
@@ -2413,7 +2413,7 @@ mod tests {
         let call = &requests[0]["methodCalls"][0];
         assert_eq!(call[0], "Email/set");
         assert_eq!(call[1]["accountId"], "shared");
-        assert_eq!(call[1]["ifInState"], "shared-state");
+        assert!(call[1].get("ifInState").is_none());
         assert_eq!(call[1]["update"]["M9"]["keywords/$seen"], true);
         assert!(call[1]["update"].get(&foreign_id.0).is_none());
     }
@@ -2481,7 +2481,7 @@ mod tests {
         let call = &requests[0]["methodCalls"][0];
         assert_eq!(call[0], "Email/set");
         assert_eq!(call[1]["accountId"], "shared");
-        assert_eq!(call[1]["ifInState"], "shared-state");
+        assert!(call[1].get("ifInState").is_none());
         assert_eq!(call[1]["update"]["M9"]["keywords/$seen"], true);
         assert!(call[1]["update"].get(&foreign_id.0).is_none());
     }
@@ -3442,7 +3442,7 @@ mod tests {
         let set = &requests[1]["methodCalls"][0];
         assert_eq!(set[0], "Email/set");
         assert_eq!(set[1]["accountId"], "shared");
-        assert_eq!(set[1]["ifInState"], "shared-state");
+        assert!(set[1].get("ifInState").is_none());
         assert_eq!(set[1]["update"]["M9"]["keywords/$seen"], true);
     }
 

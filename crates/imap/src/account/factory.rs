@@ -51,8 +51,14 @@ pub struct ImapAccountConfig {
     pub imap: ImapConfig,
     pub credentials: Credentials,
     pub auth_policy: AuthPolicy,
+    /// Data-session sizing input: data checkouts share `max(pool_cap - 1, 1)`
+    /// slots. Dedicated IDLE sessions have a separate budget below; this is
+    /// not a cap on the account's total physical connections.
     pub pool_cap: usize,
-    /// Maximum dedicated IDLE sessions used when the server lacks NOTIFY.
+    /// Maximum dedicated IDLE sessions used when the server lacks NOTIFY,
+    /// clamped to at least one. Added to the data budget, not drawn from it:
+    /// defaults allow three data plus four IDLE sessions (seven total).
+    /// NOTIFY uses one dedicated IDLE session instead.
     pub idle_connection_budget: usize,
     pub idle_timeout: Duration,
     pub enable_qresync: bool,
@@ -87,6 +93,10 @@ impl ImapAccountConfig {
             caldav: None,
             submission: None,
         }
+    }
+
+    fn data_connection_budget(&self) -> usize {
+        self.pool_cap.saturating_sub(1).max(1)
     }
 
     pub fn with_bandwidth_meter(mut self, meter: Arc<bifrost_net::BandwidthMeter>) -> Self {
@@ -236,7 +246,7 @@ impl ImapAccountFactory {
                 &imap_mailboxes,
             );
             dav_degraded.extend(dav_scope_warnings);
-            let data_cap = cfg.pool_cap.saturating_sub(1).max(1);
+            let data_cap = cfg.data_connection_budget();
             let pool = Arc::new(Pool::new(
                 Arc::clone(&cfg),
                 conn,
@@ -814,6 +824,26 @@ pub(crate) async fn list_folders(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_and_idle_connection_budgets_are_separate() {
+        let mut cfg = ImapAccountConfig::new(
+            ImapConfig::plaintext("imap.invalid"),
+            Credentials::password("user", "pass"),
+            AuthPolicy::default(),
+        );
+        assert_eq!(cfg.data_connection_budget(), 3);
+        assert_eq!(
+            cfg.data_connection_budget() + cfg.idle_connection_budget.max(1),
+            7
+        );
+        cfg.pool_cap = 0;
+        assert_eq!(cfg.data_connection_budget(), 1);
+        cfg.pool_cap = 1;
+        assert_eq!(cfg.data_connection_budget(), 1);
+        cfg.pool_cap = 8;
+        assert_eq!(cfg.data_connection_budget(), 7);
+    }
 
     fn bandwidth_config(calendar: bool) -> ImapAccountConfig {
         let mut cfg = ImapAccountConfig::new(

@@ -201,7 +201,13 @@ fn content_disposition_inline(headers: &[crate::types::GmailHeader]) -> bool {
     headers
         .iter()
         .find(|header| header.name.eq_ignore_ascii_case("Content-Disposition"))
-        .is_some_and(|header| header.value.to_ascii_lowercase().contains("inline"))
+        .is_some_and(|header| {
+            header
+                .value
+                .split(';')
+                .next()
+                .is_some_and(|disposition| disposition.trim().eq_ignore_ascii_case("inline"))
+        })
 }
 
 fn encode_blob_id(message_id: &str, attachment_id: &str) -> BlobId {
@@ -361,6 +367,22 @@ mod tests {
             handle.capabilities.encoding,
             BlobEncoding::Base64Url
         ));
+    }
+
+    #[test]
+    fn content_disposition_checks_the_token_not_its_parameters() {
+        let disposition = |value: &str| {
+            content_disposition_inline(&[crate::types::GmailHeader {
+                name: "Content-Disposition".to_string(),
+                value: value.to_string(),
+            }])
+        };
+
+        assert!(disposition("inline; filename=inline-chart.png"));
+        assert!(disposition(" INLINE ; filename=chart.png"));
+        assert!(!disposition("attachment; filename=inline-chart.png"));
+        assert!(!disposition("attachment; filename=inline"));
+        assert!(!disposition("x-inline; filename=chart.png"));
     }
 
     /// The MIME tree is walked depth-first, so an attachment nested

@@ -25,6 +25,7 @@ pub(super) async fn run_upgrade(
         UpgradePayload::StartTls {
             tls_connector,
             server_name,
+            tls_active,
         } => {
             run_starttls_upgrade(
                 wire_reader,
@@ -33,6 +34,7 @@ pub(super) async fn run_upgrade(
                 event_sink,
                 tls_connector,
                 server_name,
+                Some(tls_active),
             )
             .await
         }
@@ -62,6 +64,7 @@ pub(in crate::connection) async fn run_starttls_upgrade(
     event_sink: &mut event_sink::DriverEventSink,
     tls_connector: native_tls::TlsConnector,
     server_name: String,
+    tls_active: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), Error> {
     // Step 1: Send STARTTLS command, await tagged OK (RFC 3501 Section6.2.1).
     let consumer =
@@ -140,6 +143,12 @@ pub(in crate::connection) async fn run_starttls_upgrade(
     // dropped with old_reader in Step 3 (I10).
     *wire_reader =
         super::super::wire::WireReader::with_metering(ImapStream::Tls(tls_stream), metering);
+    if let Some(tls_active) = tls_active {
+        // Publish the security boundary at the stream swap, not after the
+        // later CAPABILITY round trip. A failed refresh retires the driver,
+        // but callers must not observe an installed TLS stream as cleartext.
+        tls_active.store(true, std::sync::atomic::Ordering::Release);
+    }
 
     // Step 6: Re-read capabilities after TLS upgrade (RFC 3501 Section6.2.1).
     state.apply_capability_fetch(Vec::new());
@@ -153,7 +162,8 @@ pub(in crate::connection) async fn run_starttls_upgrade(
         Command::Capability,
         cap_consumer,
     )
-    .await?;
+    .await
+    .map_err(|error| post_starttls_capability_failure(state, error))?;
     let caps = result.downcast::<Vec<Capability>>().map_err(|_| {
         // After the TLS swap and a completed post-TLS CAPABILITY: the
         // driver's view of this connection cannot be trusted, so it
@@ -167,6 +177,21 @@ pub(in crate::connection) async fn run_starttls_upgrade(
 
     debug!("STARTTLS upgrade complete (RFC 3501 Section 6.2.1)");
     Ok(())
+}
+
+/// Once STARTTLS has installed a new stream, returning a reusable connection
+/// without the required post-upgrade CAPABILITY result would leave callers
+/// with a half-upgraded session. Preserve existing fatal errors, and make a
+/// completed server refusal or other non-fatal refresh error retire the stream.
+fn post_starttls_capability_failure(
+    state: &mut super::super::state::ProtocolState,
+    error: Error,
+) -> Error {
+    // The TLS stream has replaced the cleartext stream. Preserve the actual
+    // response error, but mark the session dead so the driver retires it even
+    // when that response (such as a tagged NO) is normally reusable.
+    state.apply_infrastructure_failure();
+    error
 }
 
 /// COMPRESS=DEFLATE upgrade (RFC 4978).
@@ -315,10 +340,38 @@ mod bandwidth_review_tests {
     use crate::connection::{
         state::ProtocolState, stream::Tracked, tag::TagGenerator, wire::WireReader,
     };
+    use crate::error::ImapAttempt;
     use bifrost_net::{BandwidthBudget, BandwidthDirection, MeterSink, MeterSinkHandle};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::AsyncWriteExt;
     use tokio::time::{Duration, Instant};
+
+    #[test]
+    fn nonfatal_post_starttls_capability_refusal_retires_the_connection() {
+        let mut state = ProtocolState::new();
+        let error = Error::No {
+            text: "CAPABILITY refused".into(),
+            code: None,
+            attempt: Some(ImapAttempt::new(
+                bifrost_types::TransmissionState::Acknowledged,
+            )),
+        };
+
+        let error = post_starttls_capability_failure(&mut state, error);
+        assert!(matches!(error, Error::No { text, .. } if text == "CAPABILITY refused"));
+        assert_eq!(state.session_state(), SessionState::Logout);
+    }
+
+    #[test]
+    fn fatal_post_starttls_error_keeps_its_original_class() {
+        let mut state = ProtocolState::new();
+        let error = Error::Protocol("malformed post-upgrade response".into());
+        let result = post_starttls_capability_failure(&mut state, error);
+        assert!(
+            matches!(result, Error::Protocol(message) if message == "malformed post-upgrade response")
+        );
+        assert_eq!(state.session_state(), SessionState::Logout);
+    }
 
     #[derive(Default)]
     struct Counter(AtomicU64);

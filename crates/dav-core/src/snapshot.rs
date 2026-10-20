@@ -144,6 +144,23 @@ fn push_destroyed_unless_failed(changes: &mut Vec<Change>, failed: &HashSet<&str
     changes.push(object_change(uri, ObjectChangeKind::Destroyed));
 }
 
+/// Whether a listing observed enough ground to advance its collection token.
+/// Returned by the preservation helper so both DAV dialects use the same rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observation {
+    pub complete: bool,
+    pub pending: Vec<String>,
+}
+
+impl Observation {
+    /// An incomplete observation must be retried from the prior token. With no
+    /// prior token, keep snapshot polling until the missing ground is observed.
+    #[must_use]
+    pub fn advance_token(&self, previous: Option<String>, next: Option<String>) -> Option<String> {
+        if self.complete { next } else { previous }
+    }
+}
+
 /// Carry forward the members this poll did not actually observe, so the next
 /// diff compares like with like.
 ///
@@ -151,16 +168,22 @@ fn push_destroyed_unless_failed(changes: &mut Vec<Change>, failed: &HashSet<&str
 /// observation at all and the previous entries are kept verbatim. Otherwise the
 /// entries whose hrefs the server reported failed are re-inserted from the
 /// previous snapshot, then the result is re-sorted and deduplicated on href -
-/// the diff above depends on both.
+/// the diff above depends on both. The returned observation also decides
+/// whether the collection token can advance; preserving entries alone cannot
+/// make checkpointing past a refused member safe.
 pub fn preserve_unobserved_entries(
     previous: &[SnapshotEntry],
     current: &mut Vec<SnapshotEntry>,
     current_failed: &[String],
-) {
+) -> Observation {
+    let observation = Observation {
+        complete: current_failed.is_empty() && (!current.is_empty() || previous.is_empty()),
+        pending: current_failed.to_vec(),
+    };
     if current.is_empty() && !previous.is_empty() {
         current.clear();
         current.extend_from_slice(previous);
-        return;
+        return observation;
     }
     let failed: HashSet<&str> = current_failed.iter().map(String::as_str).collect();
     current.extend(
@@ -171,6 +194,7 @@ pub fn preserve_unobserved_entries(
     );
     current.sort_by(|left, right| left.uri.cmp(&right.uri));
     current.dedup_by(|left, right| left.uri == right.uri);
+    observation
 }
 
 /// Encode a snapshot into cursor bytes behind `magic`.
@@ -405,6 +429,30 @@ mod tests {
             uri: uri.to_string(),
             etag: etag.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn only_complete_observations_advance_tokens() {
+        let previous = vec![entry("/c/a", Some("old"))];
+        for (mut current, failed) in [
+            (Vec::new(), Vec::new()),
+            (vec![entry("/c/b", Some("new"))], vec!["/c/a".to_string()]),
+        ] {
+            let observation = preserve_unobserved_entries(&previous, &mut current, &failed);
+            assert!(!observation.complete);
+            assert_eq!(observation.pending, failed);
+            assert_eq!(
+                observation.advance_token(Some("old".into()), Some("new".into())),
+                Some("old".into())
+            );
+            assert_eq!(observation.advance_token(None, Some("new".into())), None);
+        }
+        let mut current = previous.clone();
+        let observation = preserve_unobserved_entries(&previous, &mut current, &[]);
+        assert_eq!(
+            observation.advance_token(Some("old".into()), Some("new".into())),
+            Some("new".into())
+        );
     }
 
     #[test]

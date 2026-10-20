@@ -62,6 +62,11 @@ impl WireMetering {
                 if reservation.offer() {
                     return reservation;
                 }
+                // This adapter sleeps on a blocking thread. With the normal
+                // Tokio clock, `into_std()` and `std::Instant::now()` share
+                // the same monotonic clock. Paused Tokio time intentionally
+                // cannot advance a blocking thread's clock, so it is not a
+                // valid harness for this wait path.
                 let wait = reservation
                     .ready_at()
                     .into_std()

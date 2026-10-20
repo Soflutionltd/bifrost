@@ -550,8 +550,10 @@ impl InventoryFusion {
 fn validate_checkpoint_envelope(checkpoint: Option<&Checkpoint>) -> Result<(), Error> {
     match checkpoint {
         Some(Checkpoint::Change(cursor)) => cursor.validate_envelope().map_err(|_| {
-            Error::Account(crate::recovery::cursor_decode_failure(
+            Error::Account(crate::recovery::fresh_cursor_contract_error(
+                checkpoint,
                 bifrost_types::AccountOperation::SyncInventory,
+                &cursor.scope,
             ))
         }),
         Some(Checkpoint::Backfill(_)) => Err(Error::Other(
@@ -592,6 +594,25 @@ mod tests {
     /// The fusion path takes a `Change` cursor and refuses a `Backfill`
     /// checkpoint.
     ///
+    #[test]
+    fn fresh_invalid_fusion_checkpoint_is_a_scoped_terminal_contract_failure() {
+        let scope = CursorScope::Account;
+        let mut cursor = crate::test_common::cursor_for(&scope, b"fresh");
+        cursor.envelope_version = u32::MAX;
+        let checkpoint = Checkpoint::Change(cursor);
+        let Err(Error::Account(error)) = validate_checkpoint_envelope(Some(&checkpoint)) else {
+            panic!("expected classified contract error");
+        };
+        assert_eq!(
+            error.scope(),
+            Some(&bifrost_types::ErrorScope::Cursor(scope))
+        );
+        assert!(matches!(
+            crate::recovery::plan_recovery(error),
+            crate::recovery::RecoveryPlan::Terminal(_)
+        ));
+    }
+
     /// Latent rather than live - no provider in this workspace attaches one - and
     /// refused for a structural reason: fusion registers the publication and then
     /// publishes it unstamped, so a `Lane::Backfill` entry created here is never

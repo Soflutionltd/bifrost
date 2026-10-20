@@ -233,6 +233,19 @@ impl RouteBuffers {
             std::mem::take(&mut route.rejected),
         ))
     }
+
+    /// Return every locally decided outcome still buffered, preserving the
+    /// order in which its owner first appeared. A terminal wire failure must
+    /// not erase decisions that needed no wire response.
+    fn drain_rejections(&mut self) -> Vec<ItemOutcome<MutationSuccess>> {
+        let mut rejected = Vec::new();
+        for owner in &self.order {
+            if let Some(route) = self.pending.get_mut(owner) {
+                rejected.append(&mut route.rejected);
+            }
+        }
+        rejected
+    }
 }
 
 fn mutation_stream<T: HttpTransport>(
@@ -295,6 +308,17 @@ fn mutation_stream<T: HttpTransport>(
                         }
                     }
                     Err(err) => {
+                        let mut rejected = rejected;
+                        rejected.extend(buffers.drain_rejections());
+                        if !rejected.is_empty() {
+                            yield SyncEvent::Batch(Batch {
+                                items: rejected,
+                                page_boundary: PageBoundary::Page,
+                                server_latency: started.elapsed(),
+                                bytes_in: 0,
+                                checkpoint: None,
+                            });
+                        }
                         yield super::error::terminated_from_jmap(
                             err,
                             super::error::JmapErrorContext::new(operation_for_kind(&kind)),
@@ -393,18 +417,24 @@ async fn apply_batch<T: HttpTransport>(
     // path report its real cost instead of only the last call's.
     let (mail, tally) = mail.metered();
     let mail = &mail;
-    let mut state = current_or_probe_state(mail, email_states, account_id).await?;
+    let guarded = uses_if_in_state(kind);
+    let mut state = if guarded {
+        Some(current_or_probe_state(mail, email_states, account_id).await?)
+    } else {
+        state_cache::get(email_states, account_id).await
+    };
 
-    let mut response = match send_set(mail, &state, &ids, kind, foreign_account).await {
+    let if_in_state = if guarded { state.as_deref() } else { None };
+    let mut response = match send_set(mail, if_in_state, &ids, kind, foreign_account).await {
         Ok(response) => response,
         Err(err) => {
-            if !super::error::is_state_mismatch(&err) {
+            if !guarded || !super::error::is_state_mismatch(&err) {
                 return Err(err);
             }
             let fresh = probe_email_state(mail).await?;
             state_cache::set(email_states, account_id, fresh.clone()).await;
-            state = fresh;
-            match send_set(mail, &state, &ids, kind, foreign_account).await {
+            state = Some(fresh);
+            match send_set(mail, state.as_deref(), &ids, kind, foreign_account).await {
                 Ok(response) => response,
                 Err(err) if super::error::is_state_mismatch(&err) => {
                     // A second method-level `stateMismatch` after a
@@ -436,7 +466,7 @@ async fn apply_batch<T: HttpTransport>(
         state_cache::advance(
             email_states,
             account_id,
-            Some(&state),
+            state.as_deref(),
             new_state.to_string(),
         )
         .await;
@@ -559,37 +589,66 @@ fn state_mismatch_method_error() -> crate::core::error::MethodError {
 
 async fn send_set<T: HttpTransport>(
     mail: &MailAccount<T>,
-    state: &str,
+    state: Option<&str>,
     ids: &[ObjectId],
     kind: &MutationKind,
     foreign_account: bool,
 ) -> crate::Result<crate::core::set::SetResponse<crate::email::Email>> {
-    let mut set = EmailSet::new().if_in_state(state.to_string());
+    mail.call(build_email_set(
+        state,
+        ids,
+        kind,
+        mail.id_str(),
+        foreign_account,
+    ))
+    .await
+}
+
+fn build_email_set(
+    state: Option<&str>,
+    ids: &[ObjectId],
+    kind: &MutationKind,
+    account_id: &str,
+    foreign_account: bool,
+) -> EmailSet {
+    let mut set = EmailSet::new();
+    if let Some(state) = state {
+        set = set.if_in_state(state.to_string());
+    }
 
     match kind {
         MutationKind::Destroy => {
             set = set.destroy(
                 ids.iter()
-                    .map(|id| wire_email_id(id, mail.id_str(), foreign_account)),
+                    .map(|id| wire_email_id(id, account_id, foreign_account)),
             );
         }
         MutationKind::Flags(op) => {
             for id in ids {
                 apply_flags(
-                    set.update(wire_email_id(id, mail.id_str(), foreign_account)),
+                    set.update(wire_email_id(id, account_id, foreign_account)),
                     op,
                 );
             }
         }
         MutationKind::Move(mailbox_id) => {
             for id in ids {
-                set.update(wire_email_id(id, mail.id_str(), foreign_account))
-                    .mailbox_ids([wire_mailbox_id(mailbox_id, mail.id_str(), foreign_account)]);
+                set.update(wire_email_id(id, account_id, foreign_account))
+                    .mailbox_ids([wire_mailbox_id(mailbox_id, account_id, foreign_account)]);
             }
         }
     }
 
-    mail.call(set).await
+    set
+}
+
+/// Account-wide Email state is useful for replacements, which could discard
+/// concurrent edits to the whole property. Dotted keyword updates and
+/// destroy do not need that guard: unrelated account changes cannot make
+/// those requested operations stale. Bulk move replaces the whole
+/// `mailboxIds` map, so it retains the state check too.
+fn uses_if_in_state(kind: &MutationKind) -> bool {
+    matches!(kind, MutationKind::Move(_)) || matches!(kind, MutationKind::Flags(FlagOp::Set(_)))
 }
 
 /// Convert a routed foreign object back to the native id JMAP accepts on the
@@ -670,43 +729,261 @@ pub(crate) async fn probe_email_state<T: HttpTransport>(
 mod tests {
     use super::*;
     use bifrost_types::{AccountErrorKind, RecoveryClass, RetryDisposition};
+    use futures::StreamExt;
+    use std::sync::Mutex as StdMutex;
 
-    /// Build the `Email/set` body `send_set` would put on the wire for one
-    /// id under one mutation kind, without a transport. Mirrors `send_set`
-    /// exactly, so the assertions below pin the real request shape.
-    fn set_body(kind: &MutationKind, ids: &[&str], state: &str) -> serde_json::Value {
-        let mut set = EmailSet::new().if_in_state(state.to_string());
-        match kind {
-            MutationKind::Destroy => {
-                set = set.destroy(ids.iter().map(|id| EmailId::new(*id)));
-            }
-            MutationKind::Flags(op) => {
-                for id in ids {
-                    apply_flags(set.update(EmailId::new(*id)), op);
-                }
-            }
-            MutationKind::Move(mailbox_id) => {
-                for id in ids {
-                    set.update(EmailId::new(*id))
-                        .mailbox_ids([mailbox_id.clone()]);
-                }
-            }
-        }
-        serde_json::to_value(&set).expect("Email/set serializes")
+    /// Serialize the exact builder used by `send_set`, so a request-shape
+    /// regression cannot pass against a parallel test-only implementation.
+    fn set_body(kind: &MutationKind, ids: &[&str], state: Option<&str>) -> serde_json::Value {
+        let ids = ids
+            .iter()
+            .map(|id| ObjectId((*id).to_string()))
+            .collect::<Vec<_>>();
+        serde_json::to_value(build_email_set(state, &ids, kind, "primary", false))
+            .expect("Email/set serializes")
     }
 
     fn flags(values: &[&str]) -> std::collections::HashSet<String> {
         values.iter().map(|value| String::from(*value)).collect()
     }
 
+    #[derive(Clone)]
+    struct FailingSetTransport;
+
+    impl HttpTransport for FailingSetTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).expect("request is JSON");
+            let calls = request["methodCalls"].as_array().expect("method calls");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0][0], "Email/set");
+            let call_id = calls[0][2].clone();
+            Ok(bytes::Bytes::from(
+                serde_json::json!({
+                    "sessionState": "session-1",
+                    "methodResponses": [["error", {"type": "forbidden"}, call_id]]
+                })
+                .to_string(),
+            ))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new(
+                "no upload reply",
+            ))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new(
+                "no download reply",
+            ))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new(
+                "no session reply",
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct SuccessfulSetTransport {
+        requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+
+    impl HttpTransport for SuccessfulSetTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).expect("request is JSON");
+            self.requests
+                .lock()
+                .expect("request log lock")
+                .push(request.clone());
+            let calls = request["methodCalls"].as_array().expect("method calls");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0][0], "Email/set");
+            let call_id = calls[0][2].clone();
+            Ok(bytes::Bytes::from(
+                serde_json::json!({
+                    "sessionState": "session-1",
+                    "methodResponses": [["Email/set", {
+                        "accountId": "primary",
+                        "oldState": "state-7",
+                        "newState": "state-8",
+                        "updated": {"m1": {}}
+                    }, call_id]]
+                })
+                .to_string(),
+            ))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new(
+                "no upload reply",
+            ))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new(
+                "no download reply",
+            ))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new(
+                "no session reply",
+            ))
+        }
+    }
+
+    fn mutation_accounts<T: HttpTransport>(
+        transport: T,
+    ) -> (MailAccount<T>, Arc<HashMap<String, MailAccount<T>>>) {
+        let session = serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
+                    "maxSizeRequest": 100_000,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": 8,
+                    "maxObjectsInGet": 256,
+                    "maxObjectsInSet": 256,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:mail": {}
+            },
+            "accounts": {
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false,
+                    "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}},
+                "shared": {"name": "Shared", "isPersonal": false, "isReadOnly": false,
+                    "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}
+            },
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("test session parses");
+        let client = crate::client::Client::with_transport(
+            transport,
+            session,
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let primary = crate::account::Account::new(client.clone(), "primary");
+        let shared = crate::account::Account::new(client, "shared");
+        (
+            primary,
+            Arc::new(HashMap::from([("shared".to_string(), shared)])),
+        )
+    }
+
     #[test]
-    fn every_batch_is_gated_by_if_in_state() {
-        // `MutationConcurrency::StateBased` is advertised in
-        // `capabilities.rs`; the guard has to actually be on the wire or
-        // the engine's optimistic-concurrency contract is a fiction.
-        let body = set_body(&MutationKind::Destroy, &["m1"], "state-7");
-        assert_eq!(body["ifInState"], serde_json::json!("state-7"));
-        assert_eq!(body["destroy"], serde_json::json!(["m1"]));
+    fn dotted_flag_patches_and_destroy_omit_account_wide_if_in_state() {
+        let add = set_body(
+            &MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
+            &["m1"],
+            None,
+        );
+        let destroy = set_body(&MutationKind::Destroy, &["m1"], None);
+
+        assert!(add.get("ifInState").is_none());
+        assert!(destroy.get("ifInState").is_none());
+        assert_eq!(destroy["destroy"], serde_json::json!(["m1"]));
+    }
+
+    #[test]
+    fn whole_property_replacements_keep_if_in_state() {
+        let set_flags = set_body(
+            &MutationKind::Flags(FlagOp::Set(flags(&["$seen"]))),
+            &["m1"],
+            Some("state-7"),
+        );
+        let move_message = set_body(
+            &MutationKind::Move(MailboxId::new("mbx-target")),
+            &["m1"],
+            Some("state-7"),
+        );
+
+        assert_eq!(set_flags["ifInState"], serde_json::json!("state-7"));
+        assert_eq!(move_message["ifInState"], serde_json::json!("state-7"));
+    }
+
+    #[tokio::test]
+    async fn bulk_keyword_patch_avoids_state_probe_and_if_in_state() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let (primary, foreign) = mutation_accounts(SuccessfulSetTransport {
+            requests: Arc::clone(&requests),
+        });
+        let states = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            "primary".to_string(),
+            Some("state-7".to_string()),
+        )])));
+        let input: AccountStream<ObjectId> =
+            Box::pin(futures::stream::iter(vec![ObjectId("m1".to_string())]));
+
+        let events = mutation_stream(
+            primary,
+            foreign,
+            CoreLimits {
+                max_objects_in_get: 256,
+                max_objects_in_set: 10,
+            },
+            states,
+            input,
+            MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [SyncEvent::Batch(_), SyncEvent::Done(_)]
+        ));
+        let requests = requests.lock().expect("request log lock");
+        assert_eq!(requests.len(), 1, "a cached Email state needs no probe");
+        let call = &requests[0]["methodCalls"][0];
+        assert_eq!(call[0], "Email/set");
+        let arguments = &call[1];
+        assert!(arguments.get("ifInState").is_none());
+        assert_eq!(
+            arguments["update"]["m1"]["keywords/$seen"],
+            serde_json::json!(true)
+        );
     }
 
     #[test]
@@ -717,7 +994,7 @@ mod tests {
         let add = set_body(
             &MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
             &["m1"],
-            "s1",
+            None,
         );
         assert_eq!(
             add["update"]["m1"]["keywords/$seen"],
@@ -727,7 +1004,7 @@ mod tests {
         let remove = set_body(
             &MutationKind::Flags(FlagOp::Remove(flags(&["$seen"]))),
             &["m1"],
-            "s1",
+            None,
         );
         assert_eq!(
             remove["update"]["m1"].get("keywords/$seen"),
@@ -744,7 +1021,7 @@ mod tests {
         let body = set_body(
             &MutationKind::Flags(FlagOp::Set(flags(&["$seen"]))),
             &["m1"],
-            "s1",
+            Some("s1"),
         );
         assert_eq!(
             body["update"]["m1"]["keywords"],
@@ -765,7 +1042,7 @@ mod tests {
                 remove: flags(&["$seen"]),
             }),
             &["m1"],
-            "s1",
+            None,
         );
         assert_eq!(
             body["update"]["m1"]["keywords/$flagged"],
@@ -794,7 +1071,7 @@ mod tests {
         let body = set_body(
             &MutationKind::Move(MailboxId::new("mbx-target")),
             &["m1"],
-            "s1",
+            Some("s1"),
         );
         assert_eq!(
             body["update"]["m1"]["mailboxIds"],
@@ -807,7 +1084,7 @@ mod tests {
         let body = set_body(
             &MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
             &["m1", "m2", "m3"],
-            "s1",
+            None,
         );
         let update = body["update"].as_object().expect("update is an object");
         assert_eq!(update.len(), 3);
@@ -930,6 +1207,83 @@ mod tests {
         let (wire, rejected) = buffers.drain("primary").expect("primary route");
         assert!(wire.is_empty(), "a rejected target never reaches the wire");
         assert_eq!(rejected.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn locally_rejected_targets_are_emitted_before_a_wire_termination() {
+        let (primary, foreign) = mutation_accounts(FailingSetTransport);
+        let foreign_id = ObjectId(super::super::foreign::encode_object("shared", "M9"));
+        let mut states = HashMap::new();
+        states.insert("primary".to_string(), Some("primary-state".to_string()));
+        states.insert("shared".to_string(), Some("shared-state".to_string()));
+        let states = Arc::new(tokio::sync::Mutex::new(states));
+        let input: AccountStream<ObjectId> = Box::pin(futures::stream::iter(vec![
+            ObjectId("m1".to_string()),
+            ObjectId("m2".to_string()),
+            foreign_id.clone(),
+            ObjectId("m3".to_string()),
+        ]));
+
+        let events = mutation_stream(
+            primary,
+            foreign,
+            CoreLimits {
+                max_objects_in_get: 256,
+                max_objects_in_set: 3,
+            },
+            states,
+            input,
+            MutationKind::Move(MailboxId::new("primary-inbox")),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(events.len(), 2);
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("locally decided outcomes precede stream termination");
+        };
+        assert_eq!(batch.items.len(), 1);
+        let ItemOutcome::Failed(failure) = &batch.items[0] else {
+            panic!("the cross-account destination is a local failure");
+        };
+        assert_eq!(failure.item.0.as_str(), foreign_id.0.as_str());
+        assert!(matches!(&events[1], SyncEvent::Terminated(_)));
+    }
+
+    #[test]
+    fn draining_rejections_preserves_owner_order_and_wire_targets() {
+        let mut buffers = RouteBuffers::new(10);
+        let destination = MutationKind::Move(MailboxId::new("primary-inbox"));
+        for (owner, native) in [("z-owner", "m1"), ("a-owner", "m2"), ("z-owner", "m3")] {
+            let target = ObjectId(super::super::foreign::encode_object(owner, native));
+            let rejection = destination_rejection(&destination, &target);
+            assert!(rejection.is_some());
+            buffers.push(owner.to_string(), target, rejection);
+        }
+        let wire = ObjectId("wire-target".to_string());
+        buffers.push("z-owner".to_string(), wire.clone(), None);
+
+        let rejected = buffers.drain_rejections();
+        let ids: Vec<&str> = rejected
+            .iter()
+            .map(|outcome| {
+                let ItemOutcome::Failed(failure) = outcome else {
+                    panic!("expected local rejection");
+                };
+                failure.item.0.as_str()
+            })
+            .collect();
+        let expected = [
+            super::super::foreign::encode_object("z-owner", "m1"),
+            super::super::foreign::encode_object("z-owner", "m3"),
+            super::super::foreign::encode_object("a-owner", "m2"),
+        ];
+        assert_eq!(ids, expected.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(buffers.drain_rejections().is_empty());
+        let (items, rejected) = buffers.drain("z-owner").expect("wire target remains");
+        assert_eq!(items, vec![wire]);
+        assert!(rejected.is_empty());
+        assert!(buffers.drain("a-owner").is_none());
     }
 
     /// The owner comparison behind the wire-level rejection, enumerated.

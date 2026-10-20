@@ -131,6 +131,11 @@ impl ImapConnection {
         // Apply greeting to protocol state (sets session state, caches
         // capabilities, returns Err on BYE).
         let greeting_alert = proto_state.apply_greeting(g)?;
+        if tls_mode.uses_starttls() {
+            // RFC 9051 requires closing a cleartext PREAUTH session. Check
+            // before a CAPABILITY fallback can send another cleartext command.
+            ensure_starttls_session(&proto_state)?;
+        }
 
         // RFC 3501 Section7.1: if the greeting carried an [ALERT], deliver it
         // on the raw channel before wrapping in DriverEventSink.
@@ -183,14 +188,7 @@ impl ImapConnection {
         // capabilities  -  so `proto_state` reflects post-TLS caps by the
         // time we snapshot it into `state_tx` below.
         if tls_mode.uses_starttls() {
-            // The server must advertise STARTTLS (RFC 3501 Section6.2.1).
-            if !proto_state
-                .capabilities()
-                .iter()
-                .any(|c| matches!(c, Capability::StartTls))
-            {
-                return Err(Error::StartTlsUnavailable);
-            }
+            ensure_starttls_available(&proto_state)?;
 
             validate_tls_server_name(host)?;
 
@@ -204,6 +202,7 @@ impl ImapConnection {
                     &mut event_sink,
                     tls_connector,
                     host.to_owned(),
+                    None,
                 ),
             )
             .await?;
@@ -230,9 +229,9 @@ impl ImapConnection {
             events_rx: tokio::sync::Mutex::new(events_rx),
             driver_handle: tokio::sync::Mutex::new(Some(handle)),
             host: host.to_owned(),
-            tls_active: std::sync::atomic::AtomicBool::new(
+            tls_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 tls_mode.uses_implicit_tls() || tls_mode.uses_starttls(),
-            ),
+            )),
             abandoned: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -388,6 +387,7 @@ impl ImapConnection {
             self.submit_upgrade(driver::UpgradePayload::StartTls {
                 tls_connector,
                 server_name: self.host.clone(),
+                tls_active: std::sync::Arc::clone(&self.tls_active),
             }),
         )
         .await
@@ -396,6 +396,29 @@ impl ImapConnection {
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
+}
+
+/// STARTTLS is only available before authentication, even when the greeting
+/// advertises the capability. PREAUTH therefore means the server has already
+/// chosen an authenticated cleartext session and the client must refuse it as
+/// a TLS-policy error instead of reporting a stale command-state transition.
+fn ensure_starttls_available(state: &super::state::ProtocolState) -> Result<(), Error> {
+    ensure_starttls_session(state)?;
+    if !state
+        .capabilities()
+        .iter()
+        .any(|capability| matches!(capability, Capability::StartTls))
+    {
+        return Err(Error::StartTlsUnavailable);
+    }
+    Ok(())
+}
+
+fn ensure_starttls_session(state: &super::state::ProtocolState) -> Result<(), Error> {
+    if state.session_state() != super::SessionState::NotAuthenticated {
+        return Err(Error::StartTlsUnavailable);
+    }
+    Ok(())
 }
 
 /// An absolute setup exchange deadline, including admission and unsolicited
@@ -476,6 +499,7 @@ mod bandwidth_review_tests {
                         &mut events,
                         build_default_tls_connector().unwrap(),
                         "imap.invalid".into(),
+                        None,
                     )
                     .await
                 }
@@ -573,5 +597,66 @@ mod bandwidth_review_tests {
     #[tokio::test(start_paused = true)]
     async fn bandwidth_setup_unsolicited_capability_spends_one_peer_budget() {
         setup_peer_case(true).await;
+    }
+}
+
+#[cfg(test)]
+mod starttls_policy_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::types::response::{GreetingResponse, GreetingStatus, ResponseCode};
+
+    #[test]
+    fn preauth_with_starttls_capability_is_a_tls_policy_refusal() {
+        let mut state = super::super::state::ProtocolState::new();
+        state
+            .apply_greeting(&GreetingResponse {
+                status: GreetingStatus::PreAuth,
+                code: Some(ResponseCode::Capability(vec![Capability::StartTls])),
+                text: "already authenticated".into(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            ensure_starttls_available(&state),
+            Err(Error::StartTlsUnavailable)
+        );
+    }
+
+    #[test]
+    fn preauth_without_greeting_capabilities_is_rejected_before_capability_fallback() {
+        let mut state = super::super::state::ProtocolState::new();
+        state
+            .apply_greeting(&GreetingResponse {
+                status: GreetingStatus::PreAuth,
+                code: None,
+                text: "already authenticated".into(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            ensure_starttls_session(&state),
+            Err(Error::StartTlsUnavailable)
+        );
+    }
+
+    #[test]
+    fn unauthenticated_session_requires_starttls_advertisement() {
+        let mut state = super::super::state::ProtocolState::new();
+        state
+            .apply_greeting(&GreetingResponse {
+                status: GreetingStatus::Ok,
+                code: Some(ResponseCode::Capability(vec![Capability::StartTls])),
+                text: "ready".into(),
+            })
+            .unwrap();
+
+        assert_eq!(ensure_starttls_available(&state), Ok(()));
+        state.apply_capability_fetch(Vec::new());
+        assert_eq!(
+            ensure_starttls_available(&state),
+            Err(Error::StartTlsUnavailable)
+        );
     }
 }

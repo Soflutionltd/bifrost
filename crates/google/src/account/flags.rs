@@ -368,29 +368,33 @@ fn asserts_read_only_state(flag: &str, labels: &[GmailLabel]) -> bool {
         || user_label_id_from_flag(flag, labels).is_some_and(|id| is_read_only_label(&id))
 }
 
-/// Resolve a `$gmail-label:<id>:<name>` flag back to its Gmail label id.
+/// Resolve a `$gmail-label:<id>:<name>` flag back to a writable Gmail label.
 ///
 /// The id is the stable key and the embedded display name is advisory, so
 /// a label renamed on the server between the read that minted the flag and
 /// the write that replays it still resolves. Splitting on the *first* `:`
 /// after the prefix is deliberate: ids never contain a colon, names may.
 ///
-/// Do NOT filter this lookup by `label_type == "user"`, tempting as the
-/// function name makes it. `canonical_flags` renders every label id it has
-/// no canonical flag for into this spelling - including Gmail's system
-/// category labels (`CATEGORY_PROMOTIONS` and friends, which come back
-/// with `name == id`). Type-filtering here makes those flags unresolvable,
-/// which lands them in `unsupported_flags`, which `apply_label_patch`
-/// turns into a failed outcome for the whole batch. The ids that would genuinely be
-/// dangerous to resolve this way (UNREAD, INBOX, SENT, TRASH, SPAM, CHAT,
-/// STARRED, DRAFT, IMPORTANT) can never reach this spelling because
-/// `canonical_flags` matches them before its fallback arm.
+/// Only user labels and Gmail's `CATEGORY_*` system labels resolve through
+/// this generic flag spelling. `canonical_flags` emits it for both groups,
+/// so filtering to user labels alone would break category round-trips. The
+/// other system labels already have dedicated meanings (or are structural),
+/// and accepting a caller-forged spelling such as `$gmail-label:TRASH:TRASH`
+/// would bypass `move_placement_patch` or contradict `\\Seen` translation.
 fn user_label_id_from_flag(flag: &str, labels: &[GmailLabel]) -> Option<String> {
     let (id, _advisory_name) = flag.strip_prefix(USER_LABEL_FLAG_PREFIX)?.split_once(':')?;
     labels
         .iter()
-        .find(|label| label.id == id)
+        .find(|label| {
+            label.id == id
+                && (label.label_type.as_deref() == Some("user") || is_category_label_id(&label.id))
+        })
         .map(|label| label.id.clone())
+}
+
+fn is_category_label_id(id: &str) -> bool {
+    id.get(.."CATEGORY_".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CATEGORY_"))
 }
 
 fn contains_flag(flags: &HashSet<String>, needle: &str) -> bool {
@@ -660,6 +664,49 @@ mod tests {
         assert!(
             patch.unsupported_flags.is_empty(),
             "a flag this crate itself minted must translate back"
+        );
+    }
+
+    #[test]
+    fn forged_container_and_unread_label_flags_never_reach_batch_modify() {
+        let labels = ["INBOX", "TRASH", "UNREAD"]
+            .into_iter()
+            .map(|id| GmailLabel {
+                id: id.to_string(),
+                name: id.to_string(),
+                label_type: Some("system".to_string()),
+                color: None,
+            })
+            .collect::<Vec<_>>();
+        let patch = translate_flag_op(
+            &FlagOp::Add(set(&[
+                "$gmail-label:INBOX:INBOX",
+                "$gmail-label:TRASH:TRASH",
+                "$gmail-label:UNREAD:UNREAD",
+            ])),
+            &labels,
+        );
+
+        assert!(patch.add_label_ids.is_empty());
+        assert!(patch.remove_label_ids.is_empty());
+        assert_eq!(
+            patch.unsupported_flags,
+            vec![
+                "$gmail-label:INBOX:INBOX".to_string(),
+                "$gmail-label:TRASH:TRASH".to_string(),
+                "$gmail-label:UNREAD:UNREAD".to_string(),
+            ]
+        );
+
+        let contradictory = translate_flag_op(
+            &FlagOp::Add(set(&["\\Seen", "$gmail-label:UNREAD:UNREAD"])),
+            &labels,
+        );
+        assert_eq!(contradictory.remove_label_ids, vec!["UNREAD".to_string()]);
+        assert!(contradictory.add_label_ids.is_empty());
+        assert_eq!(
+            contradictory.unsupported_flags,
+            vec!["$gmail-label:UNREAD:UNREAD".to_string()]
         );
     }
 

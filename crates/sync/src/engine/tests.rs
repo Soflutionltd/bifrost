@@ -1,7 +1,7 @@
 use super::attach::scope_covers_membership;
 use super::backfill::BackfillScan;
 use super::bulk::{
-    MutationBucket, classify_item_outcome, queue_unresolved_for_retry,
+    MutationBucket, classify_item_outcome, counters_from_outcomes, queue_unresolved_for_retry,
     should_forward_engine_recovery, unresolved_readback_ids,
 };
 use super::reattach::accepted_push_scopes;
@@ -3064,18 +3064,17 @@ fn retry_sweep_leaves_readback_and_engine_blocked_ids_alone() {
     assert_eq!(retry_ids, vec![unseen]);
 }
 
-/// A `Downgraded` success is read-back-verified, never trusted, and never
+/// A `Downgraded` success keeps its own bucket and is neither read back nor
 /// resubmitted.
 ///
-/// The provider did something WEAKER than asked, so its own report is
-/// exactly the thing that must not be believed. Filing it `Applied` is what
-/// produced a permanent reconcile loop for Gmail's trash-instead-of-destroy
-/// fallback: the engine believed the messages were gone, the next inventory
-/// pass saw them, and it destroyed them again forever. It must equally not
-/// land in `retry_ids` - replaying a downgrade earns the same downgrade,
-/// burning the campaign's attempts to no purpose.
+/// Filing the weaker effect as `Applied` produced a permanent reconcile loop
+/// for Gmail's trash-instead-of-destroy fallback: the engine believed the
+/// messages were gone, the next inventory pass saw them, and it destroyed
+/// them again forever. The reported effect is retained in campaign counters.
+/// It must equally not land in `retry_ids` - replaying a downgrade earns the
+/// same downgrade, burning the campaign's attempts to no purpose.
 #[test]
-fn a_downgraded_mutation_is_read_back_verified_and_not_retried() {
+fn a_downgraded_mutation_keeps_its_bucket_and_is_not_retried_or_read_back() {
     use bifrost_types::{BatchItemId, BatchSuccess, ItemOutcome, MutationSuccess};
 
     let id = bifrost_types::ObjectId("message".into());
@@ -3106,18 +3105,20 @@ fn a_downgraded_mutation_is_read_back_verified_and_not_retried() {
     assert!(forwarded.is_none(), "a downgrade is not an engine recovery");
     assert_eq!(
         outcomes.get(&id),
-        Some(&MutationBucket::PendingReadback),
-        "a downgrade must not be filed as Applied"
+        Some(&MutationBucket::Downgraded),
+        "a downgrade has its own successful-effect bucket"
     );
     assert!(
         retry.is_empty(),
         "a downgrade is not transient; resubmitting it earns the same downgrade"
     );
-    assert_eq!(
-        unresolved_readback_ids(&outcomes),
-        vec![id],
-        "the read-back guard must resolve it against observed state"
+    assert!(
+        unresolved_readback_ids(&outcomes).is_empty(),
+        "the read-back guard only handles unresolved outcomes"
     );
+    let counters = counters_from_outcomes(&outcomes);
+    assert_eq!(counters.downgraded, 1);
+    assert_eq!(counters.pending_retry, 0);
 }
 
 #[test]

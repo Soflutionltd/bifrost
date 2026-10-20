@@ -39,10 +39,9 @@ pub enum WorkKind {
     Mutation,
 }
 
-/// Shed policy when a lane is full. `DropOldest` is the v1 default
-/// (matching the original behavior); `DropNewest` rejects the
-/// incoming submission. Both increment the shed counter for
-/// observability.
+/// Shed policy when a lane is full. `DropOldest` is the default and
+/// evicts the head; `DropNewest` rejects the incoming submission. Both
+/// increment the queue's shed counter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LaneShedPolicy {
@@ -72,20 +71,29 @@ impl LaneQueue {
 
     #[must_use]
     pub fn with_capacity(priority: Priority, capacity: usize) -> Self {
+        Self::with_capacity_and_policy(priority, capacity, LaneShedPolicy::default())
+    }
+
+    /// Construct a lane with an explicit overflow policy.
+    #[must_use]
+    pub fn with_capacity_and_policy(
+        priority: Priority,
+        capacity: usize,
+        shed_policy: LaneShedPolicy,
+    ) -> Self {
         Self {
             priority,
             capacity: capacity.max(1),
             queue: Mutex::new(VecDeque::new()),
             shed_count: AtomicU64::new(0),
-            shed_policy: LaneShedPolicy::default(),
+            shed_policy,
         }
     }
 
     /// Push at the tail. If the queue is at capacity, the oldest item
-    /// is shed and the shed counter is incremented. Returning silently
-    /// matches the contract for non-coalescing schedulers: the engine
-    /// surfaces shed counters through observability, not back to the
-    /// submitter.
+    /// is shed by the default policy and the shed counter is incremented.
+    /// The counter can be read from this queue with `shed_count`; scheduler
+    /// queues are private, so the engine does not expose their counters.
     pub fn push(&self, item: WorkItem) {
         let mut g = self.queue.lock().expect("poisoned");
         if g.len() >= self.capacity {
@@ -139,4 +147,38 @@ impl LaneQueue {
 pub struct LaneSnapshot {
     pub priority: Priority,
     pub depth: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(tag: &str) -> WorkItem {
+        WorkItem {
+            account: AccountId(tag.into()),
+            priority: Priority::Normal,
+            kind: WorkKind::Sync,
+            run: Box::new(|| {}),
+        }
+    }
+
+    #[test]
+    fn explicit_drop_newest_policy_is_selectable() {
+        let lane =
+            LaneQueue::with_capacity_and_policy(Priority::Normal, 2, LaneShedPolicy::DropNewest);
+        lane.push(item("first"));
+        lane.push(item("second"));
+        lane.push(item("third"));
+
+        assert_eq!(lane.shed_count(), 1);
+        assert_eq!(
+            lane.try_pop().expect("first retained item").account,
+            AccountId("first".into())
+        );
+        assert_eq!(
+            lane.try_pop().expect("second retained item").account,
+            AccountId("second".into())
+        );
+        assert!(lane.try_pop().is_none());
+    }
 }

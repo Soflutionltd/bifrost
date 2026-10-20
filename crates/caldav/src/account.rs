@@ -4,7 +4,7 @@ use bifrost_dav_core::{
     inventory_entry as inventory_entry_from_snapshot, object_change, preserve_unobserved_entries,
     same_dav_url, slice_after_watermark, sorted_candidate_hrefs, worse_recovery,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -366,6 +366,30 @@ impl CalDavAccount {
         let listing = client
             .list_event_hrefs_filtered(calendar, operation)
             .await?;
+        // COMPLETE inventory coverage cannot discharge a refused member. Fail
+        // before emitting either items or a checkpoint, retaining its status.
+        if operation == AccountOperation::SyncInventory
+            && let Some(failure) = listing.failed.first()
+        {
+            return Err(
+                match failure
+                    .status
+                    .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
+                {
+                    Some(status) => bifrost_dav_core::status_error(
+                        operation,
+                        status,
+                        format!("inventory member refused: {}", failure.href),
+                        DavProtocol::CalDav,
+                    ),
+                    None => bifrost_dav_core::parse_error(
+                        operation,
+                        "inventory member omitted usable properties",
+                        DavProtocol::CalDav,
+                    ),
+                },
+            );
+        }
         let failed_hrefs = listing.failed_hrefs();
         let mut entries = listing
             .entries
@@ -376,6 +400,8 @@ impl CalDavAccount {
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.uri.cmp(&right.uri));
+        let observation = preserve_unobserved_entries(&[], &mut entries, &failed_hrefs);
+        let sync_token = observation.advance_token(None, sync_token);
         Ok(EventSnapshot {
             calendar_url: calendar.to_string(),
             sync_token,
@@ -1891,6 +1917,13 @@ fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<EventSnapshot, Accoun
         &cursor.server_state.bytes,
     )
     .map_err(cursor_error)?;
+    if let CursorScope::Folder(folder) = &cursor.scope
+        && !same_dav_url(&folder.0, &decoded.collection_url)
+    {
+        return Err(cursor_error(
+            "cursor collection does not match its folder scope",
+        ));
+    }
     Ok(EventSnapshot {
         calendar_url: decoded.collection_url,
         sync_token: decoded.token,
@@ -1917,6 +1950,7 @@ async fn changes_from_cursor(
 ) -> Result<(EventSnapshot, Vec<Change>), AccountError> {
     if let Some(sync_token) = previous.sync_token.as_deref() {
         let mut current = previous.clone();
+        current.failed_hrefs.clear();
         let mut changes = Vec::new();
         let mut token = sync_token.to_string();
         // RFC 6578 s3.6: a server may answer a sync REPORT with only part of
@@ -1940,7 +1974,13 @@ async fn changes_from_cursor(
                 );
                 break;
             };
-            current.sync_token = Some(next_token.clone());
+            let observation =
+                preserve_unobserved_entries(&[], &mut current.entries, &current.failed_hrefs);
+            current.sync_token =
+                observation.advance_token(current.sync_token.take(), Some(next_token.clone()));
+            if !observation.complete {
+                break;
+            }
             if !truncated {
                 break;
             }
@@ -1972,20 +2012,113 @@ async fn changes_from_cursor(
 }
 
 fn preserve_unobserved_event_entries(previous: &EventSnapshot, current: &mut EventSnapshot) {
-    preserve_unobserved_entries(
+    let observation = preserve_unobserved_entries(
         &previous.entries,
         &mut current.entries,
         &current.failed_hrefs,
     );
+    current.sync_token =
+        observation.advance_token(previous.sync_token.clone(), current.sync_token.take());
+}
+
+// Match same_dav_url's resource identity without rewriting published native ids.
+// Keep decoded segments separate: an encoded slash is not a path separator.
+#[derive(Eq, Hash, PartialEq)]
+enum SyncHrefKey {
+    Url {
+        scheme: String,
+        host: Option<String>,
+        port: Option<u16>,
+        segments: Vec<String>,
+        query: Option<String>,
+    },
+    Raw(String),
+}
+
+fn sync_href_key(href: &str) -> SyncHrefKey {
+    let Ok(url) = Url::parse(href) else {
+        return SyncHrefKey::Raw(href.trim_end_matches('/').to_string());
+    };
+    let mut segments: Vec<String> = url
+        .path()
+        .split('/')
+        .map(|segment| {
+            let raw = segment.as_bytes();
+            let mut decoded = Vec::with_capacity(raw.len());
+            let mut index = 0;
+            while index < raw.len() {
+                if raw[index] == b'%'
+                    && index + 2 < raw.len()
+                    && let (Some(high), Some(low)) = (
+                        (raw[index + 1] as char).to_digit(16),
+                        (raw[index + 2] as char).to_digit(16),
+                    )
+                {
+                    decoded.push(
+                        u8::try_from(high * 16 + low).expect("two hexadecimal digits fit in u8"),
+                    );
+                    index += 3;
+                } else {
+                    decoded.push(raw[index]);
+                    index += 1;
+                }
+            }
+            String::from_utf8_lossy(&decoded).into_owned()
+        })
+        .collect();
+    if segments.last().is_some_and(String::is_empty) {
+        segments.pop();
+    }
+    SyncHrefKey::Url {
+        scheme: url.scheme().to_string(),
+        host: url.host_str().map(str::to_ascii_lowercase),
+        port: url.port_or_known_default(),
+        segments,
+        query: url.query().map(str::to_string),
+    }
 }
 
 fn apply_sync_report(
     current: &mut EventSnapshot,
     entries: Vec<crate::parse::CalDavSyncEntry>,
 ) -> Vec<Change> {
+    apply_sync_report_with_key(current, entries, sync_href_key)
+}
+
+fn apply_sync_report_with_key(
+    current: &mut EventSnapshot,
+    entries: Vec<crate::parse::CalDavSyncEntry>,
+    mut key_for: impl FnMut(&str) -> SyncHrefKey,
+) -> Vec<Change> {
+    let mut aliases: HashMap<SyncHrefKey, BTreeSet<String>> = HashMap::new();
+    for entry in &current.entries {
+        aliases
+            .entry(key_for(&entry.uri))
+            .or_default()
+            .insert(entry.uri.clone());
+    }
     let mut changes = Vec::new();
     for entry in entries {
-        let uri = entry.uri;
+        let key = key_for(&entry.uri);
+        // Keep the already published native id when a REPORT changes only
+        // URL spelling. Global canonicalization would also require changing
+        // listing and hydration identities and migrating persisted cursors.
+        // Exact spelling wins; otherwise retain the first sorted equivalent,
+        // just as the former snapshot scan did. Store ids rather than vector
+        // offsets, which shift whenever a report inserts or removes a member.
+        let uri = if current
+            .entries
+            .binary_search_by(|known| known.uri.cmp(&entry.uri))
+            .is_ok()
+        {
+            entry.uri.clone()
+        } else {
+            aliases
+                .get(&key)
+                .and_then(BTreeSet::first)
+                .cloned()
+                .unwrap_or_else(|| entry.uri.clone())
+        };
         // A per-member status that is neither success nor a removal is a
         // refusal to report on THAT member (403, 507, 503 ...). It says nothing
         // about the resource's content, so the prior snapshot entry is
@@ -1996,6 +2129,7 @@ fn apply_sync_report(
             .status
             .is_some_and(|code| !(200..300).contains(&code) && !matches!(code, 404 | 410))
         {
+            current.failed_hrefs.push(uri);
             continue;
         }
         // A member the server positively declared a non-event (RFC 4791
@@ -2011,8 +2145,14 @@ fn apply_sync_report(
             // href (a resource created and deleted between polls, or one
             // the consumer never saw) would otherwise surface a phantom
             // delete for an id the consumer has no record of.
-            if let Some(index) = current.entries.iter().position(|known| known.uri == uri) {
+            if let Ok(index) = current
+                .entries
+                .binary_search_by(|known| known.uri.cmp(&uri))
+            {
                 current.entries.remove(index);
+                if let Some(ids) = aliases.get_mut(&key) {
+                    ids.remove(&uri);
+                }
                 changes.push(object_change(&uri, ObjectChangeKind::Destroyed));
             }
             continue;
@@ -2033,6 +2173,7 @@ fn apply_sync_report(
             }
             Err(index) => {
                 current.entries.insert(index, resolved);
+                aliases.entry(key).or_default().insert(uri.clone());
                 changes.push(object_change(&uri, ObjectChangeKind::Created));
             }
         }
@@ -3578,6 +3719,36 @@ mod tests {
     }
 
     #[test]
+    fn a_cursor_collection_must_match_its_folder_scope() {
+        let snapshot = EventSnapshot {
+            calendar_url: "https://dav.example.test/c/a%40b/".to_string(),
+            ..EventSnapshot::default()
+        };
+        let equivalent = cursor_from_snapshot(
+            CursorScope::Folder(FolderId("https://dav.example.test/c/a@b/".to_string())),
+            &snapshot,
+        );
+        assert!(decode_cursor_snapshot(&equivalent).is_ok());
+        let mismatched = cursor_from_snapshot(
+            CursorScope::Folder(FolderId("https://dav.example.test/c/other/".to_string())),
+            &snapshot,
+        );
+        assert!(decode_cursor_snapshot(&mismatched).is_err());
+    }
+
+    #[test]
+    fn a_failed_poll_keeps_the_token_needed_to_retry_the_member() {
+        let mut previous = event_snapshot_with(&["a", "b"]);
+        previous.sync_token = Some("old".to_string());
+        let mut current = event_snapshot_with(&["a"]);
+        current.sync_token = Some("new".to_string());
+        current.failed_hrefs = vec!["b".to_string()];
+        preserve_unobserved_event_entries(&previous, &mut current);
+        assert_eq!(current.sync_token, previous.sync_token);
+        assert_eq!(current.entries, previous.entries);
+    }
+
+    #[test]
     fn event_cursor_snapshot_round_trips() {
         let snapshot = EventSnapshot {
             calendar_url: "https://dav.example.test/cal/".to_string(),
@@ -3736,7 +3907,10 @@ mod tests {
 
         preserve_unobserved_event_entries(&previous, &mut empty);
         assert_eq!(empty.entries.len(), 2);
-        assert_eq!(empty.sync_token.as_deref(), Some("refreshed"));
+        assert_eq!(
+            empty.sync_token, None,
+            "an empty observation must retry the listing"
+        );
 
         let recovered = event_snapshot_with(&["a.ics", "b.ics"]);
         assert!(diff_event_snapshots(&empty, &recovered).is_empty());
@@ -3864,6 +4038,197 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_refused_sync_member_does_not_advance_the_collection_token() {
+        let script = dav_script([cal_multistatus(format!(
+            "<D:multistatus xmlns:D=\"DAV:\"><D:sync-token>new</D:sync-token>{}</D:multistatus>",
+            refused("a"),
+        ))]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let mut previous = event_snapshot_with(&["https://dav.example.test/cal/a.ics"]);
+        previous.calendar_url = "https://dav.example.test/cal/".to_string();
+        previous.sync_token = Some("old".to_string());
+        let (current, changes) = changes_from_cursor(&client, &previous)
+            .await
+            .expect("partial report");
+        assert!(changes.is_empty());
+        assert_eq!(current.sync_token, previous.sync_token);
+        assert_eq!(current.entries, previous.entries);
+    }
+
+    #[test]
+    fn sync_href_index_matches_the_shared_equivalence_rule() {
+        let hrefs = [
+            "https://DAV.example.test:443/cal/a%40b.ics",
+            "https://dav.example.test/cal/a@b.ics",
+            "https://dav.example.test/cal/a@b.ics/",
+            "https://dav.example.test/cal/a@b.ics#ignored",
+            "https://dav.example.test/cal/a@b.ics?q=1",
+            "https://dav.example.test/cal/a%2Fb.ics",
+            "https://dav.example.test/cal/a/b.ics",
+            "https://dav.example.test/cal/%FF.ics",
+            "https://dav.example.test/cal/%FE.ics",
+            "https://dav.example.test/cal/%zz.ics",
+            "http://dav.example.test/cal/a@b.ics",
+            "relative/",
+            "relative",
+        ];
+        for left in hrefs {
+            for right in hrefs {
+                assert_eq!(
+                    sync_href_key(left) == sync_href_key(right),
+                    same_dav_url(left, right),
+                    "{left} versus {right}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sync_report_normalizes_each_snapshot_and_report_entry_once() {
+        let ids: Vec<String> = (0..10_000)
+            .map(|index| format!("https://dav.example.test/cal/{index:05}.ics"))
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut snapshot = event_snapshot_with(&refs);
+        let entries = (10_000..11_000)
+            .map(|index| crate::parse::CalDavSyncEntry {
+                uri: format!("https://dav.example.test/cal/{index:05}.ics"),
+                etag: Some("new".to_string()),
+                status: Some(200),
+                non_vevent: false,
+            })
+            .collect();
+        let mut normalizations = 0;
+        let changes = apply_sync_report_with_key(&mut snapshot, entries, |href| {
+            normalizations += 1;
+            sync_href_key(href)
+        });
+        assert_eq!(normalizations, 11_000);
+        assert_eq!(changes.len(), 1_000);
+        assert_eq!(snapshot.entries.len(), 11_000);
+    }
+
+    #[test]
+    fn sync_report_alias_index_tracks_inserts_and_removals() {
+        let encoded = "https://dav.example.test/cal/a%40b.ics";
+        let literal = "https://dav.example.test/cal/a@b.ics";
+        let mut snapshot = event_snapshot_with(&[encoded, literal]);
+        let changes = apply_sync_report(
+            &mut snapshot,
+            vec![
+                crate::parse::CalDavSyncEntry {
+                    uri: literal.to_string(),
+                    etag: None,
+                    status: Some(404),
+                    non_vevent: false,
+                },
+                crate::parse::CalDavSyncEntry {
+                    uri: literal.to_string(),
+                    etag: Some("updated".to_string()),
+                    status: Some(200),
+                    non_vevent: false,
+                },
+                crate::parse::CalDavSyncEntry {
+                    uri: literal.to_string(),
+                    etag: None,
+                    status: Some(410),
+                    non_vevent: false,
+                },
+                crate::parse::CalDavSyncEntry {
+                    uri: literal.to_string(),
+                    etag: Some("new".to_string()),
+                    status: Some(200),
+                    non_vevent: false,
+                },
+                crate::parse::CalDavSyncEntry {
+                    uri: encoded.to_string(),
+                    etag: Some("again".to_string()),
+                    status: Some(200),
+                    non_vevent: false,
+                },
+            ],
+        );
+        let expected = [
+            (literal, ObjectChangeKind::Destroyed),
+            (encoded, ObjectChangeKind::Updated),
+            (encoded, ObjectChangeKind::Destroyed),
+            (literal, ObjectChangeKind::Created),
+            (literal, ObjectChangeKind::Updated),
+        ];
+        assert_eq!(changes.len(), expected.len());
+        for (change, (id, kind)) in changes.iter().zip(expected) {
+            assert!(matches!(change, Change::ObjectChange(change)
+                if change.id.0 == id && change.kind == kind));
+        }
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].uri, literal);
+        assert_eq!(snapshot.entries[0].etag.as_deref(), Some("again"));
+    }
+
+    #[test]
+    fn sync_member_aliases_update_and_delete_the_existing_native_id() {
+        let uri = "https://dav.example.test/cal/a%40b.ics";
+        let mut snapshot = event_snapshot_with(&[uri]);
+        for (status, kind) in [
+            (200, ObjectChangeKind::Updated),
+            (404, ObjectChangeKind::Destroyed),
+        ] {
+            let changes = apply_sync_report(
+                &mut snapshot,
+                vec![crate::parse::CalDavSyncEntry {
+                    uri: "https://dav.example.test/cal/a@b.ics".to_string(),
+                    etag: Some("changed".to_string()),
+                    status: Some(status),
+                    non_vevent: false,
+                }],
+            );
+            assert!(
+                matches!(changes.as_slice(), [Change::ObjectChange(change)] if change.id.0 == uri && change.kind == kind)
+            );
+        }
+        assert!(snapshot.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_initial_partial_snapshot_does_not_seed_a_sync_token() {
+        let mut home = home_listing();
+        home.body = home.body.replace(
+            "<D:displayname>",
+            "<D:sync-token>new</D:sync-token><D:displayname>",
+        );
+        let script = dav_script([home, cal_multistatus(wrap(&[queried("a"), refused("b")]))]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let snapshot = CalDavAccount::event_snapshot(
+            &client,
+            Some("https://dav.example.test/"),
+            "https://dav.example.test/cal/",
+            AccountOperation::SyncChanges,
+        )
+        .await
+        .expect("partial snapshot");
+        assert!(snapshot.sync_token.is_none());
+        assert_eq!(snapshot.failed_hrefs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn inventory_refuses_partial_member_coverage() {
+        let script = dav_script([
+            home_listing(),
+            cal_multistatus(wrap(&[queried("a"), refused("b")])),
+        ]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+        let events = account
+            .inventory_stream(folder_scope())
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(events.as_slice(), [InventoryEvent::Terminated(_)]));
     }
 
     #[test]

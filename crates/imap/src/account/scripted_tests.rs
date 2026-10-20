@@ -1231,15 +1231,8 @@ fn downgrade_detail(from: SyncStrategy, to: SyncStrategy) -> String {
     format!("{from:?}->{to:?}")
 }
 
-/// QRESYNC happy path.
-///
-/// Pins four things at once: the QRESYNC cursor variant puts the QRESYNC
-/// parameter (with the known-UID baseline) on the SELECT line; the same UID
-/// reported by SELECT-side VANISHED and then by the CHANGEDSINCE FETCH
-/// collapses into a single `Updated` instead of surfacing in both the expunge
-/// and the update lane; a UID repeated across FETCH responses is emitted once;
-/// and the final checkpoint carries the server's new HIGHESTMODSEQ plus the
-/// recomputed live UID set.
+/// QRESYNC SELECT is the whole diff: broad VANISHED ranges intersect the
+/// baseline, duplicate FETCHes collapse, and no second command is needed.
 #[tokio::test]
 async fn qresync_dedupes_vanished_against_fetch_and_checkpoints_the_live_set() {
     let (conn, mut server) =
@@ -1278,7 +1271,9 @@ async fn qresync_dedupes_vanished_against_fetch_and_checkpoints_the_live_set() {
                  * OK [UIDVALIDITY 5] ok\r\n\
                  * OK [UIDNEXT 9] ok\r\n\
                  * OK [HIGHESTMODSEQ 200] ok\r\n\
-                 * VANISHED (EARLIER) 2\r\n\
+                 * VANISHED (EARLIER) 1:4000000000\r\n\
+                 * 1 FETCH (UID 3 FLAGS (\\Seen) MODSEQ (150))\r\n\
+                 * 2 FETCH (UID 2 FLAGS (\\Seen) MODSEQ (180))\r\n\
                  * 1 FETCH (UID 3 FLAGS (\\Seen) MODSEQ (150))\r\n\
                  {} OK [READ-ONLY] EXAMINE done\r\n",
                 tag_of(&select)
@@ -1286,22 +1281,6 @@ async fn qresync_dedupes_vanished_against_fetch_and_checkpoints_the_live_set() {
         )
         .await;
 
-        let fetch = read_line(&mut server).await;
-        assert!(
-            fetch.contains("CHANGEDSINCE 100") && fetch.contains("VANISHED"),
-            "QRESYNC diffs with CHANGEDSINCE ... VANISHED, got {fetch}"
-        );
-        respond(
-            &mut server,
-            &format!(
-                "* 1 FETCH (UID 2 FLAGS (\\Deleted) MODSEQ (180))\r\n\
-                 * 2 FETCH (UID 3 FLAGS (\\Seen) MODSEQ (150))\r\n\
-                 * VANISHED (EARLIER) 1\r\n\
-                 {} OK UID FETCH done\r\n",
-                tag_of(&fetch)
-            ),
-        )
-        .await;
         server
     });
 
@@ -1324,9 +1303,9 @@ async fn qresync_dedupes_vanished_against_fetch_and_checkpoints_the_live_set() {
     assert_eq!(
         change_labels(&events),
         vec![
+            (id(5, 1), "removed"),
             (id(5, 3), "updated"),
             (id(5, 2), "updated"),
-            (id(5, 1), "removed"),
         ],
         "UID 2 was VANISHED then re-FETCHed, so it must land in one lane only, \
          and the twice-FETCHed UID 3 must be emitted once"
@@ -1344,6 +1323,119 @@ async fn qresync_dedupes_vanished_against_fetch_and_checkpoints_the_live_set() {
             assert!(known_uids_complete);
         }
         other => panic!("QRESYNC must checkpoint a QRESYNC cursor, got {other:?}"),
+    }
+    let _server = script.await.unwrap();
+}
+
+/// The known-UID SELECT need not FETCH arrivals, even when UIDNEXT and
+/// HIGHESTMODSEQ advance. Membership discovery must precede the checkpoint.
+#[tokio::test]
+async fn qresync_discovers_delivery_outside_the_select_known_uids() {
+    qresync_delivery_transcript(false, false).await;
+}
+
+/// An arrival can replace an expunge without changing the baseline count.
+/// Compare EXISTS with the set after applying VANISHED, not the old count.
+#[tokio::test]
+async fn qresync_discovers_delivery_when_an_expunge_keeps_exists_unchanged() {
+    qresync_delivery_transcript(true, false).await;
+}
+
+#[tokio::test]
+async fn qresync_delivery_search_failure_does_not_checkpoint_new_modseq() {
+    qresync_delivery_transcript(false, true).await;
+}
+
+async fn qresync_delivery_transcript(expunge: bool, search_fails: bool) {
+    let (conn, mut server) =
+        driver_pair(&preauth_greeting("IMAP4rev1 ENABLE CONDSTORE QRESYNC")).await;
+    let enable = super::pool::enable_qresync(&conn, Duration::from_secs(5));
+    let answer = async {
+        let command = read_line(&mut server).await;
+        assert!(command.contains("ENABLE QRESYNC"), "{command}");
+        respond(
+            &mut server,
+            &format!("* ENABLED QRESYNC\r\n{} OK enabled\r\n", tag_of(&command)),
+        )
+        .await;
+    };
+    let (enabled, ()) = tokio::join!(enable, answer);
+    enabled.unwrap();
+    let account = scripted_sync_account(conn, 1, true, None, inbox_registry());
+    let baseline = FolderCursor::QResync {
+        uidvalidity: 5,
+        modseq: 100,
+        known_uids: CompactUidSet::from_uids([1, 2]),
+        known_uids_complete: true,
+    };
+    account.folders.set_cursor(&inbox(), baseline.clone());
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(select.contains("QRESYNC (5 100 1:2)"), "{select}");
+        let exists = if expunge { 2 } else { 3 };
+        let vanished = if expunge {
+            "* VANISHED (EARLIER) 1\r\n"
+        } else {
+            ""
+        };
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}\
+                 * {exists} EXISTS\r\n\
+                 * OK [UIDVALIDITY 5] ok\r\n\
+                 * OK [UIDNEXT 4] ok\r\n\
+                 * OK [HIGHESTMODSEQ 200] ok\r\n\
+                 {vanished}{} OK [READ-ONLY] selected\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        let search = read_line(&mut server).await;
+        assert!(search.contains("UID SEARCH ALL"), "{search}");
+        let reply = if search_fails {
+            format!("{} NO discovery failed\r\n", tag_of(&search))
+        } else {
+            let uids = if expunge { "2 3" } else { "1 2 3" };
+            format!("* SEARCH {uids}\r\n{} OK searched\r\n", tag_of(&search))
+        };
+        respond(&mut server, &reply).await;
+        server
+    });
+    let events = collect_changes(account.clone(), cursor_for(&baseline)).await;
+    if search_fails {
+        assert!(matches!(events.last(), Some(SyncEvent::Terminated(_))));
+        assert!(!events.iter().any(|event| match event {
+            SyncEvent::Done(_) => true,
+            SyncEvent::Batch(batch) => batch.checkpoint.is_some(),
+            _ => false,
+        }));
+        assert!(matches!(
+            account.folders.get(&inbox()).unwrap().cursor(),
+            Some(FolderCursor::QResync { modseq: 100, .. })
+        ));
+    } else {
+        let expected = if expunge {
+            vec![(id(5, 1), "removed"), (id(5, 3), "added")]
+        } else {
+            vec![(id(5, 3), "added")]
+        };
+        assert_eq!(change_labels(&events), expected);
+        assert!(warnings_of(&events).is_empty());
+        match done_cursor(&events) {
+            FolderCursor::QResync {
+                modseq,
+                known_uids,
+                known_uids_complete,
+                ..
+            } => {
+                assert_eq!(modseq, 200);
+                let expected_uids = if expunge { vec![2, 3] } else { vec![1, 2, 3] };
+                assert_eq!(known_uids.to_uids(), expected_uids);
+                assert!(known_uids_complete);
+            }
+            other => panic!("expected QRESYNC checkpoint, got {other:?}"),
+        }
     }
     let _server = script.await.unwrap();
 }
@@ -3064,4 +3156,72 @@ async fn a_refused_preflight_select_leaves_the_mutation_unsent() {
         vec![TransmissionState::Unsent],
         "the COPY was never sent: {err:?}"
     );
+}
+
+/// Mutation SELECT must not carry the cached QRESYNC baseline or refresh the
+/// guard from that baseline before the STORE tests the consumer's stale view.
+#[tokio::test]
+async fn mutation_select_omits_qresync_baseline_and_keeps_cached_store_guard() {
+    use bifrost_types::FlagOp;
+
+    let (conn, mut server) =
+        driver_pair(&preauth_greeting("IMAP4rev1 ENABLE CONDSTORE QRESYNC")).await;
+    let (enabled, ()) = tokio::join!(
+        super::pool::enable_qresync(&conn, Duration::from_secs(5)),
+        async {
+            let enable = read_line(&mut server).await;
+            respond(
+                &mut server,
+                &format!("* ENABLED QRESYNC\r\n{} OK enabled\r\n", tag_of(&enable)),
+            )
+            .await;
+        }
+    );
+    enabled.unwrap();
+    let account = scripted_sync_account(conn, 1, true, None, inbox_registry());
+    let entry = account.folders.get(&inbox()).unwrap();
+    entry.set_cursor(FolderCursor::QResync {
+        uidvalidity: 5,
+        modseq: 100,
+        known_uids: CompactUidSet::from_ranges(vec![crate::types::UidRange::range(1, 4000000000)]),
+        known_uids_complete: true,
+    });
+    entry.record_modseq(5, 2, 100).unwrap();
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("SELECT ") && !select.contains("QRESYNC"),
+            "{select}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}* 1 EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n\
+             * OK [UIDNEXT 3] ok\r\n* OK [HIGHESTMODSEQ 200] ok\r\n\
+             {} OK [READ-WRITE] selected\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        let store = read_line(&mut server).await;
+        assert!(
+            store.contains("UID STORE 2 (UNCHANGEDSINCE 100)"),
+            "{store}"
+        );
+        respond(&mut server, &format!("{} OK stored\r\n", tag_of(&store))).await;
+        server
+    });
+    let output = super::mutate::mutation_stream(
+        account,
+        Box::pin(futures::stream::iter([super::encode_object_id(
+            &inbox(),
+            5,
+            2,
+        )])),
+        super::mutate::MutationKind::Flags(FlagOp::Add(std::collections::HashSet::from([
+            "$flagged".to_owned(),
+        ]))),
+    );
+    assert_eq!(drain_mutation_batches(output).await, vec![vec![id(5, 2)]]);
+    let _server = script.await.unwrap();
 }

@@ -78,6 +78,10 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
     let phase = error.phase();
     let diagnostic = error.diagnostic_text();
 
+    if let Some(account_error) = error.preclassified_account_error() {
+        return recontextualize_preclassified(account_error, &ctx);
+    }
+
     match error.kind() {
         ErrorKind::Parse => build_basic(
             &ctx,
@@ -205,6 +209,24 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
             response_to_account_error(response, &ctx, phase, attempt_state)
         }
     }
+}
+
+/// Keep a dependency's kind and cause chain while applying the SMTP call-site
+/// context. OAuth token resolution happens before SMTP writes any message
+/// command, and bifrost-net already knows whether its failure is auth loss,
+/// refresh-transient, or another typed outcome.
+fn recontextualize_preclassified(error: AccountError, ctx: &SmtpErrorContext) -> AccountError {
+    let mut builder = error.into_builder().protocol(ctx.protocol);
+    if let Some(operation) = ctx.operation {
+        builder = builder.operation(operation);
+    }
+    if let Some(provider) = ctx.provider {
+        builder = builder.provider(provider);
+    }
+    if let Some(idempotency_override) = ctx.idempotency_override {
+        builder = builder.idempotency_override(idempotency_override);
+    }
+    finish(builder)
 }
 
 /// The SASL rung an auth-phase error was running, if the stamp names one.

@@ -10,11 +10,13 @@
 //! it lives in `bifrost-net`. This gate counts concurrent operations,
 //! not request rate.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::sync::{Arc, Mutex};
 
 use bifrost_types::AccountId;
-use dashmap::DashMap;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::error::Error;
 use crate::scheduler::lanes::WorkKind;
@@ -128,8 +130,36 @@ impl std::fmt::Debug for BudgetGate {
 struct BudgetInner {
     budget: ConcurrencyBudget,
     global: Arc<Semaphore>,
-    account_sync: DashMap<AccountId, Arc<Semaphore>>,
-    account_mutation: DashMap<AccountId, Arc<Semaphore>>,
+    accounts: Mutex<HashMap<AccountId, AccountPoolsEntry>>,
+}
+
+struct AccountPools {
+    sync: Arc<Semaphore>,
+    mutation: Arc<Semaphore>,
+    retired: CancellationToken,
+}
+
+enum AccountPoolsEntry {
+    Active(Arc<AccountPools>),
+    // Preserve a lightweight tombstone so a stray acquire after detach does
+    // not mistake this id for a never-seen account and lazily recreate pools.
+    Forgotten,
+}
+
+impl AccountPools {
+    fn new(budget: ConcurrencyBudget) -> Arc<Self> {
+        Arc::new(Self {
+            sync: Arc::new(Semaphore::new(budget.sync_permits())),
+            mutation: Arc::new(Semaphore::new(budget.mutation_permits())),
+            retired: CancellationToken::new(),
+        })
+    }
+
+    fn retire(&self) {
+        self.retired.cancel();
+        self.sync.close();
+        self.mutation.close();
+    }
 }
 
 impl BudgetGate {
@@ -143,26 +173,49 @@ impl BudgetGate {
                 // constructor invariant here so a direct `global: 0` cannot
                 // create a gate that blocks every acquisition forever.
                 global: Arc::new(Semaphore::new(budget.global.max(1))),
-                account_sync: DashMap::new(),
-                account_mutation: DashMap::new(),
+                accounts: Mutex::new(HashMap::new()),
             }),
         }
     }
 
-    /// Ensure per-account semaphores exist for `account` so the first
-    /// `acquire` call doesn't race with later config changes. Called
-    /// from `SyncEngine::attach`.
+    /// Ensure per-account semaphores exist for `account`. Re-registering an
+    /// active account preserves its pools, including pools lazily created by
+    /// an earlier direct `acquire`. Called from `SyncEngine::attach`.
     pub fn register(&self, account: AccountId) {
-        let sync = Arc::new(Semaphore::new(self.inner.budget.sync_permits()));
-        let mutation = Arc::new(Semaphore::new(self.inner.budget.mutation_permits()));
-        self.inner.account_sync.insert(account.clone(), sync);
-        self.inner.account_mutation.insert(account, mutation);
+        let mut accounts = self.inner.accounts.lock().expect("poisoned");
+        match accounts.entry(account) {
+            Entry::Vacant(entry) => {
+                entry.insert(AccountPoolsEntry::Active(AccountPools::new(
+                    self.inner.budget,
+                )));
+            }
+            Entry::Occupied(mut entry) => {
+                if matches!(entry.get(), AccountPoolsEntry::Forgotten) {
+                    entry.insert(AccountPoolsEntry::Active(AccountPools::new(
+                        self.inner.budget,
+                    )));
+                }
+            }
+        }
     }
 
-    /// Drop per-account semaphores. Called from `SyncEngine::detach`.
+    /// Retire per-account semaphores. Called from `SyncEngine::detach` after
+    /// workers have drained their granted permits. Pending acquisitions are
+    /// canceled; a later `register` creates fresh pools. The tombstone remains
+    /// so an acquire racing after detach cannot lazily resurrect this account.
     pub fn forget(&self, account: &AccountId) {
-        self.inner.account_sync.remove(account);
-        self.inner.account_mutation.remove(account);
+        let mut accounts = self.inner.accounts.lock().expect("poisoned");
+        match accounts.entry(account.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(AccountPoolsEntry::Forgotten);
+            }
+            Entry::Occupied(mut entry) => {
+                if let AccountPoolsEntry::Active(pools) = entry.get() {
+                    pools.retire();
+                }
+                entry.insert(AccountPoolsEntry::Forgotten);
+            }
+        }
     }
 
     /// Acquire a permit. Returns a `BudgetPermit` that releases the
@@ -175,45 +228,55 @@ impl BudgetGate {
         account: &AccountId,
         kind: WorkKind,
     ) -> Result<BudgetPermit, Error> {
+        let pools = self.account_pools(account)?;
         let inner_sem = match kind {
-            WorkKind::Sync => self.sync_semaphore(account),
-            WorkKind::Mutation => self.mutation_semaphore(account),
+            WorkKind::Sync => Arc::clone(&pools.sync),
+            WorkKind::Mutation => Arc::clone(&pools.mutation),
         };
-        let inner = inner_sem
-            .acquire_owned()
-            .await
-            .map_err(|e| Error::Other(format!("account semaphore closed: {e}")))?;
-        let outer = Arc::clone(&self.inner.global)
-            .acquire_owned()
-            .await
-            .map_err(|e| Error::Other(format!("global semaphore closed: {e}")))?;
+        let inner = tokio::select! {
+            acquired = inner_sem.acquire_owned() => acquired
+                .map_err(|e| Error::Other(format!("account semaphore closed: {e}")))?,
+            () = pools.retired.cancelled() => {
+                return Err(Error::Other("account budget was forgotten".into()));
+            }
+        };
+        let outer = tokio::select! {
+            acquired = Arc::clone(&self.inner.global).acquire_owned() => acquired
+                .map_err(|e| Error::Other(format!("global semaphore closed: {e}")))?,
+            () = pools.retired.cancelled() => {
+                return Err(Error::Other("account budget was forgotten".into()));
+            }
+        };
+        // If both semaphore acquisition and retirement became ready together,
+        // do not hand a permit from the retired generation to the caller.
+        if pools.retired.is_cancelled() {
+            return Err(Error::Other("account budget was forgotten".into()));
+        }
         Ok(BudgetPermit {
             _outer: outer,
             _inner: inner,
         })
     }
 
-    fn sync_semaphore(&self, account: &AccountId) -> Arc<Semaphore> {
-        // `entry().or_insert_with` is atomic on `DashMap`; this
-        // closes the race where two concurrent `acquire` calls on an
-        // unregistered account would each allocate a fresh
-        // `Semaphore`, with the loser then gating against an orphan
-        // that has no permits drained by the winner's holders.
-        let permits = self.inner.budget.sync_permits();
-        self.inner
-            .account_sync
-            .entry(account.clone())
-            .or_insert_with(|| Arc::new(Semaphore::new(permits)))
-            .clone()
-    }
-
-    fn mutation_semaphore(&self, account: &AccountId) -> Arc<Semaphore> {
-        let permits = self.inner.budget.mutation_permits();
-        self.inner
-            .account_mutation
-            .entry(account.clone())
-            .or_insert_with(|| Arc::new(Semaphore::new(permits)))
-            .clone()
+    fn account_pools(&self, account: &AccountId) -> Result<Arc<AccountPools>, Error> {
+        let mut accounts = self
+            .inner
+            .accounts
+            .lock()
+            .map_err(|_| Error::Other("account budget lock was poisoned".into()))?;
+        match accounts.entry(account.clone()) {
+            Entry::Occupied(entry) => match entry.get() {
+                AccountPoolsEntry::Active(pools) => Ok(Arc::clone(pools)),
+                AccountPoolsEntry::Forgotten => {
+                    Err(Error::Other("account budget was forgotten".into()))
+                }
+            },
+            Entry::Vacant(entry) => {
+                let pools = AccountPools::new(self.inner.budget);
+                entry.insert(AccountPoolsEntry::Active(Arc::clone(&pools)));
+                Ok(pools)
+            }
+        }
     }
 }
 
@@ -298,6 +361,105 @@ mod tests {
             .acquire(&account, WorkKind::Sync)
             .await
             .expect("public constructor must retain one global permit");
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn register_preserves_a_lazily_created_pool() {
+        let gate = BudgetGate::new(ConcurrencyBudget {
+            per_account: 2,
+            global: 4,
+            mutation_share_num: 1,
+            mutation_share_den: 2,
+        });
+        let account = AccountId("lazy-register".into());
+        let held = gate
+            .acquire(&account, WorkKind::Sync)
+            .await
+            .expect("first acquire lazily creates the account pools");
+        gate.register(account.clone());
+
+        let waiting_gate = gate.clone();
+        let waiting_account = account.clone();
+        let waiter =
+            tokio::spawn(
+                async move { waiting_gate.acquire(&waiting_account, WorkKind::Sync).await },
+            );
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "register must not replace a pool with a permit still held"
+        );
+
+        drop(held);
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("the preserved pool releases its permit");
+    }
+
+    #[tokio::test]
+    async fn forget_cancels_pending_acquires_and_blocks_stray_recreation() {
+        let gate = BudgetGate::new(ConcurrencyBudget {
+            per_account: 2,
+            global: 1,
+            mutation_share_num: 1,
+            mutation_share_den: 2,
+        });
+        let account = AccountId("forgotten-account".into());
+        gate.register(account.clone());
+        let global_held = Arc::clone(&gate.inner.global)
+            .acquire_owned()
+            .await
+            .expect("hold the only global permit");
+
+        let waiting_gate = gate.clone();
+        let waiting_account = account.clone();
+        let waiter =
+            tokio::spawn(
+                async move { waiting_gate.acquire(&waiting_account, WorkKind::Sync).await },
+            );
+        let pools = gate.account_pools(&account).expect("registered pools");
+        for _ in 0..8 {
+            if pools.sync.available_permits() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            pools.sync.available_permits(),
+            0,
+            "the waiter must hold the account permit while it waits globally"
+        );
+
+        gate.forget(&account);
+        for _ in 0..8 {
+            if waiter.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            waiter.is_finished(),
+            "forget must cancel an acquisition waiting on the global pool"
+        );
+        assert!(
+            waiter.await.expect("waiter task").is_err(),
+            "a retired account acquisition is refused"
+        );
+        assert!(
+            gate.acquire(&account, WorkKind::Sync).await.is_err(),
+            "a stray acquire after forget must not recreate account pools"
+        );
+
+        drop(global_held);
+        gate.register(account.clone());
+        let permit = gate
+            .acquire(&account, WorkKind::Sync)
+            .await
+            .expect("reattaching explicitly registers fresh pools");
         drop(permit);
     }
 }

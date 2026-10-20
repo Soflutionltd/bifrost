@@ -48,11 +48,20 @@ pub(crate) fn build_transaction_commands(
 ///
 /// Same contract as `build_transaction_commands`: every recipient is validated
 /// before the caller opens a transaction, so a rejection can never unwind past
-/// an already-sent `MAIL FROM` and strand the connection mid-transaction.
+/// an already-sent `MAIL FROM` and strand the connection mid-transaction. The
+/// options slice must have exactly one entry per address; a length mismatch is
+/// an internal error rather than silently dropping recipients.
 pub(crate) fn build_recipient_commands(
     addresses: impl IntoIterator<Item = Address>,
     rcpt_options: &[Vec<RcptParameter>],
 ) -> Result<Vec<Rcpt>, Error> {
+    let addresses = addresses.into_iter().collect::<Vec<_>>();
+    if addresses.len() != rcpt_options.len() {
+        return Err(error::internal(
+            "recipient options count did not match recipient count",
+        ));
+    }
+
     addresses
         .into_iter()
         .zip(rcpt_options)
@@ -386,6 +395,21 @@ mod test {
 
     use super::*;
     use crate::transport::smtp::extension::MailBodyParameter;
+
+    #[test]
+    fn recipient_command_builder_rejects_mismatched_options_counts() {
+        let addresses = [
+            Address::from_str("first@example.com").unwrap(),
+            Address::from_str("second@example.com").unwrap(),
+        ];
+
+        let fewer_options = build_recipient_commands(addresses.clone(), &[vec![]]).unwrap_err();
+        assert!(fewer_options.is_internal());
+
+        let more_options =
+            build_recipient_commands(addresses, &[vec![], vec![], vec![]]).unwrap_err();
+        assert!(more_options.is_internal());
+    }
 
     #[test]
     fn hello_constructors_reject_command_injection() {

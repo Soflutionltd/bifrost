@@ -272,14 +272,20 @@ const TAG_CONTEXT_3: u8 = 0xa3;
 /// Read one definite-form DER TLV from the front of `buf`. Returns the tag
 /// byte, the content (value) slice, and the remainder past this element.
 ///
-/// Only definite-form lengths are accepted: short form `0x00..=0x7f`, or long
-/// form `0x81/0x82/0x83/0x84` giving the byte count of the length. The
-/// indefinite form (`0x80`) is invalid in DER and rejected. Any truncation or
-/// length overrun is a `Protocol` error.
+/// Only low-tag-number, definite-form values are accepted. Lengths must use
+/// DER's minimal encoding: short form `0x00..=0x7f`, or long form with one to
+/// four length bytes for values of at least 128. The indefinite form (`0x80`)
+/// is invalid in DER and rejected. Any truncation or length overrun is a
+/// `Protocol` error.
 fn read_tlv(buf: &[u8]) -> Result<(u8, &[u8], &[u8]), SaslError> {
     let tag = *buf
         .first()
         .ok_or_else(|| SaslError::Protocol("truncated DER: missing tag byte".into()))?;
+    if tag & 0x1f == 0x1f {
+        return Err(SaslError::Protocol(
+            "high-tag-number DER form is not supported".into(),
+        ));
+    }
     let len_byte = *buf
         .get(1)
         .ok_or_else(|| SaslError::Protocol("truncated DER: missing length byte".into()))?;
@@ -303,6 +309,11 @@ fn read_tlv(buf: &[u8]) -> Result<(u8, &[u8], &[u8]), SaslError> {
         let len_bytes = buf
             .get(2..2 + num_len_bytes)
             .ok_or_else(|| SaslError::Protocol("truncated DER: short long-form length".into()))?;
+        if len_bytes.first() == Some(&0) {
+            return Err(SaslError::Protocol(
+                "non-minimal DER long-form length".into(),
+            ));
+        }
         // Accumulate into `u64` (the `num_len_bytes <= 4` cap keeps this exact)
         // then narrow to `usize`. Narrowing through `try_from` rather than
         // shifting directly into `usize` means a 4-byte length cannot silently
@@ -311,6 +322,11 @@ fn read_tlv(buf: &[u8]) -> Result<(u8, &[u8], &[u8]), SaslError> {
         let mut len: u64 = 0;
         for &b in len_bytes {
             len = (len << 8) | u64::from(b);
+        }
+        if len < 0x80 {
+            return Err(SaslError::Protocol(
+                "non-minimal DER long-form length".into(),
+            ));
         }
         let len = usize::try_from(len)
             .map_err(|_| SaslError::Protocol("DER length field too large".into()))?;
@@ -658,5 +674,30 @@ mod tests {
         let buf = [TAG_SEQUENCE, 0x83, 0x01];
         let err = read_tlv(&buf).unwrap_err();
         assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_tlv_rejects_non_minimal_der_lengths() {
+        let short_value_in_long_form = [TAG_SEQUENCE, 0x81, 0x7f];
+        let leading_zero_in_long_form = [TAG_SEQUENCE, 0x82, 0x00, 0x80];
+
+        assert!(matches!(
+            read_tlv(&short_value_in_long_form),
+            Err(SaslError::Protocol(_))
+        ));
+        assert!(matches!(
+            read_tlv(&leading_zero_in_long_form),
+            Err(SaslError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn read_tlv_rejects_high_tag_number_form() {
+        let high_tag_number = [0x1f, 0x01, 0x00];
+
+        assert!(matches!(
+            read_tlv(&high_tag_number),
+            Err(SaslError::Protocol(_))
+        ));
     }
 }

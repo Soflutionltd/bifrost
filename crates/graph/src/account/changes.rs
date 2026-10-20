@@ -29,6 +29,12 @@ pub(crate) fn changes_stream(
     cursor: ChangeCursor,
 ) -> AccountStream<SyncEvent<Change>> {
     Box::pin(async_stream::stream! {
+        if !super::inventory::sync_scope_readable(&cursor.scope) {
+            let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+                .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
+            yield SyncEvent::Terminated(cursor_error_to_account_error(CursorError::Unsupported, ctx));
+            return;
+        }
         let mut payload = match decode_cursor(&cursor) {
             Ok(payload) => payload,
             Err(error) => {
@@ -172,8 +178,10 @@ pub(crate) fn changes_stream(
                         // Updated ids are encoded, so a foreign item's
                         // remove carries the same bytes its add did
                         // (ratatoskr equality-joins on this id).
-                        let id = super::foreign::encode_message_id(&scope, &id.0);
-                        removed_etag_ids.push(id.0.clone());
+                        let id = super::inventory::sync_object_id(&scope, &id.0);
+                        if super::inventory::is_mail_scope(&scope) {
+                            removed_etag_ids.push(id.0.clone());
+                        }
                         changes.push(Change::ScopeChange(ScopeChange {
                             id,
                             membership: membership_from_value(&scope, &value),
@@ -188,12 +196,10 @@ pub(crate) fn changes_stream(
                     idless_value = true;
                 }
                 if let Some(id) = value.get("id").and_then(Value::as_str) {
-                    // Foreign-encode the change id at mint: the readback
-                    // guard feeds these ids straight back into
-                    // `get_stream(FlagsOnly)`, which decodes and routes to
-                    // `/users/{owner}`. A primary-scope id stays bare.
-                    let object_id = super::foreign::encode_message_id(&scope, id);
-                    if let Some(etag) = graph_etag(&value) {
+                    let object_id = super::inventory::sync_object_id(&scope, id);
+                    // Only mail mutations consume this bounded cache.
+                    if super::inventory::is_mail_scope(&scope)
+                        && let Some(etag) = graph_etag(&value) {
                         etags.push((object_id.0.clone(), etag));
                     }
                     changes.push(Change::ObjectChange(ObjectChange {

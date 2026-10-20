@@ -821,6 +821,13 @@ fn batch_modify_bodies(ids: &[ObjectId], patch: &LabelPatch) -> Vec<BatchModifyR
 }
 
 fn is_not_found(error: &GmailError) -> bool {
+    // Keep the bisection predicate narrow. Gmail's batchModify contract
+    // exposes message ids only as strings and publishes no syntax grammar or
+    // per-id detail for `invalidArgument`; a 400 can also describe a shared
+    // label body. Splitting every 400 could turn one invalid patch into up to
+    // roughly 2n requests without establishing which id was malformed. Until
+    // Gmail gives item-specific evidence or documents a local id grammar, a
+    // generic 400 stays a batch failure.
     account_error::response_parts(error).is_some_and(|(status, _)| status == 404)
 }
 
@@ -1377,6 +1384,46 @@ mod tests {
                 br#"{"ids":["live-1"],"addLabelIds":["INBOX"],"removeLabelIds":["SPAM","TRASH"]}"#
                     .as_slice()
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_batch_invalid_argument_is_not_bisected() {
+        let bad_request = Canned::Response {
+            status: StatusCode::BAD_REQUEST,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from_static(
+                br#"{"error":{"code":400,"errors":[{"reason":"invalidArgument","message":"invalid request"}]}}"#,
+            ),
+        };
+        let (client, script) = scripted_client(vec![bad_request]);
+        let events = collect_events(bulk_move(
+            client,
+            fresh_cache(Vec::new()),
+            Box::pin(stream::iter(
+                ["m1", "m2"].map(|id| ObjectId(id.to_string())),
+            )),
+            label("INBOX"),
+            None,
+            test_key(16),
+        ))
+        .await;
+
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("a complete bad-request response is classified per item");
+        };
+        assert_eq!(batch.items.len(), 2);
+        assert!(batch.items.iter().all(|item| matches!(
+            item,
+            ItemOutcome::Failed(failure)
+                if matches!(failure.error.kind(), bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed
+                ))
+        )));
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "a generic 400 can describe the shared patch, so it is not an id-level bisector signal"
         );
     }
 

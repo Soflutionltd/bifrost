@@ -4,6 +4,18 @@ use std::time::Duration;
 pub(super) mod async_impl;
 pub(super) mod sync_impl;
 
+fn idle_connection_expired(idle_duration: Duration, idle_timeout: Duration) -> bool {
+    !idle_timeout.is_zero() && idle_duration > idle_timeout
+}
+
+fn pool_worker_interval(idle_timeout: Duration) -> Duration {
+    if idle_timeout.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        idle_timeout
+    }
+}
+
 /// Configuration for a connection pool
 #[derive(Debug, Clone)]
 #[allow(missing_copy_implementations)]
@@ -42,6 +54,10 @@ impl PoolConfig {
     }
 
     /// Connection idle timeout
+    ///
+    /// Zero disables expiration of parked connections. If `min_idle` is
+    /// positive, the background worker checks for connections to replenish
+    /// once per second instead of spinning on a zero-duration wait.
     ///
     /// Defaults to `60 seconds`
     pub fn idle_timeout(mut self, idle_timeout: Duration) -> Self {
@@ -83,11 +99,30 @@ impl Default for PoolConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::PoolConfig;
+    use std::time::Duration;
+
+    use super::{PoolConfig, idle_connection_expired, pool_worker_interval};
 
     #[test]
     fn checkout_probe_defaults_to_enabled_and_can_be_disabled() {
         assert!(PoolConfig::default().test_on_checkout);
         assert!(!PoolConfig::new().test_on_checkout(false).test_on_checkout);
+    }
+
+    #[test]
+    fn zero_idle_timeout_disables_expiration_and_uses_a_nonzero_worker_interval() {
+        assert!(!idle_connection_expired(
+            Duration::from_secs(60),
+            Duration::ZERO
+        ));
+        assert!(idle_connection_expired(
+            Duration::from_secs(61),
+            Duration::from_secs(60)
+        ));
+        assert_eq!(pool_worker_interval(Duration::ZERO), Duration::from_secs(1));
+        assert_eq!(
+            pool_worker_interval(Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
     }
 }

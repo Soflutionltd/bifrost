@@ -557,26 +557,18 @@ fn terminates_mutation_stream(err: &AccountError) -> bool {
         | RecoveryClass::Reconcile(_)
         | RecoveryClass::Engine(_)
         | RecoveryClass::AuthLost
-        | RecoveryClass::NeedsAdminConsent { .. } => true,
-        RecoveryClass::NeedsPolicyChange
-        | RecoveryClass::NoPermission { .. }
-        | RecoveryClass::Unsupported(_)
+        | RecoveryClass::NeedsAdminConsent { .. }
+        | RecoveryClass::NeedsPolicyChange
+        | RecoveryClass::NoPermission { .. } => true,
+        RecoveryClass::Unsupported(_)
         | RecoveryClass::ClientBug
         | RecoveryClass::ProviderContractViolation
         | RecoveryClass::ProviderRefused
         | RecoveryClass::UnknownPermanent
-        | RecoveryClass::InternalFailure => {
-            // Permanent terminal: both `NotFound` and `Server(Error{..})`
-            // fan out per-id (the batch was transmitted, every id gets
-            // a `Failed` lane carrying the same `AccountError`). Other
-            // permanent classes still terminate the stream because the
-            // engine has no per-id signal to lean on.
-            !matches!(err.kind(), AccountErrorKind::NotFound(_))
-                && !matches!(
-                    err.kind(),
-                    AccountErrorKind::Server(ServerErrorKind::Error { .. })
-                )
-        }
+        | RecoveryClass::InternalFailure => false,
+        // RecoveryClass is non-exhaustive. A newly introduced class must
+        // retain its recovery verdict at the stream boundary until its
+        // mutation fan-out behavior is deliberately classified here.
         _ => true,
     }
 }

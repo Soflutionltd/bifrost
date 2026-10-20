@@ -47,8 +47,9 @@ inside the protocol consumers, never the other way around.
   DER-encoded certificate, using the hash named by the cert's own
   `signatureAlgorithm` with MD5/SHA-1 upgraded to SHA-256 (Section 4.1). A
   small in-crate TLV walk reads the signatureAlgorithm OID (no X.509 stack, no
-  ASN.1 dependency); SHA-384/512 hash families are supported via `sha2`, and
-  RSASSA-PSS reads its hash from the algorithm parameters.
+  ASN.1 dependency); it rejects high-tag-number forms and non-minimal DER
+  lengths. SHA-384/512 hash families are supported via `sha2`, and RSASSA-PSS
+  reads its hash from the algorithm parameters.
   Unrecognized OIDs and EdDSA (Ed25519/Ed448) are a hard `Protocol` error
   rather than a guessed binding hash - a wrong binding value is a silent auth
   failure. Returns raw hash bytes; the caller base64-frames them.
@@ -130,8 +131,9 @@ correct:
 - RFC 5929 cert binding (`channel_binding.rs`): `tls_server_end_point` over a
   hand-built DER hashes the whole DER under the family named by the
   signatureAlgorithm OID; an SHA-1-signed cert upgrades to SHA-256; truncated,
-  unrecognized-OID, and EdDSA certs are `Protocol` errors. The OID-to-family
-  table is exercised directly so a mistyped OID byte fails a type-level test.
+  non-minimal length, high-tag-number, unrecognized-OID, and EdDSA certs are
+  `Protocol` errors. The OID-to-family table is exercised directly so a
+  mistyped OID byte fails a type-level test.
 - RSASSA-PSS parameters (`channel_binding.rs`): the hash comes from the RFC
   4055 `RSASSA-PSS-params` `[0] hashAlgorithm`, defaulting to sha1 (upgraded to
   SHA-256) when the field or the whole `parameters` element is absent. The

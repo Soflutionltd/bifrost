@@ -186,8 +186,10 @@ pub async fn drive_changes_stream(
         if let Some(Checkpoint::Change(cursor)) = &checkpoint
             && cursor.validate_envelope().is_err()
         {
-            let error = crate::recovery::cursor_decode_failure(
+            let error = crate::recovery::fresh_cursor_contract_error(
+                checkpoint.as_ref(),
                 bifrost_types::AccountOperation::SyncChanges,
+                &scope,
             );
             let _ = changes_tx.send(MultiplexerEvent {
                 scope: scope.clone(),
@@ -256,14 +258,13 @@ pub async fn drive_changes_stream(
             // and any observers - so no consumer ack is coming for it.
             control.retire_publication(expected);
         }
-        if let Some(outcome) = post_publish_boundary(boundary.peek(), checkpoint.is_some()) {
+        if let Some(outcome) =
+            published_outcome(terminated_error, boundary.peek(), checkpoint.is_some())
+        {
             return Ok(outcome);
         }
         if is_done {
             return Ok(ChangesEvent::Done);
-        }
-        if let Some(err) = terminated_error {
-            return Ok(ChangesEvent::Terminated(err));
         }
         // No fallthrough: a stream that ends is answered by
         // `PolledEvent::StreamEnded` at the top of the loop.
@@ -364,6 +365,18 @@ fn refused_activity_outcome(request: BoundaryRequest) -> ChangesEvent {
             ChangesEvent::Paused
         }
     }
+}
+
+// A published termination owns recovery even if a boundary changed while the
+// provider was being polled. Boundary handling resumes after recovery dispatch.
+fn published_outcome(
+    terminated: Option<bifrost_types::AccountError>,
+    request: BoundaryRequest,
+    has_checkpoint: bool,
+) -> Option<ChangesEvent> {
+    terminated
+        .map(ChangesEvent::Terminated)
+        .or_else(|| post_publish_boundary(request, has_checkpoint))
 }
 
 fn post_publish_boundary(request: BoundaryRequest, has_checkpoint: bool) -> Option<ChangesEvent> {
@@ -704,6 +717,25 @@ fn checkpoint_for(event: &SyncEvent<Change>) -> Option<&Checkpoint> {
 mod tests {
     use super::{ChangesEvent, post_publish_boundary, refused_activity_outcome};
     use crate::cancel::BoundaryRequest;
+
+    #[test]
+    fn published_termination_wins_over_every_boundary() {
+        let error = crate::recovery::restart_scope_error(
+            bifrost_types::CursorScope::Account,
+            bifrost_types::AccountOperation::SyncChanges,
+        );
+        for request in [
+            BoundaryRequest::Run,
+            BoundaryRequest::Pause,
+            BoundaryRequest::Stop,
+            BoundaryRequest::CheckpointNow,
+        ] {
+            assert!(
+                matches!(super::published_outcome(Some(error.clone()), request, false),
+                Some(ChangesEvent::Terminated(routed)) if routed.kind() == error.kind())
+            );
+        }
+    }
 
     /// A drive refused admission under a `Stop` boundary must report
     /// `Stopped`, not `Paused`: `Paused` keeps the poll task alive and

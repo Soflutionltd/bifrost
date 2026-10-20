@@ -6,7 +6,9 @@ impl SyncEngine {
     /// Drive a single-account bulk-flag campaign against an attached
     /// account, applying the read-back guard to the retry candidates.
     ///
-    /// Returns the per-batch counters aggregated across the run.
+    /// Returns the per-batch counters aggregated across the run. Once a
+    /// campaign starts, failures are retained in `MutationCounters::error`
+    /// alongside partial accounting. Preflight failures return `Err`.
     ///
     /// Mutation accounting consumes `ItemOutcome<MutationSuccess>` and
     /// dispatches per-item failures via [`crate::recovery::plan_recovery`]:
@@ -164,6 +166,7 @@ impl SyncEngine {
             );
         }
         let mut outcomes = HashMap::new();
+        let mut effects = HashMap::new();
         let mut dedupe_count = 0;
         let mut forwarded_directives = HashSet::new();
         let mut first_error = None;
@@ -328,15 +331,15 @@ impl SyncEngine {
                 _ = boundary.changed(), if aborting => { continue; },
                 result = slot.scheduler.admit(account_id.clone(), slot.control.priority_snapshot(), crate::scheduler::WorkKind::Mutation) => match result {
                     Ok(permit) => permit,
-                    Err(error) => {
-                        first_error.get_or_insert(error);
-                        // Failed observation admission is final for this
-                        // cohort, but cannot discard submitted siblings.
+                    Err(_error) => {
+                        // Admission refusal is transient. Delay this action,
+                        // release all permits, and let ready siblings run.
+                        // It consumes neither a submission nor a retry slot.
+                        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
                         if cohorts[index].readback {
-                            for id in &remaining {
-                                outcomes.insert(id.clone(), MutationBucket::Unresolved);
-                            }
-                            cohorts[index].done = true;
+                            cohorts[index].reconcile_at = deadline;
+                        } else {
+                            cohorts[index].retry_at = deadline;
                         }
                         continue;
                     }
@@ -383,9 +386,7 @@ impl SyncEngine {
                 continue;
             };
             if cohort.readback {
-                use crate::mutation::readback::{
-                    ObjectReadback, ReadbackTarget, run_object_readback,
-                };
+                use crate::mutation::readback::{ReadbackTarget, run_object_readback};
                 let target = match &op {
                     BulkPipelineOp::SetFlags(flags) => ReadbackTarget::Flags(flags),
                     BulkPipelineOp::Move { destination, .. } => ReadbackTarget::Move(destination),
@@ -401,14 +402,7 @@ impl SyncEngine {
                 };
                 if let Some((objects, error)) = result {
                     for (id, result) in objects {
-                        outcomes.insert(
-                            id,
-                            match result {
-                                ObjectReadback::Matched => MutationBucket::Skipped,
-                                ObjectReadback::Mismatched => MutationBucket::FailedTerminal,
-                                ObjectReadback::Unresolved => MutationBucket::Unresolved,
-                            },
-                        );
+                        outcomes.insert(id, observation_bucket(result));
                     }
                     if let Some(error) = error {
                         if let Error::Account(error) = &error {
@@ -454,7 +448,7 @@ impl SyncEngine {
 
             loop {
                 let event = tokio::select! {
-                    () = slot.shutdown.cancelled() => { first_error = Some(Error::ShuttingDown); break; },
+                    () = slot.shutdown.cancelled() => { first_error.get_or_insert(Error::ShuttingDown); break; },
                     event = stream.next() => event,
                 };
                 let Some(event) = event else {
@@ -463,6 +457,14 @@ impl SyncEngine {
                 match event {
                     bifrost_types::SyncEvent::Batch(batch) => {
                         for item in batch.items {
+                            if let ItemOutcome::Succeeded(success) = &item
+                                && let MutationSuccess::Downgraded { actual } = &success.output
+                            {
+                                effects.insert(
+                                    bifrost_types::ObjectId(success.item.0.clone()),
+                                    actual.clone(),
+                                );
+                            }
                             let error = match &item {
                                 ItemOutcome::Failed(failure) => Some(&failure.error),
                                 ItemOutcome::Uncertain(uncertain) => Some(&uncertain.error),
@@ -564,6 +566,7 @@ impl SyncEngine {
                                         outcomes.get(id),
                                         Some(
                                             MutationBucket::Applied
+                                                | MutationBucket::Downgraded
                                                 | MutationBucket::Skipped
                                                 | MutationBucket::FailedTerminal
                                                 | MutationBucket::PendingReadback
@@ -609,6 +612,7 @@ impl SyncEngine {
                                         outcomes.get(id),
                                         Some(
                                             MutationBucket::Applied
+                                                | MutationBucket::Downgraded
                                                 | MutationBucket::Skipped
                                                 | MutationBucket::FailedTerminal
                                                 | MutationBucket::PendingReadback
@@ -621,7 +625,7 @@ impl SyncEngine {
                                 break;
                             }
                             RecoveryPlan::Terminal(fatal) => {
-                                first_error = Some(Error::Account(fatal.into_inner()));
+                                first_error.get_or_insert(Error::Account(fatal.into_inner()));
                                 break;
                             }
                         }
@@ -666,7 +670,7 @@ impl SyncEngine {
             for id in &remaining {
                 if retry_set.contains(id) {
                     outcomes.insert(id.clone(), MutationBucket::PendingRetry);
-                    if cohort.attempt < max_retries
+                    if retry_available(cohort.attempt, max_retries)
                         && (retry_owners.contains(id) || retry_slots > 0)
                     {
                         if retry_owners.insert(id.clone()) {
@@ -714,10 +718,9 @@ impl SyncEngine {
                 }
             }
         }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
         let mut totals = counters_from_outcomes(&outcomes);
+        totals.error = first_error.map(Arc::new);
+        totals.effects = effects.into_iter().collect();
         totals.dedupe_by_client_id = dedupe_count;
         Ok(totals)
     }
@@ -745,7 +748,7 @@ struct MutationCohort {
     submitted: bool,
     readback: bool,
     done: bool,
-    attempt: u32,
+    attempt: u64,
     retry_at: tokio::time::Instant,
     reconcile_at: tokio::time::Instant,
 }
@@ -866,6 +869,7 @@ fn record_error_throttle(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MutationBucket {
     Applied,
+    Downgraded,
     Skipped,
     FailedTerminal,
     PendingRetry,
@@ -991,18 +995,12 @@ pub(super) fn classify_item_outcome(
             let bucket = match success.output {
                 MutationSuccess::Applied => MutationBucket::Applied,
                 MutationSuccess::Skipped => MutationBucket::Skipped,
-                // The provider did something weaker than asked, so its claim
-                // is exactly what must not be trusted. `PendingReadback` puts
-                // the id in the read-back set (`unresolved_readback_ids`)
-                // WITHOUT queueing a resubmission - a downgrade is not a
-                // transient failure and replaying it just earns the same
-                // downgrade - so the final accounting comes from observed
-                // state. For the motivating case, a Gmail message trashed
-                // instead of destroyed still hydrates, so the guard files it
-                // `still_failed`: honest, and it breaks the permanent
-                // destroy/reappear reconcile loop that reporting `Applied`
-                // created.
-                MutationSuccess::Downgraded { .. } => MutationBucket::PendingReadback,
+                // A weaker successful effect is authoritative in the same
+                // way as Applied. Preserve it separately: comparing against
+                // the original request would deterministically reject a valid
+                // downgrade (trash is not permanent deletion). Replaying it
+                // cannot supply the missing provider capability.
+                MutationSuccess::Downgraded { .. } => MutationBucket::Downgraded,
                 // `MutationSuccess` is #[non_exhaustive]. A new variant must
                 // be classified deliberately, not folded into `Applied` - that
                 // is how a downgrade got reported as a clean success in the
@@ -1153,13 +1151,14 @@ pub(super) fn should_forward_engine_recovery(
     forwarded.insert(directive_key(directive))
 }
 
-fn counters_from_outcomes(
+pub(super) fn counters_from_outcomes(
     outcomes: &HashMap<bifrost_types::ObjectId, MutationBucket>,
 ) -> crate::mutation::MutationCounters {
     let mut counters = crate::mutation::MutationCounters::default();
     for bucket in outcomes.values() {
         match bucket {
             MutationBucket::Applied => counters.record_applied(),
+            MutationBucket::Downgraded => counters.downgraded += 1,
             MutationBucket::Skipped => counters.record_skipped(),
             MutationBucket::FailedTerminal => counters.record_failed(),
             MutationBucket::BlockedByEngine => counters.record_blocked_by_engine(),
@@ -1171,4 +1170,131 @@ fn counters_from_outcomes(
         }
     }
     counters
+}
+
+// `attempts` includes the initial write; the configured budget counts only
+// resubmissions. The wider attempt counter also permits the full u32 budget
+// without saturating before its final submission.
+fn retry_available(attempts: u64, max_retries: u32) -> bool {
+    attempts <= u64::from(max_retries)
+}
+
+fn observation_bucket(result: crate::mutation::readback::ObjectReadback) -> MutationBucket {
+    use crate::mutation::readback::ObjectReadback;
+    match result {
+        ObjectReadback::Matched => MutationBucket::Skipped,
+        // Observation of non-landing cannot manufacture a terminal provider
+        // failure. Keep it pending for a later consumer campaign, including
+        // exhausted retries and state-refresh reconciliation. Do not blindly
+        // replay here: reconciliation may also require consumer-side dedupe.
+        ObjectReadback::Mismatched => MutationBucket::PendingRetry,
+        ObjectReadback::Unresolved => MutationBucket::Unresolved,
+    }
+}
+
+#[cfg(test)]
+mod campaign_tests {
+    use super::*;
+    use bifrost_types::{BatchItemId, BatchSuccess, MutationEffect, ObjectId};
+
+    #[test]
+    fn retry_limit_counts_resubmissions_only() {
+        assert!(!retry_available(1, 0));
+        assert!(retry_available(1, 1));
+        assert!(!retry_available(2, 1));
+        assert!(retry_available(5, 5));
+        assert!(!retry_available(6, 5));
+    }
+
+    #[test]
+    fn weaker_success_has_its_own_bucket_and_never_replays() {
+        let id = ObjectId("message".into());
+        let mut outcomes = HashMap::new();
+        let mut retries = Vec::new();
+        let mut dedupe = 0;
+        let throttles = std::sync::Mutex::new(crate::recovery::ThrottleBucket::new());
+        let item = ItemOutcome::Succeeded(BatchSuccess::new(
+            BatchItemId(id.0.clone()),
+            MutationSuccess::Downgraded {
+                actual: MutationEffect::MovedToContainer(bifrost_types::ContainerId(
+                    "trash".into(),
+                )),
+            },
+        ));
+        assert!(
+            classify_item_outcome(
+                item,
+                &mut outcomes,
+                &mut retries,
+                &mut dedupe,
+                &throttles,
+                &AccountId("account".into()),
+                &mut None,
+            )
+            .is_none()
+        );
+        assert_eq!(outcomes.get(&id), Some(&MutationBucket::Downgraded));
+        assert!(retries.is_empty());
+        assert!(unresolved_readback_ids(&outcomes).is_empty());
+        let counters = counters_from_outcomes(&outcomes);
+        assert_eq!(counters.downgraded, 1);
+        assert_eq!(counters.failed_terminal, 0);
+    }
+
+    #[test]
+    fn non_landing_observation_is_pending_not_terminal() {
+        use crate::mutation::readback::ObjectReadback;
+        let outcomes = HashMap::from([
+            (
+                ObjectId("landed".into()),
+                observation_bucket(ObjectReadback::Matched),
+            ),
+            (
+                ObjectId("not-landed".into()),
+                observation_bucket(ObjectReadback::Mismatched),
+            ),
+            (
+                ObjectId("unknown".into()),
+                observation_bucket(ObjectReadback::Unresolved),
+            ),
+        ]);
+        let counters = counters_from_outcomes(&outcomes);
+        assert_eq!(counters.skipped, 1);
+        assert_eq!(counters.pending_retry, 2);
+        assert_eq!(counters.failed_terminal, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_campaign_retains_every_unsent_target() {
+        let engine = SyncEngine::builder().build().expect("engine");
+        let id = AccountId("cancelled-campaign".into());
+        let account = Arc::new(crate::test_common::StubAccount::new(vec![]));
+        engine
+            .attach(
+                id.clone(),
+                Arc::new(crate::test_common::StubFactory::queue(vec![account])),
+            )
+            .await
+            .expect("attach");
+        engine.accounts.get(&id).expect("slot").shutdown.cancel();
+        let vendor = crate::mutation::IdempotencyVendor::with_run_id(
+            bifrost_types::RunId("campaign-test".into()),
+            Box::new(|_| bifrost_types::ProtocolSalt::Imap),
+        );
+        let outcome = engine
+            .bulk_destroy(
+                &id,
+                vec![ObjectId("one".into()), ObjectId("two".into())],
+                &vendor,
+                bifrost_types::ProtocolKind::Imap,
+            )
+            .await
+            .expect("campaign accounting");
+        assert_eq!(outcome.pending_retry, 2);
+        assert!(matches!(
+            outcome.error.as_deref(),
+            Some(Error::ShuttingDown)
+        ));
+        engine.detach(&id).await.expect("detach");
+    }
 }

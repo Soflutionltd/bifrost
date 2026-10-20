@@ -300,19 +300,84 @@ fn marker_does_not_amplify_under_sustained_backpressure() {
 }
 
 #[test]
-fn hard_cap_fires_for_critical_overflow() {
-    let (mut sink, _rx) = make_sink(1, 2);
+fn critical_overflow_at_hard_cap_is_reported_by_queue_marker() {
+    let (mut sink, mut rx) = make_sink(1, 2);
     // Fill channel.
     sink.emit(resyncable_event(1)).unwrap();
     // Buffer 2 critical events (hard_cap = 2).
     sink.emit(critical_event("c1")).unwrap();
     sink.emit(critical_event("c2")).unwrap();
-    // Third critical should hit hard cap.
-    let result = sink.emit(critical_event("c3"));
+    // The third critical event is dropped at the cap, but its loss must be
+    // visible even though response-routing callers intentionally ignore emit's
+    // result.
+    sink.emit(critical_event("c3")).unwrap();
+    assert_eq!(sink.drop_stats.dropped_count(), 1);
+
+    drain_rx(&mut rx);
+    sink.drain_pending_nonblocking().unwrap();
+    assert!(matches!(drain_rx(&mut rx).as_slice(), [TypedEvent::Alert(msg)] if msg == "c1"));
+
+    sink.drain_pending_nonblocking().unwrap();
+    assert!(matches!(drain_rx(&mut rx).as_slice(), [TypedEvent::Alert(msg)] if msg == "c2"));
+
+    sink.drain_pending_nonblocking().unwrap();
+    let events = drain_rx(&mut rx);
+    assert!(matches!(
+        events.as_slice(),
+        [TypedEvent::QueueOverflow {
+            dropped_count: 1,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn event_after_a_full_drain_stays_behind_pending_critical_events() {
+    let (mut sink, mut rx) = make_sink(1, 4);
+    sink.emit(resyncable_event(1)).unwrap();
+    sink.emit(critical_event("older")).unwrap();
+
+    // Model the receiver freeing a slot just after drain_pending observed
+    // the full channel. emit_after_drain is the path emit takes next.
+    drain_rx(&mut rx);
+    sink.emit_after_drain(critical_event("newer")).unwrap();
+
     assert!(
-        matches!(result, Err(EventOverflow::HardCap)),
-        "expected HardCap, got {result:?}"
+        rx.try_recv().is_err(),
+        "new event overtook the older pending one"
     );
+    assert_eq!(sink.pending.len(), 2);
+    assert!(matches!(sink.pending.front(), Some(TypedEvent::Alert(msg)) if msg == "older"));
+    assert!(matches!(sink.pending.back(), Some(TypedEvent::Alert(msg)) if msg == "newer"));
+}
+
+#[test]
+fn events_arriving_while_a_loss_marker_is_blocked_join_its_loss_window() {
+    let (mut sink, mut rx) = make_sink(1, 4);
+    sink.emit(resyncable_event(1)).unwrap();
+    sink.emit(critical_event("before-loss")).unwrap();
+    sink.emit(resyncable_event(2)).unwrap();
+    assert_eq!(sink.drop_stats.dropped_count(), 1);
+
+    // Free the original slot. The next drain can publish the old critical
+    // event, but that fills the slot and keeps its loss marker pending.
+    drain_rx(&mut rx);
+    sink.emit(critical_event("after-loss")).unwrap();
+    assert!(sink.pending.is_empty());
+    assert_eq!(sink.drop_stats.dropped_count(), 2);
+    assert!(matches!(
+        drain_rx(&mut rx).as_slice(),
+        [TypedEvent::Alert(msg)] if msg == "before-loss"
+    ));
+
+    sink.drain_pending_nonblocking().unwrap();
+    assert!(matches!(
+        drain_rx(&mut rx).as_slice(),
+        [TypedEvent::QueueOverflow {
+            dropped_count: 2,
+            ..
+        }]
+    ));
 }
 
 #[test]

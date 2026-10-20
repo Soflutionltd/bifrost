@@ -185,6 +185,14 @@ impl JmapAccount {
         route_mutation_target(target, &self.mail, &self.foreign_mail).clone()
     }
 
+    /// Draft handles contain only an Email id, so the whole draft lifecycle
+    /// must use one account namespace. Submission is selected when present,
+    /// matching draft_send; Mail remains the usable fallback on accounts
+    /// without Submission, where sending a draft is unavailable.
+    fn draft_account(&self) -> &MailAccount {
+        draft_route_account(&self.mail, self.submission.as_ref())
+    }
+
     /// The owning shared-account identity for a foreign `Folder` scope,
     /// or `None` for a primary scope. Drives the revocation-isolation
     /// decision (quarantine the foreign scope vs escalate account-wide).
@@ -350,6 +358,23 @@ fn route_mutation_target<'a, H>(
         MutationTarget::Thread(thread) => route_object_id(&thread.0, primary, foreign),
         _ => primary,
     }
+}
+
+/// Draft handles are bare Email ids, so draft create/update/discard must
+/// agree with draft_send's account. Prefer Submission when available, while
+/// preserving draft editing on mail-only accounts.
+fn draft_route_account<'a, H>(mail: &'a H, submission: Option<&'a H>) -> &'a H {
+    submission.unwrap_or(mail)
+}
+
+/// Uploaded blob ids are account scoped, just like the drafts consuming them.
+fn upload_draft_attachment<T: crate::core::transport::HttpTransport>(
+    mail: &crate::account::Account<T>,
+    submission: Option<&crate::account::Account<T>>,
+    bytes: AccountStream<Result<bytes::Bytes, AccountError>>,
+    mime: String,
+) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
+    pim::attachment_upload(draft_route_account(mail, submission).clone(), bytes, mime)
 }
 
 /// Pure descriptor logic behind `Account::describe_cursor`, split out
@@ -872,7 +897,7 @@ impl Account for JmapAccount {
         bytes: AccountStream<Result<bytes::Bytes, AccountError>>,
         mime: String,
     ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
-        pim::attachment_upload(self.mail.clone(), bytes, mime)
+        upload_draft_attachment(&self.mail, self.submission.as_ref(), bytes, mime)
     }
 
     fn host_attachment(
@@ -889,10 +914,12 @@ impl Account for JmapAccount {
     }
 
     fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
+        let draft_account = self.draft_account().clone();
+        let account_id = draft_account.id_str().to_string();
         pim::draft_create(
-            self.mail.clone(),
+            draft_account,
             Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
+            account_id,
             patch,
         )
     }
@@ -902,20 +929,24 @@ impl Account for JmapAccount {
         draft: DraftHandle,
         patch: DraftPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
+        let draft_account = self.draft_account().clone();
+        let account_id = draft_account.id_str().to_string();
         pim::draft_update(
-            self.mail.clone(),
+            draft_account,
             Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
+            account_id,
             draft,
             patch,
         )
     }
 
     fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
+        let draft_account = self.draft_account().clone();
+        let account_id = draft_account.id_str().to_string();
         pim::draft_discard(
-            self.mail.clone(),
+            draft_account,
             Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
+            account_id,
             draft,
         )
     }
@@ -1513,10 +1544,10 @@ mod tests {
 
     use super::super::{foreign, state};
     use super::{
-        cursor_scopes_from_seeds, describe_cursor_support, establishment_for_seed,
-        foreign_account_id_for_object, foreign_owner_memberships_from_scopes,
-        is_unregistered_foreign, partitioning_for_scope, resolve_foreign_account_id,
-        route_mutation_target, route_object_id, route_send_as,
+        cursor_scopes_from_seeds, describe_cursor_support, draft_route_account,
+        establishment_for_seed, foreign_account_id_for_object,
+        foreign_owner_memberships_from_scopes, is_unregistered_foreign, partitioning_for_scope,
+        resolve_foreign_account_id, route_mutation_target, route_object_id, route_send_as,
     };
     use bifrost_types::{ChangeCursor, CostClass, MutationTarget, SyncStrategy, ThreadId};
 
@@ -1715,6 +1746,106 @@ mod tests {
             ),
             "PRIMARY"
         );
+    }
+
+    #[test]
+    fn draft_lifecycle_uses_submission_namespace_when_available() {
+        let mail = "MAIL".to_string();
+        let submission = "SUBMISSION".to_string();
+
+        assert_eq!(draft_route_account(&mail, Some(&submission)), &submission);
+        assert_eq!(draft_route_account(&mail, None), &mail);
+    }
+
+    #[derive(Clone)]
+    struct DraftUploadTransport {
+        expected_account: &'static str,
+    }
+
+    impl crate::core::transport::HttpTransport for DraftUploadTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            panic!("attachment upload needs no API request");
+        }
+
+        async fn upload(
+            &self,
+            url: &str,
+            body: Vec<u8>,
+            content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            assert_eq!(
+                url,
+                format!("https://example.test/upload/{}", self.expected_account)
+            );
+            assert_eq!(body, b"attachment bytes");
+            assert_eq!(content_type, Some("text/plain"));
+            Ok(bytes::Bytes::from(
+                serde_json::json!({
+                    "accountId": self.expected_account,
+                    "blobId": "uploaded-blob",
+                    "type": "text/plain",
+                    "size": body.len()
+                })
+                .to_string(),
+            ))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            panic!("attachment upload needs no download");
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            panic!("session is supplied in memory");
+        }
+    }
+
+    #[tokio::test]
+    async fn draft_attachment_upload_uses_draft_namespace_with_mail_fallback() {
+        for (has_submission, expected_account) in [(true, "submission"), (false, "mail")] {
+            let session = serde_json::from_value(serde_json::json!({
+                "capabilities": {},
+                "accounts": {},
+                "primaryAccounts": {},
+                "username": "user@example.test",
+                "apiUrl": "https://example.test/api",
+                "uploadUrl": "https://example.test/upload/{accountId}",
+                "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+                "eventSourceUrl": "https://example.test/events",
+                "state": "session-1"
+            }))
+            .expect("session parses");
+            let client = crate::client::Client::with_transport(
+                DraftUploadTransport { expected_account },
+                session,
+                "https://example.test/session",
+            )
+            .expect("client builds");
+            let mail = crate::account::Account::new(client.clone(), "mail");
+            let submission = crate::account::Account::new(client, "submission");
+            let selected = has_submission.then_some(&submission);
+            let stream = Box::pin(futures::stream::iter(vec![Ok(bytes::Bytes::from_static(
+                b"attachment bytes",
+            ))]));
+            let handle =
+                super::upload_draft_attachment(&mail, selected, stream, "text/plain".to_string())
+                    .await
+                    .expect("upload succeeds in draft account");
+            assert!(!handle.0.is_empty());
+            assert_eq!(
+                draft_route_account(&mail, selected).id_str(),
+                expected_account
+            );
+        }
     }
 
     fn as_shared() -> SendAs {

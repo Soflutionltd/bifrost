@@ -28,7 +28,7 @@ pub struct EngineConfig {
     pub backfill: BackfillConfig,
     pub push: PushConfig,
     pub mutation: MutationConfig,
-    /// Per-PHASE detach / drop timeout (see `H1`). This is not the cost of a
+    /// Per-PHASE detach / drop timeout. This is not the cost of a
     /// detach: teardown runs four phases, each with its own fresh budget -
     /// awaiting the stream workers, draining the ack writer, waiting for an
     /// in-flight reattach to release the reopen lock, then `Account::close()` -
@@ -39,8 +39,11 @@ pub struct EngineConfig {
     /// worst-case engine shutdown is `4 * detach_timeout * n_accounts` plus
     /// overhead. Size this knob against that product, not against one phase.
     pub detach_timeout: Duration,
-    /// Per-lane cap on the scheduler's `VecDeque`. On overflow the
-    /// oldest item is shed and a counter incremented (see `H4`).
+    /// Per-lane cap on the scheduler's work-item and admission queues. A zero
+    /// value is floored to one. Work-item queues shed the oldest item and
+    /// increment a queue-local counter on overflow; admission queues refuse
+    /// the incoming request and do not count the refusal. The scheduler does
+    /// not expose its work-item queue counters.
     pub lane_capacity: usize,
     /// Mutation campaign retry cap. The campaign attempts up to this
     /// many resubmissions for ids whose per-item `ItemOutcome::Failed`
@@ -68,8 +71,9 @@ impl Default for EngineConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerConfig {
     /// Number of consecutive higher-lane pulls before the starvation
-    /// floor forces one lower-lane pull. Default 64 per
-    /// `bifrost-sync.md` -> Starvation guards.
+    /// floor forces one lower-lane pull. Default 64. Zero is floored to one
+    /// when the scheduler is constructed, preserving priority for the first
+    /// pull.
     pub starvation_floor: u32,
 }
 

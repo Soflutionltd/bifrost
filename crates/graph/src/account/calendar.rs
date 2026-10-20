@@ -939,7 +939,7 @@ fn event_search_path(prefix: &str, calendar_id: Option<&CalendarId>) -> String {
     }
 }
 
-fn join_event_id(calendar_id: &str, event_id: &str) -> String {
+pub(super) fn join_event_id(calendar_id: &str, event_id: &str) -> String {
     format!("{calendar_id}{EVENT_ID_SEPARATOR}{event_id}")
 }
 
@@ -4063,5 +4063,28 @@ mod tests {
             "tentativelyAccept"
         );
         assert!(rsvp_action(RsvpStatus::NeedsAction).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sync_identity_tests {
+    use super::*;
+
+    #[test]
+    fn sync_event_identity_is_accepted_by_the_typed_calendar_parser() {
+        for ty in [
+            bifrost_types::ObjectType::Event,
+            bifrost_types::ObjectType::CalendarEvent,
+        ] {
+            let scope = bifrost_types::CursorScope::FolderType {
+                folder: bifrost_types::FolderId("calendar".into()),
+                ty,
+            };
+            let id = super::super::inventory::sync_object_id(&scope, "event");
+            assert_eq!(
+                split_event_id(&id.0, AccountOperation::EventGet).expect("typed id"),
+                ("calendar".to_string(), "event".to_string())
+            );
+        }
     }
 }

@@ -374,22 +374,66 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                     }
                 }
                 Err(err) => {
-                    // Classify rather than swallow. Terminal or
-                    // engine-action classes (auth lost, capability
-                    // changed, schema break) emit a structured
-                    // `ScopeLifecycleEvent::Terminated(AccountError)`
-                    // so the engine can route through `plan_recovery`
-                    // (escalate to `Pause` after the reopen budget, or
-                    // route an engine directive via the reopen
-                    // channel). Retry classes still sleep-and-continue
-                    // since transient transport/server hiccups are
-                    // expected for a long-running poll.
+                    // This is a state-based request even though lifecycle
+                    // has no durable engine cursor. Supply its Mailbox scope
+                    // to the common classifier, then handle expiry locally:
+                    // the lifecycle reader cannot restart a scope on its own.
                     let acct = super::error::into_account_error(
                         err,
-                        super::error::JmapErrorContext::new(
+                        super::error::JmapErrorContext::cursor(
                             bifrost_types::AccountOperation::ScopeLifecycle,
+                            CursorScope::Type(bifrost_types::ObjectType::Mailbox),
                         ),
                     );
+                    if matches!(
+                        acct.kind(),
+                        bifrost_types::AccountErrorKind::SyncState(
+                            bifrost_types::SyncStateErrorKind::CursorInvalid,
+                        ),
+                    ) {
+                        // Expired history is conforming, not a progress-guard
+                        // fault. Reconcile a complete snapshot before replacing
+                        // the position; retryable snapshot failures retain both
+                        // the old names and state for another attempt.
+                        match fetch_mailbox_names(&mail).await {
+                            Ok((state, names)) => {
+                                let events = {
+                                    let previous = mailbox_names.lock().await;
+                                    mailbox_snapshot_diff(&previous, &names)
+                                };
+                                for event in events {
+                                    yield ScopeLifecycleEvent::Lifecycle(event);
+                                }
+                                // Publish neither map until all events have
+                                // been yielded and both locks are held. A
+                                // dropped stream must not leave fresh names
+                                // hiding unannounced events on the next reseed.
+                                let mut previous = mailbox_names.lock().await;
+                                let mut states = mailbox_states.lock().await;
+                                *previous = names;
+                                states.insert(account_id.clone(), Some(state));
+                            }
+                            Err(err) => {
+                                let error = super::error::into_account_error(
+                                    err,
+                                    super::error::JmapErrorContext::new(
+                                        bifrost_types::AccountOperation::ScopeLifecycle,
+                                    ),
+                                );
+                                if error.recovery().is_terminal()
+                                    || error.recovery().requires_engine_action()
+                                {
+                                    yield ScopeLifecycleEvent::Terminated(error);
+                                    break;
+                                }
+                            }
+                        }
+                        walk = None;
+                        poll_pause(&shutdown, &mut session_changes).await;
+                        continue;
+                    }
+                    // Auth, capability and other permanent failures remain
+                    // visible; transient failures pause and retry this state.
                     if acct.recovery().is_terminal()
                         || acct.recovery().requires_engine_action()
                     {
@@ -402,6 +446,35 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
             }
         }
     })
+}
+
+/// A fresh state cannot replay expired history. Report the net topology
+/// difference instead; transient create/delete pairs entirely inside the lost
+/// interval have no surviving scope to establish. Sort ids for deterministic
+/// delivery, and do not hold the names lock while yielding to the consumer.
+fn mailbox_snapshot_diff(
+    previous: &HashMap<String, String>,
+    current: &HashMap<String, String>,
+) -> Vec<ScopeLifecycle> {
+    let mut ids: Vec<_> = previous.keys().chain(current.keys()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.into_iter()
+        .filter_map(|id| {
+            let scope = MembershipScope::Mailbox(bifrost_types::MailboxId(id.clone()));
+            match (previous.get(id), current.get(id)) {
+                (None, Some(_)) => Some(ScopeLifecycle::Created(scope)),
+                (Some(_), None) => Some(ScopeLifecycle::Deleted(scope)),
+                (Some(old), Some(new)) if old != new => Some(ScopeLifecycle::Renamed {
+                    old: scope.clone(),
+                    new: scope,
+                    old_name: old.clone(),
+                    new_name: new.clone(),
+                }),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// What one `Mailbox/get` follow-up learned about the ids a changes
@@ -680,6 +753,228 @@ mod tests {
             client,
         );
         (stream, shutdown, states, recorder)
+    }
+
+    fn method_failure(kind: &str) -> String {
+        serde_json::json!({
+            "sessionState": "session-1",
+            "methodResponses": [["error", {"type": kind}, "s0"]]
+        })
+        .to_string()
+    }
+
+    fn snapshot_reply(state: &str, names: &[(&str, &str)]) -> String {
+        let list: Vec<_> = names
+            .iter()
+            .map(|(id, name)| serde_json::json!({"id": id, "name": name}))
+            .collect();
+        serde_json::json!({
+            "sessionState": "session-1",
+            "methodResponses": [["Mailbox/get", {
+                "accountId": "primary", "state": state,
+                "list": list, "notFound": []
+            }, "s0"]]
+        })
+        .to_string()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_lifecycle_history_reconciles_and_keeps_polling() {
+        for code in ["cannotCalculateChanges", "tooManyChanges"] {
+            let (mut stream, shutdown, states, requests) = lifecycle_stream_with_limit(
+                [
+                    method_failure(code),
+                    snapshot_reply(
+                        "mbx-fresh",
+                        &[("a-new", "New"), ("c-renamed", "After"), ("d-same", "Same")],
+                    ),
+                    mailbox_changes_reply("session-1", &["e-later"]),
+                    mailbox_get_reply("session-1", "e-later", "Later"),
+                ],
+                HashMap::from([
+                    ("b-gone".to_string(), "Gone".to_string()),
+                    ("c-renamed".to_string(), "Before".to_string()),
+                    ("d-same".to_string(), "Same".to_string()),
+                ]),
+                256,
+            );
+            let Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(
+                MembershipScope::Mailbox(id),
+            ))) = stream.next().await
+            else {
+                panic!("expected snapshot create for {code}");
+            };
+            assert_eq!(id.0, "a-new");
+            let Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Deleted(
+                MembershipScope::Mailbox(id),
+            ))) = stream.next().await
+            else {
+                panic!("expected snapshot delete for {code}");
+            };
+            assert_eq!(id.0, "b-gone");
+            let Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Renamed {
+                old,
+                new,
+                old_name,
+                new_name,
+            })) = stream.next().await
+            else {
+                panic!("expected snapshot rename for {code}");
+            };
+            assert_eq!(
+                old,
+                MembershipScope::Mailbox(bifrost_types::MailboxId("c-renamed".into()))
+            );
+            assert_eq!(new, old);
+            assert_eq!((old_name.as_str(), new_name.as_str()), ("Before", "After"));
+            assert_eq!(
+                state_cache::get(&states, "primary").await.as_deref(),
+                Some("mbx-1")
+            );
+            // Pull past the snapshot's final yield, committing its state and
+            // driving the next poll on Tokio's virtual clock.
+            let Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(
+                MembershipScope::Mailbox(id),
+            ))) = stream.next().await
+            else {
+                panic!("lifecycle did not survive {code}");
+            };
+            assert_eq!(id.0, "e-later");
+            assert_eq!(
+                state_cache::get(&states, "primary").await.as_deref(),
+                Some("mbx-fresh")
+            );
+            {
+                let requests = requests.lock().expect("requests");
+                assert_eq!(requests.len(), 4);
+                assert_eq!(requests[1]["methodCalls"][0][0], "Mailbox/get");
+                assert!(requests[1]["methodCalls"][0][1]["ids"].is_null());
+                assert_eq!(requests[2]["methodCalls"][0][1]["sinceState"], "mbx-fresh");
+            }
+            shutdown.cancel();
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_reseed_failure_preserves_the_old_names_and_position() {
+        let (mut stream, shutdown, states, requests) = lifecycle_stream_with_limit(
+            [
+                method_failure("cannotCalculateChanges"),
+                method_failure("serverUnavailable"),
+                method_failure("cannotCalculateChanges"),
+                snapshot_reply("mbx-fresh", &[("known", "After")]),
+            ],
+            HashMap::from([("known".to_string(), "Before".to_string())]),
+            256,
+        );
+        let Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Renamed {
+            old_name,
+            new_name,
+            ..
+        })) = stream.next().await
+        else {
+            panic!("expected rename after reseed retry");
+        };
+        assert_eq!((old_name.as_str(), new_name.as_str()), ("Before", "After"));
+        assert_eq!(
+            state_cache::get(&states, "primary").await.as_deref(),
+            Some("mbx-1")
+        );
+        {
+            let requests = requests.lock().expect("requests");
+            assert_eq!(requests.len(), 4);
+            assert_eq!(requests[2]["methodCalls"][0][1]["sinceState"], "mbx-1");
+        }
+        shutdown.cancel();
+        assert!(stream.next().await.is_none());
+        assert_eq!(
+            state_cache::get(&states, "primary").await.as_deref(),
+            Some("mbx-fresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_partial_reseed_does_not_hide_undelivered_events() {
+        let client = crate::client::Client::with_transport(
+            ScriptTransport::new([
+                method_failure("cannotCalculateChanges"),
+                snapshot_reply("mbx-fresh", &[("a-new", "New"), ("b-new", "New")]),
+                method_failure("cannotCalculateChanges"),
+                snapshot_reply("mbx-fresh", &[("a-new", "New"), ("b-new", "New")]),
+            ]),
+            test_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let mail = crate::account::Account::new(client.clone(), "primary");
+        let states = Arc::new(Mutex::new(HashMap::from([(
+            "primary".to_string(),
+            Some("mbx-1".to_string()),
+        )])));
+        let names = Arc::new(Mutex::new(HashMap::new()));
+        let shutdown = CancellationToken::new();
+        let open_stream = || {
+            scope_lifecycle(
+                mail.clone(),
+                CoreLimits {
+                    max_objects_in_get: 256,
+                    max_objects_in_set: 256,
+                },
+                Arc::clone(&states),
+                "primary".to_string(),
+                Arc::clone(&names),
+                shutdown.clone(),
+                client.clone(),
+            )
+        };
+        let mut first = open_stream();
+        assert!(matches!(
+            first.next().await,
+            Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(_),))
+        ));
+        drop(first);
+        assert!(names.lock().await.is_empty());
+        assert_eq!(
+            state_cache::get(&states, "primary").await.as_deref(),
+            Some("mbx-1")
+        );
+
+        let mut resumed = open_stream();
+        for expected in ["a-new", "b-new"] {
+            let Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(
+                MembershipScope::Mailbox(id),
+            ))) = resumed.next().await
+            else {
+                panic!("missing replayed create");
+            };
+            assert_eq!(id.0, expected);
+        }
+        shutdown.cancel();
+        assert!(resumed.next().await.is_none());
+        assert_eq!(names.lock().await.len(), 2);
+        assert_eq!(
+            state_cache::get(&states, "primary").await.as_deref(),
+            Some("mbx-fresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permanent_reseed_failure_terminates_without_advancing() {
+        let (mut stream, shutdown, states) = lifecycle_stream([
+            method_failure("cannotCalculateChanges"),
+            method_failure("forbidden"),
+        ]);
+        let Some(ScopeLifecycleEvent::Terminated(error)) = stream.next().await else {
+            panic!("expected permanent snapshot failure");
+        };
+        assert!(error.recovery().is_terminal());
+        assert_eq!(
+            state_cache::get(&states, "primary").await.as_deref(),
+            Some("mbx-1")
+        );
+        assert!(stream.next().await.is_none());
+        shutdown.cancel();
     }
 
     #[tokio::test]

@@ -6,6 +6,12 @@ use super::ImapAccount;
 
 pub(crate) fn close(account: ImapAccount) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        // This flag records that admission has closed; it cannot establish
+        // that teardown completed. Pool::close removes its session registry
+        // before awaiting LOGOUT and termination, so a cancelled first close
+        // can leave later calls returning here without a completion to await.
+        // Fixing that requires shared close-completion state across the account
+        // and pool lifetimes, plus shutdown for the owned submission transport.
         if account.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }

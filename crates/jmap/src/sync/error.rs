@@ -640,36 +640,6 @@ pub(crate) fn contract_violation(
         .expect("valid account error classification")
 }
 
-/// Stream-side variant for "the set I was walking moved under me".
-///
-/// This is deliberately NOT `Protocol(ContractViolation)`. A server that
-/// advances `Email/query`'s `queryState` mid-walk is behaving correctly -
-/// one delivered message does it - and `ContractViolation` is terminal, so
-/// classifying it there would let ordinary mail delivery permanently kill a
-/// scope's inventory. `SyncState(CursorInvalid)` carrying the cursor scope
-/// maps to `EngineDirective::RestartScope`, which is the honest answer: this
-/// walk's coverage is not provable, so walk it again. What must never happen
-/// is the walk ending in `Done` as though it had covered the scope.
-#[must_use]
-pub(crate) fn terminated_walk_superseded<T>(
-    operation: AccountOperation,
-    scope: CursorScope,
-    message: impl Into<String>,
-) -> SyncEvent<T> {
-    terminated(
-        AccountErrorBuilder::new(
-            AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CursorInvalid),
-            Cause::State(bifrost_types::StateCause::CursorInvalid),
-        )
-        .protocol(Protocol::Jmap)
-        .operation(operation)
-        .scope(ErrorScope::Cursor(scope))
-        .text(DiagnosticText::support_only(message))
-        .try_build()
-        .expect("valid account error classification"),
-    )
-}
-
 /// Per-item classification for `Email/set` outcomes. Returns
 /// `Succeeded(Skipped)` when the set error is an absorbed notFound
 /// (the per-item NotFound absorption policy for bulk mutations); all
@@ -1296,14 +1266,9 @@ fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<Duration> 
 
 fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext) -> AccountError {
     let method_type = method.error_type();
-    // A `SyncState(CursorInvalid)` kind requires an `ErrorScope::Cursor`
-    // per the post-Phase-5 builder contract. JMAP method-level cursor
-    // errors (`cannotCalculateChanges`, `anchorNotFound`,
-    // `tooManyChanges`) classify as `CursorInvalid` only when the caller
-    // threaded a cursor scope through `JmapErrorContext::cursor(...)`;
-    // otherwise the server returned a cursor-specific error for a
-    // non-cursored request, which is a contract violation and routes
-    // there instead.
+    // CursorInvalid requires an engine cursor scope. State-based callers
+    // without one must handle expiry locally (the lifecycle poller reseeds),
+    // rather than interpreting absent client context as provider misconduct.
     let has_cursor_scope = matches!(ctx.scope, Some(ErrorScope::Cursor(_)));
     let (kind, primary, wire) = match method_type {
         MethodErrorType::ServerUnavailable => (
@@ -1389,8 +1354,14 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
             JmapMethod::CannotCalculateChanges,
         ),
         MethodErrorType::CannotCalculateChanges => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::Jmap(JmapMethod::CannotCalculateChanges)),
+            AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+            Cause::Internal(InternalCause::new(
+                InternalErrorKind::InvariantViolated,
+                Some(DiagnosticText::support_only(
+                    "state expiry reached error conversion without a cursor scope or local reseed"
+                        .to_string(),
+                )),
+            )),
             JmapMethod::CannotCalculateChanges,
         ),
         MethodErrorType::StateMismatch => (
@@ -1433,8 +1404,14 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
             JmapMethod::TooManyChanges,
         ),
         MethodErrorType::TooManyChanges => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::Jmap(JmapMethod::TooManyChanges)),
+            AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+            Cause::Internal(InternalCause::new(
+                InternalErrorKind::InvariantViolated,
+                Some(DiagnosticText::support_only(
+                    "state expiry reached error conversion without a cursor scope or local reseed"
+                        .to_string(),
+                )),
+            )),
             JmapMethod::TooManyChanges,
         ),
         MethodErrorType::Other(code) => {
@@ -1954,35 +1931,51 @@ mod tests {
     }
 
     #[test]
-    fn cannot_calculate_changes_restarts_scope() {
-        let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
-        let err = into_account_error(
-            method_error("cannotCalculateChanges"),
-            JmapErrorContext::cursor(AccountOperation::SyncChanges, scope.clone()),
-        );
-        assert_eq!(
-            err.kind(),
-            &AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
-        );
-        assert!(err.recovery().requires_engine_action());
+    fn state_expiry_restarts_the_supplied_scope() {
+        for (code, wire) in [
+            ("cannotCalculateChanges", JmapMethod::CannotCalculateChanges),
+            ("tooManyChanges", JmapMethod::TooManyChanges),
+        ] {
+            for operation in [
+                AccountOperation::SyncChanges,
+                AccountOperation::ScopeLifecycle,
+            ] {
+                let scope = CursorScope::Type(bifrost_types::ObjectType::Mailbox);
+                let err = into_account_error(
+                    method_error(code),
+                    JmapErrorContext::cursor(operation, scope.clone()),
+                );
+                assert_eq!(
+                    err.kind(),
+                    &AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+                );
+                assert_eq!(
+                    err.recovery(),
+                    &RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(scope)),
+                );
+                assert_eq!(err.operation(), Some(operation));
+                assert!(err.chain().iter().any(|cause| matches!(
+                    cause,
+                    Cause::Wire(WireCause::Jmap(method)) if method == &wire,
+                )));
+            }
+        }
     }
 
     #[test]
-    fn cannot_calculate_changes_without_scope_is_contract_violation() {
-        // Post-Phase-5: `SyncState(CursorInvalid)` requires an
-        // `ErrorScope::Cursor`. A `cannotCalculateChanges` arriving on a
-        // context that lacks the cursor scope means the server returned
-        // a cursor-specific error for a non-cursored request, which is
-        // a `Protocol(ContractViolation)`, not a cursor restart.
-        let err = into_account_error(
-            method_error("cannotCalculateChanges"),
-            JmapErrorContext::new(AccountOperation::SyncChanges),
-        );
-        assert_eq!(
-            err.kind(),
-            &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
-        );
-        assert!(err.recovery().is_terminal());
+    fn state_expiry_without_recovery_context_is_a_client_invariant() {
+        // Missing client context is not evidence of a non-conforming server.
+        for code in ["cannotCalculateChanges", "tooManyChanges"] {
+            let err = into_account_error(
+                method_error(code),
+                JmapErrorContext::new(AccountOperation::SyncChanges),
+            );
+            assert_eq!(
+                err.kind(),
+                &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+            );
+            assert!(err.recovery().is_terminal());
+        }
     }
 
     #[test]
@@ -2621,12 +2614,10 @@ mod tests {
         }
     }
 
-    /// The three method errors that mean "your cursor is no longer
-    /// usable" classify as `SyncState(CursorInvalid)` -> restart THIS
-    /// scope only when the caller actually threaded a cursor scope.
-    /// Without one, the server answered a cursor-specific error to a
-    /// non-cursored request, which is a contract violation - and
-    /// `CursorInvalid` without a scope is refused by the builder anyway.
+    /// Cursor-specific expiry methods restart THIS scope only when the
+    /// caller threaded a cursor scope. Without one, expiry of a change
+    /// cursor is an invariant error; `anchorNotFound` remains a protocol
+    /// contract violation because there is no cursor scope to restart.
     #[test]
     fn cursor_method_errors_need_a_cursor_scope_to_restart_a_scope() {
         let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
@@ -2650,11 +2641,12 @@ mod tests {
                 method_error(code),
                 JmapErrorContext::new(AccountOperation::SyncChanges),
             );
-            assert_eq!(
-                bare.kind(),
-                &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-                "{code}"
-            );
+            let expected = if code == "anchorNotFound" {
+                AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+            } else {
+                AccountErrorKind::Internal(bifrost_types::InternalErrorKind::InvariantViolated)
+            };
+            assert_eq!(bare.kind(), &expected, "{code}");
         }
     }
 

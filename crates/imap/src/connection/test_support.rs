@@ -56,7 +56,7 @@ pub(crate) fn detached(
         events_rx: tokio::sync::Mutex::new(events_rx),
         driver_handle: tokio::sync::Mutex::new(None),
         host: "test.invalid".to_owned(),
-        tls_active: std::sync::atomic::AtomicBool::new(false),
+        tls_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         abandoned: std::sync::atomic::AtomicBool::new(false),
     }
 }
@@ -136,7 +136,7 @@ async fn driver_pair_with_capacity_and_budget(
         events_rx: tokio::sync::Mutex::new(events_rx),
         driver_handle: tokio::sync::Mutex::new(Some(handle)),
         host: "test.invalid".to_owned(),
-        tls_active: std::sync::atomic::AtomicBool::new(false),
+        tls_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         abandoned: std::sync::atomic::AtomicBool::new(false),
     };
 

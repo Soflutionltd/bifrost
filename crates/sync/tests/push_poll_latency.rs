@@ -113,40 +113,43 @@ async fn push_invalidation_drives_mid_poll_cadence_without_waiting_for_the_sleep
     engine.detach(&account_id).await.expect("detach succeeds");
 }
 
-/// The regression the round-4 cold review found: a drive that returns
-/// `Err(Error::Account(..))` on the push path was logged and skipped, so the
-/// invalid cursor stayed installed and the scope stalled until some later
-/// poll happened to reproduce the same failure.
-///
-/// The observable is engine recovery running, not a log line: an incompatible
-/// cursor envelope derives `Engine(SchemaIncompatible)`, whose handler clears
-/// every cursor and re-establishes each scope. A second
-/// `establish_initial_cursor` call for the scope therefore happens if and only
-/// if the failure reached `plan_recovery` and the reopen channel.
+/// A drive that returns `Err(Error::Account(..))` on the push path must still
+/// reach recovery. A fresh unsupported cursor envelope is an account contract
+/// failure with terminal recovery: its error is published, its scope is parked,
+/// and later hints cannot drive it again. The sibling scope also proves the
+/// first multi-scope hint completes after the terminal verdict.
 #[tokio::test]
-async fn a_push_drive_account_error_reaches_engine_recovery() {
+async fn a_push_drive_account_contract_error_is_published_and_parks_its_scope() {
     let account_id = AccountId("push-drive-recovery".to_owned());
-    let scope = CursorScope::Account;
-    let drives = Arc::new(AtomicUsize::new(0));
+    let failed_scope = CursorScope::Type(ObjectType::Email);
+    let sibling_scope = CursorScope::Type(ObjectType::CalendarEvent);
+    let failed_drives = Arc::new(AtomicUsize::new(0));
+    let sibling_drives = Arc::new(AtomicUsize::new(0));
 
-    let mut stub = common::StubAccount::new(vec![scope]);
-    let hook_drives = Arc::clone(&drives);
+    let mut stub = common::StubAccount::new(vec![failed_scope.clone(), sibling_scope.clone()]);
+    let hook_failed_drives = Arc::clone(&failed_drives);
+    let hook_sibling_drives = Arc::clone(&sibling_drives);
+    let hook_failed_scope = failed_scope.clone();
     stub.changes_hook = Some(Arc::new(move |cursor| {
-        // The first drive is attach's own poll pass and must be clean, so the
-        // failure below can only be observed via the push path: the poll loop
-        // is an hour from its next iteration.
-        if hook_drives.fetch_add(1, Ordering::SeqCst) == 0 {
-            return Vec::new();
+        if cursor.scope == hook_failed_scope {
+            // Attach's first pass is clean. The next drive is the push path,
+            // which is the only path this test asks to park the scope.
+            if hook_failed_drives.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Vec::new();
+            }
+            let mut invalid = cursor.clone();
+            invalid.envelope_version += 1;
+            vec![SyncEvent::Batch(Batch {
+                items: Vec::new(),
+                page_boundary: PageBoundary::Final,
+                server_latency: Duration::ZERO,
+                bytes_in: 0,
+                checkpoint: Some(Checkpoint::Change(invalid)),
+            })]
+        } else {
+            hook_sibling_drives.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
         }
-        let mut invalid = cursor.clone();
-        invalid.envelope_version += 1;
-        vec![SyncEvent::Batch(Batch {
-            items: Vec::new(),
-            page_boundary: PageBoundary::Final,
-            server_latency: Duration::ZERO,
-            bytes_in: 0,
-            checkpoint: Some(Checkpoint::Change(invalid)),
-        })]
     }));
     let stub = Arc::new(stub);
     let established = Arc::clone(&stub.established);
@@ -163,28 +166,75 @@ async fn a_push_drive_account_error_reaches_engine_recovery() {
         .expect("attach succeeds");
 
     wait_until(
-        "the initial poll drive starts",
+        "the initial poll pass drives both scopes",
         Duration::from_secs(5),
-        || drives.load(Ordering::SeqCst) > 0,
+        || failed_drives.load(Ordering::SeqCst) > 0 && sibling_drives.load(Ordering::SeqCst) > 0,
     )
     .await;
-    let established_before = established.lock().expect("established lock").len();
-    assert_eq!(
-        established_before, 1,
-        "attach establishes the single scope exactly once"
-    );
+    assert_eq!(established.lock().expect("established lock").len(), 2);
+    let mut observer = engine
+        .account_changes_observer(&account_id)
+        .expect("account observer");
 
     engine
         .invalidation_sink()
         .push(account_id.clone(), unknown_hint());
 
     wait_until(
-        "an incompatible cursor envelope on the push path must reach schema \
-         recovery, which re-establishes the scope - not just a warning log",
-        Duration::from_secs(10),
-        || established.lock().expect("established lock").len() > established_before,
+        "the push hint must drive the failing scope and its sibling",
+        Duration::from_secs(5),
+        || failed_drives.load(Ordering::SeqCst) >= 2 && sibling_drives.load(Ordering::SeqCst) >= 2,
     )
     .await;
+
+    let observed = tokio::time::timeout(Duration::from_secs(5), observer.recv())
+        .await
+        .expect("push termination reaches observers")
+        .expect("observer remains open");
+    let SyncEvent::Terminated(error) = observed.event.as_ref() else {
+        panic!("expected terminal account error, got {:?}", observed.event);
+    };
+    assert_eq!(
+        error.kind(),
+        &AccountErrorKind::Internal(bifrost_types::InternalErrorKind::AccountContract)
+    );
+    assert_eq!(
+        error.recovery(),
+        &bifrost_types::RecoveryClass::InternalFailure
+    );
+
+    let specific_hint = |scope: CursorScope| WatchEvent::Invalidated {
+        hint: InvalidationHint {
+            source: PushSource::GraphSubscription,
+            payload: HintPayload::SpecificCursorScope(scope),
+        },
+    };
+    engine
+        .invalidation_sink()
+        .push(account_id.clone(), specific_hint(sibling_scope.clone()));
+    wait_until(
+        "the sibling hint acts as a barrier after the terminal sweep",
+        Duration::from_secs(5),
+        || sibling_drives.load(Ordering::SeqCst) >= 3,
+    )
+    .await;
+    engine
+        .invalidation_sink()
+        .push(account_id.clone(), specific_hint(failed_scope));
+    engine
+        .invalidation_sink()
+        .push(account_id.clone(), specific_hint(sibling_scope));
+    wait_until(
+        "the sibling hint completes after the terminal-scope hint",
+        Duration::from_secs(5),
+        || sibling_drives.load(Ordering::SeqCst) >= 4,
+    )
+    .await;
+    assert_eq!(
+        failed_drives.load(Ordering::SeqCst),
+        2,
+        "later hints must not re-drive a terminally failed scope"
+    );
 
     engine.detach(&account_id).await.expect("detach succeeds");
 }

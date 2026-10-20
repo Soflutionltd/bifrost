@@ -47,7 +47,6 @@ pub(super) mod wire;
 
 // pub: ImapConfig is re-exported at the crate root for direct connections.
 pub use config::ImapConfig;
-pub(crate) use dispatch::FetchStreamItem;
 use stream::{CompressedStream, ImapStream, InnerStream};
 
 #[cfg(test)]
@@ -314,7 +313,7 @@ pub(crate) struct ImapConnection {
     /// verification when the caller invokes `starttls()`.
     host: String,
     /// Whether the current transport is encrypted.
-    tls_active: std::sync::atomic::AtomicBool,
+    tls_active: Arc<std::sync::atomic::AtomicBool>,
     /// Set when a submitted command's future is dropped before its result
     /// arrives - the caller's `tokio::time::timeout` fired, or it was
     /// cancelled. The driver is still executing that command, so the next

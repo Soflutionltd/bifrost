@@ -848,6 +848,76 @@ mod tests {
     use crate::client::GraphClient;
     use bifrost_types::{CursorScope, FolderId, ObjectType};
 
+    #[tokio::test]
+    async fn delta_and_refresh_produce_identical_if_match_bytes() {
+        use crate::client::ScriptedRestResponse;
+        use futures::StreamExt;
+        use serde_json::json;
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [{"id": "m1", "changeKey": "CK1"}],
+                    "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta"
+                }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({"id": "m1", "@odata.etag": "W/\"CK1\""}),
+            ),
+        ]);
+        let account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".into()),
+            ty: ObjectType::Email,
+        };
+        let payload = super::super::cursor::GraphCursorPayload::new(
+            super::super::cursor::kind_for_scope(&scope).expect("kind"),
+            &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
+            None,
+        );
+        let cursor = super::super::cursor::encode_cursor(scope, payload).expect("cursor");
+        let events: Vec<_> = super::super::changes::changes_stream(account.clone(), cursor)
+            .collect()
+            .await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, bifrost_types::SyncEvent::Batch(_)))
+        );
+        let id = ObjectId("m1".into());
+        let cached = account
+            .etag_index
+            .write()
+            .await
+            .get(&id.0)
+            .expect("delta etag");
+        let kind = MutationKind::SetFlags(FlagOp::Set(HashSet::new()));
+        let before = request_for_mutation(
+            &account,
+            &id,
+            &kind,
+            &HashMap::from([(id.0.clone(), cached)]),
+        )
+        .expect("route")
+        .expect("request");
+        account.etag_index.write().await.remove(&id.0);
+        let mut refreshed = HashMap::new();
+        assert!(
+            refresh_missing_etags(&account, std::slice::from_ref(&id), &kind, &mut refreshed)
+                .await
+                .is_empty()
+        );
+        let after = request_for_mutation(&account, &id, &kind, &refreshed)
+            .expect("route")
+            .expect("request");
+        let before = before.headers.expect("headers");
+        let after = after.headers.expect("headers");
+        assert_eq!(before["If-Match"].as_bytes(), b"W/\"CK1\"");
+        assert_eq!(before["If-Match"].as_bytes(), after["If-Match"].as_bytes());
+    }
+
     fn shared_account() -> GraphAccount {
         GraphAccount::new_for_tests_with_shared(
             GraphClient::new("token"),

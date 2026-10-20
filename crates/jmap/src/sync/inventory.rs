@@ -120,7 +120,6 @@ fn email_inventory_loop<T: HttpTransport>(
         let (mail, tally) = mail.metered();
 
         let mut anchor: Option<String> = None;
-        let mut query_state: Option<String> = None;
         loop {
             let started = Instant::now();
             let mut query = EmailQuery::new();
@@ -134,8 +133,8 @@ fn email_inventory_loop<T: HttpTransport>(
             // page's start server-side against the CURRENT result set, so a
             // message deleted behind the cursor cannot shift an unread
             // message into a position the walk already passed. Integer
-            // position over `receivedAt desc` - which is not a total order and
-            // has no RFC 8621 tiebreak - could and did.
+            // position over `receivedAt desc` would skip ids after such a
+            // deletion.
             if let Some(anchor) = anchor.as_ref() {
                 query = query.anchor(anchor.clone()).anchor_offset(1);
             } else {
@@ -159,47 +158,27 @@ fn email_inventory_loop<T: HttpTransport>(
                 }
             };
 
-            if let Some(expected) = query_state.as_ref() {
-                if query_response.query_state() != expected {
-                    // The anchor makes the walk robust to churn ahead of the
-                    // cursor, but not to an id being destroyed out from under
-                    // the anchor itself, so a moved `queryState` means this
-                    // walk's coverage is no longer provable. Ending here
-                    // WITHOUT a `Done` is the whole point: the engine restarts
-                    // the scope rather than recording a full walk that skipped.
-                    yield super::error::terminated_walk_superseded(
-                        bifrost_types::AccountOperation::SyncInventory,
-                        scope.clone(),
-                        "JMAP Email/query state changed during an inventory walk",
-                    );
-                    return;
-                }
-            } else {
-                query_state = Some(query_response.query_state().to_string());
-            }
-
+            // Do not pin queryState: ordinary delivery changes it, and a
+            // restart from position zero can starve inventory indefinitely.
+            // receivedAt is immutable, and RFC 8620 s5.5 requires stable
+            // tie ordering between queries. Existing survivors therefore
+            // cannot cross this anchor. New arrivals and membership moves
+            // behind it are covered by the change cursor seeded BEFORE
+            // inventory. If the anchor itself disappears, anchorNotFound
+            // takes the cursor-invalid restart lane through the context above.
             let ids = query_response.ids().to_vec();
             if ids.is_empty() {
                 break;
             }
-            // Forward-progress guard. `anchor` + `anchorOffset: 1` means the
-            // next page starts strictly AFTER the previous page's last id
-            // (RFC 8620 s5.5), so that id can never appear again in a walk
-            // whose `queryState` has not moved - and the state check above
-            // has already established that it has not. A server that echoes
-            // the same trailing ids therefore never yields the empty page
-            // that ends this loop, and the walk spins forever re-fetching
-            // and re-emitting the same batch. Terminating WITHOUT a `Done`
-            // is deliberate, as with the superseded-state exit: the walk's
-            // coverage was never established, so the engine must restart the
-            // scope rather than record a completed inventory.
+            // anchorOffset: 1 excludes the anchor even when queryState moves.
+            // Echoing it would otherwise hot-loop without proving coverage.
             if let Some(previous) = anchor.as_ref()
                 && ids.iter().any(|id| id.to_string() == *previous)
             {
                 yield super::error::terminated_contract_violation(
                     bifrost_types::AccountOperation::SyncInventory,
                     Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
-                    "Email/query re-served the anchor id under an unmoved query state",
+                    "Email/query re-served the anchor id despite anchorOffset: 1",
                 );
                 return;
             }
@@ -252,7 +231,7 @@ fn email_inventory_loop<T: HttpTransport>(
             //
             // Accepted rather than bounded, because a cap would have to choose
             // between two wrong answers: ending the walk early reports
-            // coverage the walk does not have (the same error the superseded
+            // coverage the walk does not have (the same error the missing
             // and re-served-anchor exits refuse to make), and terminating
             // without `Done` restarts a scope that is behaving correctly. The
             // real cost is wasted round trips against a mailbox being emptied
@@ -682,16 +661,21 @@ mod tests {
         assert!(super::mailbox_has_id(&mailbox));
     }
 
-    /// A server that answers every anchored `Email/query` with the same
-    /// trailing ids under an unmoved `queryState`. The anchor should have
-    /// advanced the window past those ids, so this walk never reaches the
-    /// empty page that ends it: it re-fetches and re-emits the same batch
-    /// forever.
-    struct StuckQueryTransport {
+    /// In-process query scripts for delivery churn, anchor loss, and a
+    /// provider that ignores anchorOffset and would spin the walk forever.
+    #[derive(Clone, Copy)]
+    enum InventoryScenario {
+        Stuck,
+        Churn,
+        MissingAnchor,
+    }
+
+    struct InventoryTransport {
+        scenario: InventoryScenario,
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    impl crate::core::transport::HttpTransport for StuckQueryTransport {
+    impl crate::core::transport::HttpTransport for InventoryTransport {
         async fn api_request(
             &self,
             _url: &str,
@@ -703,7 +687,51 @@ mod tests {
             let call = request["methodCalls"][0].clone();
             let name = call[0].as_str().expect("method name").to_string();
             let call_id = call[2].as_str().expect("call id").to_string();
+            let anchor = call[1]["anchor"].as_str();
+            if name == "Email/query" && anchor.is_some() {
+                assert_eq!(call[1]["anchorOffset"], 1);
+                if matches!(self.scenario, InventoryScenario::MissingAnchor) {
+                    return Ok(bytes::Bytes::from(
+                        serde_json::json!({
+                            "sessionState": "session-1",
+                            "methodResponses": [["error", {"type": "anchorNotFound"}, call_id]]
+                        })
+                        .to_string(),
+                    ));
+                }
+            }
             let arguments = match name.as_str() {
+                "Email/query" if matches!(self.scenario, InventoryScenario::Churn) => {
+                    // New messages land before each surviving anchor. Tied
+                    // receivedAt values retain their server-defined order.
+                    let (state, position, ids) = match anchor {
+                        None => ("q1", 0, vec!["M1", "M2"]),
+                        Some("M2") => ("q2", 3, vec!["M3"]),
+                        Some("M3") => ("q3", 5, vec![]),
+                        other => panic!("unexpected anchor {other:?}"),
+                    };
+                    serde_json::json!({
+                        "accountId": "primary", "queryState": state,
+                        "canCalculateChanges": false, "position": position, "ids": ids
+                    })
+                }
+                "Email/get" if matches!(self.scenario, InventoryScenario::Churn) => {
+                    let ids = call[1]["ids"].as_array().expect("get ids");
+                    let list: Vec<_> = ids
+                        .iter()
+                        .map(|id| {
+                            serde_json::json!({
+                                "id": id, "blobId": "B", "size": 1,
+                                "mailboxIds": {"inbox": true}, "keywords": {},
+                                "receivedAt": "2026-01-01T00:00:00Z"
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "accountId": "primary", "state": "s1", "list": list, "notFound": []
+                    })
+                }
+
                 "Email/query" => serde_json::json!({
                     "accountId": "primary",
                     "queryState": "q1",
@@ -753,11 +781,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_re_served_inventory_anchor_terminates_instead_of_looping() {
-        use futures::StreamExt as _;
-
-        let session: crate::core::session::Session = serde_json::from_value(serde_json::json!({
+    fn inventory_test_session() -> crate::core::session::Session {
+        serde_json::from_value(serde_json::json!({
             "capabilities": {
                 "urn:ietf:params:jmap:core": {
                     "maxSizeUpload": 1000,
@@ -783,10 +808,113 @@ mod tests {
             "eventSourceUrl": "https://example.test/eventsource",
             "state": "session-1"
         }))
-        .expect("session parses");
+        .expect("session parses")
+    }
+
+    #[tokio::test]
+    async fn inventory_completes_despite_query_state_churn() {
+        use futures::StreamExt as _;
+
+        // All routes share the same walk: primary, legacy filtered mailbox,
+        // and foreign account inventory must each tolerate query-state churn.
+        for (filter, owner) in [
+            (None, None),
+            (Some(crate::email::query::Filter::in_mailbox("inbox")), None),
+            (None, Some(TypesMailboxId("share".to_string()))),
+        ] {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let client = crate::client::Client::with_transport(
+                InventoryTransport {
+                    scenario: InventoryScenario::Churn,
+                    calls: std::sync::Arc::clone(&calls),
+                },
+                inventory_test_session(),
+                "https://example.test/.well-known/jmap",
+            )
+            .expect("client builds");
+            let events = email_inventory_loop(
+                crate::account::Account::new(client, "primary"),
+                CursorScope::Type(ObjectType::Email),
+                filter,
+                owner.clone(),
+                2,
+            )
+            .collect::<Vec<_>>()
+            .await;
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 5);
+            assert!(matches!(events.last(), Some(SyncEvent::Done(None))));
+            let ids: Vec<_> = events
+                .iter()
+                .flat_map(|event| match event {
+                    SyncEvent::Batch(batch) => {
+                        batch.items.iter().map(|item| item.id.0.clone()).collect()
+                    }
+                    SyncEvent::Done(_) => Vec::new(),
+                    other => panic!("unexpected inventory event {other:?}"),
+                })
+                .collect();
+            let expected: Vec<_> = ["M1", "M2", "M3"]
+                .into_iter()
+                .map(|id| {
+                    owner.as_ref().map_or_else(
+                        || id.to_string(),
+                        |owner| super::super::foreign::encode_object(&owner.0, id),
+                    )
+                })
+                .collect();
+            assert_eq!(ids, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_inventory_anchor_restarts_without_done() {
+        use futures::StreamExt as _;
+
+        let client = crate::client::Client::with_transport(
+            InventoryTransport {
+                scenario: InventoryScenario::MissingAnchor,
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+            inventory_test_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let scope = CursorScope::Type(ObjectType::Email);
+        let events = email_inventory_loop(
+            crate::account::Account::new(client, "primary"),
+            scope.clone(),
+            None,
+            None,
+            2,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], SyncEvent::Batch(_)));
+        let SyncEvent::Terminated(error) = &events[1] else {
+            panic!("missing anchor must terminate, got {events:?}");
+        };
+        assert_eq!(
+            error.scope(),
+            Some(&bifrost_types::ErrorScope::Cursor(scope.clone()))
+        );
+        assert_eq!(
+            error.recovery(),
+            &bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(
+                scope
+            ),)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_re_served_inventory_anchor_terminates_instead_of_looping() {
+        use futures::StreamExt as _;
+
+        let session = inventory_test_session();
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let client = crate::client::Client::with_transport(
-            StuckQueryTransport {
+            InventoryTransport {
+                scenario: InventoryScenario::Stuck,
                 calls: std::sync::Arc::clone(&calls),
             },
             session,
@@ -823,7 +951,7 @@ mod tests {
             )
         );
         // No `Done`: the walk's coverage was never established, so the
-        // engine must restart the scope rather than record a full walk.
+        // consumer must not record a completed inventory.
         assert!(
             !events
                 .iter()

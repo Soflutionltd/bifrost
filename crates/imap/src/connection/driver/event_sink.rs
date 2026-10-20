@@ -17,9 +17,10 @@ use super::super::typed_event::{Priority, TypedEvent};
 /// Back-pressure strategy:
 /// - **Critical** events (ALERTs, BYE, NOTIFICATIONOVERFLOW) are buffered
 ///   in a pending `VecDeque` when the external channel is full, up to
-///   `hard_cap`. Exceeding the cap returns [`EventOverflow::HardCap`].
-/// - **Requeryable** / **Resyncable** events are dropped silently (the
-///   caller can re-query the server for the latest state).
+///   `hard_cap`. Critical events dropped at the cap or while an earlier loss
+///   marker is pending are included in that marker.
+/// - **Requeryable** / **Resyncable** events are dropped and counted for the
+///   same marker (the caller can re-query the server for the latest state).
 ///
 /// The driver task's `select!` loop calls
 /// [`drain_pending_nonblocking`](Self::drain_pending_nonblocking) between
@@ -39,6 +40,7 @@ pub(in crate::connection) struct DriverEventSink {
 /// Statistics about dropped events during back-pressure.
 #[derive(Default)]
 struct DropStats {
+    dropped_critical: usize,
     dropped_resyncable: usize,
     dropped_requeryable: usize,
     since: Option<std::time::Instant>,
@@ -47,22 +49,18 @@ struct DropStats {
 impl DropStats {
     /// Total number of events dropped in this window.
     fn dropped_count(&self) -> usize {
-        self.dropped_resyncable + self.dropped_requeryable
+        self.dropped_critical + self.dropped_resyncable + self.dropped_requeryable
     }
 }
 
-/// Default maximum pending-buffer size before the connection is poisoned.
+/// Default maximum pending-buffer size before critical events are counted as
+/// dropped.
 const DEFAULT_HARD_CAP: usize = 4096;
 
 /// Error returned by [`DriverEventSink::emit`] when the sink cannot
 /// accept the event.
 #[derive(Debug, thiserror::Error)]
 pub(in crate::connection::driver) enum EventOverflow {
-    /// Hard cap on the pending buffer exceeded. The connection is
-    /// poisoned  -  the server is producing critical events faster than
-    /// the caller can consume them.
-    #[error("critical event pending buffer exceeded hard cap")]
-    HardCap,
     /// External receiver has been dropped. The connection is closing.
     #[error("event receiver dropped")]
     CallerGone,
@@ -87,15 +85,38 @@ impl DriverEventSink {
 
     /// The ONLY publish operation. Never blocks. Never awaits.
     ///
-    /// Drains any previously-buffered critical events first, then
-    /// attempts to send the new event. Critical events that cannot be
-    /// sent immediately are buffered; requeryable/resyncable events
-    /// are dropped.
+    /// Drains previously-buffered critical events and their loss marker
+    /// before handling the new event. New events cannot overtake critical
+    /// events that remain pending if the receiver frees a slot during a
+    /// drain. Critical events that exceed the buffer cap are counted for
+    /// the loss marker.
     pub(in crate::connection::driver) fn emit(
         &mut self,
         ev: TypedEvent,
     ) -> Result<(), EventOverflow> {
         self.drain_pending()?;
+        self.emit_after_drain(ev)
+    }
+
+    /// Handles an event only after older pending events have been drained.
+    /// If a receiver frees a slot just after `drain_pending` observed a full
+    /// channel, keeping later critical events behind the older ones preserves
+    /// their wire order. Once there is a loss to report, later events join
+    /// that loss window until its marker is delivered.
+    fn emit_after_drain(&mut self, ev: TypedEvent) -> Result<(), EventOverflow> {
+        let priority = ev.priority();
+        if self.drop_stats.dropped_count() > 0 {
+            self.record_drop(priority);
+            return Ok(());
+        }
+        if !self.pending.is_empty() {
+            match priority {
+                Priority::Critical => self.buffer_critical(ev),
+                Priority::Requeryable => self.record_drop_requeryable(),
+                Priority::Resyncable => self.record_drop_resyncable(),
+            }
+            return Ok(());
+        }
         self.try_emit(ev)
     }
 
@@ -160,12 +181,11 @@ impl DriverEventSink {
             let stats = std::mem::take(&mut self.drop_stats);
             let marker = TypedEvent::QueueOverflow {
                 dropped_count: stats.dropped_count(),
-                // `since` is always `Some` when `dropped_count() > 0`
-                // because `record_drop_requeryable` and `record_drop_resyncable`
-                // both set `since = Some(Instant::now())` on the first drop.
+                // `since` is always `Some` when `dropped_count() > 0` because
+                // every record_drop_* method sets it on the first drop.
                 since: stats.since.expect(
                     "since is always Some when dropped_count > 0 \
-                     (set by record_drop_requeryable/record_drop_resyncable)",
+                     (set by a record_drop_* method)",
                 ),
             };
             match self.external.try_send(marker) {
@@ -192,12 +212,8 @@ impl DriverEventSink {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(ev)) => match ev.priority() {
                 Priority::Critical => {
-                    if self.pending.len() >= self.hard_cap {
-                        Err(EventOverflow::HardCap)
-                    } else {
-                        self.pending.push_back(ev);
-                        Ok(())
-                    }
+                    self.buffer_critical(ev);
+                    Ok(())
                 }
                 Priority::Requeryable => {
                     self.record_drop_requeryable();
@@ -209,6 +225,33 @@ impl DriverEventSink {
                 }
             },
             Err(mpsc::error::TrySendError::Closed(_)) => Err(EventOverflow::CallerGone),
+        }
+    }
+
+    /// Buffers a critical event unless the bounded queue is full. A critical
+    /// event rejected at the cap still contributes to the loss marker, so
+    /// every loss remains observable even though `emit` results are often
+    /// intentionally ignored by response-routing code.
+    fn buffer_critical(&mut self, ev: TypedEvent) {
+        if self.pending.len() >= self.hard_cap {
+            self.record_drop_critical();
+        } else {
+            self.pending.push_back(ev);
+        }
+    }
+
+    fn record_drop_critical(&mut self) {
+        if self.drop_stats.since.is_none() {
+            self.drop_stats.since = Some(std::time::Instant::now());
+        }
+        self.drop_stats.dropped_critical += 1;
+    }
+
+    fn record_drop(&mut self, priority: Priority) {
+        match priority {
+            Priority::Critical => self.record_drop_critical(),
+            Priority::Requeryable => self.record_drop_requeryable(),
+            Priority::Resyncable => self.record_drop_resyncable(),
         }
     }
 

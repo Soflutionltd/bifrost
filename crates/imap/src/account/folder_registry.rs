@@ -140,6 +140,35 @@ impl CompactUidSet {
         true
     }
 
+    /// Remove a wire range without expanding its numeric span. The returned
+    /// set is only the intersection with known membership, including when the
+    /// server coalesces holes or names UIDs never seen by this consumer.
+    pub(crate) fn remove_range(&mut self, range: UidRange) -> Self {
+        let end = range.end.unwrap_or(range.start);
+        let start = range.start.min(end).max(1);
+        let end = range.start.max(end);
+        let mut kept = Vec::new();
+        let mut removed = Vec::new();
+        for known in &self.ranges {
+            let known_end = known.end.unwrap_or(known.start);
+            let lo = known.start.max(start);
+            let hi = known_end.min(end);
+            if lo > hi {
+                kept.push(*known);
+                continue;
+            }
+            removed.push(normalized_range(lo, hi));
+            if known.start < lo {
+                kept.push(normalized_range(known.start, lo - 1));
+            }
+            if hi < known_end {
+                kept.push(normalized_range(hi + 1, known_end));
+            }
+        }
+        self.ranges = kept;
+        Self { ranges: removed }
+    }
+
     fn insert_range(&mut self, mut start: u32, mut end: u32) {
         let index = self
             .ranges
@@ -155,7 +184,7 @@ impl CompactUidSet {
     /// Ascending UIDs, produced lazily from the ranges. Callers that only
     /// walk the set in order must use this rather than `to_uids`, which
     /// materialises one `u32` per UID.
-    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
         self.ranges
             .iter()
             .flat_map(|range| range.start..=range.end.unwrap_or(range.start))
@@ -453,6 +482,27 @@ impl FolderEntry {
         }
         for uid in uids {
             modseqs.by_uid.remove(uid);
+        }
+    }
+
+    /// Clear only cached keys covered by the wire ranges. Work is bounded
+    /// by cache size, even for a VANISHED span covering the whole UID space.
+    pub(crate) fn clear_modseq_ranges(&self, uidvalidity: u32, ranges: &[UidRange]) {
+        let removed = CompactUidSet::from_ranges(
+            ranges
+                .iter()
+                .map(|range| {
+                    let end = range.end.unwrap_or(range.start);
+                    normalized_range(range.start.min(end).max(1), range.start.max(end))
+                })
+                .collect(),
+        );
+        let mut modseqs = self
+            .modseq_by_uid
+            .write()
+            .expect("folder modseq lock poisoned");
+        if modseqs.uidvalidity == Some(uidvalidity) {
+            modseqs.by_uid.retain(|uid, _| !removed.contains(*uid));
         }
     }
 
@@ -772,6 +822,17 @@ impl FolderRegistry {
     pub(crate) fn clear_modseqs(&self, folder: &MailboxName, uidvalidity: u32, uids: &[u32]) {
         if let Some(entry) = self.get(folder) {
             entry.clear_modseqs(uidvalidity, uids);
+        }
+    }
+
+    pub(crate) fn clear_modseq_ranges(
+        &self,
+        folder: &MailboxName,
+        uidvalidity: u32,
+        ranges: &[UidRange],
+    ) {
+        if let Some(entry) = self.get(folder) {
+            entry.clear_modseq_ranges(uidvalidity, ranges);
         }
     }
 
@@ -1545,6 +1606,70 @@ mod tests {
             Some(crate::types::MailboxRights::parse("lrs")),
             "a renamed shared folder must keep its MYRIGHTS projection",
         );
+    }
+
+    #[test]
+    fn range_removal_matches_membership_for_overlaps_holes_and_repeated_removals() {
+        for start in 1..=10 {
+            for end in 1..=10 {
+                let mut known = CompactUidSet::from_uids([1, 2, 4, 7, 8, 10]);
+                let removed = known.remove_range(UidRange::range(start, end));
+                let (lo, hi) = (start.min(end), start.max(end));
+                let expected: Vec<_> = [1, 2, 4, 7, 8, 10]
+                    .into_iter()
+                    .filter(|uid| (lo..=hi).contains(uid))
+                    .collect();
+                assert_eq!(removed.to_uids(), expected);
+                for uid in [1, 2, 4, 7, 8, 10] {
+                    assert_eq!(known.contains(uid), !(lo..=hi).contains(&uid));
+                }
+                assert!(known.remove_range(UidRange::range(start, end)).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn range_removal_intersects_sparse_membership_without_expanding_wire_span() {
+        let mut known = CompactUidSet::from_uids([2, 7, u32::MAX]);
+        let removed = known.remove_range(UidRange::range(1, 4000000000));
+        assert_eq!(removed.to_uids(), vec![2, 7]);
+        assert_eq!(known.to_uids(), vec![u32::MAX]);
+        assert!(
+            known
+                .remove_range(UidRange::range(1, 4000000000))
+                .is_empty()
+        );
+        assert_eq!(
+            known.remove_range(UidRange::single(u32::MAX)).to_uids(),
+            vec![u32::MAX]
+        );
+        assert!(known.is_empty());
+    }
+
+    #[test]
+    fn range_removal_splits_and_normalizes_reversed_endpoints() {
+        let mut known = CompactUidSet::from_ranges(vec![UidRange::range(1, u32::MAX)]);
+        let removed = known.remove_range(UidRange::range(9, 3));
+        assert_eq!(removed.ranges(), &[UidRange::range(3, 9)]);
+        assert_eq!(
+            known.ranges(),
+            &[UidRange::range(1, 2), UidRange::range(10, u32::MAX)]
+        );
+    }
+
+    #[test]
+    fn vanished_ranges_clear_only_cached_keys_in_the_same_epoch() {
+        let entry = FolderEntry::from_mailbox(MailboxInfo::default());
+        for uid in [2, 7, u32::MAX] {
+            entry.record_modseq(11, uid, 99).expect("valid modseq");
+        }
+        let ranges = [UidRange::range(4000000000, 1)];
+        entry.clear_modseq_ranges(12, &ranges);
+        assert_eq!(entry.modseq(11, 2), Some(99));
+        entry.clear_modseq_ranges(11, &ranges);
+        assert_eq!(entry.modseq(11, 2), None);
+        assert_eq!(entry.modseq(11, 7), None);
+        assert_eq!(entry.modseq(11, u32::MAX), Some(99));
     }
 
     #[test]

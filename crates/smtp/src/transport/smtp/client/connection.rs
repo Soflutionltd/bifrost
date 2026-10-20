@@ -393,7 +393,14 @@ impl SmtpConnection {
                 )
             })?;
 
-        let mail_cmd = Mail::new(from, mail_options).map_err(|e| (e, progress.clone()))?;
+        let mail_cmd = Mail::new(from, mail_options).map_err(|error| {
+            (
+                error
+                    .with_attempt(SmtpTransmissionState::Unsent)
+                    .with_phase(SmtpCommandPhase::MailFrom),
+                progress.clone(),
+            )
+        })?;
         let rcpt_cmds = build_recipient_commands(
             progress.recipients.iter().map(|r| r.address.clone()),
             &rcpt_options_all,
@@ -1460,12 +1467,13 @@ impl SmtpConnection {
 #[cfg(test)]
 mod transcript_tests {
     use crate::{
-        address::Envelope,
+        address::{Address, Envelope},
         transport::smtp::{
             Protocol,
             account_error::{SmtpErrorContext, into_account_error},
             authentication::{Credentials, Mechanism},
             batch::SmtpBatchRecipient,
+            error::{SmtpCommandPhase, SmtpTransmissionState},
             extension::{
                 ClientId, DeliverByMode, DsnNotify, DsnReturn, Extension, MailBodyParameter,
                 MailParameter,
@@ -1478,6 +1486,33 @@ mod transcript_tests {
     use super::{DEFAULT_TLS_HANDSHAKE_TIMEOUT, SendOptions, SmtpConnection};
 
     const HELLO: &str = "EHLO client.example\r\n";
+
+    #[test]
+    fn batch_mail_construction_failure_is_stamped_before_mail_from() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript =
+            Transcript::new("220 smtp.example\r\n").expect(HELLO, "250 smtp.example\r\n");
+        let connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        let recipients = vec![SmtpBatchRecipient {
+            id: BatchItemId("item-0".to_owned()),
+            address: "recipient@example.com".parse().unwrap(),
+        }];
+
+        let Err((error, _progress)) = connection.build_batch(
+            Protocol::Smtp,
+            Some(Address::new_dangerous("sender\r\nRSET", "example.com")),
+            recipients,
+            b"body",
+            &SendOptions::default(),
+        ) else {
+            panic!("hostile sender should fail MAIL construction");
+        };
+
+        assert_eq!(error.attempt(), Some(SmtpTransmissionState::Unsent));
+        assert_eq!(error.phase(), Some(SmtpCommandPhase::MailFrom));
+        transcript.assert_exhausted();
+    }
 
     /// The blocking mirror of the async oversized-banner pin (finding 4c): a
     /// greeting line past `MAX_RESPONSE_LINE_BYTES` is a parse error, and the

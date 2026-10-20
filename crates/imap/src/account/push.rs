@@ -826,10 +826,9 @@ fn absorb_idle_event(
         }
         IdleEvent::Vanished { uids, .. } => {
             if let Some(uidvalidity) = uidvalidity {
-                for range in uids {
-                    let uids = super::folder_registry::expand_range(*range);
-                    account.folders.clear_modseqs(selected, uidvalidity, &uids);
-                }
+                account
+                    .folders
+                    .clear_modseq_ranges(selected, uidvalidity, uids);
             }
         }
         IdleEvent::MailboxEvent(info) => account.folders.apply_mailbox_event(info.clone()),

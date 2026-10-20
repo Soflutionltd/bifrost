@@ -12,7 +12,7 @@ use std::{
 
 use super::{
     super::{Error, SmtpConnection},
-    PoolConfig,
+    PoolConfig, idle_connection_expired, pool_worker_interval,
 };
 use crate::transport::smtp::{error, transport::SmtpClient};
 
@@ -79,7 +79,9 @@ impl Pool {
                                 .iter()
                                 .enumerate()
                                 .rev()
-                                .filter(|(_, conn)| conn.idle_duration() > idle_timeout)
+                                .filter(|(_, conn)| {
+                                    idle_connection_expired(conn.idle_duration(), idle_timeout)
+                                })
                                 .map(|(i, _)| i)
                                 .collect::<Vec<_>>();
                             let dropped = to_drop
@@ -144,7 +146,7 @@ impl Pool {
 
                         drop(pool);
 
-                        match thread_rx.recv_timeout(idle_timeout) {
+                        match thread_rx.recv_timeout(pool_worker_interval(idle_timeout)) {
                             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                                 // The transport was shut down
                                 return;
@@ -233,7 +235,7 @@ impl Pool {
 
             match conn {
                 Some(conn) => {
-                    if conn.idle_duration() > self.config.idle_timeout {
+                    if idle_connection_expired(conn.idle_duration(), self.config.idle_timeout) {
                         #[cfg(feature = "tracing")]
                         tracing::debug!("dropping an expired connection");
 

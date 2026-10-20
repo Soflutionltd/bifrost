@@ -150,10 +150,10 @@ pub(crate) fn discover_memberships(
     Box::pin(
         stream::once(async move {
             let started = Instant::now();
-            // A cache hit performs no request, and then the tally is
-            // legitimately zero - the batch cost no inbound bytes.
+            // A fresh snapshot answers discovery without a request, so its
+            // request-local byte tally is legitimately zero.
             let (client, tally) = client.metered();
-            match refresh_scope_snapshot(&client, &cache).await {
+            match scope_snapshot_or_refresh(&client, &cache).await {
                 Ok(snapshot) => {
                     let items = snapshot
                         .labels
@@ -249,6 +249,12 @@ fn record_lifecycle_snapshot(
 /// The label vocabulary every flag-canonicalizing call site must go
 /// through.
 ///
+/// This helper checks cache age, not whether a caller-supplied label id is
+/// present. A translator that finds an unresolved `$gmail-label:` id in a
+/// fresh snapshot must force one serialized refresh with
+/// `refresh_scope_snapshot` and retry translation before declaring it
+/// unsupported.
+///
 /// Never reach for `snapshot(cache)` directly for this: the cache starts
 /// empty, and canonicalizing against an empty vocabulary is silently wrong
 /// in both directions. Reading, `canonical_flags` falls back to the id in
@@ -276,7 +282,7 @@ pub(crate) async fn labels_for_flags(
     if !current.is_stale() {
         return Ok(current.labels);
     }
-    match refresh_scope_snapshot(client, cache).await {
+    match refresh_scope_snapshot_locked(client, cache).await {
         Ok(snapshot) => Ok(snapshot.labels),
         Err(error) if current.fetched_at.is_some() => {
             tracing::warn!("gmail label refresh failed during flag translation: {error}");
@@ -300,13 +306,60 @@ pub(crate) fn snapshot(cache: &ScopeCache) -> ScopeSnapshot {
         })
 }
 
+/// Return the current vocabulary, refreshing only when the shared snapshot is
+/// stale. The second staleness check is inside the single-flight lock so
+/// concurrent readers consume the result of one `labels.list` request.
+pub(crate) async fn scope_snapshot_or_refresh(
+    client: &GmailClient,
+    cache: &ScopeCache,
+) -> crate::Result<ScopeSnapshot> {
+    let current = snapshot(cache);
+    if !current.is_stale() {
+        return Ok(current);
+    }
+
+    let _refresh = cache.refresh.lock().await;
+    let current = snapshot(cache);
+    if !current.is_stale() {
+        return Ok(current);
+    }
+
+    refresh_scope_snapshot_locked(client, cache).await
+}
+
+/// Fetch an authoritative snapshot even when the cache is still fresh.
+/// Containers-list uses this to report the latest server view. The refresh
+/// lock serializes it with every other cache writer and prevents an older
+/// fetch from landing after a newer one.
 pub(crate) async fn refresh_scope_snapshot(
+    client: &GmailClient,
+    cache: &ScopeCache,
+) -> crate::Result<ScopeSnapshot> {
+    let _refresh = cache.refresh.lock().await;
+    refresh_scope_snapshot_locked(client, cache).await
+}
+
+/// Mark the vocabulary stale after a label mutation. Keep the previous labels
+/// for diagnostics and fallback decisions, but require the next vocabulary
+/// consumer to refresh them. Sharing the refresh lock orders this invalidation
+/// against an already-running snapshot fetch.
+pub(crate) async fn invalidate_scope_snapshot(cache: &ScopeCache) {
+    let _refresh = cache.refresh.lock().await;
+    match cache.snapshot.write() {
+        Ok(mut guard) => guard.fetched_at = None,
+        Err(_) => tracing::warn!("scope snapshot lock poisoned; could not invalidate cache"),
+    }
+}
+
+async fn refresh_scope_snapshot_locked(
     client: &GmailClient,
     cache: &ScopeCache,
 ) -> crate::Result<ScopeSnapshot> {
     let snapshot = fetch_scope_snapshot(client).await?;
     if let Ok(mut guard) = cache.snapshot.write() {
         *guard = snapshot.clone();
+    } else {
+        tracing::warn!("scope snapshot lock poisoned; refreshed labels were not cached");
     }
     Ok(snapshot)
 }
@@ -495,12 +548,10 @@ mod tests {
         ));
     }
 
-    /// The interfering writer is the whole bug. `discover_memberships`
-    /// refreshes the SHARED `ScopeCache` unconditionally, so while the
-    /// lifecycle diff read that cache, a membership discovery landing
-    /// between two polls moved the baseline forward and the next diff
-    /// came back empty - the label creation was never announced and the
-    /// consumer's container list silently diverged.
+    /// Membership discovery shares the vocabulary cache with flag readers,
+    /// while lifecycle diffing owns an independent baseline. A discovery
+    /// between polls must not move that baseline forward and swallow a
+    /// creation event.
     #[tokio::test(start_paused = true)]
     async fn a_shared_cache_refresh_between_polls_does_not_swallow_creation() {
         let (client, script) = scripted_client(vec![
@@ -545,6 +596,62 @@ mod tests {
                 MembershipScope::Label(LabelId(id))
             ))) if id == "Label_2"
         ));
+    }
+
+    #[tokio::test]
+    async fn fresh_membership_cache_hit_performs_no_request() {
+        let (client, script) = scripted_client(Vec::new());
+        let cache: ScopeCache = Arc::new(ScopeCacheState::new(snapshot_of(vec![label(
+            "Label_1", "Work", "user",
+        )])));
+
+        let events = discover_memberships(client, cache)
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(script.requests().is_empty());
+        assert!(matches!(
+            events.as_slice(),
+            [
+                SyncEvent::Batch(Batch {
+                    items,
+                    bytes_in: 0,
+                    ..
+                }),
+                SyncEvent::Done(None)
+            ] if matches!(items.as_slice(), [MembershipScope::Label(LabelId(id))] if id == "Label_1")
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_snapshot_refreshes_share_the_refresh_lock() {
+        let (client, script) = scripted_client(vec![Canned::Pending, Canned::Pending]);
+        let cache: ScopeCache = Arc::new(ScopeCacheState::new(ScopeSnapshot::empty()));
+        let first_client = Arc::clone(&client);
+        let first_cache = Arc::clone(&cache);
+        let first =
+            tokio::spawn(async move { refresh_scope_snapshot(&first_client, &first_cache).await });
+        while script.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+
+        let second_client = Arc::clone(&client);
+        let second_cache = Arc::clone(&cache);
+        let second =
+            tokio::spawn(
+                async move { refresh_scope_snapshot(&second_client, &second_cache).await },
+            );
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "a second writer must wait for the first snapshot to finish",
+        );
+        first.abort();
+        second.abort();
     }
 
     /// Before a baseline exists there is nothing to diff, but there is

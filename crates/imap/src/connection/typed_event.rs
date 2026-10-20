@@ -21,7 +21,8 @@ use crate::types::validated::MailboxName;
 /// [`DriverEventSink`](super::driver::event_sink::DriverEventSink).
 #[derive(Debug, Clone)]
 pub enum TypedEvent {
-    /// RFC 3501 Section7.1 \[ALERT\]  -  informational, never dropped.
+    /// RFC 3501 Section7.1 \[ALERT\]  -  informational and high priority;
+    /// loss under backpressure is reported by `QueueOverflow`.
     Alert(String),
     /// RFC 3501 Section7.1.5 BYE  -  connection ending.
     Bye {
@@ -72,7 +73,8 @@ pub enum TypedEvent {
 /// pressure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::connection) enum Priority {
-    /// Never dropped  -  ALERTs, BYE, NOTIFICATIONOVERFLOW, `QueueOverflow`.
+    /// Buffered before lower priorities; any loss under backpressure is
+    /// reported by `QueueOverflow`.
     Critical,
     /// Dropped first under queue pressure  -  capability changes can be
     /// re-queried with a single CAPABILITY command.

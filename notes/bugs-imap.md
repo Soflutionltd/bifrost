@@ -28,29 +28,6 @@ authentication failure raised mid-exchange cannot be stamped although the
 AUTHENTICATE line and client-first are on the wire. Documented at the code site
 and in `reference/imap.md`; the error type itself was outside the fix's files.
 
-## IMAP-003 - `DriverEventSink` hard cap is documented as poisoning the connection, but every caller discards the result
-
-Live. Scope: imap protocol.
-
-`connection/driver/event_sink.rs`; every `emit` call site in `driver/mod.rs`,
-`driver/pipeline.rs`, `driver/idle.rs`, `driver/upgrade.rs` uses
-`let _ = event_sink.emit(...)`. The docs say exceeding the cap returns
-`EventOverflow::HardCap`, "The connection is poisoned - the server is producing
-critical events faster than the caller can consume them". Nothing matches
-`HardCap`. The 4097th pending critical event (ALERT, BYE,
-NOTIFICATIONOVERFLOW) is dropped, and `try_emit` does not call `record_drop_*`
-on that path, so no `QueueOverflow` marker fires: the one loss path the marker
-was built to make visible. Also breaks the sink doc that only "Requeryable /
-Resyncable events are dropped silently".
-
-Fix: act on `HardCap` (retire the connection, as documented) or count the
-drop so the marker fires.
-
-Ordering wrinkle in the same file: when `drain_pending` stops on `Full` with
-critical events pending, `emit` goes on to `try_emit` the new event; if a slot
-freed in between, the new event overtakes older pending critical events, and
-the `QueueOverflow` marker can land after events it should precede.
-
 ## IMAP-004 - Per-response body memory is unbounded; FETCH budgets run only after the literal is buffered twice
 
 Live. Scope: imap protocol.
@@ -138,60 +115,6 @@ decisions. They are refusals, so the worst case is a spurious
 `MissingCapability` or a server BAD, but they are a second gate site the "one
 command path" story says does not exist.
 
-## IMAP-008 - PREAUTH greeting with `TlsMode::StartTls` fails with a misleading retryable error class
-
-Latent. Scope: imap protocol.
-
-`connection/lifecycle.rs` `connect_with_tls_connector_metered` ->
-`run_starttls_upgrade` -> `prepare_command`. A cleartext PREAUTH puts the
-session in Authenticated, so STARTTLS is refused as
-`StateChangedBeforeSend("session moved to Authenticated ...")`. Secure (nothing
-sent in clear), but it says the session moved while the command waited, a
-retry-after-refresh class for what is a TLS-policy refusal (RFC 9051 s6.1.1:
-the client must close). A reconnect loop retries it forever. It should be a
-dedicated refusal such as `StartTlsUnavailable`.
-
-## IMAP-009 - A failed post-STARTTLS CAPABILITY leaves a live TLS connection reporting cleartext and no capabilities
-
-Latent. Scope: imap protocol.
-
-`connection/driver/upgrade.rs` `run_starttls_upgrade` clears capabilities
-before the re-fetch. If that CAPABILITY fails non-fatally (`ProtocolMissing`,
-tagged NO), the driver keeps the connection, and `starttls_with_connector`
-returns `Err` before `tls_active.store(true)`. The result is a TLS-wrapped
-connection with `is_encrypted() == false` and empty capabilities;
-`authenticate_best` then refuses every rung on cleartext grounds or with
-`MissingCapability`. Make the upgrade fatal once the stream is swapped, or have
-`tls_active` follow the stream rather than the call result.
-
-## IMAP-016 - VANISHED ranges are expanded UID by UID, and every expanded UID becomes a `Removed` change
-
-Scope: imap account.
-
-`changes.rs` `run_qresync` (SELECT-side `vanished` and the
-`FetchStreamItem::VanishedEarlier` arm), `record_removed_change`; `mutate.rs`
-`open_folder_for_mutation`; `push.rs` `absorb_idle_event`;
-`folder_registry.rs` `expand_range`.
-
-a) Correctness. `record_removed_change` pushes `ScopeChange::Removed` for every
-UID in the range whether or not it is in `known_uids`. The second command,
-`UID FETCH 1:* (...) (CHANGEDSINCE m VANISHED)`, runs over `1:*`, and RFC 7162
-s3.2.6 lets that reply name any UID expunged since `m`, including messages that
-arrived and were expunged between syncs. Servers also coalesce VANISHED into
-ranges covering non-existent UIDs. The result is `Removed` for ids with no
-membership record. The CONDSTORE path explicitly guards the symmetric hazard
-(`basic_updated_change` doc; `reference/imap.md` CONDSTORE bullet); QRESYNC
-does not. Fix: intersect each range with `live_uids` before emitting.
-
-b) Resource. `expand_range` materialises `start..=end` into a `Vec<u32>`.
-`VANISHED (EARLIER) 1:4000000000` (legal syntax) allocates on the order of
-16 GB and emits billions of changes, in the changes stream, every mutation
-SELECT and every IDLE VANISHED event. `CompactUidSet` is already range-based;
-removal, modseq-cache clear and the diff should operate on ranges intersected
-with the known set. The same expansion runs on `ResponseCode::Modified` in
-`modified_uids` (`mutate.rs`), bounded by the request's set but still
-better range-based.
-
 ## IMAP-017 - `Account::close()` is not cancellation-safe or concurrency-safe, and leaves SMTP submission open
 
 Scope: imap account.
@@ -211,25 +134,6 @@ Scope: imap account.
   never check `closed`. After `close()` they still dial SMTP and deliver; only
   the Sent APPEND fails, logged only, so the caller gets `Ok` with a fallback
   `imapmsgid1:` id.
-
-## IMAP-018 - IDLE sessions are uncounted, so the connection footprint exceeds `pool_cap`
-
-Scope: imap account.
-
-`factory.rs` (`data_cap = pool_cap - 1`), `pool.rs` `dial_idle`, `push.rs`
-`ensure_idle_tasks`. `dial_idle` takes no permit, and a non-NOTIFY account
-starts `idle_connection_budget` (default 4) workers, each with its own session.
-Defaults give 3 data plus 4 IDLE sessions, 7 against `pool_cap` 4, plus
-`replace_selected_member` re-dials.
-
-Claims broken: `reference/imap.md` `pool.rs` bullet ("Push lane reserves one
-slot; data lanes share the rest") and Push lifecycle ("Four matches `pool_cap`
-... keeping the account's total connection footprint inside the low per-user
-allowance many providers enforce"). On a provider with a per-user limit of
-about 5, the eighth dial is refused, usually a data checkout during sync.
-Either IDLE workers draw from a shared session budget, or the docs and
-`ImapAccountConfig` state the real total (`pool_cap - 1 +
-idle_connection_budget`).
 
 ## IMAP-020 - Push events broadcast before a `push_stream` receiver exists are lost
 
@@ -258,30 +162,6 @@ guard that, as wired, protects only the sub-second SELECT-to-STORE window.
 Take the guard value from the consumer (`ServerVersion::ModSeq` already travels
 in inventory entries), or say plainly how narrow the window is.
 
-## IMAP-023 - QRESYNC runs a redundant second round trip over `1:*`
-
-Scope: imap account.
-
-`changes.rs` `run_qresync`. A QRESYNC SELECT (RFC 7162 s3.2.5) already returns
-`VANISHED (EARLIER)` and the changed FETCHes since `modseq`. The code consumes
-both, then issues `UID FETCH 1:* (UID FLAGS MODSEQ) (CHANGEDSINCE modseq
-VANISHED)` returning the same data, deduplicated by `fetch_change_seen` /
-`removed_seen`. Cost: one extra round trip per folder per poll on the cheap
-strategy, plus IMAP-016a's widened VANISHED over `1:*`. If it is a deliberate
-guard for non-conformant servers, the reference should say so; it lists both
-sources without explaining why both are needed.
-
-## IMAP-024 - Mutation SELECT carries the full QRESYNC baseline on every mutation
-
-Scope: imap account.
-
-`mutate.rs` `open_folder_for_mutation` passes the folder's in-memory cursor to
-`select_folder`, so every mutation batch on a QRESYNC account sends the full
-known-UID set and gets back every VANISHED and changed FETCH since the last
-sync, used only to warm the MODSEQ cache (and expanded per UID, IMAP-016b). A
-one-message flag flip after a long idle gap pays for a full resync payload. A
-plain SELECT suffices.
-
 ## IMAP-025 - Smaller imap account observations
 
 Smells, imap account.
@@ -301,3 +181,25 @@ Smells, imap account.
   reference describes only additions and expunges for Basic, but
   `CursorDescriptor` for Basic does not signal "flags stale", and nothing in the
   engine-facing types says a Basic folder's flags drift until re-inventory.
+
+## IMAP-018 - IDLE sessions are still uncounted against `pool_cap`
+
+Scope: imap account. Residue: the config docs and reference now state the real
+total (`pool_cap - 1 + idle_connection_budget`). Whether IDLE workers should
+instead draw from a shared session budget, so the footprint stays inside
+`pool_cap` on providers with a low per-user connection limit, is a product
+decision.
+
+## IMAP-027 - `flush_page` documentation still describes the removed FETCH downgrade path
+
+Lateral from the QRESYNC discovery fix. The doc comment on `flush_page` in
+`crates/imap/src/account/changes.rs` still describes the downgrade path that
+belonged to the removed second `UID FETCH`.
+
+## IMAP-026 - `StartTlsUnavailable` is classified and worded wrongly for the PREAUTH refusal
+
+Scope: imap protocol. `Error::StartTlsUnavailable` maps to a policy-blocked
+authorization error and its text says STARTTLS is "not supported by server",
+though a PREAUTH greeting refuses STARTTLS even when the capability is
+advertised. Fix the wording and check the classification in
+`crates/imap/src/error.rs`.

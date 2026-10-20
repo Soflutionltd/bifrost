@@ -12,7 +12,7 @@ use bifrost_types::{
     AccessErrorKind, AccountError, AccountErrorKind, AccountFuture, AccountOperation, AddressBook,
     AddressBookId, ContactCard, ContactCorpus, ContactCreate, ContactEmail, ContactId,
     ContactOrganization, ContactPatch, ContactPhone, ContactProvenance, ContactSearchRequest,
-    DirectoryCard, Page, ProtocolKind,
+    DiagnosticText, DirectoryCard, Page, ProtocolKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -270,6 +270,7 @@ pub(crate) fn update(
         reject_photo_url_patch(&patch)?;
         let mut person = get_person(&client, &contact, AccountOperation::ContactUpdate).await?;
         let update_fields = update_fields_for_patch(&patch);
+        let fields_updated = !update_fields.is_empty();
         if !update_fields.is_empty() {
             // The People `updateContact` call needs the server etag; a
             // photo-only patch (handled below via `updateContactPhoto`)
@@ -289,8 +290,14 @@ pub(crate) fn update(
                 contact_error(error, AccountOperation::ContactUpdate, contact.0.clone())
             })?;
         }
-        if let Some(photo) = patch.photo {
-            update_contact_photo(&client, &contact, photo).await?;
+        if let Some(photo) = patch.photo
+            && let Err(error) = update_contact_photo(&client, &contact, photo).await
+        {
+            return Err(if fields_updated {
+                contact_fields_photo_error(error)
+            } else {
+                error
+            });
         }
         Ok(())
     })
@@ -325,6 +332,20 @@ async fn update_contact_photo(
             })?;
     }
     Ok(())
+}
+
+// The earlier field write landed, but recovery must still follow the photo
+// failure. Record the partial effect as diagnostic context, leaving the photo
+// request's classification and transmission evidence intact (in particular,
+// an earlier successful request cannot acknowledge a failed transport).
+fn contact_fields_photo_error(error: AccountError) -> AccountError {
+    error
+        .into_builder()
+        .text(DiagnosticText::support_only(
+            "contact fields were updated but the contact photo update failed",
+        ))
+        .try_build()
+        .expect("valid decorated contact photo error")
 }
 
 fn update_contact_photo_url(people_base: &str, encoded_resource_name: &str) -> String {
@@ -404,10 +425,17 @@ pub(crate) fn search(
             request.address_book_id.as_ref(),
             AccountOperation::ContactSearch,
         )?;
-        let _: PeopleSearchResponse = client
-            .get(&search_warmup_url(client.people_base()))
+        if let Err(error) = client
+            .get::<PeopleSearchResponse>(&search_warmup_url(client.people_base()))
             .await
-            .map_err(|error| collection_error(error, AccountOperation::ContactSearch))?;
+        {
+            let error = collection_error(error, AccountOperation::ContactSearch);
+            if error.recovery().is_terminal() {
+                return Err(error);
+            }
+            // This request only primes the search cache. A transient failure
+            // does not make the actual contact query less authoritative.
+        }
         let url = search_url(client.people_base(), &request)?;
         let response: PeopleSearchResponse = client
             .get(&url)
@@ -1309,11 +1337,15 @@ mod tests {
     use super::*;
 
     fn scripted_client(body: &'static [u8]) -> (Arc<GmailClient>, Arc<ScriptedDispatch>) {
-        let script = ScriptedDispatch::new([Canned::Response {
+        scripted_client_steps(vec![Canned::Response {
             status: StatusCode::OK,
             headers: reqwest::header::HeaderMap::new(),
             body: Bytes::from_static(body),
-        }]);
+        }])
+    }
+
+    fn scripted_client_steps(steps: Vec<Canned>) -> (Arc<GmailClient>, Arc<ScriptedDispatch>) {
+        let script = ScriptedDispatch::new(steps);
         let net = bifrost_net::test_support::scripted_account(
             &script,
             NetConfig::default(),
@@ -1366,6 +1398,95 @@ mod tests {
             bifrost_types::Cause::Attempt(attempt)
                 if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
         )));
+    }
+
+    #[tokio::test]
+    async fn photo_failure_after_field_update_preserves_permission_failure() {
+        let mut photo_error_headers = reqwest::header::HeaderMap::new();
+        photo_error_headers.insert(
+            reqwest::header::HeaderName::from_static("x-goog-request-id"),
+            reqwest::header::HeaderValue::from_static("people-req-9"),
+        );
+        let (client, script) = scripted_client_steps(vec![
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from_static(br#"{"resourceName":"people/c1","etag":"etag-1"}"#),
+            },
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from_static(br#"{"resourceName":"people/c1","etag":"etag-2"}"#),
+            },
+            Canned::Response {
+                status: StatusCode::FORBIDDEN,
+                headers: photo_error_headers,
+                body: Bytes::from_static(
+                    br#"{"error":{"code":403,"message":"photo denied","errors":[{"reason":"forbidden","message":"photo denied"}]}}"#,
+                ),
+            },
+        ]);
+        let error = update(
+            client,
+            ContactId("people/c1".to_string()),
+            ContactPatch {
+                display_name: Some(Some("Ada Lovelace".to_string())),
+                photo: Some(Some(bifrost_types::ContactPhoto {
+                    data: vec![1, 2, 3],
+                    media_type: Some("image/png".to_string()),
+                })),
+                ..ContactPatch::default()
+            },
+        )
+        .await
+        .expect_err("photo write fails after the field update succeeded");
+
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+        ));
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::NoPermission { .. }
+        ));
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Attempt(attempt)
+                if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
+        )));
+        assert_eq!(
+            error.scope(),
+            Some(&bifrost_types::ErrorScope::Contact {
+                id: ContactId("people/c1".to_string())
+            })
+        );
+        let telemetry = error.telemetry_fields();
+        assert_eq!(telemetry.status, Some(403));
+        assert_eq!(telemetry.request_id, Some("people-req-9"));
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Wire(bifrost_types::WireCause::Gmail(_))
+        )));
+        assert!(
+            error
+                .support_consented()
+                .support_text
+                .iter()
+                .any(|text| text.contains("photo denied"))
+        );
+        assert!(
+            error
+                .support_consented()
+                .support_text
+                .iter()
+                .any(|text| text.contains("contact fields were updated"))
+        );
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].method, reqwest::Method::GET);
+        assert_eq!(requests[1].method, reqwest::Method::PATCH);
+        assert!(requests[2].url.path().ends_with(":updateContactPhoto"));
     }
 
     #[test]
@@ -1896,6 +2017,55 @@ mod tests {
         assert!(url.contains("people:searchContacts?query=&readMask="));
         assert!(url.contains("names%2CemailAddresses"));
         assert!(!url.contains("pageSize="));
+    }
+
+    #[tokio::test]
+    async fn transient_contact_search_warmup_failure_falls_through_to_query() {
+        let (client, script) = scripted_client_steps(vec![
+            Canned::Response {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from_static(
+                    br#"{"error":{"code":500,"errors":[{"reason":"backendError"}]}}"#,
+                ),
+            },
+            Canned::Response {
+                status: StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::from_static(br#"{"results":[]}"#),
+            },
+        ]);
+
+        let page = search(client, ContactSearchRequest::new("Ada"))
+            .await
+            .expect("the actual search remains authoritative after a warmup blip");
+
+        assert!(page.items.is_empty());
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].url.as_str().contains("query=&readMask="));
+        assert!(requests[1].url.as_str().contains("query=Ada"));
+    }
+
+    #[tokio::test]
+    async fn terminal_contact_search_warmup_failure_still_propagates() {
+        let (client, script) = scripted_client_steps(vec![Canned::Response {
+            status: StatusCode::FORBIDDEN,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from_static(
+                br#"{"error":{"code":403,"errors":[{"reason":"domainPolicy"}]}}"#,
+            ),
+        }]);
+
+        let error = search(client, ContactSearchRequest::new("Ada"))
+            .await
+            .expect_err("terminal authorization refusal is not a cache-prime blip");
+
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)
+        ));
+        assert_eq!(script.requests().len(), 1);
     }
 
     #[test]

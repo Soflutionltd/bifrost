@@ -319,6 +319,15 @@ operation is treated idempotent). The rules at altitude (read
   (IMAP's driver death stamps the caller's phase - `Unsent` when the driver
   never received the command, `InFlight` when it owned it).
 
+State-history expiry is not a provider contract violation. A producer with an
+engine cursor reports `SyncState(CursorInvalid)` with its cursor scope so the
+engine can restart it. A long-lived producer that owns its position locally
+may instead recover before exporting an error: JMAP mailbox lifecycle diffs
+a fresh name snapshot and resumes polling when change history expires.
+Missing client recovery context does not establish provider misconduct; the
+JMAP converter treats unhandled state expiry without a cursor scope as an
+`Internal(InvariantViolated)` client error.
+
 ### Local refusals
 
 **A request a protocol crate refuses LOCALLY, before any byte of it is sent,
@@ -489,9 +498,10 @@ a wrong answer a consumer cannot detect. Gmail `bulk_destroy` under the
 to moving the messages to Trash: reported `Applied`, the engine believed
 a state it re-observed as false on every subsequent pass and re-issued
 the destroy forever; reported `Skipped`, a real mutation would be
-hidden. `bifrost-sync` files it `PendingReadback` rather than trusting
-it, so the final accounting comes from observed state - a downgrade is
-the one success report whose own claim is known to be incomplete.
+hidden. `bifrost-sync` records it in its own `downgraded` bucket and retains
+the reported effect in `MutationCounters::effects`. It neither retries nor
+reads the target back against the original request: the campaign preserves
+the provider's weaker-effect report as its accounting.
 Gmail reports `MovedToContainer(TRASH)`. A provider that applied only the
 representable subset of a flag operation reports
 `FlagsPartiallyApplied { unsupported }`, preserving the flags it could not
@@ -505,10 +515,12 @@ requested flag unrepresentable, so no request is even sent - is not a
 downgrade and must not borrow the lane. It produces `ItemOutcome::Failed`
 per id with `Unsupported(operation)` -> `RecoveryClass::Unsupported`,
 which is permanent and not retried. This matters beyond tidiness:
-`bifrost-sync` files every `Downgraded` as `PendingReadback`, so a no-op
-wearing the downgrade lane schedules a read-back for a mutation that
-never happened, and spends the read-back budget of a real one. Protocol
-crates: if there is nothing you could do, say so in the failure lane.
+`bifrost-sync` treats `Downgraded` as a completed reported effect, counts it
+in `MutationCounters::downgraded`, retains the effect, and excludes the
+target from read-back. A no-op wearing the downgrade lane would therefore be
+misreported as a successful weaker mutation and bypass observation that could
+expose the non-landing. Protocol crates: if there is nothing you could do,
+say so in the failure lane.
 
 ## Diagnostics and consent tiers
 

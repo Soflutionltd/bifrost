@@ -316,11 +316,13 @@ account-scoped clone attached to `bifrost-net` under the engine
   optional config, lifecycle state, active-handle set, and its claim on the
   mailbox's shared watch exclusively. It is built from the profile's email
   address, the key under which instances coordinate `users.stop`.
-- `scope_cache: Arc<ScopeCacheState>` for the shared, refresh-on-stale label
-  vocabulary used by canonicalization: an `RwLock<ScopeSnapshot>` for the
-  snapshot plus a `tokio::sync::Mutex` that makes the refresh single-flight.
-  Lifecycle diff state is private to each lifecycle stream and never reads this
-  cache.
+- `scope_cache: Arc<ScopeCacheState>` for the shared label vocabulary used by
+  canonicalization: an `RwLock<ScopeSnapshot>` for the snapshot plus a
+  `tokio::sync::Mutex` that serializes refreshes and invalidations. Membership
+  discovery returns a fresh cached snapshot without a request; stale reads
+  re-check after taking the lock. Container listing still fetches the latest
+  server view, but its write uses the same lock. Lifecycle diff state is
+  private to each lifecycle stream and never reads this cache.
 - `shutdown: CancellationToken` for the watch actor and the
   lifecycle stream.
 - `set_priority` / `set_bandwidth_cap` delegate to the underlying `AccountNet`.
@@ -517,8 +519,11 @@ Container CRUD treats Gmail labels as `ContainerKind::Label` and returns
 native label ids. System labels `INBOX`, `SENT`, `DRAFT`, `TRASH`, `SPAM`
 map to the matching `FolderRole`; Archive is a synthetic label-shaped
 container with native id `archive` and `FolderRole::Archive`. Create,
-rename, and delete call Gmail label endpoints. Moving containers is
-unsupported because Gmail labels are flat.
+rename, and delete call Gmail label endpoints. Each dispatched label mutation
+marks the shared vocabulary stale afterward, including an attempt whose
+response is ambiguous, so later flag translation refreshes before using the
+old label list. Moving containers is unsupported because Gmail labels are
+flat.
 
 Settings primitives map to Gmail settings endpoints:
 
@@ -589,7 +594,15 @@ first modeled name's given/family split while preserving unmodeled People name
 fields and additional name entries. Custom email and phone labels use People
 `type=custom` plus `formattedType`; postal addresses map through the shared
 `ContactAddress` model. Contact search sends the People empty-query warmup
-before `searchContacts` so the cache is populated after mutations. The account
+before `searchContacts` so the cache is populated after mutations; a transient
+warmup failure is ignored because it only primes the cache, while terminal
+failures propagate. If modeled fields are acknowledged but a requested photo
+update or deletion then fails, support-only diagnostic context records that
+fields were updated. The photo error is decorated through `into_builder`,
+preserving its kind, contact scope, transmission evidence, recovery inputs,
+and retry timing. Permission refusals remain terminal, authentication loss
+still requires reauthorization, and throttling retains its retry hint.
+The earlier field write does not acknowledge the separate photo request. The account
 exposes the synthetic `google:contacts` address book plus People
 `contactGroups.list` groups. List/search accept no id, `google:contacts`, or
 `contactGroups/*` ids; group-scoped queries filter returned contacts by
@@ -852,9 +865,10 @@ Its first successful label fetch seeds that state and emits no Created events.
 Later polls diff only against the last snapshot observed by that stream, so a
 flag mutation, hydration batch, inventory prelude, or membership discovery that
 refreshes the shared vocabulary cannot consume lifecycle changes. Rename events
-carry the same stable label id in `old` and `new`; they are invalidation
-signals telling the consumer to re-read container metadata, not a
-carrier for the old and new display names.
+carry the same stable label id in `old` and `new`, along with the previous and
+current display names. The sync multiplexer uses the scope ids to reconcile
+cursors and ignores the names; other consumers can use the names without a
+second metadata read.
 
 The poll cadence is a separate piece of state, `next_delay: Option<Duration>`,
 and NOT a function of `last_emitted`. `None` means no poll has been attempted
@@ -1392,10 +1406,12 @@ Flag canonicalization in `flags.rs`:
 - The reverse direction in `translate_flag_op` handles `Add`,
   `Remove`, `Patch`, and `Set`. A `$gmail-label:` flag resolves on
   its label id alone; the embedded display name is advisory, so a
-  server-side rename does not invalidate a queued mutation. The
-  lookup deliberately does not filter on `labelType`, because
-  canonicalization mints this spelling for system category labels
-  too and a flag this crate itself produced has to translate back.
+  server-side rename does not invalidate a queued mutation. Generic
+  label flags resolve user labels and `CATEGORY_*` system labels, the
+  two families `canonical_flags` emits with this spelling. Reserved system
+  ids such as `INBOX`, `TRASH`, and `UNREAD` are refused in this lane, so a
+  caller-forged flag cannot bypass the relocation patch or contradict
+  `\\Seen` translation.
 - `Set` re-derives an add/remove patch over the writable canonical flags
   plus the *user* label vocabulary. Since the patch is built without
   knowing what the target messages currently carry, an exact set
@@ -1484,7 +1500,10 @@ whose `body.attachment_id` is set as a `MessageAttachment` with
 id) are not surfaced. `message_from_gmail` calls it under `Full` and
 `FullWithBlobs`, matching the cross-provider rule that `Full` reports
 attachment metadata without bytes and only `FullWithBlobs` implies
-fetchable content. `blob_handles_for_message` remains as the
+fetchable content. The `inline` marker reads only the leading
+`Content-Disposition` token, case-insensitively; parameter text such as a
+filename containing `inline` does not make an attachment inline.
+`blob_handles_for_message` remains as the
 `Vec<BlobHandle>`-only helper `open_blob`'s tests build against.
 
 ## Error translation

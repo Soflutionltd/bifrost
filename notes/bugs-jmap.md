@@ -35,103 +35,6 @@ values; `crates/jmap/src/event_source/stream.rs` still substitutes without it,
 so a `{types}`-style or path variable of `.` / `..` navigates. Use the same
 helper there.
 
-## JMAP-008 - Email inventory livelocks on any mailbox that receives mail faster than one walk takes
-
-Hunter severity: P2. Scope: jmap account.
-
-`inventory.rs::email_inventory_loop` pins `queryState` across pages and ends
-via `terminated_walk_superseded` (`RestartScope`) as soon as it moves.
-`reference/jmap.md` itself says "one delivered message advances `queryState`".
-The walk has no resumable position (`checkpoint: None`), so every restart
-begins at position 0. On a large mailbox (100k messages at 256 per page is
-about 400 query+get round trips) with mail every few minutes, the walk never
-reaches the empty page; inventory never completes and the engine pays for the
-full walk repeatedly.
-
-The reference defends `RestartScope` over a terminal class because "a terminal
-class there would let ordinary mail delivery permanently kill a scope's
-inventory". Under steady delivery `RestartScope` does exactly that, more
-expensively.
-
-The pin is not needed for the claimed safety:
-- an anchor destroyed under the walk already returns `anchorNotFound`, which
-  `convert_method` maps (cursor scope present) to `SyncState(CursorInvalid)`
-  -> `RestartScope`;
-- with the unfiltered primary/foreign walk sorted by immutable `receivedAt`,
-  new arrivals land before the anchor (already passed) or ahead of it (still
-  walked), and the change cursor established before inventory reports them as
-  `Created` either way;
-- deletions ahead of the anchor just drop out.
-
-Fix: drop the `queryState` pin for the unfiltered walk and let `anchorNotFound`
-be the only "coverage unprovable" signal; optionally make the anchor a
-resumable checkpoint. The legacy `inMailbox`-filtered walk has the same
-livelock and remedy, since membership moves are covered by the change cursor.
-
-## JMAP-011 - `scope_lifecycle` dies for good on a conforming `cannotCalculateChanges`
-
-Hunter severity: P2. Scopes: jmap account and sync adoption (both reported it
-independently).
-
-`discover.rs::scope_lifecycle` classifies a failed `Mailbox/changes` with
-`JmapErrorContext::new(AccountOperation::ScopeLifecycle)`, which has no cursor
-scope. `error.rs::convert_method` maps `CannotCalculateChanges` (and
-`TooManyChanges`) without a cursor scope to `Protocol(ContractViolation)`,
-pinned by `cannot_calculate_changes_without_scope_is_contract_violation`, on
-the theory that the server "returned a cursor-specific error for a
-non-cursored request". But `Mailbox/changes` IS state-based, and
-`cannotCalculateChanges` is the RFC-sanctioned answer once the server has
-expired the open-time state (routine after a long session or days of laptop
-suspend). The stream yields `Terminated(ProviderContractViolation)` and ends;
-the engine's `lifecycle_termination` maps `Terminal` to
-`LifecycleTermination::Terminate`, broadcasts a terminal `MultiplexerEvent`,
-and ends the lifecycle reader. The account never again hears of folder
-creates, renames or deletes, and the error blames the provider.
-
-Claims broken: the in-code comment at the `ChangeWalkGuard` site reserves the
-`ContractViolation` termination for "a non-conformant provider";
-`reference/error-model.md`'s rule that a stale state is `CursorInvalid` /
-restart, not terminal.
-
-Fix: on this error the poller reseeds: full `Mailbox/get`, diff against
-`mailbox_names` to emit `Created` / `Deleted` / `Renamed`, set the new state,
-continue. At minimum classify with a scope so the restart lane applies. More
-generally the "no cursor scope -> contract violation" rule in
-`convert_method` is wrong for every state-based caller with no `CursorScope`.
-
-## JMAP-012 - `draft_*` and `draft_send` target different accounts when Mail and Submission primaries differ
-
-Hunter severity: P2. Scope: jmap account.
-
-`account.rs`: `draft_create` / `draft_update` / `draft_discard` route to
-`self.mail` (primary Mail account); `draft_send` routes to `self.submission`
-(primary Submission account) with the bare draft id. The comments on
-`send_message` / `draft_send` say the two "can resolve a distinct account".
-When they do, `draft_send` asks the Submission account to submit an email id
-that exists only in the Mail account: notFound, or on an id collision an
-unrelated message is submitted. `capabilities.rs` advertises `draft_create`
-unconditionally and `draft_send` on `support.submission`, so nothing gates
-the combination.
-
-Fix: pin the whole draft lifecycle to one account (the submission account when
-it exists), or qualify `DraftHandle` with its owning account the way foreign
-object ids are qualified.
-
-## JMAP-014 - Primary `EmailDelivery` (or any unmapped type) push entry triggers a full-account `Unknown` repoll
-
-Hunter severity: P3. Scope: jmap account.
-
-`push.rs::emit_state_change`: for the primary account, a data type with no
-`scope_for_data_type` mapping emits `HintPayload::Unknown`. The subscription
-enables only Email/Mailbox/Thread, but servers commonly send `EmailDelivery`
-alongside `Email` (RFC 8621 s1.5), so each delivery costs a narrow hint plus a
-full-account reconcile. The foreign branch deliberately drops unmapped types
-for this reason ("degrading to `Unknown` here would full-repoll the whole
-account on every foreign delivery"); the primary branch contradicts it.
-Primary `Thread` maps to `Type(Thread)`, a scope `changes::stream` refuses as
-unsupported, so that hint is dead weight. Fix: ignore `EmailDelivery` (its
-`Email` sibling carries the signal) and drop or remap `Thread`.
-
 ## JMAP-015 - Hydration repeats the route-starvation bug the mutation pipeline already fixed
 
 Hunter severity: P3. Scope: jmap account.
@@ -146,21 +49,6 @@ input a single route's partial batch never flushes, although the advertised
 pipelines, with idle and `max_wait` flushing driven by `BatchingPolicy` so the
 capability is honoured by construction.
 
-## JMAP-016 - Mutation and PIM writes use `ifInState`, turning unrelated concurrency into failures
-
-Hunter severity: P3. Scope: jmap account.
-
-`mutation.rs::apply_batch` and `pim.rs::send_email_set_with_retry` send every
-`Email/set` with `ifInState` = cached account-wide Email state. The patches
-(keyword add/remove, `mailboxIds` path patches, destroy) are commutative. On a
-busy account any delivery between probe and set yields `stateMismatch`, one
-re-probe and retry, then per-item `Failed(ConcurrencyConflict)` (bulk) or `Err`
-(single-target doors); the engine retries with `AfterStateRefresh` into the
-same race. `MutationConcurrency::StateBased` is advertised, but only
-`FlagOp::Set` (whole-keyword replace) gains anything. Proposal: drop
-`ifInState` for commutative patches, keep it only for `FlagOp::Set` if
-anywhere.
-
 ## JMAP-017 - `delete_thread` with `current == Trash` destroys messages that are not in Trash
 
 Hunter severity: P3. Scope: jmap account.
@@ -173,28 +61,6 @@ beyond what the call names. If the cross-provider contract means "destroy the
 whole thread", it belongs in the reference; otherwise filter the destroy to
 ids whose `mailboxIds` contain Trash. Compare GRAPH-001 (Graph's
 destroy-if-in-Trash rests on a soft delete).
-
-## JMAP-018 - The mutation stream drops already-decided local rejections when it terminates
-
-Hunter severity: P3. Scope: jmap account.
-
-`mutation.rs::mutation_stream`: on `Err` from `apply_batch` it yields
-`Terminated` and returns. The `rejected` outcomes drained for that route
-(cross-account destinations, decided locally with no wire involved), and
-pending routes' rejections, are discarded. The module's accounting ("the
-caller still sees exactly one outcome per input target") loses them. Emit them
-before `Terminated`.
-
-## JMAP-019 - Scheduled `send_message` builds an envelope only when `from` is set
-
-Hunter severity: P3. Scope: jmap account.
-
-With `request.from` None and recipients present there is no envelope; the
-server derives one, which is fine for immediate sends. A scheduled send in that
-shape fails with `scheduled_requires_envelope` although recipients exist and
-the identity's address could stand in as `mailFrom`. The `scheduled_send`
-capability flag does not say `from` is mandatory. Document it or fall back to
-the identity email.
 
 ## JMAP-020 - Implicit `Email/set` responses exist, contradicting the "no multiple responses" claim, and leave the state cache one behind
 
@@ -320,6 +186,14 @@ Smells, jmap account.
 - In the send paths, an extraction failure for the preceding Email create or
   import returns before the submission result in the same response is
   examined, which can obscure a committed send.
+
+## JMAP-036 - A foreign send-as can consume uploaded attachment handles from another account without `Blob/copy`
+
+Lateral from the draft-routing fix. Uploaded attachment handles retain only the
+blob id, and blob ids are scoped to the account that received the upload
+(RFC 8620 s6.3 transfers across accounts with `Blob/copy`). A send-as through a
+foreign account that reuses a handle uploaded to the primary account addresses a
+blob the target account cannot see.
 
 ## JMAP-034 - Design proposals from the jmap account hunter
 

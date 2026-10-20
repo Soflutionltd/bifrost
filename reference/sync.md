@@ -310,7 +310,7 @@ account reaches its worker deadline.
 
 One asymmetry a CONSUMER can observe, and the reason this enumeration is a
 contract rather than a note: a bulk mutation campaign selects on the same token
-and fails with `Error::ShuttingDown` the moment it fires - even for an account
+and records `Error::ShuttingDown` in its returned counters when it fires - even for an account
 whose detach is several budgets away - while in that same window the account is
 still discoverable, still hands out change receivers, and still accepts
 acknowledgements through its writer. Shutdown therefore closes the MUTATION
@@ -733,17 +733,15 @@ call `validate_boundary` on every batch the account yields. `Batch`'s fields
 are public, so `PageBoundary::Partial` carrying a checkpoint is constructible
 and no type can stop a protocol crate from emitting it.
 
-A violation is NOT a bare `Error::Other`. `handle_drive_outcome` only logs a
-generic engine error before re-entering the poll loop from the same unchanged
-cursor, so against a provider that keeps producing the shape that is an
-unbounded run of requests with no recovery dispatch, no scope stop, and
-nothing on the stream to tell a consumer the scope has quietly stopped making
-progress. `recovery::batch_boundary_violation` classifies it as
-`Protocol(ContractViolation)`, which derives to the terminal
-`ProviderContractViolation`; the driver publishes `SyncEvent::Terminated` to
-subscribers and returns `ChangesEvent::Terminated` /
-`FusionOutcome::Terminated`, so `plan_recovery` stops the scope. A provider
-emitting a nonsense boundary does not heal by being asked again.
+A violation is NOT a bare `Error::Other`.
+`recovery::batch_boundary_violation` classifies it as
+`Internal(AccountContract)`, which derives to terminal `InternalFailure`. The
+boundary is authored by the `Account` implementation, so the failure is
+attributed to client code rather than the provider. The driver publishes
+`SyncEvent::Terminated` to subscribers and returns `ChangesEvent::Terminated` /
+`FusionOutcome::Terminated`, so `plan_recovery` stops the scope. An
+implementation emitting a nonsense boundary does not heal by being asked
+again.
 
 More generally, `handle_drive_outcome` normalizes every `Error::Account` onto
 the same `plan_recovery` path as `ChangesEvent::Terminated`; the generic
@@ -977,10 +975,21 @@ scope, but a `RecoveryPlan::Terminal` verdict parks it - the uncancelled
 token stays in the map as a tombstone the scan reads as "owned", so a
 terminal error stays terminal instead of becoming a once-per-second
 respawn/re-drive loop (each drive of which would re-broadcast
-`Terminated`). A parked scope is only revived by an explicit
-scope-retiring path: `cancel_scope_token` (lifecycle deletion, engine
-restart of the scope) or multiplexer shutdown clears the entry, after
-which a still-present or re-established cursor respawns normally.
+`Terminated`). Poll ownership and parked state are bound to the registry's
+`DriveGeneration`. Before poll discovery or push dispatch, an entry whose
+fence differs from the registry is cancelled and retired. Scope deletion and
+re-establishment change the scope fence; a successful account replacement
+changes the account fence. Both therefore revive terminally parked scopes
+without requiring recovery paths to reset a second state store. Task cleanup
+still uses its separate ownership generation so an old task cannot retire a
+successor. A terminal lifecycle reader broadcasts once and waits for shutdown
+or an account generation change, then opens the replacement's lifecycle stream.
+
+Fresh unsupported change cursor envelopes from changes or inventory fusion
+are scoped `Internal(AccountContract)` failures with terminal recovery. They
+do not request an account-wide schema reset; schema recovery is reserved for
+incompatible persisted envelopes. A published `Terminated` outcome reaches
+recovery before a concurrently changed pause or stop boundary is honored.
 
 The tombstone is MARKED (`ScopeToken::parked`), not merely present, because
 the push reconciler shares the same map and needs to tell a tombstone from a
@@ -2034,11 +2043,14 @@ method and final read-back guard. Campaign flow:
    sleep until the earliest readiness, selecting on shutdown. A replacement
    account wakes the scheduler to re-evaluate declarations.
 
-   Admission remains mandatory. Re-check declarations and holds against
+   Admission remains mandatory. Refused admission delays the cohort by 100 ms
+   without spending a submission or retry slot; ready siblings can proceed.
+   Re-check declarations and holds against
    the account snapshot used after admission; release admission and return
    to the scheduler if readiness changed. Hold waits consume no attempts.
 
-   `mutation_max_retries` applies independently to each cohort.
+   `mutation_max_retries` counts resubmissions independently for each cohort,
+   excluding its initial submission (zero allows only the initial write).
    `MutationConfig::retry_queue_cap` is one campaign-wide retry-target
    allowance. A target reserves a slot on its first scheduled retry and
    retains it for later retries. Excess targets remain `PendingRetry`
@@ -2048,8 +2060,10 @@ method and final read-back guard. Campaign flow:
 
 4. Read back unresolved submitted objects per cohort. Observations return
    per-object results and merge into the campaign's outcome map.
-   Matching objects become `Skipped`; observed mismatches become
-   `FailedTerminal`; failed or missing observations remain explicitly
+   Matching objects become `Skipped`; observed mismatches remain
+   `PendingRetry` for a later consumer campaign, even after the retry budget
+   or retry-target allowance is exhausted. An observation cannot manufacture
+   a terminal provider failure. Failed or missing observations remain explicitly
    unresolved. Partial observations survive a stream termination.
    Final object counters derive from the merged map.
 
@@ -2059,7 +2073,11 @@ method and final read-back guard. Campaign flow:
    detach, pause, or observation failure leaves submitted work explicitly
    unresolved without an observation retry loop. Never-submitted targets
    become known-unsent `PendingRetry` and are excluded from read-back.
-   Return the first error after cleanup.
+   Return counters after cleanup, with the first error in
+   `MutationCounters::error`. Only preflight failures, such as an unattached
+   account, return `Err`; once a campaign starts, partial accounting survives
+   every exit. The error is shared through `Arc<Error>`, so the counters remain
+   cloneable.
 
 An engine directive also stops further submissions. Remaining retry work
 becomes `BlockedByEngine`, while `PendingReadback` remains protected:
@@ -2068,26 +2086,23 @@ Forwarded directives are deduplicated across the campaign by directive
 variant and target scope.
 
 `ItemOutcome::Succeeded` buckets by its `MutationSuccess` payload:
-`Applied` -> `applied`, `Skipped` -> `skipped`, and **`Downgraded { .. }` ->
-`PendingReadback`**. A downgrade means the provider did something weaker than
-asked, so its own success report is precisely the claim that must not be
-trusted; routing it into the read-back set makes the final accounting come
-from observed state. It is deliberately NOT pushed onto `retry_ids`: a
-downgrade is not transient, and resubmitting earns the same downgrade while
-consuming the campaign's attempts. Gmail's trash-instead-of-destroy fallback
-is the motivating case, and filing it `Applied` produced a permanent
-destroy/reappear reconcile loop. The catch-all arm for this match sends any
-FUTURE `MutationSuccess` variant to `PendingReadback` too, rather than
-assuming success - folding an unknown variant into `Applied` is how the
-downgrade went unnoticed originally.
+`Applied` -> `applied`, `Skipped` -> `skipped`, and `Downgraded { actual }`
+-> `downgraded`. Each downgraded object's identity and reported effect are
+retained in `MutationCounters::effects`. Like an applied success, the weaker
+successful effect is taken from the provider report. It does not assert that
+the original request was satisfied. Downgrades are neither replayed nor
+hydrated against the original request: trash membership cannot satisfy object
+absence, and unsupported flags cannot satisfy the original flag operation.
+Unknown future success variants remain protected in the read-back lane.
 
 `MutationCounters` buckets `ItemOutcome::Failed` outcomes via
 `crate::recovery::plan_recovery`:
 - `Retry { SameRequest | AfterAuthRefresh }` -> `pending_retry`.
 - `Retry { AfterStateRefresh }` and
   `Reconcile { CheckTarget }` -> `pending_retry` then the
-  read-back guard reclassifies into `skipped` /
-  `failed_terminal`.
+  read-back guard reclassifies into `skipped` or leaves the item pending.
+  A mismatch does not trigger automatic replay: reconcile guidance can also
+  require consumer-side dedupe.
 - `Reconcile { DedupeByClientId }` increments
   `dedupe_by_client_id` and broadcasts a
   `Warning::OperatorAttentionNeeded` (the dedupe lives at the
@@ -2135,8 +2150,8 @@ changing its attempt count or frozen key. In-flight mutation accounting
 finishes under its activity guard. During error cleanup, a pause leaves
 remaining submitted work unresolved instead of parking cleanup.
 Detach cancellation interrupts admission, readiness waits, mutation
-streams, and read-back and returns `Error::ShuttingDown` unless an earlier
-error is already being preserved.
+streams, and read-back and records `Error::ShuttingDown` in
+`MutationCounters::error` unless an earlier error is already being preserved.
 
 Consumers must still bound campaign input when retaining every target and
 outcome is too costly. `retry_queue_cap` bounds the campaign-wide retry
@@ -2263,21 +2278,29 @@ owner's call; the standing lessons in `AGENTS.md` carry the full account.
 lanes: `Foreground` / `Normal` / `Background` / `Bulk`. Starvation
 guard forces a lower-lane pull after a configurable threshold of
 consecutive higher-lane pulls (`SchedulerConfig::starvation_floor`,
-default 64).
+default 64). A configured value of zero is floored to one, so lower lanes do
+not leapfrog higher-priority work on every pull.
 
 `LaneQueue` is bounded (default 1024 items, configurable via
-`EngineConfig::lane_capacity`). Production construction always uses
-`LaneShedPolicy::DropOldest`, which evicts the head, increments a shed
-counter, and emits a `warn!`. `DropNewest` remains an internal policy
-variant for direct queue construction and tests; `EngineConfig` does
-not expose a selector.
+`EngineConfig::lane_capacity`). Standalone queues can select either
+`LaneShedPolicy`: `DropOldest` evicts the head and `DropNewest` rejects the
+incoming item. Both increment the queue-local counter and emit a `warn!`.
+Production scheduler work-item queues use `DropOldest`; `EngineConfig` does not
+expose a selector. The scheduler keeps those queues private and exposes their
+depths, not their shed counters. The same capacity bounds the separate
+admission queues used by engine work; admission overflow refuses the incoming
+request and does not increment a shed counter.
 
 `BudgetGate` exposes two semaphores per account (sync + mutation)
 plus global caps. Acquisition takes the per-account permit first and
 the global permit second, so a waiter parked on a busy account cannot
-consume global capacity needed by another account. Lazy-creation uses
-`DashMap::entry().or_insert_with(...)` to close the original
-data race. `ConcurrencyBudget::validate` requires `per_account >= 2`
+consume global capacity needed by another account. The account pools,
+registration state and forgotten-account tombstones share one mutex. This
+keeps lazy creation, registration and forgetting ordered: registering an
+active account preserves its pools, forgetting retires them and cancels pending
+acquisitions, and a later attach explicitly creates fresh pools. A tombstone
+prevents a stray acquire after detach from lazily recreating the account's
+semaphores. `ConcurrencyBudget::validate` requires `per_account >= 2`
 and a mutation share that leaves at least one real sync permit; the
 gate no longer masks a zero split by granting an extra permit. Its public
 constructor still floors the global semaphore at one permit, because direct
@@ -3628,7 +3651,7 @@ crates/sync/src/
     mod.rs                // four-lane Scheduler + admission dispatcher
     lanes.rs              // bounded LaneQueue + LaneShedPolicy
                           // (DropOldest default / DropNewest)
-    budget.rs             // BudgetGate (DashMap entry/or_insert_with)
+    budget.rs             // BudgetGate (account-pool lifecycle and cancellation)
   cancel/
     mod.rs boundary.rs    // safe-boundary mechanism
 

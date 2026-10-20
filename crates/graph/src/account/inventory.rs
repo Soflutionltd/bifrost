@@ -55,6 +55,12 @@ fn inventory_stream_from(
     Box::pin(async_stream::stream! {
         let sync_ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
             .with_scope(ErrorScope::Cursor(scope.clone()));
+        if !sync_scope_readable(&scope) {
+            yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
+                super::cursor::CursorError::Unsupported, sync_ctx,
+            ));
+            return;
+        }
         // Results this walk could not account for. Every checkpoint from the
         // first one onward declares the gap.
         let mut obligations: Vec<bifrost_types::InventoryObligation> = Vec::new();
@@ -169,7 +175,8 @@ fn inventory_stream_from(
             let mut removed_etag_ids = Vec::new();
             for value in page.value {
                 if is_removed(&value) {
-                    if let Some(id) = value.get("id").and_then(Value::as_str) {
+                    if is_mail_scope(&scope)
+                        && let Some(id) = value.get("id").and_then(Value::as_str) {
                         removed_etag_ids.push(super::foreign::encode_message_id(&scope, id).0);
                     }
                     continue;
@@ -219,7 +226,8 @@ fn inventory_stream_from(
                     });
                     continue;
                 };
-                if let ServerVersion::ETag(etag) = &entry.fingerprint.server_version {
+                if is_mail_scope(&scope)
+                    && let ServerVersion::ETag(etag) = &entry.fingerprint.server_version {
                     etags.push((entry.id.0.clone(), etag.clone()));
                 }
                 if let Some(owner) = &owner {
@@ -330,10 +338,7 @@ pub(crate) fn inventory_entry_from_value(
         .map(|thread| super::foreign::encode_thread_id(scope, thread));
 
     Some(InventoryEntry {
-        // Foreign-encode the id at mint so later hydration / blob /
-        // raw-RFC822 reads route to `/users/{owner}`; a primary-scope
-        // item stays bare. Exactly one wire form per logical item.
-        id: super::foreign::encode_message_id(scope, &id),
+        id: sync_object_id(scope, &id),
         memberships: vec![membership],
         size: None,
         blob_id: None,
@@ -377,12 +382,50 @@ pub(crate) fn membership_from_value(scope: &CursorScope, value: &Value) -> Membe
     MembershipScope::Folder(folder)
 }
 
+pub(crate) fn is_mail_scope(scope: &CursorScope) -> bool {
+    matches!(
+        scope,
+        CursorScope::FolderType {
+            ty: ObjectType::Email,
+            ..
+        }
+    )
+}
+
+pub(crate) fn sync_scope_readable(scope: &CursorScope) -> bool {
+    // Typed contact/calendar reads currently use the primary client. Do not
+    // emit shared non-mail ids that those doors would read in another mailbox.
+    !matches!(scope, CursorScope::FolderType { folder, ty }
+        if *ty != ObjectType::Email && super::foreign::parse_folder(folder).foreign().is_some())
+}
+
+pub(crate) fn sync_object_id(scope: &CursorScope, id: &str) -> ObjectId {
+    match scope {
+        CursorScope::FolderType {
+            folder,
+            ty: ObjectType::Event | ObjectType::CalendarEvent,
+        } => ObjectId(super::calendar::join_event_id(&folder.0, id)),
+        CursorScope::FolderType {
+            ty: ObjectType::Contact,
+            ..
+        } => ObjectId(id.to_string()),
+        _ => super::foreign::encode_message_id(scope, id),
+    }
+}
+
 pub(crate) fn graph_etag(value: &Value) -> Option<String> {
+    // The OData annotation is already an HTTP entity-tag. A change key is
+    // only its opaque payload, so never send it bare in If-Match.
     value
-        .get("changeKey")
+        .get("@odata.etag")
         .and_then(Value::as_str)
-        .or_else(|| value.get("@odata.etag").and_then(Value::as_str))
         .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("changeKey")
+                .and_then(Value::as_str)
+                .map(|key| format!("W/\"{key}\""))
+        })
 }
 
 pub(crate) fn is_removed(value: &Value) -> bool {
@@ -472,9 +515,12 @@ fn initial_delta_request(
 }
 
 fn calendar_view_timestamp(now: jiff::Timestamp, days: i64) -> jiff::Timestamp {
-    jiff::Span::new()
-        .try_days(days)
-        .and_then(|span| now.checked_add(span))
+    // A Timestamp is an absolute UTC instant, so its arithmetic accepts fixed
+    // durations rather than calendar-day spans. Treat these UTC window bounds
+    // as exact 24-hour days; adding a Span with a non-zero `days` component
+    // fails and silently falls back to `now`, producing a zero-width window.
+    let seconds = days.saturating_mul(24 * 60 * 60);
+    now.checked_add(jiff::SignedDuration::from_secs(seconds))
         .unwrap_or(now)
 }
 
@@ -1019,8 +1065,19 @@ mod tests {
             folder: FolderId("calendar".to_string()),
             ty: ObjectType::Event,
         };
-        let url = initial_delta_url(&account, &scope).expect("event scope is supported");
+        let now = jiff::Timestamp::new(1_700_000_000, 0).expect("fixed test timestamp");
+        let (url, end) =
+            initial_delta_request(&account, &scope, now).expect("event scope is supported");
         assert!(url.starts_with("/me/calendars/calendar/calendarView/delta?"));
+        assert_eq!(
+            end,
+            Some(
+                now.checked_add(jiff::SignedDuration::from_secs(365 * 24 * 60 * 60))
+                    .expect("one year is representable")
+                    .as_second()
+            ),
+            "the stored calendar horizon must match the URL's future end bound"
+        );
     }
 
     #[test]
@@ -1289,11 +1346,148 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn non_mail_sync_ids_match_typed_doors_and_leave_mail_cache_alone() {
+        for ty in [
+            ObjectType::Event,
+            ObjectType::CalendarEvent,
+            ObjectType::Contact,
+        ] {
+            let client = GraphClient::new("token");
+            let page = json!({
+                "value": [{"id": "item", "changeKey": "CK1"},
+                    {"id": "item", "@removed": {"reason": "deleted"}}],
+                "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta"
+            });
+            client.script_rest([
+                ScriptedRestResponse::json(reqwest::StatusCode::OK, page.clone()),
+                ScriptedRestResponse::json(reqwest::StatusCode::OK, page),
+            ]);
+            let account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
+            account
+                .etag_index
+                .write()
+                .await
+                .insert("item".into(), "mail-version".into());
+            let scope = CursorScope::FolderType {
+                folder: FolderId("collection".into()),
+                ty,
+            };
+            let events: Vec<_> = inventory_stream(account.clone(), scope).collect().await;
+            let batch = events
+                .into_iter()
+                .find_map(|event| match event {
+                    bifrost_types::InventoryEvent::Batch(batch) => Some(batch),
+                    _ => None,
+                })
+                .expect("inventory batch");
+            let expected = if ty == ObjectType::Contact {
+                "item"
+            } else {
+                "collection::item"
+            };
+            assert_eq!(batch.items[0].id.0, expected);
+            let bifrost_types::PageCheckpoint::Advance(Checkpoint::Change(cursor)) =
+                batch.checkpoint
+            else {
+                panic!("checkpoint");
+            };
+            let payload =
+                super::super::cursor::decode_cursor(&cursor).expect("inventory cursor decodes");
+            assert!(
+                !payload.inventory_in_progress,
+                "unexpected inventory cursor: {payload:?}"
+            );
+            assert!(
+                super::super::inventory::scope_matches_payload(&cursor.scope, &payload),
+                "cursor scope and payload differ: {payload:?}"
+            );
+            let changes: Vec<_> = super::super::changes::changes_stream(account.clone(), cursor)
+                .collect()
+                .await;
+            let ids: Vec<_> = changes
+                .iter()
+                .filter_map(|event| match event {
+                    SyncEvent::Batch(batch) => Some(&batch.items),
+                    _ => None,
+                })
+                .flatten()
+                .map(|change| match change {
+                    bifrost_types::Change::ObjectChange(change) => change.id.clone(),
+                    bifrost_types::Change::ScopeChange(change) => change.id.clone(),
+                    _ => panic!("unexpected change"),
+                })
+                .collect();
+            let event_summary: Vec<_> = changes
+                .iter()
+                .map(|event| match event {
+                    SyncEvent::Batch(batch) => {
+                        format!(
+                            "batch(items={}, boundary={:?})",
+                            batch.items.len(),
+                            batch.page_boundary
+                        )
+                    }
+                    SyncEvent::Terminated(error) => {
+                        format!("terminated({error:?})")
+                    }
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            assert!(!ids.is_empty(), "changes stream events: {event_summary:?}");
+            assert!(ids.iter().all(|id| id.0 == expected));
+            assert_eq!(
+                account.etag_index.write().await.get("item").as_deref(),
+                Some("mail-version")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_non_mail_scopes_have_no_typed_read_route() {
+        for ty in [
+            ObjectType::Event,
+            ObjectType::CalendarEvent,
+            ObjectType::Contact,
+        ] {
+            let scope = CursorScope::FolderType {
+                folder: super::super::foreign::encode_foreign("shared@example.com", "collection"),
+                ty,
+            };
+            assert!(!sync_scope_readable(&scope));
+            let client = GraphClient::new("token");
+            client.script_rest([]);
+            let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+            let events: Vec<_> = inventory_stream(account.clone(), scope.clone())
+                .collect()
+                .await;
+            assert!(matches!(
+                events.as_slice(),
+                [bifrost_types::InventoryEvent::Terminated(_)]
+            ));
+            let payload = GraphCursorPayload::new(
+                kind_for_scope(&scope).expect("kind"),
+                &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
+                None,
+            );
+            let cursor = encode_cursor(scope, payload).expect("cursor");
+            let events: Vec<_> = super::super::changes::changes_stream(account, cursor)
+                .collect()
+                .await;
+            assert!(matches!(events.as_slice(), [SyncEvent::Terminated(_)]));
+            assert!(client.take_rest_requests().is_empty());
+        }
+        assert_eq!(
+            graph_etag(&json!({"changeKey": "CK1"})).as_deref(),
+            Some("W/\"CK1\"")
+        );
+    }
+
     #[test]
-    fn graph_etag_prefers_change_key_over_the_odata_etag() {
+    fn graph_etag_prefers_the_http_entity_tag() {
         assert_eq!(
             graph_etag(&json!({ "changeKey": "CK1", "@odata.etag": "W/\"E1\"" })).as_deref(),
-            Some("CK1")
+            Some("W/\"E1\"")
         );
         assert_eq!(
             graph_etag(&json!({ "@odata.etag": "W/\"E1\"" })).as_deref(),

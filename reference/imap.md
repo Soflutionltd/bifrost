@@ -281,6 +281,15 @@ the command and preserves framing before accepting the next command.
 
 `TypedEvent::impact()` returns `EventImpact` for cache-coherence: `SelectedMailboxChanged`, `SelectedMailboxResync`, `MailboxStateChanged`, `ServerMetadataChanged`, `Heartbeat`, `Extension`, `None`. RECENT maps to `None` (informational; deprecated by IMAP4rev2). ServerMetadataChange is server-scoped, not selected-mailbox scoped.
 
+`DriverEventSink` never waits on the event receiver. It buffers critical
+events up to 4096 by default; requeryable and resyncable events are dropped
+under backpressure. Every backpressure drop while the receiver is live,
+including a critical event rejected at the buffer cap, contributes to a
+`QueueOverflow` marker. The marker follows older pending critical events. Once
+a loss is pending, later events join that loss window and are counted until the
+marker is delivered, so neither a newer event nor the marker can overtake the
+event sequence it summarizes.
+
 ## Streaming FETCH
 
 Streaming never drops responses. The driver-side consumer is a bounded pipe (`BoundedStreamingPipe`, default capacity 64) that pre-reserves an `OwnedPermit` *before* each socket read, so a slow consumer applies TCP backpressure instead of either buffering without limit or silently discarding under a failed `try_send`.
@@ -298,7 +307,7 @@ driving a `(fetch_rx, fetch_fut)` pair through `tokio::select!` sees the
 item receiver close *before* the future resolves - the driver drops the
 consumer synchronously and only then answers the oneshot - so the two
 branches are both ready and the choice between them is random. Every such
-loop (`run_inventory`, `run_qresync`, the CONDSTORE changes loop) therefore awaits `fetch_fut` on the
+loop (`run_inventory`, the CONDSTORE changes loop) therefore awaits `fetch_fut` on the
 `recv() -> None` arm and propagates its result unconditionally. Reading
 whatever `select!` happened to have stored would let a tagged NO, a read
 error, or a timeout break on the success path and checkpoint a truncated
@@ -475,7 +484,9 @@ merely absent.
 
 Account cursors use `CompactUidSet`, a sorted, disjoint range list with
 range-native construction, membership, insertion, removal, and linear diff.
-QRESYNC mutates its live and fallback snapshots in that representation.
+QRESYNC mutates its live snapshot in that representation. VANISHED removal
+subtracts ranges directly and emits only the intersection with known UIDs;
+MODSEQ eviction checks cached keys rather than expanding server ranges.
 `CompactUidSet::diff` subtracts sorted ranges directly, so an unchanged large
 span is skipped without visiting each UID; only changed UIDs are expanded into
 the required output vectors. Because `UidRange::range(n, n)` and
@@ -489,6 +500,15 @@ the same cursor payload no matter which path built them.
 `ImapConfig` centralizes TLS mode (Implicit / StartTls / Plaintext), connect/command timeouts, keepalive, and optional native-tls connector. Ports default per mode (993 / 143 / 143). Public constructors are `tls`, `starttls`, `plaintext`; builders cover port, timeouts, keepalive disablement, and custom TLS connectors. `ImapAccountConfig::idle_connection_budget` is the visible non-NOTIFY push-session budget and defaults to 4. The raw `connect` / `connect_authenticated` entry points were deleted in S1-W3.
 
 Internally, `connect_authenticated_metered(credentials, policy, meter, budget)` composes connect + STARTTLS-if-needed + `authenticate_best` for the factory and pool, returning `(ImapConnection, AuthOutcome)` crate-only.
+
+Connect-time STARTTLS requires both an unauthenticated greeting and an
+advertised `STARTTLS`. A cleartext PREAUTH greeting is refused as
+`StartTlsUnavailable` before sending a command, as RFC 9051 requires closing
+an already authenticated cleartext session. At runtime, `is_encrypted()` is
+updated when the TLS stream is installed. If the required post-upgrade
+CAPABILITY exchange fails, the driver retires the connection instead of
+returning a reusable half-upgraded session, while preserving the exchange's
+error for the caller.
 
 ## Sync helpers
 
@@ -507,8 +527,8 @@ The public account module re-exports only `ImapAccountFactory`, `ImapAccountConf
 Submodules:
 
 - `factory.rs` - `ImapAccountConfig`, `AccountFactory::open(account_id)`, optional `BandwidthMeter`/`MeterSink` wiring, fail-soft CardDAV/CalDAV sub-account open (`DavAttach`), open-time construction of the `DavScopeIndex` from each attached DAV account's collection-folder cursor scopes, `ID` probe, QRESYNC negotiation, folder LIST, and A5c NAMESPACE/ACL shared-folder discovery (`discover_shared_folders`).
-- `pool.rs` - per-folder connection checkout. Push lane reserves one slot; data lanes share the rest. Every dialed connection receives the account-scoped `MeterSinkHandle` and shared account `BandwidthBudget`, and is brought to the account's QRESYNC policy (`enable_qresync`) before it is handed out; see "CONDSTORE / QRESYNC strategy".
-- `folder_registry.rs` - mailbox map plus per-folder cursor and MODSEQ caches (`record_modseq`, `modseq`, `clear_modseqs`), keyed by `(folder, uidvalidity, uid)`, storing LIST delimiter/attributes and the A5c `shared_owner` tag, clearing on UIDVALIDITY change, delete, or rename.
+- `pool.rs` - per-folder connection checkout. Data checkouts share `max(pool_cap - 1, 1)` slots. Dedicated IDLE sessions use a separate budget, so `pool_cap` is not a total physical connection cap. Every dialed connection receives the account-scoped `MeterSinkHandle` and shared account `BandwidthBudget`, and is brought to the account's QRESYNC policy (`enable_qresync`) before it is handed out; see "CONDSTORE / QRESYNC strategy".
+- `folder_registry.rs` - mailbox map plus per-folder cursor and MODSEQ caches (`record_modseq`, `modseq`, `clear_modseqs`, `clear_modseq_ranges`), keyed by `(folder, uidvalidity, uid)`, storing LIST delimiter/attributes and the A5c `shared_owner` tag, clearing on UIDVALIDITY change, delete, or rename.
 - `envelope.rs` - `FolderCursor` (QResync/Condstore/Basic) plus `encode_cursor`/`decode_cursor` over `OpaqueChangeState`.
 - `capabilities.rs`, `inventory.rs`, `changes.rs`, `get.rs`, `blob.rs`, `mutate.rs`, `push.rs`, `close.rs`, `scopes.rs` - one file per `Account` method group. `mod.rs` holds `route_scope`/`ScopeHandler`; typed legacy DAV scopes dispatch by object type, while per-collection DAV folder scopes dispatch through `DavScopeIndex`. `FolderId` carries no protocol namespace and IMAP mailbox names are arbitrary strings, so the index is built once at open and made unambiguous there: a collection href equal to a known IMAP mailbox name is not indexed (the mailbox keeps its scope), and a href claimed by both sub-accounts is not indexed (the tie is never resolved silently in favour of contacts). Both exclusions are reported as open-time warnings on the degraded-DAV lane, so a dropped entry routes to IMAP or to `Unsupported` rather than syncing the wrong collection quietly. Push admission consults the same index: an indexed DAV collection scope is a syntactically valid mailbox name but names no mailbox, so it is refused per-item (the DAV sub-accounts have no push lane) instead of being reported as pushed and burning an IDLE budget slot on a folder no worker can SELECT. `scopes.rs` holds the discovery fan-in.
 - `pim.rs` - Stage 1 mail actions: container membership, keyword/read mutations, search, folder CRUD, quota, draft create/discard, message/thread hydration, IMAP-specific thread move/delete conveniences.
@@ -518,14 +538,14 @@ Submodules:
 
 `FolderCursor` has three variants and `changes_stream()` dispatches diff strategy by variant:
 
-- `QResync { uidvalidity, modseq, known_uids, known_uids_complete }`: change diff via `UID FETCH ... CHANGEDSINCE ... VANISHED` against the cached MODSEQ, plus SELECT-side VANISHED and changed-FETCH data.
+- `QResync { uidvalidity, modseq, known_uids, known_uids_complete }`: the QRESYNC SELECT supplies VANISHED and changed-FETCH data since the cached MODSEQ. No second `UID FETCH ... CHANGEDSINCE ... VANISHED` is issued. Because the known-UID parameter can restrict SELECT responses to the old baseline (RFC 7162 Section 3.2.5.1), a live UID count that disagrees with EXISTS triggers `UID SEARCH ALL` and a membership diff before checkpointing. A failed SEARCH cannot advance the cursor; a successful reconciliation retains SELECT's HIGHESTMODSEQ so concurrent changes remain eligible for the next poll. VANISHED ranges are subtracted from the live known set before removals are emitted, so unknown UIDs and coalesced holes produce no membership changes.
 - `Condstore { uidvalidity, modseq, known_uids }`: bounded streaming flag diff via `CHANGEDSINCE`; expunge detection via UID-list diff against `known_uids`. `CHANGEDSINCE` returns arrivals as well as updates, so a UID absent from `known_uids` is not emitted as `Updated` - the baseline diff reports it as `Added`, once. The QRESYNC path guards the same hazard through `record_fetch_change` / `fetch_change_seen`.
 - `Basic { uidvalidity, uidnext, known_uids }`: neither extension; UID-list diff for both additions and expunges. When SELECT returns the cursor's unchanged nonzero UIDNEXT and EXISTS still equals the baseline count, the exact snapshot is reused and `UID SEARCH ALL` is skipped. Server-authored `changed_messages` UIDs are classified against both sets before they can become changes: a UID in the baseline is `Updated`, a UID that is only in the live snapshot is an arrival and is left to the diff's `Added` lane so it is never announced twice, and a UID in neither set is contradictory and invalidates the cursor. The last case is also what makes the UIDNEXT/EXISTS skip safe, since there the live snapshot is the baseline.
 
 All three strategies emit at most `BATCH_ITEMS` changes per page. CONDSTORE
 drives its bounded FETCH receiver and command future together, and treats the
-receiver closing before the command result the same way as inventory and
-QRESYNC: the command future remains authoritative, so a failed or truncated
+receiver closing before the command result the same way as inventory:
+the command future remains authoritative, so a failed or truncated
 FETCH cannot checkpoint success.
 
 Negotiation in `factory.rs`:
@@ -556,7 +576,7 @@ describe what each mint closure decides, not a second copy of the accounting.
 
 `bulk_set_flags` and `bulk_destroy` partition targets by cached MODSEQ: cache hits go out under `STORE UNCHANGEDSINCE <modseq>`, misses fall back to unprotected STORE, and protected batches run first so their success updates the cache before the unprotected pass.
 
-- The MODSEQ cache is populated from inventory, get, changes, mutation SELECT data, and push IDLE FETCH events; cleared by successful flag mutations, expunges, VANISHED, moves, and folder delete/rename. A tolerated server MODSEQ value of zero is ignored: it cannot guard a later STORE and the opportunistic cache must not turn it into a failed sync or mutation. A zero UIDVALIDITY is also ignored because, although the response parser tolerates it from some servers, it is not a usable cache epoch. The cache is bounded per folder (50k entries, pruned back to 40k): inventory walks every UID in a mailbox, and an opportunistic cache must not grow with mailbox size. Eviction keeps the highest UIDs - arrival order is the cheap stand-in for "most likely to be mutated" - and a miss costs exactly what a cold cache costs, an unprotected STORE.
+- The MODSEQ cache is populated from inventory, get, changes, and push IDLE FETCH events; cleared by successful flag mutations, expunges, VANISHED, moves, and folder delete/rename. A tolerated server MODSEQ value of zero is ignored: it cannot guard a later STORE and the opportunistic cache must not turn it into a failed sync or mutation. A zero UIDVALIDITY is also ignored because, although the response parser tolerates it from some servers, it is not a usable cache epoch. The cache is bounded per folder (50k entries, pruned back to 40k): inventory walks every UID in a mailbox, and an opportunistic cache must not grow with mailbox size. Eviction keeps the highest UIDs - arrival order is the cheap stand-in for "most likely to be mutated" - and a miss costs exactly what a cold cache costs, an unprotected STORE.
 - `bulk_destroy` partial-failure accounting separates conflicts (UNCHANGEDSINCE rejected) from expunge failures; an expunge failure applies only to that round's UIDs, not the whole batch.
 - A two-sided `FlagOp::Patch` (non-empty add and remove) is two STOREs, and every id is accounted per UID across both. The guard rides the first (add) STORE; UIDs it rejects with `MODIFIED` are `Failed(ConcurrencyConflict)` and are excluded from the second STORE. Only the add-applied subset receives the unguarded remove, and only that subset may report `Succeeded(Applied)` - a second STORE that errors or comes back non-applied never reports success for those ids: transmission evidence decides the lane (`InFlight` evidence is `Uncertain`, an `Unsent` or server-acknowledged failure is `Failed`), per the mutation error-lane rule below. A wire error on the first STORE is confined to its own MODSEQ group: outcomes already established for earlier groups survive it and are never downgraded by the folder-level error path.
 - `bulk_move` validates the destination mailbox NAME once (syntax via `MailboxName::new`), before any source folder is opened; a syntactically invalid destination fails every target `Request(Malformed)` up front. Existence and selectability are not preflighted: a well-formed but nonexistent destination flows into the per-folder path and surfaces as per-item outcomes from the server's `NO [TRYCREATE]`.
@@ -678,7 +698,7 @@ Output ordering is therefore input-window order, then lexical folder order withi
 
 ### Blob openers
 
-`AccountCapabilities::blob_range` is `BlobRangeSupport::No` and `open_blob` / `open_blob_range` return `Unsupported`. IMAP can fetch a `BODY[]` section by range, but nothing in inventory or hydration mints a `BlobHandle` for a MIME part, so there is no handle a caller could hand back to an opener. `blob.rs` therefore serves only `open_raw_rfc822`, which streams the whole message via `BODY.PEEK[]`: the FETCH runs through the bounded streaming lane (`uid_fetch_stream`), each body section is emitted as its own `Bytes` page as it comes off the socket, and the consumer's back-pressure reaches the socket through the driver's `OwnedPermit` reservation. Like every other body path it carries a client-side byte budget (`RAW_FETCH_BUDGET`, 256 MiB, matching `HYDRATION_FETCH_BUDGET`), crossing which is `Error::FetchLimit`; the response size is the server's to choose, so the unbudgeted buffered read this path used to do could be made arbitrarily large by a corrupt or adversarial peer. The command future stays authoritative for the wire outcome, as in inventory / QRESYNC / CONDSTORE. Decoded attachment bytes nevertheless reach `FullWithBlobs` inline; that is not a resumable blob lane. Building the real capability is filed as imap-G1 and is being built in stages.
+`AccountCapabilities::blob_range` is `BlobRangeSupport::No` and `open_blob` / `open_blob_range` return `Unsupported`. IMAP can fetch a `BODY[]` section by range, but nothing in inventory or hydration mints a `BlobHandle` for a MIME part, so there is no handle a caller could hand back to an opener. `blob.rs` therefore serves only `open_raw_rfc822`, which streams the whole message via `BODY.PEEK[]`: the FETCH runs through the bounded streaming lane (`uid_fetch_stream`), each body section is emitted as its own `Bytes` page as it comes off the socket, and the consumer's back-pressure reaches the socket through the driver's `OwnedPermit` reservation. Like every other body path it carries a client-side byte budget (`RAW_FETCH_BUDGET`, 256 MiB, matching `HYDRATION_FETCH_BUDGET`), crossing which is `Error::FetchLimit`; the response size is the server's to choose, so the unbudgeted buffered read this path used to do could be made arbitrarily large by a corrupt or adversarial peer. The command future stays authoritative for the wire outcome, as in inventory / CONDSTORE. Decoded attachment bytes nevertheless reach `FullWithBlobs` inline; that is not a resumable blob lane. Building the real capability is filed as imap-G1 and is being built in stages.
 
 **imap-G1 stage 1 (`account/parts.rs`) - foundation, deliberately unwired.**
 Two pieces exist and are exercised by tests, but nothing calls them: no
@@ -845,7 +865,7 @@ server reject either for the selected mailbox (RFC 2683 2.2.2 asks the client
 to close first). `deselect_target` trusts the member's recorded selected mailbox, so that record follows the session through failures as well as successful SELECTs: after a failed `select_for_sync`, `record_failed_select` records none when the session is no longer `Selected` (a tagged NO to SELECT/EXAMINE deselects the previous mailbox), records the new folder when the failure is `ProtocolMissing` on a still-`Selected` session (the SELECT got its tagged OK and the response was then found incomplete), and otherwise leaves the previous selection standing. A stale record made `deselect_target` skip an UNSELECT the server needed. UNSELECT is preferred - it keeps the checkout on its
 connection. A pre-UNSELECT server falls back to replacing the member, and the
 old connection is LOGOUT'd BEFORE the replacement is dialed: dialing first
-would hold `pool_cap + 1` physical connections across the handshake, which a
+would temporarily add a physical connection across the handshake, which a
 server enforcing a per-user connection limit rejects - precisely on the old
 servers that need the fallback.
 
@@ -896,7 +916,7 @@ A `Transport(_)` kind must never carry an `Acknowledged` attempt - `try_build` r
 
 ### Push lifecycle
 
-The IDLE workers are account-owned, not subscription-owned. On a NOTIFY server one worker covers the selected folder plus every other accepted folder through `NOTIFY SET`. Without NOTIFY the account starts at most `ImapAccountConfig::idle_connection_budget` workers, default 4, with one dedicated IDLE session per covered folder. Four matches `pool_cap`, the default data-lane size, deliberately: it gives INBOX plus three other hot folders real push coverage while keeping the account's total connection footprint inside the low per-user allowance many providers enforce. A non-NOTIFY account starts the full budget of workers up front; a slot with no folder assigned parks rather than dialing, so the budget is a ceiling on sessions, not a floor.
+The IDLE workers are account-owned, not subscription-owned. On a NOTIFY server one worker covers the selected folder plus every other accepted folder through `NOTIFY SET`. Without NOTIFY the account starts `max(ImapAccountConfig::idle_connection_budget, 1)` workers, default 4, with one dedicated IDLE session per covered folder. The data and push budgets are separate: the default `pool_cap = 4` gives three data slots, plus up to four dedicated IDLE sessions without NOTIFY (seven total), or one with NOTIFY (four total). The data budget is `max(pool_cap - 1, 1)` and the non-NOTIFY IDLE budget is `max(idle_connection_budget, 1)`. Configure both for the provider's per-user connection allowance. A non-NOTIFY account starts the full budget of workers up front; a slot with no folder assigned parks rather than dialing, so the budget is a ceiling on sessions, not a floor.
 
 Admission is per scope, under the same lock as the insert, so two concurrent subscribes cannot both take the last slot. A folder already pushed costs no new session and is always admitted; a new distinct folder is admitted in request order while `covered.len() < budget`. Admission accepts exactly what worker assignment can watch: a folder scope whose name fails `MailboxName::new` (NUL/CR/LF) is refused into the failed lane, because `subscribed_idle_folders` drops such names and admitting one would report it as pushed while burning a slot on a mailbox no worker can SELECT. Every admitted folder always has a worker, because admission caps the admitted set at the budget - but the folder-to-slot *index* is recomputed lexically from the whole subscribed set on every wake, so a folder's slot number is not stable across subscription changes even though its coverage is. When the budget is exhausted, `push_subscribe` puts excess scopes in `PushSubscription.outcomes.failed` as `Unsupported(PushSubscribe)` carrying budget-specific diagnostic text; a subscribe that accepts nothing returns no handle. bifrost-sync records only the succeeded scopes and keeps the rest in the polling lane - it never suppresses polling on push coverage, which is what keeps a refused folder visible. Unsubscribe frees a folder slot once its last handle leaves.
 
@@ -914,9 +934,18 @@ The DONE handshake carries the account's `command_timeout`, the same bound every
 
 Every connection minted by the pool is registered weakly, including parked, checked-out, and dedicated IDLE sessions. `Pool::close` sets the closed flag, closes the permit semaphore, drains the parked list and the registry, concurrently requests LOGOUT on every live session under one `command_timeout`, then aborts any remaining driver task and drops its transport.
 
-`Account::close()` therefore means no session owned by that account is still connected when it returns - including a checkout whose command was in flight, which is terminated rather than waited for. The guarantee is about the transport, not about a graceful exchange: LOGOUT is best effort, and forced transport closure is the bounded fallback.
+The account close path currently sets `closed` before awaiting pool and
+subaccount teardown, then treats any later call as complete. The flag closes
+admission, but it does not record completion: if the first close future is
+cancelled during the pool drain, a later or concurrent call can return while
+that drain is unfinished. The submission transport is also retained after
+close, and its send paths do not consult `closed`, so SMTP sessions and sends
+are not covered by the pool guarantee. The no-session guarantee therefore
+holds only for a first close that runs to completion and excludes SMTP
+submission; cancellation-safe, concurrent teardown still needs shared
+completion state and submission shutdown.
 
-The `sessions` mutex is the linearization point that makes this hold against a concurrent operation. `close` stores the flag before it drains; registration re-reads the flag while holding that same lock. A dial that reaches the lock first is seen by the drain; one that finishes after the drain sees the flag, is refused registration, and tears its own connection down. `checkout_*` re-checks the flag after acquiring its permit as well, and the closed semaphore releases any checkout blocked on it as `Error::Closed` rather than stranding it. Without both halves, a checkout that was waiting on a permit or still dialing when `close` ran would register a live session on the far side of a completed close.
+The `sessions` mutex is the linearization point that protects pool registration against a completed close. `close` stores the flag before it drains; registration re-reads the flag while holding that same lock. A dial that reaches the lock first is seen by the drain; one that finishes after the drain sees the flag, is refused registration, and tears its own connection down. `checkout_*` re-checks the flag after acquiring its permit as well, and the closed semaphore releases any checkout blocked on it as `Error::Closed` rather than stranding it.
 
 The parking side takes the matching linearization on the other lock. `PooledConn::drop` re-checks `closed` while HOLDING the `idle` mutex, in the same critical section as its push. Reading the flag before acquiring that lock is a race with the same shape as the registration one: `close` stores the flag and only then drains `idle`, so a drop preempted between its read and its push parks a member the drain has already LOGOUT'd and terminated, leaving a dead entry on a closed pool. Under the lock only two orders exist - the push lands before the drain and is drained, or it observes the flag the drain published.
 
@@ -925,6 +954,13 @@ Registration prunes weak entries whose connection is already gone. The registry 
 A failed dial or SELECT backs off from 5s, doubling to a 300s ceiling, and resets on the first successful SELECT. The wait races the cancel and shutdown tokens rather than sleeping through them, and `Disconnected` is emitted once per disconnection rather than once per failed attempt.
 
 ### Concurrency conflicts and UNCHANGEDSINCE
+
+Mutation preparation uses a plain read-write SELECT with no QRESYNC baseline:
+it needs the live UIDVALIDITY, not all changes since the last sync. It neither
+replays VANISHED history nor warms the MODSEQ cache from that SELECT. Existing
+cached MODSEQs remain the opportunistic STORE guards. MODIFIED response sets
+stay compact; per-item classification tests only the submitted UIDs for
+membership, even when the server names a very broad range.
 
 IMAP diverges from the `MutationSuccess::Skipped` lane other crates use for the engine's "already in this state" short-circuit: the opportunistic MODSEQ cache sends cold-cache STOREs without `UNCHANGEDSINCE`, so "already in state" cannot be observed without a full SELECT+FETCH that defeats the guard. So `STORE UNCHANGEDSINCE <modseq>` rejecting with `MODIFIED` surfaces as `ItemOutcome::Failed { kind: ConcurrencyConflict }` for the conflicting UIDs, never `Succeeded(Skipped)`.
 

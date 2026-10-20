@@ -710,7 +710,14 @@ impl Account for GoogleAccount {
         parent: Option<ContainerId>,
         style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<ContainerId, AccountError>> {
-        pim::container_create(Arc::clone(&self.client), kind, name, parent, style)
+        pim::container_create(
+            Arc::clone(&self.client),
+            Arc::clone(&self.scope_cache),
+            kind,
+            name,
+            parent,
+            style,
+        )
     }
 
     fn container_rename(
@@ -719,7 +726,13 @@ impl Account for GoogleAccount {
         name: String,
         style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::container_rename(Arc::clone(&self.client), container, name, style)
+        pim::container_rename(
+            Arc::clone(&self.client),
+            Arc::clone(&self.scope_cache),
+            container,
+            name,
+            style,
+        )
     }
 
     fn container_move(
@@ -731,7 +744,11 @@ impl Account for GoogleAccount {
     }
 
     fn container_delete(&self, container: ContainerId) -> AccountFuture<Result<(), AccountError>> {
-        pim::container_delete(Arc::clone(&self.client), container)
+        pim::container_delete(
+            Arc::clone(&self.client),
+            Arc::clone(&self.scope_cache),
+            container,
+        )
     }
 
     fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>> {

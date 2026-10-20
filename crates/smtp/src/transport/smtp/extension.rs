@@ -64,7 +64,7 @@ impl ClientId {
     pub fn domain(value: impl Into<String>) -> Result<Self, Error> {
         let value = value.into();
         validate_esmtp_raw_value(&value).map_err(|_| {
-            error::invalid_input("EHLO domain must be printable ASCII without spaces")
+            error::invalid_input("EHLO domain must be printable ASCII without spaces or '='")
         })?;
         Ok(Self::Domain(value))
     }
@@ -72,7 +72,7 @@ impl ClientId {
     pub(crate) fn validate(&self) -> Result<(), Error> {
         match self {
             Self::Domain(value) => validate_esmtp_raw_value(value).map_err(|_| {
-                error::invalid_input("EHLO domain must be printable ASCII without spaces")
+                error::invalid_input("EHLO domain must be printable ASCII without spaces or '='")
             }),
             Self::Ipv4(_) | Self::Ipv6(_) => Ok(()),
         }
@@ -341,13 +341,13 @@ impl ServerInfo {
 
     /// Returns the server-advertised SIZE limit, if any.
     pub(crate) fn size_limit(&self) -> Option<usize> {
-        self.features.iter().find_map(|feature| {
-            if let Extension::Size(limit) = feature {
-                *limit
-            } else {
-                None
-            }
-        })
+        self.features
+            .iter()
+            .filter_map(|feature| match feature {
+                Extension::Size(Some(limit)) => Some(*limit),
+                _ => None,
+            })
+            .min()
     }
 
     /// Checks if the server supports SIZE.
@@ -1184,9 +1184,15 @@ fn validate_esmtp_keyword(keyword: &str) -> Result<(), Error> {
 }
 
 fn validate_esmtp_raw_value(value: &str) -> Result<(), Error> {
-    if value.is_empty() || !value.bytes().all(|byte| (b'!'..=b'~').contains(&byte)) {
+    // RFC 5321 esmtp-value excludes '=' because it separates the parameter
+    // keyword from its value.
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| (b'!'..=b'~').contains(&byte) && byte != b'=')
+    {
         return Err(error::invalid_input(
-            "raw ESMTP parameter value must contain printable ASCII without spaces",
+            "raw ESMTP parameter value must contain printable ASCII without spaces or '='",
         ));
     }
 
@@ -1477,6 +1483,44 @@ mod test {
         let info = ServerInfo::from_response(&ehlo(&["me", "SIZE 0"])).unwrap();
 
         assert_eq!(info.size_limit(), None);
+    }
+
+    #[test]
+    fn duplicate_size_limits_keep_the_tightest_finite_limit() {
+        for lines in [
+            ["me", "SIZE 100", "SIZE 50"],
+            ["me", "SIZE 50", "SIZE 100"],
+            ["me", "SIZE 0", "SIZE 50"],
+        ] {
+            let info = ServerInfo::from_response(&ehlo(&lines)).unwrap();
+            assert_eq!(info.size_limit(), Some(50));
+        }
+
+        let unlimited = ServerInfo::from_response(&ehlo(&["me", "SIZE 0", "SIZE 0"])).unwrap();
+        assert_eq!(unlimited.size_limit(), None);
+    }
+
+    #[test]
+    fn raw_esmtp_values_reject_equals() {
+        assert!(validate_esmtp_raw_value("value!").is_ok());
+        assert!(validate_esmtp_raw_value("value=other").is_err());
+        assert!(ClientId::domain("client=example.org").is_err());
+
+        assert!(
+            MailParameter::OtherRaw {
+                keyword: "X-TEST".to_owned(),
+                value: Some("value=other".to_owned()),
+            }
+            .validate_syntax()
+            .is_err()
+        );
+        assert!(
+            MailParameter::FutureRelease(FutureReleaseParameter::HoldUntil(
+                "20261020T120000=Z".to_owned(),
+            ))
+            .validate_syntax()
+            .is_err()
+        );
     }
 
     #[test]
@@ -1801,10 +1845,18 @@ mod test {
         assert!(
             MailParameter::OtherRaw {
                 keyword: "XTEST".to_owned(),
-                value: Some("raw=value".to_owned()),
+                value: Some("raw-value".to_owned()),
             }
             .validate_syntax()
             .is_ok()
+        );
+        assert!(
+            MailParameter::OtherRaw {
+                keyword: "XTEST".to_owned(),
+                value: Some("raw=value".to_owned()),
+            }
+            .validate_syntax()
+            .is_err()
         );
         assert!(
             MailParameter::OtherRaw {

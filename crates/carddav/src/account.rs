@@ -449,6 +449,30 @@ impl CardDavAccount {
             CtagSource::Known(ctag) => ctag,
         };
         let listing = client.list_contacts_listing(addressbook, operation).await?;
+        // COMPLETE inventory coverage cannot discharge a refused member. Fail
+        // before emitting either items or a checkpoint, retaining its status.
+        if operation == AccountOperation::SyncInventory
+            && let Some(failure) = listing.failed.first()
+        {
+            return Err(
+                match failure
+                    .status
+                    .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
+                {
+                    Some(status) => bifrost_dav_core::status_error(
+                        operation,
+                        status,
+                        format!("inventory member refused: {}", failure.href),
+                        DavProtocol::CardDav,
+                    ),
+                    None => bifrost_dav_core::parse_error(
+                        operation,
+                        "inventory member omitted usable properties",
+                        DavProtocol::CardDav,
+                    ),
+                },
+            );
+        }
         let failed_hrefs = listing.failed_hrefs();
         let mut entries = listing
             .entries
@@ -459,6 +483,8 @@ impl CardDavAccount {
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.uri.cmp(&right.uri));
+        let observation = preserve_unobserved_entries(&[], &mut entries, &failed_hrefs);
+        let ctag = observation.advance_token(None, ctag);
         Ok(ContactSnapshot {
             addressbook_url: addressbook.to_string(),
             ctag,
@@ -1251,10 +1277,8 @@ impl Account for CardDavAccount {
     ///
     /// **An omitted `limit` defaults to `CONTACT_PAGE_SIZE` (250)**, so a
     /// consumer that leaves the field unset still walks the collection a page at
-    /// a time and receives a `next_cursor` for the remainder. Note that the
-    /// CalDAV twin's `events_in_range` and `event_search` instead treat an
-    /// omitted `limit` as UNBOUNDED; the two crates differ on the default while
-    /// handling an explicit limit identically.
+    /// a time and receives a `next_cursor` for the remainder. The CalDAV
+    /// `events_in_range` and `event_search` defaults are also 250 candidates.
     fn contact_search(
         &self,
         request: ContactSearchRequest,
@@ -1873,6 +1897,13 @@ fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<ContactSnapshot, Acco
         &cursor.server_state.bytes,
     )
     .map_err(cursor_error)?;
+    if let CursorScope::Folder(folder) = &cursor.scope
+        && !same_dav_url(&folder.0, &decoded.collection_url)
+    {
+        return Err(cursor_error(
+            "cursor collection does not match its folder scope",
+        ));
+    }
     Ok(ContactSnapshot {
         addressbook_url: decoded.collection_url,
         ctag: decoded.token,
@@ -1889,11 +1920,12 @@ fn diff_contact_snapshots(previous: &ContactSnapshot, current: &ContactSnapshot)
 }
 
 fn preserve_unobserved_contact_entries(previous: &ContactSnapshot, current: &mut ContactSnapshot) {
-    preserve_unobserved_entries(
+    let observation = preserve_unobserved_entries(
         &previous.entries,
         &mut current.entries,
         &current.failed_hrefs,
     );
+    current.ctag = observation.advance_token(previous.ctag.clone(), current.ctag.take());
 }
 
 fn cursor_error(message: impl Into<String>) -> AccountError {
@@ -2440,9 +2472,8 @@ mod tests {
     /// collection is deliberately larger than the bound, because a fixture that
     /// fits inside it would pass against an unbounded default too.
     ///
-    /// This is the test that fails if this default is ever aligned with the
-    /// CalDAV twin's unbounded one: 300 members would then all be served in a
-    /// continuation-less page, and the sixth multiget chunk would exhaust the
+    /// This test fails if the default becomes unbounded: 300 members would
+    /// then all be served in a continuation-less page, and the sixth multiget chunk would exhaust the
     /// script and panic.
     #[tokio::test]
     async fn an_omitted_search_limit_serves_one_bounded_page_and_a_cursor() {
@@ -3021,6 +3052,78 @@ mod tests {
     }
 
     #[test]
+    fn a_cursor_collection_must_match_its_folder_scope() {
+        let snapshot = ContactSnapshot {
+            addressbook_url: "https://dav.example.test/c/a%40b/".to_string(),
+            ..ContactSnapshot::default()
+        };
+        let equivalent = cursor_from_snapshot(
+            CursorScope::Folder(bifrost_types::FolderId(
+                "https://dav.example.test/c/a@b/".to_string(),
+            )),
+            &snapshot,
+        );
+        assert!(decode_cursor_snapshot(&equivalent).is_ok());
+        let mismatched = cursor_from_snapshot(
+            CursorScope::Folder(bifrost_types::FolderId(
+                "https://dav.example.test/c/other/".to_string(),
+            )),
+            &snapshot,
+        );
+        assert!(decode_cursor_snapshot(&mismatched).is_err());
+    }
+
+    #[test]
+    fn a_failed_poll_keeps_the_token_needed_to_retry_the_member() {
+        let mut previous = snapshot_with(&["a", "b"]);
+        previous.ctag = Some("old".to_string());
+        let mut current = snapshot_with(&["a"]);
+        current.ctag = Some("new".to_string());
+        current.failed_hrefs = vec!["b".to_string()];
+        preserve_unobserved_contact_entries(&previous, &mut current);
+        assert_eq!(current.ctag, previous.ctag);
+        assert_eq!(current.entries, previous.entries);
+    }
+
+    #[tokio::test]
+    async fn inventory_snapshot_refuses_partial_member_coverage() {
+        let script = dav_script([book_multistatus(book_document(&[
+            listed_vcard("a"),
+            refused_vcard("b"),
+        ]))]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let result = CardDavAccount::contact_snapshot(
+            &client,
+            CtagSource::Known(Some("new".to_string())),
+            "https://dav.example.test/books/",
+            AccountOperation::SyncInventory,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_initial_partial_snapshot_does_not_seed_a_ctag() {
+        let script = dav_script([book_multistatus(book_document(&[
+            listed_vcard("a"),
+            refused_vcard("b"),
+        ]))]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let snapshot = CardDavAccount::contact_snapshot(
+            &client,
+            CtagSource::Known(Some("new".to_string())),
+            "https://dav.example.test/books/",
+            AccountOperation::SyncChanges,
+        )
+        .await
+        .expect("partial snapshot");
+        assert!(snapshot.ctag.is_none());
+        assert_eq!(snapshot.failed_hrefs.len(), 1);
+    }
+
+    #[test]
     fn contact_cursor_snapshot_round_trips() {
         let snapshot = ContactSnapshot {
             addressbook_url: "https://dav.example.test/contacts/".to_string(),
@@ -3183,7 +3286,10 @@ mod tests {
 
         preserve_unobserved_contact_entries(&previous, &mut empty);
         assert_eq!(empty.entries.len(), 2);
-        assert_eq!(empty.ctag.as_deref(), Some("refreshed"));
+        assert_eq!(
+            empty.ctag, None,
+            "an empty observation must retry the listing"
+        );
 
         let recovered = snapshot_with(&["a.vcf", "b.vcf"]);
         assert!(diff_contact_snapshots(&empty, &recovered).is_empty());

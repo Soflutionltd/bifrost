@@ -287,6 +287,21 @@ pub(crate) fn backfill_checkpoint_on_changes(
     )
 }
 
+/// Fresh account-authored envelopes are implementation contract failures, not
+/// evidence that persisted account state needs an account-wide schema reset.
+pub(crate) fn fresh_cursor_contract_error(
+    checkpoint: Option<&bifrost_types::Checkpoint>,
+    operation: AccountOperation,
+    scope: &CursorScope,
+) -> AccountError {
+    contract_violation(
+        checkpoint,
+        operation,
+        scope,
+        "account emitted an unsupported cursor envelope",
+    )
+}
+
 fn contract_violation(
     checkpoint: Option<&bifrost_types::Checkpoint>,
     operation: AccountOperation,

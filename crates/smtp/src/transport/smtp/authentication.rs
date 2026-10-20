@@ -4,7 +4,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use bifrost_net::{AccessToken, StaticTokenSource, TokenSource};
+use bifrost_net::{AccessToken, NetErrorContext, StaticTokenSource, TokenSource};
 use bifrost_sasl::{ScramChannelBinding, ScramHash, Secret};
 
 use crate::transport::smtp::error::{self, Error, SmtpCommandPhase};
@@ -219,6 +219,14 @@ impl Credentials {
                         Ok((identity.clone(), Zeroizing::new(token.as_str().to_owned())))
                     }
                     Poll::Ready(Err(e)) => Err(oauth_token_error(e)),
+                    // `TokenSource::current` returns an opaque future. A
+                    // Pending poll does not tell us whether the source needs
+                    // an executor for refresh work or a fresh OAuthRefresher
+                    // is only waiting for its async mutex. Polling again can
+                    // enter OAuthRefresher's `tokio::spawn` path, which panics
+                    // without a runtime and can leave its state marked as
+                    // Refreshing. A reliable distinction needs a synchronous
+                    // snapshot/readiness contract from bifrost-net.
                     Poll::Pending => Err(error::invalid_input(
                         "OAuth token source requires a network refresh; use the async SMTP transport",
                     )
@@ -232,12 +240,23 @@ impl Credentials {
     }
 }
 
-/// Map a token-source failure into the SMTP error model as an auth-phase
-/// input fault carrying the source error's message. The `TokenSource`
-/// failure projection (`AuthLost` vs `RefreshFailed`) is the error
-/// model's concern downstream and is not refined here.
+/// Preserve bifrost-net's typed projection for token-source failures. In
+/// particular, `OAuthRefresher` distinguishes terminal credential loss from a
+/// transient refresh failure; flattening either one to `InvalidInput` would
+/// turn it into a terminal policy block at the SMTP account boundary.
 fn oauth_token_error(error: bifrost_net::Error) -> Error {
-    error::invalid_input(format!("failed to read OAuth access token: {error}"))
+    let message = format!("failed to read OAuth access token: {error}");
+    let account_error = bifrost_net::into_account_error(
+        error,
+        NetErrorContext {
+            provider: None,
+            protocol: bifrost_types::error::Protocol::Smtp,
+            operation: bifrost_types::error::AccountOperation::Send,
+            scope: None,
+        },
+    );
+    error::invalid_input(message)
+        .with_preclassified_account_error(account_error)
         .with_phase(SmtpCommandPhase::Auth { mechanism: None })
 }
 
@@ -787,6 +806,81 @@ mod test {
         assert_eq!(
             Mechanism::ScramSha256Plus.to_string(),
             ScramHash::Sha256.mechanism_name(ChannelBinding::TlsServerEndPoint)
+        );
+    }
+
+    #[test]
+    fn oauth_token_source_preserves_terminal_auth_loss_classification() {
+        use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
+        use bifrost_net::Error as NetError;
+        use bifrost_types::error::{AccountErrorKind, AuthErrorKind, Protocol, RecoveryClass};
+
+        let error = super::oauth_token_error(NetError::AuthLost {
+            transmission_state: None,
+            final_response: None,
+        });
+        let account = into_account_error(error, SmtpErrorContext::send(Protocol::Smtp));
+
+        assert_eq!(
+            account.kind(),
+            &AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired)
+        );
+        assert_eq!(account.recovery(), &RecoveryClass::AuthLost);
+    }
+
+    #[test]
+    fn oauth_token_source_preserves_transient_refresh_classification() {
+        use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
+        use bifrost_net::Error as NetError;
+        use bifrost_types::error::{
+            AccountErrorKind, AuthErrorKind, Protocol, RecoveryClass, RetryDisposition, RetryReason,
+        };
+        use std::sync::Arc;
+
+        let error = super::oauth_token_error(NetError::RefreshFailed {
+            retry_after: None,
+            source: Arc::new(NetError::Cancelled),
+        });
+        let account = into_account_error(error.clone(), SmtpErrorContext::send(Protocol::Lmtp));
+
+        assert_eq!(
+            account.kind(),
+            &AccountErrorKind::Authentication(AuthErrorKind::RefreshTransient)
+        );
+        assert_eq!(account.protocol(), Some(Protocol::Lmtp));
+        assert!(matches!(
+            account.recovery(),
+            RecoveryClass::Retry(advice)
+                if advice.disposition == RetryDisposition::AfterAuthRefresh
+                    && advice.reason == RetryReason::RefreshTransient
+        ));
+    }
+
+    #[test]
+    fn blocking_oauth_rejects_a_pending_token_source_without_waiting() {
+        use crate::transport::smtp::error::SmtpCommandPhase;
+        use bifrost_net::{AccessToken, AccountFuture, Error as NetError, TokenSource};
+        use std::sync::Arc;
+
+        struct PendingSource;
+
+        impl TokenSource for PendingSource {
+            fn current(&self) -> AccountFuture<Result<AccessToken, NetError>> {
+                Box::pin(std::future::pending())
+            }
+
+            fn refresh(&self) -> AccountFuture<Result<AccessToken, NetError>> {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let credentials = Credentials::oauth2_source("alice", Arc::new(PendingSource));
+        let error = credentials.oauth2_token_blocking().unwrap_err();
+
+        assert!(error.is_invalid_input());
+        assert_eq!(
+            error.phase(),
+            Some(SmtpCommandPhase::Auth { mechanism: None })
         );
     }
 

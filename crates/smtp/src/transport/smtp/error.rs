@@ -1,6 +1,8 @@
 //! Error and result type for SMTP clients
 
-use std::{error::Error as StdError, fmt, io};
+use std::{error::Error as StdError, fmt, io, sync::Arc};
+
+use bifrost_types::error::AccountError;
 
 use crate::{
     BoxError,
@@ -30,6 +32,7 @@ impl Clone for Error {
                 source,
                 attempt: self.inner.attempt,
                 phase: self.inner.phase,
+                preclassified_account_error: self.inner.preclassified_account_error.clone(),
             }),
         }
     }
@@ -46,6 +49,10 @@ struct Inner {
     /// from low-level wire failures to `AccountErrorKind` reads only
     /// `phase()`; the context has no second phase that could disagree.
     phase: Option<SmtpCommandPhase>,
+    /// A lower-level dependency already projected this failure into the
+    /// shared account-error model. Keep the typed result through the SMTP
+    /// wrapper so its protocol boundary does not flatten it into `InvalidInput`.
+    preclassified_account_error: Option<Arc<AccountError>>,
 }
 
 /// Wire-level transmission state for the mail-send side effect.
@@ -130,6 +137,7 @@ impl Error {
                 source: source.map(Into::into),
                 attempt: None,
                 phase: None,
+                preclassified_account_error: None,
             }),
         }
     }
@@ -141,6 +149,7 @@ impl Error {
                 source: None,
                 attempt: None,
                 phase: None,
+                preclassified_account_error: None,
             }),
         }
     }
@@ -188,6 +197,17 @@ impl Error {
             ) => self.with_phase(phase),
             _ => self,
         }
+    }
+
+    /// Preserve an account error already classified by a dependency such as
+    /// bifrost-net. The SMTP account boundary will add its call-site context.
+    pub(crate) fn with_preclassified_account_error(mut self, error: AccountError) -> Self {
+        self.inner.preclassified_account_error = Some(Arc::new(error));
+        self
+    }
+
+    pub(crate) fn preclassified_account_error(&self) -> Option<AccountError> {
+        self.inner.preclassified_account_error.as_deref().cloned()
     }
 
     pub(crate) fn phase(&self) -> Option<SmtpCommandPhase> {

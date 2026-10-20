@@ -34,9 +34,11 @@ pub enum MutationSuccess {
     /// operation a provider could not perform AT ALL is not a downgrade and
     /// must not be reported here. A protocol crate that finds nothing it can
     /// express owes the caller a failure lane, not the weakest available
-    /// success - `bifrost-sync` files every `Downgraded` as
-    /// `PendingReadback`, which schedules a read-back for a mutation that
-    /// never happened and lets a no-op consume the same budget as real work.
+    /// success. `bifrost-sync` counts `Downgraded` in its own
+    /// `MutationCounters::downgraded` bucket, retains the reported effect in
+    /// `MutationCounters::effects`, and excludes the target from read-back.
+    /// A no-op reported here would be miscounted as a successful weaker
+    /// mutation and bypass observation that could expose the non-landing.
     ///
     /// The motivating case is Gmail `bulk_destroy` under the `gmail.modify`
     /// OAuth scope, which does not permit permanent delete. `messages/batchDelete`
@@ -44,9 +46,9 @@ pub enum MutationSuccess {
     /// messages move, they do not cease to exist. Reported as `Applied`, they
     /// came back on the next inventory pass and were destroyed again forever.
     ///
-    /// `bifrost-sync` routes this through the read-back guard rather than
-    /// trusting it, so the final accounting comes from observed state rather
-    /// than from the provider's claim.
+    /// `bifrost-sync` retains this reported effect in
+    /// `MutationCounters::effects` and counts the target as downgraded. It
+    /// does not retry the target or read it back against the original request.
     Downgraded { actual: MutationEffect },
 }
 

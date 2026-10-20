@@ -34,7 +34,9 @@ use super::blobs;
 use super::error;
 use super::flags;
 use super::flags::{ARCHIVE_ID, LABEL_INBOX, LABEL_SPAM, LABEL_TRASH, is_archive_id};
-use super::scopes::{ScopeCache, labels_for_flags, refresh_scope_snapshot};
+use super::scopes::{
+    ScopeCache, invalidate_scope_snapshot, labels_for_flags, refresh_scope_snapshot,
+};
 
 const LABEL_SENT: &str = "SENT";
 const LABEL_DRAFT: &str = "DRAFT";
@@ -358,6 +360,7 @@ pub(crate) fn containers_list(
 
 pub(crate) fn container_create(
     client: Arc<GmailClient>,
+    cache: ScopeCache,
     kind: ContainerKind,
     name: String,
     parent: Option<ContainerId>,
@@ -373,7 +376,11 @@ pub(crate) fn container_create(
         let color = style
             .as_ref()
             .map(|s| (s.color_fg.as_str(), s.color_bg.as_str()));
-        let label = client.create_label(&name, color).await.map_err(|e| {
+        // A transport error can arrive after Gmail applied the mutation, so
+        // invalidate after every dispatched attempt, not only after a 2xx.
+        let result = client.create_label(&name, color).await;
+        invalidate_scope_snapshot(&cache).await;
+        let label = result.map_err(|e| {
             account_error_for(
                 e,
                 error::GmailErrorContext::container(
@@ -387,6 +394,7 @@ pub(crate) fn container_create(
 
 pub(crate) fn container_rename(
     client: Arc<GmailClient>,
+    cache: ScopeCache,
     container: ContainerId,
     name: String,
     style: Option<ContainerStyle>,
@@ -403,17 +411,18 @@ pub(crate) fn container_rename(
         let color = style
             .as_ref()
             .map(|s| Some((s.color_fg.as_str(), s.color_bg.as_str())));
-        client
-            .update_label(&container.0, Some(&name), color)
-            .await
-            .map_err(|e| {
-                account_error_for(
-                    e,
-                    error::GmailErrorContext::container(
-                        bifrost_types::AccountOperation::ContainerRename,
-                    ),
-                )
-            })?;
+        // A transport error can arrive after Gmail applied the mutation, so
+        // invalidate after every dispatched attempt, not only after a 2xx.
+        let result = client.update_label(&container.0, Some(&name), color).await;
+        invalidate_scope_snapshot(&cache).await;
+        result.map_err(|e| {
+            account_error_for(
+                e,
+                error::GmailErrorContext::container(
+                    bifrost_types::AccountOperation::ContainerRename,
+                ),
+            )
+        })?;
         Ok(())
     })
 }
@@ -427,6 +436,7 @@ pub(crate) fn container_move(
 
 pub(crate) fn container_delete(
     client: Arc<GmailClient>,
+    cache: ScopeCache,
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
@@ -435,7 +445,11 @@ pub(crate) fn container_delete(
                 bifrost_types::AccountOperation::ContainerDelete,
             ));
         }
-        client.delete_label(&container.0).await.map_err(|e| {
+        // A transport error can arrive after Gmail applied the mutation, so
+        // invalidate after every dispatched attempt, not only after a 2xx.
+        let result = client.delete_label(&container.0).await;
+        invalidate_scope_snapshot(&cache).await;
+        result.map_err(|e| {
             account_error_for(
                 e,
                 error::GmailErrorContext::container(
@@ -1489,9 +1503,148 @@ fn account_error_for(error: crate::Error, ctx: error::GmailErrorContext) -> Acco
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
 
+    use bifrost_net::test_support::{Canned, ScriptedDispatch};
+    use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource};
+    use bifrost_types::FlagOp;
+    use bytes::Bytes;
+    use reqwest::StatusCode;
+
+    use super::super::scopes::{ScopeCacheState, ScopeSnapshot, snapshot};
     use super::*;
+
+    fn cache_with_label() -> ScopeCache {
+        Arc::new(ScopeCacheState::new(ScopeSnapshot {
+            labels: vec![GmailLabel {
+                id: "Label_1".to_string(),
+                name: "Work".to_string(),
+                label_type: Some("user".to_string()),
+                color: None,
+            }],
+            fetched_at: Some(Instant::now()),
+        }))
+    }
+
+    fn scripted_client(steps: Vec<Canned>) -> (Arc<GmailClient>, Arc<ScriptedDispatch>) {
+        let script = ScriptedDispatch::new(steps);
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            RetryPolicy::disabled(),
+        );
+        (
+            Arc::new(GmailClient::with_account_net("https://gmail.test", net)),
+            script,
+        )
+    }
+
+    fn ok_json(body: &'static [u8]) -> Canned {
+        Canned::Response {
+            status: StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from_static(body),
+        }
+    }
+
+    #[tokio::test]
+    async fn creating_a_label_invalidates_the_vocabulary_cache() {
+        let (client, script) = scripted_client(vec![
+            ok_json(br#"{"id":"Label_2","name":"New","type":"user"}"#),
+            ok_json(
+                br#"{"labels":[
+                {"id":"Label_1","name":"Work","type":"user"},
+                {"id":"Label_2","name":"New","type":"user"}
+            ]}"#,
+            ),
+        ]);
+        let cache = cache_with_label();
+
+        let id = container_create(
+            Arc::clone(&client),
+            Arc::clone(&cache),
+            ContainerKind::Label,
+            "New".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect("label creation succeeds");
+
+        assert_eq!(id.0, "Label_2");
+        assert!(snapshot(&cache).is_stale());
+        let labels = labels_for_flags(&client, &cache)
+            .await
+            .expect("the next vocabulary read refreshes");
+        let op = FlagOp::Add(HashSet::from(["$gmail-label:Label_2:New".to_string()]));
+        let patch = flags::translate_flag_op(&op, &labels);
+        assert!(patch.unsupported_flags.is_empty());
+        assert_eq!(patch.add_label_ids, vec!["Label_2".to_string()]);
+        assert_eq!(script.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn renaming_a_label_invalidates_the_vocabulary_cache() {
+        let (client, script) = scripted_client(vec![
+            ok_json(br#"{"id":"Label_1","name":"Renamed","type":"user"}"#),
+            ok_json(
+                br#"{"labels":[
+                {"id":"Label_1","name":"Renamed","type":"user"}
+            ]}"#,
+            ),
+        ]);
+        let cache = cache_with_label();
+
+        container_rename(
+            Arc::clone(&client),
+            Arc::clone(&cache),
+            ContainerId("Label_1".to_string()),
+            "Renamed".to_string(),
+            None,
+        )
+        .await
+        .expect("label rename succeeds");
+
+        assert!(snapshot(&cache).is_stale());
+        let labels = labels_for_flags(&client, &cache)
+            .await
+            .expect("the next vocabulary read refreshes");
+        assert_eq!(labels[0].name, "Renamed");
+        assert_eq!(script.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_label_invalidates_the_vocabulary_cache() {
+        let (client, script) = scripted_client(vec![
+            Canned::Response {
+                status: StatusCode::NO_CONTENT,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::new(),
+            },
+            ok_json(br#"{"labels":[]}"#),
+        ]);
+        let cache = cache_with_label();
+
+        container_delete(
+            Arc::clone(&client),
+            Arc::clone(&cache),
+            ContainerId("Label_1".to_string()),
+        )
+        .await
+        .expect("label deletion succeeds");
+
+        assert!(snapshot(&cache).is_stale());
+        assert!(
+            labels_for_flags(&client, &cache)
+                .await
+                .expect("the next vocabulary read refreshes")
+                .is_empty()
+        );
+        assert_eq!(script.requests().len(), 2);
+    }
 
     fn gmail_message(value: serde_json::Value) -> GmailMessage {
         serde_json::from_value(value).expect("message fixture deserializes")

@@ -592,12 +592,17 @@ destroy-everything failure modes: an empty multistatus against a populated
 prior snapshot suppresses the mass-delete (treated as "no observation"),
 and any href in `current.failed_hrefs` is preserved rather than destroyed.
 The checkpoint preserves the prior entries and etags for both no-observation
-shapes while retaining the refreshed ctag.
+shapes while retaining the prior ctag. The shared snapshot helper returns an
+`Observation`; only complete observations advance tokens. Initial snapshots
+with refused members carry no ctag, so subsequent polls repeat the listing
+rather than short-circuiting. An incomplete poll retains its prior ctag and
+retries while the remote ctag differs.
 This deliberately means a genuine delete-all is not reported on that poll or a
-later poll. When the refreshed ctag is checkpointed, the next poll may also
-short-circuit without another listing.
+later empty poll, since the empty observation remains ambiguous.
 `inventory_stream` emits contact inventory entries with ETag fingerprints for
-the same collection scope and reports full coverage of that address book.
+the same collection scope and reports full coverage of that address book. A
+listing with refused members fails the inventory before emitting entries,
+coverage or a checkpoint, using the member status classification.
 Legacy `CursorScope::Type(Contact)` calls remain accepted for compatibility,
 target the default address book, and report only a `carddav` provider region.
 The CardDAV cursor payload is version 2. Version 2 records the request-relative
@@ -607,6 +612,9 @@ classified `SyncState(SchemaIncompatible)`, deriving to
 `Engine(SchemaIncompatible)` rather than a scope restart: only that directive
 also deletes the backfill checkpoint, and without the re-walk the objects
 already backfilled would keep their pre-correction id spelling.
+Folder-scoped cursors must name an equivalent collection URL in their payload;
+a mismatch is rejected as schema-incompatible before polling. Legacy type
+scopes have no collection URL to compare.
 Cursor entry counts are checked against the remaining payload before
 allocation. Multiget response hrefs are rebased onto the same resolved
 absolute native-id namespace the snapshot, inventory, and changes lanes

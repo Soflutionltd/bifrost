@@ -41,11 +41,11 @@ pub struct Reconciler {
     pub scheduler: crate::scheduler::Scheduler,
     /// The multiplexer's per-scope poll tokens, shared rather than copied.
     ///
-    /// A scope whose poll task exited on a TERMINAL verdict leaves a parked
-    /// tombstone here, and the 1s poll scan honors it. The reconciler is the
-    /// other producer on the same lane, so without reading the same record a
-    /// later push hint re-drove a terminally failed scope - re-broadcasting
-    /// `Terminated` and re-running a wire call that cannot succeed.
+    /// A scope whose poll or push drive reached a TERMINAL verdict leaves a
+    /// parked tombstone here, and both the 1s poll scan and this reconciler
+    /// honor it. Without the shared record, a later push hint re-drove a
+    /// terminally failed scope - re-broadcasting `Terminated` and re-running
+    /// a wire call that cannot succeed.
     pub scope_tokens: crate::multiplexer::ScopeTokens,
 }
 
@@ -80,11 +80,12 @@ impl Reconciler {
                     changed = self.boundary.changed() => {
                         match changed {
                             Some(crate::cancel::BoundaryRequest::Run) => break,
-                            // Pause / CheckpointNow / Stop all keep
-                            // the loop parked. Stop is observed via
-                            // the shutdown token; CheckpointNow is a
-                            // poll-only signal that the reconciler
-                            // ignores.
+                            // Re-check the watch after every state change:
+                            // only Pause keeps this wait active. Run resumes
+                            // here; CheckpointNow and Stop leave the pause
+                            // wait too. The drive's boundary arm handles
+                            // Stop, while CheckpointNow has no reconciler
+                            // action.
                             Some(_) => continue,
                             None => return,
                         }
@@ -271,10 +272,9 @@ impl Reconciler {
             // due entry behind for the timer to drive a second time. Every
             // path below that is held again re-inserts it.
             deferred.remove(&scope);
-            // A parked scope is terminally failed. Only an explicit
-            // scope-retiring path (lifecycle deletion, an engine restart of
-            // the scope, multiplexer shutdown) clears the tombstone, and until
-            // one does, driving it again is wire work that cannot succeed.
+            // A successful scope restart or account replacement changes the
+            // registry fence, invalidating the old incarnation's terminal state.
+            crate::multiplexer::retire_stale_scope_token(&self.scope_tokens, &self.cursors, &scope);
             if crate::multiplexer::scope_is_parked(&self.scope_tokens, &scope) {
                 tracing::debug!(
                     target: "bifrost.sync.reconcile",
@@ -395,7 +395,7 @@ impl Reconciler {
                         // throttled drive's hint is kept is a question about
                         // THIS account's declaration, not the one computed
                         // before admission.
-                        (final_keys, Some(outcome))
+                        (final_keys, Some((registry_generation, outcome)))
                     }
                 }) => driven,
             };
@@ -414,16 +414,15 @@ impl Reconciler {
                 deferred.insert(scope);
                 continue;
             };
+            let (drive_generation, outcome) = outcome;
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 // An account error already carries a complete recovery
-                // verdict - an incompatible cursor envelope derives
-                // `Engine(SchemaIncompatible)`, which MUST reset state.
-                // Surviving the sibling scopes of a multi-scope hint must
-                // not cost the failing scope its recovery: logging this and
-                // moving on leaves the invalid cursor installed, so push
-                // re-terminates on every hint until some later poll happens
-                // to hit the same failure. Normalize onto the same path an
+                // verdict. Surviving sibling scopes of a multi-scope hint
+                // must not cost the failing scope its recovery: logging this
+                // and moving on leaves its cursor installed, so push
+                // re-terminates on every hint until a later poll hits the
+                // same failure. Normalize onto the same path an
                 // account-authored `Terminated` takes, exactly as the poll
                 // loop's `handle_drive_outcome` does.
                 Err(Error::Account(error)) => ChangesEvent::Terminated(error),
@@ -529,7 +528,13 @@ impl Reconciler {
                             continue;
                         }
                         RecoveryPlan::Terminal(_) => {
-                            return Ok(());
+                            crate::multiplexer::park_scope_for_drive(
+                                &self.scope_tokens,
+                                &self.cursors,
+                                &scope,
+                                drive_generation,
+                            );
+                            continue;
                         }
                     }
                 }

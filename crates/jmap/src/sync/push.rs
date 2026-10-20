@@ -520,7 +520,6 @@ fn data_type_for_scope(scope: &CursorScope) -> Option<DataType> {
         // including delegate/shared accounts represented by Folder scopes.
         CursorScope::Folder(_) => Some(DataType::Email),
         CursorScope::Type(ObjectType::Mailbox) => Some(DataType::Mailbox),
-        CursorScope::Type(ObjectType::Thread) => Some(DataType::Thread),
         _ => None,
     }
 }
@@ -528,8 +527,11 @@ fn data_type_for_scope(scope: &CursorScope) -> Option<DataType> {
 fn scope_for_data_type(data_type: &DataType) -> Option<CursorScope> {
     match data_type {
         DataType::Email => Some(CursorScope::Type(ObjectType::Email)),
+        // RFC 8621's EmailDelivery state changes only when a new Email is
+        // added, which also changes Email state. Email is the tracked
+        // cursor; emitting a second Unknown hint would broaden that signal.
+        DataType::EmailDelivery => Some(CursorScope::Type(ObjectType::Email)),
         DataType::Mailbox => Some(CursorScope::Type(ObjectType::Mailbox)),
-        DataType::Thread => Some(CursorScope::Type(ObjectType::Thread)),
         _ => None,
     }
 }
@@ -912,7 +914,15 @@ fn emit_push(push: PushObject, tx: &broadcast::Sender<WatchEvent>, routing: &Pus
             // instead of collapsing every account onto the primary type
             // scopes.
             for (account_id, by_type) in &changed {
+                let has_email_state = by_type.contains_key(&DataType::Email);
                 for data_type in by_type.keys() {
+                    // RFC 8621 advances EmailDelivery when a new Email is
+                    // added, which also advances Email. If a server includes
+                    // both keys, the Email hint already covers the same
+                    // tracked cursor; do not emit it twice.
+                    if has_email_state && matches!(data_type, DataType::EmailDelivery) {
+                        continue;
+                    }
                     emit_state_change(account_id, data_type, tx, routing);
                 }
             }
@@ -935,10 +945,16 @@ fn emit_state_change(
     routing: &PushRouting,
 ) {
     if account_id == routing.primary_account_id {
-        let payload = scope_for_data_type(data_type)
-            .map(HintPayload::SpecificCursorScope)
-            .unwrap_or(HintPayload::Unknown);
-        let _ = tx.send(invalidated(payload));
+        if let Some(scope) = scope_for_data_type(data_type) {
+            let _ = tx.send(invalidated(HintPayload::SpecificCursorScope(scope)));
+        } else if !matches!(data_type, DataType::Thread) {
+            // Preserve broad invalidation for unmapped types: this client
+            // cannot know which tracked scope their state may affect. RFC
+            // 8887 filters conforming notifications to requested types, so
+            // an extra untracked state is not part of the normal Email push.
+            // Thread is known but has no inventory or changes stream.
+            let _ = tx.send(invalidated(HintPayload::Unknown));
+        }
         return;
     }
     let Some(scope) = routing.foreign_scopes.get(account_id) else {
@@ -948,7 +964,7 @@ fn emit_state_change(
         // nothing to invalidate, and a broad repoll would gain nothing.
         return;
     };
-    if !matches!(data_type, DataType::Email) {
+    if !matches!(data_type, DataType::Email | DataType::EmailDelivery) {
         // Foreign Mailbox / Thread state is tracked by no cursor: foreign
         // mailbox lifecycle is reopen-only by design and no foreign
         // Thread scope exists. A count-only Mailbox bump arrives alongside
@@ -1045,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn a_data_type_with_no_cursor_scope_degrades_to_an_unknown_hint() {
+    fn an_untracked_primary_data_type_degrades_to_an_unknown_hint() {
         let (tx, mut rx) = broadcast::channel(8);
         emit_push(
             state_change("acct-primary", DataType::Principal, "s2"),
@@ -1055,7 +1071,70 @@ mod tests {
 
         let events = drain(&mut rx);
         assert_eq!(events.len(), 1);
-        assert_eq!(hinted_scope(&events[0]), None, "no scope maps to Principal");
+        assert!(matches!(
+            &events[0],
+            WatchEvent::Invalidated { hint }
+                if matches!(&hint.payload, HintPayload::Unknown)
+        ));
+    }
+
+    #[test]
+    fn email_delivery_invalidates_the_email_scope_without_a_broad_hint() {
+        let (tx, mut rx) = broadcast::channel(8);
+        emit_push(
+            state_change("acct-primary", DataType::EmailDelivery, "d2"),
+            &tx,
+            &routing(),
+        );
+
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            hinted_scope(&events[0]),
+            Some(CursorScope::Type(ObjectType::Email))
+        );
+    }
+
+    #[test]
+    fn email_and_email_delivery_in_one_change_emit_one_email_hint() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut by_type = HashMap::new();
+        by_type.insert(DataType::Email, "e2".to_string());
+        by_type.insert(DataType::EmailDelivery, "d2".to_string());
+        let mut changed = HashMap::new();
+        changed.insert("acct-primary".to_string(), by_type);
+
+        emit_push(
+            PushObject::StateChange {
+                changed,
+                push_state: None,
+            },
+            &tx,
+            &routing(),
+        );
+
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            hinted_scope(&events[0]),
+            Some(CursorScope::Type(ObjectType::Email))
+        );
+    }
+
+    #[test]
+    fn thread_state_changes_are_dropped_without_a_thread_cursor() {
+        let (tx, mut rx) = broadcast::channel(8);
+        emit_push(
+            state_change("acct-primary", DataType::Thread, "t2"),
+            &tx,
+            &routing(),
+        );
+
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(
+            data_type_for_scope(&CursorScope::Type(ObjectType::Thread)),
+            None
+        );
     }
 
     #[test]
@@ -1100,6 +1179,20 @@ mod tests {
             !scopes.contains(&CursorScope::Type(ObjectType::Email)),
             "the primary scope did not change and must not be repolled"
         );
+    }
+
+    #[test]
+    fn a_foreign_email_delivery_change_uses_its_account_scope() {
+        let (tx, mut rx) = broadcast::channel(8);
+        emit_push(
+            state_change("acct-foreign", DataType::EmailDelivery, "d2"),
+            &tx,
+            &routing(),
+        );
+
+        let events = drain(&mut rx);
+        let scopes = events.iter().filter_map(hinted_scope).collect::<Vec<_>>();
+        assert_eq!(scopes, vec![foreign_scope("acct-foreign")]);
     }
 
     // Foreign Mailbox state is tracked by no cursor (foreign mailbox
@@ -1196,7 +1289,6 @@ mod tests {
         for (scope, data_type) in [
             (CursorScope::Type(ObjectType::Email), DataType::Email),
             (CursorScope::Type(ObjectType::Mailbox), DataType::Mailbox),
-            (CursorScope::Type(ObjectType::Thread), DataType::Thread),
         ] {
             assert_eq!(data_type_for_scope(&scope), Some(data_type.clone()));
             assert_eq!(scope_for_data_type(&data_type), Some(scope));

@@ -6,10 +6,8 @@ use bifrost_types::{
     WarningKind,
 };
 
-use crate::connection::FetchStreamItem;
 use crate::types::{FetchAttr, MailboxName, SelectedMailbox, UidSet};
 
-use super::folder_registry::expand_range;
 use super::{
     BATCH_ITEMS, CompactUidSet, FolderCursor, ImapAccount, ScopeHandler, batch, decode_cursor,
     encode_cursor, encode_object_id, folder_from_scope, folder_scope, membership_scope,
@@ -348,25 +346,20 @@ async fn run_qresync(
         .await;
     }
     let mut live_uids = known_uids.clone();
-    let fallback_known_uids = live_uids.clone();
     let mut fetch_change_seen = BTreeSet::new();
     let mut removed_seen = BTreeSet::new();
     let mut changes = Vec::with_capacity(BATCH_ITEMS);
-    let mut pages_flushed = false;
     for range in selected.mailbox.vanished.clone() {
-        for uid in expand_range(range) {
-            record_removed_change(
-                &folder,
-                uidvalidity,
-                uid,
-                &mut live_uids,
-                &mut removed_seen,
-                &mut changes,
-            );
-            account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
+        account
+            .folders
+            .clear_modseq_ranges(&folder, uidvalidity, &[range]);
+        let removed = live_uids.remove_range(range);
+        for uid in removed.iter() {
+            if removed_seen.insert(uid) {
+                changes.push(removed_change(&folder, uidvalidity, uid));
+            }
             if changes.len() >= BATCH_ITEMS {
                 flush_page(&tx, &mut changes).await?;
-                pages_flushed = true;
             }
         }
     }
@@ -387,143 +380,30 @@ async fn run_qresync(
         );
         if changes.len() >= BATCH_ITEMS {
             flush_page(&tx, &mut changes).await?;
-            pages_flushed = true;
         }
     }
-    let attrs = [FetchAttr::Uid, FetchAttr::Flags, FetchAttr::ModSeq];
-    let all_uids = UidSet::all();
-    // Setup failure flows into the same fallback lane as a mid-stream
-    // failure: the only setup error is MissingCapability (QRESYNC ACKed by
-    // ENABLE but never echoed via `* ENABLED`), which must downgrade to
-    // CONDSTORE below rather than terminate the stream.
-    let (fallback_error, flushed_qresync_changes) = match conn
-        .connection()
-        .uid_fetch_vanished_stream(
-            all_uids.as_sequence_set(),
-            &attrs,
-            modseq,
-            account.command_timeout(),
-        ) {
-        Err(err) => (Some(err), pages_flushed),
-        Ok((mut fetch_rx, fetch_fut)) => {
-            tokio::pin!(fetch_fut);
-
-            let mut fetch_result = None;
-            let mut fallback_error = None;
-            let mut flushed_qresync_changes = pages_flushed;
-            loop {
-                tokio::select! {
-                    result = &mut fetch_fut, if fetch_result.is_none() => {
-                        fetch_result = Some(result);
-                    }
-                    item = fetch_rx.recv() => {
-                        match item {
-                            Some(Ok(FetchStreamItem::Fetch(fetch))) => {
-                                if let (Some(uid), Some(modseq)) = (fetch.uid, fetch.mod_seq) {
-                                    account.folders.record_modseq(&folder, uidvalidity, uid, modseq)?;
-                                }
-                                record_fetch_change(
-                                    &folder,
-                                    uidvalidity,
-                                    fetch.uid,
-                                    &mut live_uids,
-                                    &mut fetch_change_seen,
-                                    &mut removed_seen,
-                                    &mut changes,
-                                );
-                            }
-                            Some(Ok(FetchStreamItem::VanishedEarlier(ranges))) => {
-                                for uid in ranges.into_iter().flat_map(expand_range) {
-                                    record_removed_change(
-                                        &folder,
-                                        uidvalidity,
-                                        uid,
-                                        &mut live_uids,
-                                        &mut removed_seen,
-                                        &mut changes,
-                                    );
-                                    account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
-                                    if changes.len() >= BATCH_ITEMS {
-                                        let out = std::mem::take(&mut changes);
-                                        tx.send(batch(out, PageBoundary::Page, None))
-                                            .await
-                                            .map_err(|_| ChangeError::ChannelDropped)?;
-                                        flushed_qresync_changes = true;
-                                    }
-                                }
-                            }
-                            Some(Err(err)) => {
-                                fallback_error = Some(err);
-                                break;
-                            }
-                            None => {
-                                // The driver drops the item sender before it
-                                // answers the oneshot, so a failed FETCH
-                                // closes `fetch_rx` first and this arm can win
-                                // the race against `fetch_fut`. Await the
-                                // future rather than reading whatever
-                                // `select!` happened to store: otherwise a
-                                // tagged NO, a read error, or a timeout breaks
-                                // on the success path and checkpoints a cursor
-                                // at HIGHESTMODSEQ having processed only part
-                                // of the CHANGEDSINCE/VANISHED stream.
-                                let result = match fetch_result.take() {
-                                    Some(result) => result,
-                                    None => (&mut fetch_fut).await,
-                                };
-                                if let Err(err) = result {
-                                    fallback_error = Some(err);
-                                }
-                                break;
-                            }
-                        }
-                        if changes.len() >= BATCH_ITEMS {
-                            let out = std::mem::take(&mut changes);
-                            tx.send(batch(out, PageBoundary::Page, None))
-                                .await
-                                .map_err(|_| ChangeError::ChannelDropped)?;
-                            flushed_qresync_changes = true;
-                        }
-                    }
-                }
-            }
-            (fallback_error, flushed_qresync_changes)
+    // With known UIDs supplied, SELECT need only report changes to that
+    // set (RFC 7162 Section 3.2.5.1). Arrivals can appear only in EXISTS.
+    // Reconcile membership when SELECT has not accounted for that count;
+    // do not repeat the all-UID CHANGEDSINCE/VANISHED flags fetch.
+    let live_set = if usize::try_from(selected.mailbox.exists).ok() != Some(live_uids.uid_count()) {
+        let current = CompactUidSet::from_uids(search_all(&account, conn.connection()).await?);
+        let diff = live_uids.diff(&current);
+        for uid in diff.added {
+            changes.push(added_change(&folder, uidvalidity, uid));
+            flush_page(&tx, &mut changes).await?;
         }
+        for uid in diff.removed {
+            account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
+            changes.push(removed_change(&folder, uidvalidity, uid));
+            flush_page(&tx, &mut changes).await?;
+        }
+        current
+    } else {
+        live_uids
     };
-    if let Some(err) = fallback_error {
-        if should_disable_qresync(&err) && !flushed_qresync_changes {
-            if should_discard_conn_after_qresync_error(&err) {
-                conn.discard();
-            }
-            account.disable_qresync_for_session();
-            send_strategy_downgrade(
-                &tx,
-                SyncStrategy::QResync,
-                SyncStrategy::Condstore,
-                "QRESYNC VANISHED fetch failed; continuing with CONDSTORE",
-            )
-            .await?;
-            let cursor = FolderCursor::Condstore {
-                uidvalidity,
-                modseq,
-                known_uids: fallback_known_uids,
-            };
-            // Any buffered QRESYNC changes are intentionally discarded:
-            // the CONDSTORE retry re-derives them from the same modseq
-            // before a checkpoint is committed.
-            //
-            // Release the checkout (and its pool permit) before the retry:
-            // run_condstore_with_baseline re-enters checkout_for_folder, and
-            // holding the permit across that call deadlocks at data_cap == 1
-            // and needlessly dials a second connection above it.
-            drop(conn);
-            return run_condstore_with_baseline(account, folder, cursor, known_uids_complete, tx)
-                .await;
-        }
-        return Err(err.into());
-    }
-
-    let live_set = live_uids;
+    // Keep SELECT's MODSEQ: changes concurrent with SEARCH must still be
+    // eligible for the next poll. A failed SEARCH never advances the cursor.
     warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.uid_count()).await?;
     let next = account.cursor_from_select(&selected.mailbox, Some(live_set))?;
     account.folders.set_cursor(&folder, next.clone());
@@ -931,20 +811,6 @@ fn remove_buffered_removed_change(
     true
 }
 
-fn record_removed_change(
-    folder: &MailboxName,
-    uidvalidity: u32,
-    uid: u32,
-    live_uids: &mut CompactUidSet,
-    removed_seen: &mut BTreeSet<u32>,
-    changes: &mut Vec<Change>,
-) {
-    live_uids.remove(uid);
-    if removed_seen.insert(uid) {
-        changes.push(removed_change(folder, uidvalidity, uid));
-    }
-}
-
 fn added_change(folder: &MailboxName, uidvalidity: u32, uid: u32) -> Change {
     Change::ScopeChange(ScopeChange {
         id: encode_object_id(folder, uidvalidity, uid),
@@ -1111,6 +977,22 @@ mod tests {
     use bifrost_types::{CursorScope, RecoveryClass};
 
     use super::*;
+
+    // Construct removal state for the FETCH ordering tests through the same
+    // range subtraction used by the stream.
+    fn record_removed_change(
+        folder: &MailboxName,
+        uidvalidity: u32,
+        uid: u32,
+        live_uids: &mut CompactUidSet,
+        removed_seen: &mut BTreeSet<u32>,
+        changes: &mut Vec<Change>,
+    ) {
+        let removed = live_uids.remove_range(crate::types::UidRange::single(uid));
+        if !removed.is_empty() && removed_seen.insert(uid) {
+            changes.push(removed_change(folder, uidvalidity, uid));
+        }
+    }
 
     #[test]
     fn uidvalidity_mismatch_requests_scope_restart() {

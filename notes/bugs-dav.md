@@ -17,76 +17,6 @@ Filed from the October 2026 defect hunt: the DAV scope, plus DAV findings
 from the net, types and sync adoption scopes. Several were reported
 independently by more than one scope; each entry says which.
 
-## DAV-001 - A member the server refuses or omits is lost for good once the collection token moves past it
-
-Scope: dav. Both crates.
-
-Claim broken: `reference/caldav.md` says a transiently failed resource "is not
-an absent one" and is "preserved rather than destroyed"; `snapshot.rs` says
-the same, and `preserve_unobserved_entries` exists "so the next diff compares
-like with like"; the engine contract is that a cursor checkpoint marks observed
-ground.
-
-Each lane keeps the stale entry but also checkpoints a fresh collection token
-in the same snapshot, so every later poll short-circuits or syncs incrementally
-from that token and the refused member's change is never asked about again:
-
-1. CalDAV `sync-collection` lane (`account.rs::apply_sync_report` plus
-   `changes_from_cursor`): a member with non-2xx, non-404/410 status (403, 503,
-   507) is skipped (`continue`) while `current.sync_token` moves to the new
-   token. RFC 6578 tokens are incremental, so the member's real change (create,
-   update, even delete) is not reported again until something else touches it.
-2. CalDAV snapshot-poll fallback: `event_snapshot(.., None, ..)` calls
-   `collection_sync_token` then the listing. If the listing is an empty 207
-   (the guard keeps `previous` verbatim) or has `failed` members, the result
-   still carries the freshly read token, and from the next poll the cursor
-   takes the `sync-collection` branch from it. The reference states the shape
-   it treats as safe: "The checkpoint preserves the prior entries and etags for
-   both no-observation shapes while retaining a refreshed collection token".
-   Keeping that refreshed token is the bug.
-3. CalDAV `establish_initial_cursor` / `inventory_stream`: the initial snapshot
-   leaves `failed_hrefs` out of `entries` (and `cursor_from_snapshot` does not
-   persist `failed_hrefs`) but records the collection's `sync-token`; the first
-   `sync-collection` never mentions a resource that existed before it, so a
-   member refused during establishment never reaches the consumer until next
-   modified.
-4. CardDAV ctag short-circuit (`carddav/src/account.rs::changes_stream`): a poll
-   whose listing was an empty 207 or had failed members keeps previous entries
-   but stores `current_ctag`; next poll `prev_ctag == current_ctag` returns with
-   no listing. A transiently failed member keeps its stale etag indefinitely,
-   and changes hidden behind an empty 207 wait until the ctag moves again.
-
-Fix direction: when an observation was incomplete (empty-207 guard fired,
-`failed_hrefs` non-empty, a sync member refused), do not advance the token:
-checkpoint the previous token, or `None` to force a snapshot diff. Stronger:
-persist pending failed hrefs in the cursor payload so the next poll re-checks
-them (a cursor envelope bump the crate already knows how to do). The hunter's
-structural note: the three snapshot lanes (sync-token incremental, ctag
-short-circuit, full diff) each decide independently whether an observation was
-complete; one `Observation { complete: bool, pending: Vec<href> }` type in
-`dav-core::snapshot`, consumed by one advance-token-only-if-complete rule,
-would let both crates share the decision as they share the diff.
-
-## DAV-002 - Inventory claims COMPLETE coverage while leaving out members the server refused
-
-Scope: dav. Both crates.
-
-Both `inventory_stream`s say: "COMPLETE coverage is an accurate claim here:
-this walk terminates wholesale on any failure, so it never advances a checkpoint
-across a gap. A version that starts absorbing per-item failures must build
-`InventoryBatch` directly rather than converting." `reference/types.md`: a
-completeness claim discharges the coverage debt for the domain.
-
-The walk does absorb per-item failures. `event_snapshot` / `contact_snapshot`
-go through `list_event_hrefs_filtered` / `list_contacts_listing`, which return
-`Usable` when at least one member committed even if others' propstats failed
-(`classify_207`), putting the failures in `failed_hrefs`. `inventory_stream`
-builds `items` from `snapshot.entries` only, drops `failed_hrefs`, and lifts
-with `lift_complete_walk`. A consumer or engine reading a complete inventory as
-authoritative treats a transiently refused event or contact as gone: the exact
-case the comment says must not be converted. Emit `CoverageOutcome::Degraded`
-with the failed ids as obligations, or fail the walk.
-
 ## DAV-003 - Bearer accounts never refresh on 401; an expired token is reported as `AuthLost`
 
 Scopes: dav and net adoption (both reported it independently). Related:
@@ -199,24 +129,6 @@ ladder's `ConcurrencyConflict` mapping. `move_resource` documents "Only 405 and
 retries non-idempotent requests the arm is dead and the comment should say so.
 See SHARED-007 for the two idempotency authorities underneath this.
 
-## DAV-007 - The CalDAV `sync-collection` lane matches hrefs by bytes, unlike the rest of the crate
-
-Scope: dav.
-
-`apply_sync_report` finds the entry with `known.uri == uri` (and
-`binary_search_by` on byte order). Snapshot entries come from the
-`calendar-query` / PROPFIND listing and sync entries from the REPORT, each
-resolved through `resolve_href`, which does not canonicalise percent-encoding
-case or redundant escapes. The crate already found that two spellings of one
-URL occur in practice (the `same_dav_url` story behind the spurious MOVE) and
-applies `same_dav_url` to the collection's own response in
-`take_collection_response`, but not to members. A server spelling a member
-`%40` in one REPORT and `@` in another yields a phantom `Created` plus a stale
-entry never destroyed, and a 404 for the other spelling is ignored as "unknown
-href". The other-readers-of-the-same-identity lesson. Structural fix:
-canonicalise every href once at `resolve_href` so string equality is DAV
-identity everywhere.
-
 ## DAV-008 - iTIP REPLY omits SEQUENCE
 
 Scope: dav.
@@ -230,31 +142,6 @@ ignore or misapply the reply. The reference says RSVP "posts an iTIP
 locally regardless, so the user sees accepted while the organizer may not.
 (Per-occurrence RSVP is refused by design, so RECURRENCE-ID is not needed
 today.)
-
-## DAV-009 - CardDAV `contact_search` doc falsely says CalDAV treats an omitted limit as unbounded
-
-Scope: dav. Doc only.
-
-`carddav/src/account.rs` on `contact_search`: "the CalDAV twin's
-`events_in_range` and `event_search` instead treat an omitted `limit` as
-UNBOUNDED". False: CalDAV maps `None` to `EVENT_PAGE_SIZE` (250), and
-`reference/caldav.md` says so, "matching the CardDAV twin's
-`CONTACT_PAGE_SIZE`". Test comments in the same file ("the CalDAV twin's
-unbounded one") carry the same stale claim.
-
-## DAV-010 - The cursor payload's collection URL is not checked against the cursor scope
-
-Scope: dav. Both crates.
-
-`decode_cursor_snapshot` validates the scope kind, then trusts
-`decoded.collection_url` from the opaque bytes, and `changes_stream` polls that
-URL, not the `FolderId` in `cursor.scope`. A cursor whose scope and payload
-disagree (consumer or migration bug, or a scope rename after a calendar URL
-correction) silently syncs collection B and reports under scope A. The
-credential gate bounds damage to admitted origins, but on one origin it is a
-cross-collection mixup with no error. An equality check
-(`same_dav_url(scope folder, payload url)`) turning a mismatch into
-`SchemaIncompatible` / `CursorInvalid` closes it.
 
 ## DAV-012 - CardDAV hand-parses a status line and gets the protocol-less form wrong
 
@@ -288,3 +175,11 @@ terminal one, and the engine terminates instead of resyncing or quarantining
 the scope. A new terminal class lands at `u8::MAX` (beats `AuthLost`). If a
 severity order is wanted it is a property of `RecoveryClass` and belongs next to
 `is_terminal` or `plan_recovery`.
+
+## DAV-007 - Full snapshot diff and failed-href preservation still compare member identity by bytes
+
+Residue: sync reports now match equivalent URL spellings. The snapshot diff and
+the failed-href preservation still compare by bytes, so a server changing a
+member's spelling between listings can misclassify it. Canonicalising once at
+`resolve_href` was declined because it also changes listing, hydration and
+persisted identities; a migration-aware decision is needed.

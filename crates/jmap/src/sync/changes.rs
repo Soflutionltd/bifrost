@@ -164,11 +164,13 @@ pub(crate) fn stream<T: HttpTransport>(
 /// emits `ScopeLifecycleEvent`s rather than `SyncEvent<Change>`, reads
 /// each changed object back with a follow-up `Mailbox/get`, never
 /// checkpoints, and lives for the account rather than for one walk. It
-/// shares the part that is genuinely common - `ChangeWalkGuard` - and
-/// nothing more. The inventory walk in `inventory.rs` is a different
-/// shape again (query-then-get, anchored rather than state-based, with
-/// its own re-served-anchor and superseded-`queryState` exits that end
-/// WITHOUT a `Done`), so it too stays separate.
+/// shares `ChangeWalkGuard` and the cursor-scoped error classifier. Expiry
+/// restarts an engine-owned change scope, but lifecycle must reconcile a
+/// fresh name snapshot locally: forwarding a scope restart would end its
+/// only reader without rebuilding topology. Inventory is different again:
+/// its immutable sort and stable ties allow queryState churn, while a lost
+/// anchor requires a scope restart. A single reseed policy would erase
+/// these different coverage obligations, so the three loops stay separate.
 fn changes_walk<T, M, O>(
     mail: MailAccount<T>,
     account_id: String,

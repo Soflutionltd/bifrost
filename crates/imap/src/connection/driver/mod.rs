@@ -133,6 +133,9 @@ pub(super) enum UpgradePayload {
         tls_connector: native_tls::TlsConnector,
         /// Server name for TLS SNI and certificate verification.
         server_name: String,
+        /// Shared with the connection handle so encryption state changes at
+        /// the stream swap, even if the post-upgrade CAPABILITY fails.
+        tls_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
     /// COMPRESS=DEFLATE upgrade (RFC 4978).
     ///
@@ -434,7 +437,10 @@ pub(super) async fn driver_task(
                             &mut event_sink,
                             payload,
                         ).await;
-                        if result.as_ref().is_err_and(Error::is_connection_fatal) {
+                        if result.as_ref().is_err_and(Error::is_connection_fatal)
+                            || (result.is_err()
+                                && state.session_state() == super::SessionState::Logout)
+                        {
                             state.apply_infrastructure_failure();
                             cmd_rx.close();
                         }

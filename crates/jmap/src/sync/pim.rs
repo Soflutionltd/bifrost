@@ -125,13 +125,13 @@ pub(crate) fn set_keyword<T: HttpTransport>(
         let ids = resolve_target(&mail, target, AccountOperation::SetKeyword).await?;
         let keyword_for_set = keyword.clone();
         let ids_for_set = ids.clone();
-        let mut response = send_email_set_with_retry(
+        let mut response = send_email_set(
             &mail,
             &email_states,
             &account_id,
             AccountOperation::SetKeyword,
-            move |state| {
-                let mut set = EmailSet::new().if_in_state(state.to_string());
+            move || {
+                let mut set = EmailSet::new();
                 for id in &ids_for_set {
                     set.update(id.clone()).keyword(&keyword_for_set, value);
                 }
@@ -298,7 +298,6 @@ pub(crate) fn send_message<T: HttpTransport>(
             let window = std::time::Duration::from_secs(max_delayed_send as u64);
             bifrost_types::validate_scheduled(at, Some(window))?;
         }
-        let envelope_from = request.from.clone();
         let envelope_recipients = request
             .to
             .iter()
@@ -306,6 +305,27 @@ pub(crate) fn send_message<T: HttpTransport>(
             .chain(&request.bcc)
             .cloned()
             .collect::<Vec<_>>();
+        if scheduled.is_some() && envelope_recipients.is_empty() {
+            return Err(scheduled_requires_envelope());
+        }
+        if scheduled.is_some() && request.from.is_none() && identity.is_none() {
+            if let Some(identity_id) = personal_identity.as_ref() {
+                let selected = primary_sending_identity(&mail, identity_id).await?;
+                request.from = Some(bifrost_types::Address {
+                    name: selected.name,
+                    address: selected.email,
+                });
+            } else {
+                return Err(scheduled_requires_envelope());
+            }
+        }
+        let envelope_from = request.from.clone();
+        if scheduled.is_some() && envelope_from.is_none() {
+            // JMAP has no default Identity: only an explicit identity id can
+            // supply From when the caller omits it. Do not choose an
+            // arbitrary Identity/get row, whose order is server-defined.
+            return Err(scheduled_requires_envelope());
+        }
         // One batched Mailbox/get for both roles: `fetch_mailboxes` is an
         // uncached full listing, so resolving Drafts and Sent separately
         // would double the wire cost of the hottest write path.
@@ -360,11 +380,6 @@ pub(crate) fn send_message<T: HttpTransport>(
                         .iter()
                         .map(submission_address_from_compose),
                 );
-            } else if scheduled.is_some() {
-                // A scheduled send needs an envelope mailFrom to carry
-                // the hold parameter; without an explicit `from` and
-                // recipients there is nowhere to stamp it.
-                return Err(scheduled_requires_envelope());
             }
         }
 
@@ -656,13 +671,13 @@ pub(crate) fn draft_update<T: HttpTransport>(
         )
         .await?;
         let email_id_for_set = email_id.clone();
-        let mut response = send_email_set_with_retry(
+        let mut response = send_email_set(
             &mail,
             &email_states,
             &account_id,
             AccountOperation::DraftUpdate,
-            move |state| {
-                let mut set = EmailSet::new().if_in_state(state.to_string());
+            move || {
+                let mut set = EmailSet::new();
                 set.update_item(email_id_for_set.clone(), email_patch.clone());
                 set
             },
@@ -1195,7 +1210,7 @@ pub(crate) fn identities_list<T: HttpTransport>(
 }
 
 #[cfg_attr(test, derive(Debug))]
-struct ForeignIdentity {
+struct SendingIdentity {
     id: String,
     name: Option<String>,
     email: String,
@@ -1208,7 +1223,7 @@ struct ForeignIdentity {
 async fn foreign_sending_identity<T: HttpTransport>(
     mail: &MailAccount<T>,
     requested: Option<&bifrost_types::IdentityId>,
-) -> Result<ForeignIdentity, AccountError> {
+) -> Result<SendingIdentity, AccountError> {
     let get = IdentityGet::new().properties([
         crate::identity::Property::Id,
         crate::identity::Property::Name,
@@ -1222,21 +1237,53 @@ async fn foreign_sending_identity<T: HttpTransport>(
         .call(get)
         .await
         .map_err(to_acct_err(AccountOperation::Send))?;
-    select_concrete_identity(response.into_list(), requested.is_some())
+    select_concrete_identity(
+        response.into_list(),
+        if requested.is_some() {
+            "requested foreign sending identity is absent or has no concrete email"
+        } else {
+            "foreign account advertises no sending identity"
+        },
+    )
+}
+
+/// Resolve only a caller-selected primary identity for scheduled envelope
+/// fallback. JMAP has no default identity, and Identity/get order is not a
+/// selection contract.
+async fn primary_sending_identity<T: HttpTransport>(
+    mail: &MailAccount<T>,
+    requested: &bifrost_types::IdentityId,
+) -> Result<SendingIdentity, AccountError> {
+    let response = mail
+        .call(
+            IdentityGet::new()
+                .ids([JmapIdentityId::new(requested.0.clone())])
+                .properties([
+                    crate::identity::Property::Id,
+                    crate::identity::Property::Name,
+                    crate::identity::Property::Email,
+                ]),
+        )
+        .await
+        .map_err(to_acct_err(AccountOperation::Send))?;
+    select_concrete_identity(
+        response.into_list(),
+        "requested sending identity is absent or has no concrete email",
+    )
 }
 
 /// Pure identity selection: first row with a concrete (non-empty,
-/// non-wildcard) email. `requested` only shapes the rejection detail (the
-/// server was asked for a specific id, so an empty result means that id is
-/// absent or wildcard-only, not that the account has no identity at all).
+/// non-wildcard) email. Callers provide the detail for an empty or
+/// wildcard-only result, since a by-id read and a foreign account listing
+/// describe different failures.
 fn select_concrete_identity(
     rows: Vec<crate::identity::Identity>,
-    requested: bool,
-) -> Result<ForeignIdentity, AccountError> {
+    missing_detail: &str,
+) -> Result<SendingIdentity, AccountError> {
     let mut concrete = rows.into_iter().filter_map(|mut identity| {
         let id = identity.take_id().into_string();
         let email = identity.email()?.to_string();
-        (!id.is_empty() && !email.is_empty() && !email.contains('*')).then(|| ForeignIdentity {
+        (!id.is_empty() && !email.is_empty() && !email.contains('*')).then(|| SendingIdentity {
             id,
             name: identity.name().map(str::to_string),
             email,
@@ -1245,15 +1292,10 @@ fn select_concrete_identity(
     if let Some(identity) = concrete.next() {
         return Ok(identity);
     }
-    let detail = if requested {
-        "requested foreign sending identity is absent or has no concrete email"
-    } else {
-        "foreign account advertises no sending identity"
-    };
     Err(super::error::unsupported_error(
         AccountOperation::Send,
         None,
-        detail,
+        missing_detail,
     ))
 }
 
@@ -1815,15 +1857,14 @@ async fn patch_mailbox_membership_of<T: HttpTransport>(
     // qualification the selected account does not use.
     let mailbox = MailboxId::new(wire_id_for_mail(&container.0, mail.id_str()));
     let ids_for_set = ids.clone();
-    let mut response =
-        send_email_set_with_retry(mail, email_states, account_id, op, move |state| {
-            let mut set = EmailSet::new().if_in_state(state.to_string());
-            for id in &ids_for_set {
-                set.update(id.clone()).mailbox_id(&mailbox, value);
-            }
-            set
-        })
-        .await?;
+    let mut response = send_email_set(mail, email_states, account_id, op, move || {
+        let mut set = EmailSet::new();
+        for id in &ids_for_set {
+            set.update(id.clone()).mailbox_id(&mailbox, value);
+        }
+        set
+    })
+    .await?;
     for id in &ids {
         response.updated(id).map_err(to_acct_err(op))?;
     }
@@ -1949,74 +1990,42 @@ async fn destroy_emails<T: HttpTransport>(
         return Ok(());
     }
     let ids_for_set = ids_vec.clone();
-    let mut response =
-        send_email_set_with_retry(mail, email_states, account_id, op, move |state| {
-            EmailSet::new()
-                .if_in_state(state.to_string())
-                .destroy(ids_for_set.clone())
-        })
-        .await?;
+    let mut response = send_email_set(mail, email_states, account_id, op, move || {
+        EmailSet::new().destroy(ids_for_set.clone())
+    })
+    .await?;
     for id in &ids_vec {
         response.destroyed(id).map_err(to_acct_err(op))?;
     }
     Ok(())
 }
 
-async fn send_email_set_with_retry<T: HttpTransport, F>(
+async fn send_email_set<T: HttpTransport, F>(
     mail: &MailAccount<T>,
     email_states: &StateMap,
     account_id: &str,
     op: AccountOperation,
-    mut make_set: F,
+    make_set: F,
 ) -> Result<crate::core::set::SetResponse<Email>, AccountError>
 where
-    F: FnMut(&str) -> EmailSet,
+    F: FnOnce() -> EmailSet,
 {
-    let mut state = current_or_probe_email_state(mail, email_states, account_id, op).await?;
-    let err_fn = to_acct_err(op);
-    let response = match mail.call(make_set(&state)).await {
-        Ok(response) => response,
-        Err(err) => {
-            if !super::error::is_state_mismatch(&err) {
-                return Err(err_fn(err));
-            }
-            let fresh = super::mutation::probe_email_state(mail)
-                .await
-                .map_err(to_acct_err(op))?;
-            state_cache::set(email_states, account_id, fresh.clone()).await;
-            state = fresh;
-            mail.call(make_set(&state)).await.map_err(to_acct_err(op))?
-        }
-    };
+    // These writes are narrow field/path patches or destroys by explicit id.
+    // An account-wide `ifInState` rejects them after an unrelated Email
+    // change, while a patch preserves fields it does not name. Keep the cache
+    // advance compare-and-swap guarded without probing before the write.
+    let prior_state = state_cache::get(email_states, account_id).await;
+    let response = mail.call(make_set()).await.map_err(to_acct_err(op))?;
     if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
         state_cache::advance(
             email_states,
             account_id,
-            Some(&state),
+            prior_state.as_deref(),
             new_state.to_string(),
         )
         .await;
     }
     Ok(response)
-}
-
-async fn current_or_probe_email_state<T: HttpTransport>(
-    mail: &MailAccount<T>,
-    email_states: &StateMap,
-    account_id: &str,
-    op: AccountOperation,
-) -> Result<String, AccountError> {
-    if let Some(state) = state_cache::get(email_states, account_id).await {
-        return Ok(state);
-    }
-    let state = super::mutation::probe_email_state(mail)
-        .await
-        .map_err(to_acct_err(op))?;
-    if let Some(existing) = state_cache::get(email_states, account_id).await {
-        return Ok(existing);
-    }
-    state_cache::set(email_states, account_id, state.clone()).await;
-    Ok(state)
 }
 
 async fn role_mailbox<T: HttpTransport>(
@@ -3277,14 +3286,16 @@ fn rfc3339(at: SystemTime) -> String {
         .unwrap_or_default()
 }
 
-/// A scheduled JMAP send needs an envelope mailFrom (explicit `from` +
-/// recipients) to carry the hold parameter. Maps to `Request(Malformed)`.
+/// A scheduled JMAP send needs a concrete mailFrom and recipients to carry
+/// the hold parameter. A caller-selected Identity can supply mailFrom when
+/// `from` is absent; without either, JMAP defines no default identity to use.
+/// Maps to `Request(Malformed)`.
 fn scheduled_requires_envelope() -> AccountError {
     bifrost_types::AccountErrorBuilder::new(
         bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
         bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
             detail: bifrost_types::DiagnosticText::user_safe(
-                "Scheduled send requires an explicit from address and at least one recipient.",
+                "Scheduled send requires a from address or selected identity and at least one recipient.",
             ),
         }),
     )
@@ -5464,7 +5475,8 @@ mod tests {
             {"id": "i0", "name": "Shared", "email": "shared@example.test"},
             {"id": "i1", "email": "other@example.test"},
         ]));
-        let picked = select_concrete_identity(rows, false).expect("first concrete identity");
+        let picked = select_concrete_identity(rows, "no foreign sending identity")
+            .expect("first concrete identity");
         assert_eq!(picked.id, "i0");
         assert_eq!(picked.email, "shared@example.test");
         assert_eq!(picked.name.as_deref(), Some("Shared"));
@@ -5477,13 +5489,15 @@ mod tests {
             {"id": "i1", "email": "*@example.test"},
             {"id": "i2", "email": "concrete@example.test"},
         ]));
-        let picked = select_concrete_identity(rows, false).expect("concrete over wildcard");
+        let picked = select_concrete_identity(rows, "no foreign sending identity")
+            .expect("concrete over wildcard");
         assert_eq!(picked.id, "i2");
     }
 
     #[test]
     fn select_concrete_identity_empty_list_rejects_unsupported() {
-        let err = select_concrete_identity(Vec::new(), false).expect_err("no identity to send as");
+        let err = select_concrete_identity(Vec::new(), "no foreign sending identity")
+            .expect_err("no identity to send as");
         assert!(matches!(
             err.kind(),
             bifrost_types::AccountErrorKind::Unsupported(AccountOperation::Send)
@@ -5495,7 +5509,7 @@ mod tests {
         // A by-id get that returns nothing usable is a distinct rejection
         // detail from the empty-account case, but still `Unsupported(Send)`.
         let rows = identity_rows(serde_json::json!([{"id": "i0", "email": "*"}]));
-        let err = select_concrete_identity(rows, true)
+        let err = select_concrete_identity(rows, "requested identity has no concrete email")
             .expect_err("requested identity has no concrete email");
         assert!(matches!(
             err.kind(),
@@ -5658,6 +5672,17 @@ mod tests {
                                 "newState": "email-deleted-state",
                                 "destroyed": destroyed
                             })
+                        } else if let Some(updated) = args["update"].as_object() {
+                            let updated = updated
+                                .keys()
+                                .map(|id| (id.clone(), serde_json::Value::Null))
+                                .collect::<serde_json::Map<_, _>>();
+                            serde_json::json!({
+                                "accountId": account_id,
+                                "oldState": args["ifInState"],
+                                "newState": "email-updated-state",
+                                "updated": updated
+                            })
                         } else {
                             let create_id = args["create"]
                                 .as_object()
@@ -5672,6 +5697,24 @@ mod tests {
                                 "created": Self::keyed(create_id, serde_json::json!({"id": "email-created"}))
                             })
                         }
+                    }
+                    "Identity/get" => {
+                        let identity_id = args["ids"][0].as_str().unwrap_or("identity-primary");
+                        let email = if identity_id == "identity-selected" {
+                            "selected@example.test"
+                        } else {
+                            "identity@example.test"
+                        };
+                        serde_json::json!({
+                            "accountId": account_id,
+                            "state": "identity-state",
+                            "list": [{
+                                "id": identity_id,
+                                "name": "Sender",
+                                "email": email
+                            }],
+                            "notFound": []
+                        })
                     }
                     "Email/import" => serde_json::json!({
                         "accountId": account_id,
@@ -5816,6 +5859,34 @@ mod tests {
         request.to = vec![bifrost_types::Address::bare("to@example.test")];
         request.body_text = Some("hello".to_string());
         request
+    }
+
+    #[tokio::test]
+    async fn keyword_patch_avoids_an_account_wide_state_probe_and_precondition() {
+        let transport = SendTransport::new(false, false, false, false);
+        let states = send_state_map();
+        state_cache::set(&states, "primary", "cached-state".to_string()).await;
+
+        set_keyword(
+            send_account(transport.clone()),
+            Arc::clone(&states),
+            "primary".to_string(),
+            MutationTarget::Message(ObjectId("email-old".to_string())),
+            "$seen".to_string(),
+            true,
+        )
+        .await
+        .expect("commutative keyword patch succeeds");
+
+        assert_eq!(transport.method_sequence(), vec!["Email/set"]);
+        let sets = transport.calls("Email/set");
+        assert_eq!(sets.len(), 1);
+        assert!(sets[0].get("ifInState").is_none());
+        assert_eq!(sets[0]["update"]["email-old"]["keywords/$seen"], true);
+        assert_eq!(
+            state_cache::get(&states, "primary").await.as_deref(),
+            Some("email-updated-state")
+        );
     }
 
     #[tokio::test]
@@ -5968,7 +6039,7 @@ mod tests {
         assert_eq!(sets.len(), 2, "create, followed by best-effort destroy");
         assert!(sets[0]["create"].is_object());
         assert_eq!(sets[1]["destroy"], serde_json::json!(["email-created"]));
-        assert_eq!(sets[1]["ifInState"], "email-created-state");
+        assert!(sets[1].get("ifInState").is_none());
         let submissions = transport.calls("EmailSubmission/set");
         assert_eq!(submissions.len(), 1);
         assert!(
@@ -6004,7 +6075,7 @@ mod tests {
         let destroys = transport.calls("Email/set");
         assert_eq!(destroys.len(), 1, "the imported email is destroyed");
         assert_eq!(destroys[0]["destroy"], serde_json::json!(["email-created"]));
-        assert_eq!(destroys[0]["ifInState"], "email-imported-state");
+        assert!(destroys[0].get("ifInState").is_none());
         let submissions = transport.calls("EmailSubmission/set");
         assert_eq!(submissions.len(), 1);
         assert!(
@@ -6048,6 +6119,83 @@ mod tests {
             serde_json::json!([format!("#{SUBMISSION_CREATE_ID}")])
         );
         assert!(create["envelope"]["mailFrom"]["parameters"]["holduntil"].is_string());
+    }
+
+    #[tokio::test]
+    async fn scheduled_send_uses_the_selected_identity_when_from_is_absent() {
+        let transport = SendTransport::new(false, false, false, false);
+        let mut request = basic_send_request();
+        request.from = None;
+        request.identity = Some(bifrost_types::IdentityId("identity-selected".to_string()));
+        request.scheduled =
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(4_102_444_800));
+
+        let result = send_message(
+            send_account(transport.clone()),
+            send_state_map(),
+            "primary".to_string(),
+            usize::MAX,
+            None,
+            request,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            transport.method_sequence(),
+            vec![
+                "Identity/get",
+                "Mailbox/get",
+                "Email/set",
+                "EmailSubmission/set"
+            ]
+        );
+        let identities = transport.calls("Identity/get");
+        assert_eq!(
+            identities[0]["ids"],
+            serde_json::json!(["identity-selected"])
+        );
+        let emails = transport.calls("Email/set");
+        let email_create = emails[0]["create"]
+            .as_object()
+            .and_then(|creates| creates.values().next())
+            .expect("Email/create entry");
+        assert_eq!(email_create["from"][0]["email"], "selected@example.test");
+        let submissions = transport.calls("EmailSubmission/set");
+        let create = &submissions[0]["create"][SUBMISSION_CREATE_ID];
+        assert_eq!(
+            create["envelope"]["mailFrom"]["email"],
+            "selected@example.test"
+        );
+        assert!(create["envelope"]["mailFrom"]["parameters"]["holduntil"].is_string());
+        assert_eq!(create["identityId"], "identity-selected");
+    }
+
+    #[tokio::test]
+    async fn scheduled_send_does_not_guess_an_identity_when_none_is_selected() {
+        let transport = SendTransport::new(false, false, false, false);
+        let mut request = basic_send_request();
+        request.from = None;
+        request.identity = None;
+        request.scheduled =
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(4_102_444_800));
+
+        let error = send_message(
+            send_account(transport.clone()),
+            send_state_map(),
+            "primary".to_string(),
+            usize::MAX,
+            None,
+            request,
+        )
+        .await
+        .expect_err("JMAP does not identify a default Identity");
+
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert!(transport.method_sequence().is_empty());
     }
 
     #[tokio::test]

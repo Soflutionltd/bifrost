@@ -737,6 +737,7 @@ pub struct ScopeToken {
     /// paths that drive a scope on their own initiative (the push reconciler)
     /// must be able to tell the two apart.
     parked: bool,
+    drive_generation: Option<crate::cursor::DriveGeneration>,
 }
 
 impl ScopeToken {
@@ -754,6 +755,7 @@ impl ScopeToken {
             generation: SCOPE_TOKEN_GENERATION.fetch_add(1, Ordering::Relaxed),
             token: CancellationToken::new(),
             parked: true,
+            drive_generation: None,
         }
     }
 
@@ -960,18 +962,23 @@ impl Multiplexer {
                                             break;
                                         }
                                         LifecycleTermination::Terminate => {
-                                            // Auth/policy/provider terminal
-                                            // errors cannot be revived by an
-                                            // account reopen. Surface the
-                                            // classified failure once and end
-                                            // this lifecycle reader.
+                                            // Do not retry this failed handle. An explicit
+                                            // reattach can repair credentials or policy, so
+                                            // keep the reader alive to observe its generation.
                                             let _ = lifecycle_changes.send(MultiplexerEvent {
                                                 scope: CursorScope::Account,
                                                 event: Arc::new(SyncEvent::Terminated(err)),
                                                 checkpoint: None,
                                                 publication: None,
                                             });
-                                            return;
+                                            tokio::select! {
+                                                () = lifecycle_shutdown.cancelled() => return,
+                                                changed = lifecycle_generation.changed() => {
+                                                    if changed.is_err() { return; }
+                                                    reopened = true;
+                                                }
+                                            }
+                                            break;
                                         }
                                         LifecycleTermination::Reconnect => break,
                                     }
@@ -1052,13 +1059,12 @@ impl Multiplexer {
     ) -> Result<(), Error> {
         match done {
             Some(Checkpoint::Change(c)) if &c.scope == scope => {
-                // Last account-authored seam before the registry. A wrong
-                // outer version is a bad cursor, not a bug in this engine, so
-                // it classifies as schema recovery rather than reaching the
-                // registry's unreachable-by-construction debug assertion.
+                // This cursor was just minted by Account, not decoded from disk.
                 c.validate_envelope().map_err(|_| {
-                    Error::Account(crate::recovery::cursor_decode_failure(
+                    Error::Account(crate::recovery::fresh_cursor_contract_error(
+                        Some(&Checkpoint::Change(c.clone())),
                         bifrost_types::AccountOperation::SyncInventory,
+                        scope,
                     ))
                 })?;
                 self.cursors.put(c);
@@ -1103,12 +1109,14 @@ fn spawn_and_track_scope_poll(
 ) {
     let scope_cancel = shutdown.child_token();
     let generation = SCOPE_TOKEN_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let drive_generation = cursors.drive_generation(&scope);
     scope_tokens.lock().expect("poisoned").insert(
         scope.clone(),
         ScopeToken {
             generation,
             token: scope_cancel.clone(),
             parked: false,
+            drive_generation: Some(drive_generation),
         },
     );
     let cleanup_tokens = Arc::clone(&scope_tokens);
@@ -1136,16 +1144,9 @@ fn spawn_and_track_scope_poll(
         // of a once-per-second re-drive. The scope-retiring paths still clear
         // the entry, so a scope that is deleted-and-recreated respawns cleanly.
         //
-        // Those paths are narrower than this comment used to claim.
-        // `cancel_scope_token` has exactly ONE production caller: the
-        // lifecycle `Deleted` handler. An engine restart of a scope
-        // (`RestartScope`, and likewise `DowngradeCapabilityForScope` and
-        // `DisableScope`) calls `CursorRegistry::delete` and never touches this
-        // map, so on those paths the entry is cleared only when the task itself
-        // exits. What ends a STALLED drive on every one of them is the
-        // registry's own per-scope liveness token, which `with_drive` races -
-        // that token, not this map, is what also covers the push reconciler,
-        // which holds no entry here at all.
+        // Registry restart paths need not edit this map: discovery and push
+        // dispatch retire entries bound to an obsolete drive generation. A late
+        // terminal result can only park its original ownership generation.
         match exit {
             PollExit::Retire => retire_scope_token(&cleanup_tokens, &cleanup_scope, generation),
             // Mark the tombstone as such, by identity, so the push reconciler
@@ -1182,6 +1183,39 @@ fn park_scope_token(tokens: &ScopeTokens, scope: &CursorScope, generation: u64) 
     }
 }
 
+/// Stop the poll owner and leave a terminal tombstone for a push drive.
+///
+/// A push reconcile can reach a terminal recovery verdict while the poll
+/// worker is asleep on cadence. Cancelling that owner alone would make the
+/// one-second discovery loop respawn it, while merely marking it would leave
+/// it alive to poll again. Replace the matching registration with a fresh
+/// tombstone bound to the drive generation; the cancelled owner's cleanup is
+/// generation-checked and cannot remove the replacement.
+pub(crate) fn park_scope_for_drive(
+    tokens: &ScopeTokens,
+    cursors: &CursorRegistry,
+    scope: &CursorScope,
+    drive_generation: crate::cursor::DriveGeneration,
+) {
+    if cursors.drive_generation(scope) != drive_generation {
+        return;
+    }
+    let mut entries = tokens.lock().expect("poisoned");
+    if entries.get(scope).is_some_and(|entry| {
+        entry
+            .drive_generation
+            .is_some_and(|generation| generation != drive_generation)
+    }) {
+        return;
+    }
+    if let Some(owner) = entries.remove(scope) {
+        owner.cancel();
+    }
+    let mut tombstone = ScopeToken::tombstone();
+    tombstone.drive_generation = Some(drive_generation);
+    entries.insert(scope.clone(), tombstone);
+}
+
 /// Whether this scope is a terminal tombstone: a poll task exited on a
 /// terminal recovery verdict and nothing has cleared the entry since.
 ///
@@ -1195,6 +1229,28 @@ pub fn scope_is_parked(tokens: &ScopeTokens, scope: &CursorScope) -> bool {
         .expect("poisoned")
         .get(scope)
         .is_some_and(|entry| entry.parked)
+}
+
+/// Ownership and terminal state belong to the registry drive incarnation.
+/// Comparing the existing fence covers both scope restart and reattach without
+/// requiring every recovery caller to remember a second reset operation. Merely
+/// clearing on account replacement would leave scope-only restarts stranded.
+/// Keeping task cleanup identity separate prevents an old task retiring its successor.
+pub(crate) fn retire_stale_scope_token(
+    tokens: &ScopeTokens,
+    cursors: &CursorRegistry,
+    scope: &CursorScope,
+) {
+    let current = cursors.drive_generation(scope);
+    let mut entries = tokens.lock().expect("poisoned");
+    if entries.get(scope).is_some_and(|entry| {
+        entry
+            .drive_generation
+            .is_some_and(|generation| generation != current)
+    }) && let Some(entry) = entries.remove(scope)
+    {
+        entry.cancel();
+    }
 }
 
 pub(crate) fn cancel_scope_token(tokens: &ScopeTokens, scope: &CursorScope) {
@@ -1221,6 +1277,7 @@ fn spawn_missing_scope_polls(
     scheduler: crate::scheduler::Scheduler,
 ) {
     for scope in cursors.all_scopes() {
+        retire_stale_scope_token(&scope_tokens, &cursors, &scope);
         let should_spawn = {
             let mut g = scope_tokens.lock().expect("poisoned");
             match g.get(&scope) {
@@ -1873,6 +1930,78 @@ mod tests {
 
     fn scope_tokens() -> ScopeTokens {
         Arc::new(StdMutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn registry_replacement_and_scope_restart_retire_terminal_ownership() {
+        for replace_account in [false, true] {
+            let cursors = CursorRegistry::new();
+            let scope = CursorScope::Account;
+            let cursor = crate::test_common::cursor_for(&scope, b"initial");
+            cursors.put(cursor.clone());
+            let tokens = scope_tokens();
+            let mut entry = ScopeToken::tombstone();
+            entry.drive_generation = Some(cursors.drive_generation(&scope));
+            tokens
+                .lock()
+                .expect("poisoned")
+                .insert(scope.clone(), entry);
+            retire_stale_scope_token(&tokens, &cursors, &scope);
+            assert!(scope_is_parked(&tokens, &scope));
+            if replace_account {
+                let replacement = CursorRegistry::new();
+                replacement.put(cursor);
+                cursors.replace_topology_preserving_cursors(&replacement);
+            } else {
+                cursors.delete(&scope);
+                cursors.put(cursor);
+            }
+            retire_stale_scope_token(&tokens, &cursors, &scope);
+            assert!(!tokens.lock().expect("poisoned").contains_key(&scope));
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_bad_checkpoint_terminates_only_its_cursor_scope() {
+        let scope = CursorScope::Account;
+        let cursor = crate::test_common::cursor_for(&scope, b"initial");
+        let mut invalid = cursor.clone();
+        invalid.envelope_version = u32::MAX;
+        let mut account = crate::test_common::StubAccount::new(vec![scope.clone()]);
+        account.changes_hook = Some(Arc::new(move |_| {
+            vec![SyncEvent::Done(Some(Checkpoint::Change(invalid.clone())))]
+        }));
+        let cursors = Arc::new(CursorRegistry::new());
+        cursors.put(cursor.clone());
+        let (tx, mut rx) = broadcast::channel(4);
+        let delivery = Arc::new(ChangeDelivery::new(tx));
+        let (_boundary, view) = crate::cancel::Boundary::new();
+        let result = drive_changes_stream(
+            &account,
+            scope.clone(),
+            cursor,
+            cursors,
+            delivery,
+            view,
+            None,
+            None,
+        )
+        .await;
+        let Err(Error::Account(error)) = result else {
+            panic!("expected contract failure")
+        };
+        assert!(matches!(
+            crate::recovery::plan_recovery(error.clone()),
+            crate::recovery::RecoveryPlan::Terminal(_)
+        ));
+        assert_eq!(
+            error.scope(),
+            Some(&bifrost_types::ErrorScope::Cursor(scope))
+        );
+        assert!(matches!(
+            &*rx.try_recv().expect("termination published").event,
+            SyncEvent::Terminated(_)
+        ));
     }
 
     fn warning_event(message: &str) -> MultiplexerEvent {
@@ -2793,6 +2922,7 @@ mod tests {
                 generation,
                 token: CancellationToken::new(),
                 parked: false,
+                drive_generation: None,
             },
         );
         generation
@@ -2919,6 +3049,7 @@ mod tests {
                 generation: 7,
                 token: token.clone(),
                 parked: false,
+                drive_generation: None,
             },
         );
 
@@ -2943,6 +3074,7 @@ mod tests {
                 generation: 9,
                 token: CancellationToken::new(),
                 parked: false,
+                drive_generation: None,
             },
         );
 

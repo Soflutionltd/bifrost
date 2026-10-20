@@ -240,20 +240,24 @@ impl Scheduler {
         Self::with_lane_capacity(cfg, budget, LaneQueue::DEFAULT_CAPACITY)
     }
 
-    /// Construct with an explicit per-lane capacity. See `H4` in the
-    /// engine notes for why lane shedding matters under push storms.
+    /// Construct with an explicit per-lane capacity for work-item and
+    /// admission queues. Work-item queues use `DropOldest`; admission queues
+    /// refuse the incoming request when full.
     #[must_use]
     pub fn with_lane_capacity(
         cfg: SchedulerConfig,
         budget: BudgetGate,
         lane_capacity: usize,
     ) -> Self {
+        // A zero floor would satisfy `higher_consecutive >= floor` before
+        // any work is granted, reversing the intended priority order.
+        let starvation_floor = cfg.starvation_floor.max(1);
         let inner = Arc::new(SchedulerInner {
             foreground: LaneQueue::with_capacity(Priority::Foreground, lane_capacity),
             normal: LaneQueue::with_capacity(Priority::Normal, lane_capacity),
             background: LaneQueue::with_capacity(Priority::Background, lane_capacity),
             bulk: LaneQueue::with_capacity(Priority::Bulk, lane_capacity),
-            starvation_floor: cfg.starvation_floor,
+            starvation_floor,
             lane_capacity: lane_capacity.max(1),
             state: Mutex::new(SchedulerState::default()),
             admission: Mutex::new(AdmissionState::default()),
@@ -570,4 +574,122 @@ fn preference_rank(order: &[usize; LANES], lane: usize) -> usize {
         .iter()
         .position(|candidate| *candidate == lane)
         .unwrap_or(LANES)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scheduler(floor: u32) -> Scheduler {
+        Scheduler::new(
+            SchedulerConfig {
+                starvation_floor: floor,
+            },
+            BudgetGate::new(ConcurrencyBudget::default()),
+        )
+    }
+
+    fn item(priority: Priority, tag: &'static str) -> WorkItem {
+        WorkItem {
+            account: AccountId(tag.into()),
+            priority,
+            kind: WorkKind::Sync,
+            run: Box::new(|| {}),
+        }
+    }
+
+    #[test]
+    fn zero_starvation_floor_preserves_initial_work_item_priority() {
+        let scheduler = scheduler(0);
+        scheduler.submit(item(Priority::Bulk, "bulk"));
+        scheduler.submit(item(Priority::Foreground, "foreground"));
+
+        assert_eq!(
+            scheduler.try_pull().expect("foreground item").priority,
+            Priority::Foreground
+        );
+        assert_eq!(
+            scheduler.try_pull().expect("bulk item").priority,
+            Priority::Bulk
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_starvation_floor_preserves_initial_admission_priority() {
+        let budget = BudgetGate::new(ConcurrencyBudget {
+            per_account: 2,
+            global: 4,
+            mutation_share_num: 1,
+            mutation_share_den: 2,
+        });
+        let scheduler = Scheduler::new(
+            SchedulerConfig {
+                starvation_floor: 0,
+            },
+            budget.clone(),
+        );
+        let account = AccountId("zero-floor-admission".into());
+        // Consume capacity directly so the held permit does not count as a
+        // scheduler grant and advance its higher-priority starvation state.
+        let held = budget
+            .acquire(&account, WorkKind::Sync)
+            .await
+            .expect("hold the account's only sync permit");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let background = {
+            let scheduler = scheduler.clone();
+            let account = account.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let permit = scheduler
+                    .admit(account, Priority::Background, WorkKind::Sync)
+                    .await
+                    .expect("background admission");
+                tx.send(Priority::Background)
+                    .expect("record granted priority");
+                drop(permit);
+            })
+        };
+        let foreground = {
+            let scheduler = scheduler.clone();
+            let account = account.clone();
+            tokio::spawn(async move {
+                let permit = scheduler
+                    .admit(account, Priority::Foreground, WorkKind::Sync)
+                    .await
+                    .expect("foreground admission");
+                tx.send(Priority::Foreground)
+                    .expect("record granted priority");
+                drop(permit);
+            })
+        };
+
+        for _ in 0..64 {
+            let queued: usize = scheduler
+                .admission_snapshot()
+                .iter()
+                .map(|lane| lane.depth)
+                .sum();
+            if queued == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let queued: usize = scheduler
+            .admission_snapshot()
+            .iter()
+            .map(|lane| lane.depth)
+            .sum();
+        assert_eq!(queued, 2, "both requests must queue before release");
+
+        drop(held);
+        assert_eq!(
+            rx.recv().await,
+            Some(Priority::Foreground),
+            "zero must not make admission visit lower lanes first"
+        );
+        background.await.expect("background task");
+        foreground.await.expect("foreground task");
+    }
 }

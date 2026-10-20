@@ -790,7 +790,15 @@ builds a hybrid cursor from the calendar URL, the collection
 sync token, issuing the REPORT with `Depth: 0` as required by RFC 6578,
 and applies returned href/etag/status entries to the snapshot
 (deleting only on explicit per-entry `404`/`410`), and emits
-created/updated/destroyed event changes. A per-member status that is neither
+created/updated/destroyed event changes. Each report builds a hash index of
+normalized resource keys once from the snapshot, then maintains it as members
+are inserted or removed. Exact href spellings take priority; equivalent URL
+spellings reuse the first sorted existing native id without rewriting published
+ids. New hrefs therefore require a hash lookup instead of a snapshot-wide URL
+comparison scan. Keys follow `same_dav_url`, including segment-wise percent
+decoding, host case, default ports, query identity and trailing-slash handling.
+The sorted snapshot still incurs vector shifts on insertion and removal.
+A per-member status that is neither
 2xx nor `404`/`410` is the server declining to report on that member (403, 507,
 503): the prior entry is PRESERVED untouched rather than upserted, because an
 upsert records an etag-less entry and emits a change for a resource nobody
@@ -822,12 +830,20 @@ sync-token path) is hardened against destroy-everything failure modes: an
 empty multistatus against a populated prior snapshot suppresses the
 mass-delete, and any href in `current.failed_hrefs` is preserved rather
 than destroyed. The checkpoint preserves the prior entries and etags for
-both no-observation shapes while retaining a refreshed collection token.
+both no-observation shapes while retaining the prior collection token.
+The shared snapshot helper returns an `Observation`; only complete observations
+advance tokens. Initial snapshots with refused members carry no token, so the
+next poll repeats the listing. Incremental reports with refused members retain
+the last token before the refusal and stop draining, so the next poll retries
+the missing ground. Equivalent member URL spellings in sync reports match the
+existing entry and retain its native id for updates and deletions.
 This deliberately means a genuine delete-all is not reported on that poll or a
 later poll: the empty success is indistinguishable from the transient empty
 response the guard suppresses.
 `inventory_stream` emits event inventory entries with ETag fingerprints for
-the same cursor scope and reports full coverage of that one collection. Legacy
+the same cursor scope and reports full coverage of that one collection. A
+listing with refused members fails the inventory before emitting entries,
+coverage or a checkpoint, using the member status classification. Legacy
 `CursorScope::Type(CalendarEvent)` calls remain accepted for compatibility,
 target the default calendar, and report only a `caldav` provider region rather
 than falsely claiming whole-type coverage.
@@ -838,6 +854,9 @@ classified `SyncState(SchemaIncompatible)`, deriving to
 `Engine(SchemaIncompatible)` rather than a scope restart: only that directive
 also deletes the backfill checkpoint, and without the re-walk the objects
 already backfilled would keep their pre-correction id spelling.
+Folder-scoped cursors must name an equivalent collection URL in their payload;
+a mismatch is rejected as schema-incompatible before polling. Legacy type
+scopes have no collection URL to compare.
 An expired token reported as 403 with `DAV:valid-sync-token`, or as 410,
 becomes `SyncState(CursorInvalid)` scoped to the invalid calendar's own
 folder cursor (`ErrorScope::Cursor(CursorScope::Folder(collection url))`),

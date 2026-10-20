@@ -6,7 +6,7 @@
 //! - one frozen, vended `IdempotencyKey` per cohort (run_id + monotonic
 //!   sequence + protocol salt),
 //! - per-id accumulation through `ItemOutcome<MutationSuccess>` lanes
-//!   (applied / skipped / failed_terminal / pending_retry /
+//!   (applied / skipped / downgraded / failed_terminal / pending_retry /
 //!   pending_readback / blocked_by_engine),
 //! - retry on `RecoveryPlan::Retry`, respecting each cohort's `RetryAdvice`
 //!   deadline and resubmitting with its frozen key, within a campaign-wide
@@ -38,12 +38,22 @@ pub use readback::{
 /// that dedupe itself (the client-id space lives at the consumer);
 /// surfacing the count plus a `Warning::OperatorAttentionNeeded` is
 /// the contract.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct MutationCounters {
+    /// First campaign failure, with all counters retained. Preflight failures
+    /// (such as an unattached account) still use the method's `Err` return.
+    pub error: Option<std::sync::Arc<crate::error::Error>>,
+    /// Provider-reported weaker effects, retained without claiming the request
+    /// was satisfied. These targets are counted only in `downgraded`.
+    pub effects: Vec<(bifrost_types::ObjectId, bifrost_types::MutationEffect)>,
+    /// Targets successfully changed in a weaker way than requested.
+    pub downgraded: u64,
     pub applied: u64,
     pub skipped: u64,
     pub failed_terminal: u64,
     pub blocked_by_engine: u64,
+    /// Unresolved targets, including known-unsent work, exhausted retries,
+    /// observed non-landing writes, and inconclusive observations.
     pub pending_retry: u64,
     pub dedupe_by_client_id: u64,
 }

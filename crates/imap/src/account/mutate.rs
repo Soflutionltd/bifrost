@@ -12,7 +12,9 @@ use futures::StreamExt;
 use crate::types::{Flag, MailboxName, ResponseCode, StoreOperation};
 
 use super::targets::{TargetBatch, Verdict};
-use super::{DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id};
+use super::{
+    CompactUidSet, DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id,
+};
 
 pub(crate) fn bulk_set_flags(
     account: ImapAccount,
@@ -317,7 +319,7 @@ struct FolderMutationFailure {
     unaccounted: Vec<DecodedObjectId>,
 }
 
-/// Open the folder and fold its SELECT side effects into the MODSEQ cache.
+/// Open the folder without replaying the synchronization baseline.
 /// Split out from `run_folder_mutation` so every fallible step that precedes
 /// the first minted outcome sits in one place, and the id vector can be
 /// handed back untouched when any of them fails.
@@ -326,22 +328,14 @@ async fn open_folder_for_mutation(
     folder: &MailboxName,
 ) -> Result<(super::PooledConn, u32), crate::Error> {
     let mut conn = account.checkout_for_folder(folder).await?;
-    let cursor = account.folders.get(folder).and_then(|entry| entry.cursor());
+    // Mutation admission needs the live UIDVALIDITY, not a replay of all
+    // changes since the consumer's checkpoint. Keep its existing MODSEQ cache
+    // as the opportunistic STORE guard rather than refreshing it from a
+    // mutation's own QRESYNC SELECT before testing for a conflict.
     let selected = account
-        .select_folder(&mut conn, folder, cursor.as_ref(), false)
+        .select_folder(&mut conn, folder, None, false)
         .await?;
     let uidvalidity = super::selected_uidvalidity(&selected.mailbox)?;
-    for range in selected.mailbox.vanished.clone() {
-        let uids = super::folder_registry::expand_range(range);
-        account.folders.clear_modseqs(folder, uidvalidity, &uids);
-    }
-    for fetch in &selected.mailbox.changed_messages {
-        if let (Some(uid), Some(modseq)) = (fetch.uid, fetch.mod_seq) {
-            account
-                .folders
-                .record_modseq(folder, uidvalidity, uid, modseq)?;
-        }
-    }
     Ok((conn, uidvalidity))
 }
 
@@ -741,7 +735,7 @@ fn patch_mutation_verdict(
 fn store_applied_uid(uid: u32, outcome: &StoreWireOutcome) -> bool {
     match outcome {
         StoreWireOutcome::Applied => true,
-        StoreWireOutcome::Modified(modified) => !modified.contains(&uid),
+        StoreWireOutcome::Modified(modified) => !modified.contains(uid),
         StoreWireOutcome::PendingRetry(_) | StoreWireOutcome::Failed => false,
     }
 }
@@ -879,8 +873,8 @@ async fn store_flags(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StoreWireOutcome {
     Applied,
-    Modified(Vec<u32>),
-    PendingRetry(Vec<u32>),
+    Modified(CompactUidSet),
+    PendingRetry(CompactUidSet),
     Failed,
 }
 
@@ -902,15 +896,19 @@ impl StoreWireOutcome {
     }
 }
 
-fn modified_uids(code: Option<&ResponseCode>) -> Option<Vec<u32>> {
+fn modified_uids(code: Option<&ResponseCode>) -> Option<CompactUidSet> {
     match code {
-        Some(ResponseCode::Modified(ranges)) => Some(
+        // Keep the server's set compact: classification asks membership only
+        // for submitted targets, never expands unsolicited numeric spans.
+        Some(ResponseCode::Modified(ranges)) => Some(CompactUidSet::from_ranges(
             ranges
                 .iter()
-                .copied()
-                .flat_map(super::folder_registry::expand_range)
+                .map(|range| {
+                    let end = range.end.unwrap_or(range.start);
+                    crate::types::UidRange::range(range.start.min(end), range.start.max(end))
+                })
                 .collect(),
-        ),
+        )),
         _ => None,
     }
 }
@@ -925,7 +923,7 @@ fn mutation_verdict(
     match outcome {
         StoreWireOutcome::Applied => Verdict::Succeeded(MutationSuccess::Applied),
         StoreWireOutcome::Modified(modified) => {
-            if modified.contains(&uid) {
+            if modified.contains(uid) {
                 Verdict::Failed(concurrency_conflict_error(operation, folder))
             } else {
                 Verdict::Succeeded(MutationSuccess::Applied)
@@ -942,7 +940,7 @@ fn mutation_verdict(
         // read-back). The remaining UIDs were not committed because the
         // whole STORE was rejected.
         StoreWireOutcome::PendingRetry(modified) => {
-            if modified.contains(&uid) {
+            if modified.contains(uid) {
                 Verdict::Failed(concurrency_conflict_error(operation, folder))
             } else {
                 Verdict::Failed(store_failed_error(operation, folder))
@@ -1170,14 +1168,14 @@ mod tests {
                 crate::types::response::StatusKind::Ok,
                 Some(code.clone())
             )),
-            StoreWireOutcome::Modified(vec![2, 3])
+            StoreWireOutcome::Modified(CompactUidSet::from_uids([2, 3]))
         );
         assert_eq!(
             StoreWireOutcome::from_store_result(&result(
                 crate::types::response::StatusKind::No,
                 Some(code)
             )),
-            StoreWireOutcome::PendingRetry(vec![2, 3])
+            StoreWireOutcome::PendingRetry(CompactUidSet::from_uids([2, 3]))
         );
         assert_eq!(
             StoreWireOutcome::from_store_result(&result(
@@ -1208,7 +1206,7 @@ mod tests {
                 uid: 5,
             },
         ];
-        let outcome = StoreWireOutcome::PendingRetry(vec![2]);
+        let outcome = StoreWireOutcome::PendingRetry(CompactUidSet::from_uids([2]));
         let outcomes =
             TargetBatch::new(ids).settle(AccountOperation::UpdateFlags, &folder, |target| {
                 let verdict = mutation_verdict(
@@ -1244,12 +1242,18 @@ mod tests {
             vec![1, 2, 3, 4]
         );
         assert_eq!(
-            applied_uids_after_store(&[1, 2, 3, 4], &StoreWireOutcome::Modified(vec![2, 4])),
+            applied_uids_after_store(
+                &[1, 2, 3, 4],
+                &StoreWireOutcome::Modified(CompactUidSet::from_uids([2, 4])),
+            ),
             vec![1, 3]
         );
         assert!(
-            applied_uids_after_store(&[1, 2, 3, 4], &StoreWireOutcome::PendingRetry(vec![2, 4]))
-                .is_empty()
+            applied_uids_after_store(
+                &[1, 2, 3, 4],
+                &StoreWireOutcome::PendingRetry(CompactUidSet::from_uids([2, 4])),
+            )
+            .is_empty()
         );
         assert!(applied_uids_after_store(&[1], &StoreWireOutcome::Failed).is_empty());
     }
@@ -1440,6 +1444,24 @@ mod tests {
     }
 
     #[test]
+    fn huge_modified_span_stays_compact_and_classifies_only_submitted_targets() {
+        let result = crate::types::StoreResult {
+            fetches: Vec::new(),
+            status: crate::types::response::StatusKind::Ok,
+            code: Some(ResponseCode::Modified(vec![UidRange::range(4000000000, 1)])),
+        };
+        let outcome = StoreWireOutcome::from_store_result(&result);
+        let StoreWireOutcome::Modified(ref modified) = outcome else {
+            panic!("expected conflicts");
+        };
+        assert_eq!(modified.ranges(), &[UidRange::range(1, 4000000000)]);
+        assert_eq!(
+            applied_uids_after_store(&[2, 7, u32::MAX], &outcome),
+            vec![u32::MAX]
+        );
+    }
+
+    #[test]
     fn only_the_modified_response_code_yields_conflicting_uids() {
         assert_eq!(modified_uids(None), None);
         assert_eq!(modified_uids(Some(&ResponseCode::Alert)), None);
@@ -1448,13 +1470,13 @@ mod tests {
                 UidRange::single(2),
                 UidRange::range(5, 7),
             ]))),
-            Some(vec![2, 5, 6, 7])
+            Some(CompactUidSet::from_uids([2, 5, 6, 7]))
         );
         // An empty MODIFIED list is still a MODIFIED response: the STORE
         // outcome must not silently degrade to "no conflict reported".
         assert_eq!(
             modified_uids(Some(&ResponseCode::Modified(Vec::new()))),
-            Some(Vec::new())
+            Some(CompactUidSet::default())
         );
     }
 
@@ -1462,7 +1484,7 @@ mod tests {
     // named UIDs conflicted, everything else in the same command landed.
     #[test]
     fn modified_outcome_splits_conflicts_from_successes_per_uid() {
-        let outcome = StoreWireOutcome::Modified(vec![2]);
+        let outcome = StoreWireOutcome::Modified(CompactUidSet::from_uids([2]));
         let outcomes = settled(&[1, 2, 3], AccountOperation::UpdateFlags, |uid| {
             mutation_verdict(uid, &outcome, AccountOperation::UpdateFlags, &folder())
         });
@@ -1495,7 +1517,7 @@ mod tests {
 
     #[test]
     fn partially_conflicting_patch_only_succeeds_after_the_remove_lands() {
-        let first = StoreWireOutcome::Modified(vec![2]);
+        let first = StoreWireOutcome::Modified(CompactUidSet::from_uids([2]));
         let second = Ok(StoreWireOutcome::Applied);
         let outcomes = settled(&[1, 2, 3], AccountOperation::UpdateFlags, |uid| {
             patch_mutation_verdict(uid, &first, &second, &folder())
@@ -1519,7 +1541,7 @@ mod tests {
 
     #[test]
     fn acknowledged_second_half_rejection_is_failed() {
-        let first = StoreWireOutcome::Modified(vec![2]);
+        let first = StoreWireOutcome::Modified(CompactUidSet::from_uids([2]));
         let second = Err(store_failed_error(AccountOperation::UpdateFlags, &folder()));
         let outcomes = settled(&[1, 2], AccountOperation::UpdateFlags, |uid| {
             patch_mutation_verdict(uid, &first, &second, &folder())
@@ -1670,7 +1692,7 @@ mod tests {
     #[test]
     fn an_expunge_failure_applies_only_to_the_uids_it_marked() {
         let expunge_uids = [2u32];
-        let outcome = StoreWireOutcome::Modified(vec![3]);
+        let outcome = StoreWireOutcome::Modified(CompactUidSet::from_uids([3]));
         let expunge_error = expunge_failed_after_delete_mark(
             &folder(),
             crate::Error::Protocol("EXPUNGE refused".into()),

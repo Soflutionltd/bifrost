@@ -17,28 +17,6 @@ Filed from the October 2026 defect hunt: the smtp and sasl scope, plus an SMTP
 lateral from net adoption. Severity labels are the hunter's. The IMAP-side
 SCRAM continuation defect is IMAP-002.
 
-## SMTP-003 - The blocking transport panics on an `OAuthRefresher` needing refresh, and spuriously fails one that does not
-
-Hunter severity: P1.
-
-- `Credentials::oauth2_token_blocking` polls `token_source.current()` once with
-  a noop waker. The reference says a source "needing a network refresh is
-  rejected".
-- `OAuthRefresher::token_inner` (`net/src/auth.rs`) runs
-  `self.state.lock().await` (`tokio::sync::Mutex`), and on the Driver path calls
-  `tokio::spawn(...)` before its first await. On a plain blocking thread with no
-  runtime a stale or empty refresher panics in `tokio::spawn` instead of
-  returning the documented rejection.
-- If the tokio mutex is momentarily held by a concurrent async reader of the
-  same shared source (the ratatoskr shape: one `Arc<dyn TokenSource>` shared
-  everywhere), the single poll returns `Pending` even when the token is fresh,
-  and the send fails with "requires a network refresh", contradicting "an
-  already-fresh `OAuthRefresher` resolves immediately" (`reference/smtp.md`
-  "Auth").
-- That failure lands as `InvalidInput` plus Auth phase ->
-  `Authorization(PolicyBlocked)`, terminal `NeedsPolicyChange`, for a lock race
-  (SMTP-005).
-
 ## SMTP-004 - SCRAM never uses the GS2 `y` flag, so stripping `-PLUS` from the advertisement goes undetected
 
 Hunter severity: P1.
@@ -63,43 +41,6 @@ and binding availability and returning the rung plus a `ScramChannelBinding`
 (including `y`) would close it once for IMAP and SMTP, leaving the ladder and
 no-ladder difference to callers.
 
-## SMTP-005 - OAuth token-source failures are classified as a terminal policy block
-
-Hunter severity: P2.
-
-`oauth_token_error` maps every `bifrost_net::Error` from `current()` to
-`invalid_input(...)` plus Auth, which `account_error.rs` routes to
-`Authorization(PolicyBlocked)` (`NeedsPolicyChange`). A transient refresh
-failure (network blip, IdP 5xx, backoff) tells the consumer to change policy
-instead of retrying, and a revoked refresh token is not reported as `AuthLost`.
-The code comment admits the projection "is not refined here", and nothing
-downstream refines it, because the `AccountError` is built here. Claims broken:
-the error model's Authentication rows (`RefreshTransient` -> Retry, `Revoked` /
-`ReauthorizationRequired` -> `AuthLost`) and "the TokenSource failure projection
-is the error model's concern", which the model cannot reach once the kind is
-`PolicyBlocked`. The blocking `Pending` rejection (SMTP-003) takes the same
-lane.
-
-## SMTP-010 - `build_recipient_commands` silently drops recipients on short options
-
-Hunter severity: P3 (latent).
-
-It `zip`s addresses with `rcpt_options`, so a shorter options vector drops
-recipients instead of failing. Every current caller builds one entry per
-recipient, but this sits on the path whose contract is "validate before MAIL
-FROM", and a dropped RCPT is a silent non-delivery.
-
-## SMTP-011 - Duplicate EHLO `SIZE` lines make the size ceiling depend on hash seed
-
-Hunter severity: P3.
-
-`ServerInfo` stores features in a `HashSet<Extension>`, and
-`Size(Option<usize>)` / `FutureRelease { .. }` / `DeliverBy(..)` are distinct
-values. A server repeating `SIZE` with different limits yields two entries, and
-`size_limit()` returns whichever iteration yields first, randomized per
-process, so the "hard SIZE ceiling" depends on hash seed. Reject duplicates or
-keep the minimum.
-
 ## SMTP-012 - MAIL parameter gating and duplicate checks are incomplete
 
 Hunter severity: P3.
@@ -123,27 +64,6 @@ local-restatement shape. Moving `build_envelope` / `build_batch` into `core` (or
 a sibling sans-I/O module taking `&ServerInfo`) leaves one copy, and this entry
 gets fixed once instead of four times.
 
-## SMTP-013 - Smaller smtp and sasl defects
-
-Hunter severity: P3.
-
-- `validate_esmtp_raw_value` (used for `OtherRaw`, HOLDUNTIL and
-  `ClientId::domain`) accepts `=`; RFC 5321 `esmtp-value` excludes `%d61`.
-- In `build_batch`, a `Mail::new` failure is returned without the `Unsent` /
-  `MailFrom` stamps its sibling validation failures get two lines above.
-- The pool worker with `min_idle > 0` and `idle_timeout == 0` busy-loops: every
-  connection is instantly expired and it sleeps zero between dial rounds.
-  Nothing rejects that configuration.
-- `channel_binding::read_tlv` accepts non-minimal long-form lengths and
-  high-tag-number forms. Harmless today because the whole DER is hashed, but
-  looser than the module's "anything it cannot read unambiguously is a hard
-  error" policy.
-- `crates/smtp/src/transport/smtp/client/metering.rs` `blocking_admit_with_wait`
-  compares a Tokio-clock `ready_at().into_std()` against
-  `std::time::Instant::now()`. Identical in production, but under paused Tokio
-  time the clocks diverge, so the blocking path cannot be tested the way the
-  async one is. (From net adoption.)
-
 ## SMTP-014 - Document-versus-code disagreements in smtp and sasl
 
 - `reference/smtp.md` "DKIM": "Signing keys: `From<rsa::RsaPrivateKey>` and
@@ -162,3 +82,17 @@ Hunter severity: P3.
 - `secret.rs` test comment: "The length difference is folded into the
   accumulator". The impl comment directly above says `subtle` short-circuits on
   a length mismatch; the test comment is wrong.
+
+## SMTP-003 - The blocking transport cannot tell a busy refresher from one needing refresh
+
+Residue: a stale or empty `OAuthRefresher` can still panic in `tokio::spawn`
+on a runtime-less blocking thread, and a momentarily held state lock rejects a
+fresh token as "requires a network refresh". SMTP cannot tell them apart through
+the opaque `TokenSource` future; a safe fix needs a synchronous cached-token or
+readiness API in `bifrost-net`. The one-poll rejection is pinned by a test.
+
+## SMTP-015 - `refresh_failed` in net ignores its `retry_after`
+
+Lateral, in `crates/net/src/account_error.rs`: `refresh_failed` drops its
+`retry_after` argument and relies on a hint from the nested source cause, so the
+outer deadline is lost when the cause carries none.
