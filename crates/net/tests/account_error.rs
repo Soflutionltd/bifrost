@@ -197,7 +197,7 @@ fn rate_limited_preserves_body_and_headers() {
     let telemetry = err.telemetry_fields();
     assert_eq!(telemetry.request_id, Some("req-123"));
     assert_eq!(telemetry.trace_id, None);
-    // Account, not Tenant: Microsoft meters Outlook per mailbox, and this
+    // Account, never tenant-wide: Microsoft meters Outlook per mailbox, and this
     // layer has no target to name a narrower budget with.
     assert_eq!(telemetry.throttle_scope, Some(ThrottleScope::Account));
     assert!(support_text_contains(&err, "TooManyRequests"));

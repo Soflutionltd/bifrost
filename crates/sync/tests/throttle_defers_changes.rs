@@ -1,7 +1,7 @@
 //! A recorded throttle deadline actually defers `changes_stream`.
 //!
 //! The throttle bucket's mechanics are unit-pinned in `recovery.rs` - key
-//! resolution, max-of-overlapping records, membership, expiry. None of that
+//! resolution, max-of-overlapping records, expiry. None of that
 //! proves the engine OBSERVES a deadline: the recorder and the reader could
 //! both be correct and still never meet, because the reader ran on a
 //! different clock from the timer that retired the wait. That is exactly what
@@ -10,7 +10,7 @@
 //! under paused time re-derived the full wait after every sleep and spun
 //! forever.
 //!
-//! Both tests are staged so that ONLY the shared bucket can explain what they
+//! The test is staged so that ONLY the shared bucket can explain what they
 //! observe:
 //!
 //! - The scope under observation NEVER fails. It has no retry advice of its
@@ -32,7 +32,7 @@ use std::time::Duration;
 use bifrost_sync::{EngineConfig, MultiplexerConfig, SyncEngine};
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountFactory, AccountId,
-    AccountOperation, AttemptCause, Cause, Change, ChangeCursor, CursorScope, ObjectType, Provider,
+    AccountOperation, AttemptCause, Cause, Change, ChangeCursor, CursorScope, ObjectType,
     ServerCause, ServerErrorKind, SyncEvent, ThrottleScope, TransmissionState,
 };
 
@@ -49,8 +49,8 @@ const POLL: Duration = Duration::from_secs(1);
 /// The provider's Retry-After. Far longer than any cadence in play.
 const RETRY_AFTER: Duration = Duration::from_secs(300);
 
-fn throttled(scope: ThrottleScope, after: Duration, provider: Option<Provider>) -> AccountError {
-    let mut builder = AccountErrorBuilder::new(
+fn throttled(scope: ThrottleScope, after: Duration) -> AccountError {
+    AccountErrorBuilder::new(
         AccountErrorKind::Server(ServerErrorKind::RateLimited),
         Cause::Server(ServerCause::RateLimited {
             retry_hint: Some(bifrost_types::RetryHint::After(after)),
@@ -60,11 +60,9 @@ fn throttled(scope: ThrottleScope, after: Duration, provider: Option<Provider>) 
     // recorder arm) rather than the mid-flight `Reconcile` a send would get.
     .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .operation(AccountOperation::SyncChanges)
-    .throttle_scope(scope);
-    if let Some(provider) = provider {
-        builder = builder.provider(provider);
-    }
-    builder.try_build().expect("valid account error")
+    .throttle_scope(scope)
+    .try_build()
+    .expect("valid account error")
 }
 
 /// Counters for the two scopes' `changes_stream` calls.
@@ -165,7 +163,7 @@ async fn a_recorded_deadline_defers_a_sibling_scopes_changes_stream() {
     let engine = engine();
     let factory: Arc<dyn AccountFactory> = Arc::new(common::StubFactory::queue(vec![stub(
         &counts,
-        throttled(ThrottleScope::Account, RETRY_AFTER, None),
+        throttled(ThrottleScope::Account, RETRY_AFTER),
     )]));
     engine
         .attach(account_id.clone(), Arc::clone(&factory))
@@ -197,83 +195,4 @@ async fn a_recorded_deadline_defers_a_sibling_scopes_changes_stream() {
     );
 
     engine.detach(&account_id).await.expect("detach succeeds");
-}
-
-/// Two attached slots share a `Provider` deadline.
-///
-/// The sibling account records only a 1ms deadline of its own - enrollment in
-/// the provider key, and nothing more; it has expired before any assertion
-/// below runs. So the 300s pause its quiet scope observes cannot be its own
-/// record, cannot be a local retry sleep (that scope never failed), and can
-/// only be the deadline the OTHER account recorded under the shared
-/// `ThrottleKey::Provider`.
-#[tokio::test(start_paused = true)]
-async fn two_attached_slots_share_a_provider_deadline() {
-    let throttled_id = AccountId("provider-throttled".to_owned());
-    let sibling_id = AccountId("provider-sibling".to_owned());
-    let engine = engine();
-
-    let sibling_counts = Arc::new(PollCounts::default());
-    let sibling: Arc<dyn AccountFactory> = Arc::new(common::StubFactory::queue(vec![stub(
-        &sibling_counts,
-        // Enrollment is lazy: an account joins a provider key only when its
-        // own error stream names the provider. One millisecond is enough to
-        // enroll and short enough that it can never be mistaken for the wait
-        // the assertions observe.
-        throttled(
-            ThrottleScope::Provider,
-            Duration::from_millis(1),
-            Some(Provider::Microsoft),
-        ),
-    )]));
-    engine
-        .attach(sibling_id.clone(), sibling)
-        .await
-        .expect("sibling attach succeeds");
-
-    // Let the sibling enroll before the long deadline is recorded. (It would
-    // also see a deadline recorded first - the membership index is consulted
-    // at read time - but staging it this way keeps the two facts separate.)
-    tokio::time::sleep(POLL * 3).await;
-    assert!(
-        sibling_counts.noisy.load(Ordering::SeqCst) > 0,
-        "the sibling must have failed once, or it is not enrolled in the provider key"
-    );
-
-    let loud_counts = Arc::new(PollCounts::default());
-    let loud: Arc<dyn AccountFactory> = Arc::new(common::StubFactory::queue(vec![stub(
-        &loud_counts,
-        throttled(
-            ThrottleScope::Provider,
-            RETRY_AFTER,
-            Some(Provider::Microsoft),
-        ),
-    )]));
-    engine
-        .attach(throttled_id.clone(), loud)
-        .await
-        .expect("throttled attach succeeds");
-
-    let base = settle(&sibling_counts).await;
-    assert!(
-        base > 0,
-        "the sibling's quiet scope must have been polling before the other \
-         account's deadline landed"
-    );
-
-    tokio::time::sleep(POLL * 120).await;
-    assert_eq!(
-        sibling_counts.quiet.load(Ordering::SeqCst),
-        base,
-        "one account's provider Retry-After did not pause its sibling"
-    );
-
-    tokio::time::sleep(RETRY_AFTER).await;
-    assert!(
-        sibling_counts.quiet.load(Ordering::SeqCst) > base,
-        "the sibling never resumed: a shared provider deadline must expire, not stall"
-    );
-
-    engine.detach(&throttled_id).await.expect("detach succeeds");
-    engine.detach(&sibling_id).await.expect("detach succeeds");
 }

@@ -124,14 +124,14 @@ pub struct SyncEngine {
     /// that window sees no slot and no in-flight entry, installs fresh
     /// registrations, and then the still-running detach unregisters the
     /// NEW incarnation from the invalidation sink, the budget gate, the
-    /// backfill registry, the throttle memberships, and the bandwidth
+    /// backfill registry, and the bandwidth
     /// meter. The result is an account that looks attached but silently
     /// drops every out-of-process push. Serializing the two is what
     /// makes the teardown's identity assumption true.
     lifecycle_inflight: Arc<AsyncMutex<std::collections::HashSet<AccountId>>>,
     /// Engine-wide throttle bucket, shared by every attached account
-    /// so `Tenant` / `Provider` deadlines recorded by one account can
-    /// pause its siblings. Recovery paths record; the per-scope poll
+    /// so a `Budget` deadline recorded by one account pauses every
+    /// sibling that declares the same budget. Recovery paths record; the per-scope poll
     /// loop and the push reconciler consult it before driving work.
     throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
 }

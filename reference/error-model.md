@@ -193,9 +193,9 @@ Both advice structs are explicitly `#[non_exhaustive]`.
 `ReconcileGuidance` is an ordinary constructible public struct, so the nested
 shape is not accidentally sealed.
 
-`ThrottleScope::{CurrentOperation, Mailbox, Account, Tenant, Provider}`
+`ThrottleScope::{CurrentOperation, Mailbox, Account}`
 is the producer hint; the engine lifts the sharable scopes into a
-`ThrottleKey::{Mailbox, Account, Tenant, Provider}` bucket.
+`ThrottleKey::{Mailbox, Account}` bucket.
 `CurrentOperation` is a per-call inline delay and never enters a key.
 
 A producer that knows which provider rate budget a throttled request was
@@ -215,12 +215,13 @@ none. A crate that stamps a budget must declare it for the same work, through
 the same function of the same routing decision, or the hold is recorded where
 no wait site looks. Budgets survive `into_builder`.
 
-No in-tree producer emits `ThrottleScope::Tenant` or `ThrottleScope::Provider`.
-Graph tagged every throttle `Tenant`, but Microsoft documents the Outlook mail,
-calendar and contacts limits per app per mailbox, so a tenant hold paused
-mailboxes the provider never throttled; Graph now emits `Account` and stamps
-the mailbox budget where it can attribute the request. The variants stay
-published for implementations whose provider genuinely throttles that wide.
+There is no tenant- or provider-wide scope. A throttle that spans accounts is
+a stamped and declared budget, which reaches every account consuming it
+without the error carrying a cross-account identity. Graph once tagged every
+throttle tenant-wide, but Microsoft documents the Outlook mail, calendar and
+contacts limits per app per mailbox, so a tenant hold paused mailboxes the
+provider never throttled; Graph emits `Account` and stamps the mailbox budget
+where it can attribute the request.
 
 `Fatal(AccountError)` is the terminal-only newtype. `TryFrom` accepts
 iff `recovery().is_terminal()`, returning the error back on the `Err`

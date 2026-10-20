@@ -1171,7 +1171,7 @@ fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
     }
 }
 
-/// `Account`, not `Tenant`. Microsoft documents the Outlook mail, calendar
+/// `Account`, never tenant-wide. Microsoft documents the Outlook mail, calendar
 /// and contacts limits per app per MAILBOX - one mailbox's throttle does not
 /// affect another - so a tenant hold would pause mailboxes the provider never
 /// throttled. A throttle the REST funnel or a `$batch` subresponse could

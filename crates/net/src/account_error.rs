@@ -804,7 +804,7 @@ fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
 /// `None` is the honest answer for providers whose throttling scope is
 /// undocumented - do not invent one.
 ///
-/// Microsoft is `Account`, not `Tenant`: its Outlook limits are documented
+/// Microsoft is `Account`, never tenant-wide: its Outlook limits are documented
 /// per app per mailbox, and this layer sees no request target, so the
 /// account is the widest honest answer that names no identity it lacks. A
 /// caller that knows the mailbox (`bifrost-graph`'s REST funnel) stamps that

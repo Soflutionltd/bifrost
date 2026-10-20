@@ -3313,20 +3313,15 @@ reason. The reason rides on the warning's free-form fields; the
 
 `crate::recovery::ThrottleBucket` is engine-wide (one per
 `SyncEngine`, shared by every slot): deadlines keyed by
-`ThrottleKey::{Mailbox, Account, Tenant, Provider, Budget}` plus a
-membership index recording which lifted cross-account (`Tenant` /
-`Provider`) keys each account belongs to. An account joins a lifted
-shared key the first time its own error stream names that identity;
-membership survives `cleanup_expired` because it is an identity
-fact, not a deadline, and is bounded by the identity space.
-`ThrottleScope::CurrentOperation` is a per-call hint and never
-enters the bucket.
+`ThrottleKey::{Mailbox, Account, Budget}`. `Budget` is the only key that
+crosses accounts. `ThrottleScope::CurrentOperation` is a per-call hint and
+never enters the bucket.
 
 Keys reach the work they hold two ways. A key LIFTED from a
-`ThrottleScope` (see below) is either the account's own or a shared key
-reached through membership. A key DECLARED by `Account::throttle_keys` for
+`ThrottleScope` (see below) is the account's own `Account` key or one of its
+`Mailbox` keys. A key DECLARED by `Account::throttle_keys` for
 the work about to be driven is looked up literally by
-`recovery::throttle_wait`, with no enrollment step, so an account that has
+`recovery::throttle_wait`, so an account that has
 never failed still sees the first deadline a sibling recorded under it.
 Every wait site asks the account what its work consumes, through
 `recovery::declared_keys`: the poll loop and the reconciler for the scope
@@ -3426,7 +3421,7 @@ fallback: IMAP's folder-scoped `[LIMIT]` carries no hint, and without it the
 per-folder hold was never recorded at all. Otherwise
 both recorders resolve the key from the
 identities the classified error actually carries
-(the error's mailbox scope, `AccountError::provider()`). The mailbox identity is
+(the error's mailbox scope). The mailbox identity is
 read in BOTH shapes it is produced in - `ErrorScope::Mailbox { id }` and
 `ErrorScope::Cursor(CursorScope::Folder(id))` - because every production folder
 producer builds the latter, via `with_folder_scope`, and IMAP's
@@ -3435,19 +3430,15 @@ fires for either. Reading only the former made `ThrottleKey::Mailbox`
 unreachable in production while its test passed against the synthetic shape.
 A mailbox throttle carrying no mailbox identity at all remains local to the
 current operation: degrading it to the account key would widen a per-mailbox 429
-into an account-wide stall. Broader
-provider scope may degrade to the account key. `Tenant` degrades too: the
-error carries no tenant identity string. No in-tree producer emits it; a
+into an account-wide stall. There is no tenant- or provider-wide scope: a
 provider whose throttle genuinely spans accounts stamps and declares a
-budget instead, which needs no identity on the error. Reading happens at
+budget, which needs no identity on the error. Reading happens at
 every wait site listed above, re-checked after waking since a longer
 deadline can land mid-sleep; cold-start hydration (the backfill runner and
 the deferred-inventory worker) is the heaviest request lane the engine
 drives, so it consults the same keys at the same boundary as its pause
 checks rather than barrelling through a Retry-After that paused the
-polls. `detach` forgets the account's shared-key memberships so
-a reattached id cannot inherit a previous life's provider enrollment. Its own
-`Account` deadline is deliberately retained until expiry: it describes the
+polls. An account's own `Account` deadline is deliberately retained until expiry: it describes the
 stable account identity, not the connection incarnation, and prevents detach
 plus immediate reattach from bypassing a provider wait. Expired waits are
 pruned opportunistically, so retained entries are time-bounded.
@@ -3471,28 +3462,19 @@ correct clock for a wait site, and a caller-supplied instant is how the wrong
 one got read. This is the same move `bifrost-smtp` made for `AsyncDeadline`
 and `ByteBucket`.
 
-`tests/throttle_defers_changes.rs` pins the two engine-level facts the unit
+`tests/throttle_defers_changes.rs` pins the engine-level fact the unit
 tests cannot reach: that a recorded deadline actually defers `changes_stream`
 (a scope that never failed - so it holds no retry advice and takes no local
 `retry_delay` sleep - stops polling on its fixed cadence and resumes when the
-`Retry-After` elapses), and that two attached slots share a `Provider`
-deadline (the sibling's own record is 1ms and long expired, so only the other
-account's 300s record can explain its pause). Both assert a poll COUNT flat
+`Retry-After` elapses). It asserts a poll COUNT flat
 across a window many cadences wide and then RESUMING, not a total elapsed
 time another timer could satisfy. `tests/throttle_budget_isolation.rs` pins
 the declared-key half the same way: a stamped budget holds the scopes that
 declare it, on this account and on a second attached account that never
-failed (first-deadline reach without enrollment), while a sibling scope on
+failed (first-deadline reach), while a sibling scope on
 another budget keeps polling (recording precedence). In
 `tests/readback_guard.rs`, `a_campaign_waits_for_a_budget_its_targets_declare`
 pins the campaign side across two accounts.
-
-One limit on the cross-account reach remains, and only on the legacy lifted
-route: enrollment is lazy, so the FIRST deadline under a lifted `Provider`
-key is invisible to a sibling that has never failed. Declared keys have no
-such gap, which is the route a crate should use for a budget its provider
-shares across accounts. No in-tree producer emits `ThrottleScope::Provider`
-today.
 
 Cursor envelope schema mismatches at `get_change_cursor` are
 translated through `crate::recovery::cursor_decode_failure` into an

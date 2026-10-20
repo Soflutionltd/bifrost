@@ -15,8 +15,8 @@ use tokio::time::Instant;
 use bifrost_sync::ThrottleBucket;
 use bifrost_types::{
     AccountErrorBuilder, AccountErrorKind, AccountId, AccountOperation, AttemptCause, AuthCause,
-    AuthErrorKind, Cause, EngineDirective, MailboxId, Provider, RecoveryClass, ResourceKind,
-    StateCause, SyncStateErrorKind, ThrottleKey, ThrottleScope, TransmissionState, TransportCause,
+    AuthErrorKind, Cause, EngineDirective, MailboxId, RecoveryClass, ResourceKind, StateCause,
+    SyncStateErrorKind, ThrottleKey, ThrottleScope, TransmissionState, TransportCause,
     TransportErrorKind, TransportKind,
 };
 
@@ -118,29 +118,6 @@ fn schema_incompatible_account_error_derives_engine_directive() {
 }
 
 #[test]
-fn throttle_bucket_tenant_pauses_multiple_accounts() {
-    let mut bucket = ThrottleBucket::new();
-    let now = Instant::now();
-    // Recording a tenant key is independent of any single account.
-    let key = ThrottleKey::Tenant("tenant-1".into());
-    bucket.record(key.clone(), now + Duration::from_secs(10));
-    // Two different accounts both observe the same tenant throttle.
-    let wait_a = bucket.wait_for(&key, now);
-    let wait_b = bucket.wait_for(&key, now);
-    assert_eq!(wait_a, Some(Duration::from_secs(10)));
-    assert_eq!(wait_b, Some(Duration::from_secs(10)));
-}
-
-#[test]
-fn throttle_bucket_provider_pauses_multiple_accounts() {
-    let mut bucket = ThrottleBucket::new();
-    let now = Instant::now();
-    let key = ThrottleKey::Provider(Provider::Microsoft);
-    bucket.record(key.clone(), now + Duration::from_secs(5));
-    assert_eq!(bucket.wait_for(&key, now), Some(Duration::from_secs(5)));
-}
-
-#[test]
 fn throttle_bucket_account_does_not_cross_accounts() {
     let mut bucket = ThrottleBucket::new();
     let now = Instant::now();
@@ -173,5 +150,5 @@ fn throttle_bucket_mailbox_does_not_cross_accounts() {
 #[test]
 fn imports_smoke() {
     let _: ResourceKind = ResourceKind::Message;
-    let _: ThrottleScope = ThrottleScope::Tenant;
+    let _: ThrottleScope = ThrottleScope::Account;
 }

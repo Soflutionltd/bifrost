@@ -2306,7 +2306,7 @@ Mapping highlights:
 
 Microsoft documents the Outlook mail, calendar and contacts limits per app
 per MAILBOX: one mailbox's throttle does not affect another. Graph therefore
-never tags a throttle `Tenant` (that paused mailboxes the provider never
+never throttles tenant-wide (that paused mailboxes the provider never
 throttled); `throttle_scope_for` answers `Account`, the conservative fallback,
 and an attributable throttle also stamps the mailbox's `ThrottleBudget`, which
 the engine then records ALONE.

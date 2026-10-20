@@ -130,8 +130,8 @@ impl SyncEngine {
 
         // Engine-wide throttle bucket (one per SyncEngine, shared via
         // Mutex because recovery paths cross task boundaries). Shared
-        // across accounts so `Tenant` / `Provider` deadlines recorded
-        // by one account pause its siblings.
+        // across accounts so a `Budget` deadline recorded by one account
+        // pauses every sibling declaring the same budget.
         let throttles = Arc::clone(&self.throttles);
 
         // Drive cursor establishment per scope. We do this before

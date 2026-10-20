@@ -480,7 +480,7 @@ mod tests {
             TransmissionState::InFlight,
         )))
         .idempotency_override(false)
-        .throttle_scope(ThrottleScope::Tenant)
+        .throttle_scope(ThrottleScope::Account)
         .try_build()
         .expect("valid account error classification");
 
@@ -497,7 +497,7 @@ mod tests {
             RecoveryClass::Reconcile(advice)
                 if advice.reason == ReconcileReason::ThrottledMidFlight
                     && advice.retry_hint == Some(hint)
-                    && advice.throttle_scope == Some(ThrottleScope::Tenant)
+                    && advice.throttle_scope == Some(ThrottleScope::Account)
         ));
     }
 }

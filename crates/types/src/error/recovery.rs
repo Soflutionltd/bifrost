@@ -14,7 +14,7 @@ use super::kind::{
     AccessErrorKind, AccountErrorKind, AuthErrorKind, MailboxUnavailableKind, ProtocolErrorKind,
     RequestErrorKind, ResourceKind, ServerErrorKind, SyncStateErrorKind,
 };
-use super::scope::{AccountOperation, ErrorScope, Provider};
+use super::scope::{AccountOperation, ErrorScope};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -223,41 +223,37 @@ pub enum RetryReason {
     RefreshTransient,
 }
 
-/// Provider-documented scope at which a throttle applies. `Mailbox`,
-/// `Account`, `Tenant`, and `Provider` map onto sharable
-/// [`ThrottleKey`] entries the engine consults across work items.
-/// `CurrentOperation` is a per-call hint: the caller delays the single
-/// work item inline without entering any shared bucket.
+/// Provider-documented scope at which a throttle applies. `Mailbox` and
+/// `Account` map onto sharable [`ThrottleKey`] entries the engine consults
+/// across work items. `CurrentOperation` is a per-call hint: the caller
+/// delays the single work item inline without entering any shared bucket.
+///
+/// There is deliberately no tenant- or provider-wide scope. A throttle that
+/// spans accounts is expressed as a [`ThrottleBudget`] the crate declares
+/// and stamps, which reaches every account consuming it without the error
+/// having to carry a cross-account identity. Microsoft Graph, the one
+/// provider that once tagged throttles tenant-wide, meters Outlook per app
+/// per MAILBOX, so a tenant hold paused mailboxes it never throttled.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum ThrottleScope {
     CurrentOperation,
     Mailbox,
     Account,
-    Tenant,
-    Provider,
 }
 
 /// Engine bucket key for throttle holds that survive across requests.
 ///
 /// Two routes produce one. The engine LIFTS a `ThrottleScope` plus the
-/// identity the error carries into `Mailbox` / `Account` / `Tenant` /
-/// `Provider`; and an `Account` implementation DECLARES the keys a unit of
-/// work consumes (`Account::throttle_keys`), while its errors STAMP the
+/// identity the error carries into `Mailbox` / `Account`; and an `Account`
+/// implementation DECLARES the keys a unit of work consumes
+/// (`Account::throttle_keys`), while its errors STAMP the
 /// [`ThrottleBudget`]s a throttled request was held against
-/// (`AccountErrorBuilder::throttle_budget`). `Tenant` and `Provider` cross
-/// account boundaries by design, and so does `Budget`: a budget identity is
-/// process-wide, so two attached accounts declaring the same one share its
-/// deadline. `ThrottleScope::CurrentOperation` never enters a
-/// `ThrottleKey`; it is a per-call hint, not a bucket.
-///
-/// No in-tree producer mints `Tenant`: the only provider that tagged its
-/// throttles tenant-wide was Microsoft Graph, whose Outlook limits are
-/// documented per app per MAILBOX, so a tenant hold would have paused
-/// mailboxes the provider never throttled. Graph declares and stamps
-/// `Budget` keys instead. The variant remains for implementations whose
-/// provider genuinely throttles a tenant; its identity is a free-form
-/// string the engine treats as opaque.
+/// (`AccountErrorBuilder::throttle_budget`). `Budget` crosses account
+/// boundaries by design: a budget identity is process-wide, so two attached
+/// accounts declaring the same one share its deadline.
+/// `ThrottleScope::CurrentOperation` never enters a `ThrottleKey`; it is a
+/// per-call hint, not a bucket.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum ThrottleKey {
@@ -266,8 +262,6 @@ pub enum ThrottleKey {
         mailbox: MailboxId,
     },
     Account(AccountId),
-    Tenant(String),
-    Provider(Provider),
     Budget(ThrottleBudget),
 }
 
@@ -1212,7 +1206,7 @@ mod tests {
             &chain(Cause::Server(ServerCause::RateLimited {
                 retry_hint: Some(hint),
             })),
-            Some(ThrottleScope::Tenant),
+            Some(ThrottleScope::Account),
             None,
         );
 
@@ -1222,7 +1216,7 @@ mod tests {
                 disposition: RetryDisposition::SameRequest,
                 retry_hint: Some(hint),
                 reason: RetryReason::RateLimited,
-                throttle_scope: Some(ThrottleScope::Tenant),
+                throttle_scope: Some(ThrottleScope::Account),
             })
         );
     }

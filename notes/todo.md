@@ -27,18 +27,6 @@ has not made, and ruled work that has not landed. Nothing else.
   `net`, `sasl`, `sync`) is verified with the full-workspace `brokkr
   check`, never `-p`.
 
-## Throttle budgets: follow-ups
-
-Filed 2026-10-19 while landing declared throttle keys and stamped budgets
-(the sync-F6 close-out). Each was outside that change's scope.
-
-- **Unproduced published variants, owner's call.** `ThrottleScope::Tenant`,
-  `ThrottleScope::Provider` and `ThrottleKey::Tenant` now have no in-tree
-  producer: Graph, the only `Tenant` producer, meters per mailbox and stamps
-  budgets instead, and nothing ever emitted `Provider`. They stay published
-  for out-of-tree implementations; whether to retire them is a removal, so it
-  waits for the owner.
-
 ## A9 (directory search) follow-ups
 
 - **a9-2 residual: the alias `$select` may cost directory reach.** The
@@ -57,13 +45,6 @@ Filed 2026-10-19 while landing declared throttle keys and stamped budgets
   the first 403 - narrow all properties outside the basic set and re-issue -
   NOT dropping them from the query outright, which would give every tenant the degraded
   projection to spare the minority.
-
-## Namespaced-container follow-ups
-
-Surfaced while landing the namespaced-container surface (shared-mailbox and
-public-folder containers, EWS public-folder hydration, allowlisted public-folder
-scopes). Each was deliberately out of that brick's scope; none blocks the
-container projection itself.
 
 ## Open items folded in from the bug-hunt ledgers (2026-08-23)
 
