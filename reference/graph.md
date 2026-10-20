@@ -1950,11 +1950,30 @@ searches keep the `$filter` path.
 `/contacts` corpus `contact_search` scans) queries `/users` with a
 `displayName,mail,otherMails,proxyAddresses,businessPhones,companyName,jobTitle,department`
 `$select`,
-`$top`, and (non-empty query) a provider-side `$filter`
-`startswith(displayName,'q') or startswith(mail,'q')` (escaped + URL-encoded as
-a whole) - unlike `contact_search`, which scans client-side and only
-server-filters exact-email queries. Rows without `mail` are dropped;
-`@odata.nextLink` pages.
+`$top`, and (non-empty query) tenant-root `/users` `$search`, independent
+of the client's `/me` or `/users/{mailbox}` routing prefix. The expression
+ORs individually quoted `displayName:q`, `givenName:q`, `surname:q`,
+`mail:q` and `userPrincipalName:q` clauses with uppercase `OR` outside
+the quotes. Terms escape backslash before double quote; the entire expression
+is percent-encoded, with ampersands double-encoded as `%2526` for the
+[documented directory-search issue](https://learn.microsoft.com/en-us/graph/known-issues#search-for-directory-objects-fails-for-encoded-ampersand--character).
+Matching is tokenized word-prefix matching on displayName in any token order,
+and startswith semantics on the other fields: neither substring nor domain
+search. See Microsoft's
+[directory search contract](https://learn.microsoft.com/en-us/graph/search-query-parameter).
+Search requests carry `ConsistencyLevel: eventual`, including nextLink and
+resumed pages. Empty or whitespace-only queries enumerate without `$search`
+or that header. Rows without `mail` are dropped.
+
+Only the initial, non-resumed search request can fall back: HTTP 400 with
+Graph error code `Request_UnsupportedQuery` retries once using the escaped
+`startswith(displayName,'q') or startswith(mail,'q')` filter. The fallback
+logs status and provider code, resets the walk, results and row offset, and
+mints filter-mode cursors. Other 400s, local malformed requests, and failures
+on search continuations propagate without restarting. Paged directory cursors
+store explicit search/filter mode alongside page URL and consumed server-row
+count; the mode is never inferred from query text or URL. Older cursors without
+mode retain their original filter behavior.
 
 `additional_emails` carries `otherMails` in server order, then the SMTP half
 of `proxyAddresses` in server order. A Graph proxy address is `TYPE:value`
@@ -2017,7 +2036,8 @@ in `additional_emails`**; a local-part case VARIANT of it, coming from
 `otherMails`, legitimately can, because under the universal rule it may be a
 different mailbox.
 
-Consent caveat, unresolved: `otherMails` and `proxyAddresses` sit outside the
+Consent caveat, unresolved: `otherMails`, `proxyAddresses`, `businessPhones`,
+`companyName`, `jobTitle` and `department` sit outside the
 fixed property set `User.ReadBasic.All` grants, so a tenant consented only to
 ReadBasic may answer the whole `/users` query with a 403
 (`Authorization_RequestDenied`) now that they are selected, where before it
@@ -2041,8 +2061,8 @@ mail-disabled groups are dropped. `directory_group_expand` walks
 `/groups/{id}/transitiveMembers/microsoft.graph.user` (nested groups
 flattened and cycle-checked server-side), projecting
 `DirectoryGroupMember { email, display_name }` with `mail` preferred over
-`userPrincipalName`, lowercased, memberless-of-both rows dropped. Both
-page via `@odata.nextLink` bytes like `directory_search` and need
+`userPrincipalName`, lowercased, memberless-of-both rows dropped. Membership remains mailbox-scoped;
+group expansion is tenant-root regardless of mailbox routing. Both page via bare `@odata.nextLink` bytes and need
 `GroupMember.Read.All`-class consent - a harder grant than the mail
 scopes; an ungranted tenant 403s -> `NoPermission` at call time (the
 capability flags state protocol support, not tenant consent).

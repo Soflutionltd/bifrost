@@ -49,20 +49,19 @@ Filed 2026-10-19 while landing declared throttle keys and stamped budgets
 - **a9-2 residual: the alias `$select` may cost directory reach.** The
   projection itself landed 2026-09-07. What it left open is a consent question
   nobody can settle hermetically: `otherMails` and `proxyAddresses` sit outside
-  the property set `User.ReadBasic.All` grants, so a tenant holding only basic
-  directory consent may now 403 the WHOLE `/users` query where it previously
+  the property set `User.ReadBasic.All` grants. `businessPhones`, `companyName`,
+  `jobTitle` and `department` are also outside that documented basic set,
+  so the consent uncertainty is broader than the alias fields. A tenant holding
+  only basic directory consent may now 403 the WHOLE `/users` query where it previously
   succeeded. It maps to `NoPermission` correctly, so nothing is misreported -
   but a tenant with working directory search can lose it, which is a reach
   regression rather than a graceful degradation. Confirming it needs a live
   ReadBasic-only tenant, because whether Graph actually refuses a `$select`
   overreach (as opposed to omitting the fields) is not something the hermetic
   suite can observe. If it does fire, the fix is a select-narrowing retry after
-  the first 403 - drop the two alias fields and re-issue - NOT dropping them
-  from the query outright, which would give every tenant the degraded
+  the first 403 - narrow all properties outside the basic set and re-issue -
+  NOT dropping them from the query outright, which would give every tenant the degraded
   projection to spare the minority.
-- **a9-3 (graph)** `$search` (with `ConsistencyLevel: eventual`) as a
-  richer substring directory match than the current `startswith` prefix
-  `$filter`, if needed.
 
 ## Namespaced-container follow-ups
 

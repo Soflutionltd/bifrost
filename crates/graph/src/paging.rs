@@ -84,10 +84,19 @@ impl PageWalk {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DirectoryMode {
+    Search,
+    #[default]
+    Filter,
+}
+
 #[derive(Serialize, Deserialize)]
 struct PagedCursor {
     url: String,
     skip: usize,
+    #[serde(default)]
+    mode: DirectoryMode,
 }
 
 /// Decode a caller's paged cursor (minted by [`encode_paged_cursor`]) into
@@ -108,7 +117,7 @@ pub(crate) fn decode_paged_cursor(
         return Ok(None);
     };
     match serde_json::from_slice::<PagedCursor>(&cursor) {
-        Ok(PagedCursor { url, skip }) => {
+        Ok(PagedCursor { url, skip, .. }) => {
             if !url.starts_with('/') && reqwest::Url::parse(&url).is_err() {
                 return Err("page cursor url is neither absolute nor a path".to_string());
             }
@@ -119,6 +128,30 @@ pub(crate) fn decode_paged_cursor(
         }
         Err(_) => Ok(decode_link_cursor(client, Some(cursor))?.map(|url| (url, 0))),
     }
+}
+
+pub(crate) fn decode_directory_cursor(
+    client: &GraphClient,
+    cursor: Option<Vec<u8>>,
+) -> Result<Option<(AdmittedUrl, usize, DirectoryMode)>, String> {
+    let mode = cursor
+        .as_ref()
+        .and_then(|bytes| serde_json::from_slice::<PagedCursor>(bytes).ok())
+        .map_or(DirectoryMode::Filter, |cursor| cursor.mode);
+    Ok(decode_paged_cursor(client, cursor)?.map(|(url, skip)| (url, skip, mode)))
+}
+
+pub(crate) fn encode_directory_cursor(
+    url: &AdmittedUrl,
+    skip: usize,
+    mode: DirectoryMode,
+) -> Vec<u8> {
+    serde_json::to_vec(&PagedCursor {
+        url: url.as_str().to_string(),
+        skip,
+        mode,
+    })
+    .expect("directory cursor is serializable")
 }
 
 /// Decode a caller's bare link cursor: the verbatim `@odata.nextLink` bytes
@@ -146,6 +179,7 @@ pub(crate) fn encode_paged_cursor(url: &AdmittedUrl, skip: usize) -> Vec<u8> {
     serde_json::to_vec(&PagedCursor {
         url: url.as_str().to_string(),
         skip,
+        mode: DirectoryMode::Filter,
     })
     .expect("search cursor is serializable")
 }

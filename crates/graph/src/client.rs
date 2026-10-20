@@ -857,6 +857,18 @@ impl GraphClient {
         self.request::<T, ()>(resource, url, "GET", None).await
     }
 
+    pub(crate) async fn get_eventual<T: DeserializeOwned>(
+        &self,
+        resource: Resource,
+        url: &AdmittedUrl,
+        eventual: bool,
+    ) -> Result<T, GraphError> {
+        let response = self
+            .execute_wire(resource, url, "GET", None, (None, eventual), None)
+            .await?;
+        parse_json_response(response)
+    }
+
     pub(crate) async fn get_prefer<T: DeserializeOwned>(
         &self,
         resource: Resource,
@@ -916,7 +928,7 @@ impl GraphClient {
                 &url,
                 "POST",
                 None,
-                None,
+                (None, false),
                 Some(WireBody::mime(base64_mime)),
             )
             .await?;
@@ -1046,7 +1058,7 @@ impl GraphClient {
             Some(body) => Some(WireBody::json(body)?),
             None => None,
         };
-        self.execute_wire(resource, url, method, if_match, prefer, body)
+        self.execute_wire(resource, url, method, if_match, (prefer, false), body)
             .await
     }
 
@@ -1063,9 +1075,10 @@ impl GraphClient {
         url: &AdmittedUrl,
         method: &str,
         if_match: Option<&str>,
-        prefer: Option<&str>,
+        options: (Option<&str>, bool),
         body: Option<WireBody>,
     ) -> Result<RestResponse, GraphError> {
+        let (prefer, eventual) = options;
         let url = url.as_str();
         // Records the request in this crate's richer shape and does not
         // answer it: the response comes back from the scripted transport
@@ -1096,6 +1109,9 @@ impl GraphClient {
             body.as_ref()
                 .map_or(JSON_CONTENT_TYPE, |body| body.content_type),
         );
+        if eventual {
+            builder = builder.header("ConsistencyLevel", "eventual");
+        }
         if let Some(etag) = if_match {
             builder = builder.header("If-Match", etag);
         }
@@ -1478,6 +1494,19 @@ impl GraphClient {
             .wire
             .as_ref()
             .map_or(0, |wire| wire.requests().len())
+    }
+
+    /// Actual transport requests, including emitted headers.
+    #[cfg(test)]
+    pub(crate) fn rest_requests(&self) -> Vec<bifrost_net::test_support::RequestSnapshot> {
+        self.inner
+            .scripted
+            .lock()
+            .expect("REST script lock")
+            .wire
+            .as_ref()
+            .expect("script installed")
+            .requests()
     }
 
     /// The scripted transport, when one is installed. Resolved through the
@@ -1883,7 +1912,7 @@ mod tests {
             .api_url(&format!("{}/messages", shared.api_path_prefix()))
             .expect("api url");
         match shared
-            .execute_wire(Resource::Outlook, &url, "GET", None, None, None)
+            .execute_wire(Resource::Outlook, &url, "GET", None, (None, false), None)
             .await
         {
             Err(GraphError::MailboxThrottled { budget, .. }) => {
@@ -1919,7 +1948,7 @@ mod tests {
             .expect("api url");
         assert!(matches!(
             shouted
-                .execute_wire(Resource::Outlook, &url, "GET", None, None, None)
+                .execute_wire(Resource::Outlook, &url, "GET", None, (None, false), None)
                 .await,
             Err(GraphError::MailboxThrottled { .. })
         ));
@@ -1930,7 +1959,7 @@ mod tests {
             assert!(
                 matches!(
                     primary
-                        .execute_wire(Resource::Unmetered, &url, "GET", None, None, None)
+                        .execute_wire(Resource::Unmetered, &url, "GET", None, (None, false), None)
                         .await,
                     Err(GraphError::Net(_))
                 ),
@@ -2452,7 +2481,7 @@ mod tests {
         client.script_rest(responses);
         let url = client.api_url("/me/messages").expect("api url");
         client
-            .execute_wire(Resource::Outlook, &url, "GET", None, None, None)
+            .execute_wire(Resource::Outlook, &url, "GET", None, (None, false), None)
             .await
     }
 
@@ -2576,7 +2605,7 @@ mod tests {
 
         let url = client.api_url("/me").expect("api url");
         let response = client
-            .execute_wire(Resource::Outlook, &url, "GET", None, None, None)
+            .execute_wire(Resource::Outlook, &url, "GET", None, (None, false), None)
             .await
             .expect("the retried 503 succeeds on the second attempt");
 

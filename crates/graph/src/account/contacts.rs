@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use crate::client::Resource;
 use crate::origin::AdmittedUrl;
+use crate::paging::DirectoryMode;
 use crate::types::ODataCollection;
 
 use super::GraphAccount;
@@ -299,8 +300,8 @@ const DIRECTORY_SELECT: &str =
 /// Organization-directory (Global Address List) search over `/users`.
 ///
 /// An empty `query` enumerates the directory; a non-empty `query` pushes
-/// a provider-side `startswith(displayName,..) or startswith(mail,..)`
-/// `$filter`. A 403 from a tenant that has not granted directory read
+/// a provider-side advanced `$search` with eventual consistency; only an
+/// initial unsupported-query rejection retries with a startswith filter. A 403 from a tenant that has not granted directory read
 /// (`User.ReadBasic.All` / `User.Read.All`) maps through `into_error` to
 /// a real `NoPermission` `AccountError` - unlike Google, an unauthorized
 /// directory is an error here, not an empty result.
@@ -315,18 +316,27 @@ pub(crate) async fn directory_search(
         .unwrap_or(250)
         .max(1);
     let operation = AccountOperation::DirectorySearch;
-    let (mut url, mut skip) = match decode_paged_cursor(&account, page_cursor, operation)? {
-        Some(position) => position,
-        None => {
-            let prefix = account.client.api_path_prefix();
-            let top = top_for_limit(limit, 999);
-            let first = account
-                .client
-                .api_url(&directory_search_path(&prefix, &query, top))
-                .map_err(|error| into_error(error, operation))?;
-            (first, 0)
-        }
-    };
+    let resumed = page_cursor.is_some();
+    let top = top_for_limit(limit, 999);
+    let (mut url, mut skip, mut mode) =
+        match crate::paging::decode_directory_cursor(&account.client, page_cursor)
+            .map_err(|detail| graph_error::invalid_account_error(operation, detail))?
+        {
+            Some(position) => position,
+            None => {
+                let mode = if query.trim().is_empty() {
+                    DirectoryMode::Filter
+                } else {
+                    DirectoryMode::Search
+                };
+                let first = account
+                    .client
+                    .api_url(&directory_search_path(&query, top, mode))
+                    .map_err(|error| into_error(error, operation))?;
+                (first, 0, mode)
+            }
+        };
+    let mut initial = !resumed;
     let mut items = Vec::new();
     let mut walk = crate::paging::PageWalk::new("directory search");
     let next_cursor;
@@ -337,8 +347,37 @@ pub(crate) async fn directory_search(
                 graph_error::GraphErrorContext::graph(AccountOperation::DirectorySearch),
             )
         })?;
-        let page: ODataCollection<GraphDirectoryUser> =
-            get_page(&account, Resource::Unmetered, &url, operation).await?;
+        let page: ODataCollection<GraphDirectoryUser> = match get_page_with_consistency(
+            &account,
+            Resource::Unmetered,
+            &url,
+            mode == DirectoryMode::Search,
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(error)
+                if initial && mode == DirectoryMode::Search && advanced_query_rejected(&error) =>
+            {
+                tracing::warn!(
+                    status = 400,
+                    code = "Request_UnsupportedQuery",
+                    "Graph directory advanced query rejected; retrying with startswith filter"
+                );
+                mode = DirectoryMode::Filter;
+                url = account
+                    .client
+                    .api_url(&directory_search_path(&query, top, mode))
+                    .map_err(|error| into_error(error, operation))?;
+                walk = crate::paging::PageWalk::new("directory search");
+                items.clear();
+                skip = 0;
+                initial = false;
+                continue;
+            }
+            Err(error) => return Err(into_error(error, operation)),
+        };
+        initial = false;
         let next_link = admit_next(&account, &page, operation)?;
         let page_len = page.value.len();
         for (index, value) in page.value.into_iter().enumerate().skip(skip) {
@@ -347,11 +386,11 @@ pub(crate) async fn directory_search(
                 if items.len() == limit_cap {
                     let consumed = index + 1;
                     next_cursor = if consumed < page_len {
-                        Some(crate::paging::encode_paged_cursor(&url, consumed))
+                        Some(crate::paging::encode_directory_cursor(&url, consumed, mode))
                     } else {
                         next_link
                             .as_ref()
-                            .map(|next| crate::paging::encode_paged_cursor(next, 0))
+                            .map(|next| crate::paging::encode_directory_cursor(next, 0, mode))
                     };
                     return Ok(Page {
                         items,
@@ -379,18 +418,65 @@ pub(crate) async fn directory_search(
     })
 }
 
-fn directory_search_path(prefix: &str, query: &str, top: u32) -> String {
-    let base = format!("{prefix}/users?$select={DIRECTORY_SELECT}&$top={top}");
+// Only this provider code denotes an unsupported advanced query. A generic
+// 400, an invalid search expression, or a local malformed request must surface.
+fn advanced_query_rejected(error: &crate::error::GraphError) -> bool {
+    use crate::error::GraphError;
+    let evidence = match error {
+        GraphError::Response(response) => Some((response.status, response.body.clone())),
+        GraphError::Net(net) => match net.terminal() {
+            bifrost_net::Error::Status { code, body, .. } => Some((*code, body.clone())),
+            _ => None,
+        },
+        _ => None,
+    };
+    evidence.is_some_and(|(status, body)| {
+        status == reqwest::StatusCode::BAD_REQUEST
+            && serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|value| value.get("error")?.get("code")?.as_str().map(str::to_owned))
+                .as_deref()
+                == Some("Request_UnsupportedQuery")
+    })
+}
+
+fn directory_search_path(query: &str, top: u32, mode: DirectoryMode) -> String {
+    let base = format!("/users?$select={DIRECTORY_SELECT}&$top={top}");
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return base;
     }
-    let escaped = trimmed.replace('\'', "''");
-    let filter = format!("startswith(displayName,'{escaped}') or startswith(mail,'{escaped}')");
-    format!(
-        "{base}&$filter={}",
-        bifrost_net::url::encode_query_value(&filter)
-    )
+    let (parameter, expression) = match mode {
+        DirectoryMode::Search => {
+            let escaped = trimmed.replace('\\', "\\\\").replace('"', "\\\"");
+            let expression = [
+                "displayName",
+                "givenName",
+                "surname",
+                "mail",
+                "userPrincipalName",
+            ]
+            .map(|field| format!("\"{field}:{escaped}\""))
+            .join(" OR ");
+            ("$search", expression)
+        }
+        DirectoryMode::Filter => {
+            let escaped = trimmed.replace('\'', "''");
+            (
+                "$filter",
+                format!("startswith(displayName,'{escaped}') or startswith(mail,'{escaped}')"),
+            )
+        }
+    };
+    let encoded = bifrost_net::url::encode_query_value(&expression);
+    // Graph v1.0 decodes ampersands twice in directory $search.
+    // Apply its documented workaround only to search values.
+    let encoded = if mode == DirectoryMode::Search {
+        encoded.replace("%26", "%2526")
+    } else {
+        encoded
+    };
+    format!("{base}&{parameter}={encoded}")
 }
 
 /// Which half of the mailbox one SMTP `proxyAddresses` entry names.
@@ -589,11 +675,20 @@ pub(crate) async fn get_page<T: serde::de::DeserializeOwned>(
     url: &AdmittedUrl,
     operation: AccountOperation,
 ) -> Result<ODataCollection<T>, AccountError> {
-    account
-        .client
-        .get(resource, url)
+    get_page_with_consistency(account, resource, url, false)
         .await
         .map_err(|error| into_error(error, operation))
+}
+
+/// Keep the provider error until directory search has decided whether the
+/// initial advanced query is eligible for its one filter retry.
+async fn get_page_with_consistency<T: serde::de::DeserializeOwned>(
+    account: &GraphAccount,
+    resource: Resource,
+    url: &AdmittedUrl,
+    eventual: bool,
+) -> Result<ODataCollection<T>, crate::error::GraphError> {
+    account.client.get_eventual(resource, url, eventual).await
 }
 
 /// Admit a page's `@odata.nextLink` at receipt, before it is followed or
@@ -1573,9 +1668,221 @@ mod tests {
     }
 
     #[test]
+    fn directory_search_expression_escapes_special_terms() {
+        let path = directory_search_path(r#"A\B"&C"#, 17, DirectoryMode::Search);
+        assert!(path.starts_with(&format!(
+            "/users?$select={DIRECTORY_SELECT}&$top=17&$search="
+        )));
+        let expected = r#""displayName:A\\B\"&C" OR "givenName:A\\B\"&C" OR "surname:A\\B\"&C" OR "mail:A\\B\"&C" OR "userPrincipalName:A\\B\"&C""#;
+        assert_eq!(
+            path.split_once("&$search=").unwrap().1,
+            bifrost_net::url::encode_query_value(expected).replace("%26", "%2526")
+        );
+        assert!(path.contains("%2526"));
+    }
+
+    fn eventual(request: &bifrost_net::test_support::RequestSnapshot) -> bool {
+        request
+            .headers
+            .get("ConsistencyLevel")
+            .is_some_and(|value| value == "eventual")
+    }
+
+    fn directory_account(
+        mailbox: bool,
+        responses: impl IntoIterator<Item = crate::client::ScriptedRestResponse>,
+    ) -> (GraphAccount, crate::client::GraphClient) {
+        let client = crate::client::GraphClient::new("token");
+        let client = if mailbox {
+            client.for_shared_mailbox("shared@example.test")
+        } else {
+            client
+        };
+        client.script_rest(responses);
+        (
+            GraphAccount::new_for_tests(client.clone(), super::super::PushMode::GraphSubscriptions),
+            client,
+        )
+    }
+
+    fn directory_page(next: bool) -> crate::client::ScriptedRestResponse {
+        let mut page = json!({"value": [
+            {"displayName":"Ada", "mail":"ada@example.test"},
+            {"displayName":"Grace", "mail":"grace@example.test"}
+        ]});
+        if next {
+            page["@odata.nextLink"] = json!("https://graph.microsoft.com/v1.0/opaque-next");
+        }
+        crate::client::ScriptedRestResponse::json(reqwest::StatusCode::OK, page)
+    }
+
+    fn directory_rejection(code: &str) -> crate::client::ScriptedRestResponse {
+        crate::client::ScriptedRestResponse::json(
+            reqwest::StatusCode::BAD_REQUEST,
+            json!({"error":{"code":code,"message":"scripted rejection"}}),
+        )
+    }
+
+    #[tokio::test]
+    async fn directory_search_headers_follow_explicit_mode_and_tenant_root() {
+        for shared in [false, true] {
+            let (account, client) =
+                directory_account(shared, [directory_page(true), directory_page(false)]);
+            let result = directory_search(account, r#"A\B"&C"#.into(), Some(10), None)
+                .await
+                .unwrap();
+            assert_eq!(result.items.len(), 4);
+            let requests = client.rest_requests();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests[0]
+                    .url
+                    .as_str()
+                    .starts_with("https://graph.microsoft.com/v1.0/users?")
+            );
+            assert!(requests[0].url.as_str().contains("$search="));
+            assert!(requests[0].url.as_str().contains("%2526"));
+            assert!(requests[0].url.as_str().contains("A%5C%5CB%5C%22%2526C"));
+            assert!(requests.iter().all(eventual));
+            assert!(requests[1].url.as_str().ends_with("/opaque-next"));
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_search_resumed_header_comes_from_cursor_even_with_empty_query() {
+        let (account, client) = directory_account(
+            false,
+            [
+                directory_page(true),
+                directory_page(true),
+                directory_page(false),
+            ],
+        );
+        let first = directory_search(account.clone(), "ada".into(), Some(1), None)
+            .await
+            .unwrap();
+        let second = directory_search(account.clone(), String::new(), Some(1), first.next_cursor)
+            .await
+            .unwrap();
+        assert_eq!(second.items[0].email, "grace@example.test");
+        directory_search(account, String::new(), Some(10), second.next_cursor)
+            .await
+            .unwrap();
+        assert!(client.rest_requests().iter().all(eventual));
+    }
+
+    #[tokio::test]
+    async fn directory_search_empty_enumeration_has_no_search_or_header() {
+        let (account, client) =
+            directory_account(false, [directory_page(true), directory_page(false)]);
+        directory_search(account, "  ".into(), None, None)
+            .await
+            .unwrap();
+        for request in client.rest_requests() {
+            assert!(!eventual(&request));
+            assert!(!request.url.as_str().contains("$search"));
+            assert!(!request.url.as_str().contains("$filter"));
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_search_only_unsupported_initial_query_falls_back_once() {
+        let (account, client) = directory_account(
+            false,
+            [
+                directory_rejection("Request_UnsupportedQuery"),
+                directory_page(true),
+                directory_page(true),
+                directory_page(false),
+            ],
+        );
+        let first = directory_search(account.clone(), "O'Hara".into(), Some(1), None)
+            .await
+            .unwrap();
+        let second = directory_search(
+            account.clone(),
+            "changed".into(),
+            Some(1),
+            first.next_cursor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.items[0].email, "grace@example.test");
+        directory_search(account, "changed".into(), None, second.next_cursor)
+            .await
+            .unwrap();
+        let requests = client.rest_requests();
+        assert_eq!(requests.len(), 4);
+        assert!(eventual(&requests[0]));
+        assert!(requests[1].url.as_str().contains("$filter=startswith"));
+        assert!(!requests[1].url.as_str().contains("$search"));
+        assert!(requests[1..].iter().all(|request| !eventual(request)));
+        assert_eq!(requests[1].url, requests[2].url);
+    }
+
+    #[tokio::test]
+    async fn directory_search_other_bad_requests_and_continuations_never_fall_back() {
+        for code in [
+            "BadRequest",
+            "Request_BadRequest",
+            "Request_UnsupportedQuery",
+        ] {
+            let (account, client) =
+                directory_account(false, [directory_page(true), directory_rejection(code)]);
+            assert!(
+                directory_search(account, "ada".into(), None, None)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(client.rest_requests().len(), 2);
+            assert!(client.rest_requests().iter().all(eventual));
+        }
+        for code in ["BadRequest", "Request_BadRequest", "Request_InvalidQuery"] {
+            let (account, client) = directory_account(false, [directory_rejection(code)]);
+            assert!(
+                directory_search(account, "ada".into(), None, None)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(client.rest_requests().len(), 1);
+        }
+        let (account, client) = directory_account(
+            false,
+            [
+                directory_page(true),
+                directory_rejection("Request_UnsupportedQuery"),
+            ],
+        );
+        let first = directory_search(account.clone(), "ada".into(), Some(1), None)
+            .await
+            .unwrap();
+        assert!(
+            directory_search(account, "ada".into(), None, first.next_cursor)
+                .await
+                .is_err()
+        );
+        assert_eq!(client.rest_requests().len(), 2);
+
+        let (account, client) = directory_account(
+            false,
+            [
+                directory_rejection("Request_UnsupportedQuery"),
+                directory_rejection("Request_UnsupportedQuery"),
+            ],
+        );
+        assert!(
+            directory_search(account, "ada".into(), None, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(client.rest_requests().len(), 2);
+        assert!(!eventual(&client.rest_requests()[1]));
+    }
+
+    #[test]
     fn directory_search_url_escapes_query_into_startswith_filter() {
-        let path = directory_search_path("/me", "O'Hara", 50);
-        assert!(path.starts_with(&format!("/me/users?$select={DIRECTORY_SELECT}&$top=50")));
+        let path = directory_search_path("O'Hara", 50, DirectoryMode::Filter);
+        assert!(path.starts_with(&format!("/users?$select={DIRECTORY_SELECT}&$top=50")));
         // The single quote is doubled, and the whole filter is URL-encoded.
         let filter = "startswith(displayName,'O''Hara') or startswith(mail,'O''Hara')";
         assert!(path.contains(&format!(
@@ -1587,13 +1894,13 @@ mod tests {
     #[test]
     fn directory_search_empty_query_omits_filter() {
         assert_eq!(
-            directory_search_path("/me", "", 999),
-            format!("/me/users?$select={DIRECTORY_SELECT}&$top=999")
+            directory_search_path("", 999, DirectoryMode::Filter),
+            format!("/users?$select={DIRECTORY_SELECT}&$top=999")
         );
         // Whitespace-only is treated as empty.
         assert_eq!(
-            directory_search_path("/me", "   ", 999),
-            format!("/me/users?$select={DIRECTORY_SELECT}&$top=999")
+            directory_search_path("   ", 999, DirectoryMode::Filter),
+            format!("/users?$select={DIRECTORY_SELECT}&$top=999")
         );
     }
 
@@ -1639,7 +1946,10 @@ mod tests {
         // both of these from a /users row unless they are asked for.
         assert!(DIRECTORY_SELECT.contains("otherMails"));
         assert!(DIRECTORY_SELECT.contains("proxyAddresses"));
-        assert!(directory_search_path("/me", "", 999).contains("otherMails,proxyAddresses"));
+        assert!(
+            directory_search_path("", 999, DirectoryMode::Filter)
+                .contains("otherMails,proxyAddresses")
+        );
     }
 
     #[test]
