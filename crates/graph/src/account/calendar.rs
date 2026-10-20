@@ -1,3 +1,6 @@
+#[path = "calendar_public.rs"]
+mod public;
+
 use bifrost_types::{
     AccountError, AccountOperation, AttendeeRole, Calendar, CalendarEvent, CalendarId,
     CalendarProvenance, EventAttendee, EventAvailability, EventCreate, EventId, EventOrganizer,
@@ -74,6 +77,7 @@ pub(crate) async fn calendars_list(account: GraphAccount) -> Result<Vec<Calendar
             .admit_next(page.next_link.as_ref())
             .map_err(|error| into_error(error, AccountOperation::CalendarsList))?;
     }
+    calendars.extend(public::calendars(&account).await);
     Ok(calendars)
 }
 
@@ -81,6 +85,9 @@ pub(crate) async fn events_in_range(
     account: GraphAccount,
     range: EventRange,
 ) -> Result<Page<CalendarEvent>, AccountError> {
+    if let Some(folder) = super::foreign::parse_public_calendar(&range.calendar_id.0) {
+        return public::range(&account, folder, &range).await;
+    }
     let operation = AccountOperation::EventsInRange;
     let cursor = crate::paging::decode_link_cursor(&account.client, range.page_cursor)
         .map_err(|detail| graph_error::invalid_account_error(operation, detail))?;
@@ -123,6 +130,9 @@ pub(crate) async fn get(
     account: GraphAccount,
     event: EventId,
 ) -> Result<CalendarEvent, AccountError> {
+    if let Some((folder, item)) = super::foreign::parse_public_event(&event.0) {
+        return public::get(&account, folder, item).await;
+    }
     let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventGet)?;
     let event = fetch_graph_event(&account, &calendar_id, &event_id).await?;
     Ok(event_from_graph(calendar_id, event))
@@ -145,6 +155,7 @@ pub(crate) async fn create(
     account: GraphAccount,
     event: EventCreate,
 ) -> Result<EventId, AccountError> {
+    public::reject_calendar(&event.calendar_id, AccountOperation::EventCreate)?;
     reject_create_organizer(&event)?;
     reject_unwritable_status(event.status, AccountOperation::EventCreate)?;
     reject_unusable_write_times(
@@ -272,6 +283,10 @@ pub(crate) async fn update(
     patch: EventPatch,
 ) -> Result<(), AccountError> {
     let operation = AccountOperation::EventUpdate;
+    public::reject_event(&event, operation)?;
+    if let Some(calendar) = &patch.calendar_id {
+        public::reject_calendar(calendar, operation)?;
+    }
     reject_unusable_write_times(operation, patch.start.as_ref(), patch.end.as_ref())?;
     validate_event_patch_timezones(&patch)?;
     if let Some(status) = patch.status {
@@ -319,6 +334,7 @@ fn reject_calendar_move(patch: &EventPatch, event_calendar_id: &str) -> Result<(
 }
 
 pub(crate) async fn delete(account: GraphAccount, event: EventId) -> Result<(), AccountError> {
+    public::reject_event(&event, AccountOperation::EventDelete)?;
     let current = get(account.clone(), event.clone()).await?;
     let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventDelete)?;
     let path = event_url(&account, &calendar_id, &event_id);
@@ -338,6 +354,7 @@ pub(crate) async fn rsvp(
     event: EventId,
     status: RsvpStatus,
 ) -> Result<(), AccountError> {
+    public::reject_event(&event, AccountOperation::EventRsvp)?;
     let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventRsvp)?;
     let action = rsvp_action(status)?;
     let path = format!("{}/{action}", event_url(&account, &calendar_id, &event_id));
@@ -367,6 +384,13 @@ pub(crate) async fn search(
     account: GraphAccount,
     request: EventSearchRequest,
 ) -> Result<Page<CalendarEvent>, AccountError> {
+    if let Some(folder) = request
+        .calendar_id
+        .as_ref()
+        .and_then(|id| super::foreign::parse_public_calendar(&id.0))
+    {
+        return public::search(&account, folder, &request).await;
+    }
     // A Search-API cursor must resume through the Search API: a local
     // nextLink walk cannot consume a `from`-offset cursor.
     if let Some(from) = search_api_cursor_offset(request.page_cursor.as_deref()) {

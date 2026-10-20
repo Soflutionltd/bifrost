@@ -418,6 +418,98 @@ lossless and consistent, but a consumer must not read a Graph contact's
 `kind` as "work"/"home", and a `kind` it writes appears as the address
 display name in Outlook.
 
+### Public calendars (EWS)
+
+`calendar_public.rs` mirrors the public contact routing pattern. After the
+REST walk, `calendars_list` appends discovery-seeded readable public folders
+with `IPF.Appointment` or a dot-separated subclass. Pins and background sync
+selection do not restrict listing. Public calendars have every event write
+flag false. `foreign.rs` tags collections as `public-calendar\u{1e}<folder>`
+and events as `public-calendar\u{1e}<folder>\u{1e}<item>`; native ids and
+provenance retain the bare EWS ids. Every typed calendar door dispatches
+before REST id/cursor decoding. Missing public routing refuses locally as
+`ConcurrencyConflict` with `Unsent` evidence, never a REST fallback.
+
+`events_in_range` uses `FindItem` with `CalendarView`, never an indexed item
+view. Exchange expands occurrences and exceptions and hides recurring masters;
+a master in the response is a contract violation. Each returned instance
+retains its own native ItemId, which `event_get` sends directly to `GetItem`.
+The identifier includes occurrence data, rather than being the master's id:
+see Microsoft's [identifier format](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxcext/087b58b5-6e78-45ec-acd3-7dbac7346aed)
+and [recurrence expansion](https://learn.microsoft.com/en-us/exchange/client-developer/exchange-web-services/recurrence-patterns-and-ews).
+Hermetic SOAP tests pin distinct occurrence and exception ids through both
+doors; they do not claim a live-server round trip.
+
+CalendarView has no offset. A non-final response or one reaching the requested
+250-row cap is discarded and its time window bisected, left child first.
+Both children share the split boundary. The versioned JSON cursor binds the
+native folder, original start/end strings and zones, pending windows, accepted
+instance ids awaiting delivery, seen ids and cumulative request count. Stable
+native instance ids deduplicate events spanning multiple windows. Accepted
+ids drain in caller-sized pages without repeating FindItem, and are hydrated
+through GetItem for full body and attendee data. Hydration batches 20 ids per
+request and runs at most four chunks concurrently, retaining submitted order.
+This is a local fan-out bound, not a claim that EWS shares Graph's per-mailbox
+REST throttle policy. `EwsClient::get_calendar_items` uses a separate typed
+multi-item funnel: HTTP/transport errors, SOAP Faults, malformed documents and
+response-count mismatches abort the request. A sole error response to a
+multi-id request is a general batch failure and keeps its EWS classification. Application ResponseMessage
+errors and per-item kind, identity or projection failures instead name that
+item's native id in `Page::failed_ids`; those rows are consumed and the cursor
+advances. A deletion from a saved ready list cannot pin that continuation.
+Each successful response still verifies its identity and CalendarItem kind. An empty accepted child may
+return an empty page with a continuation; only absence of both pending windows
+and pending ids means exhaustion. No truncated view is reported as exhausted.
+
+Boundaries use integer 100ns ticks, preserving Exchange date-time precision;
+inputs finer than that are refused as malformed. Offset timestamps and local
+date-times with a resolvable IANA or Windows zone are accepted through the
+same `resolve_time_zone` helper used by the all-day projection. A still-capped indivisible
+window fails as `Internal(LimitExceeded)`. The same classification bounds the
+whole continuation to 10,000 FindItem requests and 100,000 seen instance ids.
+Those are explicit client limits, never a successful truncated result. Like
+other provider pages, this is a live view, not a snapshot across mutations.
+
+`ews/calendar.rs` requests calendar properties valid for CalendarItem; no
+message-specific fields are sent. GetItem verifies the native identity,
+CalendarItem wire kind and `IPM.Appointment` class/subclass. A non-calendar
+result is `Unsupported(EventGet)`. Its errors carry `ErrorScope::Event` and
+the tagged event id, so `ErrorItemNotFound` becomes `NotFound(Event)` with that
+id. Event scope/resource are also preserved by shared transport error mapping
+and the sync ledger's version-5 error digest (versions 3 and 4 remain readable).
+
+Projection includes subject, start/end and original timezone ids, exclusive
+local all-day dates, location, organizer, required/optional/resource attendees
+and response status, text body with preview fallback, UID/change key,
+cancellation, sensitivity and free/busy status. Occurrence and exception
+`OriginalStart` is preserved in `EventRecurrence::recurrence_id`; a missing
+original start refuses parsing rather than inventing a different identity.
+Expanded instances do not carry a master RRULE. All-day UTC boundaries are
+converted into the supplied item zone before taking their dates; an unresolved
+all-day zone is refused rather than shifted silently.
+
+Create, update, delete and RSVP refuse `Unsupported(operation)` before any
+request for a tagged public id, including a REST event patch targeting a
+public calendar.
+
+Public scoped event search uses indexed EWS FindItem with an escaped OR
+Restriction of substring/ignore-case Contains clauses over subject, location
+and body. An empty query enumerates the folder. `EventSearchRequest` has no
+range; as on the scoped REST `/events` path, search returns stored single
+items and recurring masters, without occurrence expansion. Masters project
+their EWS recurrence pattern/range through the existing Graph-to-RRULE mapping;
+occurrences and exceptions remain available through the range door. The
+GetItem shape requests recurrence alongside body and attendee properties.
+
+Search hydrates through the same batched per-item funnel, applies the existing
+local text matcher to complete bodies and honors `include_cancelled`.
+Only matched, admitted events count toward the result limit. The opaque
+cursor binds folder, exact query and cancellation policy, and retains pending
+ids, next indexed offset and a cumulative 10,000-request budget. It consumes
+failed and filtered rows while progressing to a strictly advancing server
+offset. A missing/stalled offset is `Protocol(ContractViolation)`, never
+exhaustion. REST and unscoped search behavior is unchanged.
+
 ### Public contact books (EWS)
 
 `contacts/public.rs` implements the read-only public contact leg. After its
@@ -2150,24 +2242,22 @@ item, folder and subscription ids are unescaped rather than returned raw) do
 the same, and there is no lenient variant left: `ews_stream.rs` uses the shared
 `xml_escape` rather than a private copy.
 
-That scan is whole-RESPONSE: it produces one verdict for the body, exactly
-as the operation parsers produce one result. EWS, however, answers per entry
-of an `m:`-namespaced id collection (`m:ItemIds`, `m:FolderIds`,
-`m:ParentFolderIds`, `m:AttachmentIds`, `m:SubscriptionIds`), so the two
-agree only while a request names at most one such id - otherwise one item's
-`ErrorItemNotFound` discards its siblings' results, the same
-per-request-answer-on-a-per-item-surface mistake the `$batch` funnel had to
-unlearn. Every read builder does name exactly one (public-folder hydration
-deliberately issues one `GetItem` per item because the routing headers
-differ), and that is ENFORCED rather than assumed: `build_soap_envelope` -
-the single funnel `EwsClient::execute` puts every request through -
-`debug_assert!`s `per_answer_request_ids(body) <= 1`, so a multi-item body
-panics at construction in any dev or test build, no transport needed. The
-Subscribe folder set is exempt by construction, not by exception: it rides
-in `t:FolderIds` inside `m:StreamingSubscriptionRequest`, which EWS answers
-with one `SubscribeResponseMessage` however many folders it names, and the
-counter keys on the namespace prefix. Making the response scan per item is a
-prerequisite for any batched EWS request, not a follow-up to one.
+The single-result `EwsClient::execute` scan is whole-response. It and the
+single-result operation parsers are fenced by `build_soap_envelope`'s
+`debug_assert!(per_answer_request_ids(body) <= 1)`: EWS answers per entry of
+an `m:`-namespaced id collection, and flattening a batched response would let
+one item's `ErrorItemNotFound` discard its siblings. The Subscribe folder set
+is not a per-answer collection: it rides in `t:FolderIds` and receives one
+subscription response for the whole set.
+
+The typed calendar batch funnel, `EwsClient::get_calendar_items`, shares the
+same HTTP/tally/SOAP-Fault path but frames and interprets each
+`GetItemResponseMessage` independently in `ews/calendar.rs`. It validates the
+entire document and response count before admitting outcomes. Responses are
+correlated in [EWS request order](https://github.com/OfficeDev/ews-managed-api/blob/master/Core/Requests/GetItemRequest.cs), including errors without an ItemId; every
+success also checks its returned native identity against the submitted id.
+The single-result guard remains in place for existing callers. Public mail
+hydration retains its existing single-id requests and per-folder routing.
 
 Known Graph vocabulary lands on typed `WireCause::Graph(GraphSignal::*)` variants
 (auth/access/throttle/cursor codes; see `classify`). `GraphSignal::Unknown
@@ -2415,7 +2505,7 @@ exhausted" without them.
   sub-watermark non-mail-to-mail admission, in-place edits, or deduplication
   of scan additions (including timestamped additions during recovery). A scan below the cap restores tracking.
   Public contacts are available through the typed read-only contact doors;
-  public calendars remain a follow-up.
+  public calendars are available through the typed read-only calendar doors.
 - EWS streaming requires EWS reachable with an accepted token; webhook mode
   needs a public HTTPS endpoint (else `Unsupported(PushSubscribe)`). EWS
   streaming currently supports primary-mailbox folders only: shared-mailbox

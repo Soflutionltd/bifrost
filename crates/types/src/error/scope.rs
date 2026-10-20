@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::calendar::CalendarId;
+use crate::calendar::{CalendarId, EventId};
 use crate::contact::ContactId;
 use crate::cursor::{CursorScope, ObjectType};
 use crate::ids::{MailboxId, ObjectId, ThreadId};
@@ -14,6 +14,7 @@ pub enum ErrorScope {
     Message { id: ObjectId },
     Thread { id: ThreadId },
     Calendar { id: CalendarId },
+    Event { id: EventId },
     CalendarCollection,
     Contact { id: ContactId },
     ContactCollection,
@@ -65,6 +66,7 @@ fn scope_fields(scope: &ErrorScope) -> ScopeFields<'_> {
         ErrorScope::Message { id } => fields.push("kind", "message").push("id", &id.0),
         ErrorScope::Thread { id } => fields.push("kind", "thread").push("id", &id.0),
         ErrorScope::Calendar { id } => fields.push("kind", "calendar").push("id", &id.0),
+        ErrorScope::Event { id } => fields.push("kind", "event").push("id", &id.0),
         ErrorScope::CalendarCollection => fields.push("kind", "calendar_collection"),
         ErrorScope::Contact { id } => fields.push("kind", "contact").push("id", &id.0),
         ErrorScope::ContactCollection => fields.push("kind", "contact_collection"),
@@ -349,6 +351,12 @@ mod tests {
             (
                 ErrorScope::Calendar { id: "c".into() },
                 vec![("kind", "calendar"), ("id", "c")],
+            ),
+            (
+                ErrorScope::Event {
+                    id: crate::EventId("e".into()),
+                },
+                vec![("kind", "event"), ("id", "e")],
             ),
             (
                 ErrorScope::Contact { id: "p".into() },

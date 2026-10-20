@@ -70,6 +70,7 @@ pub(crate) fn derive(kind: &AccountErrorKind) -> &'static str {
         AccountErrorKind::NotFound(ResourceKind::Message) => "notfound.message",
         AccountErrorKind::NotFound(ResourceKind::Mailbox) => "notfound.mailbox",
         AccountErrorKind::NotFound(ResourceKind::Thread) => "notfound.thread",
+        AccountErrorKind::NotFound(ResourceKind::Event) => "notfound.event",
         AccountErrorKind::NotFound(ResourceKind::Calendar) => "notfound.calendar",
         AccountErrorKind::NotFound(ResourceKind::Contact) => "notfound.contact",
         AccountErrorKind::NotFound(ResourceKind::Draft) => "notfound.draft",
@@ -267,6 +268,10 @@ mod tests {
             (
                 AccountErrorKind::NotFound(ResourceKind::Account),
                 "notfound.account",
+            ),
+            (
+                AccountErrorKind::NotFound(ResourceKind::Event),
+                "notfound.event",
             ),
             (
                 AccountErrorKind::NotFound(ResourceKind::Filter),

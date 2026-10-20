@@ -83,10 +83,32 @@ impl EwsClient {
         body_xml: &str,
         headers: &EwsHeaders,
     ) -> Result<String, EwsError> {
-        // EWS throttling is per calling user under its own policy; streaming
-        // notifications have a separate subscription budget. The REST
-        // per-mailbox four does not apply, so this path stays ungated.
-        let envelope = build_soap_envelope(body_xml);
+        let xml = self
+            .execute_envelope(build_soap_envelope(body_xml), headers)
+            .await?;
+        check_response_error(&xml)?;
+        Ok(xml)
+    }
+
+    /// One response message per submitted id. SOAP/HTTP/transport failures are
+    /// request-level; application responses are interpreted independently.
+    pub(crate) async fn get_calendar_items(
+        &self,
+        ids: &[String],
+        headers: &EwsHeaders,
+    ) -> Result<Vec<Result<super::contacts::Node, EwsError>>, EwsError> {
+        let body = super::calendar::get_many_body(ids);
+        let xml = self
+            .execute_envelope(super::xml_helpers::get_items_envelope(&body), headers)
+            .await?;
+        super::calendar::parse_get_items(&xml, ids.len())
+    }
+
+    async fn execute_envelope(
+        &self,
+        envelope: String,
+        headers: &EwsHeaders,
+    ) -> Result<String, EwsError> {
         let mut req = self
             .net
             .post(self.endpoint()?)
@@ -123,11 +145,10 @@ impl EwsClient {
         // Two distinct error shapes ride inside a 200 OK: a SOAP
         // `<Fault>` (transport/envelope failure) and the canonical EWS
         // application error `ResponseClass="Error"` / `<m:ResponseCode>`.
-        // Inspect both before any parser sees the body, so an
-        // `ErrorAccessDenied` / `ErrorServerBusy` is classified instead
-        // of degrading to an empty success.
+        // SOAP faults are request-level on both funnels. Application errors
+        // are scanned by execute for single-result callers, or separately
+        // per response message by get_calendar_items.
         check_soap_fault(&xml)?;
-        check_response_error(&xml)?;
         Ok(xml)
     }
 }

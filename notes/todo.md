@@ -71,11 +71,6 @@ public-folder containers, EWS public-folder hydration, allowlisted public-folder
 scopes). Each was deliberately out of that brick's scope; none blocks the
 container projection itself.
 
-- **nc-2a (graph, remaining stage)** Stage C: public Calendar folders through
-  EWS CalendarView with window-splitting continuation, classified failure on
-  unpageable density, and per-occurrence ids resolvable by `event_get`.
-  Read-only, including RSVP.
-
 ## Open items folded in from the bug-hunt ledgers (2026-08-23)
 
 Categories, as the ledgers used them: **C1** live defect, **C2** latent defect,

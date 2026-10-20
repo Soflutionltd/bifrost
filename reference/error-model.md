@@ -104,7 +104,7 @@ top-level taxonomy with per-family subkind enums:
   operator-override needed, scope revoked.
 - `ConcurrencyConflict` (flat).
 - `Request(RequestErrorKind)` - `Malformed` / `BatchInputInvalid`.
-- `NotFound(ResourceKind)` - message, mailbox, thread, calendar,
+- `NotFound(ResourceKind)` - message, mailbox, thread, calendar, event,
   contact, draft, identity, vacation, push-subscription, account,
   filter (a server-side mail rule: ManageSieve script, Gmail filter,
   JMAP SieveScript - the operation enum already treats filters as first
@@ -537,10 +537,10 @@ reason/actions/throttle for reconcile, none for terminal) via the
 
 `scope.rs`. `ErrorScope` (`#[non_exhaustive]`, custom `Serialize`)
 locates the failure: `Account`, `Cursor(CursorScope)`, and id-bearing
-`Mailbox` / `Message` / `Thread` / `Calendar` / `Contact` plus the
+`Mailbox` / `Message` / `Thread` / `Calendar` / `Event` / `Contact` plus the
 collection variants. The id-bearing variants use the same typed ids as
 the account surface (`MailboxId`, `ObjectId`, `ThreadId`, `CalendarId`,
-`ContactId`) and serialize their inner strings for support exports.
+`EventId`, `ContactId`) and serialize their inner strings for support exports.
 `scope_fields` is the single source for both the declared struct field
 count and the fields written, so the count cannot drift from the body
 across the variable-width cursor shapes - a drift that self-describing

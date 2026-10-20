@@ -1144,6 +1144,7 @@ fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
         ErrorScope::Message { .. } => Some(ResourceKind::Message),
         ErrorScope::Mailbox { .. } => Some(ResourceKind::Mailbox),
         ErrorScope::Thread { .. } => Some(ResourceKind::Thread),
+        ErrorScope::Event { .. } => Some(ResourceKind::Event),
         ErrorScope::Calendar { .. } => Some(ResourceKind::Calendar),
         ErrorScope::Contact { .. } => Some(ResourceKind::Contact),
         ErrorScope::Account
@@ -1159,6 +1160,7 @@ fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
         ErrorScope::Message { id } => Some(id.0.clone()),
         ErrorScope::Mailbox { id } => Some(id.0.clone()),
         ErrorScope::Thread { id } => Some(id.0.clone()),
+        ErrorScope::Event { id } => Some(id.0.clone()),
         ErrorScope::Calendar { id } => Some(id.0.clone()),
         ErrorScope::Contact { id } => Some(id.0.clone()),
         ErrorScope::Account

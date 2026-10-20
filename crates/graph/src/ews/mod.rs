@@ -1,3 +1,4 @@
+pub(crate) mod calendar;
 mod client;
 pub(crate) mod contacts;
 mod ops;
@@ -278,8 +279,8 @@ pub(crate) type EwsBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, EwsError
 
 /// The seam between the EWS worker loops and the wire.
 ///
-/// `EwsClient::execute` is the single funnel every EWS request in this
-/// crate goes through, so a scripted implementation of this one method is
+/// `EwsClient::execute` is the single-result SOAP funnel used by the
+/// streaming worker, so a scripted implementation of this one method is
 /// enough to drive the whole Subscribe / GetStreamingEvents / Unsubscribe
 /// cycle hermetically. The streaming worker takes `impl EwsExecute`
 /// instead of the concrete client for exactly that reason; `EwsClient` is

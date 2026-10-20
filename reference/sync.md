@@ -3088,7 +3088,9 @@ because an older decoder would refuse it: the version that added the
 `Internal` account error kind changed nothing else, so the version before it
 stays in the window and is read as is, while a row of that older version
 carrying the new tag is corrupt (`Error::Other`), since no writer of it could
-have produced one.
+have produced one. Version 5 adds the Event error resource and scope for typed
+public-calendar reads. Versions 3 and 4 still decode, but reject the new Event
+tags as corruption; existing tags and layouts are unchanged.
 
 Decode VALIDATES, never heals: a duplicated entry, barrier or lineage key,
 trailing bytes, a lineage that is not flat (a parent naming itself or an entry

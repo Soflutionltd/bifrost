@@ -148,6 +148,7 @@ pub enum ResourceKind {
     /// / `FilterValidate`), so a missing one has its own resource rather
     /// than borrowing an unrelated variant.
     Filter,
+    Event,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

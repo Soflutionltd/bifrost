@@ -288,6 +288,20 @@ pub(crate) fn parse_public_contact(id: &str) -> Option<(&str, &str)> {
     parse_public_address_book(id).map(|tail| tail.split_once(PUBLIC_SEP).unwrap_or((tail, "")))
 }
 
+/// Typed calendar ids remain public even when discovery routing is absent.
+pub(crate) fn public_calendar(folder: &str) -> bifrost_types::CalendarId {
+    bifrost_types::CalendarId(format!("public-calendar{PUBLIC_SEP}{folder}"))
+}
+pub(crate) fn public_event(folder: &str, item: &str) -> bifrost_types::EventId {
+    bifrost_types::EventId(format!("{}{PUBLIC_SEP}{item}", public_calendar(folder).0))
+}
+pub(crate) fn parse_public_calendar(id: &str) -> Option<&str> {
+    id.strip_prefix("public-calendar\u{1e}")
+}
+pub(crate) fn parse_public_event(id: &str) -> Option<(&str, &str)> {
+    parse_public_calendar(id).map(|tail| tail.split_once(PUBLIC_SEP).unwrap_or((tail, "")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

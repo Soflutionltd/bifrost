@@ -49,6 +49,9 @@
 //! is; a version-3 row carrying tag 10 is corrupt, because no version-3 writer
 //! produced one.
 //!
+//! Version 5 adds Event resource (tag 11) and scope (tag 9) to the error
+//! digest. Versions 3 and 4 remain readable without those tags.
+//!
 //! A `BarrierIncident::resume_from` nests a whole cursor envelope through
 //! `encode_envelope` / `decode_envelope` rather than re-deriving one: the
 //! checkpoint codec owns that layout and its migration chain, and a second
@@ -110,7 +113,7 @@ use crate::error::Error;
 /// Current ledger envelope version. Bumped whenever the layout below changes
 /// in a way an older decoder would misread, including a new tag in a
 /// vocabulary an older decoder would refuse.
-pub const LEDGER_ENVELOPE_VERSION: u32 = 4;
+pub const LEDGER_ENVELOPE_VERSION: u32 = 5;
 
 /// Lowest ledger envelope version still readable by this engine.
 ///
@@ -297,7 +300,7 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
 /// one.
 ///
 /// A no-op while every version in the readable window shares one layout
-/// (version 4 only widened the error-kind vocabulary). It exists as the
+/// (versions 4 and 5 only widened the error vocabulary). It exists as the
 /// named boundary anyway, for the same reason `migrate_change_cursor` does:
 /// the codec is the only place in the workspace that may hold ledger state in
 /// an older shape, so a fixup written anywhere else spreads knowledge of a dead
@@ -1049,7 +1052,7 @@ fn decode_error_kind(reader: &mut Reader<'_>) -> Result<AccountErrorKind, Error>
             1 => RequestErrorKind::BatchInputInvalid,
             other => return Err(unknown_tag("request error kind", other)),
         }),
-        7 => AccountErrorKind::NotFound(decode_resource(reader.u8()?)?),
+        7 => AccountErrorKind::NotFound(decode_resource(reader.u8()?, reader.version)?),
         8 => AccountErrorKind::Unsupported(decode_operation(reader.u8()?)?),
         9 => AccountErrorKind::Protocol(match reader.u8()? {
             0 => ProtocolErrorKind::ParseFailed,
@@ -1102,6 +1105,10 @@ fn encode_error_scope(out: &mut Vec<u8>, scope: &ErrorScope) {
             write_string(out, &id.0);
         }
         ErrorScope::ContactCollection => out.push(8),
+        ErrorScope::Event { id } => {
+            out.push(9);
+            write_string(out, &id.0);
+        }
         // `ErrorScope` is `#[non_exhaustive]`.
         _ => panic!("ledger envelope: unknown error scope variant"),
     }
@@ -1128,6 +1135,9 @@ fn decode_error_scope(reader: &mut Reader<'_>) -> Result<ErrorScope, Error> {
             id: bifrost_types::ContactId(reader.string()?),
         },
         8 => ErrorScope::ContactCollection,
+        9 if reader.version >= 5 => ErrorScope::Event {
+            id: bifrost_types::EventId(reader.string()?),
+        },
         other => return Err(unknown_tag("error scope", other)),
     })
 }
@@ -1201,11 +1211,12 @@ fn encode_resource(resource: ResourceKind) -> u8 {
         ResourceKind::PushSubscription => 8,
         ResourceKind::Account => 9,
         ResourceKind::Filter => 10,
+        ResourceKind::Event => 11,
         _ => panic!("ledger envelope: unknown resource kind variant"),
     }
 }
 
-fn decode_resource(tag: u8) -> Result<ResourceKind, Error> {
+fn decode_resource(tag: u8, version: u32) -> Result<ResourceKind, Error> {
     Ok(match tag {
         0 => ResourceKind::Message,
         1 => ResourceKind::Mailbox,
@@ -1218,6 +1229,7 @@ fn decode_resource(tag: u8) -> Result<ResourceKind, Error> {
         8 => ResourceKind::PushSubscription,
         9 => ResourceKind::Account,
         10 => ResourceKind::Filter,
+        11 if version >= 5 => ResourceKind::Event,
         other => return Err(unknown_tag("resource kind", other)),
     })
 }
@@ -1708,6 +1720,41 @@ mod tests {
         }
         let past_end = u8::try_from(super::OPERATIONS.len()).expect("table fits a u8 tag");
         assert!(super::decode_operation(past_end).is_err());
+    }
+
+    #[test]
+    fn nc2c_event_error_digest_retains_resource_and_scope() {
+        use bifrost_types::{AccountOperation, ErrorScope, ResourceKind};
+        let error = bifrost_types::AccountErrorBuilder::new(
+            AccountErrorKind::NotFound(ResourceKind::Event),
+            bifrost_types::Cause::Request(bifrost_types::RequestCause::NotFound {
+                what: ResourceKind::Event,
+                id: Some("public-instance".into()),
+            }),
+        )
+        .operation(AccountOperation::EventGet)
+        .scope(ErrorScope::Event {
+            id: bifrost_types::EventId("public-instance".into()),
+        })
+        .try_build()
+        .expect("valid error");
+        let mut bytes = Vec::new();
+        super::encode_error(&mut bytes, &error);
+        let restored =
+            super::decode_error(&mut super::Reader::new(&bytes, 5)).expect("event digest");
+        assert_eq!(restored.kind(), error.kind());
+        assert_eq!(restored.scope(), error.scope());
+        assert_eq!(restored.operation(), error.operation());
+        for version in [3, 4] {
+            assert!(super::decode_error(&mut super::Reader::new(&bytes, version)).is_err());
+            assert!(super::decode_resource(11, version).is_err());
+            let mut scope = Vec::new();
+            super::encode_error_scope(&mut scope, error.scope().expect("scope"));
+            assert!(super::decode_error_scope(&mut super::Reader::new(&scope, version)).is_err());
+        }
+        let mut previous = super::encode_ledger(&DebtLedger::new());
+        previous[4..8].copy_from_slice(&4u32.to_le_bytes());
+        assert!(super::decode_ledger(&previous).is_ok());
     }
 
     /// Version 4 only widened the error-kind vocabulary, so a version-3 row

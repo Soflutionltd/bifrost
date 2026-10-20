@@ -5,24 +5,25 @@ use quick_xml::events::{BytesRef, BytesText, Event};
 // SOAP envelope.
 
 pub(crate) fn build_soap_envelope(body_xml: &str) -> String {
-    // Every EWS request this crate sends is funnelled through here by
-    // `EwsClient::execute`, which makes it the one place the
-    // single-answer invariant can be enforced rather than merely
-    // observed. `check_response_error` collapses a whole response body
-    // into ONE verdict, and the per-operation parsers each project a
-    // single result, so both are exact only while a request names at
-    // most one per-answer id. A multi-id body would let one item's
-    // `ErrorItemNotFound` discard its siblings' results - the same
-    // per-request-answer-on-a-per-item-surface mistake the Graph
-    // `$batch` funnel had to unlearn. Reintroducing it requires making
-    // the response scan per item first; until then this trips in every
-    // dev build the moment such a body is constructed.
+    // Single-result callers use the whole-response error scan. Keep them
+    // fenced from multi-id requests: those require the separate GetItem
+    // funnel, which reconciles one response message per submitted id.
     debug_assert!(
         per_answer_request_ids(body_xml) <= 1,
         "EWS request names more than one per-answer id; the response-error \
          scan and the operation parsers are whole-response and would report \
          one item's outcome for all of them"
     );
+    soap_envelope(body_xml)
+}
+
+/// Multi-item GetItem has its own per-response parser; other callers retain
+/// the single-answer guard above.
+pub(super) fn get_items_envelope(body_xml: &str) -> String {
+    soap_envelope(body_xml)
+}
+
+fn soap_envelope(body_xml: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
@@ -44,8 +45,9 @@ pub(crate) fn build_soap_envelope(body_xml: &str) -> String {
 /// collection (`m:ItemIds`, `m:FolderIds`, `m:ParentFolderIds`,
 /// `m:AttachmentIds`, `m:SubscriptionIds`), so a body naming N ids gets N
 /// independent verdicts back. This crate's response handling is
-/// whole-response - see `build_soap_envelope` - so the count must stay at
-/// most one.
+/// whole-response on the single-result funnel - see `build_soap_envelope` -
+/// so its count must stay at most one. The typed multi-item GetItem funnel
+/// has an independent response-message parser.
 ///
 /// The subscription folder set is deliberately NOT counted. Subscribe
 /// carries its folders in `t:FolderIds` inside
