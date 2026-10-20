@@ -36,6 +36,7 @@ use bifrost_types::{
     SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
+use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use bifrost_net::TokenSource;
@@ -260,6 +261,103 @@ impl GoogleAccount {
             closed: AtomicBool::new(false),
         }))
     }
+
+    fn shutdown_stream<T: Send + 'static>(&self, stream: AccountStream<T>) -> AccountStream<T> {
+        shutdown_stream(self.shutdown.clone(), stream)
+    }
+
+    fn shutdown_future<T: Send + 'static>(
+        &self,
+        operation: AccountOperation,
+        future: AccountFuture<Result<T, AccountError>>,
+    ) -> AccountFuture<Result<T, AccountError>> {
+        shutdown_future(self.shutdown.clone(), operation, future)
+    }
+}
+
+/// End adapter-owned streams as soon as account shutdown is signalled.
+/// Dropping the `next()` future also drops any provider request the stream is
+/// currently waiting on; read streams do not emit a partial completion.
+fn shutdown_stream<T: Send + 'static>(
+    shutdown: CancellationToken,
+    stream: AccountStream<T>,
+) -> AccountStream<T> {
+    Box::pin(futures::stream::unfold(
+        (stream, shutdown),
+        |(mut stream, shutdown)| async move {
+            let item = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return None,
+                item = stream.next() => item,
+            };
+            item.map(|item| (item, (stream, shutdown)))
+        },
+    ))
+}
+
+/// Race an account future against shutdown at the adapter boundary.
+/// Before the inner future is polled, closure is a local refusal. Once it has
+/// been polled, the adapter cannot prove that it remained before dispatch, so
+/// the error is conservatively marked `InFlight` to protect non-idempotent
+/// operations from blind replay. `AccountFuture` exposes neither request
+/// progress nor a target continuation; multi-step writes need a richer
+/// operation boundary to retain resource-specific recovery scope.
+fn shutdown_future<T: Send + 'static>(
+    shutdown: CancellationToken,
+    operation: AccountOperation,
+    mut future: AccountFuture<Result<T, AccountError>>,
+) -> AccountFuture<Result<T, AccountError>> {
+    Box::pin(async move {
+        if shutdown.is_cancelled() {
+            return Err(account_closed_error(operation));
+        }
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => Err(shutdown_account_future_error(operation)),
+            result = &mut future => result,
+        }
+    })
+}
+
+fn shutdown_account_future_error(operation: AccountOperation) -> AccountError {
+    use bifrost_types::{AccountErrorBuilder, AccountErrorKind, AttemptCause, Cause};
+
+    let builder = AccountErrorBuilder::new(
+        AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
+        Cause::Transport(bifrost_types::TransportCause::new(
+            bifrost_types::TransportKind::Network,
+            Some(bifrost_types::DiagnosticText::support_only(
+                "google account closed while an operation future was active; provider outcome may be unknown",
+            )),
+        )),
+    )
+    .provider(bifrost_types::Provider::Gmail)
+    .protocol(bifrost_types::Protocol::Gmail)
+    .operation(operation)
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        bifrost_types::TransmissionState::InFlight,
+    )));
+    // These updates can commit a first write before awaiting a second one.
+    // The adapter has lost that progress and continuation context, so the
+    // operation's ordinary idempotency cannot justify replaying the input.
+    let builder = if matches!(
+        operation,
+        AccountOperation::EventUpdate | AccountOperation::ContactUpdate
+    ) {
+        builder.idempotency_override(false)
+    } else {
+        builder
+    };
+    builder
+        .try_build()
+        .expect("valid shutdown error classification")
+}
+
+fn account_closed_error(operation: AccountOperation) -> AccountError {
+    error::into_account_error(
+        crate::Error::unsupported_with(operation, "account is closed"),
+        error::GmailErrorContext::base(operation),
+    )
 }
 
 /// Runs the transport detach when the close future finishes OR is
@@ -346,7 +444,10 @@ impl Account for GoogleAccount {
     }
 
     fn discover_memberships(&self) -> AccountStream<SyncEvent<MembershipScope>> {
-        scopes::discover_memberships(Arc::clone(&self.client), Arc::clone(&self.scope_cache))
+        self.shutdown_stream(scopes::discover_memberships(
+            Arc::clone(&self.client),
+            Arc::clone(&self.scope_cache),
+        ))
     }
 
     fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
@@ -384,11 +485,11 @@ impl Account for GoogleAccount {
         &self,
         requests: AccountStream<bifrost_types::InventoryRepairRequest>,
     ) -> AccountStream<bifrost_types::InventoryRepairEvent> {
-        inventory::repair_inventory(
+        self.shutdown_stream(inventory::repair_inventory(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),
             requests,
-        )
+        ))
     }
 
     fn get_stream(
@@ -433,7 +534,7 @@ impl Account for GoogleAccount {
     }
 
     fn open_blob(&self, handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {
-        blobs::open_blob(Arc::clone(&self.client), handle)
+        self.shutdown_stream(blobs::open_blob(Arc::clone(&self.client), handle))
     }
 
     fn open_blob_range(
@@ -441,11 +542,15 @@ impl Account for GoogleAccount {
         handle: BlobHandle,
         range: ByteRange,
     ) -> AccountStream<SyncEvent<Bytes>> {
-        blobs::open_blob_range(Arc::clone(&self.client), handle, range)
+        self.shutdown_stream(blobs::open_blob_range(
+            Arc::clone(&self.client),
+            handle,
+            range,
+        ))
     }
 
     fn open_raw_rfc822(&self, message: ObjectId) -> AccountStream<SyncEvent<Bytes>> {
-        blobs::open_raw_rfc822(Arc::clone(&self.client), message)
+        self.shutdown_stream(blobs::open_raw_rfc822(Arc::clone(&self.client), message))
     }
 
     fn bulk_set_flags(
@@ -522,7 +627,10 @@ impl Account for GoogleAccount {
         target: MutationTarget,
         container: ContainerId,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::add_to_container(Arc::clone(&self.client), target, container)
+        self.shutdown_future(
+            AccountOperation::AddToContainer,
+            pim::add_to_container(Arc::clone(&self.client), target, container),
+        )
     }
 
     fn remove_from_container(
@@ -530,7 +638,10 @@ impl Account for GoogleAccount {
         target: MutationTarget,
         container: ContainerId,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::remove_from_container(Arc::clone(&self.client), target, container)
+        self.shutdown_future(
+            AccountOperation::RemoveFromContainer,
+            pim::remove_from_container(Arc::clone(&self.client), target, container),
+        )
     }
 
     fn set_keyword(
@@ -539,12 +650,15 @@ impl Account for GoogleAccount {
         _keyword: String,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(error::into_account_error(
-                crate::error::Error::unsupported(AccountOperation::SetKeyword),
-                error::GmailErrorContext::mutation(AccountOperation::SetKeyword),
-            ))
-        })
+        self.shutdown_future(
+            AccountOperation::SetKeyword,
+            Box::pin(async {
+                Err(error::into_account_error(
+                    crate::error::Error::unsupported(AccountOperation::SetKeyword),
+                    error::GmailErrorContext::mutation(AccountOperation::SetKeyword),
+                ))
+            }),
+        )
     }
 
     fn set_label_membership(
@@ -553,7 +667,10 @@ impl Account for GoogleAccount {
         label: ContainerId,
         value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::set_label_membership(Arc::clone(&self.client), target, label, value)
+        self.shutdown_future(
+            AccountOperation::SetLabelMembership,
+            pim::set_label_membership(Arc::clone(&self.client), target, label, value),
+        )
     }
 
     fn set_category(
@@ -562,12 +679,15 @@ impl Account for GoogleAccount {
         _category: String,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(error::into_account_error(
-                crate::error::Error::unsupported(AccountOperation::SetCategory),
-                error::GmailErrorContext::mutation(AccountOperation::SetCategory),
-            ))
-        })
+        self.shutdown_future(
+            AccountOperation::SetCategory,
+            Box::pin(async {
+                Err(error::into_account_error(
+                    crate::error::Error::unsupported(AccountOperation::SetCategory),
+                    error::GmailErrorContext::mutation(AccountOperation::SetCategory),
+                ))
+            }),
+        )
     }
 
     fn set_extended_property(
@@ -576,12 +696,15 @@ impl Account for GoogleAccount {
         _property_id: String,
         _value: Option<String>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(error::into_account_error(
-                crate::error::Error::unsupported(AccountOperation::SetExtendedProperty),
-                error::GmailErrorContext::mutation(AccountOperation::SetExtendedProperty),
-            ))
-        })
+        self.shutdown_future(
+            AccountOperation::SetExtendedProperty,
+            Box::pin(async {
+                Err(error::into_account_error(
+                    crate::error::Error::unsupported(AccountOperation::SetExtendedProperty),
+                    error::GmailErrorContext::mutation(AccountOperation::SetExtendedProperty),
+                ))
+            }),
+        )
     }
 
     fn set_is_read(
@@ -589,7 +712,10 @@ impl Account for GoogleAccount {
         target: MutationTarget,
         is_read: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::set_is_read(Arc::clone(&self.client), target, is_read)
+        self.shutdown_future(
+            AccountOperation::SetIsRead,
+            pim::set_is_read(Arc::clone(&self.client), target, is_read),
+        )
     }
 
     fn set_importance(
@@ -598,19 +724,25 @@ impl Account for GoogleAccount {
         _level: Importance,
     ) -> AccountFuture<Result<(), AccountError>> {
         // Gmail has no message-importance field.
-        Box::pin(async {
-            Err(error::into_account_error(
-                crate::error::Error::unsupported(AccountOperation::SetImportance),
-                error::GmailErrorContext::mutation(AccountOperation::SetImportance),
-            ))
-        })
+        self.shutdown_future(
+            AccountOperation::SetImportance,
+            Box::pin(async {
+                Err(error::into_account_error(
+                    crate::error::Error::unsupported(AccountOperation::SetImportance),
+                    error::GmailErrorContext::mutation(AccountOperation::SetImportance),
+                ))
+            }),
+        )
     }
 
     fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
-        pim::send_message(
-            Arc::clone(&self.client),
-            self.profile.email_address.clone(),
-            request,
+        self.shutdown_future(
+            AccountOperation::Send,
+            pim::send_message(
+                Arc::clone(&self.client),
+                self.profile.email_address.clone(),
+                request,
+            ),
         )
     }
 
@@ -619,7 +751,10 @@ impl Account for GoogleAccount {
         raw: Bytes,
         save_to_sent: Option<bool>,
     ) -> AccountFuture<Result<ObjectId, AccountError>> {
-        pim::send_raw_message(Arc::clone(&self.client), raw, save_to_sent)
+        self.shutdown_future(
+            AccountOperation::Send,
+            pim::send_raw_message(Arc::clone(&self.client), raw, save_to_sent),
+        )
     }
 
     fn attachment_upload(
@@ -627,7 +762,10 @@ impl Account for GoogleAccount {
         bytes: AccountStream<Result<Bytes, AccountError>>,
         mime: String,
     ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
-        pim::attachment_upload(bytes, mime)
+        self.shutdown_future(
+            AccountOperation::AttachmentUpload,
+            pim::attachment_upload(bytes, mime),
+        )
     }
 
     fn host_attachment(
@@ -635,6 +773,10 @@ impl Account for GoogleAccount {
         bytes: Bytes,
         meta: CloudUploadMeta,
     ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
+        // Keep the Drive upload outside the generic adapter cancellation
+        // wrapper: dropping this multi-request future skips its asynchronous
+        // resumable-session cancellation. It needs token-aware cleanup before
+        // close can safely interrupt it.
         cloud::host_attachment(
             Arc::clone(&self.client),
             self.profile.email_address.clone(),
@@ -644,10 +786,13 @@ impl Account for GoogleAccount {
     }
 
     fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
-        pim::draft_create(
-            Arc::clone(&self.client),
-            self.profile.email_address.clone(),
-            patch,
+        self.shutdown_future(
+            AccountOperation::DraftCreate,
+            pim::draft_create(
+                Arc::clone(&self.client),
+                self.profile.email_address.clone(),
+                patch,
+            ),
         )
     }
 
@@ -656,25 +801,37 @@ impl Account for GoogleAccount {
         draft: DraftHandle,
         patch: DraftPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::draft_update(
-            Arc::clone(&self.client),
-            self.profile.email_address.clone(),
-            draft,
-            patch,
+        self.shutdown_future(
+            AccountOperation::DraftUpdate,
+            pim::draft_update(
+                Arc::clone(&self.client),
+                self.profile.email_address.clone(),
+                draft,
+                patch,
+            ),
         )
     }
 
     fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
-        pim::draft_discard(Arc::clone(&self.client), draft)
+        self.shutdown_future(
+            AccountOperation::DraftDiscard,
+            pim::draft_discard(Arc::clone(&self.client), draft),
+        )
     }
 
     fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
-        pim::draft_send(Arc::clone(&self.client), draft)
+        self.shutdown_future(
+            AccountOperation::DraftSend,
+            pim::draft_send(Arc::clone(&self.client), draft),
+        )
     }
 
     fn cancel_scheduled_send(&self, _handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
         // Gmail's REST API exposes no scheduled-send model.
-        pim::cancel_scheduled_send_unsupported()
+        self.shutdown_future(
+            AccountOperation::CancelScheduledSend,
+            pim::cancel_scheduled_send_unsupported(),
+        )
     }
 
     fn reschedule_send(
@@ -682,25 +839,37 @@ impl Account for GoogleAccount {
         _handle: ObjectId,
         _scheduled: std::time::SystemTime,
     ) -> AccountFuture<Result<ObjectId, AccountError>> {
-        pim::reschedule_send_unsupported()
+        self.shutdown_future(
+            AccountOperation::RescheduleSend,
+            pim::reschedule_send_unsupported(),
+        )
     }
 
     fn search(
         &self,
         request: SearchRequest,
     ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
-        pim::search(Arc::clone(&self.client), request)
+        self.shutdown_future(
+            AccountOperation::Search,
+            pim::search(Arc::clone(&self.client), request),
+        )
     }
 
     fn search_messages(
         &self,
         request: SearchRequest,
     ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
-        pim::search_messages(Arc::clone(&self.client), request)
+        self.shutdown_future(
+            AccountOperation::SearchMessages,
+            pim::search_messages(Arc::clone(&self.client), request),
+        )
     }
 
     fn containers_list(&self) -> AccountFuture<Result<ContainerList, AccountError>> {
-        pim::containers_list(Arc::clone(&self.client), Arc::clone(&self.scope_cache))
+        self.shutdown_future(
+            AccountOperation::ContainersList,
+            pim::containers_list(Arc::clone(&self.client), Arc::clone(&self.scope_cache)),
+        )
     }
 
     fn container_create(
@@ -710,13 +879,16 @@ impl Account for GoogleAccount {
         parent: Option<ContainerId>,
         style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<ContainerId, AccountError>> {
-        pim::container_create(
-            Arc::clone(&self.client),
-            Arc::clone(&self.scope_cache),
-            kind,
-            name,
-            parent,
-            style,
+        self.shutdown_future(
+            AccountOperation::ContainerCreate,
+            pim::container_create(
+                Arc::clone(&self.client),
+                Arc::clone(&self.scope_cache),
+                kind,
+                name,
+                parent,
+                style,
+            ),
         )
     }
 
@@ -726,12 +898,15 @@ impl Account for GoogleAccount {
         name: String,
         style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::container_rename(
-            Arc::clone(&self.client),
-            Arc::clone(&self.scope_cache),
-            container,
-            name,
-            style,
+        self.shutdown_future(
+            AccountOperation::ContainerRename,
+            pim::container_rename(
+                Arc::clone(&self.client),
+                Arc::clone(&self.scope_cache),
+                container,
+                name,
+                style,
+            ),
         )
     }
 
@@ -740,19 +915,28 @@ impl Account for GoogleAccount {
         container: ContainerId,
         new_parent: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::container_move(container, new_parent)
+        self.shutdown_future(
+            AccountOperation::ContainerMove,
+            pim::container_move(container, new_parent),
+        )
     }
 
     fn container_delete(&self, container: ContainerId) -> AccountFuture<Result<(), AccountError>> {
-        pim::container_delete(
-            Arc::clone(&self.client),
-            Arc::clone(&self.scope_cache),
-            container,
+        self.shutdown_future(
+            AccountOperation::ContainerDelete,
+            pim::container_delete(
+                Arc::clone(&self.client),
+                Arc::clone(&self.scope_cache),
+                container,
+            ),
         )
     }
 
     fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>> {
-        pim::identities_list(Arc::clone(&self.client))
+        self.shutdown_future(
+            AccountOperation::IdentitiesList,
+            pim::identities_list(Arc::clone(&self.client)),
+        )
     }
 
     fn identity_update(
@@ -760,30 +944,45 @@ impl Account for GoogleAccount {
         identity: IdentityId,
         patch: IdentityPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::identity_update(Arc::clone(&self.client), identity, patch)
+        self.shutdown_future(
+            AccountOperation::IdentityUpdate,
+            pim::identity_update(Arc::clone(&self.client), identity, patch),
+        )
     }
 
     fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
-        pim::vacation_get(Arc::clone(&self.client))
+        self.shutdown_future(
+            AccountOperation::VacationGet,
+            pim::vacation_get(Arc::clone(&self.client)),
+        )
     }
 
     fn vacation_set(&self, config: VacationConfig) -> AccountFuture<Result<(), AccountError>> {
-        pim::vacation_set(Arc::clone(&self.client), config)
+        self.shutdown_future(
+            AccountOperation::VacationSet,
+            pim::vacation_set(Arc::clone(&self.client), config),
+        )
     }
 
     fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
-        pim::quota_get()
+        self.shutdown_future(AccountOperation::QuotaGet, pim::quota_get())
     }
 
     fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
-        filters::list(Arc::clone(&self.client))
+        self.shutdown_future(
+            AccountOperation::FiltersList,
+            filters::list(Arc::clone(&self.client)),
+        )
     }
 
     fn filter_create(
         &self,
         filter: ServerFilterCreate,
     ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
-        filters::create(Arc::clone(&self.client), filter)
+        self.shutdown_future(
+            AccountOperation::FilterCreate,
+            filters::create(Arc::clone(&self.client), filter),
+        )
     }
 
     fn filter_update(
@@ -791,27 +990,36 @@ impl Account for GoogleAccount {
         _filter: ServerFilterId,
         _patch: ServerFilterPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(error::into_account_error(
-                crate::error::Error::unsupported(AccountOperation::FilterUpdate),
-                error::GmailErrorContext::base(AccountOperation::FilterUpdate),
-            ))
-        })
+        self.shutdown_future(
+            AccountOperation::FilterUpdate,
+            Box::pin(async {
+                Err(error::into_account_error(
+                    crate::error::Error::unsupported(AccountOperation::FilterUpdate),
+                    error::GmailErrorContext::base(AccountOperation::FilterUpdate),
+                ))
+            }),
+        )
     }
 
     fn filter_delete(&self, filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
-        filters::delete(Arc::clone(&self.client), filter)
+        self.shutdown_future(
+            AccountOperation::FilterDelete,
+            filters::delete(Arc::clone(&self.client), filter),
+        )
     }
 
     fn filter_validate(
         &self,
         filter: ServerFilterCreate,
     ) -> AccountFuture<Result<FilterValidation, AccountError>> {
-        filters::validate(filter)
+        self.shutdown_future(AccountOperation::FilterValidate, filters::validate(filter))
     }
 
     fn address_books_list(&self) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
-        contacts::address_books_list(Arc::clone(&self.client))
+        self.shutdown_future(
+            AccountOperation::AddressBooksList,
+            contacts::address_books_list(Arc::clone(&self.client)),
+        )
     }
 
     fn contacts_list(
@@ -819,18 +1027,27 @@ impl Account for GoogleAccount {
         address_book: Option<AddressBookId>,
         page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        contacts::list(Arc::clone(&self.client), address_book, page_cursor)
+        self.shutdown_future(
+            AccountOperation::ContactsList,
+            contacts::list(Arc::clone(&self.client), address_book, page_cursor),
+        )
     }
 
     fn contact_get(&self, contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
-        contacts::get(Arc::clone(&self.client), contact)
+        self.shutdown_future(
+            AccountOperation::ContactGet,
+            contacts::get(Arc::clone(&self.client), contact),
+        )
     }
 
     fn contact_create(
         &self,
         contact: ContactCreate,
     ) -> AccountFuture<Result<ContactId, AccountError>> {
-        contacts::create(Arc::clone(&self.client), contact)
+        self.shutdown_future(
+            AccountOperation::ContactCreate,
+            contacts::create(Arc::clone(&self.client), contact),
+        )
     }
 
     fn contact_update(
@@ -838,18 +1055,27 @@ impl Account for GoogleAccount {
         contact: ContactId,
         patch: ContactPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        contacts::update(Arc::clone(&self.client), contact, patch)
+        self.shutdown_future(
+            AccountOperation::ContactUpdate,
+            contacts::update(Arc::clone(&self.client), contact, patch),
+        )
     }
 
     fn contact_delete(&self, contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
-        contacts::delete(Arc::clone(&self.client), contact)
+        self.shutdown_future(
+            AccountOperation::ContactDelete,
+            contacts::delete(Arc::clone(&self.client), contact),
+        )
     }
 
     fn contact_search(
         &self,
         request: ContactSearchRequest,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        contacts::search(Arc::clone(&self.client), request)
+        self.shutdown_future(
+            AccountOperation::ContactSearch,
+            contacts::search(Arc::clone(&self.client), request),
+        )
     }
 
     fn directory_search(
@@ -858,19 +1084,25 @@ impl Account for GoogleAccount {
         limit: Option<u32>,
         page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
-        contacts::directory_search(Arc::clone(&self.client), query, limit, page_cursor)
+        self.shutdown_future(
+            AccountOperation::DirectorySearch,
+            contacts::directory_search(Arc::clone(&self.client), query, limit, page_cursor),
+        )
     }
 
     fn directory_groups_list(
         &self,
         _page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
-        Box::pin(async {
-            Err(error::into_account_error(
-                crate::error::Error::unsupported(AccountOperation::DirectoryGroupsList),
-                error::GmailErrorContext::base(AccountOperation::DirectoryGroupsList),
-            ))
-        })
+        self.shutdown_future(
+            AccountOperation::DirectoryGroupsList,
+            Box::pin(async {
+                Err(error::into_account_error(
+                    crate::error::Error::unsupported(AccountOperation::DirectoryGroupsList),
+                    error::GmailErrorContext::base(AccountOperation::DirectoryGroupsList),
+                ))
+            }),
+        )
     }
 
     fn directory_group_expand(
@@ -878,31 +1110,46 @@ impl Account for GoogleAccount {
         _group: DirectoryGroupId,
         _page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
-        Box::pin(async {
-            Err(error::into_account_error(
-                crate::error::Error::unsupported(AccountOperation::DirectoryGroupExpand),
-                error::GmailErrorContext::base(AccountOperation::DirectoryGroupExpand),
-            ))
-        })
+        self.shutdown_future(
+            AccountOperation::DirectoryGroupExpand,
+            Box::pin(async {
+                Err(error::into_account_error(
+                    crate::error::Error::unsupported(AccountOperation::DirectoryGroupExpand),
+                    error::GmailErrorContext::base(AccountOperation::DirectoryGroupExpand),
+                ))
+            }),
+        )
     }
 
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
-        calendar::calendars_list(Arc::clone(&self.client))
+        self.shutdown_future(
+            AccountOperation::CalendarsList,
+            calendar::calendars_list(Arc::clone(&self.client)),
+        )
     }
 
     fn events_in_range(
         &self,
         range: EventRange,
     ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
-        calendar::events_in_range(Arc::clone(&self.client), range)
+        self.shutdown_future(
+            AccountOperation::EventsInRange,
+            calendar::events_in_range(Arc::clone(&self.client), range),
+        )
     }
 
     fn event_get(&self, event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>> {
-        calendar::get(Arc::clone(&self.client), event)
+        self.shutdown_future(
+            AccountOperation::EventGet,
+            calendar::get(Arc::clone(&self.client), event),
+        )
     }
 
     fn event_create(&self, event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
-        calendar::create(Arc::clone(&self.client), event)
+        self.shutdown_future(
+            AccountOperation::EventCreate,
+            calendar::create(Arc::clone(&self.client), event),
+        )
     }
 
     fn event_update(
@@ -910,11 +1157,17 @@ impl Account for GoogleAccount {
         event: EventId,
         patch: EventPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        calendar::update(Arc::clone(&self.client), event, patch)
+        self.shutdown_future(
+            AccountOperation::EventUpdate,
+            calendar::update(Arc::clone(&self.client), event, patch),
+        )
     }
 
     fn event_delete(&self, event: EventId) -> AccountFuture<Result<(), AccountError>> {
-        calendar::delete(Arc::clone(&self.client), event)
+        self.shutdown_future(
+            AccountOperation::EventDelete,
+            calendar::delete(Arc::clone(&self.client), event),
+        )
     }
 
     fn event_rsvp(
@@ -922,11 +1175,14 @@ impl Account for GoogleAccount {
         event: EventId,
         status: RsvpStatus,
     ) -> AccountFuture<Result<(), AccountError>> {
-        calendar::rsvp(
-            Arc::clone(&self.client),
-            self.profile.email_address.clone(),
-            event,
-            status,
+        self.shutdown_future(
+            AccountOperation::EventRsvp,
+            calendar::rsvp(
+                Arc::clone(&self.client),
+                self.profile.email_address.clone(),
+                event,
+                status,
+            ),
         )
     }
 
@@ -934,17 +1190,23 @@ impl Account for GoogleAccount {
         &self,
         request: EventSearchRequest,
     ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
-        calendar::search(Arc::clone(&self.client), request)
+        self.shutdown_future(
+            AccountOperation::EventSearch,
+            calendar::search(Arc::clone(&self.client), request),
+        )
     }
 
     fn thread_hydrate(
         &self,
         thread: ThreadId,
     ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
-        pim::thread_hydrate(
-            Arc::clone(&self.client),
-            Arc::clone(&self.scope_cache),
-            thread,
+        self.shutdown_future(
+            AccountOperation::HydrateThread,
+            pim::thread_hydrate(
+                Arc::clone(&self.client),
+                Arc::clone(&self.scope_cache),
+                thread,
+            ),
         )
     }
 
@@ -953,11 +1215,14 @@ impl Account for GoogleAccount {
         message: ObjectId,
         projection: HydrationProjection,
     ) -> AccountFuture<Result<Message, AccountError>> {
-        pim::message_hydrate(
-            Arc::clone(&self.client),
-            Arc::clone(&self.scope_cache),
-            message,
-            projection,
+        self.shutdown_future(
+            AccountOperation::HydrateMessage,
+            pim::message_hydrate(
+                Arc::clone(&self.client),
+                Arc::clone(&self.scope_cache),
+                message,
+                projection,
+            ),
         )
     }
 
@@ -967,7 +1232,10 @@ impl Account for GoogleAccount {
         target: ContainerId,
         source: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::move_thread(Arc::clone(&self.client), thread, target, source)
+        self.shutdown_future(
+            AccountOperation::MoveThread,
+            pim::move_thread(Arc::clone(&self.client), thread, target, source),
+        )
     }
 
     fn delete_thread(
@@ -975,7 +1243,10 @@ impl Account for GoogleAccount {
         thread: ThreadId,
         current: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::delete_thread(Arc::clone(&self.client), thread, current)
+        self.shutdown_future(
+            AccountOperation::DeleteThread,
+            pim::delete_thread(Arc::clone(&self.client), thread, current),
+        )
     }
 
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
@@ -985,10 +1256,13 @@ impl Account for GoogleAccount {
         // Linearization point. `closed` is now observable, so everything a
         // closed account promises must already hold before the caller can
         // touch - or drop - the returned future. Cancelling the shutdown
-        // token here retires the watch renewer and the push and scope
-        // lifecycle streams synchronously, and `DetachOnDrop` runs the
-        // transport detach on every exit path of the future, completion and
-        // cancellation alike. Only the best-effort `users.stop` round trip is
+        // token here retires the watch renewer, push and scope lifecycle
+        // streams, adapter-wrapped reads, and PIM, contacts, and Calendar
+        // futures synchronously. An active future that is interrupted carries
+        // InFlight evidence because the adapter cannot inspect its request
+        // progress. `DetachOnDrop` runs the transport detach on every exit
+        // path of the close future, completion and cancellation alike. Only
+        // the best-effort `users.stop` round trip is
         // left inside the future, because it needs the transport that the
         // detach sheds; a caller that drops the future mid-call leaves a
         // Gmail-side watch that expires on its own within seven days, and
@@ -1172,10 +1446,10 @@ mod tests {
         spec.hosts = vec![RateLimit::new(TEST_HOST, 100.0, 1, 100)];
         spec.default_retry = RetryPolicy::disabled();
         let account_net = net.attach_account(AccountId("close-test".to_owned()), spec);
-        let client = Arc::new(GmailClient::with_account_net(
-            format!("https://{TEST_HOST}"),
-            account_net,
-        ));
+        let client = Arc::new(
+            GmailClient::with_account_net(format!("https://{TEST_HOST}"), account_net)
+                .with_calendar_base(format!("https://{TEST_HOST}/calendar/v3")),
+        );
         let shutdown = CancellationToken::new();
         let account = Arc::new(GoogleAccount {
             client: Arc::clone(&client),
@@ -1201,6 +1475,133 @@ mod tests {
             closed: AtomicBool::new(false),
         });
         (account, net)
+    }
+
+    #[tokio::test]
+    async fn close_cancels_membership_discovery_during_its_read() {
+        let script = ScriptedDispatch::new([Canned::Pending]);
+        let (account, _net) = scripted_account(&script);
+        let mut stream = account.discover_memberships();
+        let mut next = Box::pin(stream.next());
+
+        for _ in 0..8 {
+            assert!(futures::future::poll_immediate(&mut next).await.is_none());
+            if !script.requests().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(script.requests().len(), 1, "labels.list is in flight");
+
+        drop(account.close());
+        assert!(next.await.is_none(), "close ends this read stream silently");
+        assert_eq!(script.requests().len(), 1, "close sends no follow-up read");
+    }
+
+    #[tokio::test]
+    async fn close_cancels_calendar_future_with_inflight_evidence() {
+        let script = ScriptedDispatch::new([Canned::Pending]);
+        let (account, _net) = scripted_account(&script);
+        let mut future = account.calendars_list();
+
+        for _ in 0..8 {
+            assert!(futures::future::poll_immediate(&mut future).await.is_none());
+            if !script.requests().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(script.requests().len(), 1, "calendarList is in flight");
+
+        drop(account.close());
+        let error = future
+            .await
+            .expect_err("shutdown cancels the active future");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network)
+        ));
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Attempt(attempt)
+                if attempt.transmission_state == bifrost_types::TransmissionState::InFlight
+        )));
+        assert_eq!(script.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn close_after_event_move_requires_reconciliation() {
+        let script = ScriptedDispatch::new([
+            bifrost_net::test_support::canned(reqwest::StatusCode::OK, br#"{"id":"event-1"}"#),
+            Canned::Pending,
+        ]);
+        let (account, _net) = scripted_account(&script);
+        let mut future = account.event_update(
+            EventId("source::event-1".into()),
+            EventPatch {
+                calendar_id: Some(bifrost_types::CalendarId("destination".into())),
+                title: Some(Some("Updated".into())),
+                ..EventPatch::default()
+            },
+        );
+        for _ in 0..8 {
+            assert!(futures::future::poll_immediate(&mut future).await.is_none());
+            if script.requests().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let requests = script.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "move answered; destination PATCH is pending"
+        );
+        assert_eq!(requests[0].method, reqwest::Method::POST);
+        assert_eq!(requests[1].method, reqwest::Method::PATCH);
+        assert!(
+            requests[1]
+                .url
+                .path()
+                .contains("/calendars/destination/events/event-1")
+        );
+
+        drop(account.close());
+        let error = future.await.expect_err("shutdown interrupts the PATCH");
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::Reconcile(advice)
+                if advice.reason == bifrost_types::ReconcileReason::TransportDropAfterSend
+        ));
+        assert_eq!(script.requests().len(), 2);
+    }
+
+    #[test]
+    fn shutdown_of_composite_updates_never_advises_plain_retry() {
+        for operation in [
+            AccountOperation::EventUpdate,
+            AccountOperation::ContactUpdate,
+        ] {
+            let error = shutdown_account_future_error(operation);
+            assert!(error.recovery().requires_reconciliation());
+        }
+    }
+
+    #[tokio::test]
+    async fn account_future_called_after_close_does_not_start_a_request() {
+        let script = ScriptedDispatch::new([Canned::Pending]);
+        let (account, _net) = scripted_account(&script);
+        drop(account.close());
+
+        let error = account
+            .calendars_list()
+            .await
+            .expect_err("closed account refuses before polling the operation");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::CalendarsList)
+        ));
+        assert!(script.requests().is_empty());
     }
 
     /// `close()` flips `closed` before it is awaited, so every later

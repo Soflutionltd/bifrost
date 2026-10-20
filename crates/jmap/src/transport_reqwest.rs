@@ -119,7 +119,7 @@ impl ReqwestTransport {
         ))
     }
 
-    async fn send_once(
+    async fn build_request(
         &self,
         method: &str,
         url: &str,
@@ -127,7 +127,7 @@ impl ReqwestTransport {
         content_type: Option<&str>,
         total_timeout: Option<Duration>,
         limit: Option<ConcurrencyLimit>,
-    ) -> Result<bifrost_net::Response, TransportError> {
+    ) -> Result<bifrost_net::RequestBuilder, TransportError> {
         let mut request = match method {
             "GET" => self.net.get(url),
             "POST" => self.net.post(url),
@@ -179,7 +179,23 @@ impl ReqwestTransport {
         if let Some(limit) = limit {
             request = request.concurrency_limit(limit);
         }
-        request.send().await.map_err(transport_error_from_net)
+        Ok(request)
+    }
+
+    async fn send_once(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<Bytes>,
+        content_type: Option<&str>,
+        total_timeout: Option<Duration>,
+        limit: Option<ConcurrencyLimit>,
+    ) -> Result<bifrost_net::Response, TransportError> {
+        self.build_request(method, url, body, content_type, total_timeout, limit)
+            .await?
+            .send()
+            .await
+            .map_err(transport_error_from_net)
     }
 
     fn handle_response(
@@ -247,15 +263,65 @@ impl HttpTransport for ReqwestTransport {
     }
 
     async fn download(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
-        self.send("GET", url, None, None, None).await
+        Ok(self.download_measured(url).await?.0)
     }
 
     async fn download_measured(&self, url: &str) -> Result<(bytes::Bytes, u64), TransportError> {
-        self.send_measured("GET", url, None, None, None, None).await
+        use crate::blob::download::BlobTransport;
+        use futures::StreamExt;
+        let download = self
+            .download_stream(url, crate::blob::download::DEFAULT_MAX_BLOB_SIZE)
+            .await?;
+        let mut stream = download.body;
+        let mut body = bytes::BytesMut::new();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk?);
+        }
+        Ok((body.freeze(), download.bytes_in.bytes_in()))
     }
 
     async fn get_session(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
         self.send("GET", url, None, None, Some(self.timeout)).await
+    }
+}
+
+impl crate::blob::download::BlobTransport for ReqwestTransport {
+    async fn download_stream(
+        &self,
+        url: &str,
+        max_bytes: u64,
+    ) -> Result<crate::blob::download::BlobDownload, TransportError> {
+        // Use the streaming request door rather than AccountNet::download_stream:
+        // blobs need the JMAP default headers, Basic auth support, and no total
+        // deadline. Both doors use net's retry, metering and inactivity bounds.
+        let response = self
+            .build_request("GET", url, None, None, None, None)
+            .await?
+            .send_streaming()
+            .await
+            .map_err(transport_error_from_net)?;
+        if !response.status().is_success() {
+            use futures::StreamExt;
+            let mut stream = response.body;
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let Ok(chunk) = chunk else { break };
+                let remaining = PASSTHROUGH_BODY_CAP.saturating_sub(body.len());
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if body.len() == PASSTHROUGH_BODY_CAP {
+                    break;
+                }
+            }
+            return Err(TransportError::from_net(bifrost_net::Error::Status {
+                code: response.status,
+                headers: response.headers,
+                body: Bytes::from(body),
+            }));
+        }
+        Ok(crate::blob::download::BlobDownload {
+            bytes_in: response.bytes_in,
+            body: crate::blob::download::bounded_stream(response.body, max_bytes),
+        })
     }
 }
 
@@ -403,6 +469,48 @@ mod tests {
     use crate::client::Credentials;
     use bifrost_net::StaticTokenSource;
     use bifrost_net::test_support::{Canned, ScriptedDispatch, scripted_net};
+
+    #[tokio::test]
+    async fn blobs_bypass_json_buffer_limit_and_keep_streaming_and_buffered_doors() {
+        use crate::blob::download::BlobTransport;
+        use futures::StreamExt;
+        let script = ScriptedDispatch::new((0..3).map(|_| Canned::Stream {
+            status: reqwest::StatusCode::OK,
+            headers: header::HeaderMap::new(),
+            chunks: vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")],
+        }));
+        let mut transport = scripted_transport(&script);
+        let mut spec = AccountSpec::new(None);
+        spec.max_buffered_response = Some(1);
+        transport.net = scripted_net(&script, bifrost_net::NetConfig::default())
+            .attach_account(AccountId("small-json-limit".to_owned()), spec);
+
+        let download = transport
+            .download_stream("https://jmap.test/blob", 4)
+            .await
+            .unwrap();
+        let mut stream = download.body;
+        assert_eq!(stream.next().await.unwrap().unwrap(), b"ab"[..]);
+        assert_eq!(stream.next().await.unwrap().unwrap(), b"cd"[..]);
+        assert!(stream.next().await.is_none());
+        assert_eq!(download.bytes_in.bytes_in(), 4);
+        assert_eq!(
+            transport.download("https://jmap.test/blob").await.unwrap(),
+            b"abcd"[..]
+        );
+        let (body, count) = transport
+            .download_measured("https://jmap.test/blob")
+            .await
+            .unwrap();
+        assert_eq!(body, b"abcd"[..]);
+        assert_eq!(count, 4);
+        assert!(
+            script
+                .requests()
+                .iter()
+                .all(|request| request.timeout.is_none())
+        );
+    }
 
     #[test]
     fn independently_built_transports_share_the_process_net() {

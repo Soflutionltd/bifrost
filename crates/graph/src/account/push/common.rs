@@ -94,7 +94,12 @@ pub(super) fn no_subscribable_push_scopes(failed: &[bifrost_types::BatchFailure]
             builder = builder.push_cause(cause.clone());
         }
     }
-    builder.try_build().unwrap_or_else(|_| first.error.clone())
+    // Rebuilding preserves the first failure's classification evidence. Sibling
+    // attempts describe other scopes, including acknowledged responses beside
+    // a transport failure; they must neither reclassify it nor be discarded.
+    builder
+        .try_build()
+        .expect("valid decorated push failure classification")
 }
 
 /// Raise the account's push-down latch, emitting `Disconnected` on the edge.
@@ -356,6 +361,43 @@ mod tests {
         DecodedHandle, account_binding, decode_handle, ews_handle, graph_handle, token_from_entropy,
     };
     use bifrost_types::{AccountErrorKind, InternalErrorKind, RecoveryClass, SubscriptionHandle};
+
+    #[test]
+    fn all_failed_scopes_preserve_the_first_recovery_and_every_cause() {
+        use bifrost_types::{
+            AccountErrorBuilder, AttemptCause, BatchFailure, BatchItemId, Cause, ServerCause,
+            ServerErrorKind, TransmissionState, TransportCause, TransportErrorKind, TransportKind,
+        };
+
+        let first = AccountErrorBuilder::new(
+            AccountErrorKind::Transport(TransportErrorKind::Network),
+            Cause::Transport(TransportCause::new(TransportKind::Network, None)),
+        )
+        .idempotency_override(false)
+        .try_build()
+        .expect("valid transport failure");
+        let sibling = AccountErrorBuilder::new(
+            AccountErrorKind::Server(ServerErrorKind::Unavailable),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+        )
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::Acknowledged,
+        )))
+        .try_build()
+        .expect("valid sibling evidence");
+        let expected_len = first.chain().iter().count() + sibling.chain().iter().count();
+        let merged = super::no_subscribable_push_scopes(&[
+            BatchFailure::new(BatchItemId("first".into()), first.clone()),
+            BatchFailure::new(BatchItemId("sibling".into()), sibling),
+        ]);
+        assert_eq!(merged.kind(), first.kind());
+        assert_eq!(merged.recovery(), first.recovery());
+        assert_eq!(merged.chain().iter().count(), expected_len);
+        assert!(
+            matches!(merged.chain().iter().last(), Some(Cause::Attempt(attempt))
+            if attempt.transmission_state == TransmissionState::Acknowledged)
+        );
+    }
 
     #[test]
     fn a_graph_handle_round_trips_its_account_and_server_ids() {

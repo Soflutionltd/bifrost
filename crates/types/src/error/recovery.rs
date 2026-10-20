@@ -372,6 +372,9 @@ pub enum StrategyDowngrade {
     CondstoreToBasic,
 }
 
+// The builder supplies only producer-owned classification causes here, never
+// evidence appended while decorating an already classified error. Helpers may
+// scan this entire chain because its diagnostic suffix has been excluded.
 pub(crate) fn derive(
     kind: &AccountErrorKind,
     scope: Option<&ErrorScope>,

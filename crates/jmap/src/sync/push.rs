@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bifrost_types::{
@@ -16,6 +17,15 @@ use crate::client::Client;
 use crate::{DataType, PushObject};
 
 pub(crate) type DataTypeSet = HashSet<DataType>;
+
+/// State handles held while a subscription transaction applies and commits a
+/// new union. The values retain their independent locks and lifetimes.
+pub(crate) struct SubscribeState {
+    pub(crate) subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, DataTypeSet>>>,
+    pub(crate) enabled: Arc<Mutex<DataTypeSet>>,
+    pub(crate) push_state: Arc<Mutex<Option<String>>>,
+    pub(crate) closed: Arc<AtomicBool>,
+}
 
 /// Routing snapshot for push notifications: which JMAP `accountId` is the
 /// primary, and which seeded account-level `Folder` cursor scope each
@@ -353,9 +363,7 @@ pub(crate) fn subscribe<T: PushTransport>(
     push: PushCapability,
     handle: SubscriptionHandle,
     scopes: Vec<CursorScope>,
-    subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, DataTypeSet>>>,
-    enabled: Arc<Mutex<DataTypeSet>>,
-    push_state: Arc<Mutex<Option<String>>>,
+    state: SubscribeState,
 ) -> AccountFuture<Result<(SubscriptionHandle, Vec<bool>), AccountError>> {
     Box::pin(async move {
         if push != PushCapability::InProcess {
@@ -383,9 +391,16 @@ pub(crate) fn subscribe<T: PushTransport>(
         // takes more than one, and every commit happens after the frame send
         // succeeds. Holding all three across the send is what makes a
         // cancelled subscribe future commit nothing at all.
-        let mut subscriptions_guard = subscriptions.lock().await;
-        let mut enabled_guard = enabled.lock().await;
-        let mut push_state_guard = push_state.lock().await;
+        let mut subscriptions_guard = state.subscriptions.lock().await;
+        let mut enabled_guard = state.enabled.lock().await;
+        let mut push_state_guard = state.push_state.lock().await;
+        if state.closed.load(Ordering::Acquire) {
+            return Err(super::error::unsupported_error(
+                AccountOperation::PushSubscribe,
+                None,
+                "JMAP account is closed",
+            ));
+        }
         let mut prospective = subscriptions_guard.clone();
         prospective.insert(handle.clone(), data_types.clone());
         let union = union_data_types(&prospective);
@@ -427,6 +442,32 @@ pub(crate) fn subscribe<T: PushTransport>(
         commit_push_set(&mut enabled_guard, &mut push_state_guard, union);
         Ok((handle, accepted))
     })
+}
+
+/// Disable push while holding the same lock chain as subscribe and
+/// unsubscribe. The account sets `closed` before entering here, so a
+/// subscriber already holding these guards completes first and is then
+/// disabled; one waiting behind close observes `closed` and cannot re-enable.
+pub(crate) async fn disable_for_close<T: PushTransport>(
+    client: T,
+    subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, DataTypeSet>>>,
+    enabled: Arc<Mutex<DataTypeSet>>,
+    push_state: Arc<Mutex<Option<String>>>,
+) -> crate::Result<()> {
+    let mut subscriptions_guard = subscriptions.lock().await;
+    let mut enabled_guard = enabled.lock().await;
+    let mut push_state_guard = push_state.lock().await;
+    let empty = DataTypeSet::new();
+    match client
+        .set_push_data_types(&empty, push_state_guard.clone())
+        .await
+    {
+        Ok(()) | Err(crate::Error::WebSocketNotConnected | crate::Error::WebSocketSend(_)) => {}
+        Err(error) => return Err(error),
+    }
+    subscriptions_guard.clear();
+    commit_push_set(&mut enabled_guard, &mut push_state_guard, empty);
+    Ok(())
 }
 
 /// Tear down a subscription handle.
@@ -982,6 +1023,30 @@ mod tests {
     use futures::StreamExt;
     use std::sync::Mutex as StdMutex;
 
+    async fn subscribe<T: PushTransport>(
+        client: T,
+        push: PushCapability,
+        handle: SubscriptionHandle,
+        scopes: Vec<CursorScope>,
+        subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, DataTypeSet>>>,
+        enabled: Arc<Mutex<DataTypeSet>>,
+        push_state: Arc<Mutex<Option<String>>>,
+    ) -> Result<(SubscriptionHandle, Vec<bool>), AccountError> {
+        super::subscribe(
+            client,
+            push,
+            handle,
+            scopes,
+            SubscribeState {
+                subscriptions,
+                enabled,
+                push_state,
+                closed: Arc::new(AtomicBool::new(false)),
+            },
+        )
+        .await
+    }
+
     fn drain(rx: &mut broadcast::Receiver<WatchEvent>) -> Vec<WatchEvent> {
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -1289,6 +1354,13 @@ mod tests {
         applied: AppliedPushSets,
     }
 
+    #[derive(Clone)]
+    struct CloseRacePushTransport {
+        applied: AppliedPushSets,
+        nonempty_entered: Arc<tokio::sync::Notify>,
+        release_nonempty: Arc<tokio::sync::Notify>,
+    }
+
     impl PushTransport for RecordingPushTransport {
         type Stream = BoxedWsStream;
 
@@ -1312,6 +1384,34 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        async fn ping_push(&self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl PushTransport for CloseRacePushTransport {
+        type Stream = BoxedWsStream;
+
+        async fn connect_push(&self) -> crate::Result<Self::Stream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        async fn set_push_data_types(
+            &self,
+            data_types: &DataTypeSet,
+            push_state: Option<String>,
+        ) -> crate::Result<()> {
+            self.applied
+                .lock()
+                .expect("apply log")
+                .push((data_types.clone(), push_state));
+            if !data_types.is_empty() {
+                self.nonempty_entered.notify_one();
+                self.release_nonempty.notified().await;
+            }
+            Ok(())
         }
 
         async fn ping_push(&self) -> crate::Result<()> {
@@ -1591,6 +1691,91 @@ mod tests {
                 "the next connection applies the committed subscription"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn close_serializes_after_an_inflight_subscribe_and_blocks_waiters() {
+        let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+        let enabled = Arc::new(Mutex::new(HashSet::new()));
+        let push_state = Arc::new(Mutex::new(None));
+        let closed = Arc::new(AtomicBool::new(false));
+        let applied = Arc::new(StdMutex::new(Vec::new()));
+        let transport = CloseRacePushTransport {
+            applied: Arc::clone(&applied),
+            nonempty_entered: Arc::new(tokio::sync::Notify::new()),
+            release_nonempty: Arc::new(tokio::sync::Notify::new()),
+        };
+
+        let subscribe_transport = transport.clone();
+        let subscribe_closed = Arc::clone(&closed);
+        let subscribe_subscriptions = Arc::clone(&subscriptions);
+        let subscribe_enabled = Arc::clone(&enabled);
+        let subscribe_push_state = Arc::clone(&push_state);
+        let subscribe_task = tokio::spawn(async move {
+            super::subscribe(
+                subscribe_transport,
+                PushCapability::InProcess,
+                SubscriptionHandle("in-flight".to_string()),
+                vec![CursorScope::Type(ObjectType::Email)],
+                SubscribeState {
+                    subscriptions: subscribe_subscriptions,
+                    enabled: subscribe_enabled,
+                    push_state: subscribe_push_state,
+                    closed: subscribe_closed,
+                },
+            )
+            .await
+        });
+        transport.nonempty_entered.notified().await;
+        closed.store(true, Ordering::Release);
+
+        let close_task = tokio::spawn(disable_for_close(
+            transport.clone(),
+            Arc::clone(&subscriptions),
+            Arc::clone(&enabled),
+            Arc::clone(&push_state),
+        ));
+        tokio::task::yield_now().await;
+        transport.release_nonempty.notify_one();
+        subscribe_task
+            .await
+            .expect("subscribe task joins")
+            .expect("a subscribe already in flight may commit before close");
+        close_task
+            .await
+            .expect("close task joins")
+            .expect("close applies the empty union");
+
+        assert_eq!(
+            applied.lock().expect("apply log").clone(),
+            vec![
+                ([DataType::Email].into_iter().collect(), None),
+                (DataTypeSet::new(), None),
+            ]
+        );
+        assert!(subscriptions.lock().await.is_empty());
+        assert!(enabled.lock().await.is_empty());
+        assert_eq!(push_state.lock().await.as_deref(), None);
+
+        let refused = super::subscribe(
+            transport,
+            PushCapability::InProcess,
+            SubscriptionHandle("after-close".to_string()),
+            vec![CursorScope::Type(ObjectType::Email)],
+            SubscribeState {
+                subscriptions,
+                enabled,
+                push_state,
+                closed,
+            },
+        )
+        .await
+        .expect_err("a waiter after close cannot re-enable push");
+        assert_eq!(
+            refused.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
+        );
+        assert_eq!(applied.lock().expect("apply log").len(), 2);
     }
 
     /// The knock-on the dead-sink failure caused. After a WebSocket drop

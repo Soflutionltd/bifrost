@@ -362,6 +362,25 @@ Blob methods return byte streams. `open_blob_range` is only usable when
 advertised by `blob_range`; `open_raw_rfc822` returns verbatim
 server-assembled message bytes.
 
+`Address::parse_list` parses unfolded address-list values using the same
+parser as `HeaderMap::addresses`: quoted commas and quoted-pairs are handled
+before display-name RFC 2047 decoding. Group colons and list separators count
+only outside quoted strings, nested comments, angle addresses and domain
+literals. Quoted local parts retain spaces, tabs, colons and quoted-pairs
+verbatim. This remains tolerant parsing, not complete RFC 5322 validation.
+`Address::parse_list_checked` and `HeaderMap::addresses_checked` return
+`Result<Vec<Address>, Vec<String>>`: any rejected mailbox makes the whole
+result an error containing the original rejected items, rather than a partial
+recipient list. Empty lists and empty groups succeed. Unsupported syntax must
+be treated as a rejection, not evidence that the mailbox is invalid.
+The existing `parse_list` and `addresses` convenience methods return only
+accepted mailboxes. IMAP submission and Google draft hydration currently use
+these convenience methods; callers that submit or rewrite recipients must use
+the checked methods and propagate rejection before writing.
+`HeaderMap::parse` accepts a standalone header block, unfolding continuations
+and preserving repeated fields in wire order. Its caller bounds the input;
+unlike full MIME parsing, it applies no header-size limit itself.
+
 Header decoding is bounded on two independent axes. `ENCODED_WORD_SCAN_LIMIT`
 (998, the RFC 5322 line limit) caps what a SINGLE RFC 2047 candidate may scan,
 so an overlong word is never recognized and is echoed verbatim.

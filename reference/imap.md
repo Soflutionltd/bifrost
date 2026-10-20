@@ -508,7 +508,12 @@ Internally, `connect_authenticated_metered(credentials, policy, meter, budget)` 
 Connect-time STARTTLS requires both an unauthenticated greeting and an
 advertised `STARTTLS`. A cleartext PREAUTH greeting is refused as
 `StartTlsUnavailable` before sending a command, as RFC 9051 requires closing
-an already authenticated cleartext session. At runtime, `is_encrypted()` is
+an already authenticated cleartext session. The error maps to
+`Authorization(PolicyBlocked)` because the configured TLS requirement cannot
+be met either when the capability is absent or when the greeting is PREAUTH.
+Its account-boundary diagnostic currently says the server does not advertise
+STARTTLS, which is inaccurate for PREAUTH with the capability present. At
+runtime, `is_encrypted()` is
 updated when the TLS stream is installed. If the required post-upgrade
 CAPABILITY exchange fails, the driver retires the connection instead of
 returning a reusable half-upgraded session, while preserving the exchange's
@@ -544,13 +549,18 @@ Submodules:
 
 - `QResync { uidvalidity, modseq, known_uids, known_uids_complete }`: the QRESYNC SELECT supplies VANISHED and changed-FETCH data since the cached MODSEQ. No second `UID FETCH ... CHANGEDSINCE ... VANISHED` is issued. Because the known-UID parameter can restrict SELECT responses to the old baseline (RFC 7162 Section 3.2.5.1), a live UID count that disagrees with EXISTS triggers `UID SEARCH ALL` and a membership diff before checkpointing. A failed SEARCH cannot advance the cursor; a successful reconciliation retains SELECT's HIGHESTMODSEQ so concurrent changes remain eligible for the next poll. VANISHED ranges are subtracted from the live known set before removals are emitted, so unknown UIDs and coalesced holes produce no membership changes.
 - `Condstore { uidvalidity, modseq, known_uids }`: bounded streaming flag diff via `CHANGEDSINCE`; expunge detection via UID-list diff against `known_uids`. `CHANGEDSINCE` returns arrivals as well as updates, so a UID absent from `known_uids` is not emitted as `Updated` - the baseline diff reports it as `Added`, once. The QRESYNC path guards the same hazard through `record_fetch_change` / `fetch_change_seen`.
-- `Basic { uidvalidity, uidnext, known_uids }`: neither extension; UID-list diff for both additions and expunges. When SELECT returns the cursor's unchanged nonzero UIDNEXT and EXISTS still equals the baseline count, the exact snapshot is reused and `UID SEARCH ALL` is skipped. Server-authored `changed_messages` UIDs are classified against both sets before they can become changes: a UID in the baseline is `Updated`, a UID that is only in the live snapshot is an arrival and is left to the diff's `Added` lane so it is never announced twice, and a UID in neither set is contradictory and invalidates the cursor. The last case is also what makes the UIDNEXT/EXISTS skip safe, since there the live snapshot is the baseline.
+- `Basic { uidvalidity, uidnext, known_uids }`: neither extension; UID-list diff for additions and expunges. When SELECT returns the cursor's unchanged nonzero UIDNEXT and EXISTS still equals the baseline count, the exact snapshot is reused and `UID SEARCH ALL` is skipped. Server-authored `changed_messages` UIDs are classified against both sets before they can become changes: a UID in the baseline is `Updated`, a UID that is only in the live snapshot is an arrival and is left to the diff's `Added` lane so it is never announced twice, and a UID in neither set is contradictory and invalidates the cursor. The last case is also what makes the UIDNEXT/EXISTS skip safe, since there the live snapshot is the baseline. Without CONDSTORE, SELECT's changed-message FETCH responses are only hints; flag changes on an existing UID can go unobserved until re-inventory. `CursorDescriptor` has no flag-freshness field, so consumers cannot distinguish this limitation from a current flag view.
 
 All three strategies emit at most `BATCH_ITEMS` changes per page. CONDSTORE
 drives its bounded FETCH receiver and command future together, and treats the
 receiver closing before the command result the same way as inventory:
 the command future remains authoritative, so a failed or truncated
 FETCH cannot checkpoint success.
+
+The folder entry's in-memory cursor is committed only after the final change
+page and `Done` carrying its checkpoint are accepted by the stream channel.
+That cursor is a hint for later SELECTs; the engine-provided cursor remains the
+durable synchronization checkpoint.
 
 Negotiation in `factory.rs`:
 
@@ -580,6 +590,11 @@ describe what each mint closure decides, not a second copy of the accounting.
 
 `bulk_set_flags` and `bulk_destroy` partition targets by cached MODSEQ: cache hits go out under `STORE UNCHANGEDSINCE <modseq>`, misses fall back to unprotected STORE, and protected batches run first so their success updates the cache before the unprotected pass.
 
+All three bulk operations accept the Account API's `IdempotencyKey`, but IMAP
+has no wire token for server-side request deduplication, so the provider does
+not inspect or persist the key. Uncertain per-UID outcomes are reconciled by
+the engine's read-back path.
+
 - The MODSEQ cache is populated from inventory, get, changes, and push IDLE FETCH events; cleared by successful flag mutations, expunges, VANISHED, moves, and folder delete/rename. A tolerated server MODSEQ value of zero is ignored: it cannot guard a later STORE and the opportunistic cache must not turn it into a failed sync or mutation. A zero UIDVALIDITY is also ignored because, although the response parser tolerates it from some servers, it is not a usable cache epoch. The cache is bounded per folder (50k entries, pruned back to 40k): inventory walks every UID in a mailbox, and an opportunistic cache must not grow with mailbox size. Eviction keeps the highest UIDs - arrival order is the cheap stand-in for "most likely to be mutated" - and a miss costs exactly what a cold cache costs, an unprotected STORE.
 - `bulk_destroy` partial-failure accounting separates conflicts (UNCHANGEDSINCE rejected) from expunge failures; an expunge failure applies only to that round's UIDs, not the whole batch.
 - A two-sided `FlagOp::Patch` (non-empty add and remove) is two STOREs, and every id is accounted per UID across both. The guard rides the first (add) STORE; UIDs it rejects with `MODIFIED` are `Failed(ConcurrencyConflict)` and are excluded from the second STORE. Only the add-applied subset receives the unguarded remove, and only that subset may report `Succeeded(Applied)` - a second STORE that errors or comes back non-applied never reports success for those ids: transmission evidence decides the lane (`InFlight` evidence is `Uncertain`, an `Unsent` or server-acknowledged failure is `Failed`), per the mutation error-lane rule below. A wire error on the first STORE is confined to its own MODSEQ group: outcomes already established for earlier groups survive it and are never downgraded by the folder-level error path.
@@ -602,6 +617,11 @@ message metadata and parses selected bytes through `bifrost-types::mime`.
 The per-folder PIM primitives (`copy_messages`, `delete_messages`, `set_flag`, `hydrate_decoded`) stamp failures in the folder's PREPARATION (checkout, SELECT/EXAMINE, UIDVALIDITY read) `Unsent` through `preflight_err`, relative to the operation: the SELECT's own evidence (a tagged NO is `Acknowledged`) is about the SELECT, not the COPY / STORE / FETCH that was never sent, and publishing it would make recovery reconcile a non-idempotent mutation that never reached the server. It speaks for the folder being prepared only; earlier folders of a multi-folder call may already have been mutated, which these `Result<(), _>` lanes cannot express.
 
 Every path that removes messages (sync-side `bulk_destroy`, PIM `delete_messages`) goes through `expunge_uids_or_fall_back`. It issues `UID EXPUNGE` (RFC 4315 Section 2), and on `MissingCapability` - a server with neither UIDPLUS nor IMAP4rev2 - falls back to plain `EXPUNGE` only when `UID SEARCH DELETED` shows the mailbox's `\Deleted` set is a subset of the UIDs this batch just marked. Plain EXPUNGE names no messages: running it with a foreign `\Deleted` present would silently destroy another client's mail, so that case keeps the `MissingCapability` failure with the batch left flagged.
+
+The SEARCH check is not atomic with the following `EXPUNGE`. Another client
+can mark a message `\Deleted` in that interval, and IMAP has no command to
+restrict plain EXPUNGE to the checked UID set. Without UIDPLUS, the remaining
+race cannot be closed by this client.
 - Keywords: `set_keyword` via UID STORE; convenience keywords `$flagged`/`$answered`/`$seen` map to `\Flagged`/`\Answered`/`\Seen`. `$forwarded` and `$MDNSent` stay IMAP keywords; `mdn_sent_via_keyword` is true, so `mark_mdn_sent` flips `$MDNSent`.
 - Read state: `set_is_read` via `\Seen`.
 - Importance: `set_importance` maps onto the `$important` keyword (no native IMAP field). Two-valued/exclusive: `High` sets it, `Normal`/`Low` clear it (one STORE); the read side maps `$important` presence to `Message.importance`.
@@ -642,6 +662,14 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
   Google's `MailDocument`): text/html/`multipart/alternative` bodies, a
   `multipart/mixed` wrapper for inline attachments, RFC 2047 display names, and a
   controlled-domain `Message-ID` (sender domain, never `hostname::get()`).
+- Draft submission reads its header block through `HeaderMap::parse`, with
+  shared address-list parsing (quoted-pairs and RFC 2047 display names) and
+  `HeaderMap::message_ids`. `HeaderMap::addresses_checked` validates From,
+  Sender, To, Cc, and Bcc; any rejected item returns `Request(Malformed)` before
+  SMTP submission. Repeated recipient headers retain wire order. Message IDs
+  without angle brackets are not recognized and use the existing sender-domain
+  fallback. Header decoding does not rewrite the transmitted draft bytes; only
+  the Bcc header is stripped from the SMTP copy.
 - `ObjectId` rule: `send_message` / `draft_send` return the APPENDUID-derived id
   from the Sent APPEND when UIDPLUS yields one, else the generated/parsed
   `Message-ID` (`imapmsgid1:<id>`). The send result is authoritative for `Ok`.
@@ -921,6 +949,11 @@ A `Transport(_)` kind must never carry an `Acknowledged` attempt - `try_build` r
 ### Push lifecycle
 
 Dial, SELECT, NOTIFY registration and IDLE errors are classified as `PushStream` with the selected folder scope. Only `Retry` emits transport disconnects and uses the redial backoff. Every other class is latched as `WatchEvent::Terminated` for late or lagged readers, and the failed worker releases its connection and parks until subscription reconfiguration or shutdown. A replacement subscription clears the latch. Deleted, renamed and revoked folders therefore do not cause timer-driven redials. The slot remains alive so reconfiguration can assign it another folder.
+
+Events published while no `push_stream` receiver exists are retained in a
+bounded queue and delivered when a receiver attaches. If that queue fills, the
+pending history collapses to one account-wide coalesced invalidation and the
+latest connection state.
 
 The IDLE workers are account-owned, not subscription-owned. On a NOTIFY server one worker covers the selected folder plus every other accepted folder through `NOTIFY SET`. Without NOTIFY the account starts `max(ImapAccountConfig::idle_connection_budget, 1)` workers, default 4, with one dedicated IDLE session per covered folder. The data and push budgets are separate: the default `pool_cap = 4` gives three data slots, plus up to four dedicated IDLE sessions without NOTIFY (seven total), or one with NOTIFY (four total). The data budget is `max(pool_cap - 1, 1)` and the non-NOTIFY IDLE budget is `max(idle_connection_budget, 1)`. Configure both for the provider's per-user connection allowance. A non-NOTIFY account starts the full budget of workers up front; a slot with no folder assigned parks rather than dialing, so the budget is a ceiling on sessions, not a floor.
 

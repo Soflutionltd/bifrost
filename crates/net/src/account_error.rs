@@ -429,11 +429,25 @@ fn refresh_failed(
     if let Some(cause) = support_cause_from_source(source) {
         builder = builder.push_cause(cause);
     }
-    // retry hint flows through the source cause (e.g. ServerCause::RateLimited)
-    // attached above. retry_after parameter is preserved here for backward
-    // compatibility with callers that pass it but no longer used as a
-    // builder side-channel.
-    let _ = retry_after;
+    // Keep the issuer's typed hint when present. The outer quiet deadline
+    // also matters for transport failures whose cause has no server hint.
+    let has_hint = matches!(
+        support_cause_from_source(source),
+        Some(Cause::Server(
+            ServerCause::Unavailable {
+                retry_hint: Some(_)
+            } | ServerCause::RateLimited {
+                retry_hint: Some(_)
+            } | ServerCause::QuotaExhausted {
+                retry_hint: Some(_)
+            }
+        ))
+    );
+    if !has_hint && let Some(at) = retry_after {
+        builder = builder.push_cause(Cause::Server(ServerCause::Unavailable {
+            retry_hint: Some(RetryHint::At(at)),
+        }));
+    }
     finish(builder, ctx)
 }
 
@@ -968,5 +982,33 @@ mod retry_hint_tests {
             };
             assert_eq!(advice.retry_hint, Some(RetryHint::At(at)));
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn refresh_transport_failure_preserves_outer_quiet_deadline() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1234);
+        let error = into_account_error(
+            Error::RefreshFailed {
+                retry_after: Some(at),
+                source: std::sync::Arc::new(Error::Timeout {
+                    transmission_state: TransmissionState::Unsent,
+                }),
+            },
+            NetErrorContext {
+                provider: None,
+                protocol: Protocol::Jmap,
+                operation: AccountOperation::SyncChanges,
+                scope: None,
+            },
+        );
+        let bifrost_types::RecoveryClass::Retry(advice) = error.recovery() else {
+            panic!("refresh failure must remain retryable");
+        };
+        assert_eq!(advice.retry_hint, Some(RetryHint::At(at)));
     }
 }

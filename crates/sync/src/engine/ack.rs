@@ -964,6 +964,10 @@ async fn apply_repair_resolutions(
     published_and_acknowledged: bool,
 ) -> Result<(), Error> {
     let now = jiff::Timestamp::now().as_second();
+    // Keep the authoritative in-memory ledger aligned with durable state. A
+    // failed write must not leave a discharge or attempt available to a later
+    // unrelated writer request.
+    let mut candidate = ledger.clone();
 
     for resolution in resolutions {
         match resolution {
@@ -975,10 +979,10 @@ async fn apply_repair_resolutions(
                 if !published_and_acknowledged {
                     // Recovered but never delivered. Costs an attempt and stays
                     // owed, which is the conservative direction.
-                    ledger.record_attempt(&key, crate::repair::DEFAULT_REPAIR_BUDGET);
+                    candidate.record_attempt(&key, crate::repair::DEFAULT_REPAIR_BUDGET);
                     continue;
                 }
-                if !ledger.discharge_repaired(
+                if !candidate.discharge_repaired(
                     &key,
                     generation,
                     crate::cursor::DischargeEvidence::RepairedAndPublished { attempt },
@@ -998,7 +1002,7 @@ async fn apply_repair_resolutions(
                 // Nothing was published and nothing needs to be: absence from
                 // an old inventory snapshot is not a deletion to apply against
                 // current consumer state.
-                ledger.discharge_repaired(
+                candidate.discharge_repaired(
                     &key,
                     generation,
                     crate::cursor::DischargeEvidence::ProvedIrrelevant { detail },
@@ -1009,7 +1013,7 @@ async fn apply_repair_resolutions(
                 proof,
                 generation,
             } => {
-                apply_replacement(ledger, &key, &proof, generation, now);
+                apply_replacement(&mut candidate, &key, &proof, generation, now);
             }
             crate::repair::RepairResolution::Deferred { key } => {
                 // Charges `key`'s lineage only while `key` is still open. A
@@ -1018,12 +1022,14 @@ async fn apply_repair_resolutions(
                 // first; that result then charges nothing, which cannot uncap
                 // anything because a closed key is never planned again. See
                 // `DebtLedger::record_attempt`.
-                ledger.record_attempt(&key, crate::repair::DEFAULT_REPAIR_BUDGET);
+                candidate.record_attempt(&key, crate::repair::DEFAULT_REPAIR_BUDGET);
             }
         }
     }
 
-    persist_ledger_only(account_id, store, ledger).await
+    persist_ledger_only(account_id, store, &candidate).await?;
+    *ledger = candidate;
+    Ok(())
 }
 
 /// Apply a region proof, which either discharges the region or splits it.
@@ -1818,5 +1824,73 @@ mod tests {
             drop(tx);
             task.await.expect("writer exits");
         }
+    }
+
+    #[tokio::test]
+    async fn failed_repair_resolutions_do_not_leak_into_later_writes() {
+        let store = seeded_store().await;
+        let account = AccountId("acct".into());
+        let key = bifrost_types::ObligationKey(b"owed".to_vec());
+        let (tx, task) = start_flaky_writer(Arc::clone(&store));
+        let resolution = || crate::repair::RepairResolution::Irrelevant {
+            key: key.clone(),
+            detail: "the object is no longer owed".into(),
+            generation: 1,
+        };
+
+        store
+            .fail_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::ApplyRepair {
+            resolutions: vec![resolution()],
+            publication: None,
+            done,
+        })
+        .await
+        .expect("writer alive");
+        assert!(wait.await.expect("repair answered").is_err());
+
+        store
+            .fail_writes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        persist_test_cursor(&tx)
+            .await
+            .expect("unrelated write after failed repair");
+        assert!(
+            store
+                .inner
+                .get_ledger(&account)
+                .await
+                .expect("read ledger")
+                .entry(&key)
+                .expect("debt retained")
+                .is_open()
+        );
+
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::ApplyRepair {
+            resolutions: vec![resolution()],
+            publication: None,
+            done,
+        })
+        .await
+        .expect("writer alive");
+        wait.await
+            .expect("repair answered")
+            .expect("repair retry persisted");
+        assert!(
+            !store
+                .inner
+                .get_ledger(&account)
+                .await
+                .expect("read ledger")
+                .entry(&key)
+                .expect("resolved debt retained for audit")
+                .is_open()
+        );
+
+        drop(tx);
+        task.await.expect("writer exits");
     }
 }

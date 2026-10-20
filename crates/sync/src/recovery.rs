@@ -193,16 +193,15 @@ pub(crate) fn restart_scope_error(scope: CursorScope, operation: AccountOperatio
     .expect("valid account error classification")
 }
 
-/// Synthesize an `AccountError` for an engine-level re-establishment
-/// failure that has no `AccountError` of its own (`EstablishCursorFailed`,
-/// `CheckpointStore`, and the other non-`Account` `engine::Error`
-/// variants surfaced from `run_establish`). Without this, a scope that
-/// exhausts its reopen budget on purely engine-level errors would
-/// broadcast no `SyncEvent::Terminated` - only the operator warning -
-/// violating the documented "after three failures broadcast
-/// `Terminated(last_error)`" contract. Operator attention is required:
-/// emitting CursorInvalid here would instruct consumers to restart the scope
-/// whose automatic recovery budget the engine has just exhausted.
+/// Synthesize scoped operator attention when automatic re-establishment
+/// cannot continue. This covers engine errors with no `AccountError` of their
+/// own (`EstablishCursorFailed`, `CheckpointStore`, and other non-`Account`
+/// variants surfaced from `run_establish`) and provider retry advice after its
+/// automatic budget is spent. Without it, a scope exhausted on engine-only
+/// errors would broadcast no `SyncEvent::Terminated`, while exhausted retry
+/// advice would tell consumers to retry work the engine has abandoned.
+/// Emitting CursorInvalid would also be wrong: it would request another scope
+/// restart after the automatic recovery budget was exhausted.
 #[must_use]
 pub(crate) fn establish_failure_error(
     scope: CursorScope,
@@ -218,6 +217,36 @@ pub(crate) fn establish_failure_error(
     .operation(operation)
     .try_build()
     .expect("valid account error classification")
+}
+
+/// A stored inventory cursor is scoped state owned by the current account
+/// implementation. If its classifier and resume-stream hook disagree, restart
+/// only that cursor; this is not evidence that the engine's persisted envelope
+/// schema changed.
+#[must_use]
+pub(crate) fn inventory_resume_contract_failure(scope: CursorScope) -> AccountError {
+    restart_scope_error(scope, AccountOperation::SyncInventory)
+}
+
+/// Make a scope's final recovery event match the action still available after
+/// its automatic budget is spent. A terminal provider error remains useful as
+/// authored, and an existing operator-attention verdict remains useful too.
+/// Retry, reconciliation, and other engine directives no longer describe an
+/// action the engine will take, so replace them with the same scoped operator
+/// attention error used for engine-internal establishment failures.
+#[must_use]
+pub(crate) fn scope_recovery_exhaustion_error(
+    last_error: AccountError,
+    scope: CursorScope,
+    operation: AccountOperation,
+) -> AccountError {
+    match plan_recovery(last_error.clone()) {
+        RecoveryPlan::Terminal(_) => last_error,
+        RecoveryPlan::Engine(EngineDirective::OperatorOverrideRequired { .. }) => last_error,
+        RecoveryPlan::Retry(_) | RecoveryPlan::Reconcile(_) | RecoveryPlan::Engine(_) => {
+            establish_failure_error(scope, operation)
+        }
+    }
 }
 
 /// Translate a cursor envelope schema mismatch into an `AccountError`
@@ -931,6 +960,33 @@ mod tests {
             ));
             assert_eq!(err.scope(), Some(&ErrorScope::Cursor(scope)));
         }
+    }
+
+    #[test]
+    fn exhausted_scope_actionable_errors_become_operator_attention() {
+        let scope = CursorScope::Folder(bifrost_types::FolderId("inbox".into()));
+        for last_error in [build_retry(), build_reconcile(), build_engine()] {
+            let exhausted = scope_recovery_exhaustion_error(
+                last_error,
+                scope.clone(),
+                AccountOperation::EstablishCursor,
+            );
+            assert!(matches!(
+                exhausted.recovery(),
+                RecoveryClass::Engine(EngineDirective::OperatorOverrideRequired { .. })
+            ));
+            assert_eq!(exhausted.scope(), Some(&ErrorScope::Cursor(scope.clone())));
+            assert!(exhausted.throttle_budgets().is_empty());
+        }
+
+        let terminal = build_terminal();
+        let preserved = scope_recovery_exhaustion_error(
+            terminal.clone(),
+            CursorScope::Account,
+            AccountOperation::EstablishCursor,
+        );
+        assert_eq!(preserved.message_key(), terminal.message_key());
+        assert!(preserved.recovery().is_terminal());
     }
 
     #[test]

@@ -702,6 +702,39 @@ enum LifecycleTermination {
     Terminate,
 }
 
+// Lifecycle polling can normally be minutes apart. A failed first read must
+// not turn that into a 50 ms request loop. Only observed lifecycle progress or
+// a replacement account resets this backoff; opening a stream proves nothing.
+const LIFECYCLE_RECONNECT_MIN: Duration = Duration::from_secs(30);
+const LIFECYCLE_RECONNECT_MAX: Duration = Duration::from_secs(480);
+
+fn lifecycle_retry_wait(
+    error: &AccountError,
+    fallback: Duration,
+    throttles: &StdMutex<crate::recovery::ThrottleBucket>,
+    account_id: &AccountId,
+) -> Duration {
+    use crate::recovery::{RecoveryPlan, plan_recovery};
+    let now = std::time::SystemTime::now();
+    let hint = match plan_recovery(error.clone()) {
+        RecoveryPlan::Retry(advice) => {
+            crate::recovery::record_throttle(throttles, account_id, &advice, error);
+            // Account requests own token refresh through their transport. There
+            // is no engine token source to refresh here; reconnect retries the
+            // read through that same authenticated request funnel.
+            crate::recovery::retry_delay(&advice, now, fallback)
+        }
+        RecoveryPlan::Reconcile(advice) => {
+            crate::recovery::record_reconcile_throttle(throttles, account_id, &advice, error);
+            // Lifecycle reads have no mutation target to reconcile. Retry the
+            // uncommitted read, preserving its provider-owned diff baseline.
+            crate::recovery::reconcile_delay(&advice, now, fallback)
+        }
+        RecoveryPlan::Engine(_) | RecoveryPlan::Terminal(_) => fallback,
+    };
+    fallback.max(hint)
+}
+
 fn lifecycle_termination(error: &AccountError) -> LifecycleTermination {
     use crate::recovery::{RecoveryPlan, plan_recovery};
     use bifrost_types::EngineDirective;
@@ -892,12 +925,30 @@ impl Multiplexer {
         let lifecycle_reopen = reopen_tx.clone();
         let lifecycle_changes = delivery.sender().clone();
         let mut lifecycle_generation = account_generation;
+        let lifecycle_throttles = Arc::clone(&throttles);
+        let lifecycle_account_id = account_id.clone();
         let lifecycle_handle = tokio::spawn(async move {
-            let mut reconnect_delay = Duration::from_millis(50);
+            let mut reconnect_delay = LIFECYCLE_RECONNECT_MIN;
             loop {
+                // Recheck shared holds after every wake; sibling work can
+                // extend one while this reader is waiting.
+                if let Some(wait) = crate::recovery::account_throttle_wait(
+                    &lifecycle_throttles,
+                    &lifecycle_account_id,
+                ) {
+                    tokio::select! {
+                        () = lifecycle_shutdown.cancelled() => return,
+                        changed = lifecycle_generation.changed() => {
+                            if changed.is_err() { return; }
+                            reconnect_delay = LIFECYCLE_RECONNECT_MIN;
+                        }
+                        () = tokio::time::sleep(wait) => {}
+                    }
+                    continue;
+                }
                 let acc = lifecycle_account.load_full();
                 let mut stream = acc.scope_lifecycle_stream();
-                let mut received = false;
+                let mut retry_wait = Duration::ZERO;
                 let mut reopened = false;
                 loop {
                     tokio::select! {
@@ -915,12 +966,16 @@ impl Multiplexer {
                                 &ev,
                                 bifrost_types::ScopeLifecycleEvent::Lifecycle(_)
                             ) {
-                                received = true;
+                                reconnect_delay = LIFECYCLE_RECONNECT_MIN;
                             }
                             let lifecycle = match ev {
                                 bifrost_types::ScopeLifecycleEvent::Lifecycle(lc) => lc,
                                 bifrost_types::ScopeLifecycleEvent::Terminated(err) => {
                                     let policy = lifecycle_termination(&err);
+                                    retry_wait = lifecycle_retry_wait(
+                                        &err, reconnect_delay, &lifecycle_throttles,
+                                        &lifecycle_account_id,
+                                    );
                                     match policy {
                                         LifecycleTermination::AwaitReopen
                                         | LifecycleTermination::ForwardAndReconnect => {
@@ -996,19 +1051,21 @@ impl Multiplexer {
                     }
                 }
                 if reopened {
-                    reconnect_delay = Duration::from_millis(50);
+                    reconnect_delay = LIFECYCLE_RECONNECT_MIN;
                     continue;
-                }
-                if received {
-                    reconnect_delay = Duration::from_millis(50);
                 }
                 tokio::select! {
                     () = lifecycle_shutdown.cancelled() => return,
-                    () = tokio::time::sleep(reconnect_delay) => {}
+                    changed = lifecycle_generation.changed() => {
+                        if changed.is_err() { return; }
+                        reconnect_delay = LIFECYCLE_RECONNECT_MIN;
+                        continue;
+                    }
+                    () = tokio::time::sleep(reconnect_delay.max(retry_wait)) => {}
                 }
                 reconnect_delay = reconnect_delay
                     .saturating_mul(2)
-                    .min(Duration::from_secs(30));
+                    .min(LIFECYCLE_RECONNECT_MAX);
             }
         });
 
@@ -3084,6 +3141,36 @@ mod tests {
             tokens.lock().expect("poisoned").contains_key(&scope),
             "an older generation must not retire the current entry"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_retry_records_hold_and_honours_hint_without_shortening_backoff() {
+        let account = AccountId("lifecycle".into());
+        let throttles = StdMutex::new(crate::recovery::ThrottleBucket::default());
+        for (hint, expected) in [(600, 600), (1, 30)] {
+            let error = AccountErrorBuilder::new(
+                AccountErrorKind::Server(bifrost_types::ServerErrorKind::RateLimited),
+                Cause::Server(bifrost_types::ServerCause::RateLimited {
+                    retry_hint: Some(bifrost_types::RetryHint::After(Duration::from_secs(hint))),
+                }),
+            )
+            .throttle_scope(bifrost_types::ThrottleScope::Account)
+            .try_build()
+            .expect("valid lifecycle throttle");
+            assert_eq!(
+                lifecycle_termination(&error),
+                LifecycleTermination::Reconnect
+            );
+            assert_eq!(
+                lifecycle_retry_wait(&error, LIFECYCLE_RECONNECT_MIN, &throttles, &account),
+                Duration::from_secs(expected),
+            );
+            assert_eq!(
+                crate::recovery::account_throttle_wait(&throttles, &account),
+                Some(Duration::from_secs(600)),
+                "a shorter subsequent hint must not erase a sibling hold",
+            );
+        }
     }
 
     #[test]

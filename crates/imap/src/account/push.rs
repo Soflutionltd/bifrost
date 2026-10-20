@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,8 +15,13 @@ use crate::connection::IdleEvent;
 
 use super::{ImapAccount, account_error_with, boxed_receiver_stream, folder_scope};
 
+const PUSH_EVENT_CAPACITY: usize = 128;
+
 pub(crate) struct PushState {
     tx: broadcast::Sender<WatchEvent>,
+    /// Broadcast does not retain events sent with zero receivers. Keep a
+    /// bounded handoff until the engine's push forwarder subscribes.
+    pending_events: Mutex<VecDeque<WatchEvent>>,
     scopes: Mutex<HashMap<String, HashSet<CursorScope>>>,
     pub(super) task_cancel: Mutex<Vec<CancellationToken>>,
     supports_notify: bool,
@@ -39,9 +44,10 @@ pub(crate) struct PushState {
 
 impl PushState {
     pub(crate) fn new(supports_notify: bool, idle_budget: usize) -> Self {
-        let (tx, _rx) = broadcast::channel(128);
+        let (tx, _rx) = broadcast::channel(PUSH_EVENT_CAPACITY);
         Self {
             tx,
+            pending_events: Mutex::new(VecDeque::new()),
             scopes: Mutex::new(HashMap::new()),
             task_cancel: Mutex::new(Vec::new()),
             supports_notify,
@@ -56,6 +62,34 @@ impl PushState {
     fn bump_generation(&self) {
         self.resubscribe
             .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    /// Publish an event, retaining it if no push stream has subscribed yet.
+    /// The same lock protects subscribe-and-drain so a send cannot land in
+    /// the gap between a new receiver joining and the pending queue moving.
+    fn publish_event(&self, event: WatchEvent) {
+        let mut pending = self
+            .pending_events
+            .lock()
+            .expect("push event lock poisoned");
+        if self.tx.receiver_count() == 0 {
+            retain_pending_event(&mut pending, event);
+            return;
+        }
+        if let Err(error) = self.tx.send(event) {
+            // A receiver can drop after receiver_count() was read. Keep the
+            // event for the next stream rather than losing it in that race.
+            retain_pending_event(&mut pending, error.0);
+        }
+    }
+
+    fn subscribe_events(&self) -> (broadcast::Receiver<WatchEvent>, VecDeque<WatchEvent>) {
+        let mut pending = self
+            .pending_events
+            .lock()
+            .expect("push event lock poisoned");
+        let receiver = self.tx.subscribe();
+        (receiver, std::mem::take(&mut *pending))
     }
 
     pub(crate) fn stop(&self) {
@@ -273,7 +307,7 @@ pub(crate) fn push_stream(account: ImapAccount) -> AccountStream<WatchEvent> {
 }
 
 fn push_event_stream(push: &PushState, shutdown: CancellationToken) -> AccountStream<WatchEvent> {
-    let mut rx = push.tx.subscribe();
+    let (mut rx, mut pending) = push.subscribe_events();
     let mut terminal = push.terminal.subscribe();
     let (tx, out) = tokio::sync::mpsc::channel(128);
     // Detached rather than `guarded_receiver_stream`, deliberately: this
@@ -287,6 +321,12 @@ fn push_event_stream(push: &PushState, shutdown: CancellationToken) -> AccountSt
             if let Some(error) = failure {
                 let _ = tx.send(WatchEvent::Terminated(error)).await;
                 break;
+            }
+            if let Some(event) = pending.pop_front() {
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+                continue;
             }
             tokio::select! {
                 changed = terminal.changed() => {
@@ -318,6 +358,39 @@ fn push_event_stream(push: &PushState, shutdown: CancellationToken) -> AccountSt
         }
     });
     boxed_receiver_stream(out)
+}
+
+/// Keep pre-subscription delivery bounded. If the engine attaches after a
+/// full ring of events, preserve a coarse reconcile signal and the latest
+/// connection state instead of unboundedly retaining stale details.
+fn retain_pending_event(pending: &mut VecDeque<WatchEvent>, event: WatchEvent) {
+    if pending.len() < PUSH_EVENT_CAPACITY {
+        pending.push_back(event);
+        return;
+    }
+
+    let latest_connection = match &event {
+        WatchEvent::Disconnected | WatchEvent::Reconnected => Some(event.clone()),
+        _ => pending
+            .iter()
+            .rev()
+            .find(|event| matches!(event, WatchEvent::Disconnected | WatchEvent::Reconnected))
+            .cloned(),
+    };
+    pending.clear();
+    pending.push_back(coalesced_invalidation());
+    if let Some(connection) = latest_connection {
+        pending.push_back(connection);
+    }
+}
+
+fn coalesced_invalidation() -> WatchEvent {
+    WatchEvent::Invalidated {
+        hint: InvalidationHint {
+            source: PushSource::Coalesced,
+            payload: HintPayload::Unknown,
+        },
+    }
 }
 
 fn ensure_idle_tasks(account: ImapAccount) -> Result<(), crate::Error> {
@@ -412,7 +485,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                     continue;
                 }
                 if !was_disconnected {
-                    let _ = account.push.tx.send(WatchEvent::Disconnected);
+                    account.push.publish_event(WatchEvent::Disconnected);
                 }
                 was_disconnected = true;
                 if !sleep_backoff(&account, &cancel, &mut backoff).await {
@@ -433,7 +506,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                     continue;
                 }
                 if !was_disconnected {
-                    let _ = account.push.tx.send(WatchEvent::Disconnected);
+                    account.push.publish_event(WatchEvent::Disconnected);
                 }
                 was_disconnected = true;
                 if !sleep_backoff(&account, &cancel, &mut backoff).await {
@@ -465,7 +538,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
             };
         signal_notify_coverage_loss(&account.push, registered);
         if was_disconnected {
-            let _ = account.push.tx.send(WatchEvent::Reconnected);
+            account.push.publish_event(WatchEvent::Reconnected);
             was_disconnected = false;
         }
         // Set when the session dies in-IDLE (server BYE / termination / idle
@@ -525,7 +598,9 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                     if !matches!(event, IdleEvent::Cancelled)
                         && absorb_idle_event(&account, &folder, uidvalidity, &event).is_err()
                     {
-                        let _ = account.push.tx.send(invalidated(HintPayload::Unknown));
+                        account
+                            .push
+                            .publish_event(invalidated(HintPayload::Unknown));
                     }
                     // Re-choose under the new scope set. Marking the
                     // generation seen first keeps the same discipline as the
@@ -556,7 +631,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                     // next round. The event this round did return is
                     // published rather than folded into the coarse hint.
                     if let Some(event) = map_idle_event(event, &folder) {
-                        let _ = account.push.tx.send(event);
+                        account.push.publish_event(event);
                     }
                     // The watched set may still have changed around this
                     // folder, so the NOTIFY registration is re-issued; a
@@ -589,7 +664,9 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                 }
                 Ok(event) => {
                     if absorb_idle_event(&account, &folder, uidvalidity, &event).is_err() {
-                        let _ = account.push.tx.send(invalidated(HintPayload::Unknown));
+                        account
+                            .push
+                            .publish_event(invalidated(HintPayload::Unknown));
                     }
                     // A server BYE (or any server-initiated termination)
                     // closes the connection: surface it as a disconnect
@@ -614,7 +691,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                             wait_for_push_reconfigure(&account, &cancel, &mut resubscribe).await;
                             break;
                         }
-                        let _ = account.push.tx.send(WatchEvent::Disconnected);
+                        account.push.publish_event(WatchEvent::Disconnected);
                         was_disconnected = true;
                         session_died = true;
                         break;
@@ -623,7 +700,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                     // the next failure starts a fresh backoff ramp.
                     backoff = INITIAL_REDIAL_BACKOFF;
                     if let Some(event) = map_idle_event(event, &folder) {
-                        let _ = account.push.tx.send(event);
+                        account.push.publish_event(event);
                     }
                 }
                 Err(error) => {
@@ -632,7 +709,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                         wait_for_push_reconfigure(&account, &cancel, &mut resubscribe).await;
                         break;
                     }
-                    let _ = account.push.tx.send(WatchEvent::Disconnected);
+                    account.push.publish_event(WatchEvent::Disconnected);
                     was_disconnected = true;
                     session_died = true;
                     break;
@@ -887,7 +964,7 @@ async fn register_notify(
 /// this round was watching is known, but the content of the lost window is
 /// not, and unsolicited events can name other mailboxes.
 fn signal_idle_interrupt_loss(push: &PushState) {
-    let _ = push.tx.send(invalidated(HintPayload::Unknown));
+    push.publish_event(invalidated(HintPayload::Unknown));
 }
 
 /// Cover the folders a runtime `NOTIFY SET` rejection leaves unwatched.
@@ -918,7 +995,7 @@ fn signal_idle_interrupt_loss(push: &PushState) {
 /// once per round on every non-NOTIFY server.
 fn signal_notify_coverage_loss(push: &PushState, registered: bool) {
     if push.supports_notify && !registered {
-        let _ = push.tx.send(invalidated(HintPayload::Unknown));
+        push.publish_event(invalidated(HintPayload::Unknown));
     }
 }
 
@@ -1002,6 +1079,53 @@ fn invalidated(payload: HintPayload) -> WatchEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_event_published_before_stream_creation_reaches_the_late_reader() {
+        use futures::StreamExt as _;
+
+        let push = PushState::new(false, 1);
+        let folder = crate::types::MailboxName::new("INBOX").expect("mailbox");
+        push.publish_event(invalidated(HintPayload::SpecificCursorScope(folder_scope(
+            &folder,
+        ))));
+
+        let mut stream = push_event_stream(&push, CancellationToken::new());
+        let event = stream.next().await.expect("retained push event");
+        assert!(matches!(
+            event,
+            WatchEvent::Invalidated {
+                hint: InvalidationHint {
+                    source: PushSource::ImapNotify,
+                    payload: HintPayload::SpecificCursorScope(CursorScope::Folder(folder)),
+                }
+            } if folder.0 == "INBOX"
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unobserved_event_backlog_coalesces_at_the_ring_capacity() {
+        use futures::StreamExt as _;
+
+        let push = PushState::new(false, 1);
+        for _ in 0..=PUSH_EVENT_CAPACITY {
+            push.publish_event(invalidated(HintPayload::SpecificCursorScope(
+                CursorScope::Account,
+            )));
+        }
+
+        let mut stream = push_event_stream(&push, CancellationToken::new());
+        let event = stream.next().await.expect("coalesced push event");
+        assert!(matches!(
+            event,
+            WatchEvent::Invalidated {
+                hint: InvalidationHint {
+                    source: PushSource::Coalesced,
+                    payload: HintPayload::Unknown,
+                }
+            }
+        ));
+    }
 
     #[tokio::test]
     async fn permanent_idle_failure_terminates_late_and_lagged_readers() {

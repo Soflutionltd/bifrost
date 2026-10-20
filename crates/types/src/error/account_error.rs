@@ -31,6 +31,7 @@ struct AccountErrorInner {
     protocol: Option<Protocol>,
     diagnostics: DiagnosticInfo,
     chain: CauseChain,
+    classification_cause_count: usize,
     message_key: &'static str,
     idempotency_override: Option<bool>,
     throttle_scope: Option<ThrottleScope>,
@@ -50,6 +51,7 @@ impl AccountError {
                 protocol: parts.protocol,
                 diagnostics: parts.diagnostics,
                 chain: parts.chain,
+                classification_cause_count: parts.classification_cause_count,
                 message_key: parts.message_key,
                 idempotency_override: parts.idempotency_override,
                 throttle_scope: parts.throttle_scope,
@@ -175,7 +177,8 @@ impl AccountError {
     /// must construct a fresh builder via `AccountErrorBuilder::new`.
     ///
     /// Derived fields (`recovery`, `remediation`, `message_key`) are
-    /// recomputed on `try_build()`. Builder overrides
+    /// recomputed on `try_build()` using only the original classification
+    /// causes. Appended evidence does not participate. Builder overrides
     /// (`idempotency_override`, `throttle_scope`) and retry hints set on
     /// a `ServerCause` survive the round-trip.
     #[must_use]
@@ -187,6 +190,7 @@ impl AccountError {
             kind: inner.kind,
             primary_cause,
             chain_extras: causes,
+            classification_cause_count: inner.classification_cause_count,
             scope: inner.scope,
             operation: inner.operation,
             provider: inner.provider,
@@ -221,6 +225,7 @@ pub(crate) struct AccountErrorParts {
     pub protocol: Option<Protocol>,
     pub diagnostics: DiagnosticInfo,
     pub chain: CauseChain,
+    pub classification_cause_count: usize,
     pub message_key: &'static str,
     pub idempotency_override: Option<bool>,
     pub throttle_scope: Option<ThrottleScope>,

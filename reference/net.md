@@ -47,7 +47,8 @@ The caller-authored configuration records `NetConfig`, `AccountSpec`,
 start from their constructors or defaults and then assign supported fields.
 JMAP attaches every independently opened account to the shared transport
 selected by `Net::shared_for_tls` (see the TLS section), so its accounts share
-the client, governor, and meter within each trust class as advertised. The
+the client within each trust class. Both shared clients use the same governor,
+meter, bandwidth registry and provider holds. The
 CalDAV and CardDAV clients ride `AccountNet` too, through
 `bifrost-dav-core`'s `DavDispatch`: `AccountNet::request(Method, ..)` is what
 carries their WebDAV extension verbs, and they attach with no token source
@@ -124,8 +125,9 @@ against the same string-keyed registry on that Net. The registry owns its
 entries until their monotonic expiry; dropping every account and hold handle
 cannot erase an unexpired hold. Expired entries are pruned opportunistically.
 Handles look up the key again on every access, so an old handle still shares
-updates with one opened after pruning. Independent Nets have independent hold
-registries; Google factories use the shared default Net.
+updates with one opened after pruning. Explicitly constructed Nets have independent hold
+registries; the two TLS variants of the shared Net use one process hold registry.
+Google factories use the shared default Net.
 
 `HoldDeadline` pairs a `tokio::time::Instant` for enforcement with a
 `SystemTime` for reporting, resolved together at response observation.
@@ -592,9 +594,25 @@ max-age windows, because `tokio::time::advance` moves only the tokio
 clock and real time barely moves inside a test. Both windows are now
 drivable exactly the way the rate governor and byte bucket already are.
 
-**Do not nest `OAuthRefresher`s.** Wrapping one refresher around
-another causes the outer's `force_refresh` to bypass the inner's
-single-flight. Compose against the raw `TokenSource` instead.
+`TokenSource::is_coordinating()` defaults to false and is true for
+`OAuthRefresher` and `StaticTokenSource`. `Net::attach_account` retains these
+sources unchanged, so multiple attachments preserve one cache and its update
+semantics. For `OAuthRefresher`, its own max-age configuration takes precedence
+over `AccountSpec::token_max_age`; raw provider adapters still receive an
+attach-time refresher. `StaticTokenSource` is already the live cache for
+out-of-band token rotation, and an extra refresher would hide later `set`
+updates behind its snapshot.
+Do not manually nest refreshers: the outer proactive refresh calls the inner
+forced refresh and can perform an unnecessary issuer exchange.
+
+`AccountNet::bearer()` reads this same coordinator for non-HTTP wire paths.
+JMAP also retains a coordinating source before attaching, sharing that exact
+handle between HTTP and WebSocket authentication; its factory retains it across
+reopens. Coordinating sources supplied to Graph and Google are likewise retained
+by account attachment.
+WebSocket setup has the JMAP timeout, a User-Agent and one rejected-token-aware
+401 refresh retry. The WebSocket library uses direct TCP, refuses redirects,
+and does not inherit reqwest proxies or emit net's trace context.
 
 ### `StaticTokenSource`
 
@@ -604,10 +622,9 @@ service pushes a fresh token periodically). Backed by
 `Arc<RwLock<AccessToken>>`; `set(AccessToken)` replaces the cached
 token under the write lock, `token()` snapshots the current value,
 and the trait's `refresh()` is the same as `current()` because there
-is no refresh material inside bifrost-net for this shape. The
-refresher above wraps a `StaticTokenSource` just like any other
-provider; rotation just means the next `current()` reads the
-swapped-in token.
+is no refresh material inside bifrost-net for this shape. The source
+remains unwrapped because `current()` reads the live value directly;
+rotation means the next call sees the swapped-in token.
 
 ## Rate-limit governor (`RateLimitGovernor`)
 
@@ -895,7 +912,9 @@ insert share one lock. Final budget teardown
 removes its own entry only if the pointer still matches, preserving any
 replacement. `Net::with_bandwidth_registry` injects it;
 `Net::bandwidth_registry` exposes it. `Net::new` creates a fresh private
-registry. `AccountNet` gets its budget at attach, and its cap accessors use that
+registry. Both shared TLS variants use one process registry; applications using
+those defaults pass `Net::shared_default().bandwidth_registry().clone()` to the
+engine and stream factories. `AccountNet` gets its budget at attach, and its cap accessors use that
 shared budget. Retag uses the destination id budget for future admission;
 outstanding grants remain attributed to the source.
 

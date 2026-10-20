@@ -812,12 +812,22 @@ async fn re_establish_scope_with_backoff(
             }
         }
     }
-    // Budget exhausted for this scope. Emit the last AccountError
-    // verbatim and warn that operator attention is needed. The account
+    // Budget exhausted for this scope. A retry or reconciliation verdict no
+    // longer describes an action the engine will take, so publish an
+    // operator-attention error instead. Preserve provider errors already
+    // classified terminal and existing operator-attention errors. The account
     // continues running for sibling scopes; only this scope stays
     // unestablished.
     if let Some(err) = last_account_error {
-        broadcast_terminated(ctx.changes_tx, scope.clone(), err);
+        broadcast_terminated(
+            ctx.changes_tx,
+            scope.clone(),
+            crate::recovery::scope_recovery_exhaustion_error(
+                err,
+                scope.clone(),
+                bifrost_types::AccountOperation::EstablishCursor,
+            ),
+        );
     }
     broadcast_warning(
         ctx.changes_tx,
@@ -2109,7 +2119,9 @@ async fn run_establish(
                 // would hand it straight to `changes_stream`, which has no
                 // delta link to walk. Finish the inventory instead - the same
                 // decision `establish_initial_cursor` makes at open.
-                if account.is_inventory_cursor(&existing) {
+                let classified_as_inventory = account.is_inventory_cursor(&existing);
+                let resume_stream = account.inventory_resume_stream(existing.clone());
+                if classified_as_inventory || resume_stream.is_some() {
                     pacing.wait(ctx, Some(account), Some(&scope)).await?;
                     let fusion = crate::multiplexer::InventoryFusion {
                         account_id: account_id.clone(),
@@ -2121,7 +2133,12 @@ async fn run_establish(
                         shutdown: Some(shutdown.clone()),
                     };
                     return match fusion
-                        .run_resume_with_broadcast(account, existing, Some(delivery))
+                        .run_resume_stream_with_broadcast(
+                            scope.clone(),
+                            classified_as_inventory,
+                            resume_stream,
+                            Some(delivery),
+                        )
                         .await?
                     {
                         crate::multiplexer::FusionOutcome::Established
@@ -2137,11 +2154,13 @@ async fn run_establish(
                 return Ok(EstablishOrigin::ResumedStored);
             }
             Ok(None) => {}
-            // Unlike `establish_one`, this path runs with a live reopen
-            // listener, so an undecodable envelope is reported as a typed
-            // error whose derived `RecoveryClass` is
-            // `Engine(SchemaIncompatible)` and the listener runs the
-            // account-wide schema-clear loop.
+            // Unlike `establish_one`, this path runs after attach, but its
+            // callers do not send this result back through the reopen
+            // listener: scoped re-establishment reports it at its own
+            // exhaustion tail, while replacement attach treats it as a failed
+            // replacement. The typed error derives to
+            // `Engine(SchemaIncompatible)`, but that classification alone does
+            // not invoke the account-wide schema-clear loop.
             Ok(Some(_)) | Err(Error::SchemaIncompatible) => {
                 return Err(Error::Account(crate::recovery::cursor_decode_failure(
                     bifrost_types::AccountOperation::EstablishCursor,

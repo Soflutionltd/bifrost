@@ -207,7 +207,16 @@ impl GmailClient {
         api_base: impl Into<String>,
         token_source: Arc<dyn TokenSource>,
     ) -> Self {
-        let parent_net = Net::shared_default();
+        Self::with_api_base_source_and_net(api_base, token_source, Net::shared_default())
+    }
+
+    // The public factory can thread an application-owned Net through here.
+    // Keep attachment deferred until for_account supplies the engine id.
+    pub(crate) fn with_api_base_source_and_net(
+        api_base: impl Into<String>,
+        token_source: Arc<dyn TokenSource>,
+        parent_net: Net,
+    ) -> Self {
         Self {
             tally: None,
             quota_project: None,
@@ -1152,5 +1161,26 @@ mod tests {
         let opened = client.for_account(AccountId("client-test".to_string()));
         assert!(opened.inner.net.is_some());
         opened.detach_account();
+    }
+}
+
+#[cfg(test)]
+mod injected_net_tests {
+    use super::*;
+
+    #[test]
+    fn injected_transport_survives_account_attachment() {
+        let net = Net::new(bifrost_net::NetConfig::default()).unwrap();
+        let witness = net.attach_account(
+            AccountId("google-net-witness".into()),
+            AccountSpec::new(None),
+        );
+        let client = GmailClient::with_api_base_source_and_net(
+            GMAIL_API_BASE,
+            Arc::new(StaticTokenSource::new("token", None)),
+            net,
+        )
+        .for_account(AccountId("google-injected-net".into()));
+        assert!(client.account_net().shares_transport_with(&witness));
     }
 }

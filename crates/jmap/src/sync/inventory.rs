@@ -9,7 +9,7 @@ use bifrost_types::{
 use crate::core::query;
 use crate::core::transport::HttpTransport;
 use crate::email::{Email, EmailGet, EmailQuery, Property as EmailProperty};
-use crate::mailbox::{Mailbox, MailboxGet, Property as MailboxProperty};
+use crate::mailbox::{Mailbox, MailboxGet, MailboxQuery, Property as MailboxProperty};
 
 use super::capabilities::CoreLimits;
 
@@ -23,7 +23,9 @@ pub(crate) fn stream<T: HttpTransport>(
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     match scope {
         CursorScope::Type(ObjectType::Email) => email_inventory(mail, limits),
-        CursorScope::Type(ObjectType::Mailbox) => mailbox_inventory(mail),
+        CursorScope::Type(ObjectType::Mailbox) => {
+            mailbox_inventory(mail, limits.max_objects_in_get.max(1))
+        }
         // A foreign (shared/delegate) account scope: page its emails via
         // `Email/query` against the foreign account, hydrating inventory
         // entries there. The seeded shape is the ACCOUNT-LEVEL scope
@@ -170,6 +172,8 @@ fn email_inventory_loop<T: HttpTransport>(
             if ids.is_empty() {
                 break;
             }
+            // RFC 8620 s5.5 permits a server to clamp the query limit.
+            // Only an empty page proves completion, never a short page.
             // anchorOffset: 1 excludes the anchor even when queryState moves.
             // Echoing it would otherwise hot-loop without proving coverage.
             if let Some(previous) = anchor.as_ref()
@@ -245,7 +249,6 @@ fn email_inventory_loop<T: HttpTransport>(
                     checkpoint: None,
                 });
             }
-
         }
         yield SyncEvent::Done(None);
     })
@@ -334,43 +337,94 @@ pub(crate) fn inventory_properties() -> Vec<EmailProperty> {
 
 fn mailbox_inventory<T: HttpTransport>(
     mail: MailAccount<T>,
+    page_size: usize,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     Box::pin(async_stream::stream! {
         let (mail, tally) = mail.metered();
-        let started = Instant::now();
-        let response = mail
-            .call(MailboxGet::new().properties(mailbox_inventory_properties()))
-            .await;
+        let scope = CursorScope::Type(ObjectType::Mailbox);
+        let mut anchor: Option<String> = None;
+        loop {
+            let started = Instant::now();
+            let mut query = MailboxQuery::new()
+                .sort([
+                    crate::mailbox::query::Comparator::sort_order().ascending(),
+                    crate::mailbox::query::Comparator::name().ascending(),
+                ])
+                .limit(page_size);
+            if let Some(anchor) = anchor.as_ref() {
+                query = query.anchor(anchor.clone()).anchor_offset(1);
+            } else {
+                query = query.position(0);
+            }
+            let query_response = match mail.call(query).await {
+                Ok(response) => response,
+                Err(err) => {
+                    yield super::error::terminated(super::error::shared_scope_error(
+                        err,
+                        &scope,
+                        None,
+                        super::error::JmapErrorContext::cursor(
+                            bifrost_types::AccountOperation::SyncInventory,
+                            scope.clone(),
+                        ),
+                    ));
+                    return;
+                }
+            };
 
-        let response = match response {
-            Ok(response) => response,
-            Err(err) => {
-                yield super::error::terminated_from_jmap(
-                    err,
-                    super::error::JmapErrorContext::cursor(
-                        bifrost_types::AccountOperation::SyncInventory,
-                        CursorScope::Type(ObjectType::Mailbox),
-                    ),
+            let ids = query_response.ids().to_vec();
+            if ids.is_empty() {
+                break;
+            }
+            if let Some(previous) = anchor.as_ref()
+                && ids.iter().any(|id| id.as_str() == previous)
+            {
+                yield super::error::terminated_contract_violation(
+                    bifrost_types::AccountOperation::SyncInventory,
+                    Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
+                    "Mailbox/query re-served the anchor id despite anchorOffset: 1",
                 );
                 return;
             }
-        };
+            anchor = ids.last().map(ToString::to_string);
 
-        let state = response.state().to_string();
-        let items = response
-            .into_list()
-            .into_iter()
-            .filter(mailbox_has_id)
-            .map(|mailbox| mailbox_to_inventory(mailbox, &state))
-            .collect::<Vec<_>>();
+            let response = match mail
+                .call(MailboxGet::new().ids(ids).properties(mailbox_inventory_properties()))
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    yield super::error::terminated(super::error::shared_scope_error(
+                        err,
+                        &scope,
+                        None,
+                        super::error::JmapErrorContext::cursor(
+                            bifrost_types::AccountOperation::SyncInventory,
+                            scope.clone(),
+                        ),
+                    ));
+                    return;
+                }
+            };
 
-        yield SyncEvent::Batch(Batch {
-            items,
-            page_boundary: PageBoundary::Final,
-            server_latency: started.elapsed(),
-            bytes_in: tally.take(),
-            checkpoint: None,
-        });
+            let state = response.state().to_string();
+            let items = response
+                .into_list()
+                .into_iter()
+                .filter(mailbox_has_id)
+                .map(|mailbox| mailbox_to_inventory(mailbox, &state))
+                .collect::<Vec<_>>();
+
+            if !items.is_empty() {
+                yield SyncEvent::Batch(Batch {
+                    items,
+                    page_boundary: PageBoundary::Page,
+                    server_latency: started.elapsed(),
+                    bytes_in: tally.take(),
+                    checkpoint: None,
+                });
+            }
+        }
         yield SyncEvent::Done(None);
     })
 }
@@ -667,12 +721,103 @@ mod tests {
     enum InventoryScenario {
         Stuck,
         Churn,
+        Clamped,
         MissingAnchor,
     }
 
     struct InventoryTransport {
         scenario: InventoryScenario,
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    struct MailboxInventoryTransport {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl crate::core::transport::HttpTransport for MailboxInventoryTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: serde_json::Value = serde_json::from_slice(&body).expect("request json");
+            let call = request["methodCalls"][0].clone();
+            self.calls.lock().expect("calls").push(call.clone());
+            let name = call[0].as_str().expect("method name").to_string();
+            let call_id = call[2].as_str().expect("call id").to_string();
+            let arguments = match name.as_str() {
+                "Mailbox/query" => {
+                    assert_eq!(call[1]["limit"], 2);
+                    let ids = match call[1]["anchor"].as_str() {
+                        None => {
+                            assert_eq!(call[1]["position"], 0);
+                            serde_json::json!(["X1", "X2"])
+                        }
+                        Some("X2") => {
+                            assert_eq!(call[1]["anchorOffset"], 1);
+                            serde_json::json!(["X3"])
+                        }
+                        Some("X3") => {
+                            assert_eq!(call[1]["anchorOffset"], 1);
+                            serde_json::json!([])
+                        }
+                        other => panic!("unexpected mailbox query anchor {other:?}"),
+                    };
+                    serde_json::json!({
+                        "accountId": "primary",
+                        "queryState": "mailbox-query-state",
+                        "position": 0,
+                        "ids": ids
+                    })
+                }
+                "Mailbox/get" => {
+                    let ids = call[1]["ids"].as_array().expect("bounded get ids");
+                    assert!(!ids.is_empty());
+                    assert!(ids.len() <= 2);
+                    serde_json::json!({
+                        "accountId": "primary",
+                        "state": "mailbox-state",
+                        "list": ids.iter().map(|id| serde_json::json!({
+                            "id": id,
+                            "name": format!("mailbox-{}", id.as_str().expect("mailbox id"))
+                        })).collect::<Vec<_>>(),
+                        "notFound": []
+                    })
+                }
+                other => panic!("unexpected method {other}"),
+            };
+            Ok(bytes::Bytes::from(
+                serde_json::json!({
+                    "sessionState": "session-1",
+                    "methodResponses": [[name, arguments, call_id]]
+                })
+                .to_string(),
+            ))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no upload"))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no download"))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no session"))
+        }
     }
 
     impl crate::core::transport::HttpTransport for InventoryTransport {
@@ -701,6 +846,22 @@ mod tests {
                 }
             }
             let arguments = match name.as_str() {
+                "Email/query" if matches!(self.scenario, InventoryScenario::Clamped) => {
+                    assert_eq!(call[1]["limit"], 2);
+                    let ids = match anchor {
+                        None => {
+                            assert_eq!(call[1]["position"], 0);
+                            vec!["M1"]
+                        }
+                        Some("M1") => vec!["M2"],
+                        Some("M2") => vec![],
+                        other => panic!("unexpected anchor {other:?}"),
+                    };
+                    serde_json::json!({
+                        "accountId": "primary", "queryState": "q1",
+                        "canCalculateChanges": false, "position": 0, "ids": ids
+                    })
+                }
                 "Email/query" if matches!(self.scenario, InventoryScenario::Churn) => {
                     // New messages land before each surviving anchor. Tied
                     // receivedAt values retain their server-defined order.
@@ -715,7 +876,12 @@ mod tests {
                         "canCalculateChanges": false, "position": position, "ids": ids
                     })
                 }
-                "Email/get" if matches!(self.scenario, InventoryScenario::Churn) => {
+                "Email/get"
+                    if matches!(
+                        self.scenario,
+                        InventoryScenario::Churn | InventoryScenario::Clamped
+                    ) =>
+                {
                     let ids = call[1]["ids"].as_array().expect("get ids");
                     let list: Vec<_> = ids
                         .iter()
@@ -867,6 +1033,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn email_inventory_continues_after_server_clamped_pages() {
+        use futures::StreamExt as _;
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client = crate::client::Client::with_transport(
+            InventoryTransport {
+                scenario: InventoryScenario::Clamped,
+                calls: std::sync::Arc::clone(&calls),
+            },
+            inventory_test_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let events = email_inventory_loop(
+            crate::account::Account::new(client, "primary"),
+            CursorScope::Type(ObjectType::Email),
+            None,
+            None,
+            2,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        // The server serves one id per query despite the requested limit of
+        // two. Both pages must be hydrated before the third, empty query.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 5);
+        let ids = events
+            .iter()
+            .flat_map(|event| match event {
+                SyncEvent::Batch(batch) => {
+                    batch.items.iter().map(|item| item.id.0.clone()).collect()
+                }
+                SyncEvent::Done(_) => Vec::new(),
+                other => panic!("unexpected inventory event {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["M1", "M2"]);
+        assert!(matches!(events.last(), Some(SyncEvent::Done(None))));
+    }
+
+    #[tokio::test]
     async fn a_missing_inventory_anchor_restarts_without_done() {
         use futures::StreamExt as _;
 
@@ -958,5 +1165,56 @@ mod tests {
                 .any(|event| matches!(event, SyncEvent::Done(_))),
             "a refused walk must not report completion"
         );
+    }
+
+    #[tokio::test]
+    async fn mailbox_inventory_batches_get_by_the_advertised_limit() {
+        use futures::StreamExt as _;
+
+        let transport = MailboxInventoryTransport {
+            calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let client = crate::client::Client::with_transport(
+            transport.clone(),
+            inventory_test_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let events = mailbox_inventory(crate::account::Account::new(client, "primary"), 2)
+            .collect::<Vec<_>>()
+            .await;
+
+        let calls = transport.calls.lock().expect("calls").clone();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call[0].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "Mailbox/query",
+                "Mailbox/get",
+                "Mailbox/query",
+                "Mailbox/get",
+                "Mailbox/query",
+            ]
+        );
+        for call in &calls {
+            if call[0] == "Mailbox/get" {
+                assert!(call[1]["ids"].is_array());
+                assert!(call[1]["ids"].as_array().unwrap().len() <= 2);
+            }
+        }
+        let ids = events
+            .iter()
+            .flat_map(|event| match event {
+                SyncEvent::Batch(batch) => {
+                    batch.items.iter().map(|item| item.id.0.clone()).collect()
+                }
+                SyncEvent::Done(_) => Vec::new(),
+                other => panic!("unexpected inventory event {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["X1", "X2", "X3"]);
+        assert!(matches!(events.last(), Some(SyncEvent::Done(None))));
     }
 }

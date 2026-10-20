@@ -406,20 +406,7 @@ async fn run_qresync(
     // eligible for the next poll. A failed SEARCH never advances the cursor.
     warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.uid_count()).await?;
     let next = account.cursor_from_select(&selected.mailbox, Some(live_set))?;
-    account.folders.set_cursor(&folder, next.clone());
-    let checkpoint = Some(Checkpoint::Change(encode_cursor(
-        folder_scope(&folder),
-        &next,
-    )));
-    if !changes.is_empty() {
-        tx.send(batch(changes, PageBoundary::Final, checkpoint.clone()))
-            .await
-            .map_err(|_| ChangeError::ChannelDropped)?;
-    }
-    tx.send(SyncEvent::Done(checkpoint))
-        .await
-        .map_err(|_| ChangeError::ChannelDropped)?;
-    Ok(())
+    finish_changes(account, folder, next, changes, tx).await
 }
 
 async fn run_condstore(
@@ -703,7 +690,6 @@ async fn finish_changes(
     changes: Vec<Change>,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
 ) -> Result<(), ChangeError> {
-    account.folders.set_cursor(&folder, cursor.clone());
     let checkpoint = Some(Checkpoint::Change(encode_cursor(
         folder_scope(&folder),
         &cursor,
@@ -716,24 +702,24 @@ async fn finish_changes(
     tx.send(SyncEvent::Done(checkpoint))
         .await
         .map_err(|_| ChangeError::ChannelDropped)?;
+    // The in-memory cursor is a hint for later SELECTs. Do not advance it if
+    // this changes stream could not enqueue its terminal checkpoint; the
+    // engine's durable cursor still belongs to the consumer.
+    account.folders.set_cursor(&folder, cursor);
     Ok(())
 }
 
-/// The at-most-`BATCH_ITEMS`-per-page guarantee holds by CONVENTION here, not
-/// by construction. All three strategies honour it, but through separate loops:
-/// this helper owns the boundary for CONDSTORE and both Basic entries, while
-/// QRESYNC flushes inline because it must also track
-/// `flushed_qresync_changes`: its mid-stream downgrade to CONDSTORE is legal
-/// only while no page has yet escaped, and SELECT-side flushes count toward
-/// that. A new emission loop must page AND respect the downgrade rule, and
-/// nothing in the types forces either.
+/// The at-most-`BATCH_ITEMS`-per-page guarantee holds by convention, not by
+/// construction. QRESYNC, CONDSTORE, and both Basic paths call this helper
+/// after adding changes; a new emission loop must keep doing so because the
+/// event types do not enforce a page-size limit.
 ///
 /// Consolidating the three behind a `Strategy` trait was proposed and rejected:
-/// QRESYNC owns that mid-stream downgrade (with connection discard), CONDSTORE
-/// has a fallible bounded stream but no VANISHED lane, and Basic has no
-/// change-source stream at all, so a shared runner would end up owning
-/// strategy-specific wire policy. The consolidation was taken at this narrower
-/// seam instead, which is the part that is genuinely common.
+/// QRESYNC handles its SELECT-parse downgrade and discards the suspect
+/// connection, CONDSTORE has a fallible bounded FETCH stream but no VANISHED
+/// lane, and Basic has no change-source stream at all. A shared runner would
+/// end up owning strategy-specific wire policy. The consolidation was taken
+/// at this narrower seam instead, which is the part that is genuinely common.
 async fn flush_page(
     tx: &tokio::sync::mpsc::Sender<SyncEvent<Change>>,
     changes: &mut Vec<Change>,
@@ -846,6 +832,10 @@ fn updated_change(folder: &MailboxName, uidvalidity: u32, uid: u32) -> Change {
 /// hazard the CONDSTORE path guards. Emitting nothing here is therefore
 /// lossless. Only a UID in neither set is contradictory - the server described
 /// a message it does not list - and that invalidates the cursor.
+///
+/// On Basic servers, SELECT's changed-message FETCH responses are only
+/// opportunistic hints. Without CONDSTORE there is no reliable way to detect
+/// flag changes for every existing UID without fetching the full mailbox.
 fn basic_updated_change(
     folder: &MailboxName,
     uidvalidity: u32,
@@ -977,6 +967,61 @@ mod tests {
     use bifrost_types::{CursorScope, RecoveryClass};
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_failed_done_send_does_not_advance_the_cached_cursor() {
+        use bifrost_types::Account;
+
+        let (conn, server) = crate::connection::test_support::driver_pair(
+            &crate::connection::test_support::preauth_greeting("IMAP4rev1"),
+        )
+        .await;
+        drop(server);
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        let registry = super::super::folder_registry::FolderRegistry::from_list(vec![
+            crate::types::MailboxInfo {
+                name: folder.clone(),
+                ..Default::default()
+            },
+        ]);
+        let mut parts = super::super::test_support::scripted_account_parts(conn, 1);
+        parts.folders = std::sync::Arc::new(registry);
+        let account = super::super::ImapAccount::new(parts);
+        let cursor = FolderCursor::Basic {
+            uidvalidity: 7,
+            uidnext: 2,
+            known_uids: CompactUidSet::from_uids([1]),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(finish_changes(
+            account.clone(),
+            folder.clone(),
+            cursor,
+            vec![added_change(&folder, 7, 1)],
+            tx,
+        ));
+
+        let final_page = rx.recv().await.expect("final page queued");
+        assert!(matches!(
+            final_page,
+            SyncEvent::Batch(ref batch) if batch.page_boundary == PageBoundary::Final
+        ));
+        rx.close();
+        assert!(matches!(
+            task.await.expect("finish task"),
+            Err(ChangeError::ChannelDropped)
+        ));
+        assert!(
+            account
+                .folders
+                .get(&folder)
+                .expect("registered folder")
+                .cursor()
+                .is_none(),
+            "a failed terminal checkpoint send must leave the SELECT hint unchanged"
+        );
+        account.close().await.expect("account cleanup");
+    }
 
     // Construct removal state for the FETCH ordering tests through the same
     // range subtraction used by the stream.

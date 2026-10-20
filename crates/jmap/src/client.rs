@@ -41,7 +41,16 @@ impl Authorization {
     fn from_credentials(credentials: Credentials) -> Self {
         match credentials {
             Credentials::Basic(value) => Self::Basic(value),
-            Credentials::Bearer(token) => Self::Bearer(token),
+            Credentials::Bearer(token) => {
+                // HTTP and WebSocket retain this exact coordinating handle.
+                // Net preserves it rather than wrapping a second cache.
+                let source = if token.is_coordinating() {
+                    token
+                } else {
+                    Arc::new(bifrost_net::OAuthRefresher::new(token)) as Arc<dyn TokenSource>
+                };
+                Self::Bearer(source)
+            }
         }
     }
 
@@ -51,7 +60,7 @@ impl Authorization {
     }
 
     /// Build the `Authorization` header value. For the bearer case this
-    /// reads `source.current()` so a token rotated on the shared source
+    /// reads the coordinating `source.current()` so a token rotated on the shared source
     /// is presented live; only the WebSocket handshake (which builds its
     /// own header) and the Basic path take this route - the HTTP request
     /// pipeline injects the bearer through `AccountNet` instead.
@@ -259,7 +268,7 @@ pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
     #[cfg(feature = "tokio")]
     session_changes: tokio::sync::watch::Sender<u64>,
 
-    timeout: Duration,
+    pub(crate) timeout: Duration,
     #[cfg(feature = "websockets")]
     pub(crate) accept_invalid_certs: bool,
 
@@ -1473,5 +1482,39 @@ mod tests {
             }, "t2" ]]}"#,
         )
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bearer_lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn websocket_authentication_reads_the_http_coordinator() {
+        struct Source;
+        impl TokenSource for Source {
+            fn current(
+                &self,
+            ) -> bifrost_net::AccountFuture<Result<bifrost_net::AccessToken, bifrost_net::Error>>
+            {
+                Box::pin(async { Ok(bifrost_net::AccessToken::new("old", None)) })
+            }
+            fn refresh(
+                &self,
+            ) -> bifrost_net::AccountFuture<Result<bifrost_net::AccessToken, bifrost_net::Error>>
+            {
+                Box::pin(async { Ok(bifrost_net::AccessToken::new("new", None)) })
+            }
+        }
+        let auth = Authorization::from_credentials(Credentials::Bearer(Arc::new(Source)));
+        let source = auth.account_token_source();
+        assert!(source.is_coordinating());
+        let net = bifrost_net::Net::new(bifrost_net::NetConfig::default()).unwrap();
+        let account = net.attach_account(
+            NetAccountId("jmap-auth-test".into()),
+            bifrost_net::AccountSpec::new(Some(source)),
+        );
+        assert_eq!(account.bearer().await.unwrap().unwrap().as_str(), "new");
+        assert_eq!(auth.header_value().await.unwrap(), "Bearer new");
     }
 }

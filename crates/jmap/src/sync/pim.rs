@@ -123,26 +123,45 @@ pub(crate) fn set_keyword<T: HttpTransport>(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let ids = resolve_target(&mail, target, AccountOperation::SetKeyword).await?;
-        let keyword_for_set = keyword.clone();
-        let ids_for_set = ids.clone();
-        let mut response = send_email_set(
-            &mail,
-            &email_states,
-            &account_id,
-            AccountOperation::SetKeyword,
-            move || {
-                let mut set = EmailSet::new();
-                for id in &ids_for_set {
-                    set.update(id.clone()).keyword(&keyword_for_set, value);
+        let batch_size = super::factory::max_objects_in_set(&mail.client().session());
+        for (index, chunk) in ids.chunks(batch_size).enumerate() {
+            let keyword_for_set = keyword.clone();
+            let ids_for_set = chunk.to_vec();
+            let mut response = match send_email_set(
+                &mail,
+                &email_states,
+                &account_id,
+                AccountOperation::SetKeyword,
+                move || {
+                    let mut set = EmailSet::new();
+                    for id in &ids_for_set {
+                        set.update(id.clone()).keyword(&keyword_for_set, value);
+                    }
+                    set
+                },
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    return Err(if index == 0 {
+                        error
+                    } else {
+                        partial_email_set_error(AccountOperation::SetKeyword, &error)
+                    });
                 }
-                set
-            },
-        )
-        .await?;
-        for id in &ids {
-            response
-                .updated(id)
-                .map_err(to_acct_err(AccountOperation::SetKeyword))?;
+            };
+            for id in chunk {
+                if let Err(error) = response
+                    .updated(id)
+                    .map_err(to_acct_err(AccountOperation::SetKeyword))
+                {
+                    return Err(partial_email_set_error(
+                        AccountOperation::SetKeyword,
+                        &error,
+                    ));
+                }
+            }
         }
         Ok(())
     })
@@ -211,7 +230,11 @@ fn resolve_foreign_headers(
 
 /// A successful exchange can still leave a multi-step write incomplete or
 /// its final effect unknown. Replaying the whole operation is unsafe.
-fn incomplete_submission(op: AccountOperation, error: AccountError, detail: &str) -> AccountError {
+fn incomplete_multi_step_write(
+    op: AccountOperation,
+    error: AccountError,
+    detail: &str,
+) -> AccountError {
     bifrost_types::AccountErrorBuilder::new(
         bifrost_types::AccountErrorKind::Protocol(
             bifrost_types::ProtocolErrorKind::PartialResponse,
@@ -234,6 +257,35 @@ fn incomplete_submission(op: AccountOperation, error: AccountError, detail: &str
     .expect("valid partial submission classification")
 }
 
+fn partial_email_set_error(op: AccountOperation, error: &AccountError) -> AccountError {
+    let detail = "The Email/set operation may have changed some messages before it failed or returned an incomplete result. Reconcile the affected messages before retrying.";
+    let mut builder = bifrost_types::AccountErrorBuilder::new(
+        bifrost_types::AccountErrorKind::Protocol(
+            bifrost_types::ProtocolErrorKind::PartialResponse,
+        ),
+        bifrost_types::Cause::Wire(bifrost_types::WireCause::MalformedResponse {
+            protocol: bifrost_types::Protocol::Jmap,
+            detail: Some(bifrost_types::DiagnosticText::support_only(detail)),
+        }),
+    )
+    .protocol(bifrost_types::Protocol::Jmap)
+    .operation(op)
+    .idempotency_override(false)
+    .push_cause(bifrost_types::Cause::Attempt(
+        bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Acknowledged),
+    ))
+    .text(bifrost_types::DiagnosticText::user_safe(detail))
+    .text(bifrost_types::DiagnosticText::support_only(format!(
+        "underlying error: {error:?}"
+    )));
+    for cause in error.chain().iter().cloned() {
+        builder = builder.push_cause(cause);
+    }
+    builder
+        .try_build()
+        .expect("valid partial Email/set classification")
+}
+
 fn submission_create_error(error: crate::Error) -> (AccountError, bool) {
     // These errors came from the submission handle, so Method names that
     // call and Set came from its notCreated entry. Missing/invalid replies
@@ -244,7 +296,7 @@ fn submission_create_error(error: crate::Error) -> (AccountError, bool) {
         (error, true)
     } else {
         (
-            incomplete_submission(
+            incomplete_multi_step_write(
                 AccountOperation::Send,
                 error,
                 "Submission outcome is unknown; the source Email was retained. Reconcile before sending again.",
@@ -252,6 +304,57 @@ fn submission_create_error(error: crate::Error) -> (AccountError, bool) {
             false,
         )
     }
+}
+
+fn require_created_email_id(email: &Email, op: AccountOperation) -> Result<EmailId, AccountError> {
+    email
+        .id()
+        .filter(|id| !id.as_str().is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            bifrost_types::AccountErrorBuilder::new(
+                bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::MissingField,
+                ),
+                bifrost_types::Cause::Wire(bifrost_types::WireCause::MalformedResponse {
+                    protocol: bifrost_types::Protocol::Jmap,
+                    detail: Some(bifrost_types::DiagnosticText::support_only(
+                        "JMAP Email/set or Email/import create result omitted a usable id",
+                    )),
+                }),
+            )
+            .protocol(bifrost_types::Protocol::Jmap)
+            .operation(op)
+            .try_build()
+            .expect("valid missing Email id classification")
+        })
+}
+
+fn require_created_submission_id(
+    submission: &crate::email_submission::EmailSubmission,
+    op: AccountOperation,
+) -> Result<crate::email_submission::EmailSubmissionId, AccountError> {
+    submission
+        .id()
+        .filter(|id| !id.as_str().is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            bifrost_types::AccountErrorBuilder::new(
+                bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::MissingField,
+                ),
+                bifrost_types::Cause::Wire(bifrost_types::WireCause::MalformedResponse {
+                    protocol: bifrost_types::Protocol::Jmap,
+                    detail: Some(bifrost_types::DiagnosticText::support_only(
+                        "JMAP EmailSubmission/set create result omitted a usable id",
+                    )),
+                }),
+            )
+            .protocol(bifrost_types::Protocol::Jmap)
+            .operation(op)
+            .try_build()
+            .expect("valid missing EmailSubmission id classification")
+        })
 }
 
 pub(crate) fn send_message<T: HttpTransport>(
@@ -413,46 +516,76 @@ pub(crate) fn send_message<T: HttpTransport>(
             .send()
             .await
             .map_err(to_acct_err(AccountOperation::Send))?;
-        let mut email_response = response
-            .get(&email_handle)
-            .map_err(to_acct_err(AccountOperation::Send))?;
-        let mut email = email_response
-            .created(&email_create_id)
-            .map_err(to_acct_err(AccountOperation::Send))?;
-        let email_id = email.take_id();
 
-        // An absent `newState` is a non-conforming server (RFC 8620 s5.3
-        // makes it mandatory) and an empty one names no state; neither is
-        // a value to cache, and caching either would hand a later
-        // `*/changes` a `sinceState` no server ever issued.
-        if let Some(new_state) = email_response.new_state().filter(|state| !state.is_empty()) {
-            state_cache::advance(
-                &email_states,
-                &account_id,
-                prior_state.as_deref(),
-                new_state.to_string(),
-            )
-            .await;
-        }
-
-        let mut submission = match response
+        // Inspect the submission outcome before extracting the preceding
+        // Email create. A malformed Email result must not hide that the
+        // submission create was acknowledged and may already be live.
+        let submission_result = response
             .get(&submission_handle)
             .and_then(|mut result| result.created(SUBMISSION_CREATE_ID))
-            .map_err(submission_create_error)
-        {
+            .map_err(submission_create_error);
+        let email_result = response
+            .get(&email_handle)
+            .map_err(to_acct_err(AccountOperation::Send))
+            .map(|result| {
+                if let Some(new_state) = result.new_state().filter(|state| !state.is_empty()) {
+                    // An absent `newState` is non-conforming and an empty
+                    // one names no state; neither belongs in the cache.
+                    let state = new_state.to_string();
+                    (result, Some(state))
+                } else {
+                    (result, None)
+                }
+            });
+        let email_result = match email_result {
+            Ok((mut result, new_state)) => {
+                if let Some(new_state) = new_state {
+                    state_cache::advance(
+                        &email_states,
+                        &account_id,
+                        prior_state.as_deref(),
+                        new_state,
+                    )
+                    .await;
+                }
+                result
+                    .created(&email_create_id)
+                    .map_err(to_acct_err(AccountOperation::Send))
+                    .and_then(|email| require_created_email_id(&email, AccountOperation::Send))
+            }
+            Err(error) => Err(error),
+        };
+
+        let submission = match submission_result {
             Ok(submission) => submission,
             Err((error, rejected)) => {
-                if rejected {
-                    discard_created_send_email(&mail, &email_states, &account_id, &email_id).await;
+                if rejected && let Ok(email_id) = email_result.as_ref() {
+                    discard_created_send_email(&mail, &email_states, &account_id, email_id).await;
                 }
                 return Err(error);
             }
         };
 
+        let email_id = email_result.map_err(|error| {
+            incomplete_multi_step_write(
+                AccountOperation::Send,
+                error,
+                "The submission was acknowledged, but the Email create result had no usable id. The send may have committed; reconcile before sending again.",
+            )
+        })?;
+
         // A scheduled send returns its EmailSubmission id for
         // cancel/reschedule. An immediate send keeps returning the email id.
         if scheduled.is_some() {
-            Ok(ObjectId(submission.take_id().into_string()))
+            let submission_id = require_created_submission_id(&submission, AccountOperation::Send)
+                .map_err(|error| {
+                    incomplete_multi_step_write(
+                        AccountOperation::Send,
+                        error,
+                        "The submission was acknowledged, but its create result had no usable id. Reconcile the schedule before sending again.",
+                    )
+                })?;
+            Ok(ObjectId(submission_id.into_string()))
         } else {
             Ok(ObjectId(email_id.into_string()))
         }
@@ -533,39 +666,52 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
             .send()
             .await
             .map_err(to_acct_err(AccountOperation::Send))?;
-        let mut import_response = response
-            .get(&import_handle)
-            .map_err(to_acct_err(AccountOperation::Send))?;
-        let mut email = import_response
-            .created(&import_create_id)
-            .map_err(to_acct_err(AccountOperation::Send))?;
-        let email_id = email.take_id();
-        let imported_state = import_response.new_state().to_string();
-        if !imported_state.is_empty() {
-            state_cache::advance(
-                &email_states,
-                &account_id,
-                prior_state.as_deref(),
-                imported_state,
-            )
-            .await;
-        }
-
-        // Surface a submission failure rather than reporting the import id
-        // as if the send committed.
-        match response
+        let submission_result = response
             .get(&submission_handle)
             .and_then(|mut result| result.created(SUBMISSION_CREATE_ID))
-            .map_err(submission_create_error)
-        {
+            .map_err(submission_create_error);
+        let email_result = response
+            .get(&import_handle)
+            .map_err(to_acct_err(AccountOperation::Send))
+            .map(|result| {
+                let imported_state = result.new_state().to_string();
+                (result, imported_state)
+            });
+        let email_result = match email_result {
+            Ok((mut result, imported_state)) => {
+                if !imported_state.is_empty() {
+                    state_cache::advance(
+                        &email_states,
+                        &account_id,
+                        prior_state.as_deref(),
+                        imported_state,
+                    )
+                    .await;
+                }
+                result
+                    .created(&import_create_id)
+                    .map_err(to_acct_err(AccountOperation::Send))
+                    .and_then(|email| require_created_email_id(&email, AccountOperation::Send))
+            }
+            Err(error) => Err(error),
+        };
+
+        match submission_result {
             Ok(_) => {}
             Err((error, rejected)) => {
-                if rejected {
-                    discard_created_send_email(&mail, &email_states, &account_id, &email_id).await;
+                if rejected && let Ok(email_id) = email_result.as_ref() {
+                    discard_created_send_email(&mail, &email_states, &account_id, email_id).await;
                 }
                 return Err(error);
             }
         }
+        let email_id = email_result.map_err(|error| {
+            incomplete_multi_step_write(
+                AccountOperation::Send,
+                error,
+                "The submission was acknowledged, but the Email import result had no usable id. The send may have committed; reconcile before sending again.",
+            )
+        })?;
         Ok(ObjectId(email_id.into_string()))
     })
 }
@@ -605,6 +751,7 @@ pub(crate) fn attachment_upload<T: HttpTransport>(
             .await
             .map_err(to_acct_err(AccountOperation::AttachmentUpload))?;
         Ok(bifrost_types::AttachmentHandle(encode_attachment_handle(
+            mail.id_str(),
             blob.blob_id.as_str(),
             Some(&mime),
         )))
@@ -646,10 +793,18 @@ pub(crate) fn draft_create<T: HttpTransport>(
             )
             .await;
         }
-        let mut email = response
+        let email = response
             .created(&create_id)
             .map_err(to_acct_err(AccountOperation::DraftCreate))?;
-        Ok(bifrost_types::DraftHandle(email.take_id().into_string()))
+        let email_id = require_created_email_id(&email, AccountOperation::DraftCreate)
+            .map_err(|error| {
+                incomplete_multi_step_write(
+                    AccountOperation::DraftCreate,
+                    error,
+                    "The draft was created, but its response had no usable id. Reconcile the draft before creating another.",
+                )
+            })?;
+        Ok(bifrost_types::DraftHandle(email_id.into_string()))
     })
 }
 
@@ -1916,23 +2071,51 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
             "Trash membership read returned no Email state".to_string(),
         ))
     })?;
-    let ids_for_set = ids.clone();
-    let prior_state = state_cache::get(email_states, account_id).await;
-    let mut response = mail
-        .call(EmailSet::new().if_in_state(read_state).destroy(ids_for_set))
-        .await
-        .map_err(to_acct_err(op))?;
-    if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
-        state_cache::advance(
-            email_states,
-            account_id,
-            prior_state.as_deref(),
-            new_state.to_string(),
-        )
-        .await;
-    }
-    for id in &ids {
-        response.destroyed(id).map_err(to_acct_err(op))?;
+    let batch_size = super::factory::max_objects_in_set(&mail.client().session());
+    let mut if_in_state = read_state;
+    for (index, chunk) in ids.chunks(batch_size).enumerate() {
+        let prior_state = state_cache::get(email_states, account_id).await;
+        let set = EmailSet::new()
+            .if_in_state(if_in_state.clone())
+            .destroy(chunk.iter().cloned());
+        let mut response = match mail.call(set).await {
+            Ok(response) => response,
+            Err(error) => {
+                let error = to_acct_err(op)(error);
+                return Err(if index == 0 {
+                    error
+                } else {
+                    partial_email_set_error(op, &error)
+                });
+            }
+        };
+        let new_state = response
+            .new_state()
+            .filter(|state| !state.is_empty())
+            .map(str::to_string);
+        if let Some(new_state) = new_state.as_ref() {
+            state_cache::advance(
+                email_states,
+                account_id,
+                prior_state.as_deref(),
+                new_state.clone(),
+            )
+            .await;
+        }
+        for id in chunk {
+            if let Err(error) = response.destroyed(id).map_err(to_acct_err(op)) {
+                return Err(partial_email_set_error(op, &error));
+            }
+        }
+        if index + 1 < ids.len().div_ceil(batch_size) {
+            let Some(new_state) = new_state else {
+                let error = to_acct_err(op)(crate::Error::NotParsable(
+                    "Email/set omitted newState before the next guarded destroy batch".to_string(),
+                ));
+                return Err(partial_email_set_error(op, &error));
+            };
+            if_in_state = new_state;
+        }
     }
     Ok(())
 }
@@ -1958,9 +2141,9 @@ async fn patch_mailbox_membership<T: HttpTransport>(
 /// the thread between the two resolves was therefore removed from the
 /// source without ever having been added to the target: it lost the
 /// source membership and gained nothing. The two-leg non-atomicity is the
-/// documented cross-provider shape and is not fixable here, but the
-/// window only has to be one `Email/set` pair over a FIXED id set, so the
-/// thread is resolved once and both legs run over that set.
+/// documented cross-provider shape and is not fixable here, but both legs
+/// operate on one FIXED id set, resolved only once. Each leg then splits that
+/// set at the server's `maxObjectsInSet` limit.
 ///
 /// The caller performs the cross-account container check for each
 /// container it passes; the ids themselves are already in this account's
@@ -1974,22 +2157,40 @@ async fn patch_mailbox_membership_of<T: HttpTransport>(
     value: bool,
     op: AccountOperation,
 ) -> Result<(), AccountError> {
-    let ids = ids.to_vec();
+    if ids.is_empty() {
+        return Ok(());
+    }
     // The owner check has established that the container names the
     // same account as the target, so the only work left is stripping the
     // qualification the selected account does not use.
     let mailbox = MailboxId::new(wire_id_for_mail(&container.0, mail.id_str()));
-    let ids_for_set = ids.clone();
-    let mut response = send_email_set(mail, email_states, account_id, op, move || {
-        let mut set = EmailSet::new();
-        for id in &ids_for_set {
-            set.update(id.clone()).mailbox_id(&mailbox, value);
+    let batch_size = super::factory::max_objects_in_set(&mail.client().session());
+    for (index, chunk) in ids.chunks(batch_size).enumerate() {
+        let ids_for_set = chunk.to_vec();
+        let mailbox_for_set = mailbox.clone();
+        let mut response = match send_email_set(mail, email_states, account_id, op, move || {
+            let mut set = EmailSet::new();
+            for id in &ids_for_set {
+                set.update(id.clone()).mailbox_id(&mailbox_for_set, value);
+            }
+            set
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(if index == 0 {
+                    error
+                } else {
+                    partial_email_set_error(op, &error)
+                });
+            }
+        };
+        for id in chunk {
+            if let Err(error) = response.updated(id).map_err(to_acct_err(op)) {
+                return Err(partial_email_set_error(op, &error));
+            }
         }
-        set
-    })
-    .await?;
-    for id in &ids {
-        response.updated(id).map_err(to_acct_err(op))?;
     }
     Ok(())
 }
@@ -3328,8 +3529,11 @@ async fn build_body<T: HttpTransport>(
         attachments.push(part);
     }
     for handle in uploaded {
-        let (blob_id, mime) = decode_attachment_handle(&handle.0);
-        let mut part = EmailBodyPart::new().with_blob_id(crate::core::id::BlobId::new(blob_id));
+        let Some((source_account, blob_id, mime)) = decode_attachment_handle(&handle.0) else {
+            return Err(invalid_attachment_handle(op));
+        };
+        let blob_id = copy_attachment_blob(mail, &source_account, blob_id, op).await?;
+        let mut part = EmailBodyPart::new().with_blob_id(blob_id);
         if let Some(mime) = mime {
             part = part.with_content_type(mime);
         }
@@ -3365,21 +3569,65 @@ async fn build_body<T: HttpTransport>(
     })
 }
 
-fn encode_attachment_handle(blob_id: &str, mime: Option<&str>) -> String {
-    match mime {
-        Some(mime) => format!("{ATTACHMENT_HANDLE_PREFIX}{blob_id}\n{mime}"),
-        None => format!("{ATTACHMENT_HANDLE_PREFIX}{blob_id}"),
-    }
+fn encode_attachment_handle(account_id: &str, blob_id: &str, mime: Option<&str>) -> String {
+    format!(
+        "{ATTACHMENT_HANDLE_PREFIX}v2\n{}",
+        serde_json::to_string(&(account_id, blob_id, mime))
+            .expect("attachment handle fields serialize")
+    )
 }
 
-fn decode_attachment_handle(handle: &str) -> (String, Option<String>) {
-    let raw = handle
-        .strip_prefix(ATTACHMENT_HANDLE_PREFIX)
-        .unwrap_or(handle);
-    let mut parts = raw.splitn(2, '\n');
-    let blob = parts.next().unwrap_or("").to_string();
-    let mime = parts.next().filter(|v| !v.is_empty()).map(str::to_string);
-    (blob, mime)
+fn decode_attachment_handle(handle: &str) -> Option<(String, String, Option<String>)> {
+    let payload = handle
+        .strip_prefix(ATTACHMENT_HANDLE_PREFIX)?
+        .strip_prefix("v2\n")?;
+    let (account, blob, mime): (String, String, Option<String>) =
+        serde_json::from_str(payload).ok()?;
+    if account.is_empty() || blob.is_empty() {
+        return None;
+    }
+    Some((account, blob, mime))
+}
+
+async fn copy_attachment_blob<T: HttpTransport>(
+    mail: &MailAccount<T>,
+    source_account: &str,
+    blob_id: String,
+    op: AccountOperation,
+) -> Result<crate::core::id::BlobId, AccountError> {
+    let blob_id = crate::core::id::BlobId::new(blob_id);
+    if source_account == mail.id_str() {
+        return Ok(blob_id);
+    }
+
+    let mut response = mail
+        .call(crate::blob::copy::CopyBlobRequest::new(source_account).blob_id(blob_id.clone()))
+        .await
+        .map_err(to_acct_err(op))?;
+    if response.from_account_id().as_str() != source_account
+        || response.account_id().as_str() != mail.id_str()
+    {
+        return Err(to_acct_err(op)(crate::Error::NotParsable(
+            "Blob/copy response named accounts other than the requested source and destination"
+                .to_string(),
+        )));
+    }
+    response.copied(&blob_id).map_err(to_acct_err(op))
+}
+
+fn invalid_attachment_handle(op: AccountOperation) -> AccountError {
+    bifrost_types::AccountErrorBuilder::new(
+        bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+        bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
+            detail: bifrost_types::DiagnosticText::support_only(
+                "JMAP attachment handle has no source account; upload it again before sending",
+            ),
+        }),
+    )
+    .protocol(bifrost_types::Protocol::Jmap)
+    .operation(op)
+    .try_build()
+    .expect("valid attachment handle classification")
 }
 
 fn address_to_jmap(address: bifrost_types::Address) -> JmapEmailAddress {
@@ -3551,20 +3799,26 @@ pub(crate) fn reschedule_send<T: HttpTransport>(
             .call(set)
             .await
             .map_err(to_acct_err(AccountOperation::RescheduleSend))
-            .map_err(|error| incomplete_submission(
+            .map_err(|error| incomplete_multi_step_write(
                 AccountOperation::RescheduleSend,
                 error,
                 "The old schedule was canceled; replacement scheduling failed or is unconfirmed. Reconcile the submission before scheduling again.",
             ))?;
-        let mut new_submission = set_response
+        let new_submission = set_response
             .created(SUBMISSION_CREATE_ID)
             .map_err(to_acct_err(AccountOperation::RescheduleSend))
-            .map_err(|error| incomplete_submission(
+            .map_err(|error| incomplete_multi_step_write(
                 AccountOperation::RescheduleSend,
                 error,
                 "The old schedule was canceled; replacement scheduling failed or is unconfirmed. Reconcile the submission before scheduling again.",
             ))?;
-        Ok(ObjectId(new_submission.take_id().into_string()))
+        let new_id = require_created_submission_id(&new_submission, AccountOperation::RescheduleSend)
+            .map_err(|error| incomplete_multi_step_write(
+                AccountOperation::RescheduleSend,
+                error,
+                "The old schedule was canceled; the replacement response had no usable id. Reconcile the submission before scheduling again.",
+            ))?;
+        Ok(ObjectId(new_id.into_string()))
     })
 }
 
@@ -5817,7 +6071,14 @@ mod tests {
                                 "accountId": account_id,
                                 "oldState": "email-state-before-create",
                                 "newState": "email-created-state",
-                                "created": Self::keyed(create_id, serde_json::json!({"id": "email-created"}))
+                                "created": Self::keyed(
+                                    create_id,
+                                    if self.submission_reply == Some("missing_email_id") {
+                                        serde_json::json!({})
+                                    } else {
+                                        serde_json::json!({"id": "email-created"})
+                                    }
+                                )
                             })
                         }
                     }
@@ -5843,8 +6104,28 @@ mod tests {
                         "accountId": account_id,
                         "oldState": "email-state-before-import",
                         "newState": "email-imported-state",
-                        "created": {"i0": {"id": "email-created"}}
+                        "created": {
+                            "i0": if self.submission_reply == Some("missing_email_id") {
+                                serde_json::json!({})
+                            } else {
+                                serde_json::json!({"id": "email-created"})
+                            }
+                        }
                     }),
+                    "Blob/copy" => {
+                        let source = args["blobIds"].as_array().expect("blob ids");
+                        let copied = source
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(|id| (id.to_string(), serde_json::json!(format!("copy-{id}"))))
+                            .collect::<serde_json::Map<_, _>>();
+                        serde_json::json!({
+                            "fromAccountId": args["fromAccountId"],
+                            "accountId": account_id,
+                            "copied": copied,
+                            "notCopied": {}
+                        })
+                    }
                     "EmailSubmission/set" => {
                         let mut result = serde_json::json!({
                             "accountId": account_id,
@@ -5876,8 +6157,14 @@ mod tests {
                                     }),
                                 );
                             } else {
-                                result["created"] =
-                                    Self::keyed(id, serde_json::json!({"id": "new-submission"}));
+                                result["created"] = Self::keyed(
+                                    id,
+                                    if self.submission_reply == Some("missing_submission_id") {
+                                        serde_json::json!({})
+                                    } else {
+                                        serde_json::json!({"id": "new-submission"})
+                                    },
+                                );
                             }
                         }
                         result
@@ -5972,6 +6259,59 @@ mod tests {
         crate::account::Account::new(client, "primary")
     }
 
+    #[tokio::test]
+    async fn foreign_send_copies_uploaded_attachment_into_its_account() {
+        let transport = SendTransport::new(false, false, false, false);
+        let primary = send_account(transport.clone());
+        let shared = crate::account::Account::new(primary.client().clone(), "shared");
+        let handle = bifrost_types::AttachmentHandle(encode_attachment_handle(
+            "primary",
+            "source-blob",
+            Some("image/png"),
+        ));
+
+        let body = build_body(
+            &shared,
+            None,
+            None,
+            Vec::new(),
+            vec![handle],
+            AccountOperation::Send,
+        )
+        .await
+        .expect("cross-account handle is copied before Email/set");
+
+        let copy = transport.calls("Blob/copy");
+        assert_eq!(copy.len(), 1);
+        assert_eq!(copy[0]["fromAccountId"], "primary");
+        assert_eq!(copy[0]["accountId"], "shared");
+        assert_eq!(copy[0]["blobIds"], serde_json::json!(["source-blob"]));
+        assert_eq!(
+            body.attachments[0]
+                .blob_id()
+                .map(crate::core::id::BlobId::as_str),
+            Some("copy-source-blob")
+        );
+        assert_eq!(body.attachments[0].content_type(), Some("image/png"));
+    }
+
+    #[test]
+    fn attachment_handles_carry_their_source_account_and_reject_legacy_values() {
+        assert_eq!(
+            decode_attachment_handle(&encode_attachment_handle(
+                "primary",
+                "B1",
+                Some("image/png")
+            )),
+            Some((
+                "primary".to_string(),
+                "B1".to_string(),
+                Some("image/png".to_string())
+            ))
+        );
+        assert_eq!(decode_attachment_handle("jmap:B1\nimage/png"), None);
+    }
+
     fn send_state_map() -> StateMap {
         Arc::new(tokio::sync::Mutex::new(HashMap::new()))
     }
@@ -6010,6 +6350,48 @@ mod tests {
             state_cache::get(&states, "primary").await.as_deref(),
             Some("email-updated-state")
         );
+    }
+
+    #[tokio::test]
+    async fn thread_keyword_patch_batches_at_the_advertised_set_limit() {
+        let transport = DeleteThreadTransport::new();
+        let mut session = serde_json::to_value(search_session()).expect("session serializes");
+        session["capabilities"]["urn:ietf:params:jmap:core"]["maxObjectsInSet"] =
+            serde_json::json!(2);
+        let client = crate::client::Client::with_transport(
+            transport.clone(),
+            serde_json::from_value(session).expect("session parses"),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let mail = crate::account::Account::new(client, "primary");
+        let states: StateMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        set_keyword(
+            mail,
+            states,
+            "primary".to_string(),
+            MutationTarget::Thread(ThreadId("thread-1".to_string())),
+            "$seen".to_string(),
+            true,
+        )
+        .await
+        .expect("thread keyword patches honor maxObjectsInSet");
+
+        let calls = transport.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call[0].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["Thread/get", "Email/set", "Email/set", "Email/set"]
+        );
+        assert_eq!(calls[1][1]["update"].as_object().unwrap().len(), 2);
+        assert_eq!(calls[2][1]["update"].as_object().unwrap().len(), 2);
+        assert_eq!(calls[3][1]["update"].as_object().unwrap().len(), 1);
+        for set in &calls[1..] {
+            assert!(set[1].get("ifInState").is_none());
+        }
     }
 
     #[tokio::test]
@@ -6098,6 +6480,10 @@ mod tests {
 
     #[tokio::test]
     async fn replacement_failure_preserves_confirmed_cancellation() {
+        // Cancellation is verified before replacement so two schedules cannot
+        // remain live. Once cancellation is confirmed it cannot be rolled back;
+        // failures below therefore return an acknowledged partial outcome that
+        // tells the caller the old schedule was canceled and needs reconciling.
         for reply in [
             None,
             Some("missing"),
@@ -6105,8 +6491,10 @@ mod tests {
             Some("empty"),
             Some("method"),
             Some("transport"),
+            Some("missing_submission_id"),
         ] {
-            let mut transport = SendTransport::new(true, false, false, false);
+            let mut transport = SendTransport::new(false, false, false, false);
+            transport.fail_submission = reply != Some("missing_submission_id");
             transport.submission_reply = reply;
             let error = reschedule_send(
                 send_account(transport.clone()),
@@ -6177,6 +6565,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acknowledged_send_with_an_email_create_missing_its_id_is_partial() {
+        let mut transport = SendTransport::new(false, false, false, false);
+        transport.submission_reply = Some("missing_email_id");
+        let error = send_message(
+            send_account(transport.clone()),
+            send_state_map(),
+            "primary".to_string(),
+            0,
+            None,
+            basic_send_request(),
+        )
+        .await
+        .expect_err("a missing created Email id cannot become an empty ObjectId");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::PartialResponse
+            )
+        );
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::Reconcile(_)
+        ));
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Attempt(attempt)
+                if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
+        )));
+        assert!(
+            error
+                .user_safe_text()
+                .any(|text| text.contains("submission was acknowledged"))
+        );
+        assert_eq!(transport.calls("EmailSubmission/set").len(), 1);
+        assert_eq!(transport.calls("Email/set").len(), 1);
+        assert!(transport.calls("Email/set")[0].get("destroy").is_none());
+    }
+
+    #[tokio::test]
     async fn failed_raw_send_submission_best_effort_destroys_imported_email() {
         let transport = SendTransport::new(true, false, false, false);
         let states = send_state_map();
@@ -6213,6 +6641,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acknowledged_raw_send_with_an_import_missing_its_id_is_partial() {
+        let mut transport = SendTransport::new(false, false, false, false);
+        transport.submission_reply = Some("missing_email_id");
+        let error = send_raw_message(
+            send_account(transport.clone()),
+            send_state_map(),
+            "primary".to_string(),
+            Bytes::from_static(b"raw message"),
+            None,
+        )
+        .await
+        .expect_err("a missing imported Email id cannot become an empty ObjectId");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::PartialResponse
+            )
+        );
+        assert!(
+            error
+                .user_safe_text()
+                .any(|text| text.contains("submission was acknowledged"))
+        );
+        assert_eq!(transport.calls("EmailSubmission/set").len(), 1);
+        assert_eq!(transport.calls("Email/import").len(), 1);
+        assert!(transport.calls("Email/set").is_empty());
+    }
+
+    #[tokio::test]
+    async fn created_draft_with_missing_email_id_is_partial() {
+        let mut transport = SendTransport::new(false, false, false, false);
+        transport.submission_reply = Some("missing_email_id");
+        let error = draft_create(
+            send_account(transport.clone()),
+            send_state_map(),
+            "primary".to_string(),
+            bifrost_types::DraftPatch::default(),
+        )
+        .await
+        .expect_err("a missing created Email id cannot become an empty DraftHandle");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::PartialResponse
+            )
+        );
+        assert!(
+            error
+                .user_safe_text()
+                .any(|text| text.contains("draft was created"))
+        );
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Attempt(attempt)
+                if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
+        )));
+    }
+
+    #[tokio::test]
     async fn scheduled_send_omits_server_owned_undo_status() {
         let transport = SendTransport::new(false, false, false, false);
         let mut request = basic_send_request();
@@ -6242,6 +6731,40 @@ mod tests {
             serde_json::json!([format!("#{SUBMISSION_CREATE_ID}")])
         );
         assert!(create["envelope"]["mailFrom"]["parameters"]["holduntil"].is_string());
+    }
+
+    #[tokio::test]
+    async fn acknowledged_scheduled_send_with_missing_submission_id_is_partial() {
+        let mut transport = SendTransport::new(false, false, false, false);
+        transport.submission_reply = Some("missing_submission_id");
+        let mut request = basic_send_request();
+        request.scheduled =
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(4_102_444_800));
+
+        let error = send_message(
+            send_account(transport.clone()),
+            send_state_map(),
+            "primary".to_string(),
+            usize::MAX,
+            None,
+            request,
+        )
+        .await
+        .expect_err("an empty scheduled-send id cannot be returned");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::PartialResponse
+            )
+        );
+        assert!(
+            error
+                .user_safe_text()
+                .any(|text| text.contains("usable id"))
+        );
+        assert_eq!(transport.calls("EmailSubmission/set").len(), 1);
+        assert!(transport.calls("Email/set")[0].get("destroy").is_none());
     }
 
     #[tokio::test]
@@ -6396,12 +6919,21 @@ mod tests {
     #[derive(Clone)]
     struct DeleteThreadTransport {
         calls: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        fail_set_number: Option<usize>,
     }
 
     impl DeleteThreadTransport {
         fn new() -> Self {
             Self {
                 calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_set_number: None,
+            }
+        }
+
+        fn failing_on_set(number: usize) -> Self {
+            Self {
+                fail_set_number: Some(number),
+                ..Self::new()
             }
         }
 
@@ -6420,6 +6952,21 @@ mod tests {
             let call = request["methodCalls"][0].clone();
             self.calls.lock().expect("calls").push(call.clone());
             let method = call[0].as_str().expect("method name").to_string();
+            if method == "Email/set"
+                && self.fail_set_number
+                    == Some(
+                        self.calls
+                            .lock()
+                            .expect("calls")
+                            .iter()
+                            .filter(|call| call[0] == "Email/set")
+                            .count(),
+                    )
+            {
+                return Err(crate::core::transport::TransportError::new(
+                    "second Email/set batch failed",
+                ));
+            }
             let call_id = call[2].clone();
             let account_id = call[1]["accountId"].clone();
             let arguments = match method.as_str() {
@@ -6434,7 +6981,7 @@ mod tests {
                     "state": "thread-state",
                     "list": [{
                         "id": "thread-1",
-                        "emailIds": ["sent-copy", "inbox-copy", "trash-copy"]
+                        "emailIds": ["trash-copy-1", "sent-copy", "trash-copy-2", "inbox-copy", "trash-copy-3"]
                     }],
                     "notFound": []
                 }),
@@ -6447,7 +6994,15 @@ mod tests {
                         .collect::<HashSet<_>>();
                     let list = vec![
                         serde_json::json!({
-                            "id": "trash-copy",
+                            "id": "trash-copy-1",
+                            "mailboxIds": { "trash-id": true, "sent-id": false }
+                        }),
+                        serde_json::json!({
+                            "id": "trash-copy-2",
+                            "mailboxIds": { "trash-id": true, "sent-id": false }
+                        }),
+                        serde_json::json!({
+                            "id": "trash-copy-3",
                             "mailboxIds": { "trash-id": true, "sent-id": false }
                         }),
                         serde_json::json!({
@@ -6473,13 +7028,49 @@ mod tests {
                         "notFound": []
                     })
                 }
-                "Email/set" => serde_json::json!({
-                    "accountId": account_id,
-                    "oldState": "email-state",
-                    "newState": "email-next",
-                    "destroyed": call[1]["destroy"],
-                    "notDestroyed": {}
-                }),
+                "Email/set" => {
+                    let set_number = self
+                        .calls
+                        .lock()
+                        .expect("calls")
+                        .iter()
+                        .filter(|call| call[0] == "Email/set")
+                        .count();
+                    let prior = call[1]["ifInState"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| match set_number {
+                            1 => "email-state".to_string(),
+                            2 => "email-next".to_string(),
+                            _ => "email-final".to_string(),
+                        });
+                    let next = match set_number {
+                        1 => "email-next".to_string(),
+                        2 => "email-final".to_string(),
+                        _ => format!("email-final-{set_number}"),
+                    };
+                    let mut result = serde_json::json!({
+                        "accountId": account_id,
+                        "oldState": prior,
+                        "newState": next,
+                    });
+                    if let Some(destroyed) = call[1].get("destroy") {
+                        result["destroyed"] = destroyed.clone();
+                        result["notDestroyed"] = serde_json::json!({});
+                    } else {
+                        let updates = call[1]["update"]
+                            .as_object()
+                            .expect("Email/set update object");
+                        result["updated"] = serde_json::Value::Object(
+                            updates
+                                .keys()
+                                .map(|id| (id.clone(), serde_json::json!({})))
+                                .collect(),
+                        );
+                        result["notUpdated"] = serde_json::json!({});
+                    }
+                    result
+                }
                 other => panic!("unexpected method {other}"),
             };
             let response = serde_json::json!({
@@ -6519,6 +7110,8 @@ mod tests {
         let mut session = serde_json::to_value(search_session()).expect("session serializes");
         session["capabilities"]["urn:ietf:params:jmap:core"]["maxObjectsInGet"] =
             serde_json::json!(2);
+        session["capabilities"]["urn:ietf:params:jmap:core"]["maxObjectsInSet"] =
+            serde_json::json!(2);
         let client = crate::client::Client::with_transport(
             transport.clone(),
             serde_json::from_value(session).expect("session parses"),
@@ -6549,19 +7142,122 @@ mod tests {
                 "Thread/get",
                 "Email/get",
                 "Email/get",
+                "Email/get",
+                "Email/set",
                 "Email/set"
             ]
         );
         assert_eq!(calls[2][1]["ids"].as_array().unwrap().len(), 2);
-        assert_eq!(calls[3][1]["ids"].as_array().unwrap().len(), 1);
-        for get in [&calls[2], &calls[3]] {
+        assert_eq!(calls[3][1]["ids"].as_array().unwrap().len(), 2);
+        assert_eq!(calls[4][1]["ids"].as_array().unwrap().len(), 1);
+        for get in [&calls[2], &calls[3], &calls[4]] {
             assert_eq!(
                 get[1]["properties"],
                 serde_json::json!(["id", "mailboxIds"])
             );
         }
-        assert_eq!(calls[4][1]["destroy"], serde_json::json!(["trash-copy"]));
-        assert_eq!(calls[4][1]["ifInState"], "email-state");
-        assert!(calls[4][1].get("update").is_none());
+        assert_eq!(
+            calls[5][1]["destroy"],
+            serde_json::json!(["trash-copy-1", "trash-copy-2"])
+        );
+        assert_eq!(calls[5][1]["ifInState"], "email-state");
+        assert_eq!(calls[6][1]["destroy"], serde_json::json!(["trash-copy-3"]));
+        assert_eq!(calls[6][1]["ifInState"], "email-next");
+        assert!(calls[5][1].get("update").is_none());
+        assert!(calls[6][1].get("update").is_none());
+    }
+
+    #[tokio::test]
+    async fn thread_membership_patch_batches_at_the_advertised_set_limit() {
+        let transport = DeleteThreadTransport::new();
+        let mut session = serde_json::to_value(search_session()).expect("session serializes");
+        session["capabilities"]["urn:ietf:params:jmap:core"]["maxObjectsInSet"] =
+            serde_json::json!(2);
+        let client = crate::client::Client::with_transport(
+            transport.clone(),
+            serde_json::from_value(session).expect("session parses"),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let mail = crate::account::Account::new(client, "primary");
+        let states: StateMap = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let ids = ["M1", "M2", "M3", "M4", "M5"]
+            .into_iter()
+            .map(crate::email::EmailId::new)
+            .collect::<Vec<_>>();
+
+        patch_mailbox_membership_of(
+            &mail,
+            &states,
+            "primary",
+            &ids,
+            ContainerId("target-mailbox".to_string()),
+            true,
+            AccountOperation::AddToContainer,
+        )
+        .await
+        .expect("thread membership patches honor maxObjectsInSet");
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0][1]["update"].as_object().unwrap().len(), 2);
+        assert_eq!(calls[1][1]["update"].as_object().unwrap().len(), 2);
+        assert_eq!(calls[2][1]["update"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            calls[0][1]["update"]["M1"]["mailboxIds/target-mailbox"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_thread_destroy_batch_failure_reports_partial_completion() {
+        let transport = DeleteThreadTransport::failing_on_set(2);
+        let mut session = serde_json::to_value(search_session()).expect("session serializes");
+        session["capabilities"]["urn:ietf:params:jmap:core"]["maxObjectsInGet"] =
+            serde_json::json!(2);
+        session["capabilities"]["urn:ietf:params:jmap:core"]["maxObjectsInSet"] =
+            serde_json::json!(2);
+        let client = crate::client::Client::with_transport(
+            transport.clone(),
+            serde_json::from_value(session).expect("session parses"),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let mail = crate::account::Account::new(client, "primary");
+        let states: StateMap = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let error = delete_thread(
+            mail,
+            states,
+            "primary".to_string(),
+            ThreadId("thread-1".to_string()),
+            Some(ContainerId("trash-id".to_string())),
+        )
+        .await
+        .expect_err("a failed later batch follows an acknowledged destroy");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::PartialResponse
+            )
+        );
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::Reconcile(_)
+        ));
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Attempt(attempt)
+                if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
+        )));
+        assert_eq!(
+            transport
+                .calls()
+                .iter()
+                .filter(|call| call[0] == "Email/set")
+                .count(),
+            2
+        );
     }
 }

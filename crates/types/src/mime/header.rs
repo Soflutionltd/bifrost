@@ -20,7 +20,38 @@ struct HeaderEntry {
     value: String,
 }
 
+impl Address {
+    /// Parse an unfolded address-list header value, decoding display names.
+    ///
+    /// Quoted local parts retain their quotes and quoted-pairs. This tolerant
+    /// convenience method returns accepted mailboxes only. Use
+    /// `parse_list_checked` before rewriting a draft or submitting recipients.
+    pub fn parse_list(value: &str) -> Vec<Self> {
+        parse_addresses(value).0
+    }
+
+    /// Parse an address list, failing with the original rejected items if any
+    /// mailbox cannot be represented. Empty groups and empty lists are valid.
+    /// No partial recipient list is returned on failure.
+    pub fn parse_list_checked(value: &str) -> Result<Vec<Self>, Vec<String>> {
+        let (addresses, rejected) = parse_addresses(value);
+        if rejected.is_empty() {
+            Ok(addresses)
+        } else {
+            Err(rejected)
+        }
+    }
+}
+
 impl HeaderMap {
+    /// Parse a header block without the separating blank line or message body.
+    ///
+    /// Repeated fields retain wire order and continuation lines are unfolded.
+    /// The caller bounds the block size; this does not apply MIME limits.
+    pub fn parse(raw: &[u8]) -> Self {
+        parse_header_block(raw)
+    }
+
     pub fn get(&self, name: &str) -> Option<&str> {
         self.entries
             .iter()
@@ -50,7 +81,23 @@ impl HeaderMap {
     }
 
     pub fn addresses(&self, name: &str) -> Vec<Address> {
-        self.get_all(name).flat_map(parse_addresses).collect()
+        self.get_all(name).flat_map(Address::parse_list).collect()
+    }
+
+    /// Parse every occurrence of a field without silently losing recipients.
+    pub fn addresses_checked(&self, name: &str) -> Result<Vec<Address>, Vec<String>> {
+        let mut addresses = Vec::new();
+        let mut rejected = Vec::new();
+        for value in self.get_all(name) {
+            let (accepted, failures) = parse_addresses(value);
+            addresses.extend(accepted);
+            rejected.extend(failures);
+        }
+        if rejected.is_empty() {
+            Ok(addresses)
+        } else {
+            Err(rejected)
+        }
     }
 
     pub fn date(&self, name: &str) -> Option<SystemTime> {
@@ -165,57 +212,145 @@ fn parse_header_block(raw: &[u8]) -> HeaderMap {
     map
 }
 
-fn parse_addresses(value: &str) -> Vec<Address> {
-    split_address_items(value)
-        .into_iter()
-        .filter_map(|item| {
-            let item = item.trim();
-            let item = item
-                .rsplit_once(':')
-                .map_or(item, |(_, members)| members.trim());
-            let item = item.strip_suffix(';').unwrap_or(item).trim();
-            let (name, address) = if let Some(open) = item.rfind('<') {
-                let close = item[open + 1..].find('>')? + open + 1;
-                (item[..open].trim(), item[open + 1..close].trim())
-            } else {
-                ("", item)
-            };
-            if !address.contains('@') || address.chars().any(char::is_whitespace) {
-                return None;
-            }
-            let name = name
-                .trim_matches('\"')
-                .replace("\\\"", "\"")
-                .replace("\\\\", "\\");
-            Some(Address {
-                name: (!name.is_empty()).then(|| decode_encoded_words(name.as_bytes())),
-                address: address.to_owned(),
-            })
-        })
-        .collect()
-}
-
-fn split_address_items(value: &str) -> Vec<&str> {
-    let mut items = Vec::new();
-    let mut start = 0;
+// Only syntax outside quoted strings, nested comments and angle addresses
+// delimits a list or introduces a group. Quoted-pairs escape in comments too.
+fn address_syntax(value: &str) -> Vec<(usize, char)> {
+    let mut syntax = Vec::new();
     let mut quoted = false;
     let mut escaped = false;
+    let mut comments = 0;
     let mut angle = 0;
+    let mut literal = false;
     for (index, ch) in value.char_indices() {
         if escaped {
             escaped = false;
             continue;
         }
+        if ch == '\\' && (quoted || comments > 0) {
+            escaped = true;
+            continue;
+        }
+        if comments > 0 {
+            match ch {
+                '(' => comments += 1,
+                ')' => comments -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        if ch == '"' && !literal {
+            quoted = !quoted;
+            continue;
+        }
+        if quoted {
+            continue;
+        }
+        match ch {
+            '(' if !literal => comments = 1,
+            '[' => literal = true,
+            ']' => literal = false,
+            '<' if !literal => {
+                if angle == 0 {
+                    syntax.push((index, ch));
+                }
+                angle += 1;
+            }
+            '>' if !literal && angle > 0 => {
+                angle -= 1;
+                if angle == 0 {
+                    syntax.push((index, ch));
+                }
+            }
+            ':' | ',' | ';' if angle == 0 && !literal => syntax.push((index, ch)),
+            _ => {}
+        }
+    }
+    syntax
+}
+
+fn parse_addresses(value: &str) -> (Vec<Address>, Vec<String>) {
+    let mut addresses = Vec::new();
+    let mut rejected = Vec::new();
+    for original in split_address_items(value) {
+        let item = original.trim();
+        let syntax = address_syntax(item);
+        let item = syntax
+            .iter()
+            .find(|(_, ch)| *ch == ':')
+            .map_or(item, |(index, _)| item[index + 1..].trim());
+        if item.is_empty() {
+            continue;
+        }
+        let syntax = address_syntax(item);
+        let mailbox = if let Some((open, _)) = syntax.iter().find(|(_, ch)| *ch == '<') {
+            syntax
+                .iter()
+                .find(|(index, ch)| *index > *open && *ch == '>')
+                .filter(|(close, _)| item[close + 1..].trim().is_empty())
+                .map(|(close, _)| (item[..*open].trim(), item[open + 1..*close].trim()))
+        } else {
+            Some(("", item))
+        };
+        let Some((name, address)) = mailbox.filter(|(_, address)| acceptable_addr_spec(address))
+        else {
+            rejected.push(original.trim().to_owned());
+            continue;
+        };
+        let name = name
+            .trim_matches('"')
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\");
+        addresses.push(Address {
+            name: (!name.is_empty()).then(|| decode_encoded_words(name.as_bytes())),
+            address: address.to_owned(),
+        });
+    }
+    (addresses, rejected)
+}
+
+// This is deliberately not full RFC validation. In particular, do not apply
+// an unquoted whitespace rule to a quoted local part (RFC 5322 section 3.2.4).
+fn acceptable_addr_spec(value: &str) -> bool {
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut at = None;
+    let mut literal = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            if !matches!(ch, ' '..='~' | '\t') {
+                return false;
+            }
+            escaped = false;
+            continue;
+        }
         match ch {
             '\\' if quoted => escaped = true,
-            '\"' => quoted = !quoted,
-            '<' if !quoted => angle += 1,
-            '>' if !quoted && angle > 0 => angle -= 1,
-            ',' if !quoted && angle == 0 => {
-                items.push(&value[start..index]);
-                start = index + 1;
+            '"' if at.is_none() => quoted = !quoted,
+            '[' if !quoted && at.is_some() => literal = true,
+            ']' if literal => literal = false,
+            '@' if !quoted && !literal => {
+                if at.replace(index).is_some() {
+                    return false;
+                }
+            }
+            ' ' | '\t' if quoted => {}
+            ch if ch.is_whitespace() || ch.is_control() => return false,
+            '<' | '>' | ',' | ';' | ':' | '(' | ')' | '"' if !quoted && !literal => {
+                return false;
             }
             _ => {}
+        }
+    }
+    !quoted && !escaped && !literal && at.is_some_and(|index| index > 0 && index + 1 < value.len())
+}
+
+fn split_address_items(value: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut start = 0;
+    for (index, ch) in address_syntax(value) {
+        if matches!(ch, ',' | ';') {
+            items.push(&value[start..index]);
+            start = index + 1;
         }
     }
     items.push(&value[start..]);

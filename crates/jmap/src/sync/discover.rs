@@ -226,18 +226,10 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                                         bifrost_types::AccountOperation::ScopeLifecycle,
                                     ),
                                 );
-                                if acct.recovery().is_terminal()
-                                    || acct.recovery().requires_engine_action()
-                                {
-                                    yield ScopeLifecycleEvent::Terminated(acct);
-                                    break;
-                                }
-                                // Do not advance the changes state: retrying
-                                // this response is the only way to preserve
-                                // the created/renamed lifecycle event.
-                                walk = None;
-                                poll_pause(&shutdown, &mut session_changes).await;
-                                continue;
+                                // The shared state has not advanced. Reopening
+                                // retries this response without losing its diff.
+                                yield ScopeLifecycleEvent::Terminated(acct);
+                                break;
                             }
                         }
                     } else {
@@ -392,8 +384,10 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                         ),
                     ) {
                         // Expired history is conforming, not a progress-guard
-                        // fault. Reconcile a complete snapshot before replacing
-                        // the position; retryable snapshot failures retain both
+                        // fault. This state is private to lifecycle, so an engine
+                        // scope restart cannot repair it. Reconcile a complete
+                        // snapshot before replacing the position. Snapshot
+                        // failures retain both
                         // the old names and state for another attempt.
                         match fetch_mailbox_names(&mail).await {
                             Ok((state, names)) => {
@@ -420,28 +414,18 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                                         bifrost_types::AccountOperation::ScopeLifecycle,
                                     ),
                                 );
-                                if error.recovery().is_terminal()
-                                    || error.recovery().requires_engine_action()
-                                {
-                                    yield ScopeLifecycleEvent::Terminated(error);
-                                    break;
-                                }
+                                yield ScopeLifecycleEvent::Terminated(error);
+                                break;
                             }
                         }
                         walk = None;
                         poll_pause(&shutdown, &mut session_changes).await;
                         continue;
                     }
-                    // Auth, capability and other permanent failures remain
-                    // visible; transient failures pause and retry this state.
-                    if acct.recovery().is_terminal()
-                        || acct.recovery().requires_engine_action()
-                    {
-                        yield ScopeLifecycleEvent::Terminated(acct);
-                        break;
-                    }
-                    walk = None;
-                    poll_pause(&shutdown, &mut session_changes).await;
+                    // Let the engine record holds and choose the reconnect
+                    // delay. Do not silently absorb retry or reconcile advice.
+                    yield ScopeLifecycleEvent::Terminated(acct);
+                    break;
                 }
             }
         }
@@ -857,41 +841,56 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn retryable_changes_and_followup_failures_reach_the_lifecycle_consumer() {
+        for replies in [
+            vec![method_failure("serverUnavailable")],
+            vec![
+                changes_reply(&["new"], &[], &[]),
+                method_failure("serverUnavailable"),
+            ],
+        ] {
+            let expected_requests = replies.len();
+            let (mut stream, _shutdown, states, requests) =
+                lifecycle_stream_with_limit(replies, HashMap::new(), 256);
+            let started = tokio::time::Instant::now();
+            assert!(matches!(
+                stream.next().await,
+                Some(ScopeLifecycleEvent::Terminated(_))
+            ));
+            assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+            assert_eq!(requests.lock().expect("requests").len(), expected_requests);
+            assert_eq!(
+                state_cache::get(&states, "primary").await.as_deref(),
+                Some("mbx-1"),
+                "the replacement reader must retry the uncommitted position",
+            );
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_transient_reseed_failure_preserves_the_old_names_and_position() {
         let (mut stream, shutdown, states, requests) = lifecycle_stream_with_limit(
             [
                 method_failure("cannotCalculateChanges"),
                 method_failure("serverUnavailable"),
-                method_failure("cannotCalculateChanges"),
-                snapshot_reply("mbx-fresh", &[("known", "After")]),
             ],
             HashMap::from([("known".to_string(), "Before".to_string())]),
             256,
         );
-        let Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Renamed {
-            old_name,
-            new_name,
-            ..
-        })) = stream.next().await
-        else {
-            panic!("expected rename after reseed retry");
-        };
-        assert_eq!((old_name.as_str(), new_name.as_str()), ("Before", "After"));
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            stream.next().await,
+            Some(ScopeLifecycleEvent::Terminated(_))
+        ));
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
         assert_eq!(
             state_cache::get(&states, "primary").await.as_deref(),
             Some("mbx-1")
         );
-        {
-            let requests = requests.lock().expect("requests");
-            assert_eq!(requests.len(), 4);
-            assert_eq!(requests[2]["methodCalls"][0][1]["sinceState"], "mbx-1");
-        }
-        shutdown.cancel();
+        assert_eq!(requests.lock().expect("requests").len(), 2);
         assert!(stream.next().await.is_none());
-        assert_eq!(
-            state_cache::get(&states, "primary").await.as_deref(),
-            Some("mbx-fresh")
-        );
+        shutdown.cancel();
     }
 
     #[tokio::test]

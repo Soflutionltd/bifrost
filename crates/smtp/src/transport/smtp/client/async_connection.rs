@@ -20,7 +20,7 @@ use super::{
     async_net::AsyncNetworkStream,
     core,
     core::{Op, OpOutcome, ProtocolMachine, Step},
-    data_terminator, smtp_data_size,
+    data_terminator,
 };
 use crate::{
     Envelope,
@@ -32,18 +32,11 @@ use crate::{
             decode_scram_payload, oauth_mechanism, password_mechanism, resolve_scram_binding,
             scram_hash,
         },
-        batch::{RecipientProgress, SendProgress, SmtpBatchRecipient},
-        commands::{
-            Auth, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Starttls, Vrfy, build_recipient_commands,
-            build_transaction_commands,
-        },
+        batch::{SendProgress, SmtpBatchRecipient},
+        commands::{Auth, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Starttls, Vrfy},
         error,
-        error::{Error, SmtpCommandPhase, SmtpTransmissionState},
-        extension::{
-            ClientId, DeliverByMode, Extension, FutureReleaseParameter, MailBodyParameter,
-            MailParameter, RcptParameter, SendOptions, ServerInfo,
-            addresses_match_for_recipient_options,
-        },
+        error::{Error, SmtpCommandPhase},
+        extension::{ClientId, Extension, SendOptions, ServerInfo},
         response::{Response, parse_response},
     },
 };
@@ -473,9 +466,11 @@ impl AsyncSmtpConnection {
         options: &SendOptions,
         allow_binary_mime: bool,
     ) -> Result<(Mail, Vec<Rcpt>), Error> {
-        let mail_options = self.mail_options(envelope, email, options, allow_binary_mime)?;
-        let rcpt_options = self.rcpt_options(envelope, options)?;
-        build_transaction_commands(envelope, mail_options, &rcpt_options)
+        super::envelope::EnvelopeBuilder {
+            server_info: self.server_info(),
+            encrypted: self.is_encrypted(),
+        }
+        .build_envelope(envelope, email, options, allow_binary_mime)
     }
 
     pub(crate) async fn send_with_options(
@@ -594,44 +589,11 @@ impl AsyncSmtpConnection {
         email: &[u8],
         options: &SendOptions,
     ) -> Result<(Mail, Vec<Rcpt>, SendProgress), (Error, SendProgress)> {
-        let progress = SendProgress::new(protocol, recipients);
-        let rcpt_options_all = self
-            .rcpt_options_for_batch(&progress.recipients, options)
-            .map_err(|error| {
-                (
-                    error
-                        .with_attempt(SmtpTransmissionState::Unsent)
-                        .with_phase(SmtpCommandPhase::RcptTo),
-                    progress.clone(),
-                )
-            })?;
-
-        let mail_options = self
-            .mail_options_for_batch(from.as_ref(), &progress.recipients, email, options, false)
-            .map_err(|error| {
-                (
-                    error
-                        .with_attempt(SmtpTransmissionState::Unsent)
-                        .with_phase(SmtpCommandPhase::MailFrom),
-                    progress.clone(),
-                )
-            })?;
-
-        let mail_cmd = Mail::new(from, mail_options).map_err(|error| {
-            (
-                error
-                    .with_attempt(SmtpTransmissionState::Unsent)
-                    .with_phase(SmtpCommandPhase::MailFrom),
-                progress.clone(),
-            )
-        })?;
-        let rcpt_cmds = build_recipient_commands(
-            progress.recipients.iter().map(|r| r.address.clone()),
-            &rcpt_options_all,
-        )
-        .map_err(|e| (e, progress.clone()))?;
-
-        Ok((mail_cmd, rcpt_cmds, progress))
+        super::envelope::EnvelopeBuilder {
+            server_info: self.server_info(),
+            encrypted: self.is_encrypted(),
+        }
+        .build_batch(protocol, from, recipients, email, options)
     }
 
     /// Run a sans-I/O protocol machine to completion.
@@ -704,383 +666,6 @@ impl AsyncSmtpConnection {
     /// Write the DATA body without reading the final reply.
     async fn write_body(&mut self, email: &[u8]) -> Result<(), Error> {
         self.write_body_iter(std::iter::once(email)).await
-    }
-
-    /// Compute RCPT TO parameters for a single recipient and the given options.
-    fn rcpt_options_single(
-        &self,
-        addr: &Address,
-        options: &SendOptions,
-    ) -> Result<Vec<RcptParameter>, Error> {
-        let parameters = options.rcpt_parameters_for(addr);
-        for parameter in &parameters {
-            self.validate_rcpt_parameter(parameter)?;
-        }
-        Ok(parameters)
-    }
-
-    fn rcpt_options_for_batch(
-        &self,
-        recipients: &[RecipientProgress],
-        options: &SendOptions,
-    ) -> Result<Vec<Vec<RcptParameter>>, Error> {
-        for (recipient, _) in options.recipient_parameters() {
-            if !recipients.iter().any(|batch_recipient| {
-                addresses_match_for_recipient_options(recipient, &batch_recipient.address)
-            }) {
-                return Err(error::invalid_input(
-                    "recipient-specific RCPT parameters do not match a batch recipient",
-                ));
-            }
-        }
-
-        recipients
-            .iter()
-            .map(|recipient| self.rcpt_options_single(&recipient.address, options))
-            .collect()
-    }
-
-    /// Like `mail_options` but takes an explicit sender address instead of an `Envelope`.
-    fn mail_options_for_batch(
-        &self,
-        from: Option<&Address>,
-        recipients: &[RecipientProgress],
-        email: &[u8],
-        options: &SendOptions,
-        allow_binary_mime: bool,
-    ) -> Result<Vec<MailParameter>, Error> {
-        let mut mail_options = vec![];
-        let message_size = if allow_binary_mime {
-            email.len()
-        } else {
-            smtp_data_size(email)
-        };
-
-        let has_smtputf8 = options
-            .mail_parameters()
-            .iter()
-            .any(|parameter| matches!(parameter, MailParameter::SmtpUtfEight));
-        let has_body_parameter = options
-            .mail_parameters()
-            .iter()
-            .any(|parameter| matches!(parameter, MailParameter::Body(_)));
-
-        let has_non_ascii = from.is_some_and(|a| !AsRef::<str>::as_ref(a).is_ascii())
-            || recipients
-                .iter()
-                .any(|recipient| !AsRef::<str>::as_ref(&recipient.address).is_ascii());
-        if has_non_ascii && !has_smtputf8 {
-            if !self.server_info().supports_feature(Extension::SmtpUtfEight) {
-                return Err(error::feature_unsupported(
-                    "Envelope contains non-ascii chars but server does not support SMTPUTF8",
-                ));
-            }
-            mail_options.push(MailParameter::SmtpUtfEight);
-        }
-
-        if !email.is_ascii() && !has_body_parameter {
-            if !self.server_info().supports_feature(Extension::EightBitMime) {
-                return Err(error::feature_unsupported(
-                    "Message contains non-ascii chars but server does not support 8BITMIME",
-                ));
-            }
-            mail_options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
-        }
-
-        if self.server_info().supports_size()
-            && !options
-                .mail_parameters()
-                .iter()
-                .any(|parameter| matches!(parameter, MailParameter::Size(_)))
-        {
-            if self
-                .server_info()
-                .size_limit()
-                .is_some_and(|limit| message_size > limit)
-            {
-                return Err(error::invalid_input(
-                    "Message is larger than the server-advertised SIZE limit",
-                ));
-            }
-            mail_options.push(MailParameter::Size(message_size));
-        }
-
-        for parameter in options.mail_parameters() {
-            self.validate_mail_parameter(
-                parameter,
-                message_size,
-                email.is_ascii(),
-                allow_binary_mime,
-            )?;
-            mail_options.push(parameter.clone());
-        }
-
-        Ok(mail_options)
-    }
-
-    fn mail_options(
-        &self,
-        envelope: &Envelope,
-        email: &[u8],
-        options: &SendOptions,
-        allow_binary_mime: bool,
-    ) -> Result<Vec<MailParameter>, Error> {
-        // Mail
-        let mut mail_options = vec![];
-        let message_size = if allow_binary_mime {
-            email.len()
-        } else {
-            smtp_data_size(email)
-        };
-
-        // Internationalization handling
-        //
-        // * 8BITMIME: https://tools.ietf.org/html/rfc6152
-        // * SMTPUTF8: https://tools.ietf.org/html/rfc653
-
-        // Check for non-ascii addresses and use the SMTPUTF8 option if any.
-        let has_smtputf8 = options
-            .mail_parameters()
-            .iter()
-            .any(|parameter| matches!(parameter, MailParameter::SmtpUtfEight));
-        let has_body_parameter = options
-            .mail_parameters()
-            .iter()
-            .any(|parameter| matches!(parameter, MailParameter::Body(_)));
-
-        if envelope.has_non_ascii_addresses() && !has_smtputf8 {
-            if !self.server_info().supports_feature(Extension::SmtpUtfEight) {
-                // don't try to send non-ascii addresses (per RFC)
-                return Err(error::feature_unsupported(
-                    "Envelope contains non-ascii chars but server does not support SMTPUTF8",
-                ));
-            }
-            mail_options.push(MailParameter::SmtpUtfEight);
-        }
-
-        // Check for non-ascii content in the message
-        if !email.is_ascii() && !has_body_parameter {
-            if !self.server_info().supports_feature(Extension::EightBitMime) {
-                return Err(error::feature_unsupported(
-                    "Message contains non-ascii chars but server does not support 8BITMIME",
-                ));
-            }
-            mail_options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
-        }
-
-        if self.server_info().supports_size()
-            && !options
-                .mail_parameters()
-                .iter()
-                .any(|parameter| matches!(parameter, MailParameter::Size(_)))
-        {
-            if self
-                .server_info()
-                .size_limit()
-                .is_some_and(|limit| message_size > limit)
-            {
-                return Err(error::invalid_input(
-                    "Message is larger than the server-advertised SIZE limit",
-                ));
-            }
-            mail_options.push(MailParameter::Size(message_size));
-        }
-
-        for parameter in options.mail_parameters() {
-            self.validate_mail_parameter(
-                parameter,
-                message_size,
-                email.is_ascii(),
-                allow_binary_mime,
-            )?;
-            mail_options.push(parameter.clone());
-        }
-
-        Ok(mail_options)
-    }
-
-    fn rcpt_options(
-        &self,
-        envelope: &Envelope,
-        options: &SendOptions,
-    ) -> Result<Vec<Vec<RcptParameter>>, Error> {
-        for (recipient, _) in options.recipient_parameters() {
-            if !envelope.to().iter().any(|envelope_recipient| {
-                addresses_match_for_recipient_options(recipient, envelope_recipient)
-            }) {
-                return Err(error::invalid_input(
-                    "recipient-specific RCPT parameters do not match an envelope recipient",
-                ));
-            }
-        }
-
-        envelope
-            .to()
-            .iter()
-            .map(|recipient| {
-                let parameters = options.rcpt_parameters_for(recipient);
-                for parameter in &parameters {
-                    self.validate_rcpt_parameter(parameter)?;
-                }
-                Ok(parameters)
-            })
-            .collect()
-    }
-
-    fn validate_mail_parameter(
-        &self,
-        parameter: &MailParameter,
-        message_size: usize,
-        message_is_ascii: bool,
-        allow_binary_mime: bool,
-    ) -> Result<(), Error> {
-        parameter.validate_syntax()?;
-
-        match parameter {
-            MailParameter::Body(MailBodyParameter::SevenBit) => {
-                if message_is_ascii {
-                    Ok(())
-                } else {
-                    Err(error::invalid_input(
-                        "BODY=7BIT cannot be used with non-ASCII message content",
-                    ))
-                }
-            }
-            MailParameter::Body(MailBodyParameter::EightBitMime) => {
-                if self.server_info().supports_feature(Extension::EightBitMime) {
-                    Ok(())
-                } else {
-                    Err(error::feature_unsupported(
-                        "BODY=8BITMIME requires server 8BITMIME support",
-                    ))
-                }
-            }
-            MailParameter::Body(MailBodyParameter::BinaryMime) => {
-                if !allow_binary_mime {
-                    return Err(error::invalid_input(
-                        "BODY=BINARYMIME requires a BDAT send path",
-                    ));
-                }
-                if self.server_info().supports_binary_mime() {
-                    Ok(())
-                } else {
-                    Err(error::feature_unsupported(
-                        "BODY=BINARYMIME requires server BINARYMIME support",
-                    ))
-                }
-            }
-            MailParameter::Size(size) => {
-                if self
-                    .server_info()
-                    .size_limit()
-                    .is_some_and(|limit| *size > limit || message_size > limit)
-                {
-                    Err(error::invalid_input(
-                        "Message is larger than the server-advertised SIZE limit",
-                    ))
-                } else {
-                    Ok(())
-                }
-            }
-            MailParameter::SmtpUtfEight => {
-                if self.server_info().supports_feature(Extension::SmtpUtfEight) {
-                    Ok(())
-                } else {
-                    Err(error::feature_unsupported(
-                        "SMTPUTF8 requires server SMTPUTF8 support",
-                    ))
-                }
-            }
-            MailParameter::RequireTls => {
-                if !self.server_info().supports_require_tls() {
-                    return Err(error::feature_unsupported(
-                        "REQUIRETLS requires server REQUIRETLS support",
-                    ));
-                }
-                if !self.is_encrypted() {
-                    return Err(error::policy(
-                        "REQUIRETLS requires an encrypted SMTP connection",
-                    ));
-                }
-                Ok(())
-            }
-            MailParameter::FutureRelease(value) => {
-                if !self.server_info().supports_future_release() {
-                    return Err(error::feature_unsupported(
-                        "FUTURERELEASE requires server FUTURERELEASE support",
-                    ));
-                }
-                match value {
-                    FutureReleaseParameter::HoldFor(seconds)
-                        if self
-                            .server_info()
-                            .future_release_max_interval()
-                            .is_some_and(|limit| *seconds > limit) =>
-                    {
-                        return Err(error::parameter_over_limit(
-                            "HOLDFOR exceeds the server-advertised FUTURERELEASE limit",
-                        ));
-                    }
-                    _ => {}
-                }
-                Ok(())
-            }
-            MailParameter::DeliverBy(value) => {
-                if !self.server_info().supports_deliver_by() {
-                    return Err(error::feature_unsupported(
-                        "BY requires server DELIVERBY support",
-                    ));
-                }
-                if value.mode() == DeliverByMode::Return
-                    && value.seconds() > 0
-                    && self
-                        .server_info()
-                        .deliver_by_minimum()
-                        .is_some_and(|minimum| value.seconds() < minimum)
-                {
-                    return Err(error::invalid_input(
-                        "BY return deadline is below the server-advertised DELIVERBY minimum",
-                    ));
-                }
-                Ok(())
-            }
-            MailParameter::MtPriority(_) => {
-                if self.server_info().supports_mt_priority() {
-                    Ok(())
-                } else {
-                    Err(error::feature_unsupported(
-                        "MT-PRIORITY requires server MT-PRIORITY support",
-                    ))
-                }
-            }
-            MailParameter::DsnReturn(_) | MailParameter::EnvelopeId(_) => {
-                if self.server_info().supports_dsn() {
-                    Ok(())
-                } else {
-                    Err(error::feature_unsupported(
-                        "DSN MAIL parameters require server DSN support",
-                    ))
-                }
-            }
-            MailParameter::Other { .. } | MailParameter::OtherRaw { .. } => Ok(()),
-        }
-    }
-
-    fn validate_rcpt_parameter(&self, parameter: &RcptParameter) -> Result<(), Error> {
-        parameter.validate_syntax()?;
-
-        match parameter {
-            RcptParameter::Notify(_) | RcptParameter::OriginalRecipient { .. } => {
-                if self.server_info().supports_dsn() {
-                    Ok(())
-                } else {
-                    Err(error::feature_unsupported(
-                        "DSN RCPT parameters require server DSN support",
-                    ))
-                }
-            }
-            RcptParameter::Other { .. } => Ok(()),
-        }
     }
 
     pub(crate) fn has_broken(&self) -> bool {
@@ -4032,7 +3617,9 @@ mod transcript_tests {
             .await
             .expect_err("unmatched recipient parameters are a pre-wire input error");
         assert!(
-            error.to_string().contains("do not match a batch recipient"),
+            error
+                .to_string()
+                .contains("do not match an envelope recipient"),
             "expected an unmatched-recipient refusal, got: {error}"
         );
         assert!(progress.resolve().succeeded().is_empty());

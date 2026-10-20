@@ -608,7 +608,7 @@ async fn send_set<T: HttpTransport>(
         kind,
         mail.id_str(),
         foreign_account,
-    ))
+    )?)
     .await
 }
 
@@ -618,7 +618,7 @@ fn build_email_set(
     kind: &MutationKind,
     account_id: &str,
     foreign_account: bool,
-) -> EmailSet {
+) -> crate::Result<EmailSet> {
     let mut set = EmailSet::new();
     if let Some(state) = state {
         set = set.if_in_state(state.to_string());
@@ -636,7 +636,7 @@ fn build_email_set(
                 apply_flags(
                     set.update(wire_email_id(id, account_id, foreign_account)),
                     op,
-                );
+                )?;
             }
         }
         MutationKind::Move(mailbox_id) => {
@@ -647,7 +647,7 @@ fn build_email_set(
         }
     }
 
-    set
+    Ok(set)
 }
 
 /// Account-wide Email state is useful for replacements, which could discard
@@ -680,7 +680,7 @@ fn wire_mailbox_id(id: &MailboxId, account_id: &str, foreign_account: bool) -> M
     }
 }
 
-fn apply_flags(patch: &mut EmailPatch, op: &FlagOp) {
+fn apply_flags(patch: &mut EmailPatch, op: &FlagOp) -> crate::Result<()> {
     match op {
         FlagOp::Add(flags) => {
             for flag in flags {
@@ -703,8 +703,16 @@ fn apply_flags(patch: &mut EmailPatch, op: &FlagOp) {
                 patch.keyword(flag, false);
             }
         }
-        _ => {}
+        // `set_flags` refuses unknown variants before building the
+        // mutation stream. Retain a second refusal here so a future internal
+        // caller cannot turn an unhandled operation into a successful no-op.
+        _ => {
+            return Err(crate::Error::NotParsable(
+                "JMAP flag patch received an unsupported FlagOp variant".to_string(),
+            ));
+        }
     }
+    Ok(())
 }
 
 async fn current_or_probe_state<T: HttpTransport>(
@@ -747,8 +755,11 @@ mod tests {
             .iter()
             .map(|id| ObjectId((*id).to_string()))
             .collect::<Vec<_>>();
-        serde_json::to_value(build_email_set(state, &ids, kind, "primary", false))
-            .expect("Email/set serializes")
+        serde_json::to_value(
+            build_email_set(state, &ids, kind, "primary", false)
+                .expect("supported mutation builds an Email/set"),
+        )
+        .expect("Email/set serializes")
     }
 
     fn flags(values: &[&str]) -> std::collections::HashSet<String> {

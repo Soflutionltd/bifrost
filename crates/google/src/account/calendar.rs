@@ -1,9 +1,8 @@
 //! Google Calendar list, range, search, and event CRUD.
 //!
-//! The Account adapter does not select these futures against its shutdown
-//! token, so close cannot interrupt an active request. The adapter must wrap
-//! these futures with its token, or the token must be threaded into this
-//! module's operation boundaries.
+//! The Account adapter selects these futures against its shutdown token, so
+//! close can interrupt an active request without adding token plumbing to
+//! every Calendar operation.
 //!
 //! Audit boundary: the 2026-07 google bug sweep did NOT line-audit this
 //! module; it was skipped as already test-dense. A later auditor should read
@@ -28,7 +27,6 @@ use serde_json::{Map, Value, json};
 use crate::client::GmailClient;
 
 use super::error::{self, GmailErrorContext};
-use super::non_empty;
 use bifrost_types::{AccountError, AccountFuture, AccountOperation};
 
 const EVENT_ID_SEPARATOR: &str = "::";
@@ -163,11 +161,12 @@ pub(crate) fn create(
             Some(&event.end),
             Some(event.is_all_day),
         )?;
+        let body = google_event_from_create(&event)?;
         let calendar_id = event.calendar_id.0.clone();
         let encoded = bifrost_net::url::encode_path_component(&calendar_id);
         let url = format!("{}/calendars/{encoded}/events", client.calendar_base());
         let created: GoogleEvent = client
-            .post(&url, &google_event_from_create(&event))
+            .post(&url, &body)
             .await
             .map_err(|error| collection_error(error, AccountOperation::EventCreate))?;
         let id = created.id.ok_or_else(|| {
@@ -203,12 +202,10 @@ pub(crate) fn update(
         let (mut calendar_id, native_event_id) =
             split_event_id(&event.0, AccountOperation::EventUpdate)?;
         let has_field_patch = event_patch_has_non_move_fields(&patch);
-        // Local, patch-only validation. It cannot see post-move state,
-        // so hoisting it ahead of the move is behaviour-preserving for
-        // any patch that would have passed, and it stops a patch that
-        // could never be applied from stranding the event in the
-        // destination calendar.
-        if has_field_patch {
+        // Validate and encode the field patch before a move. The patch's
+        // times and attendee statuses cannot be repaired by moving the event,
+        // so refusing them afterwards would strand it in the destination.
+        let google_patch = if has_field_patch {
             reject_unexpressible_all_day_patch(&patch)?;
             reject_unusable_write_times(
                 AccountOperation::EventUpdate,
@@ -216,7 +213,10 @@ pub(crate) fn update(
                 patch.end.as_ref(),
                 patch.is_all_day,
             )?;
-        }
+            Some(google_event_from_patch(&patch)?)
+        } else {
+            None
+        };
         let mut moved = false;
         if let Some(target_calendar) = patch.calendar_id.as_ref()
             && target_calendar.0 != calendar_id
@@ -248,17 +248,15 @@ pub(crate) fn update(
         // reconcile directive that names the source calendar sends the
         // consumer to look at a resource that is no longer there.
         let target_event_id = join_event_id(&calendar_id, &native_event_id);
-        let _: GoogleEvent = client
-            .patch(&url, &google_event_from_patch(&patch))
-            .await
-            .map_err(|error| {
-                let error = event_error(error, AccountOperation::EventUpdate, target_event_id);
-                if moved {
-                    event_move_patch_error(error)
-                } else {
-                    error
-                }
-            })?;
+        let google_patch = google_patch.expect("a field patch was prepared before the move");
+        let _: GoogleEvent = client.patch(&url, &google_patch).await.map_err(|error| {
+            let error = event_error(error, AccountOperation::EventUpdate, target_event_id);
+            if moved {
+                event_move_patch_error(error)
+            } else {
+                error
+            }
+        })?;
         Ok(())
     })
 }
@@ -709,8 +707,8 @@ fn event_from_google(
     })
 }
 
-fn google_event_from_create(event: &EventCreate) -> GoogleEventPatch {
-    GoogleEventPatch {
+fn google_event_from_create(event: &EventCreate) -> Result<GoogleEventPatch, AccountError> {
+    Ok(GoogleEventPatch {
         summary: event.title.clone().map(Some),
         description: event.description.clone().map(Some),
         location: event.location.clone().map(Some),
@@ -719,7 +717,7 @@ fn google_event_from_create(event: &EventCreate) -> GoogleEventPatch {
         // refuses it on create.
         end: Some(google_time(&event.end, event.is_all_day)),
         status: Some(google_event_status(event.status).to_string()),
-        attendees: non_empty(event.attendees.iter().map(google_attendee)),
+        attendees: google_attendees(&event.attendees, AccountOperation::EventCreate)?,
         recurrence: recurrence_lines(&event.recurrence),
         visibility: Some(match event.visibility {
             EventVisibility::Private => "private".to_string(),
@@ -729,11 +727,11 @@ fn google_event_from_create(event: &EventCreate) -> GoogleEventPatch {
             _ => "default".to_string(),
         }),
         transparency: Some(transparency(event.availability).to_string()),
-    }
+    })
 }
 
-fn google_event_from_patch(patch: &EventPatch) -> GoogleEventPatch {
-    GoogleEventPatch {
+fn google_event_from_patch(patch: &EventPatch) -> Result<GoogleEventPatch, AccountError> {
+    Ok(GoogleEventPatch {
         summary: patch.title.clone(),
         description: patch.description.clone(),
         location: patch.location.clone(),
@@ -756,7 +754,8 @@ fn google_event_from_patch(patch: &EventPatch) -> GoogleEventPatch {
         attendees: patch
             .attendees
             .as_ref()
-            .map(|attendees| attendees.iter().map(google_attendee).collect()),
+            .map(|attendees| google_attendee_vec(attendees, AccountOperation::EventUpdate))
+            .transpose()?,
         // A present recurrence patch always emits the key. An empty
         // `EventRecurrence` produces an empty array, which is how the
         // Google API clears an existing RRULE/RDATE/EXDATE; an absent
@@ -775,7 +774,7 @@ fn google_event_from_patch(patch: &EventPatch) -> GoogleEventPatch {
         transparency: patch
             .availability
             .map(|availability| transparency(availability).to_string()),
-    }
+    })
 }
 
 fn attendee_from_google(attendee: GoogleAttendee) -> Option<EventAttendee> {
@@ -806,15 +805,38 @@ fn attendee_from_google(attendee: GoogleAttendee) -> Option<EventAttendee> {
     })
 }
 
-fn google_attendee(attendee: &EventAttendee) -> GoogleAttendee {
-    GoogleAttendee {
+fn google_attendees(
+    attendees: &[EventAttendee],
+    operation: AccountOperation,
+) -> Result<Option<Vec<GoogleAttendee>>, AccountError> {
+    if attendees.is_empty() {
+        return Ok(None);
+    }
+    google_attendee_vec(attendees, operation).map(Some)
+}
+
+fn google_attendee_vec(
+    attendees: &[EventAttendee],
+    operation: AccountOperation,
+) -> Result<Vec<GoogleAttendee>, AccountError> {
+    attendees
+        .iter()
+        .map(|attendee| google_attendee(attendee, operation))
+        .collect()
+}
+
+fn google_attendee(
+    attendee: &EventAttendee,
+    operation: AccountOperation,
+) -> Result<GoogleAttendee, AccountError> {
+    Ok(GoogleAttendee {
         email: Some(attendee.email.clone()),
         display_name: attendee.name.clone(),
-        response_status: Some(rsvp_value(attendee.status).to_string()),
+        response_status: Some(attendee_status_value(attendee.status, operation)?.to_string()),
         optional: Some(matches!(attendee.role, AttendeeRole::Optional)),
         resource: matches!(attendee.role, AttendeeRole::Resource).then_some(true),
         extra: Map::new(),
-    }
+    })
 }
 
 fn google_time(time: &EventTime, all_day: bool) -> GoogleEventTime {
@@ -1225,29 +1247,30 @@ fn rsvp_status(value: Option<&str>) -> RsvpStatus {
     }
 }
 
-fn rsvp_value(value: RsvpStatus) -> &'static str {
-    match value {
-        RsvpStatus::Accepted => "accepted",
-        RsvpStatus::Declined => "declined",
-        RsvpStatus::Tentative => "tentative",
-        RsvpStatus::NeedsAction | RsvpStatus::Unknown => "needsAction",
-        RsvpStatus::Delegated => "needsAction",
-        _ => "needsAction",
-    }
-}
-
-fn rsvp_request_value(value: RsvpStatus) -> Result<&'static str, AccountError> {
+fn attendee_status_value(
+    value: RsvpStatus,
+    operation: AccountOperation,
+) -> Result<&'static str, AccountError> {
     match value {
         RsvpStatus::Accepted => Ok("accepted"),
         RsvpStatus::Declined => Ok("declined"),
         RsvpStatus::Tentative => Ok("tentative"),
         RsvpStatus::NeedsAction => Ok("needsAction"),
-        // Google has no safe responseStatus equivalent for these shared
-        // values. Refuse them before reading or writing the event.
-        _ => Err(rsvp_unsupported(
-            "Google Calendar cannot write this RSVP status",
+        // Google Calendar has no wire value for delegated or future shared
+        // states. Refuse before a create, update, or move can write a
+        // misleading `needsAction` response on the attendee's behalf.
+        _ => Err(error::into_account_error(
+            crate::error::Error::unsupported_with(
+                operation,
+                "Google Calendar cannot write this attendee status",
+            ),
+            GmailErrorContext::calendar_collection(operation),
         )),
     }
+}
+
+fn rsvp_request_value(value: RsvpStatus) -> Result<&'static str, AccountError> {
+    attendee_status_value(value, AccountOperation::EventRsvp)
 }
 
 fn rsvp_google_attendees_for_self(
@@ -2475,12 +2498,16 @@ mod tests {
         assert_eq!(attendee.role, AttendeeRole::Resource);
         assert_eq!(attendee.status, RsvpStatus::Accepted);
 
-        let google = google_attendee(&EventAttendee {
-            email: "room@example.test".to_string(),
-            name: None,
-            role: AttendeeRole::Resource,
-            status: RsvpStatus::Accepted,
-        });
+        let google = google_attendee(
+            &EventAttendee {
+                email: "room@example.test".to_string(),
+                name: None,
+                role: AttendeeRole::Resource,
+                status: RsvpStatus::Accepted,
+            },
+            AccountOperation::EventCreate,
+        )
+        .expect("accepted is a representable attendee status");
         assert_eq!(google.resource, Some(true));
         assert_eq!(google.optional, Some(false));
     }
@@ -2543,6 +2570,51 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn unrepresentable_attendee_statuses_are_refused_before_create_or_move() {
+        for status in [RsvpStatus::Delegated, RsvpStatus::Unknown] {
+            let (client, script) = scripted_client(Vec::new());
+            let mut event = create_with("2026-06-02T12:00:00Z", "2026-06-02T13:00:00Z");
+            event.attendees.push(EventAttendee {
+                email: "person@example.test".to_string(),
+                name: None,
+                role: AttendeeRole::Required,
+                status,
+            });
+            let error = create(client, event)
+                .await
+                .expect_err("Google cannot represent this attendee status");
+            assert!(matches!(
+                error.kind(),
+                AccountErrorKind::Unsupported(AccountOperation::EventCreate)
+            ));
+            assert!(script.requests().is_empty());
+
+            let (client, script) = scripted_client(Vec::new());
+            let patch = EventPatch {
+                calendar_id: Some(CalendarId("destination".to_string())),
+                attendees: Some(vec![EventAttendee {
+                    email: "person@example.test".to_string(),
+                    name: None,
+                    role: AttendeeRole::Required,
+                    status,
+                }]),
+                ..EventPatch::default()
+            };
+            let error = update(client, EventId("source::event-1".to_string()), patch)
+                .await
+                .expect_err("Google cannot represent this attendee status");
+            assert!(matches!(
+                error.kind(),
+                AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+            ));
+            assert!(
+                script.requests().is_empty(),
+                "unsupported attendee state must be refused before moving the event"
+            );
+        }
+    }
+
     #[test]
     fn an_event_without_the_account_attendee_is_not_a_caller_input_error() {
         let mut attendees = Some(vec![GoogleAttendee {
@@ -2584,7 +2656,8 @@ mod tests {
             organizer: None,
             attendees: Vec::new(),
             recurrence: EventRecurrence::default(),
-        });
+        })
+        .expect("event without attendees is expressible");
 
         assert_eq!(patch.transparency.as_deref(), Some("transparent"));
         assert_eq!(patch.status.as_deref(), Some("tentative"));
@@ -2685,7 +2758,8 @@ mod tests {
             location: Some(Some("Room 1".to_string())),
             status: Some(EventStatus::Cancelled),
             ..EventPatch::default()
-        });
+        })
+        .expect("patch is expressible");
         let value = serde_json::to_value(&patch).expect("patch json");
 
         assert!(value.get("summary").is_some_and(serde_json::Value::is_null));
@@ -2712,7 +2786,8 @@ mod tests {
                 timezone: Some("UTC".to_string()),
             }),
             ..EventPatch::default()
-        });
+        })
+        .expect("patch is expressible");
         let value = serde_json::to_value(&patch).expect("patch json");
 
         assert_eq!(
@@ -2735,7 +2810,8 @@ mod tests {
         let patch = google_event_from_patch(&EventPatch {
             recurrence: Some(EventRecurrence::default()),
             ..EventPatch::default()
-        });
+        })
+        .expect("patch is expressible");
         let value = serde_json::to_value(&patch).expect("patch json");
 
         assert_eq!(
@@ -2751,7 +2827,8 @@ mod tests {
         let patch = google_event_from_patch(&EventPatch {
             title: Some(Some("Planning".to_string())),
             ..EventPatch::default()
-        });
+        })
+        .expect("patch is expressible");
         let value = serde_json::to_value(&patch).expect("patch json");
 
         assert!(value.get("recurrence").is_none());
@@ -2765,7 +2842,8 @@ mod tests {
                 ..EventRecurrence::default()
             }),
             ..EventPatch::default()
-        });
+        })
+        .expect("patch is expressible");
 
         assert_eq!(
             patch.recurrence.as_deref(),
@@ -2834,10 +2912,13 @@ mod tests {
     /// the blank-end filter in `google_event_from_patch` is removed.
     #[test]
     fn patch_echoing_an_empty_end_omits_it() {
-        let value = serde_json::to_value(google_event_from_patch(&EventPatch {
-            end: Some(write_time("")),
-            ..EventPatch::default()
-        }))
+        let value = serde_json::to_value(
+            google_event_from_patch(&EventPatch {
+                end: Some(write_time("")),
+                ..EventPatch::default()
+            })
+            .expect("patch is expressible"),
+        )
         .expect("patch json");
 
         assert!(value.get("end").is_none(), "no empty dateTime is sent");
@@ -2846,10 +2927,13 @@ mod tests {
 
     #[test]
     fn patch_with_a_real_end_sends_it() {
-        let value = serde_json::to_value(google_event_from_patch(&EventPatch {
-            end: Some(write_time("2026-06-02T13:00:00Z")),
-            ..EventPatch::default()
-        }))
+        let value = serde_json::to_value(
+            google_event_from_patch(&EventPatch {
+                end: Some(write_time("2026-06-02T13:00:00Z")),
+                ..EventPatch::default()
+            })
+            .expect("patch is expressible"),
+        )
         .expect("patch json");
 
         assert_eq!(value["end"]["dateTime"], json!("2026-06-02T13:00:00Z"));

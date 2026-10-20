@@ -120,8 +120,22 @@ fn display_closed() {
 fn display_starttls_unavailable() {
     assert_eq!(
         Error::StartTlsUnavailable.to_string(),
-        "STARTTLS not supported by server",
+        "STARTTLS unavailable in current session",
     );
+}
+
+#[test]
+fn starttls_unavailable_is_classified_as_a_policy_block() {
+    use bifrost_types::{AccessErrorKind, AccountErrorKind, AccountOperation};
+
+    let account_error = crate::account::error::into_account_error(
+        Error::StartTlsUnavailable,
+        crate::account::error::ImapErrorContext::operation(AccountOperation::Discover),
+    );
+    assert!(matches!(
+        account_error.kind(),
+        AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)
+    ));
 }
 
 #[test]

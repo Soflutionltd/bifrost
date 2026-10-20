@@ -267,8 +267,8 @@ pub struct StubAccount {
     /// anything, so a test that wants this stream parked must subscribe first.
     pub inventory_stall: Option<Arc<tokio::sync::Notify>>,
     /// Instrumentation for the stalled stream above, taken by the first stalling
-    /// `inventory_stream` call. See [`StallProbe`].
-    pub inventory_stall_probe: Option<StallProbe>,
+    /// inventory walk. See [`StallProbe`].
+    pub inventory_stall_probe: Arc<Mutex<Option<StallProbe>>>,
     /// A stall for the NEXT `discover_memberships` call, armed at runtime and
     /// taken by the call it stalls. That call yields `memberships` and then
     /// parks on the `Notify`; the optional probe observes the parked stream.
@@ -287,7 +287,7 @@ pub struct StubAccount {
     /// tokens; the explicit abort there is for the lifecycle task), so they are
     /// not among the workers `detach` waits on.
     pub memberships_stall: Mutex<Option<(Arc<tokio::sync::Notify>, Option<StallProbe>)>>,
-    /// `inventory_stream()` call count.
+    /// Number of inventory walks whose stream has begun, including resumed walks.
     pub inventory_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// When set, `changes_stream` yields `changes_hook`'s events and then
     /// parks forever instead of ending.
@@ -428,6 +428,25 @@ fn stalled<T: Send + 'static>(
     Box::pin(stream::iter(items).chain(tail))
 }
 
+fn stub_inventory_stream(
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    hook: Option<InventoryHook>,
+    stall: Option<Arc<tokio::sync::Notify>>,
+    probe: Arc<Mutex<Option<StallProbe>>>,
+    scope: CursorScope,
+) -> AccountStream<InventoryEvent> {
+    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let items = match hook {
+        Some(hook) => hook(&scope),
+        None => Vec::new(),
+    };
+    if let Some(gate) = stall {
+        let probe = probe.lock().expect("inventory stall probe lock");
+        return stalled(items, gate, probe.as_ref());
+    }
+    Box::pin(stream::iter(items))
+}
+
 impl StubAccount {
     #[must_use]
     pub fn new(scopes: Vec<CursorScope>) -> Self {
@@ -453,7 +472,7 @@ impl StubAccount {
             close_fails: false,
             close_error: None,
             inventory_stall: None,
-            inventory_stall_probe: None,
+            inventory_stall_probe: Arc::new(Mutex::new(None)),
             memberships_stall: Mutex::new(None),
             inventory_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             changes_stall: None,
@@ -612,8 +631,21 @@ impl Account for StubAccount {
         &self,
         cursor: ChangeCursor,
     ) -> Option<AccountStream<InventoryEvent>> {
-        self.resume_inventory
-            .then(|| self.inventory_stream(cursor.scope))
+        self.resume_inventory.then(|| {
+            // Construction is also the classifier path, so defer inventory
+            // work and its instrumentation until the first poll.
+            let calls = Arc::clone(&self.inventory_calls);
+            let hook = self.inventory_hook.clone();
+            let stall = self.inventory_stall.clone();
+            let probe = Arc::clone(&self.inventory_stall_probe);
+            let scope = cursor.scope;
+            let stream =
+                stream::once(
+                    async move { stub_inventory_stream(calls, hook, stall, probe, scope) },
+                )
+                .flatten();
+            Box::pin(stream) as AccountStream<InventoryEvent>
+        })
     }
 
     fn establish_initial_cursor(
@@ -645,16 +677,13 @@ impl Account for StubAccount {
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
-        self.inventory_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let items = match &self.inventory_hook {
-            Some(hook) => hook(&scope),
-            None => Vec::new(),
-        };
-        if let Some(gate) = &self.inventory_stall {
-            return stalled(items, Arc::clone(gate), self.inventory_stall_probe.as_ref());
-        }
-        Box::pin(stream::iter(items))
+        stub_inventory_stream(
+            Arc::clone(&self.inventory_calls),
+            self.inventory_hook.clone(),
+            self.inventory_stall.clone(),
+            Arc::clone(&self.inventory_stall_probe),
+            scope,
+        )
     }
 
     fn inventory_partition_stream(

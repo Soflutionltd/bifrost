@@ -93,7 +93,16 @@ impl JmapAccountFactoryBuilder {
     pub fn new(url: impl Into<String>, credentials: JmapCredentials) -> Self {
         Self {
             url: url.into(),
-            credentials,
+            // Preserve one cache across repeated opens as well as across
+            // HTTP and WebSocket paths within each opened account.
+            credentials: match credentials {
+                JmapCredentials::Bearer { token_source } if !token_source.is_coordinating() => {
+                    JmapCredentials::Bearer {
+                        token_source: Arc::new(bifrost_net::OAuthRefresher::new(token_source)),
+                    }
+                }
+                credentials => credentials,
+            },
             timeout: None,
             accept_invalid_certs: false,
             reconnect_policy: ReconnectPolicy::default(),
@@ -414,6 +423,18 @@ pub(super) fn max_objects_in_get(session: &crate::core::session::Session) -> usi
         .and_then(crate::core::session::CoreCapabilities::max_objects_in_get)
         .unwrap_or(1)
         .max(1)
+}
+
+/// The per-call `/set` ceiling for paths that hold a bare `Account`
+/// instead of the validated `CoreLimits` from open. Keep the same upper
+/// bound used by bulk mutation batching, while never exceeding the
+/// server-advertised limit.
+pub(super) fn max_objects_in_set(session: &crate::core::session::Session) -> usize {
+    session
+        .core_capabilities()
+        .and_then(crate::core::session::CoreCapabilities::max_objects_in_set)
+        .unwrap_or(1)
+        .clamp(1, 500)
 }
 
 /// The optional PIM family handles a session yields, each already read

@@ -384,6 +384,56 @@ impl Client {
     pub(crate) async fn connect_ws(
         &self,
     ) -> crate::Result<Pin<Box<impl Stream<Item = crate::Result<WebSocketMessage>> + use<>>>> {
+        tokio::time::timeout(self.timeout, async {
+            let mut retried = false;
+            loop {
+                let (authorization, used) = match &self.authorization {
+                    crate::client::Authorization::Bearer(source) => {
+                        let token = source.current().await.map_err(|error| {
+                            crate::Error::from(crate::core::transport::TransportError::from_net(
+                                error,
+                            ))
+                        })?;
+                        (format!("Bearer {}", token.as_str()), Some(token))
+                    }
+                    crate::client::Authorization::Basic(_) => (self.authorization().await?, None),
+                };
+                let result = self.connect_ws_inner(&authorization).await;
+                if !retried
+                    && matches!(
+                        &result,
+                        Err(crate::Error::WebSocketHandshake(
+                            tokio_websockets::Error::Upgrade(
+                                tokio_websockets::upgrade::Error::DidNotSwitchProtocols(401)
+                            )
+                        ))
+                    )
+                    && let (crate::client::Authorization::Bearer(source), Some(used)) =
+                        (&self.authorization, used)
+                {
+                    source.refresh_if_unchanged(used).await.map_err(|error| {
+                        crate::Error::from(crate::core::transport::TransportError::from_net(error))
+                    })?;
+                    retried = true;
+                    continue;
+                }
+                return result;
+            }
+        })
+        .await
+        .map_err(|_| {
+            crate::Error::from(crate::core::transport::TransportError::from_net(
+                bifrost_net::Error::Timeout {
+                    transmission_state: bifrost_net::TransmissionState::Unsent,
+                },
+            ))
+        })?
+    }
+
+    async fn connect_ws_inner(
+        &self,
+        authorization: &str,
+    ) -> crate::Result<Pin<Box<impl Stream<Item = crate::Result<WebSocketMessage>> + use<>>>> {
         let session = self.session();
         // Absent and malformed part company here. No websocket block is
         // "this server does not do websockets" - `WebSocketNotConnected`,
@@ -415,9 +465,8 @@ impl Client {
                 },
             )?;
 
-        let authorization = self.authorization().await?;
         let auth_value =
-            HeaderValue::from_str(&authorization).map_err(crate::Error::from_invalid_header)?;
+            HeaderValue::from_str(authorization).map_err(crate::Error::from_invalid_header)?;
 
         // Match the parsed scheme, not a string prefix: `WSS://` must still
         // get TLS, and a non-websocket scheme in the capability object is a
@@ -442,7 +491,18 @@ impl Client {
             }
         };
 
+        // This connector does not follow redirects: an upgrade target cannot
+        // carry credentials onward to a Location supplied by a different host.
+        // It uses a direct TCP connection; reqwest proxy configuration applies
+        // only to HTTP and cannot be inherited by this WebSocket library.
+        // Net's trace context builder is private to its HTTP pipeline, so this
+        // path does not invent a second traceparent generation policy.
         let builder = ClientBuilder::from_uri(uri.clone())
+            .add_header(
+                header::USER_AGENT,
+                HeaderValue::from_static(concat!("bifrost-jmap/", env!("CARGO_PKG_VERSION"))),
+            )
+            .map_err(crate::Error::WebSocketHandshake)?
             .add_header(header::AUTHORIZATION, auth_value)
             .map_err(crate::Error::WebSocketHandshake)?
             .add_header(
@@ -569,6 +629,11 @@ impl Client {
         // repeat across reconnects: a per-connection counter restarted at
         // 0, and a late response from the old connection then carried an
         // id the new one was about to reuse.
+        let max_size_request = request
+            .session_state()
+            .session()
+            .core_capabilities()
+            .and_then(crate::core::session::CoreCapabilities::max_size_request);
         let request_id = self.next_ws_request_id();
 
         let method_calls =
@@ -591,10 +656,7 @@ impl Client {
         // unusable here for the same reason `CallLimit` declines both of
         // its unusable states, but they are distinct on the wire and the
         // session validator classifies them differently.
-        if let Some(max) = self
-            .session()
-            .core_capabilities()
-            .and_then(crate::core::session::CoreCapabilities::max_size_request)
+        if let Some(max) = max_size_request
             && max > 0
             && frame.len() > max
         {
@@ -1607,6 +1669,25 @@ mod tests {
         client
             .encode_ws_request(big)
             .expect("a zero limit is not a bound this door enforces");
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn websocket_encoding_uses_the_requests_session_limit() {
+        let original = size_limited_client(10000);
+        let encoder = size_limited_client(1);
+        let request = original.build_oversized_request();
+        encoder
+            .encode_ws_request(request)
+            .expect("the encoder must retain the request's original limit");
+
+        let original = size_limited_client(1);
+        let encoder = size_limited_client(10000);
+        let request = original.build_oversized_request();
+        assert!(matches!(
+            encoder.encode_ws_request(request),
+            Err(crate::Error::RequestSizeLimit { max: 1, .. })
+        ));
     }
 
     #[cfg(feature = "mail")]

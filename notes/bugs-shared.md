@@ -22,158 +22,6 @@ DAV-003 to DAV-005, DAV-012, DAV-013, GOOG-005, GRAPH-011, JMAP-011, SYNC-008).
 What remains here spans crates or roots in a shared crate. Entries set aside as
 low value or awaiting a ruling are in `notes/bugs-deferred.md`.
 
-## SHARED-001 - `attach_account` wraps every token source in an `OAuthRefresher`, while providers tell consumers to pass one: refreshers nest by design
-
-Scope: net adoption.
-
-- Claim broken: `reference/net.md` "Do not nest `OAuthRefresher`s. Wrapping one
-  refresher around another causes the outer's `force_refresh` to bypass the
-  inner's single-flight", repeated in `crates/net/src/auth.rs` above
-  `impl TokenSource for OAuthRefresher`.
-- `Net::attach_account` (`crates/net/src/net.rs`, the `token_source` arm)
-  unconditionally does
-  `Arc::new(OAuthRefresher::new(source).with_max_age(..))`.
-- Provider entry points document the consumer's source as "typically an
-  `OAuthRefresher` over its own refresh-token store":
-  `crates/jmap/src/sync/factory.rs` (`JmapCredentials::Bearer`),
-  `crates/graph/src/client.rs` (`with_source`),
-  `crates/google/src/account/mod.rs`; SMTP's docs say the same (`transport.rs`,
-  "an already-fresh `OAuthRefresher`").
-- Consequence: the outer refresher's proactive window (60 s before expiry, or
-  `token_max_age` = 55 min for opaque tokens) calls `inner.refresh()`, i.e.
-  `force_refresh()`, an unconditional issuer round trip ignoring the inner's
-  fresh cache. Each HTTP attachment (JMAP, Graph and Google each attach their
-  own `AccountNet`, and reopen attaches again) is a separate outer refresher, so
-  one consumer refresher is force-refreshed once per attachment per window, and
-  the outer's error backoff stacks on the inner's. The 401 path is fine
-  (`refresh_if_unchanged` is coordinated); the proactive path is not.
-- Fix in net: do not wrap a source that already coordinates (a marker method on
-  `TokenSource`, e.g. `fn is_coordinating(&self) -> bool`), or have the outer
-  proactive path call `current()` on the source first and `refresh()` only when
-  it returns the same stale token.
-
-## SHARED-002 - The token lifecycle is split: HTTP requests use net's refresher, other wire paths read the raw source
-
-Scope: net adoption.
-
-- Claim broken: `reference/net.md`'s OAuth single-flight section (proactive
-  refresh, max-age fallback, 401 one-shot forced refresh, error backoff) is
-  presented as THE token lifecycle; JMAP's `Authorization::header_value` doc
-  calls the bearer read "live".
-- The refreshed token lives in the attach-time `OAuthRefresher`. Paths calling
-  `token_source.current()` on the consumer's raw source instead:
-  - JMAP WebSocket handshake: `crates/jmap/src/client.rs`
-    `Authorization::header_value`, used by `client_ws.rs` `connect_ws`
-    (JMAP-027). SSE and Basic use the helper only for non-bearer, so they are
-    fine.
-  - DAV: `crates/dav-core/src/dispatch.rs` `auth_headers`; DAV attaches with
-    `AccountSpec::new(None)`, so net holds no refresher for it (DAV-003).
-- With a plain `TokenSource` (the trait says `current()` returns the cached
-  token and `refresh()` is driven "by `OAuthRefresher`"), these paths NEVER see
-  a refreshed token: JMAP HTTP requests succeed with the refresher's new token
-  while the WS upgrade presents the expired one. With a refresher, SHARED-001
-  applies. Neither shape gives one coherent lifecycle.
-- Structural fix: net owns one coordinating token handle per account and
-  exposes it (`AccountNet::bearer()` or similar, returning the refresher's
-  `current()`), and WS / DAV / IMAP / SMTP read through it.
-
-## SHARED-003 - Bandwidth registries cannot be unified for JMAP accounts that accept invalid certs, and JMAP and Google take no injected `Net`
-
-Scope: net adoption.
-
-- Claim broken: `reference/net.md` bandwidth section: "The consumer must wire
-  ONE registry into every Net, the engine and the IMAP factory. Matching ids in
-  different registries do not coordinate."
-- `Net::shared_default()` and `Net::shared_accepting_invalid_certs()`
-  (`crates/net/src/net.rs`) each call `Net::new`, minting a fresh private
-  `BandwidthRegistry`. JMAP attaches through `Net::shared_for_tls` with no way
-  to pass a Net (`ReqwestTransport::new`); Google always uses
-  `Net::shared_default` (`crates/google/src/client.rs`). The only way to satisfy
-  the rule is to pass `Net::shared_default().bandwidth_registry()` to the
-  engine (undocumented), and even that leaves every JMAP account with
-  `accept_invalid_certs = true` on a second registry the engine's per-account
-  budget (`crates/sync/src/engine/attach.rs`) never reaches. IMAP, CalDAV and
-  CardDAV accept `with_net`; JMAP and Google do not.
-- Fix: the two shared Nets share one process registry (and one hold registry
-  and governor, for the same reason), and JMAP / Google factories accept a
-  `Net` like the others.
-
-## SHARED-004 - Three copies of the address-list parser, the IMAP one wrong on escaped quotes
-
-Scope: types adoption.
-
-The types crate renders display names through `format_address` /
-`encode_phrase` (`crates/types/src/mime/render.rs`), quoting an ASCII name with
-specials and backslash-escaping embedded `"` and `\`: a name `a", b` renders as
-`"a\", b" <x@y>`.
-
-- IMAP (`crates/imap/src/account/pim.rs`, `parse_draft_for_submission` ->
-  `addresses_for` / `first_address` -> `parse_address_list` /
-  `split_address_list`) toggles `in_quotes` on every `"` with no quoted-pair
-  handling, so `\"` closes the quoted string and the following comma splits the
-  item into a bare `"a\"` (no angle brackets, taken verbatim as an address) and
-  ` b" <x@y>`. The bare one becomes an SMTP `RCPT TO` in the submission
-  envelope. The name half is not unescaped (`\"` stays in `Address.name`) and
-  RFC 2047 encoded-words are not decoded. Claim broken: the doc on
-  `parse_address_list` itself, which says the splitter exists to stop a draft
-  this crate emitted (quoting names like `"Last, First" <a@b>`) from
-  round-tripping into garbage recipients; it prevents only the unescaped case.
-- Google (`crates/google/src/account/pim.rs`, `parse_address_list` /
-  `parse_address` / `split_address_list`, on the `draft_update` write path)
-  says it is "mirroring the imap crate's", but it grew quoted-pair handling and
-  name unescaping IMAP lacks, so Google is right on the input above and IMAP is
-  not. Neither decodes encoded-words.
-- The types crate already has the correct parser: `mime::header`'s
-  `parse_addresses` / `split_address_items` handles quoted-pairs, groups,
-  nested angles and encoded-words, reachable through
-  `parse_message(raw).headers.addresses(name)` (IMAP already imports
-  `parse_message` in the same file). It is private as a free function, which is
-  probably why the copies exist.
-
-Structural fix: make `parse_addresses` (or an `Address::parse_list`) public in
-bifrost-types and delete both provider copies, along with IMAP's
-`unfold_headers` / `header_value` / message-id trimming that duplicate
-`HeaderMap`.
-
-## SHARED-005 - Appending causes reclassifies an `AccountError`, and Graph's push merge loses or changes evidence because of it
-
-Scope: types adoption (provider finding plus its root in the types crate).
-
-Root, in bifrost-types: `reference/error-model.md` calls `into_builder` "the
-decoration path, not reclassification" and says `push_cause` "only appends
-secondary evidence". But `recovery::derive` and its helpers read the WHOLE
-chain with `find_map` / `any` (`transmission_state`, `server_retry_hint`,
-`server_status`, `access_needed`, `access_resource`, `strategy_downgrade`,
-`operator_reason`, `smtp_reply`). An appended `Attempt(InFlight)` turns a
-primary-without-attempt `Transport` retry into a reconcile; a sibling `Server`
-hint becomes the retry hint; a `Wire(Smtp)` anywhere flips a 5xx to
-`ProviderRefused`. `TransportAcknowledged` scans the whole chain, so appending
-acknowledged evidence to a transport error fails the build. Every chain-merging
-producer inherits this: Graph push merge, net `AttemptHistory` / `LocalHold`,
-dav-core `response_read_error_with_history`, carddav/caldav
-`partial_move_error` and `directory_sync_error`. Either derive reads only the
-primary plus causes the producer marks as its own, or the doc says appended
-causes are classification inputs.
-
-Provider instance: `crates/graph/src/account/push/common.rs`,
-`no_subscribable_push_scopes`, takes the first failed scope's error,
-`into_builder()`, `push_cause`s every cause of every other failed scope, and
-ends with `try_build().unwrap_or_else(|_| first.error.clone())`.
-- If the first failure is `Transport(_)` (the doc names "a transport failure on
-  the translation POST" as one population) and any sibling failed with an
-  acknowledged response (the `Protocol(ContractViolation)` from
-  `translateExchangeIds`, or any status-mapped error, all carrying
-  `Attempt(Acknowledged)`), `try_build` rejects with `TransportAcknowledged` and
-  the fallback returns the first error alone, dropping the per-scope diagnosis
-  the doc says "is not lost with the ledger". It is the one production
-  `try_build` in the workspace without `.expect(...)`, hiding exactly the
-  producer bug the funnel exists to surface.
-- When it builds, the merged chain changes derived recovery: a primary with no
-  `Attempt` adopts a sibling's `InFlight`; a primary
-  `RateLimited { retry_hint: None }` adopts a sibling's hint. The doc's "the
-  first failure is promoted verbatim - it is already classified" is false
-  whenever the primary lacks one of those causes.
-
 ## SHARED-007 - Two idempotency authorities
 
 Scope: types adoption. Weaker finding.
@@ -248,40 +96,6 @@ inline; Google's `body_excerpt` (`crates/google/src/error.rs`,
 net emits a read-failure marker. All three should call `cap_status_body` or a
 shared capped drain.
 
-## SHARED-012 - Google and JMAP lifecycle streams reimplement the engine's lifecycle termination policy, and disagree with it
-
-Scope: sync adoption. Hunter severity P2.
-
-`crates/google/src/account/scopes.rs` (`scope_lifecycle_stream`, the `Err`
-arm) and `crates/jmap/src/sync/discover.rs` (both `Err` arms) triage locally:
-`is_terminal() || requires_engine_action()` yields `Terminated`, everything else
-is swallowed into a local sleep (Google doubling to 480 s, JMAP fixed 300 s).
-The engine owns this decision: `lifecycle_termination` in
-`crates/sync/src/multiplexer/mod.rs` routes through `plan_recovery` and maps
-`Retry` / `Reconcile` to `LifecycleTermination::Reconnect`. The
-`ScopeLifecycleEvent::Terminated` doc in `crates/types/src/account.rs` says the
-carrier exists so the protocol no longer has to "sleep-and-retry silently".
-Because both providers pre-filter, the engine's `Reconnect` arm is unreachable
-for them, and:
-- `Retry { AfterAuthRefresh }` is swallowed; nothing in the lifecycle loop
-  refreshes auth, so an expired token stalls lifecycle until another path
-  happens to refresh it;
-- `Reconcile(_)` classes are swallowed as transient;
-- a rate limit's retry hint is ignored and the engine's throttle registry never
-  sees the error, so no hold is recorded for sibling work and the poll can fire
-  inside a hold the engine enforces elsewhere;
-- three backoff policies (Google exponential, JMAP flat, engine reconnect
-  delay) govern the same failure class.
-
-Claims broken: the `scope_lifecycle_stream` trait doc; `reference/sync.md`
-("the engine dispatches every termination through `plan_recovery`"). Fix:
-providers emit `Terminated` for every classified failure and let the engine
-reconnect. The hunter warns the hole may move: the engine's lifecycle reconnect
-delay starts at 50 ms, so check that it grows and honours retry hints before
-flipping, and fix it there if it is too aggressive for a long-period poll.
-SYNC-002 (the lifecycle reader never revived after termination) and JMAP-011
-(JMAP's terminal `cannotCalculateChanges`) sit on the same path.
-
 ## SHARED-006 - Net OAuth refresh and the DAV status ladder still use the duration projection of Retry-After
 
 Residue: `bifrost_net::request::parse_retry_after_hint` returns a `RetryHint`
@@ -301,4 +115,23 @@ classifications as `Terminated`, and IMAP classifies and parks):
 - Graph and Google push health streams are broadcast-only and can lose a
   terminal event for a late or lagged subscriber, the shape JMAP closed with a
   latch.
+
+## SHARED-003 - JMAP and Google factories still take no injected `Net`
+
+Residue: both shared Nets now share one bandwidth registry, meter, governor and
+hold set per process, and Google has an internal constructor taking a Net. The
+public factory parameter is still missing for both providers: Google needs
+`account/mod.rs` and JMAP needs `transport_reqwest.rs`, so a consumer cannot
+wire its own registry into those accounts.
+
+## SHARED-012 - Google lifecycle still pre-filters failures locally
+
+Residue: JMAP now emits `Terminated` for read and snapshot-repair failures and
+the engine reconnects with a 30 to 480 s backoff that honours retry hints and
+records throttle holds. Google's `scope_lifecycle_stream` still filters locally,
+because an engine reconnect would drop its stream-local diff baseline and
+silently lose label changes. Enabling it needs the baseline to live in
+account-owned state (`google/account/mod.rs`). JMAP's successful expired-history
+snapshot repair also stays local, since engine scope recovery cannot repair its
+private lifecycle position.
 

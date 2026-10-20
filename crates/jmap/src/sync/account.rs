@@ -22,10 +22,11 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::Client;
+use crate::core::transport::HttpTransport;
 use crate::transport_reqwest::ReqwestTransport;
 
 use super::capabilities::CoreLimits;
-use super::state_cache::StateMap;
+use super::state_cache::{self, StateMap};
 use super::{
     blob, calendar_ops, changes, contacts, discover, filters, foreign, hydrate, inventory,
     mutation, pim, push, state,
@@ -47,7 +48,7 @@ use super::{
 /// `HttpTransport` so a scripted transport reaches them. Closing the residual
 /// means threading the transport generic through `JmapAccount` (and giving
 /// push its own seam), not adding a test-support type elsewhere.
-type MailAccount = crate::account::Account<ReqwestTransport>;
+type MailAccount<T = ReqwestTransport> = crate::account::Account<T>;
 
 pub(crate) struct JmapAccount {
     pub(crate) client: Client,
@@ -77,7 +78,7 @@ pub(crate) struct JmapAccount {
     pub(crate) ws: push::WsState,
     pub(crate) subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, push::DataTypeSet>>>,
     pub(crate) shutdown: CancellationToken,
-    pub(crate) closed: AtomicBool,
+    pub(crate) closed: Arc<AtomicBool>,
     pub(crate) subscription_seq: AtomicU64,
     /// Per-`accountId` `Email/changes` state cache (the mutation
     /// `ifInState` cache and changes side-cache). Keyed by accountId so
@@ -136,7 +137,7 @@ impl JmapAccount {
             ws,
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             subscription_seq: AtomicU64::new(1),
             email_states: Arc::new(Mutex::new(email_states)),
             mailbox_states: Arc::new(Mutex::new(mailbox_states)),
@@ -285,34 +286,78 @@ fn partitioning_for_scope(
     InventoryPartitioning::Full
 }
 
-/// Turn a scope's `open()`-time seed into a cursor establishment.
-///
-/// JMAP seeds every scope it can drive at `open`, so a scope with no
-/// seed is one this account cannot sync at all - reported `Unsupported`
-/// rather than established with an empty state, which would present as a
-/// working cursor that returns nothing.
-///
-/// Routed through the shared `unsupported_error` helper so every
-/// `Unsupported` in this crate has one construction path; the inline
-/// builder that used to live here had drifted from the helper's
-/// invariants (no scope attached, no diagnostic text).
-fn establishment_for_seed(
+/// Probe the selected account immediately before returning a cursor.
+/// The open-time seed is only the membership gate: reusing its state for a
+/// later `RestartScope` can repeat `cannotCalculateChanges` forever after the
+/// server expires that old position.
+async fn fresh_cursor_establishment<T: HttpTransport>(
+    mail: MailAccount<T>,
     scope: CursorScope,
-    seed: Option<bifrost_types::OpaqueChangeState>,
+    email_states: StateMap,
+    mailbox_states: StateMap,
 ) -> Result<CursorEstablishment, AccountError> {
-    let Some(server_state) = seed else {
-        return Err(super::error::unsupported_error(
-            AccountOperation::EstablishCursor,
-            Some(ErrorScope::Cursor(scope)),
-            "JMAP did not seed a cursor for this scope",
-        ));
+    let (states, account_id) = match &scope {
+        CursorScope::Type(bifrost_types::ObjectType::Email) | CursorScope::Folder(_) => {
+            (&email_states, mail.id_str().to_string())
+        }
+        CursorScope::Type(bifrost_types::ObjectType::Mailbox) => {
+            (&mailbox_states, mail.id_str().to_string())
+        }
+        _ => return Err(unseeded_scope_error(scope)),
     };
-    Ok(CursorEstablishment::Ready(ChangeCursor {
+    // Capture the cache value before the network read. If a concurrent
+    // mutation advances it while the probe is in flight, the CAS below keeps
+    // that newer state instead of replacing it with this probe's older one.
+    let cached_before_probe = state_cache::get(states, &account_id).await;
+    let state_string = match &scope {
+        CursorScope::Type(bifrost_types::ObjectType::Email) | CursorScope::Folder(_) => mail
+            .call(crate::email::EmailGet::new().ids(Vec::<crate::email::EmailId>::new()))
+            .await
+            .map(crate::core::get::GetResponse::<crate::email::Email>::into_state),
+        CursorScope::Type(bifrost_types::ObjectType::Mailbox) => mail
+            .call(crate::mailbox::MailboxGet::new().ids(Vec::<crate::mailbox::MailboxId>::new()))
+            .await
+            .map(crate::core::get::GetResponse::<crate::mailbox::Mailbox>::into_state),
+        _ => unreachable!("scope kind was checked above"),
+    }
+    .map_err(|error| {
+        super::error::into_account_error(
+            error,
+            super::error::JmapErrorContext::cursor(
+                AccountOperation::EstablishCursor,
+                scope.clone(),
+            ),
+        )
+    })?;
+    state_cache::advance(
+        states,
+        &account_id,
+        cached_before_probe.as_deref(),
+        state_string.clone(),
+    )
+    .await;
+    Ok(cursor_from_state(scope, state_string))
+}
+
+fn cursor_from_state(scope: CursorScope, state_string: String) -> CursorEstablishment {
+    let server_state = state::encode_for_scope(&scope, state_string)
+        .expect("seeded JMAP cursor scopes have encodable payloads");
+    CursorEstablishment::Ready(ChangeCursor {
         scope,
         server_state,
         advanced_through: None,
         envelope_version: state::OUTER_CURSOR_ENVELOPE_VERSION,
-    }))
+    })
+}
+
+/// An unseeded scope is unsupported rather than a cursor over an empty
+/// state, which would present as a working cursor that returns nothing.
+fn unseeded_scope_error(scope: CursorScope) -> AccountError {
+    super::error::unsupported_error(
+        AccountOperation::EstablishCursor,
+        Some(ErrorScope::Cursor(scope)),
+        "JMAP did not seed a cursor for this scope",
+    )
 }
 
 /// Production-dead: kept only as the test pin for the object-id routing
@@ -454,8 +499,16 @@ impl Account for JmapAccount {
         &self,
         scope: CursorScope,
     ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
-        let seed = self.seed_states.get(&scope).cloned();
-        Box::pin(async move { establishment_for_seed(scope, seed) })
+        if !self.seed_states.contains_key(&scope) {
+            return Box::pin(async move { Err(unseeded_scope_error(scope)) });
+        }
+        let mail = self.mail_for_scope(&scope).clone();
+        Box::pin(fresh_cursor_establishment(
+            mail,
+            scope,
+            Arc::clone(&self.email_states),
+            Arc::clone(&self.mailbox_states),
+        ))
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
@@ -564,9 +617,12 @@ impl Account for JmapAccount {
             self.caps.push,
             self.next_subscription_handle(),
             scopes.clone(),
-            Arc::clone(&self.subscriptions),
-            Arc::clone(&self.ws.enabled),
-            Arc::clone(&self.ws.push_state),
+            push::SubscribeState {
+                subscriptions: Arc::clone(&self.subscriptions),
+                enabled: Arc::clone(&self.ws.enabled),
+                push_state: Arc::clone(&self.ws.push_state),
+                closed: Arc::clone(&self.closed),
+            },
         );
         Box::pin(async move {
             let (handle, accepted) = future.await?;
@@ -1369,6 +1425,10 @@ impl Account for JmapAccount {
     }
 
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
+        // This synchronous transition happens before the returned future is
+        // polled. Dropping that future before its first poll skips shutdown
+        // and makes a later close call return early; close-future cancellation
+        // needs a separate retryable completion state.
         if self.closed.swap(true, Ordering::AcqRel) {
             return Box::pin(async { Ok(()) });
         }
@@ -1376,6 +1436,9 @@ impl Account for JmapAccount {
         let client = self.client.clone();
         let shutdown = self.shutdown.clone();
         let reader = self.ws.reader_handle();
+        let subscriptions = Arc::clone(&self.subscriptions);
+        let enabled = Arc::clone(&self.ws.enabled);
+        let push_state = Arc::clone(&self.ws.push_state);
         // The same bound the reader applies to its own setup awaits. Both
         // steps below are WebSocket sink writes or a task join, and a
         // half-open socket parks either indefinitely - which would block
@@ -1385,14 +1448,18 @@ impl Account for JmapAccount {
         let teardown_timeout = self.ws.teardown_timeout();
         Box::pin(async move {
             shutdown.cancel();
-            let result =
-                match tokio::time::timeout(teardown_timeout, client.disable_push_ws()).await {
-                    Ok(result) => result,
-                    // The unsubscribe never made it out. The connection is
-                    // being dropped anyway and the server drops the
-                    // subscription with it, so this is not a close failure.
-                    Err(_) => Ok(()),
-                };
+            let result = match tokio::time::timeout(
+                teardown_timeout,
+                super::push::disable_for_close(client, subscriptions, enabled, push_state),
+            )
+            .await
+            {
+                Ok(result) => result,
+                // The unsubscribe never made it out. The connection is
+                // being dropped anyway and the server drops the
+                // subscription with it, so this is not a close failure.
+                Err(_) => Ok(()),
+            };
             // Only NOW is the reader's stop observable: `close()` used to
             // return while the detached task was still running, which is
             // what made the reference's "awaits teardown" claim false.
@@ -1541,7 +1608,8 @@ fn route_send_as(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     use bifrost_types::{
         AccountErrorKind, AccountOperation, CursorScope, MailboxId, MembershipScope, ObjectId,
@@ -1551,9 +1619,10 @@ mod tests {
     use super::super::{foreign, state};
     use super::{
         cursor_scopes_from_seeds, describe_cursor_support, draft_route_account,
-        establishment_for_seed, foreign_account_id_for_object,
-        foreign_owner_memberships_from_scopes, is_unregistered_foreign, partitioning_for_scope,
+        foreign_account_id_for_object, foreign_owner_memberships_from_scopes,
+        fresh_cursor_establishment, is_unregistered_foreign, partitioning_for_scope,
         resolve_foreign_account_id, route_mutation_target, route_object_id, route_send_as,
+        unseeded_scope_error,
     };
     use bifrost_types::{ChangeCursor, CostClass, MutationTarget, SyncStrategy, ThreadId};
 
@@ -1654,29 +1723,174 @@ mod tests {
         }
     }
 
-    /// A seeded scope establishes ready, carrying the seed state and the
-    /// current envelope version.
-    #[test]
-    fn a_seeded_scope_establishes_ready_from_its_seed() {
-        let scope = CursorScope::Type(ObjectType::Email);
-        let seed = bifrost_types::OpaqueChangeState {
-            protocol: bifrost_types::ProtocolKind::Jmap,
-            envelope_version: state::PAYLOAD_ENVELOPE_VERSION,
-            bytes: b"seed-state".to_vec(),
-        };
+    #[derive(Clone)]
+    struct CursorProbeTransport {
+        calls: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
 
-        let established = establishment_for_seed(scope.clone(), Some(seed.clone()))
-            .expect("a seeded scope establishes");
-        let bifrost_types::CursorEstablishment::Ready(cursor) = established else {
-            panic!("a seeded scope is Ready");
+    impl crate::core::transport::HttpTransport for CursorProbeTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: serde_json::Value = serde_json::from_slice(&body).expect("request JSON");
+            let call = request["methodCalls"][0].clone();
+            self.calls.lock().expect("calls").push(call.clone());
+            let method = call[0].as_str().expect("method name").to_string();
+            let call_id = call[2].as_str().expect("call id").to_string();
+            let account = call[1]["accountId"].as_str().expect("account id");
+            let state = match method.as_str() {
+                "Email/get" => format!("fresh-email-{account}"),
+                "Mailbox/get" => format!("fresh-mailbox-{account}"),
+                other => panic!("unexpected method {other}"),
+            };
+            let response = serde_json::json!({
+                "sessionState": "session-1",
+                "methodResponses": [[method, {
+                    "accountId": account,
+                    "state": state,
+                    "list": [],
+                    "notFound": []
+                }, call_id]]
+            });
+            Ok(bytes::Bytes::from(response.to_string()))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no upload"))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no download"))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no session"))
+        }
+    }
+
+    fn cursor_probe_session() -> crate::core::session::Session {
+        serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {
+                    "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
+                    "maxSizeRequest": 100000,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": 8,
+                    "maxObjectsInGet": 2,
+                    "maxObjectsInSet": 2,
+                    "collationAlgorithms": []
+                },
+                "urn:ietf:params:jmap:mail": {}
+            },
+            "accounts": {
+                "primary": {"name": "Primary", "isPersonal": true, "isReadOnly": false,
+                    "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}},
+                "shared": {"name": "Shared", "isPersonal": false, "isReadOnly": false,
+                    "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}
+            },
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "primary"},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("session parses")
+    }
+
+    #[tokio::test]
+    async fn cursor_establishment_probes_fresh_state_for_each_seeded_scope() {
+        let transport = CursorProbeTransport {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
-        assert_eq!(cursor.scope, scope);
-        assert_eq!(cursor.server_state.bytes, seed.bytes);
-        assert_eq!(cursor.advanced_through, None);
-        assert_eq!(
-            cursor.envelope_version,
-            state::OUTER_CURSOR_ENVELOPE_VERSION
-        );
+        let client = crate::client::Client::with_transport(
+            transport.clone(),
+            cursor_probe_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let email_states: super::super::state_cache::StateMap =
+            Arc::new(tokio::sync::Mutex::new(HashMap::from([
+                ("primary".to_string(), Some("open-email".to_string())),
+                ("shared".to_string(), Some("open-shared-email".to_string())),
+            ])));
+        let mailbox_states: super::super::state_cache::StateMap =
+            Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+                "primary".to_string(),
+                Some("open-mailbox".to_string()),
+            )])));
+        let cases = [
+            (
+                crate::account::Account::new(client.clone(), "primary"),
+                CursorScope::Type(ObjectType::Email),
+                "fresh-email-primary",
+                "primary",
+            ),
+            (
+                crate::account::Account::new(client.clone(), "primary"),
+                CursorScope::Type(ObjectType::Mailbox),
+                "fresh-mailbox-primary",
+                "primary",
+            ),
+            (
+                crate::account::Account::new(client, "shared"),
+                folder_scope("shared"),
+                "fresh-email-shared",
+                "shared",
+            ),
+        ];
+
+        for (mail, scope, expected_state, account_id) in cases {
+            let established = fresh_cursor_establishment(
+                mail,
+                scope.clone(),
+                Arc::clone(&email_states),
+                Arc::clone(&mailbox_states),
+            )
+            .await
+            .expect("a seeded cursor is re-probed");
+            let bifrost_types::CursorEstablishment::Ready(cursor) = established else {
+                panic!("seeded cursor is Ready");
+            };
+            assert_eq!(cursor.scope, scope);
+            let (_, state_string) = state::decode_cursor(&cursor).expect("cursor decodes");
+            assert_eq!(state_string, expected_state);
+            assert_eq!(cursor.advanced_through, None);
+            assert_eq!(
+                cursor.envelope_version,
+                state::OUTER_CURSOR_ENVELOPE_VERSION
+            );
+            let cached = if matches!(scope, CursorScope::Type(ObjectType::Mailbox)) {
+                super::super::state_cache::get(&mailbox_states, account_id).await
+            } else {
+                super::super::state_cache::get(&email_states, account_id).await
+            };
+            assert_eq!(cached.as_deref(), Some(expected_state));
+        }
+
+        let calls = transport.calls.lock().expect("calls").clone();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0][0], "Email/get");
+        assert_eq!(calls[0][1]["ids"], serde_json::json!([]));
+        assert_eq!(calls[1][0], "Mailbox/get");
+        assert_eq!(calls[1][1]["ids"], serde_json::json!([]));
+        assert_eq!(calls[2][0], "Email/get");
+        assert_eq!(calls[2][1]["accountId"], "shared");
     }
 
     /// An unseeded scope is `Unsupported`, NOT a cursor over an empty
@@ -1687,8 +1901,7 @@ mod tests {
     fn an_unseeded_scope_is_unsupported_and_names_its_scope() {
         let scope = CursorScope::Type(ObjectType::Mailbox);
 
-        let error = establishment_for_seed(scope.clone(), None)
-            .expect_err("an unseeded scope cannot establish");
+        let error = unseeded_scope_error(scope.clone());
         assert!(matches!(
             error.kind(),
             AccountErrorKind::Unsupported(AccountOperation::EstablishCursor)

@@ -50,7 +50,7 @@ pub enum AccountErrorBuildError {
         primary_cause: Cause,
     },
     /// `Transport(_)` kind combined with an `Attempt(Acknowledged)`
-    /// cause. Transport failures by definition mean no complete
+    /// classification cause. Transport failures by definition mean no complete
     /// server response was received; an acknowledged transmission
     /// would belong on a `Server(_)` or `Protocol(_)` kind.
     TransportAcknowledged,
@@ -115,6 +115,7 @@ pub(crate) struct RebuildParts {
     pub kind: AccountErrorKind,
     pub primary_cause: Cause,
     pub chain_extras: Vec<Cause>,
+    pub classification_cause_count: usize,
     pub scope: Option<ErrorScope>,
     pub operation: Option<AccountOperation>,
     pub provider: Option<Provider>,
@@ -130,6 +131,7 @@ pub struct AccountErrorBuilder {
     kind: AccountErrorKind,
     primary_cause: Cause,
     chain_extras: Vec<Cause>,
+    classification_cause_count: Option<usize>,
     scope: Option<ErrorScope>,
     operation: Option<AccountOperation>,
     provider: Option<Provider>,
@@ -147,6 +149,7 @@ impl AccountErrorBuilder {
             kind,
             primary_cause,
             chain_extras: Vec::new(),
+            classification_cause_count: None,
             scope: None,
             operation: None,
             provider: None,
@@ -172,6 +175,7 @@ impl AccountErrorBuilder {
             kind: parts.kind,
             primary_cause: parts.primary_cause,
             chain_extras: parts.chain_extras,
+            classification_cause_count: Some(parts.classification_cause_count),
             scope: parts.scope,
             operation: parts.operation,
             provider: parts.provider,
@@ -207,6 +211,9 @@ impl AccountErrorBuilder {
         self
     }
 
+    /// Add evidence. On a fresh builder it participates in classification;
+    /// after `AccountError::into_builder` it is diagnostic-only. To classify
+    /// a combined outcome, start a fresh builder and state its own evidence.
     #[must_use]
     pub fn push_cause(mut self, cause: Cause) -> Self {
         self.chain_extras.push(cause);
@@ -371,10 +378,25 @@ impl AccountErrorBuilder {
         causes.extend(self.chain_extras);
         let chain = CauseChain::try_new(causes).ok_or(AccountErrorBuildError::EmptyChain)?;
 
+        // A fresh producer owns all supplied evidence. Decoration retains that
+        // prefix across every rebuild: sibling failures and historical attempts
+        // must stay visible without becoming evidence about this failure.
+        let classification_cause_count = self
+            .classification_cause_count
+            .unwrap_or_else(|| chain.iter().count());
+        let classification_chain = CauseChain::try_new(
+            chain
+                .iter()
+                .take(classification_cause_count)
+                .cloned()
+                .collect(),
+        )
+        .ok_or(AccountErrorBuildError::EmptyChain)?;
+
         // Transport(_) cannot pair with an Acknowledged Attempt. The
         // wire-level evidence contradicts the kind.
         if matches!(self.kind, AccountErrorKind::Transport(_))
-            && chain.iter().any(|cause| {
+            && classification_chain.iter().any(|cause| {
                 matches!(
                     cause,
                     Cause::Attempt(attempt)
@@ -390,11 +412,16 @@ impl AccountErrorBuilder {
             &self.kind,
             self.scope.as_ref(),
             self.operation,
-            &chain,
+            &classification_chain,
             self.throttle_scope,
             self.idempotency_override,
         );
-        let remediation = recovery::suggest(&self.kind, &recovery, self.scope.as_ref(), &chain);
+        let remediation = recovery::suggest(
+            &self.kind,
+            &recovery,
+            self.scope.as_ref(),
+            &classification_chain,
+        );
         let message_key = message_key::derive(&self.kind);
 
         Ok(AccountError::from_parts(AccountErrorParts {
@@ -407,6 +434,7 @@ impl AccountErrorBuilder {
             protocol: self.protocol,
             diagnostics: self.diagnostics,
             chain,
+            classification_cause_count,
             message_key,
             idempotency_override: self.idempotency_override,
             throttle_scope: self.throttle_scope,
@@ -422,6 +450,74 @@ mod tests {
         AttemptCause, Cause, RequestCause, RequestErrorKind, TransmissionState, TransportCause,
         TransportErrorKind, TransportKind,
     };
+
+    #[test]
+    fn decoration_does_not_adopt_sibling_transmission_evidence() {
+        let original = AccountErrorBuilder::new(
+            AccountErrorKind::Transport(TransportErrorKind::Network),
+            Cause::Transport(TransportCause {
+                kind: TransportKind::Network,
+                message: None,
+            }),
+        )
+        .idempotency_override(false)
+        .try_build()
+        .expect("valid transport failure");
+        for state in [TransmissionState::InFlight, TransmissionState::Acknowledged] {
+            let decorated = original
+                .clone()
+                .into_builder()
+                .push_cause(Cause::Attempt(AttemptCause::new(state)))
+                .try_build()
+                .expect("sibling evidence cannot contradict the primary attempt");
+            assert_eq!(decorated.recovery(), original.recovery());
+            assert_eq!(decorated.chain().iter().count(), 2);
+            // A second rebuild must not promote the previous diagnostic suffix.
+            let rebuilt = decorated
+                .into_builder()
+                .try_build()
+                .expect("valid decoration");
+            assert_eq!(rebuilt.recovery(), original.recovery());
+            assert_eq!(rebuilt.chain().iter().count(), 2);
+        }
+    }
+
+    #[test]
+    fn decoration_does_not_adopt_sibling_retry_hints_or_smtp_identity() {
+        use crate::error::{EnhancedStatusCode, RetryHint, ServerCause, WireCause};
+
+        for (kind, primary, extra) in [
+            (
+                ServerErrorKind::RateLimited,
+                ServerCause::RateLimited { retry_hint: None },
+                Cause::Server(ServerCause::RateLimited {
+                    retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(37))),
+                }),
+            ),
+            (
+                ServerErrorKind::Error { status: Some(554) },
+                ServerCause::Error { status: Some(554) },
+                Cause::Wire(WireCause::Smtp(EnhancedStatusCode::new(554, None, None))),
+            ),
+        ] {
+            let original =
+                AccountErrorBuilder::new(AccountErrorKind::Server(kind), Cause::Server(primary))
+                    .try_build()
+                    .expect("valid server failure");
+            let decorated = original
+                .clone()
+                .into_builder()
+                .push_cause(extra)
+                .try_build()
+                .expect("valid decorated server failure");
+            assert_eq!(decorated.recovery(), original.recovery());
+            assert_eq!(
+                decorated.suggested_remediation(),
+                original.suggested_remediation()
+            );
+            assert_eq!(decorated.chain().iter().count(), 2);
+        }
+    }
 
     #[test]
     fn build_derives_message_key_and_recovery() {

@@ -230,6 +230,14 @@ pub(crate) fn scope_lifecycle_stream(
                         error,
                         super::error::GmailErrorContext::containers_list(),
                     );
+                    // Retry failures cannot simply end this stream yet: the
+                    // diff baseline is stream-local, and a replacement seeds
+                    // silently from current labels, losing intervening changes.
+                    // Move that baseline to account-owned state before handing
+                    // retries to the engine's reconnect policy. The shared flag
+                    // vocabulary cache is not a baseline: other readers write it.
+                    // Token refresh still runs in the authenticated transport
+                    // request funnel; this loop has no separate refresh API.
                     if acct.recovery().is_terminal() || acct.recovery().requires_engine_action() {
                         return Some((ScopeLifecycleEvent::Terminated(acct), state));
                     }
@@ -677,6 +685,32 @@ mod tests {
         );
         first.abort();
         second.abort();
+    }
+
+    /// A reconnect with a stream-local baseline would seed Label_2 silently.
+    /// Keep this read in one stream until the baseline can outlive a reconnect.
+    #[tokio::test(start_paused = true)]
+    async fn a_retryable_failure_preserves_the_populated_lifecycle_baseline() {
+        let (client, script) = scripted_client(vec![
+            ok_json(json!({
+                "labels": [{"id": "Label_1", "name": "One", "type": "user"}]
+            })),
+            unavailable(),
+            ok_json(json!({
+                "labels": [
+                    {"id": "Label_1", "name": "One", "type": "user"},
+                    {"id": "Label_2", "name": "Two", "type": "user"}
+                ]
+            })),
+        ]);
+        let mut lifecycle = scope_lifecycle_stream(client, CancellationToken::new());
+        assert!(matches!(
+            lifecycle.next().await,
+            Some(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(
+                MembershipScope::Label(LabelId(id))
+            ))) if id == "Label_2"
+        ));
+        assert_eq!(script.requests().len(), 3);
     }
 
     /// Before a baseline exists there is nothing to diff, but there is

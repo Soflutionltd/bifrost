@@ -115,10 +115,37 @@ impl InventoryFusion {
     ) -> Result<FusionOutcome, Error> {
         let scope = cursor.scope.clone();
         let classified_as_inventory = account.is_inventory_cursor(&cursor);
-        let stream = inventory_resume_stream_checked(
-            classified_as_inventory,
-            account.inventory_resume_stream(cursor),
-        )?;
+        let stream = account.inventory_resume_stream(cursor);
+        self.run_resume_stream_with_broadcast(scope, classified_as_inventory, stream, delivery)
+            .await
+    }
+
+    /// Resume a cursor after its classifier and stream have already been
+    /// queried by an establishment caller. Keeping the check here ensures an
+    /// invocation routes either disagreement through scoped recovery.
+    /// Callers that gate on the classifier alone can still bypass this guard
+    /// when the stream hook returns `Some` for an unclassified cursor.
+    pub(crate) async fn run_resume_stream_with_broadcast(
+        &self,
+        scope: CursorScope,
+        classified_as_inventory: bool,
+        stream: Option<bifrost_types::AccountStream<bifrost_types::InventoryEvent>>,
+        delivery: Option<Arc<ChangeDelivery>>,
+    ) -> Result<FusionOutcome, Error> {
+        let stream =
+            match inventory_resume_stream_checked(scope.clone(), classified_as_inventory, stream) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    // Route a bad resume cursor through the ordinary scoped
+                    // recovery path. Returning `Err` here made the deferred attach
+                    // worker log and exit with no registered cursor to poll again.
+                    return Ok(forward_resume_contract_failure(
+                        &scope,
+                        error,
+                        delivery.as_ref(),
+                    ));
+                }
+            };
         let Some(stream) = stream else {
             return Ok(FusionOutcome::NoCursor);
         };
@@ -566,18 +593,36 @@ fn validate_checkpoint_envelope(checkpoint: Option<&Checkpoint>) -> Result<(), E
     }
 }
 
-fn inventory_cursor_contract_error() -> Error {
-    Error::Account(crate::recovery::cursor_decode_failure(
-        bifrost_types::AccountOperation::SyncInventory,
-    ))
+fn inventory_cursor_contract_error(scope: CursorScope) -> bifrost_types::AccountError {
+    crate::recovery::inventory_resume_contract_failure(scope)
+}
+
+fn forward_resume_contract_failure(
+    scope: &CursorScope,
+    error: bifrost_types::AccountError,
+    delivery: Option<&Arc<ChangeDelivery>>,
+) -> FusionOutcome {
+    if let Some(tx) = delivery {
+        let _ = tx.sender().send(MultiplexerEvent {
+            scope: scope.clone(),
+            event: Arc::new(SyncEvent::Terminated(error.clone())),
+            checkpoint: None,
+            publication: None,
+        });
+    }
+    FusionOutcome::Terminated(error)
 }
 
 fn inventory_resume_stream_checked(
+    scope: CursorScope,
     classified_as_inventory: bool,
     stream: Option<bifrost_types::AccountStream<bifrost_types::InventoryEvent>>,
-) -> Result<Option<bifrost_types::AccountStream<bifrost_types::InventoryEvent>>, Error> {
+) -> Result<
+    Option<bifrost_types::AccountStream<bifrost_types::InventoryEvent>>,
+    bifrost_types::AccountError,
+> {
     if classified_as_inventory != stream.is_some() {
-        Err(inventory_cursor_contract_error())
+        Err(inventory_cursor_contract_error(scope))
     } else {
         Ok(stream)
     }
@@ -657,10 +702,62 @@ mod tests {
 
     #[test]
     fn resume_guard_rejects_both_classifier_hook_disagreements() {
-        assert!(inventory_resume_stream_checked(true, None).is_err());
-        assert!(inventory_resume_stream_checked(false, Some(empty_inventory_stream())).is_err());
-        assert!(inventory_resume_stream_checked(false, None).is_ok());
-        assert!(inventory_resume_stream_checked(true, Some(empty_inventory_stream())).is_ok());
+        let scope = CursorScope::Folder(bifrost_types::FolderId("resume".into()));
+        let Err(classified_without_stream) =
+            inventory_resume_stream_checked(scope.clone(), true, None)
+        else {
+            panic!("a declared resume cursor needs a stream")
+        };
+        let Err(stream_without_classification) =
+            inventory_resume_stream_checked(scope.clone(), false, Some(empty_inventory_stream()))
+        else {
+            panic!("an undeclared cursor cannot have a resume stream")
+        };
+        for error in [classified_without_stream, stream_without_classification] {
+            assert_eq!(
+                error.scope(),
+                Some(&bifrost_types::ErrorScope::Cursor(scope.clone()))
+            );
+            assert!(matches!(
+                error.recovery(),
+                bifrost_types::RecoveryClass::Engine(
+                    bifrost_types::EngineDirective::RestartScope(found)
+                ) if found == &scope
+            ));
+        }
+        assert!(inventory_resume_stream_checked(scope.clone(), false, None).is_ok());
+        assert!(
+            inventory_resume_stream_checked(scope, true, Some(empty_inventory_stream())).is_ok()
+        );
+    }
+
+    #[test]
+    fn resume_contract_failure_is_forwarded_as_a_scoped_termination() {
+        let scope = CursorScope::Folder(bifrost_types::FolderId("resume".into()));
+        let error = inventory_cursor_contract_error(scope.clone());
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(2);
+        let delivery = Arc::new(ChangeDelivery::new(sender));
+
+        let FusionOutcome::Terminated(outcome_error) =
+            forward_resume_contract_failure(&scope, error, Some(&delivery))
+        else {
+            panic!("a resume disagreement must enter scoped recovery")
+        };
+        assert_eq!(
+            outcome_error.scope(),
+            Some(&bifrost_types::ErrorScope::Cursor(scope.clone()))
+        );
+        let event = receiver.try_recv().expect("termination forwarded");
+        assert_eq!(event.scope, scope.clone());
+        let SyncEvent::Terminated(forwarded) = event.event.as_ref() else {
+            panic!("the forwarded event must be terminal")
+        };
+        assert!(matches!(
+            forwarded.recovery(),
+            bifrost_types::RecoveryClass::Engine(
+                bifrost_types::EngineDirective::RestartScope(found)
+            ) if found == &scope
+        ));
     }
 
     fn barrier_coverage() -> bifrost_types::InventoryCoverageReport {

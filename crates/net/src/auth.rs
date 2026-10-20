@@ -76,6 +76,13 @@ fn failed_refresh_delay(consecutive: u32, terminal: bool) -> Duration {
 /// contract. `reference/net.md` states the exclusion; do not re-file it as
 /// missing coverage.
 pub trait TokenSource: Send + Sync + 'static {
+    /// Whether this source owns its token-cache semantics and must be kept as
+    /// the shared source of truth. Attachments preserve coordinating sources;
+    /// raw provider adapters receive an OAuth refresher.
+    fn is_coordinating(&self) -> bool {
+        false
+    }
+
     /// Return the currently cached access token. Implementations must
     /// be cheap; a hot path through `RequestBuilder::send` may call
     /// this once per request.
@@ -154,6 +161,12 @@ impl StaticTokenSource {
 }
 
 impl TokenSource for StaticTokenSource {
+    fn is_coordinating(&self) -> bool {
+        // This RwLock is the live token cache. Wrapping it would snapshot a
+        // token that an external auth service can later replace with `set`.
+        true
+    }
+
     fn current(&self) -> AccountFuture<Result<AccessToken, Error>> {
         let token = Arc::clone(&self.token);
         Box::pin(async move { Ok(token.read().expect("static token lock poisoned").clone()) })
@@ -505,14 +518,14 @@ impl OAuthRefresher {
 // returns the cached token (refreshing only if stale); `refresh()`
 // forces a network round-trip.
 //
-// **Do not nest refreshers.** Wrapping `OAuthRefresher` around
-// another `OAuthRefresher` makes the outer refresher's
-// `force_refresh` (via `refresh()`) bypass the inner state machine
-// and call the inner's `force_refresh` directly, which always drives
-// a network round-trip and defeats the inner's single-flight. If you
-// need composition, wrap the underlying provider, not another
-// refresher.
+// Attachments recognize this coordinator and preserve its cache and policy.
+// Manually nesting refreshers still forces the inner proactive refresh through
+// refresh(), bypassing its fresh-cache check and causing an issuer exchange.
 impl TokenSource for OAuthRefresher {
+    fn is_coordinating(&self) -> bool {
+        true
+    }
+
     fn current(&self) -> AccountFuture<Result<AccessToken, Error>> {
         // Clone the source-bearing fields so the returned future is
         // `'static`. The trait return is `Pin<Box<...>>` for dyn

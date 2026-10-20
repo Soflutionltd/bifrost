@@ -60,6 +60,13 @@ pub(crate) enum Error {
     /// path can carry, and the account boundary folds it into the
     /// support-only diagnostic text - `AuthPolicyFailure` covers the same
     /// question on the LOCAL-policy path only.
+    ///
+    /// Transmission evidence is not currently stored on this variant. The
+    /// driver does stamp authentication failures after the SASL exchange, but
+    /// `with_attempt` cannot preserve it here. Adding that state also requires
+    /// the account translation match to accept the new field and keep using
+    /// `Error::attempt()`; changing only this enum would leave that match
+    /// non-exhaustive.
     #[error("authentication failed: {text}")]
     Auth {
         text: String,
@@ -198,8 +205,14 @@ pub(crate) enum Error {
     #[error("connection closed")]
     Closed { attempt: Option<ImapAttempt> },
 
-    /// STARTTLS was requested but the server does not advertise it.
-    #[error("STARTTLS not supported by server")]
+    /// STARTTLS was requested, but this session cannot be upgraded.
+    ///
+    /// This includes a cleartext PREAUTH greeting even when STARTTLS is
+    /// advertised: STARTTLS is legal only before authentication, so the
+    /// current session cannot satisfy a policy that requires TLS. Keep the
+    /// wording reason-neutral; capability absence and PREAUTH share this
+    /// outcome.
+    #[error("STARTTLS unavailable in current session")]
     StartTlsUnavailable,
 
     /// Authentication policy rejected every mechanism the server offered.

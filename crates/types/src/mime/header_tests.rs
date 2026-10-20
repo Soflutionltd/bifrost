@@ -136,3 +136,110 @@ fn header_missing_separator_bare_body_input_is_all_body() {
     assert!(parsed.is_empty());
     assert_eq!(body, b"just some prose\r\nwith no headers");
 }
+
+#[test]
+fn address_list_round_trips_rendered_quoted_pairs_and_encoded_words() {
+    for name in ["a\", b", "a\\, b", "a\\\", b", "Doe, Jane", "Janne \u{e4}"] {
+        let address = Address::named(name, "x@y");
+        let value = crate::mime::format_address(&address);
+        let parsed = Address::parse_list(&value);
+        assert_eq!(parsed.len(), 1, "{value}");
+        assert_eq!(parsed[0].address, address.address);
+        assert_eq!(parsed[0].name, address.name);
+    }
+}
+
+#[test]
+fn standalone_header_block_unfolds_and_preserves_repeated_addresses() {
+    let parsed = HeaderMap::parse(
+        b"To: a@b.test,\r\n  c@d.test\r\ntO: e@f.test\r\nMessage-ID: <id@test>\r\n",
+    );
+    let addresses: Vec<_> = parsed
+        .addresses("TO")
+        .into_iter()
+        .map(|address| address.address)
+        .collect();
+    assert_eq!(addresses, ["a@b.test", "c@d.test", "e@f.test"]);
+    assert_eq!(parsed.message_ids("message-id"), ["id@test"]);
+}
+
+#[test]
+fn address_split_keeps_commas_inside_angle_brackets() {
+    assert_eq!(split_address_items("<a@b, c>, d@e"), ["<a@b, c>", " d@e"]);
+}
+
+#[test]
+fn address_group_colons_respect_quoted_names_comments_and_angles() {
+    let value = r#"Team (nested (label: ignored), still ignored): "Role: more text" <role@example.test>, "local:part"@example.test; "Angle" <"angle:part"@example.test>"#;
+    let parsed = Address::parse_list_checked(value).expect("valid mailboxes");
+    assert_eq!(parsed.len(), 3);
+    assert_eq!(parsed[0].name.as_deref(), Some("Role: more text"));
+    assert_eq!(parsed[0].address, "role@example.test");
+    assert_eq!(parsed[1].address, r#""local:part"@example.test"#);
+    assert_eq!(parsed[2].address, r#""angle:part"@example.test"#);
+    assert_eq!(
+        address_syntax(r#"Name (nested (comment: ignored)) <"a:b"@example.test>"#)
+            .into_iter()
+            .map(|(_, ch)| ch)
+            .collect::<Vec<_>>(),
+        ['<', '>']
+    );
+}
+
+#[test]
+fn address_quoted_local_parts_preserve_whitespace_and_quoted_pairs() {
+    for local in [
+        r#""a b""#,
+        "\"a\tb\"",
+        r#""a\" b""#,
+        r#""a\\ b""#,
+        r#""a@b, c:d""#,
+    ] {
+        let address = format!("{local}@example.test");
+        for value in [address.clone(), format!("Mailbox <{address}>")] {
+            let parsed = Address::parse_list_checked(&value).expect("quoted local part");
+            assert_eq!(parsed.len(), 1, "{value}");
+            assert_eq!(parsed[0].address, address);
+            let tolerant = Address::parse_list(&value);
+            assert_eq!(tolerant.len(), 1);
+            assert_eq!(tolerant[0].address, address);
+        }
+    }
+}
+
+#[test]
+fn address_checked_parser_reports_rejected_items_instead_of_partial_success() {
+    let value = "good@example.test, missing-at, bad local@example.test, <missing@example.test";
+    assert_eq!(
+        Address::parse_list_checked(value).expect_err("must not return a reduced list"),
+        [
+            "missing-at",
+            "bad local@example.test",
+            "<missing@example.test"
+        ]
+    );
+    for value in [
+        r#""unclosed@example.test"#,
+        r#""dangling\"#,
+        "@example.test",
+        "local@",
+    ] {
+        assert_eq!(Address::parse_list_checked(value).unwrap_err(), [value]);
+    }
+}
+
+#[test]
+fn header_checked_addresses_collect_rejections_across_repeated_fields() {
+    let headers =
+        HeaderMap::parse(b"To: good@example.test, bad local@example.test\r\nTo: missing-at\r\n");
+    assert_eq!(
+        headers.addresses_checked("to").unwrap_err(),
+        ["bad local@example.test", "missing-at"]
+    );
+    assert!(headers.addresses_checked("bcc").unwrap().is_empty());
+    assert!(
+        Address::parse_list_checked("Undisclosed:;")
+            .unwrap()
+            .is_empty()
+    );
+}

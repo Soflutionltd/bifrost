@@ -25,6 +25,7 @@ mod async_net;
 pub(crate) use async_net::AsyncNetworkStream;
 mod connection;
 mod core;
+mod envelope;
 pub(crate) mod metering;
 mod net;
 mod tls;

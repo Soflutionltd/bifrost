@@ -322,8 +322,8 @@ account-scoped clone attached to `bifrost-net` under the engine
   re-check after taking the lock. Container listing still fetches the latest
   server view, but its write uses the same lock. Lifecycle diff state is
   private to each lifecycle stream and never reads this cache.
-- `shutdown: CancellationToken` for the watch actor and cancellable account
-  streams.
+- `shutdown: CancellationToken` for the watch actor, cancellable account
+  streams, and adapter-wrapped PIM, People, and Calendar futures.
 - `set_priority` / `set_bandwidth_cap` delegate to the underlying `AccountNet`.
 
 Clients (`from_access_token` or `from_token_source`) retain their parent
@@ -546,13 +546,15 @@ Hydration primitives use Gmail's `full` and `metadata` formats.
 `message_hydrate` picks the cheapest format for the requested
 `HydrationProjection`, parses common address and threading headers, maps
 label ids to containers and canonical flags, and surfaces attachment blob
-handles for `FullWithBlobs`. Address-list headers split on top-level commas
-only (commas inside a quoted display name or an angle-bracketed addr-spec
-are not separators, and `\"` / `\\` escapes in quoted names are resolved),
-mirroring the imap crate's parser. This matters beyond display:
-`draft_update` re-renders the parsed headers back into the stored draft, so
-a naive comma split would corrupt any draft addressed to
-`"Last, First" <a@b>` on the next field-level patch.
+handles for `FullWithBlobs`. Address-list headers use the shared
+`Address::parse_list` for ordinary hydration, including quoted-pair handling
+and RFC 2047 display-name decoding; rejected items are omitted from this read
+projection. `draft_update` reparses From, To, Cc, Bcc, and Reply-To with
+`Address::parse_list_checked` before fetching inline attachments or writing.
+Any rejected item returns `Request(Malformed)` and leaves the stored draft
+untouched, so an update never writes a shortened address list. Accepted
+addresses preserve quoted commas and escaped quotes without introducing
+phantom recipients or re-encoding encoded-words.
 
 Google Calendar maps shared lifecycle status, availability, visibility,
 attendees, and recurrence on create/update. Organizer is server-derived
@@ -761,6 +763,11 @@ apply as it stands (CalDAV re-emits the stored DTSTART/DTEND under the new
 value type, JMAP sets `showWithoutTime`); it is this implementation that
 cannot express it without reading the current bounds, so a `ClientBug`
 classification would be false.
+Create and update attendee payloads accept only Google's `accepted`,
+`declined`, `tentative`, and `needsAction` response statuses. Shared
+`Delegated`, `Unknown`, and future statuses are refused as
+`Unsupported(EventCreate | EventUpdate)` before any request; an update checks
+them before moving the event so it cannot strand the event after the move.
 
 Calendar mutations advertise `MutationConcurrency::None` and write blind:
 `event_update`/`event_delete`/`event_rsvp` send PATCH/DELETE without
@@ -961,6 +968,20 @@ take the account's `CancellationToken` and select on it around every provider
 call and every wait on an input stream. Without it, a stream that outlived
 `close()` kept calling Gmail through a deregistered `AccountNet` - unmetered,
 and reporting the result as a transport fault rather than as a closed account.
+The adapter also wraps `repair_inventory`, `discover_memberships`, blob reads,
+and the network-backed PIM, People and Calendar futures with that token. A
+wrapped stream ends silently on close. A wrapped future called after close is
+refused before its inner operation is polled; cancellation after it has been
+polled returns `Transport(Network)` with `AttemptCause(InFlight)`, because the
+adapter cannot inspect the request's progress. The operation identifies the
+recovery lane, but this adapter error does not retain a resource-specific scope.
+For `EventUpdate` and `ContactUpdate`, shutdown overrides idempotency to false:
+these composite writes may already have committed a move or contact fields
+before their second request is interrupted. Their generic shutdown error requires
+reconciliation (`TransportDropAfterSend`, `CheckTarget`), never a plain retry of
+the original input. Unlike a provider error handled inside the update path, this
+adapter error has no destination continuation; callers must inspect provider
+state, including the requested destination calendar, before continuing.
 
 The rule for the READ streams is that cancellation ends them SILENTLY: they
 return without a `Done`, a `PageBoundary::Final`, a checkpoint or a coverage
@@ -1423,7 +1444,10 @@ Flag canonicalization in `flags.rs`:
   two families `canonical_flags` emits with this spelling. Reserved system
   ids such as `INBOX`, `TRASH`, and `UNREAD` are refused in this lane, so a
   caller-forged flag cannot bypass the relocation patch or contradict
-  `\\Seen` translation.
+  `\\Seen` translation. If a well-formed id is absent from the current
+  vocabulary, mutation translation forces one serialized `labels.list`
+  refresh and retries before reporting it unsupported; if it remains absent,
+  the original unsupported result is retained.
 - `Set` re-derives an add/remove patch over the writable canonical flags
   plus the *user* label vocabulary. Since the patch is built without
   knowing what the target messages currently carry, an exact set

@@ -43,25 +43,6 @@ transport disconnected" warning is lost. A sticky "needs full reconcile" flag
 drained by the reconciler would replace both the timeout and the unbounded
 queue: lossless, bounded, no worse than the coalesced event.
 
-## SYNC-015 - `handle_schema_incompatible` resets only registered scopes
-
-Scope: sync engine.
-
-It resets only `cursors.all_scopes()`. Durable rows for scopes not currently in
-the registry (deferred-inventory scopes still establishing, scopes whose
-re-establishment budget ran out) keep their completion markers, exempt from the
-re-walk the reset claims to force ("delete every backfill checkpoint - the
-completion marker included").
-
-## SYNC-017 - `apply_repair_resolutions` mutates the authoritative ledger before persisting
-
-Scope: sync engine. Lateral from the ack writer fix.
-
-Same shape as the operator waive/block defect that was just closed: the repair
-resolution path in `engine/ack.rs` applies discharges to the in-memory ledger
-and then persists, so a failed write leaves the discharges available to later
-ledger-bearing writes. Apply to a candidate ledger and adopt it only on success.
-
 ## SYNC-007 - A proven non-landing write is never resubmitted
 
 Scope: sync engine. Residue: a read-back mismatch now stays pending instead of
@@ -69,13 +50,6 @@ becoming `failed_terminal`. Once read-back proves an `Uncertain` write did not
 land, replay is the safe case the uncertainty lane protected, yet the pipeline
 still never resubmits it. Replay was deferred because reconciliation can need
 consumer-side dedupe; a ruling is needed on whether the engine replays.
-
-## SYNC-018 - Inventory resume capability and stream disagreement uses account-wide schema recovery
-
-Lateral from the multiplexer fixes. When a resumed inventory's declared
-capability and its stream disagree, the engine recovers through the
-account-wide schema reset, the blast radius the bad-checkpoint fix removed for
-fresh checkpoints. Scope it to the cursor.
 
 ## SYNC-009 - Push ingress can still lose or unboundedly queue control events
 
@@ -86,9 +60,21 @@ termination classifications or their ordering, so a bounded lossless ingress
 needs a control-event overflow policy or an API change. Reasoning is at both
 code sites and a test shows the semantic loss.
 
-## SYNC-020 - Exhaustion tails in `engine/reattach.rs` broadcast provider errors verbatim
+## SYNC-015 - `handle_schema_incompatible` still resets only registered scopes
 
-Lateral: after the engine abandons a scope, the error it broadcasts can still
-carry the provider's retry advice. It should be re-derived as terminal or
-operator-attention like the other synthetic exhaustion errors.
+Durable completion markers for scopes not in the registry survive the reset. A
+complete fix needs writer or store support for an account-wide reset or durable
+enumeration; the limitation is documented in the reference.
+
+## SYNC-021 - Smaller attach and exhaustion observations
+
+- `engine/attach.rs::establish_one` gates initial attach on the classifier only,
+  so a false classifier with a stream present is not caught the way replacement
+  attach now catches it.
+- A comment in `engine/attach.rs` says `run_establish` errors reach the reopen
+  listener and trigger schema clearing; callers do not route them there.
+- The unreadable-envelope path in `run_establish` retries or fails without
+  clearing the row.
+- Account-wide `RestartAccount` exhaustion still broadcasts its last error
+  verbatim before pausing; only per-scope exhaustion was re-derived.
 

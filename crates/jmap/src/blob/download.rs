@@ -7,6 +7,93 @@ use crate::{
     },
 };
 
+/// Blob buffering has its own bound, independent of small JSON responses.
+/// Streaming callers choose their own ceiling without allocating that ceiling.
+pub(crate) const DEFAULT_MAX_BLOB_SIZE: u64 = 512 * 1024 * 1024;
+
+pub(crate) type BlobStream = std::pin::Pin<
+    Box<
+        dyn futures::Stream<Item = Result<bytes::Bytes, crate::core::transport::TransportError>>
+            + Send,
+    >,
+>;
+
+pub(crate) struct BlobDownload {
+    pub(crate) body: BlobStream,
+    pub(crate) bytes_in: bifrost_net::RequestByteCounter,
+}
+
+/// Kept separate from HttpTransport so buffered custom transports retain
+/// their existing contract without pretending to support incremental reads.
+pub(crate) trait BlobTransport: HttpTransport {
+    fn download_stream(
+        &self,
+        url: &str,
+        max_bytes: u64,
+    ) -> impl std::future::Future<
+        Output = Result<BlobDownload, crate::core::transport::TransportError>,
+    > + Send;
+}
+
+pub(crate) fn bounded_stream(mut source: bifrost_net::ByteStream, max_bytes: u64) -> BlobStream {
+    Box::pin(async_stream::stream! {
+        use futures::StreamExt;
+        let mut remaining = max_bytes;
+        while let Some(chunk) = source.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    let len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                    if len > remaining {
+                        yield Err(crate::core::transport::TransportError::limit_exceeded(
+                            format!("blob exceeds the {max_bytes} byte download ceiling"),
+                        ));
+                        break;
+                    }
+                    remaining -= len;
+                    yield Ok(chunk);
+                }
+                Err(error) => {
+                    yield Err(crate::core::transport::TransportError::from_net(error));
+                    break;
+                }
+            }
+        }
+    })
+}
+
+impl<Tr: BlobTransport> Client<Tr> {
+    /// Download incrementally, rejecting a chunk that would exceed the caller's
+    /// ceiling. A failure after earlier chunks leaves an incomplete blob; the
+    /// caller must discard it. Dropping the stream cancels the body read.
+    pub(crate) async fn download_stream(
+        &self,
+        blob: &BlobRef,
+        max_bytes: u64,
+    ) -> crate::Result<BlobStream> {
+        let download = self
+            .transport()
+            .download_stream(&self.blob_download_url(blob), max_bytes)
+            .await
+            .map_err(crate::Error::from)?;
+        let client = self.clone();
+        Ok(Box::pin(async_stream::stream! {
+            use futures::StreamExt;
+            let mut body = download.body;
+            let mut recorded = 0;
+            loop {
+                let chunk = body.next().await;
+                let total = download.bytes_in.bytes_in();
+                client.record_bytes_in(total.saturating_sub(recorded));
+                recorded = total;
+                match chunk {
+                    Some(chunk) => yield chunk,
+                    None => break,
+                }
+            }
+        }))
+    }
+}
+
 impl<Tr: HttpTransport> Client<Tr> {
     /// Download a blob.
     ///
@@ -24,6 +111,17 @@ impl<Tr: HttpTransport> Client<Tr> {
     /// `"application/ld+json"` reaches the server intact rather than
     /// splitting a path segment or decoding `+` as a space.
     pub(crate) async fn download(&self, blob: &BlobRef) -> crate::Result<bytes::Bytes> {
+        let download_url = self.blob_download_url(blob);
+        let (bytes, bytes_in) = self
+            .transport()
+            .download_measured(&download_url)
+            .await
+            .map_err(crate::Error::from)?;
+        self.record_bytes_in(bytes_in);
+        Ok(bytes)
+    }
+
+    fn blob_download_url(&self, blob: &BlobRef) -> String {
         let state = self.session_state();
         let mut download_url = String::with_capacity(state.session().download_url().len() + 64);
 
@@ -58,17 +156,7 @@ impl<Tr: HttpTransport> Client<Tr> {
             }
         }
 
-        // Measured, not plain: blob octets are the bulk of the traffic a
-        // raw-message or blob read causes, and a metered handle whose
-        // batch omitted them would report a count that leaves out
-        // traffic it caused.
-        let (bytes, bytes_in) = self
-            .transport()
-            .download_measured(&download_url)
-            .await
-            .map_err(crate::Error::from)?;
-        self.record_bytes_in(bytes_in);
-        Ok(bytes)
+        download_url
     }
 }
 
@@ -88,6 +176,43 @@ mod tests {
             transport::{HttpTransport, TransportError},
         },
     };
+
+    #[tokio::test]
+    async fn blob_ceiling_accepts_exact_size_and_stops_after_overflow() {
+        use futures::StreamExt;
+        let source = || {
+            Box::pin(futures::stream::iter([
+                Ok(Bytes::from_static(b"ab")),
+                Ok(Bytes::from_static(b"cd")),
+                Ok(Bytes::from_static(b"e")),
+                Ok(Bytes::from_static(b"must not escape")),
+            ])) as bifrost_net::ByteStream
+        };
+        let mut stream = super::bounded_stream(source(), 4);
+        assert_eq!(stream.next().await.unwrap().unwrap(), b"ab"[..]);
+        assert_eq!(stream.next().await.unwrap().unwrap(), b"cd"[..]);
+        assert!(stream.next().await.unwrap().is_err());
+        assert!(stream.next().await.is_none());
+        let mut zero = super::bounded_stream(source(), 0);
+        assert!(zero.next().await.unwrap().is_err());
+        assert!(zero.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn blob_stream_ends_after_a_body_error() {
+        use futures::StreamExt;
+        let source = Box::pin(futures::stream::iter([
+            Err(bifrost_net::Error::Status {
+                code: reqwest::StatusCode::BAD_REQUEST,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::new(),
+            }),
+            Ok(Bytes::from_static(b"must not escape")),
+        ]));
+        let mut stream = super::bounded_stream(source, 100);
+        assert!(stream.next().await.unwrap().is_err());
+        assert!(stream.next().await.is_none());
+    }
 
     /// Captures the URL the client asked to download from.
     struct UrlCapture(Arc<Mutex<Option<String>>>);

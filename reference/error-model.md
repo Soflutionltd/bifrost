@@ -34,7 +34,15 @@ the internal support export. Each `Cause` variant is itself `StdError`.
 It unwraps the Arc (clone-on-share), splits the chain into primary +
 extras, and returns a builder pre-loaded with the original `kind`,
 primary `Cause`, top-level fields, and diagnostics. The builder exposes
-no kind-changing method; `push_cause` only appends secondary evidence.
+no kind-changing method. On this rebuilt builder, `push_cause` only appends
+secondary diagnostic evidence. The error retains the length of its original
+classification prefix across repeated rebuilds; derivation and transmission
+validation read only that prefix. On a fresh builder, all supplied causes
+participate in classification, including transmission and wire evidence.
+Producers combining outcomes must use a fresh builder to declare the combined
+kind and its own evidence before attaching history. This preserves existing
+net attempt-history/local-hold and DAV partial-sequence classifications while
+keeping sibling Graph push failures from reclassifying the first failure.
 Derived fields recompute on `try_build`. Builder overrides
 (`idempotency_override`, `throttle_scope`) are preserved across the
 round-trip, as is a `ServerCause` retry hint because it lives in the
@@ -72,8 +80,8 @@ translation boundaries call
   on anything but `Server(RateLimited | QuotaExhausted)`, for the same
   reason.
 - `TransportAcknowledged` - `Transport(_)` kind paired with any
-  `Attempt(Acknowledged)` cause. Transport failure means no complete
-  server response arrived; an acknowledged attempt belongs on a
+  `Attempt(Acknowledged)` classification cause. Transport failure means no
+  complete server response arrived; an acknowledged attempt belongs on a
   `Server`/`Protocol` kind.
 - `CursorInvalidWithoutScope` - `SyncState(CursorInvalid)` without an
   `ErrorScope::Cursor`. The engine cannot route a scope-less cursor
@@ -383,7 +391,8 @@ whether the connection survives is the producer's call, and IMAP retires it.
 `AttemptCause` / `TransmissionState::{Unsent, InFlight, Acknowledged}`
 is the **transmission-evidence** carrier: it is what `derive` reads to
 choose retry-vs-reconcile, and what `try_build` cross-checks against
-`Transport`. Producers thread it as a secondary cause via `push_cause`.
+`Transport`. Producers thread it via `push_cause` on a fresh builder.
+An attempt appended after `into_builder` is diagnostic evidence only.
 
 `ServerCause` carries the optional `RetryHint` for the
 unavailable/rate/quota arms (the only structural channel for retry
@@ -391,9 +400,11 @@ timing). `StateCause` carries engine-directive payloads
 (`StrategyDowngrade`, `CapabilityChanged { delta }`,
 `OperatorOverrideNeeded { reason }`).
 
-`WireCause` is **diagnostic-only** - it never feeds `derive` (the
-recovery mapping keys off `kind`, not the raw wire code). It preserves
-the provider's native vocabulary for support exports:
+`WireCause` preserves native diagnostic evidence. Its raw code does not
+classify the error, but an SMTP wire cause in the classification prefix marks
+an SMTP reply: a 5xx reply is a permanent refusal, unlike an HTTP 5xx retry.
+Wire causes appended during decoration do not affect this decision. The native
+vocabulary preserved for support exports includes:
 `Graph(GraphSignal)`, `Jmap(JmapMethod)`, `Imap(ImapResponseCode)`,
 `Smtp(EnhancedStatusCode)`, `Gmail(GmailSignal)`, and
 `MalformedResponse { protocol, detail }`. Each provider enum exposes

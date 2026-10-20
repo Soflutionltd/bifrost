@@ -993,11 +993,15 @@ async fn message_from_gmail(
     Ok(Message {
         id: ObjectId(message.id.clone()),
         thread_id: Some(ThreadId(message.thread_id.clone())),
-        from: parse_address_list(header_from(headers, "From").as_deref()),
-        to: parse_address_list(header_from(headers, "To").as_deref()),
-        cc: parse_address_list(header_from(headers, "Cc").as_deref()),
-        bcc: parse_address_list(header_from(headers, "Bcc").as_deref()),
-        reply_to: parse_address_list(header_from(headers, "Reply-To").as_deref()),
+        from: Address::parse_list(header_from(headers, "From").as_deref().unwrap_or_default()),
+        to: Address::parse_list(header_from(headers, "To").as_deref().unwrap_or_default()),
+        cc: Address::parse_list(header_from(headers, "Cc").as_deref().unwrap_or_default()),
+        bcc: Address::parse_list(header_from(headers, "Bcc").as_deref().unwrap_or_default()),
+        reply_to: Address::parse_list(
+            header_from(headers, "Reply-To")
+                .as_deref()
+                .unwrap_or_default(),
+        ),
         subject: header_from(headers, "Subject"),
         date: internal_date(&message.internal_date),
         containers: message
@@ -1024,6 +1028,13 @@ async fn document_from_message(
     include_attachments: bool,
 ) -> Result<MailDocument, AccountError> {
     let headers = message_headers(message);
+    let from = checked_draft_address_list(headers, "From")?
+        .into_iter()
+        .next();
+    let to = checked_draft_address_list(headers, "To")?;
+    let cc = checked_draft_address_list(headers, "Cc")?;
+    let bcc = checked_draft_address_list(headers, "Bcc")?;
+    let reply_to = checked_draft_address_list(headers, "Reply-To")?;
     let (body_text, body_html) = body_parts(message.payload.as_ref());
     let attachments_inline = if include_attachments {
         attachment_inlines(client, message).await?
@@ -1032,13 +1043,11 @@ async fn document_from_message(
     };
     Ok(MailDocument {
         identity: None,
-        from: parse_address_list(header_from(headers, "From").as_deref())
-            .into_iter()
-            .next(),
-        to: parse_address_list(header_from(headers, "To").as_deref()),
-        cc: parse_address_list(header_from(headers, "Cc").as_deref()),
-        bcc: parse_address_list(header_from(headers, "Bcc").as_deref()),
-        reply_to: parse_address_list(header_from(headers, "Reply-To").as_deref()),
+        from,
+        to,
+        cc,
+        bcc,
+        reply_to,
         subject: header_from(headers, "Subject"),
         body_text,
         body_html,
@@ -1049,6 +1058,32 @@ async fn document_from_message(
         thread_id: Some(message.thread_id.clone()),
         request_read_receipt: false,
     })
+}
+
+fn checked_draft_address_list(
+    headers: &[GmailHeader],
+    name: &str,
+) -> Result<Vec<Address>, AccountError> {
+    let mut addresses = Vec::new();
+    for header in headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case(name))
+    {
+        let parsed = Address::parse_list_checked(&header.value).map_err(|rejected| {
+            account_error_for(
+                crate::Error::invalid_request(
+                    bifrost_types::AccountOperation::DraftUpdate,
+                    format!(
+                        "draft {name} header contains {} unsupported address item(s)",
+                        rejected.len()
+                    ),
+                ),
+                error::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftUpdate),
+            )
+        })?;
+        addresses.extend(parsed);
+    }
+    Ok(addresses)
 }
 
 async fn attachment_inlines(
@@ -1181,86 +1216,6 @@ fn references_from_header(value: Option<&str>) -> Vec<String> {
             .filter(|item| !item.is_empty())
             .collect()
     })
-}
-
-/// Minimal RFC 5322 address-list parser (recipient addr-specs and an
-/// optional display name), mirroring the imap crate's.
-///
-/// Commas inside a quoted display name or inside the angle-bracketed
-/// addr-spec do not split addresses. This sits on a WRITE path:
-/// `draft_update` re-renders the parsed headers back into the stored
-/// draft, so a naive comma split would silently corrupt any draft
-/// addressed to `"Last, First" <a@b>` on the next field-level patch.
-fn parse_address_list(value: Option<&str>) -> Vec<Address> {
-    value.map_or_else(Vec::new, |value| {
-        split_address_list(value)
-            .into_iter()
-            .filter_map(|item| parse_address(&item))
-            .collect()
-    })
-}
-
-fn parse_address(value: &str) -> Option<Address> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    if let Some((name, rest)) = value.split_once('<')
-        && let Some((address, _)) = rest.split_once('>')
-    {
-        let name = name.trim().trim_matches('"').trim();
-        // A quoted display name escapes embedded quotes and backslashes;
-        // resolve them so the model (and the re-render, which re-quotes)
-        // sees the literal name rather than the wire escapes.
-        let name = name.replace("\\\"", "\"").replace("\\\\", "\\");
-        return Some(Address {
-            name: (!name.is_empty()).then_some(name),
-            address: address.trim().to_string(),
-        });
-    }
-    Some(Address::bare(value.to_string()))
-}
-
-/// Split an address-list header value on the top-level commas only:
-/// commas inside a `"..."` quoted display name or inside a `<...>`
-/// addr-spec are not separators.
-fn split_address_list(value: &str) -> Vec<String> {
-    let mut items = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut in_angle = false;
-    let mut escaped = false;
-    for ch in value.chars() {
-        if escaped {
-            escaped = false;
-            current.push(ch);
-            continue;
-        }
-        match ch {
-            '\\' if in_quotes => {
-                escaped = true;
-                current.push(ch);
-            }
-            '"' if !in_angle => {
-                in_quotes = !in_quotes;
-                current.push(ch);
-            }
-            '<' if !in_quotes => {
-                in_angle = true;
-                current.push(ch);
-            }
-            '>' if !in_quotes => {
-                in_angle = false;
-                current.push(ch);
-            }
-            ',' if !in_quotes && !in_angle => {
-                items.push(std::mem::take(&mut current));
-            }
-            _ => current.push(ch),
-        }
-    }
-    items.push(current);
-    items
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1711,16 +1666,88 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn draft_document_decodes_names_before_rendering_again() {
+        let (client, script) = scripted_client(Vec::new());
+        let message = gmail_message(serde_json::json!({
+            "id": "draft-message", "threadId": "thread", "snippet": "",
+            "payload": {"mimeType": "text/plain", "headers": [
+                {"name": "To", "value": "\"a\\\", b\" <x@y>, =?UTF-8?Q?Doe=2C_Jane?= <jane@test>"}
+            ]}
+        }));
+        let doc = document_from_message(&client, &message, false)
+            .await
+            .expect("draft document");
+        assert_eq!(doc.to.len(), 2);
+        assert_eq!(doc.to[0].name.as_deref(), Some("a\", b"));
+        assert_eq!(doc.to[0].address, "x@y");
+        assert_eq!(doc.to[1].name.as_deref(), Some("Doe, Jane"));
+        let encoded = render_message(&doc, "sender@test", true).expect("rendered draft");
+        let raw = URL_SAFE_NO_PAD.decode(encoded).expect("base64url draft");
+        let parsed = bifrost_types::mime::parse_message(&raw)
+            .headers
+            .addresses("To");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, doc.to[0].name);
+        assert_eq!(parsed[1].name, doc.to[1].name);
+        assert!(script.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn draft_update_refuses_rejected_addresses_before_put() {
+        let (client, script) = scripted_client(vec![ok_json(
+            br#"{"id":"draft-1","message":{"id":"message-1","threadId":"thread-1","payload":{"mimeType":"text/plain","headers":[{"name":"To","value":"kept@example.test"},{"name":"To","value":"also@example.test, rejected-item"}]}}}"#,
+        )]);
+
+        let error = draft_update(
+            client,
+            "sender@example.test".to_string(),
+            DraftHandle("draft-1".to_string()),
+            DraftPatch::default(),
+        )
+        .await
+        .expect_err("a lossy draft address list must not be written back");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        );
+        assert_eq!(
+            error.operation(),
+            Some(bifrost_types::AccountOperation::DraftUpdate)
+        );
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, reqwest::Method::GET);
+    }
+
+    #[tokio::test]
+    async fn message_hydration_remains_lenient_for_rejected_addresses() {
+        let message = gmail_message(serde_json::json!({
+            "id": "message-1", "threadId": "thread-1",
+            "payload": {"mimeType": "text/plain", "headers": [
+                {"name": "To", "value": "kept@example.test, rejected-item"}
+            ]}
+        }));
+
+        let hydrated = message_from_gmail(&[], &message, HydrationProjection::Headers)
+            .await
+            .expect("ordinary message hydration keeps its tolerant behavior");
+
+        assert_eq!(hydrated.to.len(), 1);
+        assert_eq!(hydrated.to[0].address, "kept@example.test");
+    }
+
     /// A quoted display name legally contains commas (and escaped quotes).
     /// The comma split must not fire inside quotes or angle brackets: this
     /// parser feeds `draft_update`'s re-render, so a naive split writes the
     /// corrupted recipients back into the stored draft.
     #[test]
     fn address_list_respects_quoted_commas_and_escapes() {
-        let parsed = parse_address_list(Some(
+        let parsed = Address::parse_list(
             "\"Doe, John\" <jd@example.com>, plain@example.com, \
              \"Escaped \\\"Nick\\\", Esq.\" <nick@example.com>",
-        ));
+        );
 
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0].name.as_deref(), Some("Doe, John"));

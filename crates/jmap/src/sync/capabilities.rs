@@ -1042,18 +1042,21 @@ mod tests {
 
     #[test]
     fn scheduled_send_envelope_serializes_holduntil_on_mailfrom() {
-        use crate::email_submission::{Address, EmailSubmissionSet, UndoStatus};
+        use crate::email_submission::{Address, EmailSubmissionSet};
 
         let mut set = EmailSubmissionSet::new();
         {
             let submit = set.create_with_id("submit0");
-            submit.undo_status(UndoStatus::Final);
             let mail_from = Address::new("sender@example.test")
                 .with_parameter("holduntil", Some("2026-06-16T10:00:00+00:00"));
             submit.envelope(mail_from, [Address::new("rcpt@example.test")]);
         }
         let json = serde_json::to_value(&set).unwrap();
         let body = json.to_string();
+        assert!(
+            json["create"]["submit0"].get("undoStatus").is_none(),
+            "undoStatus is server-set and production scheduled creates omit it"
+        );
         assert!(
             body.contains("holduntil"),
             "envelope mailFrom must carry the holduntil parameter: {body}"

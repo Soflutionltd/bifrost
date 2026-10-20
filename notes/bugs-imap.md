@@ -18,16 +18,6 @@ scopes. Push-error triage in the IDLE worker is filed with the cross-provider
 entry SHARED-013; the private address parser in `pim.rs` with SHARED-004.
 "Live" and "latent" are the hunters' labels.
 
-## IMAP-002 - A failed SASL continuation auth error carries no transmission evidence
-
-Scope: imap protocol. Residue of a closed fix (the connection is now answered
-with `*`, the tagged NO is read, and the connection stays usable).
-
-`Error::Auth` has no attempt field and `with_attempt` cannot add one, so the
-authentication failure raised mid-exchange cannot be stamped although the
-AUTHENTICATE line and client-first are on the wire. Documented at the code site
-and in `reference/imap.md`; the error type itself was outside the fix's files.
-
 ## IMAP-005 - Mailbox identity is decoded lossily and never round-trips
 
 Live. Scope: imap protocol.
@@ -57,15 +47,6 @@ Latent sibling: `gmail_label` (`codec/decode/envelope_fetch.rs`) always runs
 `decode_utf7`, even in UTF-8 mode. Gmail advertises `UTF8=ACCEPT`; the account
 layer does not ENABLE it today.
 
-## IMAP-020 - Push events broadcast before a `push_stream` receiver exists are lost
-
-Smell, imap account. Same shape as JMAP-009.
-
-`push.rs` `push_stream`: `broadcast::Sender::send` with zero receivers drops the
-event, so a `push_subscribe` that starts workers before the engine attaches its
-stream loses the first events silently. bifrost-sync may always subscribe the
-stream first; if so, that ordering is an undocumented requirement.
-
 ## IMAP-022 - The MODSEQ cache records server state the consumer has not seen, so `UNCHANGEDSINCE` guards less than documented
 
 Scope: imap account.
@@ -84,26 +65,6 @@ guard that, as wired, protects only the sub-second SELECT-to-STORE window.
 Take the guard value from the consumer (`ServerVersion::ModSeq` already travels
 in inventory entries), or say plainly how narrow the window is.
 
-## IMAP-025 - Smaller imap account observations
-
-Smells, imap account.
-
-- `run_qresync` / `finish_changes` call `folders.set_cursor` before the
-  `Final` / `Done` send. An abort in between advances the in-memory cursor past
-  what the consumer checkpointed. Read today only for mutation SELECT
-  parameters (IMAP-024), but the ordering is backwards for future readers.
-- `expunge_uids_or_fall_back`: the `UID SEARCH DELETED` then plain `EXPUNGE`
-  fallback is check-then-act; a `\Deleted` set by another client between the
-  two is expunged. The doc's guarantee holds at SEARCH time, not EXPUNGE time;
-  the reference should name the window, which cannot close without UIDPLUS.
-- `mutate.rs` ignores `IdempotencyKey` on all three bulk paths (`_key`).
-  Acceptable for IMAP, but `reference/imap.md` does not say so while other
-  providers' docs explain their key handling.
-- Basic strategy cannot observe flag changes on a non-CONDSTORE server. The
-  reference describes only additions and expunges for Basic, but
-  `CursorDescriptor` for Basic does not signal "flags stale", and nothing in the
-  engine-facing types says a Basic folder's flags drift until re-inventory.
-
 ## IMAP-018 - IDLE sessions are still uncounted against `pool_cap`
 
 Scope: imap account. Residue: the config docs and reference now state the real
@@ -111,20 +72,6 @@ total (`pool_cap - 1 + idle_connection_budget`). Whether IDLE workers should
 instead draw from a shared session budget, so the footprint stays inside
 `pool_cap` on providers with a low per-user connection limit, is a product
 decision.
-
-## IMAP-027 - `flush_page` documentation still describes the removed FETCH downgrade path
-
-Lateral from the QRESYNC discovery fix. The doc comment on `flush_page` in
-`crates/imap/src/account/changes.rs` still describes the downgrade path that
-belonged to the removed second `UID FETCH`.
-
-## IMAP-026 - `StartTlsUnavailable` is classified and worded wrongly for the PREAUTH refusal
-
-Scope: imap protocol. `Error::StartTlsUnavailable` maps to a policy-blocked
-authorization error and its text says STARTTLS is "not supported by server",
-though a PREAUTH greeting refuses STARTTLS even when the capability is
-advertised. Fix the wording and check the classification in
-`crates/imap/src/error.rs`.
 
 ## IMAP-004 - FETCH budget handoff and copy-free literals
 
@@ -146,3 +93,22 @@ gating and SMTP submission shutdown. IMAP dials still inside authentication are
 not registered with the pool, so `close()` cannot wait for them (needs
 `account/pool.rs`), and closing the pool directly is still not
 cancellation-safe; only the account-level close is protected.
+
+## IMAP-002 - `Error::Auth` cannot carry transmission evidence
+
+Scope: imap protocol. The SASL continuation failure now cancels with `*` and
+keeps the connection, but `Error::Auth` has no attempt field, so the failure
+cannot be stamped although AUTHENTICATE and client-first are on the wire. Add
+the field and let the exact `Error::Auth` match in `account/error.rs` carry it;
+the constraint is documented in `error.rs`.
+
+## IMAP-029 - Smaller observations after the account fixes
+
+- `account/inventory.rs` advances the in-memory cursor before sending the
+  checkpoint, the ordering the changes path just fixed.
+- `account/error.rs` still words the STARTTLS refusal as "server does not
+  advertise STARTTLS", which is wrong for a PREAUTH greeting with the capability
+  advertised.
+- Residual limits documented rather than fixable: the plain `EXPUNGE` fallback
+  window without UIDPLUS, bulk mutation ignoring `IdempotencyKey`, and Basic
+  folders being unable to observe flag changes without CONDSTORE.

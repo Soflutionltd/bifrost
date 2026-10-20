@@ -31,6 +31,13 @@ use crate::retry::RetryPolicy;
 use crate::{AccountId, ByteRange, Priority};
 use crate::{DEFAULT_MAX_BUFFERED_RESPONSE, FollowRedirects};
 
+type SharedNetResources = (
+    Arc<BandwidthRegistry>,
+    RateLimitGovernor,
+    Arc<BandwidthMeter>,
+    Arc<crate::hold::HoldRegistry>,
+);
+
 /// Process-wide HTTP transport. Holds the shared reqwest client, the
 /// per-host rate-limit governor, and the bandwidth meter. Cheap to
 /// clone via the inner `Arc`.
@@ -55,7 +62,7 @@ pub(crate) struct NetInner {
     /// box.
     pub(crate) governor: RateLimitGovernor,
     /// Bandwidth meter, partitioned per account.
-    pub(crate) meter: BandwidthMeter,
+    pub(crate) meter: Arc<BandwidthMeter>,
     bandwidth_registry: Arc<BandwidthRegistry>,
     /// Successfully registered hosts, indexed first by `AccountId`
     /// and then by the exact attachment token.
@@ -175,7 +182,7 @@ impl Net {
                 client,
                 dispatch,
                 governor: RateLimitGovernor::new(),
-                meter: BandwidthMeter::new(),
+                meter: Arc::new(BandwidthMeter::new()),
                 bandwidth_registry,
                 account_hosts: Mutex::new(HashMap::new()),
                 next_registration_id: AtomicU64::new(1),
@@ -185,6 +192,27 @@ impl Net {
         })
     }
 
+    // TLS trust requires separate clients, but does not partition process quota,
+    // provider holds, bandwidth admission or observation.
+    fn shared_build(config: NetConfig) -> Self {
+        static RESOURCES: OnceLock<SharedNetResources> = OnceLock::new();
+        let (registry, governor, meter, holds) = RESOURCES.get_or_init(|| {
+            (
+                Arc::new(BandwidthRegistry::new()),
+                RateLimitGovernor::new(),
+                Arc::new(BandwidthMeter::new()),
+                Arc::default(),
+            )
+        });
+        let mut net = Self::with_bandwidth_registry(config, Arc::clone(registry))
+            .expect("default NetConfig should build");
+        let inner = Arc::get_mut(&mut net.inner).expect("new Net is uniquely owned");
+        inner.governor = governor.clone();
+        inner.meter = Arc::clone(meter);
+        inner.holds = Arc::clone(holds);
+        net
+    }
+
     /// Shared default transport for simple constructors. Applications
     /// with explicit transport ownership can still call `Net::new`
     /// and pass account handles into protocol clients directly.
@@ -192,7 +220,7 @@ impl Net {
     pub fn shared_default() -> Self {
         static DEFAULT: OnceLock<Net> = OnceLock::new();
         DEFAULT
-            .get_or_init(|| Net::new(NetConfig::default()).expect("default NetConfig should build"))
+            .get_or_init(|| Net::shared_build(NetConfig::default()))
             .clone()
     }
 
@@ -219,7 +247,7 @@ impl Net {
                     dangerous_accept_invalid_certs: true,
                     ..NetConfig::default()
                 };
-                Net::new(config).expect("default NetConfig should build")
+                Net::shared_build(config)
             })
             .clone()
     }
@@ -302,8 +330,12 @@ impl Net {
                 registration_id,
                 meter: account_meter,
                 token_source: spec.token_source.map(|source| {
-                    Arc::new(OAuthRefresher::new(source).with_max_age(spec.token_max_age))
-                        as Arc<dyn TokenSource>
+                    if source.is_coordinating() {
+                        source
+                    } else {
+                        Arc::new(OAuthRefresher::new(source).with_max_age(spec.token_max_age))
+                            as Arc<dyn TokenSource>
+                    }
                 }),
                 rate_scopes,
                 default_retry: spec.default_retry,
@@ -471,6 +503,15 @@ impl Drop for AccountNetInner {
 }
 
 impl AccountNet {
+    /// Read the same coordinating bearer cache used by HTTP requests.
+    /// Non-HTTP wire paths must use this lifecycle, including its backoff.
+    pub async fn bearer(&self) -> Result<Option<crate::AccessToken>, Error> {
+        match &self.inner.token_source {
+            Some(source) => source.current().await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Open a provider hold in the parent transport's registry.
     #[must_use]
     pub fn shared_hold(&self, key: impl Into<String>) -> crate::SharedHold {
@@ -870,10 +911,9 @@ pub struct AccountSpec {
     /// Per-host rate-limit declarations. Empty means "no governor
     /// enforcement for this account", which is the default for JMAP.
     pub hosts: Vec<RateLimit>,
-    /// Optional raw OAuth token provider. `Net::attach_account` wraps this in
-    /// an `OAuthRefresher` using this spec's `token_max_age`, so callers
-    /// should pass the provider itself rather than pre-wrapping it in
-    /// another refresher.
+    /// Optional OAuth token provider. Coordinating sources are retained as-is;
+    /// raw providers are wrapped in an `OAuthRefresher` using `token_max_age`.
+    /// A retained source owns its proactive refresh and backoff policy.
     /// `None` expresses an account that does not use bearer auth.
     pub token_source: Option<Arc<dyn TokenSource>>,
     /// Default retry policy.
@@ -1759,5 +1799,80 @@ mod tests {
         assert_eq!(b.bandwidth_cap(), Some(7));
         let private = build_net().attach_account(id, AccountSpec::new(None));
         assert_eq!(private.bandwidth_cap(), None);
+    }
+}
+
+#[cfg(test)]
+mod coordinating_resource_tests {
+    use super::*;
+    use crate::{AccessToken, StaticTokenSource};
+
+    #[tokio::test]
+    async fn coordinating_sources_survive_multiple_attachments() {
+        let source: Arc<dyn TokenSource> = Arc::new(OAuthRefresher::new(Arc::new(
+            StaticTokenSource::new("shared", None),
+        )));
+        let net = Net::new(NetConfig::default()).unwrap();
+        let mut spec = AccountSpec::new(Some(Arc::clone(&source)));
+        spec.token_max_age = Duration::ZERO;
+        let first = net.attach_account(AccountId("coordinated-first".into()), spec);
+        let mut spec = AccountSpec::new(Some(Arc::clone(&source)));
+        spec.token_max_age = Duration::ZERO;
+        let second = net.attach_account(AccountId("coordinated-second".into()), spec);
+        assert!(Arc::ptr_eq(
+            first.inner.token_source.as_ref().unwrap(),
+            &source
+        ));
+        assert!(Arc::ptr_eq(
+            second.inner.token_source.as_ref().unwrap(),
+            &source
+        ));
+        assert_eq!(first.bearer().await.unwrap().unwrap().as_str(), "shared");
+        assert_eq!(second.bearer().await.unwrap().unwrap().as_str(), "shared");
+    }
+
+    #[tokio::test]
+    async fn bearer_reads_the_http_refresh_cache_for_plain_sources() {
+        struct Source;
+        impl TokenSource for Source {
+            fn current(&self) -> bifrost_types::AccountFuture<Result<AccessToken, Error>> {
+                Box::pin(async { Ok(AccessToken::new("stale", None)) })
+            }
+            fn refresh(&self) -> bifrost_types::AccountFuture<Result<AccessToken, Error>> {
+                Box::pin(async { Ok(AccessToken::new("fresh", None)) })
+            }
+        }
+        let net = Net::new(NetConfig::default()).unwrap();
+        let account = net.attach_account(
+            AccountId("plain-bearer".into()),
+            AccountSpec::new(Some(Arc::new(Source))),
+        );
+        account
+            .inner
+            .token_source
+            .as_ref()
+            .unwrap()
+            .refresh()
+            .await
+            .unwrap();
+        assert_eq!(account.bearer().await.unwrap().unwrap().as_str(), "fresh");
+    }
+
+    #[test]
+    fn shared_tls_clients_share_process_resources() {
+        let trusted = Net::shared_default();
+        let permissive = Net::shared_accepting_invalid_certs();
+        assert!(!Arc::ptr_eq(&trusted.inner, &permissive.inner));
+        assert!(Arc::ptr_eq(
+            trusted.bandwidth_registry(),
+            permissive.bandwidth_registry()
+        ));
+        assert!(Arc::ptr_eq(&trusted.inner.holds, &permissive.inner.holds));
+        assert!(Arc::ptr_eq(&trusted.inner.meter, &permissive.inner.meter));
+        let id = AccountId("shared-tls-resource-test".into());
+        let first = trusted.attach_account(id.clone(), AccountSpec::new(None));
+        let second = permissive.attach_account(id, AccountSpec::new(None));
+        first.set_bandwidth_cap(Some(17));
+        assert_eq!(second.bandwidth_cap(), Some(17));
     }
 }

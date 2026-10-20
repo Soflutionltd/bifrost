@@ -34,7 +34,7 @@ use super::error::{
 };
 use super::flags;
 use super::flags::{LABEL_TRASH, LabelPatch, translate_flag_op};
-use super::scopes::{ScopeCache, labels_for_flags};
+use super::scopes::{ScopeCache, labels_for_flags, refresh_scope_snapshot};
 
 /// `batchModify` costs 50 quota units per call. With 1000 ids, a fully
 /// 404-producing binary split has a finite worst case of 2n - 1 calls
@@ -207,7 +207,27 @@ fn mutation_stream(
                             return Some((SyncEvent::Terminated(account_error), state));
                         }
                     };
-                    state.patch = Some(translate_flag_op(op, &labels));
+                    let mut patch = translate_flag_op(op, &labels);
+                    if has_unresolved_label_id(&patch, &labels) {
+                        let refreshed = tokio::select! {
+                            () = state.shutdown.cancelled() => return None,
+                            result = refresh_scope_snapshot(&state.client, &state.cache) => result,
+                        };
+                        let labels = match refreshed {
+                            Ok(snapshot) => snapshot.labels,
+                            Err(error) => {
+                                state.finished = true;
+                                state.emitted_done = true;
+                                let account_error = account_error::into_account_error(
+                                    error,
+                                    GmailErrorContext::mutation(AccountOperation::UpdateFlags),
+                                );
+                                return Some((SyncEvent::Terminated(account_error), state));
+                            }
+                        };
+                        patch = translate_flag_op(op, &labels);
+                    }
+                    state.patch = Some(patch);
                 }
                 MutationKind::Move {
                     destination,
@@ -366,6 +386,23 @@ fn mutation_stream(
             }
         }
     }))
+}
+
+/// Whether translation left a well-formed `$gmail-label:<id>:<name>` flag
+/// unsupported because the current vocabulary does not contain its id. A
+/// known but read-only system label is not a cache miss and must not cause an
+/// unnecessary refresh.
+fn has_unresolved_label_id(patch: &LabelPatch, labels: &[crate::types::GmailLabel]) -> bool {
+    patch.unsupported_flags.iter().any(|flag| {
+        let Some(id) = flag
+            .strip_prefix("$gmail-label:")
+            .and_then(|rest| rest.split_once(':').map(|(id, _)| id))
+            .filter(|id| !id.is_empty())
+        else {
+            return false;
+        };
+        !labels.iter().any(|label| label.id == id)
+    })
 }
 
 enum MutationKind {
@@ -1150,6 +1187,14 @@ mod tests {
             } else {
                 Bytes::new()
             },
+        }
+    }
+
+    fn canned_json(status: StatusCode, body: &'static [u8]) -> Canned {
+        Canned::Response {
+            status,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from_static(body),
         }
     }
 
@@ -1954,6 +1999,40 @@ mod tests {
                 .expect("JSON request");
         assert_eq!(body["addLabelIds"], serde_json::json!(["STARRED"]));
         assert_eq!(body["removeLabelIds"], serde_json::json!(["UNREAD"]));
+    }
+
+    #[tokio::test]
+    async fn unresolved_label_id_forces_one_refresh_before_translation() {
+        let (client, script) = scripted_client(vec![
+            canned_json(
+                StatusCode::OK,
+                br#"{"labels":[{"id":"Label_42","name":"Created elsewhere","type":"user"}]}"#,
+            ),
+            canned(StatusCode::NO_CONTENT),
+        ]);
+        let events = collect_events(bulk_set_flags(
+            client,
+            fresh_cache(Vec::new()),
+            Box::pin(stream::iter([ObjectId("m1".to_string())])),
+            FlagOp::Add(set(&["$gmail-label:Label_42:Old: Name"])),
+            test_key(120),
+        ))
+        .await;
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2, "one refresh must precede one mutation");
+        assert_eq!(requests[0].url.path(), "/labels");
+        assert_eq!(requests[1].url.path(), "/messages/batchModify");
+        let body: serde_json::Value =
+            serde_json::from_slice(requests[1].body.as_ref().expect("mutation request body"))
+                .expect("JSON mutation body");
+        assert_eq!(body["addLabelIds"], serde_json::json!(["Label_42"]));
+        assert!(matches!(
+            &events[..],
+            [SyncEvent::Batch(batch), SyncEvent::Done(None)]
+                if matches!(batch.items.as_slice(), [ItemOutcome::Succeeded(success)]
+                    if success.output == MutationSuccess::Applied)
+        ));
     }
 
     #[tokio::test]

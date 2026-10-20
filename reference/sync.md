@@ -700,6 +700,14 @@ getting it wrong is silent: deleting the completion marker on ordinary cursor
 invalidation turns every recovery into a full historical inventory and
 hydration walk.
 
+Schema recovery currently enumerates only registered cursors. A scope still
+establishing, or absent after exhausting its establishment budget, can retain
+durable rows and completion markers. The store contract has no account-wide
+row reset or durable scope enumeration; resetting registered scopes therefore
+does not guarantee an account-wide schema migration. Closing this gap requires
+an account-wide store operation routed through the checkpoint writer, including
+its publication retirement and acknowledgement fences.
+
 `CheckpointStore` remains a published consumer-implemented trait; ownership is
 enforced by which internal engine type can reach its `Arc`, not by hiding the
 trait. `BackfillCheckpointWriter` is also published, but its `store` field is an
@@ -846,12 +854,17 @@ at attach and `run_establish` on reopen - ask whether the saved state is a
 resumable inventory position before putting it into the registry. The default
 `is_inventory_cursor` implementation delegates directly to
 `inventory_resume_stream(cursor.clone()).is_some()`, and the resume seam guards
-both directions of that equivalence with classified schema recovery so an
-override cannot silently diverge. A
-stored page position must never reach `changes_stream`, which has no delta link
-to walk. The terminal
-`Done` still installs the ordinary live
-change cursor in the registry.
+both directions of that equivalence once reached. A mismatch is a scoped cursor
+invalidation (`RestartScope`), not an envelope schema change. Deferred attach
+forwards a classified resume to the ordinary recovery path so only that scope
+is reset and re-established. Replacement attach checks both the classifier and
+stream before deciding to resume; a mismatch rejects the candidate connection,
+leaving its pre-existing durable cursor untouched for a later retry. Initial
+attach still gates resume on the classifier alone, so a false classifier paired
+with a provided stream is not routed through the guard there. The guarded path
+keeps stored page positions away from `changes_stream`, which has no delta link
+to walk. The terminal `Done` still installs the ordinary live change cursor in
+the registry.
 
 `ChangesEvent` is the per-batch outcome returned by the driver:
 `Advanced` / `Done` / `Stopped` / `Paused` / `Terminated(AccountError)`.
@@ -936,12 +949,22 @@ and the accompanying warning is what tells the consumer to reconcile.
   NOTIFY-MAILBOXES / LIST-diff lifecycle detection for IMAP is a
   deferred feature, not a bug. The lifecycle reader reloads the
   replacement account whenever the reopen-generation watch changes;
-  a naturally-ended or retryable stream reconnects with bounded
-  exponential backoff. A terminal lifecycle error is broadcast once and
-  stops that reader. Every non-terminal classified error is handed to
-  the reopen channel exactly once - the reopen path owns the
-  three-strike budget, so one dead lifecycle stream cannot enqueue
-  unbounded account reopens - and only `RestartAccount`, the one
+  a naturally-ended or retryable stream reconnects with exponential
+  backoff from 30 seconds to 480 seconds. Opening a stream alone does
+  not reset the delay; a lifecycle event or account replacement does.
+  Retry and reconcile errors record shared throttle holds and wait at
+  least the larger of the backoff and provider retry hint. The reader
+  rechecks account-wide holds before opening another stream, and both
+  shutdown and account replacement interrupt the wait. Authenticated
+  requests retain transport ownership of token refresh.
+  JMAP forwards read failures, including failures of its expired-history
+  snapshot repair; successful expired-history repair stays local because
+  its Mailbox position is private to lifecycle. Google still retries
+  locally: its stream-local diff baseline must become account-owned
+  before reconnect can preserve changes across a failed label poll.
+  A terminal lifecycle error is broadcast once and parks the reader
+  until account replacement. Engine directives are handed to the reopen
+  channel exactly once per stream failure - only `RestartAccount`, the one
   directive that actually replaces this reader's connection, then waits
   for the generation change. That wait is bounded (30s): a reopen that
   exhausts its budget or queues behind a pause never bumps the
@@ -3047,15 +3070,19 @@ Every encoded length is checked against `u32::MAX`. An impossible
 larger in-memory field panics at the encoding boundary instead of
 writing a false truncated prefix and silently corrupting the envelope.
 
-An unreadable row is healed where it is found. `run_establish` - the
-running-account path - returns a typed `AccountError` whose derived
-`RecoveryClass` is `Engine(SchemaIncompatible)`, and the reopen
-listener runs the account-wide schema-clear loop. `establish_one` -
+An unreadable row is classified where it is found. `establish_one` -
 the attach path - deletes the row and re-establishes that one scope
 inline, because the reopen listener is spawned later in `attach_inner`
-and does not exist yet: propagating the error there would fail the
-attach with nothing left running to clear the row, so every later
-attach would fail identically.
+and does not exist yet. `run_establish` also translates an unreadable
+row into a typed `AccountError` whose derived `RecoveryClass` is
+`Engine(SchemaIncompatible)`, but its callers do not send that result
+through the reopen listener: per-scope recovery retries and then
+terminates that scope, while replacement attach rejects the candidate
+connection. An automatic account restart retries the reopen; a
+consumer-driven reattach returns the failure. The account-wide schema
+clear loop is reached when a running worker sends a classified error
+through `RecoveryContext::recover`, not from the `run_establish`
+result alone.
 
 (These are engine `Error` enum variants, not `RecoveryClass`
 variants.)
@@ -3345,8 +3372,13 @@ scope (per-scope re-establishment) or for the account
 (`RestartAccount`). When the last failure is engine-internal and has no
 account error, the synthetic error derives
 `Engine(OperatorOverrideRequired)` and retains the affected cursor scope;
-it does not request another automatic scope restart. Provider-authored last
-errors retain their original classification. Account exhaustion then publishes
+it does not request another automatic scope restart. A provider retry,
+reconciliation, or other engine-action error is also replaced with this scoped
+operator-attention error at per-scope exhaustion; an already terminal error or
+an existing operator-attention error keeps its classification. The
+account-wide `RestartAccount` exhaustion tail still publishes the last account
+error unchanged before pausing.
+Account exhaustion then publishes
 `AccountControl::Pause(PauseReason::RetryBudgetExhausted)` and
 flips the boundary to `Pause` so workers park. Consumers subscribe
 to the per-account `AccountControl` broadcast via

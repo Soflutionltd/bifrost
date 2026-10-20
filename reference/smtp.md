@@ -194,8 +194,14 @@ What stays adapter-side is what is genuinely I/O: dialling, the greeting and
 EHLO/LHLO exchange, the AUTH ladder, the STARTTLS upgrade, reply-line reading
 and parsing with its size caps, read and write deadlines, bandwidth throttling,
 and the socket shutdown `Op::Abort` performs. The local validation that runs
-before `MAIL FROM` - `build_envelope` and `build_batch` - also stays with the
-adapter, because it reads `ServerInfo` capabilities off the live connection.
+before `MAIL FROM` lives in the sans-I/O sibling `client/envelope.rs`.
+`EnvelopeBuilder` takes `ServerInfo` and the connection's encryption state;
+both adapters delegate `build_envelope` and `build_batch` to it. Direct and
+batch sends share one MAIL option builder and one RCPT option builder.
+Explicit SIZE requires server advertisement, and the completed MAIL option
+list rejects duplicate keywords case-insensitively, including custom aliases
+and collisions with inferred options. RCPT options retain their last-value-wins
+normalization and recipient-specific overrides.
 
 ## Connection lifecycle
 

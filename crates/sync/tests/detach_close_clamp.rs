@@ -607,7 +607,10 @@ async fn a_parked_inventory_walk_is_dropped_at_detach_not_at_the_deadline() {
     // Never notified: only the shutdown arm can end this walk early.
     stub.inventory_stall = Some(Arc::new(tokio::sync::Notify::new()));
     let (probe, parked, destroyed) = common::StallProbe::install();
-    stub.inventory_stall_probe = Some(probe);
+    *stub
+        .inventory_stall_probe
+        .lock()
+        .expect("inventory stall probe lock") = Some(probe);
     let stub = Arc::new(stub);
     let engine = attach(&account_id, Arc::clone(&stub)).await;
     let _subscriber = engine

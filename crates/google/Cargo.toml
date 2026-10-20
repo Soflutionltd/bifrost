@@ -24,7 +24,6 @@ bifrost-types = { path = "../types" }
 bytes = { workspace = true }
 jiff = { workspace = true, features = ["tzdb-bundle-always"] }
 futures = { workspace = true }
-httpdate = { workspace = true }
 reqwest = { workspace = true, features = ["json", "native-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

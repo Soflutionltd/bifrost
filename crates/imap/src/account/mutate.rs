@@ -16,6 +16,10 @@ use super::{
     CompactUidSet, DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id,
 };
 
+// The Account surface supplies an idempotency key to each bulk operation, but
+// IMAP has no request token that a server can use to deduplicate these
+// commands. Keep the key intentionally unused; uncertain outcomes are
+// reconciled through the per-UID result lanes and read-back.
 pub(crate) fn bulk_set_flags(
     account: ImapAccount,
     targets: AccountStream<bifrost_types::ObjectId>,
@@ -1057,10 +1061,12 @@ fn store_failed_error(operation: AccountOperation, folder: &MailboxName) -> Acco
 /// *every* `\Deleted` message in the mailbox, including ones another
 /// client marked and has not committed to removing - so it is only run
 /// when `UID SEARCH DELETED` shows the mailbox's `\Deleted` set is
-/// exactly the set this batch marked. When a foreign `\Deleted` message
-/// is present the original `MissingCapability` is returned and the batch
-/// fails with its messages left flagged, which is the honest outcome:
-/// better a reported failure than silently expunging someone else's mail.
+/// a subset of the set this batch marked. This is a check at SEARCH time,
+/// not an atomic guarantee: another client can mark a message `\Deleted`
+/// before the following plain `EXPUNGE`, and IMAP has no command to close
+/// that race without UIDPLUS. When a foreign `\Deleted` message is already
+/// present at SEARCH time, return the original `MissingCapability` and leave
+/// this batch's messages flagged rather than knowingly expunging foreign mail.
 pub(super) async fn expunge_uids_or_fall_back(
     account: &ImapAccount,
     conn: &super::PooledConn,

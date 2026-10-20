@@ -551,28 +551,32 @@ fn parse_draft_for_submission(
     let (header_end, body_start) = split_header_body(raw);
     let header_block = &raw[..header_end];
 
-    let headers = unfold_headers(&String::from_utf8_lossy(header_block));
+    let headers = bifrost_types::mime::HeaderMap::parse(header_block);
 
-    let from = first_address(&headers, "from")
-        .or_else(|| first_address(&headers, "sender"))
+    let from_addresses = checked_draft_addresses(&headers, "from", op)?;
+    let sender_addresses = checked_draft_addresses(&headers, "sender", op)?;
+    let to = checked_draft_addresses(&headers, "to", op)?;
+    let cc = checked_draft_addresses(&headers, "cc", op)?;
+    let bcc = checked_draft_addresses(&headers, "bcc", op)?;
+
+    let from = from_addresses
+        .into_iter()
+        .next()
+        .or_else(|| sender_addresses.into_iter().next())
         .unwrap_or_else(|| default_from.clone());
 
     let mut recipients = Vec::new();
-    recipients.extend(addresses_for(&headers, "to"));
-    recipients.extend(addresses_for(&headers, "cc"));
-    recipients.extend(addresses_for(&headers, "bcc"));
+    recipients.extend(to);
+    recipients.extend(cc);
+    recipients.extend(bcc);
     if recipients.is_empty() {
         return Err(pim_malformed(op, "draft has no recipients"));
     }
 
-    let message_id = header_value(&headers, "message-id")
-        .map(|value| {
-            value
-                .trim()
-                .trim_matches(|c| c == '<' || c == '>')
-                .to_owned()
-        })
-        .filter(|value| !value.is_empty())
+    let message_id = headers
+        .message_ids("message-id")
+        .into_iter()
+        .next()
         .unwrap_or_else(|| {
             let domain = from
                 .address
@@ -587,6 +591,22 @@ fn parse_draft_for_submission(
         envelope: bifrost_types::SubmissionEnvelope { from, recipients },
         body,
         message_id,
+    })
+}
+
+fn checked_draft_addresses(
+    headers: &bifrost_types::mime::HeaderMap,
+    name: &str,
+    op: AccountOperation,
+) -> Result<Vec<Address>, AccountError> {
+    headers.addresses_checked(name).map_err(|rejected| {
+        pim_malformed(
+            op,
+            format!(
+                "draft {name} header contains {} unsupported address item(s)",
+                rejected.len()
+            ),
+        )
     })
 }
 
@@ -705,104 +725,6 @@ fn header_name_is_bcc(line: &[u8]) -> bool {
 
 /// Collapse RFC 5322 folded header lines into `(lowercase-name, value)`
 /// pairs, preserving order.
-fn unfold_headers(header_block: &str) -> Vec<(String, String)> {
-    let mut headers: Vec<(String, String)> = Vec::new();
-    for line in header_block.split('\n') {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() {
-            continue;
-        }
-        if (line.starts_with(' ') || line.starts_with('\t')) && !headers.is_empty() {
-            let last = headers.last_mut().expect("non-empty");
-            last.1.push(' ');
-            last.1.push_str(line.trim());
-        } else if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
-        }
-    }
-    headers
-}
-
-fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.as_str())
-}
-
-fn addresses_for(headers: &[(String, String)], name: &str) -> Vec<bifrost_types::Address> {
-    headers
-        .iter()
-        .filter(|(key, _)| key == name)
-        .flat_map(|(_, value)| parse_address_list(value))
-        .collect()
-}
-
-fn first_address(headers: &[(String, String)], name: &str) -> Option<bifrost_types::Address> {
-    header_value(headers, name).and_then(|value| parse_address_list(value).into_iter().next())
-}
-
-/// Minimal RFC 5322 address-list parser sufficient for envelope
-/// construction (recipient addr-specs and an optional display name).
-///
-/// Commas inside a quoted display name or inside the angle-bracketed
-/// addr-spec do not split addresses - otherwise a draft this crate
-/// itself emitted (the shared assembler quotes names like
-/// `"Last, First" <a@b>`) would round-trip into garbage recipients.
-fn parse_address_list(value: &str) -> Vec<bifrost_types::Address> {
-    split_address_list(value)
-        .into_iter()
-        .filter_map(|item| {
-            let item = item.trim();
-            if item.is_empty() {
-                return None;
-            }
-            if let Some((name, rest)) = item.split_once('<')
-                && let Some((address, _)) = rest.split_once('>')
-            {
-                let name = name.trim().trim_matches('"').trim();
-                return Some(bifrost_types::Address {
-                    name: (!name.is_empty()).then(|| name.to_owned()),
-                    address: address.trim().to_owned(),
-                });
-            }
-            Some(bifrost_types::Address::bare(item.to_owned()))
-        })
-        .collect()
-}
-
-/// Split an address-list header value on the top-level commas only:
-/// commas inside a `"..."` quoted display name or inside a `<...>`
-/// addr-spec are not separators.
-fn split_address_list(value: &str) -> Vec<String> {
-    let mut items = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut in_angle = false;
-    for ch in value.chars() {
-        match ch {
-            '"' if !in_angle => {
-                in_quotes = !in_quotes;
-                current.push(ch);
-            }
-            '<' if !in_quotes => {
-                in_angle = true;
-                current.push(ch);
-            }
-            '>' if !in_quotes => {
-                in_angle = false;
-                current.push(ch);
-            }
-            ',' if !in_quotes && !in_angle => {
-                items.push(std::mem::take(&mut current));
-            }
-            _ => current.push(ch),
-        }
-    }
-    items.push(current);
-    items
-}
-
 /// Re-stamp an `AccountError` from the submission boundary with the IMAP
 /// operation that drove it, so recovery/telemetry attribute it correctly.
 ///
@@ -2748,6 +2670,62 @@ mod tests {
     }
 
     #[test]
+    fn draft_send_round_trips_escaped_and_encoded_display_names() {
+        for name in ["a\", b", "a\\, b", "Janne \u{e4}"] {
+            let address = bifrost_types::Address::named(name, "x@y");
+            let wire_address = bifrost_types::mime::format_address(&address);
+            let raw = format!(
+                "From: {wire_address}\r\nTo: {wire_address}\r\nBcc: {wire_address}\r\nMessage-ID: <id@test>\r\n\r\nbody"
+            );
+            let parsed = parse_draft_for_submission(
+                raw.as_bytes(),
+                &bifrost_types::Address::bare("fallback@test"),
+                AccountOperation::DraftSend,
+            )
+            .expect("rendered addresses parse");
+            assert_eq!(parsed.envelope.from.name.as_deref(), Some(name));
+            assert_eq!(parsed.envelope.from.address, "x@y");
+            assert_eq!(parsed.envelope.recipients.len(), 2);
+            for recipient in &parsed.envelope.recipients {
+                assert_eq!(recipient.address, "x@y");
+                assert_eq!(recipient.name.as_deref(), Some(name));
+            }
+            assert_eq!(parsed.message_id, "id@test");
+            let body = String::from_utf8(parsed.body).expect("UTF-8 draft");
+            assert!(!body.contains("Bcc:"));
+            assert!(body.ends_with("\r\n\r\nbody"));
+        }
+    }
+
+    #[test]
+    fn draft_send_refuses_rejected_envelope_addresses() {
+        for field in ["From", "Sender", "To", "Cc", "Bcc"] {
+            let raw = format!(
+                "From: sender@example.test\r\nTo: recipient@example.test\r\n{field}: accepted@example.test, rejected-item\r\n\r\nbody"
+            );
+            let error = parse_draft_for_submission(
+                raw.as_bytes(),
+                &bifrost_types::Address::bare("fallback@example.test"),
+                AccountOperation::DraftSend,
+            )
+            .expect_err("a rejected envelope address must stop draft submission");
+
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed
+                ),
+                "field {field}"
+            );
+            assert_eq!(
+                error.operation(),
+                Some(AccountOperation::DraftSend),
+                "field {field}"
+            );
+        }
+    }
+
+    #[test]
     fn draft_send_strips_bcc_into_envelope() {
         let raw = b"From: Me <me@sender.test>\r\n\
 To: Ann <ann@to.test>\r\n\
@@ -3341,30 +3319,21 @@ body text\r\n";
     }
 
     #[test]
-    fn unfold_headers_joins_folds_and_keeps_repeats_in_order() {
-        let headers = unfold_headers("To: a@b.test,\r\n  c@d.test\r\nTo: e@f.test\r\nX: 1\r\n");
-        assert_eq!(
-            headers,
-            vec![
-                ("to".to_owned(), "a@b.test, c@d.test".to_owned()),
-                ("to".to_owned(), "e@f.test".to_owned()),
-                ("x".to_owned(), "1".to_owned()),
-            ]
-        );
-        // Both `To:` headers contribute recipients.
-        let addrs: Vec<String> = addresses_for(&headers, "to")
-            .into_iter()
-            .map(|a| a.address)
+    fn draft_send_collects_folded_repeated_headers_in_order() {
+        let raw = b"To: a@b.test,\r\n  c@d.test\r\nTo: e@f.test\r\n\r\nbody";
+        let parsed = parse_draft_for_submission(
+            raw,
+            &bifrost_types::Address::bare("sender@test"),
+            AccountOperation::DraftSend,
+        )
+        .expect("parses");
+        let addresses: Vec<_> = parsed
+            .envelope
+            .recipients
+            .iter()
+            .map(|address| address.address.as_str())
             .collect();
-        assert_eq!(addrs, ["a@b.test", "c@d.test", "e@f.test"]);
-    }
-
-    #[test]
-    fn address_list_splitting_ignores_commas_inside_angle_brackets() {
-        let items = split_address_list("<a@b, c>, d@e");
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].trim(), "<a@b, c>");
-        assert_eq!(items[1].trim(), "d@e");
+        assert_eq!(addresses, ["a@b.test", "c@d.test", "e@f.test"]);
     }
 
     #[test]
@@ -3507,7 +3476,8 @@ body text\r\n";
     fn parse_address_list_respects_quoted_commas() {
         // A display name this crate's own assembler quotes (`"Last, First"`)
         // must not split into a phantom recipient.
-        let parsed = parse_address_list("\"Doe, Jane\" <jane@to.test>, bob@to.test");
+        let parsed =
+            bifrost_types::Address::parse_list("\"Doe, Jane\" <jane@to.test>, bob@to.test");
         let addrs: Vec<&str> = parsed.iter().map(|a| a.address.as_str()).collect();
         assert_eq!(addrs, ["jane@to.test", "bob@to.test"]);
         assert_eq!(parsed[0].name.as_deref(), Some("Doe, Jane"));
