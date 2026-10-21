@@ -135,7 +135,13 @@ pub(crate) async fn get(
         return public::get(&account, folder, item).await;
     }
     let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventGet)?;
-    let event = fetch_graph_event(&account, &calendar_id, &event_id).await?;
+    let event = fetch_graph_event(
+        &account,
+        &calendar_id,
+        &event_id,
+        AccountOperation::EventGet,
+    )
+    .await?;
     Ok(event_from_graph(calendar_id, event))
 }
 
@@ -143,13 +149,14 @@ async fn fetch_graph_event(
     account: &GraphAccount,
     calendar_id: &str,
     event_id: &str,
+    operation: AccountOperation,
 ) -> Result<GraphEvent, AccountError> {
     let path = event_url(account, calendar_id, event_id);
     account
         .client
         .get_json_prefer::<GraphEvent>(Resource::Outlook, &path, EVENT_TIMEZONE_PREFER)
         .await
-        .map_err(|error| into_error(error, AccountOperation::EventGet))
+        .map_err(|error| into_error(error, operation))
 }
 
 pub(crate) async fn create(
@@ -310,7 +317,8 @@ pub(crate) async fn update(
         .transpose()?;
     // Recurrence serialization may need the existing series anchor. This
     // read supplies content only; it never replaces the caller's validator.
-    let current = fetch_graph_event(&account, &event_calendar_id, &native_event_id).await?;
+    let current =
+        fetch_graph_event(&account, &event_calendar_id, &native_event_id, operation).await?;
     let series = CurrentSeries {
         recurrence: current.recurrence.as_ref(),
         time_zone: current.original_start_time_zone.as_deref(),
@@ -2503,6 +2511,38 @@ mod tests {
                 expected.or(Some("W/\"fresh\""))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn event_update_preflight_failure_names_the_update_operation() {
+        let client = crate::client::GraphClient::new("token");
+        client.script_rest([crate::client::ScriptedRestResponse::json(
+            reqwest::StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "error": { "code": "ErrorItemNotFound", "message": "missing" }
+            }),
+        )]);
+        let account =
+            GraphAccount::new_for_tests(client.clone(), super::super::PushMode::GraphSubscriptions);
+
+        let error = update(
+            account,
+            EventId("cal::event-1".into()),
+            EventPatch {
+                expected_version: Some(bifrost_types::ServerVersion::ETag(
+                    "W/\"caller-version\"".into(),
+                )),
+                title: Some(Some("changed".into())),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a failed update preflight must fail the update");
+
+        assert_eq!(error.operation(), Some(AccountOperation::EventUpdate));
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
     }
 
     #[test]

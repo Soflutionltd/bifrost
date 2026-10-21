@@ -40,6 +40,16 @@ guard that, as wired, protects only the sub-second SELECT-to-STORE window.
 Take the guard value from the consumer (`ServerVersion::ModSeq` already travels
 in inventory entries), or say plainly how narrow the window is.
 
+## IMAP-032 - Small-response compaction memmoves the whole unread suffix
+
+Lateral from the retained-slice work. `crates/imap/src/connection/wire.rs`
+greeting and small-response paths replaced an O(1) `split_to` with
+`copy_within(consumed..len, 0)` to keep the allocation rooted for the later
+capacity check. Every small response then moves the whole unread suffix, so a
+large read followed by many small untagged lines is quadratic in that read's
+size. Compact only once the consumed prefix passes half the capacity. Not a
+correctness defect.
+
 ## IMAP-018 - IDLE sessions are still uncounted against `pool_cap`
 
 **Needs a technical implementation specification** (owner, 2026-10-21): too
@@ -59,16 +69,4 @@ response, not copies. Still open:
   not emitted incrementally. Standalone parsers without an owned backing still
   copy, and generic string fields still parse owned.
 - Non-literal syntax and parser overhead are outside the literal ceiling.
-
-## IMAP-031 - A retained FETCH slice pins its whole backing allocation
-
-Lateral from the copy-free literal work. Body and binary sections now share the
-frozen response buffer, so keeping one small section alive keeps the whole
-allocation alive, including spare capacity and any co-read response bytes. The
-consumer size estimate counts payload lengths plus a fixed allowance, so
-physical memory retained can exceed it. Documented in `reference/imap.md`;
-compacting small retained slices (copy below a threshold) would bound it. The
-same sharing means the reader's `BytesMut` cannot reclaim the allocation on its
-next `reserve` while a slice lives, so sustained FETCH traffic probably costs
-one fresh read-buffer allocation per retained response.
 

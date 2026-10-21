@@ -56,20 +56,6 @@ once.
 
 # Low value or not defects
 
-## JMAP-032 - JMAP observations that need net facilities
-
-Residue; both need a `bifrost-net` addition first, and the current behaviour is
-recorded at the code sites and in `reference/jmap.md`.
-
-- `redirect_policy_from_trusted_hosts` emulates "no cross-host redirects" by
-  trusting the sentinel host `__bifrost_jmap_no_cross_host_redirects__`,
-  because an empty allowlist means every host: a missing same-origin
-  `RedirectPolicy` mode in net expressed as a magic string.
-- `open_sse` fabricates `bifrost_net::Error::Status` for a passed-through 3xx;
-  net defines `Status` as a terminal 4xx/5xx-style status, so classification
-  sees a 3xx in a variant that never otherwise carries one. A fix needs a
-  shared response shape and account mapping for passed-through redirects.
-
 ## SHARED-016 - `FlagOp::validate_for_account` fixes the operation for its caller
 
 Scope: types adoption (lateral in bifrost-types). Minor.

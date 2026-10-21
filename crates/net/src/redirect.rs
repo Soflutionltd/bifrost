@@ -75,6 +75,8 @@ pub struct RedirectPolicy {
     /// Maximum number of redirect hops before the loop aborts with
     /// `Error::RedirectLoop`.
     pub max_hops: u8,
+    /// Refuse every hop that changes scheme, host, or effective port.
+    pub same_origin_only: bool,
     /// Cross-host targets that the policy accepts. Empty means
     /// "every host is allowed"; populated means strict allowlist.
     /// Host comparison is case-insensitive (HTTP hosts are
@@ -93,6 +95,7 @@ impl Default for RedirectPolicy {
     fn default() -> Self {
         Self {
             max_hops: DEFAULT_MAX_HOPS,
+            same_origin_only: false,
             trusted_hosts: HashSet::new(),
         }
     }
@@ -105,8 +108,16 @@ impl RedirectPolicy {
     pub fn with_hops(max_hops: u8) -> Self {
         Self {
             max_hops,
+            same_origin_only: false,
             trusted_hosts: HashSet::new(),
         }
+    }
+
+    /// Restrict redirects to the departing origin.
+    #[must_use]
+    pub fn same_origin(mut self) -> Self {
+        self.same_origin_only = true;
+        self
     }
 
     /// Add a trusted host to the allowlist. Builder-style; returns
@@ -122,6 +133,9 @@ impl RedirectPolicy {
     /// acceptable.
     #[must_use]
     pub fn allows_host(&self, host: &str) -> bool {
+        if self.same_origin_only {
+            return false;
+        }
         if self.trusted_hosts.is_empty() {
             return true;
         }
@@ -422,6 +436,29 @@ mod tests {
             DEFAULT_MAX_HOPS,
             "the default cap is the shared constant"
         );
+    }
+
+    #[test]
+    fn same_origin_policy_rejects_every_origin_change() {
+        let policy = RedirectPolicy::default()
+            .same_origin()
+            .trust_host("a.example");
+        let prior = url("https://a.example/");
+        for target in [
+            "https://other.example/",
+            "https://a.example:8443/",
+            "http://a.example:443/",
+        ] {
+            let result = classify_redirect(
+                &policy,
+                &Method::GET,
+                &prior,
+                StatusCode::FOUND,
+                &header(LOCATION, target),
+            );
+            assert!(matches!(result, Err(Error::RedirectRejected { .. })));
+        }
+        assert!(policy.admits_hop(Some(&prior), &url("https://a.example:443/next")));
     }
 
     #[test]

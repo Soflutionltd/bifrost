@@ -16,7 +16,7 @@ use bifrost_net::{BandwidthBudget, BandwidthDirection, MeterSinkHandle, Reservat
 use bytes::BytesMut;
 use tracing::{trace, warn};
 
-use crate::codec::decode::parse_response_bytes;
+use crate::codec::decode::{parse_response_bytes, parse_response_utf8};
 use crate::error::Error;
 use crate::types::Response;
 
@@ -312,7 +312,11 @@ impl WireReader {
         match parse_greeting(&self.buf) {
             Ok((remaining, resp)) => {
                 let consumed = self.buf.len() - remaining.len();
-                let _ = self.buf.split_to(consumed);
+                // Keep the allocation rooted at its start so later capacity
+                // checks include all storage a shared FETCH frame would pin.
+                let len = self.buf.len();
+                self.buf.copy_within(consumed..len, 0);
+                self.buf.truncate(len - consumed);
                 Ok(Some(resp))
             }
             Err(nom::Err::Incomplete(_)) => Ok(Option::None),
@@ -355,9 +359,37 @@ impl WireReader {
         let Some(frame_len) = response_frame_len_limited(&self.buf, limit)? else {
             return Ok(Option::None);
         };
-        // Freeze one complete response so FETCH literals can retain slices
-        // into its allocation. Any following response bytes stay mutable.
-        let frame = self.buf.split_to(frame_len).freeze();
+        // Small responses own their small literals and leave the read allocation
+        // reusable, even while the consumer retains every response.
+        if frame_len < 4096 {
+            return match parse_response_utf8(&self.buf[..frame_len], utf8_mode) {
+                Ok((remaining, resp)) => {
+                    let consumed = frame_len - remaining.len();
+                    let len = self.buf.len();
+                    self.buf.copy_within(consumed..len, 0);
+                    self.buf.truncate(len - consumed);
+                    Ok(Some(resp))
+                }
+                Err(nom::Err::Incomplete(_)) => Ok(None),
+                Err(e) => {
+                    warn!("response parse error: {e}");
+                    Err(Error::Parse(format!("response parse error: {e}")))
+                }
+            };
+        }
+        // A retained slice must not pin arbitrary spare capacity or co-read
+        // responses. Move the suffix to a fresh reader, and compact an oversized
+        // allocation before handing the frame to the slice-aware parser.
+        let suffix = &self.buf[frame_len..];
+        let mut next = BytesMut::with_capacity(suffix.len().max(8192));
+        next.extend_from_slice(suffix);
+        let mut buffer = std::mem::replace(&mut self.buf, next);
+        let frame = if buffer.capacity() > frame_len.saturating_mul(2) {
+            bytes::Bytes::copy_from_slice(&buffer[..frame_len])
+        } else {
+            buffer.truncate(frame_len);
+            buffer.freeze()
+        };
 
         match parse_response_bytes(&frame, utf8_mode) {
             Ok((remaining, resp)) => {

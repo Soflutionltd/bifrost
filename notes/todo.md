@@ -90,6 +90,14 @@ PUBLISHED SURFACE fence apply.
   range read fails, a top-severity defect hiding behind a green suite. The
   only ledger item of the wave left open as a possible defect.
 
+## Later, from the October 2026 resolution waves
+
+- **Graph contact moves.** `crates/graph/src/account/contacts.rs`. Graph
+  contact updates never sent `address_book_id`, so a folder change was
+  silently ignored; it is now refused as `Unsupported(ContactUpdate)` before
+  I/O. Supporting it means folder-aware move routing (Graph lists
+  `parentFolderId` as an update field). A new capability, not a fix.
+
 ## Notes
 
 - The rules for working an item are at the top of this file. One more that

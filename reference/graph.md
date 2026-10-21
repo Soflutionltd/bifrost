@@ -419,9 +419,16 @@ non-`Confirmed` status, and an RSVP value Graph has no action for stay
 `self_response`; RSVP uses native `accept`/`decline`/`tentativelyAccept`.
 Contact and calendar patches accept `expected_version: Option<ServerVersion>`.
 An `ETag` is sent verbatim as `If-Match`; a 412 is `ConcurrencyConflict`.
-A versioned contact update no longer fetches a validator. Calendar update still reads series
-content for recurrence serialization, but never substitutes that read's change
-key for the caller token. An absent version retains the existing immediate-read guard.
+A versioned contact update no longer fetches a validator. Contact updates
+refuse an `address_book_id` change as `Unsupported(ContactUpdate)` before I/O:
+this Graph path does not issue a folder-aware move, so it does not acknowledge
+a request to move a contact. Calendar update still reads series content for
+recurrence serialization, but never substitutes that read's change key for the
+caller token. Its preflight read failure is attributed to `EventUpdate`, since
+the read is part of the update operation. An absent version retains the existing
+immediate-read guard. Graph accepts HTTP entity-tag syntax and forwards the
+accepted token verbatim; the weak-tag prefix is uppercase `W/`, so lowercase
+`w/` is refused as an invalid token.
 Delete still has no caller-version input and retains its immediate-read guard.
 Other token kinds are refused as `Unsupported` before I/O.
 Updates send sparse PATCH (scalar clears as null;

@@ -313,9 +313,9 @@ passed-through 3xx carries status + headers AND its body (bifrost-net's redirect
 `PassThrough` arm hands the body up through the same `into_byte_stream` the
 redirects-disabled arm uses, rather than discarding it; a `Location`-less
 redirect carrying an explanatory document therefore arrives intact). The
-production `ReqwestTransport` preserves that evidence, then currently wraps
-streamed 3xx results in `bifrost_net::Error::Status`, as described under HTTP
-redirect handling below. The scripted dispatcher pins the net decision and
+production `ReqwestTransport` preserves that evidence, then wraps
+streamed 3xx results in `bifrost_net::Error::UnexpectedResponse`, as described
+under HTTP redirect handling below. The scripted dispatcher pins the net decision and
 response evidence, not the final classification through that JMAP wrapper. A
 second 401 is `AuthLost`; statuses retryable under `RetryPolicy::default()` (429
 plus the 5xx family, read off the policy rather than restated) come back as
@@ -1023,18 +1023,23 @@ Typed `ServerFilterCreate::Rule` / `ServerFilterPatch::Rule` return `Unsupported
 `ReqwestTransport` delegates redirects to `bifrost-net` (JMAP trusted-host
 allowlist, five-hop limit). `bifrost-net` strips `Authorization` on every
 cross-host hop, including injected Basic headers. With an empty JMAP trusted
-host list, the current net API would trust every cross-host target, so JMAP
-uses an impossible sentinel host to refuse those hops. A same-origin-only
-redirect mode requires a net API addition. The bearer path routes through
-bifrost-net; only Basic and the WebSocket handshake build a header via async
+host list, JMAP selects net's same-origin policy, which rejects changes to
+scheme, host, or effective port. The bearer path routes through bifrost-net;
+only Basic and the WebSocket handshake build a header via async
 `header_value()`.
 
-When `send_streaming` passes through a redirect that cannot be followed,
-`ReqwestTransport` currently carries its 3xx status, headers and bounded body
-through `bifrost_net::Error::Status` for both streamed downloads and
-EventSource. That variant and JMAP's account mapping are defined for terminal
-HTTP failures, so a distinct shared nonterminal response shape is needed to
-classify this case without treating it as a terminal status.
+When `send_streaming` passes through a response that is not successful,
+streamed downloads and EventSource preserve its status, headers and bounded
+body in `bifrost_net::Error::UnexpectedResponse`. The shared mapper classifies
+this as an acknowledged protocol contract violation. These bodies bypass JMAP
+Problem Details parsing so they cannot replace that classification.
+
+The WebSocket handshake uses the public `bifrost_net::trace::current_traceparent`
+builder, sharing HTTP's current trace policy. It still connects directly:
+`NetConfig` has no explicit proxy configuration, and reqwest's implicit
+system/environment proxy selection is internal to its HTTP connector. A shared
+proxy resolver and tunnel connector remain necessary for WebSocket parity;
+copying only environment variables would not establish equivalent routing.
 
 ### Error translation
 

@@ -362,14 +362,18 @@ impl crate::blob::download::BlobTransport for ReqwestTransport {
             .await
             .map_err(transport_error_from_net)?;
         if !response.status().is_success() {
-            // The streamed blob door has the same limitation as EventSource:
-            // net has no separate terminal carrier for a passed-through 3xx.
+            // A blob requires a successful response, even when HTTP permits
+            // passing this status through to a caller that understands it.
             let body = passthrough_excerpt(response.body).await;
-            return Err(TransportError::from_net(bifrost_net::Error::Status {
-                code: response.status,
-                headers: response.headers,
-                body,
-            }));
+            return Err(TransportError::from_net(
+                bifrost_net::Error::UnexpectedResponse {
+                    response: bifrost_net::error::FinalResponse {
+                        status: response.status,
+                        headers: response.headers,
+                        body,
+                    },
+                },
+            ));
         }
         Ok(crate::blob::download::BlobDownload {
             bytes_in: response.bytes_in,
@@ -466,15 +470,15 @@ impl SseTransport for ReqwestTransport {
         // hostile or stalled body cannot hang or bloat the failure
         // path.
         let body = passthrough_excerpt(response.body).await;
-        // Net has no separate terminal carrier for a passed-through 3xx.
-        // `Status` preserves its response evidence, but its contract and the
-        // account error mapper treat it as a terminal HTTP failure. Correct
-        // classification needs a shared nonterminal response shape.
-        Err(TransportError::from_net(bifrost_net::Error::Status {
-            code: response.status,
-            body,
-            headers: response.headers,
-        }))
+        Err(TransportError::from_net(
+            bifrost_net::Error::UnexpectedResponse {
+                response: bifrost_net::error::FinalResponse {
+                    status: response.status,
+                    body,
+                    headers: response.headers,
+                },
+            },
+        ))
     }
 }
 
@@ -521,10 +525,7 @@ fn transport_error_from_net(error: bifrost_net::Error) -> TransportError {
 fn redirect_policy_from_trusted_hosts(trusted_hosts: &HashSet<String>) -> RedirectPolicy {
     let mut policy = RedirectPolicy::with_hops(5);
     if trusted_hosts.is_empty() {
-        // Net interprets an empty allowlist as trusting every cross-host
-        // target. Until it exposes a same-origin-only mode, this impossible
-        // host keeps JMAP's default policy from following any cross-host hop.
-        policy = policy.trust_host("__bifrost_jmap_no_cross_host_redirects__");
+        policy = policy.same_origin();
     } else {
         for host in trusted_hosts {
             policy = policy.trust_host(host);
@@ -838,12 +839,33 @@ mod tests {
             Err(err) => err,
             Ok(_) => panic!("a Location-less 308 cannot open a stream"),
         };
+        assert!(matches!(
+            err.net,
+            Some(bifrost_net::Error::UnexpectedResponse { .. })
+        ));
         assert_eq!(
             err.body.as_deref(),
             Some(&b"{\"why\":\"gone\"}"[..]),
             "the passed-through body must reach the error"
         );
     }
+    #[test]
+    fn passed_through_problem_body_keeps_shared_classification() {
+        let error = TransportError::from_net(bifrost_net::Error::UnexpectedResponse {
+            response: bifrost_net::error::FinalResponse {
+                status: reqwest::StatusCode::NOT_MODIFIED,
+                headers: header::HeaderMap::new(),
+                body: Bytes::from_static(
+                    br#"{"type":"urn:ietf:params:jmap:error:limit","status":429}"#,
+                ),
+            },
+        });
+        assert!(matches!(
+            crate::Error::from(error),
+            crate::Error::Transport(_)
+        ));
+    }
+
     #[tokio::test]
     async fn passthrough_excerpt_distinguishes_eof_overflow_and_read_failure() {
         let exact = Bytes::from(vec![b'x'; bifrost_net::STATUS_BODY_CAP]);

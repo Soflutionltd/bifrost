@@ -397,6 +397,11 @@ pub(super) fn literal_bytes<'a>(
             nom::error::ErrorKind::Verify,
         )));
     }
+    // A small section must not keep a much larger response alive after its
+    // siblings have been consumed. Large, proportionate literals stay shared.
+    if data.len() < 4096 || data.len().saturating_mul(4) < backing.len() {
+        return Ok((input, Bytes::copy_from_slice(data)));
+    }
     Ok((input, backing.slice(start..end)))
 }
 

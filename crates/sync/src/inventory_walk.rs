@@ -35,33 +35,43 @@ use crate::error::Error;
 /// Project inventory tombstones into the same removal vocabulary as changes.
 /// Keep these in the page's synthetic batch so its checkpoint cannot be
 /// acknowledged independently of the removals it covers.
-pub(crate) fn removals(
+pub(crate) fn removals<'a>(
     scope: &bifrost_types::CursorScope,
-    removed: &[bifrost_types::ObjectId],
-) -> impl Iterator<Item = bifrost_types::Change> {
+    removed: impl IntoIterator<Item = &'a bifrost_types::ObjectId>,
+) -> Result<Vec<bifrost_types::Change>, bifrost_types::AccountError> {
     use bifrost_types::{
         Change, CursorScope, MembershipScope, ObjectChange, ObjectChangeKind, ScopeChange,
         ScopeChangeKind,
     };
+    let mut removed = removed.into_iter().peekable();
+    if removed.peek().is_none() {
+        return Ok(Vec::new());
+    }
     let membership = match scope {
         CursorScope::Folder(folder) | CursorScope::FolderType { folder, .. } => {
             Some(MembershipScope::Folder(folder.clone()))
         }
         CursorScope::Query(query) => Some(MembershipScope::Query(query.clone())),
         CursorScope::Account | CursorScope::Type(_) => None,
-        _ => panic!("unsupported inventory removal scope"),
+        _ => {
+            return Err(crate::recovery::inventory_removal_scope_contract_failure(
+                scope,
+            ));
+        }
     };
-    removed.iter().cloned().map(move |id| match &membership {
-        Some(membership) => Change::ScopeChange(ScopeChange {
-            id,
-            membership: membership.clone(),
-            kind: ScopeChangeKind::Removed,
-        }),
-        None => Change::ObjectChange(ObjectChange {
-            id,
-            kind: ObjectChangeKind::Destroyed,
-        }),
-    })
+    Ok(removed
+        .map(|id| match &membership {
+            Some(membership) => Change::ScopeChange(ScopeChange {
+                id: id.clone(),
+                membership: membership.clone(),
+                kind: ScopeChangeKind::Removed,
+            }),
+            None => Change::ObjectChange(ObjectChange {
+                id: id.clone(),
+                kind: ObjectChangeKind::Destroyed,
+            }),
+        })
+        .collect())
 }
 
 pub(crate) enum WalkDecision {
@@ -327,6 +337,64 @@ mod tests {
             panic!("a barrier must stop the walk");
         };
         assert_eq!(resume_from, Some(checkpoint(10)));
+    }
+
+    #[test]
+    fn inventory_removals_follow_the_scope_removal_contract() {
+        use bifrost_types::{
+            Change, CursorScope, FolderId, MembershipScope, ObjectChangeKind, ObjectId,
+            ScopeChangeKind,
+        };
+
+        let removed = [ObjectId("gone".into())];
+        let folder = removals(
+            &CursorScope::Folder(FolderId("inbox".into())),
+            removed.iter(),
+        )
+        .expect("folder removal projects");
+        assert_eq!(folder.len(), 1);
+        let Change::ScopeChange(scope_change) = &folder[0] else {
+            panic!("folder removal must be a ScopeChange");
+        };
+        assert_eq!(scope_change.id, removed[0]);
+        assert_eq!(
+            scope_change.membership,
+            MembershipScope::Folder(FolderId("inbox".into()))
+        );
+        assert_eq!(scope_change.kind, ScopeChangeKind::Removed);
+
+        let account =
+            removals(&CursorScope::Account, removed.iter()).expect("account removal projects");
+        assert_eq!(account.len(), 1);
+        let Change::ObjectChange(object_change) = &account[0] else {
+            panic!("account removal must be an ObjectChange");
+        };
+        assert_eq!(object_change.id, removed[0]);
+        assert_eq!(object_change.kind, ObjectChangeKind::Destroyed);
+        let no_removals: [ObjectId; 0] = [];
+        assert!(
+            removals(&CursorScope::Account, no_removals.iter())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unsupported_inventory_removal_scope_has_a_scoped_internal_error() {
+        use bifrost_types::{
+            AccountErrorKind, AccountOperation, CursorScope, ErrorScope, InternalErrorKind,
+            ObjectType, RecoveryClass,
+        };
+
+        let scope = CursorScope::Type(ObjectType::Email);
+        let error = crate::recovery::inventory_removal_scope_contract_failure(&scope);
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Internal(InternalErrorKind::AccountContract)
+        );
+        assert_eq!(error.operation(), Some(AccountOperation::SyncInventory));
+        assert_eq!(error.scope(), Some(&ErrorScope::Cursor(scope)));
+        assert_eq!(error.recovery(), &RecoveryClass::InternalFailure);
     }
 
     fn incident_writer(

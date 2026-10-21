@@ -319,6 +319,19 @@ pub fn into_account_error_with_throttle_scope(
                 contract_violation(&ctx, message, TransmissionState::Acknowledged)
             }
         },
+        Error::UnexpectedResponse { response } => {
+            let builder = base_builder(
+                &ctx,
+                AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+                malformed_response_cause(
+                    &ctx,
+                    format!("unexpected HTTP response {}", response.status),
+                ),
+            );
+            let builder =
+                response_diagnostics(builder, response.status, &response.headers, &response.body);
+            finish(push_attempt(builder, TransmissionState::Acknowledged), &ctx)
+        }
         Error::RedirectRejected { message } => {
             let builder = invalid_argument_builder(&ctx, "redirect_policy", message);
             finish(push_attempt(builder, TransmissionState::Acknowledged), &ctx)
@@ -902,6 +915,7 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
         | Error::InvalidHeader { .. }
         | Error::InvalidRequest { .. }
         | Error::RangeNotHonored { .. }
+        | Error::UnexpectedResponse { .. }
         | Error::RedirectRejected { .. }
         | Error::MalformedRedirect { .. }
         | Error::RedirectLoop { .. }
@@ -930,6 +944,32 @@ fn server_cause_from_status(
 mod retry_hint_tests {
     use super::*;
     use bifrost_types::RecoveryClass;
+
+    #[test]
+    fn unexpected_response_is_an_acknowledged_contract_violation() {
+        let error = into_account_error_with_throttle_scope(
+            Error::UnexpectedResponse {
+                response: FinalResponse {
+                    status: StatusCode::NOT_MODIFIED,
+                    headers: HeaderMap::new(),
+                    body: Bytes::from_static(b"stream unavailable"),
+                },
+            },
+            NetErrorContext {
+                provider: None,
+                protocol: Protocol::Jmap,
+                operation: AccountOperation::PushStream,
+                scope: None,
+            },
+            None,
+        );
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+        );
+        assert!(error.chain().iter().any(|cause| matches!(cause,
+            Cause::Attempt(attempt) if attempt.transmission_state == TransmissionState::Acknowledged)));
+    }
 
     #[test]
     fn final_http_date_survives_status_and_exhausted_errors() {

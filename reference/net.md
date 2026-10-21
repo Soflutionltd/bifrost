@@ -1226,8 +1226,22 @@ rejection of the re-encoded DER, or client-builder failure. These
 route to the account error model as `Request(Malformed)`, not as a
 retryable transport setup failure.
 
+`RedirectPolicy::same_origin()` restricts followed hops to the departing
+scheme, host and effective port, even if `trusted_hosts` names the target.
+The default policy continues to allow any cross-origin target with an empty
+allowlist. JMAP selects the restriction when its trusted-host list is empty.
+
+`UnexpectedResponse { response: FinalResponse }` lets protocol consumers reject
+an otherwise valid passed-through response without fabricating `Status`.
+The shared account mapper preserves response diagnostics and classifies it as
+`Protocol(ContractViolation)` with `Attempt(Acknowledged)`. Net still returns
+passed-through 3xx responses as ordinary response data; consumers opt into this
+failure when their protocol requires success.
+
 ## traceparent
 
+`trace::current_traceparent()` is public so upgrade handshakes can use the
+same builder as HTTP requests. JMAP's WebSocket handshake uses it.
 W3C `traceparent` injected on every outbound request. Span id is
 read from `tracing::Span::current()` when available; trace id is
 freshly minted via `uuid::Uuid::new_v4` per request as a stopgap.
@@ -1431,3 +1445,11 @@ crates/net/src/
   url.rs          // distinct path-component and query-value encoders;
                   // parent_collection_url; origin-rooted well_known_url
 ```
+
+## Upgrade connector limitation
+
+`NetConfig` exposes no explicit proxy input. Reqwest's default connector owns
+implicit environment/system proxy selection, while JMAP WebSocket setup uses
+direct TCP. There is no shared proxy resolution or CONNECT tunnel facility yet.
+A WebSocket connector must share routing selection, bypass rules, proxy
+credentials and proxy TLS handling before it can claim HTTP proxy inheritance.

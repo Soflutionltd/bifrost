@@ -161,6 +161,15 @@ pub enum Error {
         headers: HeaderMap,
     },
 
+    /// A protocol expected a successful response but received a passed-through
+    /// status (for example 304 or a redirect without Location). The transport
+    /// itself returns these responses as data; callers opt into this error.
+    #[error("unexpected HTTP response {}", response.status)]
+    UnexpectedResponse {
+        /// Status, headers and bounded diagnostic excerpt of the response.
+        response: FinalResponse,
+    },
+
     /// Retry budget exhausted. The final response is preserved when
     /// one was received so protocol crates keep status, headers, and
     /// capped body evidence after the retry loop gives up.

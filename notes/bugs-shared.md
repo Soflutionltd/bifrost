@@ -64,6 +64,15 @@ Removing a published variant needs the owner. The `IdempotencyKey` doc in
 `crates/types/src/mutation.rs` still contrasts itself with `StateBased` as
 "optimistic concurrency on the wire".
 
+## SHARED-018 - `RedirectPolicy::allows_host` changed meaning under same-origin mode
+
+Lateral from the same-origin redirect work. The published
+`RedirectPolicy::allows_host` now returns `false` for every host, the departing
+one included, when `same_origin_only` is set, while `admits_hop` admits
+same-origin hops. A caller using `allows_host` as a standalone predicate gets a
+different answer than redirect classification does. At minimum the method doc
+must say so; better, make `allows_host` agree with the hop rule.
+
 ## SHARED-008 - Comments and references still name the deleted net throttle API
 
 Residue: net's provider throttle inference, its `into_account_error` wrapper

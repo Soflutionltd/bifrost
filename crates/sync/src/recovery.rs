@@ -228,6 +228,28 @@ pub(crate) fn inventory_resume_contract_failure(scope: CursorScope) -> AccountEr
     restart_scope_error(scope, AccountOperation::SyncInventory)
 }
 
+/// Classify inventory tombstones for a cursor scope whose removal semantics
+/// the engine does not know. The walk cannot safely guess whether the tombstone
+/// removes one membership or destroys the object, so it must stop before
+/// publishing the page or its checkpoint.
+#[must_use]
+pub(crate) fn inventory_removal_scope_contract_failure(scope: &CursorScope) -> AccountError {
+    let kind = bifrost_types::InternalErrorKind::AccountContract;
+    bifrost_types::AccountErrorBuilder::new(
+        bifrost_types::AccountErrorKind::Internal(kind),
+        bifrost_types::Cause::Internal(bifrost_types::InternalCause::new(
+            kind,
+            Some(bifrost_types::DiagnosticText::support_only(
+                "inventory removals were emitted for an unsupported cursor scope",
+            )),
+        )),
+    )
+    .operation(AccountOperation::SyncInventory)
+    .scope(bifrost_types::ErrorScope::Cursor(scope.clone()))
+    .try_build()
+    .expect("valid inventory removal scope contract error")
+}
+
 /// Make the final recovery event match the action still available after its
 /// automatic budget is spent. A terminal provider error remains useful as
 /// authored, and an existing operator-attention verdict remains useful too.

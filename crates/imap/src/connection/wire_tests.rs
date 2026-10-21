@@ -343,7 +343,7 @@ async fn read_one_reassembles_a_literal_split_across_writes() {
 }
 
 #[tokio::test]
-async fn fetch_literal_fields_share_the_reader_buffer_without_copying() {
+async fn small_fetch_literals_leave_the_reader_allocation_reusable() {
     let (mut reader, _server) = memory_reader();
     let wire = b"* 1 FETCH (BODY[] {5}\r\nhello BINARY[1] {4}\r\ndata)\r\nA001 OK done\r\n";
     reader.buf.extend_from_slice(wire);
@@ -375,8 +375,10 @@ async fn fetch_literal_fields_share_the_reader_buffer_without_copying() {
 
     assert_eq!(body.as_ref(), b"hello");
     assert_eq!(binary.as_ref(), b"data");
-    assert_eq!(body.as_ptr() as usize, buffer_start + body_start);
-    assert_eq!(binary.as_ptr() as usize, buffer_start + binary_start);
+    assert_ne!(body.as_ptr() as usize, buffer_start + body_start);
+    assert_ne!(binary.as_ptr() as usize, buffer_start + binary_start);
+    assert_eq!(reader.buf.as_ptr() as usize, buffer_start);
+    assert_eq!(reader.buf.capacity(), 8192);
     assert!(!reader.buffer_is_empty(), "next response stays buffered");
     assert!(matches!(
         reader.read_one(false).await.expect("tagged completion"),
@@ -804,4 +806,85 @@ async fn status_braces_do_not_spend_the_literal_budget() {
     let (mut reader, mut peer) = memory_reader();
     peer.write_all(b"* OK limit {999}\r\n").await.unwrap();
     assert!(reader.read_one_limited(false, Some(0)).await.is_ok());
+}
+
+// Copies are allocated while the original buffer is still live, so allocator
+// address reuse cannot make a copied payload look shared.
+#[test]
+fn large_fetch_literals_share_only_proportionate_backing() {
+    for (body_len, binary_len, capacity, shared_body, shared_binary) in [
+        (8192, 8192, 32768, true, true),
+        (65536, 8192, 100000, true, false),
+        (8192, 8192, 1024 * 1024, false, false),
+        // Capacity must not exceed twice the frame, or production compacts
+        // the frame into a fresh copy and the pointer no longer matches.
+        (8192, 0, 16384, true, false),
+    ] {
+        let (mut reader, _peer) = memory_reader();
+        reader.buf = BytesMut::with_capacity(capacity);
+        let header = format!("* 1 FETCH (BODY[] {{{body_len}}}\r\n");
+        reader.buf.extend_from_slice(header.as_bytes());
+        let body_start = reader.buf.len();
+        reader.buf.resize(body_start + body_len, b'b');
+        let marker = format!(" BINARY[1] {{{binary_len}}}\r\n");
+        reader.buf.extend_from_slice(marker.as_bytes());
+        let binary_start = reader.buf.len();
+        reader.buf.resize(binary_start + binary_len, b'c');
+        reader.buf.extend_from_slice(b")\r\n");
+        let frame_len = reader.buf.len();
+        reader.buf.extend_from_slice(b"A001 OK done\r\n");
+        let base = reader.buf.as_ptr() as usize;
+        let response = reader
+            .try_parse_response_limited(false, None)
+            .unwrap()
+            .unwrap();
+        let Response::Untagged(response) = response else {
+            panic!("expected untagged response");
+        };
+        let UntaggedResponse::Fetch(fetch) = *response else {
+            panic!("expected FETCH");
+        };
+        let body = fetch.body_sections[0].data.as_ref().unwrap();
+        let binary = fetch.binary_sections[0].data.as_ref().unwrap();
+        assert_eq!(body.len(), body_len);
+        assert_eq!(binary.len(), binary_len);
+        assert_eq!(body.as_ptr() as usize == base + body_start, shared_body);
+        assert_eq!(
+            binary.as_ptr() as usize == base + binary_start,
+            shared_binary
+        );
+        assert_eq!(&reader.buf[..], b"A001 OK done\r\n");
+        assert_eq!(reader.buf.capacity(), 8192);
+        assert_ne!(reader.buf.as_ptr() as usize, base + frame_len);
+    }
+}
+
+#[test]
+fn co_read_responses_do_not_inflate_retained_literal_backing() {
+    let (mut reader, _peer) = memory_reader();
+    reader.buf = BytesMut::with_capacity(1024 * 1024);
+    reader
+        .buf
+        .extend_from_slice(b"* 1 FETCH (BODY[] {8192}\r\n");
+    let start = reader.buf.len();
+    reader.buf.resize(start + 8192, b'x');
+    reader.buf.extend_from_slice(b")\r\n");
+    let frame_len = reader.buf.len();
+    reader.buf.resize(frame_len + 65536, b' ');
+    let base = reader.buf.as_ptr() as usize;
+    let response = reader
+        .try_parse_response_limited(false, None)
+        .unwrap()
+        .unwrap();
+    let Response::Untagged(response) = response else {
+        panic!("expected untagged response");
+    };
+    let UntaggedResponse::Fetch(fetch) = *response else {
+        panic!("expected FETCH");
+    };
+    let body = fetch.body_sections[0].data.as_ref().unwrap();
+    assert_ne!(body.as_ptr() as usize, base + start);
+    assert_eq!(body.len(), 8192);
+    assert_eq!(reader.buf.len(), 65536);
+    assert_eq!(reader.buf.capacity(), 65536);
 }

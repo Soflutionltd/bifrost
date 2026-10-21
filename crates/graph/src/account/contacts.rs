@@ -160,6 +160,21 @@ pub(crate) async fn update(
             AccountOperation::ContactUpdate,
         ));
     }
+    // This update path does not issue a folder-aware move. Refuse the target
+    // instead of reporting success for a PATCH that only changes contact
+    // fields, which would also leave a caller-supplied version guarding no
+    // folder change at all.
+    if patch.address_book_id.is_some() {
+        return Err(
+            graph_error::unsupported_account_error(AccountOperation::ContactUpdate)
+                .into_builder()
+                .text(bifrost_types::DiagnosticText::support_only(
+                    "Graph contact updates cannot move a contact between address books".to_string(),
+                ))
+                .try_build()
+                .expect("valid account error classification"),
+        );
+    }
     if patch.photo.is_some() {
         return Err(
             graph_error::unsupported_account_error(AccountOperation::ContactUpdate)
@@ -1404,6 +1419,39 @@ mod tests {
             let write = requests.last().unwrap();
             assert_eq!(write.method, "PATCH");
             assert_eq!(write.if_match.as_deref(), expected.or(Some("W/\"fresh\"")));
+        }
+    }
+
+    #[tokio::test]
+    async fn contact_update_refuses_address_book_changes_before_io() {
+        for expected_version in [
+            None,
+            Some(bifrost_types::ServerVersion::ETag(
+                "W/\"caller-version\"".into(),
+            )),
+        ] {
+            let (client, account) = test_account();
+            client.script_rest([]);
+
+            let error = update(
+                account,
+                ContactId("contact-1".into()),
+                ContactPatch {
+                    expected_version,
+                    address_book_id: Some(AddressBookId("folder-2".into())),
+                    display_name: Some(Some("Ada".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("Graph must not acknowledge an unimplemented folder move");
+
+            assert!(matches!(
+                error.kind(),
+                bifrost_types::AccountErrorKind::Unsupported(AccountOperation::ContactUpdate)
+            ));
+            assert_eq!(error.operation(), Some(AccountOperation::ContactUpdate));
+            assert_eq!(client.wire_attempts(), 0, "nothing may be sent");
         }
     }
 

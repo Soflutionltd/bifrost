@@ -170,6 +170,7 @@ impl TransportError {
 /// typed auth failure with a status-derived guess.
 fn preserved_response_body(error: &bifrost_net::Error) -> Option<Bytes> {
     match error {
+        bifrost_net::Error::UnexpectedResponse { response } => Some(response.body.clone()),
         bifrost_net::Error::RateLimited { final_response, .. } => Some(final_response.body.clone()),
         bifrost_net::Error::RetryBudgetExhausted {
             final_response: Some(final_response),

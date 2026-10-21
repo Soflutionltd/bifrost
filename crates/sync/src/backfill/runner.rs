@@ -1,8 +1,8 @@
 //! Backfill partition runner.
 //!
 //! Walks `inventory_partition_stream(scope)` and forwards each `Batch`
-//! as a `MultiplexerEvent` carrying `Change::ObjectChange::Created`
-//! items plus a `BackfillCheckpoint` checkpoint. The runner filters
+//! as a `MultiplexerEvent` carrying inventory entries and removals plus
+//! a `BackfillCheckpoint` checkpoint. The runner filters
 //! each page through `LiveSupersedes`, which is intentionally never
 //! populated - see that type's docs for why "we broadcast it" is not
 //! evidence the consumer received it, and what a sound producer would
@@ -43,7 +43,7 @@
 //! changes take no capacity, are never stamped, and are never delayed by a
 //! parked backfill.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -66,9 +66,10 @@ use super::partitioner::partition_key;
 /// grow unboundedly in long-running sessions.
 pub const LIVE_SUPERSEDES_DEFAULT_CAP: usize = 100_000;
 
-/// Side channel intended to let live `Created` changes pre-empt
-/// inventory entries, so cold-start hydration does not double-emit
-/// objects the live stream has already shown.
+/// Side channel intended to let live `Created` changes pre-empt stale
+/// inventory observations, so cold-start inventory does not emit an old
+/// entry or removal after the live stream has already shown the object's
+/// newer state.
 ///
 /// The set is capped (default `LIVE_SUPERSEDES_DEFAULT_CAP`); on
 /// overflow the oldest insertion is dropped.
@@ -161,9 +162,9 @@ impl LiveSupersedes {
         }
     }
 
-    /// Mark an id as superseded by the live stream. Subsequent
-    /// backfill passes will skip it. On overflow the oldest entry is
-    /// dropped from the ring.
+    /// Mark an id as superseded by the live stream. A backfill page skips
+    /// inventory entries and removal ids for it. On overflow the oldest entry
+    /// is dropped from the ring.
     ///
     /// No production path calls this, and adding one is not a matter of
     /// finding a convenient call site - see the type docs for what a
@@ -340,9 +341,9 @@ impl Default for BackfillPartitionOutcome {
 
 impl BackfillRunner {
     /// Walk one inventory pass to completion. Forwards each `Batch`
-    /// onto the per-account `changes_tx` broadcast as
-    /// `Change::ObjectChange::Created` (skipping ids in
-    /// `LiveSupersedes`), each page carrying a `BackfillCheckpoint`.
+    /// onto the per-account `changes_tx` broadcast as `Created` changes and
+    /// projected removals (skipping superseded ids), each page carrying a
+    /// `BackfillCheckpoint`.
     /// Does NOT write to `CheckpointStore`: durable advance is
     /// consumer-ack-driven (see module docs). Checkpoint progress counts
     /// entries observed before filtering because it describes the
@@ -440,9 +441,27 @@ impl BackfillRunner {
                     let seen = u64::try_from(batch.items.len().saturating_add(batch.removed.len()))
                         .unwrap_or(u64::MAX);
                     seen_total = seen_total.saturating_add(seen);
-                    let kept = filter_supersedes(&batch.items, live);
+                    let (kept, kept_removed) =
+                        filter_inventory_supersedes(&batch.items, &batch.removed, live);
                     let kept_count = u64::try_from(kept.len()).unwrap_or(u64::MAX);
                     kept_total = kept_total.saturating_add(kept_count);
+                    let projected_removals = if changes_tx.is_some() {
+                        match crate::inventory_walk::removals(&scope, kept_removed.iter().copied())
+                        {
+                            Ok(removals) => removals,
+                            Err(error) => {
+                                if let Some(tx) = &changes_tx {
+                                    let _ = tx.send(MultiplexerEvent::unacked(
+                                        scope.clone(),
+                                        Arc::new(SyncEvent::Terminated(error.clone())),
+                                    ));
+                                }
+                                return Err(Error::Account(error));
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
 
                     let crossed = if batch.coverage.has_barrier() {
                         cross_waived_barriers(writer_tx, &batch.coverage, generation).await?
@@ -472,7 +491,7 @@ impl BackfillRunner {
                                         kind: ObjectChangeKind::Created,
                                     })
                                 })
-                                .chain(crate::inventory_walk::removals(&scope, &batch.removed))
+                                .chain(projected_removals)
                                 .collect();
                             let synthetic = Batch {
                                 items: changes,
@@ -579,7 +598,7 @@ impl BackfillRunner {
                                     kind: ObjectChangeKind::Created,
                                 })
                             })
-                            .chain(crate::inventory_walk::removals(&scope, &batch.removed))
+                            .chain(projected_removals)
                             .collect();
                         let synthetic = Batch {
                             items: changes,
@@ -801,11 +820,35 @@ fn warn_barrier(
     ));
 }
 
-fn filter_supersedes<'a>(
+fn filter_inventory_supersedes<'a>(
     items: &'a [InventoryEntry],
+    removed: &'a [ObjectId],
     live: &LiveSupersedes,
-) -> Vec<&'a InventoryEntry> {
-    items.iter().filter(|entry| !live.take(&entry.id)).collect()
+) -> (Vec<&'a InventoryEntry>, Vec<&'a ObjectId>) {
+    if live.is_empty() {
+        return (items.iter().collect(), removed.iter().collect());
+    }
+
+    // A live re-add supersedes every stale inventory observation of its id,
+    // including a tombstone. Forwarding that removal after the re-add could
+    // erase the object the live event just restored.
+    let mut superseded = HashSet::new();
+    for id in items.iter().map(|entry| &entry.id).chain(removed.iter()) {
+        if !superseded.contains(id) && live.take(id) {
+            superseded.insert(id.clone());
+        }
+    }
+
+    (
+        items
+            .iter()
+            .filter(|entry| !superseded.contains(&entry.id))
+            .collect(),
+        removed
+            .iter()
+            .filter(|id| !superseded.contains(*id))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -840,7 +883,37 @@ mod tests {
         // not evidence the consumer received it.
         let live = LiveSupersedes::new();
         let page = vec![entry("a"), entry("b"), entry("c")];
-        assert_eq!(filter_supersedes(&page, &live).len(), 3);
+        let (kept, removed) = filter_inventory_supersedes(&page, &[], &live);
+        assert_eq!(kept.len(), 3);
+        assert!(removed.is_empty());
+        assert!(live.is_empty());
+    }
+
+    #[test]
+    fn live_supersedes_filters_inventory_removals_and_same_page_entries() {
+        let live = LiveSupersedes::new();
+        let id = ObjectId("readded".into());
+        live.add(id.clone());
+        let removed_only_id = ObjectId("readded-through-removal".into());
+        live.add(removed_only_id.clone());
+
+        let items = vec![entry("readded"), entry("still-present")];
+        let removed = vec![id, removed_only_id, ObjectId("still-removed".into())];
+        let (kept, kept_removed) = filter_inventory_supersedes(&items, &removed, &live);
+
+        assert_eq!(
+            kept.iter()
+                .map(|item| item.id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["still-present"]
+        );
+        assert_eq!(
+            kept_removed
+                .iter()
+                .map(|id| id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["still-removed"]
+        );
         assert!(live.is_empty());
     }
 

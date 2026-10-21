@@ -336,7 +336,11 @@ impl InventoryFusion {
                         self.record_barriers(&scope, &batch.coverage, resume_from)
                             .await?;
                         if let Some(tx) = &changes_tx {
-                            self.forward_inventory_batch(tx, &scope, &batch, None);
+                            if let Err(error) =
+                                self.forward_inventory_batch(tx, &scope, &batch, None)
+                            {
+                                return Ok(FusionOutcome::Terminated(error));
+                            }
                             Self::warn_degraded(&changes_tx, &scope, &batch.coverage);
                         }
                         return Ok(FusionOutcome::NoCursor);
@@ -344,8 +348,11 @@ impl InventoryFusion {
                     let checkpoint = batch.checkpoint.accepted(crossed).cloned();
                     validate_checkpoint_envelope(checkpoint.as_ref())?;
                     walk.accept(checkpoint.clone());
-                    if let Some(tx) = &changes_tx {
-                        self.forward_inventory_batch(tx, &scope, &batch, checkpoint);
+                    if let Some(tx) = &changes_tx
+                        && let Err(error) =
+                            self.forward_inventory_batch(tx, &scope, &batch, checkpoint)
+                    {
+                        return Ok(FusionOutcome::Terminated(error));
                     }
                 }
                 // A producer-emitted warning is forwarded, not absorbed. Graph
@@ -496,7 +503,19 @@ impl InventoryFusion {
         scope: &CursorScope,
         batch: &bifrost_types::InventoryBatch,
         checkpoint: Option<Checkpoint>,
-    ) {
+    ) -> Result<(), AccountError> {
+        let removals = match crate::inventory_walk::removals(scope, batch.removed.iter()) {
+            Ok(removals) => removals,
+            Err(error) => {
+                let _ = tx.sender().send(MultiplexerEvent {
+                    scope: scope.clone(),
+                    event: Arc::new(SyncEvent::Terminated(error.clone())),
+                    checkpoint: None,
+                    publication: None,
+                });
+                return Err(error);
+            }
+        };
         // Inventory entries describe object existence; surface them as
         // `Created` changes so consumers handle inventory the same way
         // they handle a freshly-discovered object on the live stream.
@@ -509,7 +528,7 @@ impl InventoryFusion {
                     kind: ObjectChangeKind::Created,
                 })
             })
-            .chain(crate::inventory_walk::removals(scope, &batch.removed))
+            .chain(removals)
             .collect();
         let synthetic = bifrost_types::Batch {
             items: changes,
@@ -538,6 +557,7 @@ impl InventoryFusion {
         if !tx.publish_acknowledgeable(me) {
             self.retire_claim(publication);
         }
+        Ok(())
     }
 
     async fn finalize(

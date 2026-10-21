@@ -42,7 +42,7 @@ pub mod status_line;
 // and a published copy for downstream.
 #[cfg(any(feature = "test-support", test))]
 pub mod test_support;
-pub(crate) mod trace;
+pub mod trace;
 mod upload;
 pub mod url;
 

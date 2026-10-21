@@ -751,6 +751,10 @@ A scope removal does not assert global destruction. Consumers apply the whole
 batch, including removals, and its checkpoint in one transaction before acking.
 A barrier page still delivers removals, but carries no accepted checkpoint.
 Graph fills this lane from delta tombstones; other providers leave it empty.
+If a nonempty removal list arrives for a cursor scope without a defined
+projection, the walk emits a scoped `Internal(AccountContract)` termination
+before forwarding the batch or its checkpoint. Neither global destruction nor
+dropping the removal is a safe guess.
 
 ### Batch boundary validation
 
@@ -1758,13 +1762,16 @@ tests' doc comments was applied, observed to fail the test, and restored.
 
 `LiveSupersedes` is the ring-evicting `(VecDeque + HashSet)` set
 `BackfillRunner::run_partition` filters each inventory page through,
-via `filter_supersedes`. Default cap
+via `filter_inventory_supersedes`. It filters removal ids as well as entries:
+a newer live re-add supersedes a stale inventory tombstone, which otherwise
+could erase the object after that re-add. When one id appears in both lanes of
+the same page, both observations are suppressed. Default cap
 `LIVE_SUPERSEDES_DEFAULT_CAP = 100_000`; overflow drops the oldest
 insertion.
 
 **Nothing populates it, and that is deliberate.** No production
 path calls `add`, so the filter is a no-op and every inventory
-entry is forwarded. Cold-start can therefore re-emit a `Created`
+entry and removal is forwarded. Cold-start can therefore re-emit a `Created`
 for an object the live stream already announced. That duplicate is
 accepted: consumers must already tolerate a repeated `Created`,
 because a crash mid-plan re-walks every partition and re-emits
@@ -3298,8 +3305,8 @@ sled / sqlite default; storage is consumer-owned.
 use the greatest parsed page upper bound, then lexicographically
 greatest opaque partition bytes, so equal-sized page windows resume
 deterministically from the furthest one. Page checkpoint
-`items_done` counts entries observed before `LiveSupersedes` filtering plus
-explicit removals;
+`items_done` counts entries and explicit removals observed before
+`LiveSupersedes` filtering;
 filtering therefore cannot make a full inventory window look short and
 falsely signal exhaustion.
 

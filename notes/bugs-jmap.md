@@ -17,13 +17,13 @@ Filed from the October 2026 defect hunt: the jmap protocol scope, the jmap
 account scope, and the net and sync adoption scopes where they reached JMAP.
 Severity labels are the hunters' own.
 
-## JMAP-027 - WebSocket proxy inheritance and trace context need net facilities
+## JMAP-027 - The WebSocket handshake does not inherit the account proxy
 
-Residue: the WebSocket handshake has bounded setup, a User-Agent, refused
-redirects, one-shot 401 recovery and metering. It still does not inherit the
-account proxy and sends no trace context, because `bifrost-net` exposes neither a
-proxy or tunnel connector nor a public trace-context builder; the limits are
-documented at the code sites.
+Residue: the handshake now sends trace context through net's public
+`trace::current_traceparent()`. It still opens a direct TCP connection, because
+reqwest owns implicit proxy selection and `bifrost-net` has no shared proxy
+resolver or tunnel connector the handshake could use. Documented at the code
+site and in both references.
 
 ## JMAP-034 - The PIM send path as a state machine with compensations
 

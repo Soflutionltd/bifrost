@@ -407,6 +407,15 @@ impl std::error::Error for Error {}
 
 impl From<core::transport::TransportError> for Error {
     fn from(e: core::transport::TransportError) -> Self {
+        // A passed-through response is not a JMAP request failure document.
+        // Preserve the shared protocol classification even if its body happens
+        // to deserialize as Problem Details.
+        if matches!(
+            e.net.as_ref().map(bifrost_net::Error::terminal),
+            Some(bifrost_net::Error::UnexpectedResponse { .. })
+        ) {
+            return Error::Transport(e);
+        }
         if let Some(ref body) = e.body
             && let Ok(problem) = serde_json::from_slice::<ProblemDetails>(body)
         {

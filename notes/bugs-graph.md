@@ -40,19 +40,4 @@ mutations, IMAP enforcement of a caller MODSEQ (IMAP-022), versioned DAV
 relocations, and whether the absent-version fetch-then-condition path that
 guards only the GET-to-write gap should go.
 
-## GRAPH-013 - Graph calendar update preflight errors are labelled `EventGet`
-
-Lateral from the caller-version work. In `crates/graph/src/account/calendar.rs`
-an update's preflight read failure is attributed to the `EventGet` operation
-rather than the update the caller made, so telemetry and recovery context name
-the wrong operation.
-
-## GRAPH-014 - A versioned Graph contact update that changes folder is not checked
-
-Lateral from the caller-version work. DAV refuses a caller-versioned update that
-relocates the object. A Graph contact update whose `address_book_id` names a
-different folder was not traced: if it moves the contact, the caller's ETag
-guards the PATCH but not the move, and it should be refused the same way.
-Separately, Graph's `expected_etag` accepts `W/"x"` but not lowercase `w/"x"`
-because the weak check is case-insensitive while the strip is not.
 

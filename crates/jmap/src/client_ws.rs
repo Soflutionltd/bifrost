@@ -495,12 +495,16 @@ impl Client {
         // carry credentials onward to a Location supplied by a different host.
         // It uses a direct TCP connection; reqwest proxy configuration applies
         // only to HTTP; Net exposes no proxy resolution or tunnel connector.
-        // Net's trace context builder is private to its HTTP pipeline, so this
-        // path does not invent a second traceparent generation policy.
         let builder = ClientBuilder::from_uri(uri.clone())
             .add_header(
                 header::USER_AGENT,
                 HeaderValue::from_static(concat!("bifrost-jmap/", env!("CARGO_PKG_VERSION"))),
+            )
+            .map_err(crate::Error::WebSocketHandshake)?
+            .add_header(
+                header::HeaderName::from_static("traceparent"),
+                HeaderValue::from_str(&bifrost_net::trace::current_traceparent())
+                    .map_err(crate::Error::from_invalid_header)?,
             )
             .map_err(crate::Error::WebSocketHandshake)?
             .add_header(header::AUTHORIZATION, auth_value)
