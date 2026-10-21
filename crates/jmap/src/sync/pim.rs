@@ -528,43 +528,72 @@ pub(crate) fn send_message<T: HttpTransport>(
             .get(&email_handle)
             .map_err(to_acct_err(AccountOperation::Send))
             .map(|result| {
-                if let Some(new_state) = result.new_state().filter(|state| !state.is_empty()) {
-                    // An absent `newState` is non-conforming and an empty
-                    // one names no state; neither belongs in the cache.
-                    let state = new_state.to_string();
-                    (result, Some(state))
-                } else {
-                    (result, None)
-                }
+                let new_state = result
+                    .new_state()
+                    .filter(|state| !state.is_empty())
+                    .map(str::to_string);
+                (result, new_state)
             });
-        let email_result = match email_result {
-            Ok((mut result, new_state)) => {
-                if let Some(new_state) = new_state {
-                    state_cache::advance(
-                        &email_states,
-                        &account_id,
-                        prior_state.as_deref(),
-                        new_state,
-                    )
-                    .await;
-                }
-                result
-                    .created(&email_create_id)
-                    .map_err(to_acct_err(AccountOperation::Send))
-                    .and_then(|email| require_created_email_id(&email, AccountOperation::Send))
-            }
-            Err(error) => Err(error),
-        };
 
         let submission = match submission_result {
             Ok(submission) => submission,
             Err((error, rejected)) => {
-                if rejected && let Ok(email_id) = email_result.as_ref() {
-                    discard_created_send_email(&mail, &email_states, &account_id, email_id).await;
+                if let Ok((_, Some(new_state))) = email_result.as_ref() {
+                    state_cache::advance(
+                        &email_states,
+                        &account_id,
+                        prior_state.as_deref(),
+                        new_state.clone(),
+                    )
+                    .await;
+                }
+                if rejected
+                    && let Ok((mut result, _)) = email_result
+                    && let Ok(email) = result.created(&email_create_id)
+                    && let Ok(email_id) = require_created_email_id(&email, AccountOperation::Send)
+                {
+                    discard_created_send_email(&mail, &email_states, &account_id, &email_id).await;
                 }
                 return Err(error);
             }
         };
+
+        // RFC 8621 appends the implicit Email/set result under the
+        // submission call id. Its state follows the initial Email create,
+        // so advance once to the newest state rather than CAS-advancing
+        // twice against the same pre-call value.
+        let implicit_email_state = response
+            .get_method::<EmailSet>(&submission_handle.call_id)
+            .ok()
+            .and_then(|result| {
+                result
+                    .new_state()
+                    .filter(|state| !state.is_empty())
+                    .map(str::to_string)
+            });
+        let email_state = implicit_email_state.or_else(|| {
+            email_result
+                .as_ref()
+                .ok()
+                .and_then(|(_, state)| state.clone())
+        });
+        if let Some(new_state) = email_state {
+            state_cache::advance(
+                &email_states,
+                &account_id,
+                prior_state.as_deref(),
+                new_state,
+            )
+            .await;
+        }
+
+        let email_result = email_result
+            .and_then(|(mut result, _)| {
+                result
+                    .created(&email_create_id)
+                    .map_err(to_acct_err(AccountOperation::Send))
+            })
+            .and_then(|email| require_created_email_id(&email, AccountOperation::Send));
 
         let email_id = email_result.map_err(|error| {
             incomplete_multi_step_write(
@@ -677,34 +706,62 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
                 let imported_state = result.new_state().to_string();
                 (result, imported_state)
             });
-        let email_result = match email_result {
-            Ok((mut result, imported_state)) => {
-                if !imported_state.is_empty() {
-                    state_cache::advance(
-                        &email_states,
-                        &account_id,
-                        prior_state.as_deref(),
-                        imported_state,
-                    )
-                    .await;
-                }
-                result
-                    .created(&import_create_id)
-                    .map_err(to_acct_err(AccountOperation::Send))
-                    .and_then(|email| require_created_email_id(&email, AccountOperation::Send))
-            }
-            Err(error) => Err(error),
-        };
 
         match submission_result {
             Ok(_) => {}
             Err((error, rejected)) => {
-                if rejected && let Ok(email_id) = email_result.as_ref() {
-                    discard_created_send_email(&mail, &email_states, &account_id, email_id).await;
+                if let Ok((_, imported_state)) = email_result.as_ref()
+                    && !imported_state.is_empty()
+                {
+                    state_cache::advance(
+                        &email_states,
+                        &account_id,
+                        prior_state.as_deref(),
+                        imported_state.clone(),
+                    )
+                    .await;
+                }
+                if rejected
+                    && let Ok((mut result, _)) = email_result
+                    && let Ok(email) = result.created(&import_create_id)
+                    && let Ok(email_id) = require_created_email_id(&email, AccountOperation::Send)
+                {
+                    discard_created_send_email(&mail, &email_states, &account_id, &email_id).await;
                 }
                 return Err(error);
             }
         }
+        let implicit_email_state = response
+            .get_method::<EmailSet>(&submission_handle.call_id)
+            .ok()
+            .and_then(|result| {
+                result
+                    .new_state()
+                    .filter(|state| !state.is_empty())
+                    .map(str::to_string)
+            });
+        let email_state = implicit_email_state.or_else(|| {
+            email_result
+                .as_ref()
+                .ok()
+                .and_then(|(_, state)| (!state.is_empty()).then(|| state.clone()))
+        });
+        if let Some(new_state) = email_state {
+            state_cache::advance(
+                &email_states,
+                &account_id,
+                prior_state.as_deref(),
+                new_state,
+            )
+            .await;
+        }
+        let email_result = email_result
+            .and_then(|(mut result, _)| {
+                result
+                    .created(&import_create_id)
+                    .map_err(to_acct_err(AccountOperation::Send))
+            })
+            .and_then(|email| require_created_email_id(&email, AccountOperation::Send));
         let email_id = email_result.map_err(|error| {
             incomplete_multi_step_write(
                 AccountOperation::Send,
@@ -892,17 +949,33 @@ pub(crate) fn draft_send<T: HttpTransport>(
             .on_success_update_email(SUBMISSION_CREATE_ID)
             .submitted_to_sent(&sent_mailbox, draft_mailbox.as_ref());
         let prior_state = state_cache::get(&email_states, &account_id).await;
-        let mut response = mail
+        let mut request = mail.build();
+        let submission_handle = request
             .call(submission_set)
+            .map_err(to_acct_err(AccountOperation::DraftSend))?;
+        let mut response = request
+            .send()
             .await
             .map_err(to_acct_err(AccountOperation::DraftSend))?;
         response
-            .created(SUBMISSION_CREATE_ID)
+            .get(&submission_handle)
+            .and_then(|mut result| result.created(SUBMISSION_CREATE_ID))
             .map_err(to_acct_err(AccountOperation::DraftSend))?;
         // The submission is already committed. A failed cache refresh must
         // not turn that success into an error that invites a duplicate send;
         // the stale state will be reconciled by the next conditional mutation.
-        if let Ok(fresh) = super::mutation::probe_email_state(&mail).await {
+        let implicit_state = response
+            .get_method::<EmailSet>(&submission_handle.call_id)
+            .ok()
+            .and_then(|result| {
+                result
+                    .new_state()
+                    .filter(|state| !state.is_empty())
+                    .map(str::to_string)
+            });
+        if let Some(state) = implicit_state {
+            state_cache::advance(&email_states, &account_id, prior_state.as_deref(), state).await;
+        } else if let Ok(fresh) = super::mutation::probe_email_state(&mail).await {
             state_cache::advance(&email_states, &account_id, prior_state.as_deref(), fresh).await;
         }
         Ok(ObjectId(draft_id.into_string()))
@@ -5906,6 +5979,7 @@ mod tests {
         fail_cancel: bool,
         fail_probe_after_submission: bool,
         missing_email: bool,
+        implicit_email_state: Option<&'static str>,
     }
 
     impl SendTransport {
@@ -5923,6 +5997,7 @@ mod tests {
                 fail_cancel,
                 fail_probe_after_submission,
                 missing_email,
+                implicit_email_state: None,
             }
         }
 
@@ -6199,7 +6274,25 @@ mod tests {
                         _ => {}
                     }
                 }
-                responses.push(serde_json::json!([method, result, call_id]));
+                responses.push(serde_json::json!([method, result, call_id.clone()]));
+                let email_success_update = args["onSuccessUpdateEmail"].is_object();
+                let email_success_destroy = args["onSuccessDestroyEmail"].is_array();
+                if method == "EmailSubmission/set"
+                    && self.implicit_email_state.is_some()
+                    && !self.fail_submission
+                    && (email_success_update || email_success_destroy)
+                {
+                    responses.push(serde_json::json!([
+                        "Email/set",
+                        {
+                            "accountId": account_id.clone(),
+                            "oldState": "email-created-state",
+                            "newState": self.implicit_email_state,
+                            "updated": {"email-created": null}
+                        },
+                        call_id
+                    ]));
+                }
             }
 
             Ok(bytes::Bytes::from(
@@ -6349,6 +6442,89 @@ mod tests {
         assert_eq!(
             state_cache::get(&states, "primary").await.as_deref(),
             Some("email-updated-state")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_advances_email_state_from_implicit_email_set_response() {
+        let mut transport = SendTransport::new(false, false, false, false);
+        transport.implicit_email_state = Some("email-after-send");
+        let states = send_state_map();
+        state_cache::set(&states, "primary", "email-before-send".to_string()).await;
+
+        let sent = send_message(
+            send_account(transport.clone()),
+            Arc::clone(&states),
+            "primary".to_string(),
+            3600,
+            None,
+            basic_send_request(),
+        )
+        .await
+        .expect("submission succeeds");
+
+        assert_eq!(sent, ObjectId("email-created".to_string()));
+        assert_eq!(
+            state_cache::get(&states, "primary").await.as_deref(),
+            Some("email-after-send")
+        );
+        assert_eq!(
+            transport.method_sequence(),
+            vec!["Mailbox/get", "Email/set", "EmailSubmission/set"]
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_send_advances_email_state_from_implicit_email_set_response() {
+        let mut transport = SendTransport::new(false, false, false, false);
+        transport.implicit_email_state = Some("email-after-raw-send");
+        let states = send_state_map();
+        state_cache::set(&states, "primary", "email-before-send".to_string()).await;
+
+        send_raw_message(
+            send_account(transport.clone()),
+            Arc::clone(&states),
+            "primary".to_string(),
+            Bytes::from_static(b"raw message"),
+            None,
+        )
+        .await
+        .expect("submission succeeds");
+
+        assert_eq!(
+            state_cache::get(&states, "primary").await.as_deref(),
+            Some("email-after-raw-send")
+        );
+        assert_eq!(
+            transport.method_sequence(),
+            vec!["Mailbox/get", "Email/import", "EmailSubmission/set"]
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_send_uses_implicit_email_set_state_without_a_probe() {
+        let mut transport = SendTransport::new(false, false, true, false);
+        transport.implicit_email_state = Some("email-after-draft-send");
+        let states = send_state_map();
+        state_cache::set(&states, "primary", "email-before-send".to_string()).await;
+
+        let sent = draft_send(
+            send_account(transport.clone()),
+            Arc::clone(&states),
+            "primary".to_string(),
+            bifrost_types::DraftHandle("email-old".to_string()),
+        )
+        .await
+        .expect("submission succeeds without a post-send probe");
+
+        assert_eq!(sent, ObjectId("email-old".to_string()));
+        assert_eq!(
+            state_cache::get(&states, "primary").await.as_deref(),
+            Some("email-after-draft-send")
+        );
+        assert_eq!(
+            transport.method_sequence(),
+            vec!["Mailbox/get", "EmailSubmission/set"]
         );
     }
 

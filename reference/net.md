@@ -824,16 +824,26 @@ failed request into per-item failures and still emit a batch; recording from the
 `Response` would report zero for exactly the batches that hit trouble.
 
 Above this, each protocol crate owns a batch-scoped accumulator - `ByteTally` in
-bifrost-google, bifrost-graph, and bifrost-jmap - because an engine batch
+bifrost-google, bifrost-graph, and bifrost-jmap, and `DavByteTally` in
+bifrost-dav-core for CalDAV and CardDAV - because an engine batch
 routinely covers several requests: a list page plus a hydration fan-out, a
 `$batch` submission plus its etag preflight, an `Email/set` plus its state
-probe and post-`stateMismatch` retry. A metered client handle is one `Arc` bump
-over the same transport and reports every buffered response into one stream's
+probe and post-`stateMismatch` retry. A metered client handle shares the existing
+transport and reports every buffered response into one stream's
 accumulator; each emitted batch takes and clears it, so consecutive batches
 partition the traffic rather than each restating a running total. Deliberately
 NOT a delta across the cumulative account meter: that meter is shared by every
 concurrent request on the account, so a delta would attribute another scope's
 traffic to this batch.
+
+DAV installs the tally on a cloned `DavDispatch` for each inventory or changes
+stream. Every buffered net send uses `count_bytes_into` and records its counter
+before DAV decodes or classifies the result. The local redirect walk and 401
+refresh therefore contribute all their net sends, including error-body drains,
+to the same tally. Each batch calls `take()`. This measures fetched HTTP body
+octets, before DAV's lossy UTF-8 conversion and diagnostic truncation, rather
+than the length of decoded XML. It excludes HTTP headers and transport framing;
+it is not a TCP/TLS wire-byte total.
 
 ### Bodies abandoned before they are read are not metered
 

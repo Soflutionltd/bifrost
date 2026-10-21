@@ -396,6 +396,7 @@ mod bandwidth_review_tests {
             Some(sink),
             Some(budget.clone()),
         );
+        let inbound_bytes = reader.metering().inbound_counter();
         let mut state = ProtocolState::new();
         let (_, crate::types::Response::Greeting(greeting)) = crate::codec::decode::parse_greeting(
             b"* PREAUTH [CAPABILITY IMAP4rev1 COMPRESS=DEFLATE] ready\r\n",
@@ -437,9 +438,18 @@ mod bandwidth_review_tests {
             counter.0.load(Ordering::Relaxed),
             u64::try_from(ok_len).unwrap()
         );
+        assert_eq!(
+            inbound_bytes.load(Ordering::Relaxed),
+            u64::try_from(ok_len).unwrap(),
+            "the coalesced deflate suffix is counted after decompression"
+        );
         reader.read_one(false).await.unwrap();
         assert_eq!(
             counter.0.load(Ordering::Relaxed),
+            u64::try_from(ok_len + plaintext.len()).unwrap()
+        );
+        assert_eq!(
+            inbound_bytes.load(Ordering::Relaxed),
             u64::try_from(ok_len + plaintext.len()).unwrap()
         );
         let next = budget.reserve(BandwidthDirection::Inbound, 1024);

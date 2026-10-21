@@ -135,9 +135,7 @@ pub(crate) fn classify(
                 "STATUS command dispatched without setting command_target"
             );
             match ctx.command_target {
-                Some(target) if mailbox_names_eq(mailbox.as_ref(), target.as_ref()) => {
-                    OnlySolicited
-                }
+                Some(target) if mailbox.matches_mailbox(target) => OnlySolicited,
                 _ => OnlyUnsolicited,
             }
         }

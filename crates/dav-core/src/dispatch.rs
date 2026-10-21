@@ -28,6 +28,7 @@
 
 use crate::error::net_account_error as into_account_error;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
 use bifrost_net::{
@@ -87,6 +88,26 @@ pub trait DavRequestGuard: Send + Sync {
     ) -> Result<(), AccountError>;
 }
 
+/// Inbound response-body bytes attributed to one DAV account stream.
+///
+/// A metered dispatcher records request-local net counters here, including
+/// error drains, retries and redirect hops. Separate streams own separate
+/// tallies even when they share an account transport.
+#[derive(Clone, Default)]
+pub struct DavByteTally(Arc<AtomicU64>);
+
+impl DavByteTally {
+    fn add(&self, n: u64) {
+        self.0.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Take the bytes recorded since the preceding batch boundary.
+    #[must_use]
+    pub fn take(&self) -> u64 {
+        self.0.swap(0, Ordering::Relaxed)
+    }
+}
+
 /// A DAV client's transport half: the account handle, credentials, and the set
 /// of origins those credentials may reach.
 #[derive(Clone)]
@@ -97,6 +118,7 @@ pub struct DavDispatch {
     trusted_origins: Vec<String>,
     protocol: DavProtocol,
     request_guard: Option<Arc<dyn DavRequestGuard>>,
+    byte_tally: Option<DavByteTally>,
 }
 
 impl DavDispatch {
@@ -164,7 +186,18 @@ impl DavDispatch {
             trusted_origins,
             protocol,
             request_guard: None,
+            byte_tally: None,
         }
+    }
+
+    /// Clone this dispatcher with a fresh stream-local byte tally.
+    /// The transport, credentials and request guard retain their identity.
+    #[must_use]
+    pub fn metered(&self) -> (Self, DavByteTally) {
+        let tally = DavByteTally::default();
+        let mut dispatch = self.clone();
+        dispatch.byte_tally = Some(tally.clone());
+        (dispatch, tally)
     }
 
     /// Install a dialect policy before sharing the account. The policy may
@@ -536,7 +569,12 @@ impl DavDispatch {
         // response on that copy leg derive `Retry(SameRequest)`, whose replay
         // answers 412 at the destination the first attempt already occupied,
         // forever.
-        self.wire_outcome(request, operation, builder.send().await)
+        let counter = bifrost_net::RequestByteCounter::new();
+        let outcome = builder.count_bytes_into(counter.clone()).send().await;
+        if let Some(tally) = &self.byte_tally {
+            tally.add(counter.bytes_in());
+        }
+        self.wire_outcome(request, operation, outcome)
             .map_err(|error| {
                 let error = if matches!(
                     error.kind(),
@@ -1368,6 +1406,53 @@ mod tests {
             RecoveryClass::Reconcile(advice)
                 if advice.guidance.actions.contains(&ReconcileAction::CheckTarget)
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_tally_counts_raw_bodies_across_retries_and_redirects() {
+        let response = |status, body: &'static [u8]| Canned::Response {
+            status,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(body),
+        };
+        let mut redirect_headers = HeaderMap::new();
+        redirect_headers.insert(reqwest::header::LOCATION, "/next".parse().unwrap());
+        let script = dav_script([
+            response(StatusCode::SERVICE_UNAVAILABLE, b"retry"),
+            Canned::Response {
+                status: StatusCode::TEMPORARY_REDIRECT,
+                headers: redirect_headers,
+                body: Bytes::from_static(b"hop"),
+            },
+            response(StatusCode::OK, b"\xff\xfe"),
+            response(StatusCode::OK, b"unrelated"),
+            response(StatusCode::OK, b"second"),
+        ]);
+        let dispatch = scripted_dispatch(scripted_dav_net(&script));
+        let (first, first_tally) = dispatch.metered();
+        let (second, second_tally) = dispatch.metered();
+        let operation = AccountOperation::SyncInventory;
+        let result = first
+            .send_raw_request(first.request(Method::GET, BASE), operation)
+            .await
+            .unwrap();
+        assert_eq!(result.body.len(), 6, "lossy UTF-8 expands the two bytes");
+        dispatch
+            .send_raw_request(dispatch.request(Method::GET, BASE), operation)
+            .await
+            .unwrap();
+        second
+            .send_raw_request(second.request(Method::GET, BASE), operation)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_tally.take(),
+            10,
+            "retry + redirect + raw success body"
+        );
+        assert_eq!(second_tally.take(), 6, "other streams cannot contribute");
+        assert_eq!(first_tally.take(), 0, "a batch consumes its tally once");
+        assert_eq!(transcripts(&script).len(), 5);
     }
 
     /// A `MOVE` dropped mid-flight must reconcile, not replay.

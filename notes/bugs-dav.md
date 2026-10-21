@@ -13,15 +13,25 @@
    and they are never deduplicated through git history. Carry the context
    inline instead.
 
-Filed from the October 2026 defect hunt: the DAV scope, plus DAV findings
-from the net, types and sync adoption scopes. Several were reported
-independently by more than one scope; each entry says which.
+Filed from the October 2026 defect hunt and the resolution waves that followed.
 
-## DAV-016 - The URL identity key decodes path segments with lossy UTF-8
+## DAV-017 - CardDAV establishment and inventory list the whole home for one ctag
 
-Lateral from the href-key work. The identity rule shared by `same_dav_url`, the
-sync-report lane, snapshot diffs and failed-href preservation decodes
-percent-encoded path segments lossily, so `%FF` and `%FE` produce the same key.
-Left unchanged because changing it also changes the established mutation
-identity matching; the evidence is documented at the key implementation.
+Lateral from the CalDAV depth-0 token work. CalDAV `event_snapshot` now reads a
+collection's sync-token with a depth-0 request; CardDAV establishment and
+inventory still issue a depth-1 PROPFIND of the whole address-book home to read
+one collection's ctag, which is O(collections) per scope. That listing also
+refreshes the observed directory URLs, so moving it to depth 0 needs those
+URLs refreshed some other way.
 
+## DAV-018 - Namespace-aware parsing hard-fails on sloppy server XML
+
+Lateral from the namespace-aware parser work. `dav-core` now parses with
+`NsReader`, and `resolved_xml_name` treats an undeclared prefix
+(`ResolveResult::Unknown`) as a hard parse error where it used to be tolerated;
+an element with no namespace at all can no longer match any DAV element. Every
+in-repo fixture declares its prefixes, but a real server that omits `xmlns:D`
+now fails every parse instead of degrading. Separately, `property_namespace` is
+a closed name table defaulting to `DAV:`, so a future non-DAV property name not
+in the table silently never matches. Decide whether to tolerate unbound
+prefixes and default-namespace-less DAV elements.

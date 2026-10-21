@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use futures::FutureExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::connection::ImapConnection;
+use crate::connection::{DriverTask, ImapConnection};
 use crate::error::Error;
 use crate::types::MailboxName;
 
@@ -12,6 +12,11 @@ use super::factory::ImapAccountConfig;
 struct PoolMember {
     conn: Arc<ImapConnection>,
     selected: Option<MailboxName>,
+}
+
+struct SessionRegistration {
+    connection: std::sync::Weak<ImapConnection>,
+    driver: Arc<DriverTask>,
 }
 
 pub(crate) struct Pool {
@@ -29,9 +34,10 @@ struct PoolInner {
     /// here because `dial` reads it: a member dialed while it is set is
     /// brought to QRESYNC before it is handed out.
     qresync_policy: std::sync::atomic::AtomicBool,
-    /// Every live session minted by this pool, including checked-out and
-    /// push sessions. Weak entries do not extend their lifetime, but let
-    /// close reach sessions which are outside the parked list.
+    /// Every registered session minted by this pool, including checked-out and
+    /// push sessions. The weak connection reference does not extend the
+    /// command handle's lifetime; the shared driver owner does keep its join
+    /// handle available so close can wait for a detached graceful LOGOUT.
     ///
     /// This mutex is also the linearization point for closure: `close`
     /// stores `closed` before it drains here, and registration re-reads
@@ -39,7 +45,7 @@ struct PoolInner {
     /// therefore seen by the drain; one that reaches it after the drain
     /// observes the flag and terminates itself. Nothing can land a live
     /// session on the far side of a completed close.
-    sessions: Mutex<Vec<std::sync::Weak<ImapConnection>>>,
+    sessions: Mutex<Vec<SessionRegistration>>,
     // A read guard spans connect, authentication and initialization. Close takes
     // the write guard before draining, so no admitted dial outlives completion.
     dials: tokio::sync::RwLock<()>,
@@ -62,6 +68,7 @@ impl Pool {
     ) -> Self {
         let primed = Arc::new(primed);
         let primed_weak = Arc::downgrade(&primed);
+        let primed_driver = primed.driver_task();
         Self {
             inner: Arc::new(PoolInner {
                 permits: Arc::new(Semaphore::new(data_cap.max(1))),
@@ -74,7 +81,10 @@ impl Pool {
                 bandwidth_budget,
                 closed: std::sync::atomic::AtomicBool::new(false),
                 qresync_policy: std::sync::atomic::AtomicBool::new(false),
-                sessions: Mutex::new(vec![primed_weak]),
+                sessions: Mutex::new(vec![SessionRegistration {
+                    connection: primed_weak,
+                    driver: primed_driver,
+                }]),
                 dials: tokio::sync::RwLock::new(()),
                 cancel_dials: tokio_util::sync::CancellationToken::new(),
                 close_completion: std::sync::OnceLock::new(),
@@ -192,7 +202,7 @@ impl PoolInner {
             .lock()
             .expect("pool sessions lock poisoned")
             .drain(..)
-            .filter_map(|weak| weak.upgrade())
+            .map(|session| (session.connection.upgrade(), session.driver))
             .collect();
         drop(members);
         // LOGOUT is best effort and the pool is already gated shut, so the
@@ -200,13 +210,26 @@ impl PoolInner {
         // out concurrently (a silent peer must not make the others wait its
         // turn) under one `command_timeout` for the whole drain, which is
         // the bound every other command in the account layer already has.
-        let drain = futures::future::join_all(sessions.iter().map(|conn| async move {
-            let _ = conn.logout().await;
-        }));
+        let drain =
+            futures::future::join_all(sessions.iter().filter_map(|(conn, _)| conn.as_ref()).map(
+                |conn| async move {
+                    let _ = conn.logout().await;
+                },
+            ));
         let _ = tokio::time::timeout(self.config.imap.command_timeout, drain).await;
-        for conn in sessions {
-            conn.terminate().await;
-        }
+        // Detached drivers are joined concurrently: each owns its own
+        // LOGOUT_DRAIN_TIMEOUT bound, and a sequential walk would let N silent
+        // peers hold close open for N times that bound.
+        futures::future::join_all(sessions.into_iter().map(|(connection, driver)| async move {
+            if let Some(conn) = connection {
+                conn.terminate().await;
+            } else {
+                driver
+                    .finish_or_abort(crate::connection::LOGOUT_DRAIN_TIMEOUT)
+                    .await;
+            }
+        }))
+        .await;
     }
 
     fn is_closed(&self) -> bool {
@@ -349,19 +372,23 @@ impl PoolInner {
         Ok(conn)
     }
 
-    /// Record a freshly minted session, pruning entries whose connection has
-    /// already been dropped. Without the prune a long-lived account with
-    /// reconnecting IDLE workers grows this vector by one entry per dial for
-    /// as long as it stays open. Returns `false` when the pool closed before
-    /// this session could be registered, meaning the caller owns tearing it
-    /// down (the drain in `close` has already run and will not see it).
+    /// Record a freshly minted session, pruning drivers that have completed.
+    /// A missing connection handle may still have a graceful LOGOUT in flight,
+    /// so its registration remains until that driver finishes. Pruning keeps
+    /// reconnecting IDLE workers from retaining completed tasks per dial.
+    /// Returns `false` when the pool closed before this session could be
+    /// registered, meaning the caller owns tearing it down (the drain in
+    /// `close` has already run and will not see it).
     fn register(&self, conn: &Arc<ImapConnection>) -> bool {
         let mut sessions = self.sessions.lock().expect("pool sessions lock poisoned");
         if self.is_closed() {
             return false;
         }
-        sessions.retain(|weak| weak.strong_count() > 0);
-        sessions.push(Arc::downgrade(conn));
+        sessions.retain(|session| !session.driver.is_finished());
+        sessions.push(SessionRegistration {
+            connection: Arc::downgrade(conn),
+            driver: conn.driver_task(),
+        });
         true
     }
 }
@@ -539,7 +566,7 @@ mod tests {
     use std::time::Duration;
 
     use super::super::factory::ImapAccountConfig;
-    use super::{Pool, PoolMember};
+    use super::{Pool, PoolMember, SessionRegistration};
     use crate::connection::test_support::{
         driver_pair, preauth_greeting, read_line, respond, tag_of,
     };
@@ -616,6 +643,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_joins_a_detached_healthy_drivers_graceful_logout() {
+        let (primed, mut peer) = marked("ACL").await;
+        let pool = pool_of(primed, 1);
+        let member = pool.inner.idle.lock().unwrap().pop().unwrap();
+        let PoolMember { conn: detached, .. } = member;
+        drop(detached);
+
+        let mut closing = Box::pin(pool.close());
+        assert!(futures::poll!(closing.as_mut()).is_pending());
+        let logout = read_line(&mut peer).await;
+        assert!(logout.contains("LOGOUT"));
+        assert!(
+            futures::poll!(closing.as_mut()).is_pending(),
+            "close must retain and await the healthy driver's detached LOGOUT",
+        );
+
+        respond(
+            &mut peer,
+            &format!("* BYE closing\r\n{} OK done\r\n", tag_of(&logout)),
+        )
+        .await;
+        closing.await;
+        assert!(pool.inner.sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn close_cancels_a_dial_before_registration() {
         let (primed, primed_peer) = marked("ACL").await;
         let pool = pool_of(primed, 1);
@@ -658,6 +711,7 @@ mod tests {
             .unwrap()
             .last()
             .unwrap()
+            .connection
             .upgrade()
             .unwrap();
         let started = tokio::time::Instant::now();
@@ -724,6 +778,7 @@ mod tests {
             .unwrap()
             .last()
             .unwrap()
+            .connection
             .upgrade()
             .unwrap();
         drop(dial);
@@ -839,7 +894,10 @@ mod tests {
             .sessions
             .lock()
             .unwrap()
-            .push(Arc::downgrade(&conn));
+            .push(SessionRegistration {
+                connection: Arc::downgrade(&conn),
+                driver: conn.driver_task(),
+            });
         pool.inner
             .idle
             .lock()
@@ -1181,28 +1239,37 @@ mod tests {
         );
     }
 
-    /// The registry must not grow by one entry per dial for the life of the
-    /// account. A non-NOTIFY push worker redials on every network blip, so
-    /// an unpruned registry is an unbounded leak on exactly the path this
-    /// round added connections to. Registering many connections that are
-    /// each dropped immediately must leave the registry at live size.
+    /// Completed detached drivers are pruned at the next registration, so a
+    /// reconnecting account does not retain one join handle per old session.
     #[tokio::test]
-    async fn registration_prunes_sessions_whose_connection_is_gone() {
-        let (primed, _primed_server) = marked("ACL").await;
+    async fn registration_prunes_completed_detached_drivers() {
+        let (primed, primed_server) = marked("ACL").await;
         let pool = pool_of(primed, 1);
 
         for _ in 0..32 {
-            let (transient, transient_server) = marked("BINARY").await;
+            let (transient, mut peer) = marked("BINARY").await;
             let transient = Arc::new(transient);
             assert!(pool.inner.register(&transient));
+            let driver = transient.driver_task();
             drop(transient);
-            drop(transient_server);
+            let logout = read_line(&mut peer).await;
+            respond(
+                &mut peer,
+                &format!("* BYE closing\r\n{} OK done\r\n", tag_of(&logout)),
+            )
+            .await;
+            driver
+                .finish_or_abort(crate::connection::LOGOUT_DRAIN_TIMEOUT)
+                .await;
         }
 
         let registered = pool.inner.sessions.lock().unwrap().len();
         assert!(
             registered <= 2,
-            "32 reconnects left {registered} registry entries; dead weak refs are retained",
+            "completed detached sessions left {registered} registry entries",
         );
+        drop(primed_server);
+        pool.close().await;
+        assert!(pool.inner.sessions.lock().unwrap().is_empty());
     }
 }

@@ -277,7 +277,7 @@ impl Scheduler {
     }
 
     pub fn submit(&self, item: WorkItem) {
-        self.lane(item.priority).push(item);
+        self.lane(item.kind.priority(item.priority)).push(item);
         self.inner.submitted.notify_one();
     }
 
@@ -361,6 +361,10 @@ impl Scheduler {
     /// protocol operation, and MUST acquire it outside any drive lease:
     /// admission can block for as long as the budget is saturated.
     ///
+    /// `priority` is the account priority. Backfill runs in Background for
+    /// Foreground/Normal accounts and Bulk for Background/Bulk accounts.
+    /// Live sync and mutations retain the account lane.
+    ///
     /// The request waits in a scheduler-owned lane, so it counts against
     /// `lane_capacity` for its whole wait and a later higher-priority
     /// request can overtake it. The permit is minted only when the
@@ -377,6 +381,8 @@ impl Scheduler {
         priority: Priority,
         kind: WorkKind,
     ) -> Result<BudgetPermit, crate::Error> {
+        let priority = kind.priority(priority);
+        let kind = kind.budget_kind();
         self.ensure_dispatcher();
         let (tx, rx) = oneshot::channel();
         {

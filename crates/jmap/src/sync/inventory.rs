@@ -12,6 +12,7 @@ use crate::email::{Email, EmailGet, EmailQuery, Property as EmailProperty};
 use crate::mailbox::{Mailbox, MailboxGet, MailboxQuery, Property as MailboxProperty};
 
 use super::capabilities::CoreLimits;
+use super::state_walk::StateWalk;
 
 type MailAccount<T> = crate::account::Account<T>;
 
@@ -121,7 +122,7 @@ fn email_inventory_loop<T: HttpTransport>(
         // both requests of its page.
         let (mail, tally) = mail.metered();
 
-        let mut anchor: Option<String> = None;
+        let mut walk = StateWalk::inventory(scope.clone());
         loop {
             let started = Instant::now();
             let mut query = EmailQuery::new();
@@ -137,8 +138,8 @@ fn email_inventory_loop<T: HttpTransport>(
             // message into a position the walk already passed. Integer
             // position over `receivedAt desc` would skip ids after such a
             // deletion.
-            if let Some(anchor) = anchor.as_ref() {
-                query = query.anchor(anchor.clone()).anchor_offset(1);
+            if let Some(anchor) = walk.inventory_anchor() {
+                query = query.anchor(anchor.to_string()).anchor_offset(1);
             } else {
                 query = query.position(0);
             }
@@ -151,10 +152,7 @@ fn email_inventory_loop<T: HttpTransport>(
                         err,
                         &scope,
                         owner.as_ref(),
-                        super::error::JmapErrorContext::cursor(
-                            bifrost_types::AccountOperation::SyncInventory,
-                            scope.clone(),
-                        ),
+                        walk.error_context(bifrost_types::AccountOperation::SyncInventory),
                     ));
                     return;
                 }
@@ -176,17 +174,14 @@ fn email_inventory_loop<T: HttpTransport>(
             // Only an empty page proves completion, never a short page.
             // anchorOffset: 1 excludes the anchor even when queryState moves.
             // Echoing it would otherwise hot-loop without proving coverage.
-            if let Some(previous) = anchor.as_ref()
-                && ids.iter().any(|id| id.to_string() == *previous)
-            {
+            if let Some(fault) = walk.observe_inventory_page(&ids) {
                 yield super::error::terminated_contract_violation(
                     bifrost_types::AccountOperation::SyncInventory,
                     Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
-                    "Email/query re-served the anchor id despite anchorOffset: 1",
+                    fault.describe("Email/query"),
                 );
                 return;
             }
-            anchor = ids.last().map(ToString::to_string);
             let get_response = mail
                 .call(EmailGet::new().ids(ids).properties(inventory_properties()))
                 .await;
@@ -198,10 +193,7 @@ fn email_inventory_loop<T: HttpTransport>(
                         err,
                         &scope,
                         owner.as_ref(),
-                        super::error::JmapErrorContext::cursor(
-                            bifrost_types::AccountOperation::SyncInventory,
-                            scope.clone(),
-                        ),
+                        walk.error_context(bifrost_types::AccountOperation::SyncInventory),
                     ));
                     return;
                 }
@@ -342,7 +334,7 @@ fn mailbox_inventory<T: HttpTransport>(
     Box::pin(async_stream::stream! {
         let (mail, tally) = mail.metered();
         let scope = CursorScope::Type(ObjectType::Mailbox);
-        let mut anchor: Option<String> = None;
+        let mut walk = StateWalk::inventory(scope.clone());
         loop {
             let started = Instant::now();
             let mut query = MailboxQuery::new()
@@ -351,8 +343,8 @@ fn mailbox_inventory<T: HttpTransport>(
                     crate::mailbox::query::Comparator::name().ascending(),
                 ])
                 .limit(page_size);
-            if let Some(anchor) = anchor.as_ref() {
-                query = query.anchor(anchor.clone()).anchor_offset(1);
+            if let Some(anchor) = walk.inventory_anchor() {
+                query = query.anchor(anchor.to_string()).anchor_offset(1);
             } else {
                 query = query.position(0);
             }
@@ -363,10 +355,7 @@ fn mailbox_inventory<T: HttpTransport>(
                         err,
                         &scope,
                         None,
-                        super::error::JmapErrorContext::cursor(
-                            bifrost_types::AccountOperation::SyncInventory,
-                            scope.clone(),
-                        ),
+                        walk.error_context(bifrost_types::AccountOperation::SyncInventory),
                     ));
                     return;
                 }
@@ -376,17 +365,14 @@ fn mailbox_inventory<T: HttpTransport>(
             if ids.is_empty() {
                 break;
             }
-            if let Some(previous) = anchor.as_ref()
-                && ids.iter().any(|id| id.as_str() == previous)
-            {
+            if let Some(fault) = walk.observe_inventory_page(&ids) {
                 yield super::error::terminated_contract_violation(
                     bifrost_types::AccountOperation::SyncInventory,
                     Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
-                    "Mailbox/query re-served the anchor id despite anchorOffset: 1",
+                    fault.describe("Mailbox/query"),
                 );
                 return;
             }
-            anchor = ids.last().map(ToString::to_string);
 
             let response = match mail
                 .call(MailboxGet::new().ids(ids).properties(mailbox_inventory_properties()))
@@ -398,10 +384,7 @@ fn mailbox_inventory<T: HttpTransport>(
                         err,
                         &scope,
                         None,
-                        super::error::JmapErrorContext::cursor(
-                            bifrost_types::AccountOperation::SyncInventory,
-                            scope.clone(),
-                        ),
+                        walk.error_context(bifrost_types::AccountOperation::SyncInventory),
                     ));
                     return;
                 }

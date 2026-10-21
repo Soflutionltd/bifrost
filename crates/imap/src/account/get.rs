@@ -57,7 +57,7 @@ pub(crate) fn get_stream(
                     let item_id = BatchItemId(id.0.clone());
                     let outcome = ItemOutcome::Failed(BatchFailure::new(item_id, err));
                     if tx
-                        .send(batch(vec![outcome], PageBoundary::Page, None))
+                        .send(batch(vec![outcome], PageBoundary::Page, None, 0))
                         .await
                         .is_err()
                     {
@@ -112,15 +112,18 @@ async fn flush_get_groups(
                 // shared-folder SELECT denial is pre-classified to
                 // `ScopeRevoked` so it quarantines that scope rather
                 // than masquerading as a generic hydration failure.
-                let account_err = match other {
-                    GetError::Account(err) => err,
-                    GetError::Imap(err) => super::account_error_with(
-                        err,
-                        super::error::ImapErrorContext::operation(
-                            bifrost_types::AccountOperation::Hydrate,
-                        )
-                        .with_folder_scope(&folder),
-                    ),
+                let (account_err, bytes_in) = match other {
+                    GetError::Account(err, bytes_in) => (err, bytes_in),
+                    GetError::Imap(err, bytes_in) => {
+                        let account_err = super::account_error_with(
+                            err,
+                            super::error::ImapErrorContext::operation(
+                                bifrost_types::AccountOperation::Hydrate,
+                            )
+                            .with_folder_scope(&folder),
+                        );
+                        (account_err, bytes_in)
+                    }
                     GetError::ChannelDropped => unreachable!("handled above"),
                 };
                 let uncertain: Vec<ItemOutcome<HydratedObject>> = pending
@@ -133,7 +136,7 @@ async fn flush_get_groups(
                     })
                     .collect();
                 if tx
-                    .send(batch(uncertain, PageBoundary::Page, None))
+                    .send(batch(uncertain, PageBoundary::Page, None, bytes_in))
                     .await
                     .is_err()
                 {
@@ -148,17 +151,17 @@ async fn flush_get_groups(
 /// Per-folder hydration failure: either an IMAP wire error to classify
 /// per-item, or a dropped output channel (silent return).
 enum GetError {
-    Imap(crate::Error),
+    Imap(crate::Error, u64),
     /// A pre-classified `AccountError` (shared-folder SELECT denial built
     /// as `ScopeRevoked` rather than letting the raw permission denial
     /// derive account-terminal `NoPermission`).
-    Account(bifrost_types::AccountError),
+    Account(bifrost_types::AccountError, u64),
     ChannelDropped,
 }
 
 impl From<crate::Error> for GetError {
     fn from(value: crate::Error) -> Self {
-        Self::Imap(value)
+        Self::Imap(value, 0)
     }
 }
 
@@ -218,12 +221,15 @@ async fn emit_stale_failures(
     tx: &tokio::sync::mpsc::Sender<SyncEvent<ItemOutcome<HydratedObject>>>,
     stale: Vec<DecodedObjectId>,
     folder: &MailboxName,
+    connection: &crate::ImapConnection,
+    previous_bytes_in: &mut u64,
 ) -> Result<(), GetError> {
     if stale.is_empty() {
         return Ok(());
     }
     let outcomes = failed_hydration(stale, uidvalidity_changed_error(folder));
-    tx.send(batch(outcomes, PageBoundary::Page, None))
+    let bytes_in = super::measured_bytes_in(connection, previous_bytes_in);
+    tx.send(batch(outcomes, PageBoundary::Page, None, bytes_in))
         .await
         .map_err(|_| GetError::ChannelDropped)
 }
@@ -242,6 +248,7 @@ async fn run_folder_get(
     tx: &tokio::sync::mpsc::Sender<SyncEvent<ItemOutcome<HydratedObject>>>,
 ) -> Result<(), GetError> {
     let mut conn = account.checkout_for_folder(folder).await?;
+    let mut previous_bytes_in = conn.connection().bytes_in();
     let folder_entry = account.folders.get(folder);
     let cursor = folder_entry.as_ref().and_then(|entry| entry.cursor());
     let shared_owner = folder_entry
@@ -258,17 +265,29 @@ async fn run_folder_get(
         // folder, or any non-permission failure, flows through the normal
         // mapping.
         Err(err) if shared_owner.is_some() => {
-            return Err(GetError::Account(super::error::shared_folder_error(
-                err,
-                folder,
-                shared_owner.as_ref(),
-                super::error::ImapErrorContext::operation(bifrost_types::AccountOperation::Hydrate)
+            let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
+            return Err(GetError::Account(
+                super::error::shared_folder_error(
+                    err,
+                    folder,
+                    shared_owner.as_ref(),
+                    super::error::ImapErrorContext::operation(
+                        bifrost_types::AccountOperation::Hydrate,
+                    )
                     .with_folder_scope(folder),
-            )));
+                ),
+                bytes_in,
+            ));
         }
-        Err(err) => return Err(err.into()),
+        Err(err) => {
+            let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
+            return Err(GetError::Imap(err, bytes_in));
+        }
     };
-    let uidvalidity = super::selected_uidvalidity(&selected.mailbox)?;
+    let uidvalidity = super::selected_uidvalidity(&selected.mailbox).map_err(|err| {
+        let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
+        GetError::Imap(err, bytes_in)
+    })?;
     // `pending` is drained only now: a checkout or SELECT failure above
     // must leave every id in the caller's unresolved set.
     let (valid, stale): (Vec<_>, Vec<_>) = pending
@@ -291,9 +310,10 @@ async fn run_folder_get(
     // emitted first. Buffering them behind the FETCH would lose established
     // per-item truth if that FETCH fails and the folder falls back to the
     // uncertain lane.
-    emit_stale_failures(tx, stale, folder).await?;
+    emit_stale_failures(tx, stale, folder, conn.connection(), &mut previous_bytes_in).await?;
     if !excluded_outcomes.is_empty() {
-        tx.send(batch(excluded_outcomes, PageBoundary::Page, None))
+        let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
+        tx.send(batch(excluded_outcomes, PageBoundary::Page, None, bytes_in))
             .await
             .map_err(|_| GetError::ChannelDropped)?;
     }
@@ -321,12 +341,17 @@ async fn run_folder_get(
                 HYDRATION_FETCH_BUDGET,
                 account.command_timeout(),
             )
-            .await?
+            .await
     } else {
         conn.connection()
             .uid_fetch(uid_set.as_sequence_set(), &attrs, account.command_timeout())
-            .await?
-    };
+            .await
+    }
+    .map_err(|err| {
+        let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
+        GetError::Imap(err, bytes_in)
+    })?;
+    let mut page_bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
     // A server may emit several FETCH responses for one UID: the solicited
     // one plus unsolicited FLAGS updates that carry none of the requested
     // data items. Merge them per UID before conversion so a trailing partial
@@ -342,7 +367,8 @@ async fn run_folder_get(
         if let Some(modseq) = fetch.mod_seq {
             account
                 .folders
-                .record_modseq(folder, uidvalidity, uid, modseq)?;
+                .record_modseq(folder, uidvalidity, uid, modseq)
+                .map_err(|err| GetError::Imap(err, page_bytes_in))?;
         }
         match fetched_by_uid.entry(uid) {
             std::collections::hash_map::Entry::Occupied(mut existing) => {
@@ -375,13 +401,18 @@ async fn run_folder_get(
         };
         out.push(target.seal(verdict).into_outcome());
         if out.len() >= BATCH_ITEMS {
-            tx.send(batch(std::mem::take(&mut out), PageBoundary::Page, None))
-                .await
-                .map_err(|_| GetError::ChannelDropped)?;
+            tx.send(batch(
+                std::mem::take(&mut out),
+                PageBoundary::Page,
+                None,
+                std::mem::take(&mut page_bytes_in),
+            ))
+            .await
+            .map_err(|_| GetError::ChannelDropped)?;
         }
     }
     if !out.is_empty() {
-        tx.send(batch(out, PageBoundary::Page, None))
+        tx.send(batch(out, PageBoundary::Page, None, page_bytes_in))
             .await
             .map_err(|_| GetError::ChannelDropped)?;
     }
@@ -959,7 +990,14 @@ mod tests {
             uidvalidity: 8,
             uid: 2,
         }];
-        assert!(emit_stale_failures(&tx, stale, &folder()).await.is_ok());
+        let (connection, _server) =
+            crate::connection::test_support::driver_pair(b"* PREAUTH ready\r\n").await;
+        let mut previous_bytes_in = connection.bytes_in();
+        assert!(
+            emit_stale_failures(&tx, stale, &folder(), &connection, &mut previous_bytes_in)
+                .await
+                .is_ok()
+        );
         // Simulate the hydration FETCH blowing up after this point.
         drop(tx);
         let event = rx.recv().await.expect("stale failures already published");

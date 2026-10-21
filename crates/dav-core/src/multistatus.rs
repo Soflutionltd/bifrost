@@ -30,10 +30,12 @@
 //!   exists.
 
 use bifrost_net::{status_line_code, status_line_is_success};
-use quick_xml::Reader;
 use quick_xml::events::Event;
+use quick_xml::reader::NsReader;
 
-use crate::xml::{local_name, push_text, trimmed};
+use crate::xml::{
+    DAV_NAMESPACE, XmlName, property_namespace, push_text, resolved_xml_name, trimmed,
+};
 
 /// The staged property bag one crate reads out of a `<prop>`.
 ///
@@ -375,19 +377,23 @@ pub trait MultiStatusSink {
     /// The staged property bag this crate reads.
     type Props: PropSet;
 
-    /// A start or empty element inside a `<response>`. `stack` holds the
-    /// ANCESTORS of `name`, so a `resourcetype` guard reads
-    /// `stack.iter().any(|item| item == "resourcetype")`.
-    fn element(&mut self, name: &str, stack: &[String], parts: &mut ResponseParts<Self::Props>) {
+    /// A start or empty element inside a `<response>`. Names include their
+    /// resolved namespace, and `stack` holds the ancestors of `name`.
+    fn element(
+        &mut self,
+        name: &XmlName,
+        stack: &[XmlName],
+        parts: &mut ResponseParts<Self::Props>,
+    ) {
         let _ = (name, stack, parts);
     }
 
     /// A closing element inside a `<response>` with its accumulated text.
-    /// `parent` is the enclosing element's local name.
+    /// `parent` is the enclosing element's resolved name.
     fn property(
         &mut self,
-        parent: Option<&str>,
-        name: &str,
+        parent: Option<&XmlName>,
+        name: &XmlName,
         text: &str,
         parts: &mut ResponseParts<Self::Props>,
     ) {
@@ -396,7 +402,7 @@ pub trait MultiStatusSink {
 
     /// A closing element OUTSIDE any `<response>` - the document-level
     /// `<sync-token>`, for instance.
-    fn document_property(&mut self, parent: Option<&str>, name: &str, text: &str) {
+    fn document_property(&mut self, parent: Option<&XmlName>, name: &XmlName, text: &str) {
         let _ = (parent, name, text);
     }
 
@@ -410,29 +416,39 @@ pub trait MultiStatusSink {
 /// individual responses failed is NOT an error: those are per-resource
 /// outcomes, and RFC 4918 s13 makes them the whole point of a 207.
 pub fn parse_multistatus<S: MultiStatusSink>(xml: &str, sink: &mut S) -> Result<(), String> {
-    let mut reader = Reader::from_str(xml);
+    let mut reader = NsReader::from_str(xml);
     let mut parts: ResponseParts<S::Props> = ResponseParts::default();
-    let mut stack: Vec<String> = Vec::new();
+    let mut stack: Vec<XmlName> = Vec::new();
     let mut text = String::new();
 
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "response" {
+        let (resolved, event) = reader
+            .read_resolved_event()
+            .map_err(|error| format!("XML parse error: {error}"))?;
+        let name = match &event {
+            Event::Start(element) | Event::Empty(element) => {
+                Some(resolved_xml_name(resolved, element.name().as_ref())?)
+            }
+            Event::End(element) => Some(resolved_xml_name(resolved, element.name().as_ref())?),
+            _ => None,
+        };
+        match event {
+            Event::Start(_) => {
+                let name = name.as_ref().expect("element event has a resolved name");
+                if name.is(DAV_NAMESPACE, "response") {
                     parts.begin_response();
                 }
                 if parts.in_response() {
-                    if name == "propstat" {
+                    if name.is(DAV_NAMESPACE, "propstat") {
                         parts.begin_propstat();
                     }
-                    sink.element(&name, &stack, &mut parts);
+                    sink.element(name, &stack, &mut parts);
                 }
-                stack.push(name);
+                stack.push(name.clone());
                 text.clear();
             }
-            Ok(Event::Empty(element)) => {
-                let name = local_name(element.name().as_ref());
+            Event::Empty(_) => {
+                let name = name.as_ref().expect("element event has a resolved name");
                 if parts.in_response() {
                     // `<status/>` is the driver's element in either position,
                     // and an empty one never reaches the `End` arm that reads
@@ -441,13 +457,15 @@ pub fn parse_multistatus<S: MultiStatusSink>(xml: &str, sink: &mut S) -> Result<
                     // success - the exact inverse of the rule: a status that is
                     // present and unparseable is a refusal, because it is not
                     // evidence that the property was returned.
-                    if name == "status"
-                        && matches!(stack.last().map(String::as_str), Some("propstat"))
+                    if name.is(DAV_NAMESPACE, "status")
+                        && stack
+                            .last()
+                            .is_some_and(|parent| parent.is(DAV_NAMESPACE, "propstat"))
                     {
                         parts.staged_status = None;
                         parts.staged_success = Some(false);
                     } else {
-                        sink.element(&name, &stack, &mut parts);
+                        sink.element(name, &stack, &mut parts);
                     }
                 }
                 // Then the same text reset `Start` and `End` do, unconditionally
@@ -463,37 +481,43 @@ pub fn parse_multistatus<S: MultiStatusSink>(xml: &str, sink: &mut S) -> Result<
                 // `element` and hrefs, never through accumulated text.
                 text.clear();
             }
-            Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
-            Ok(Event::CData(value)) => text.push_str(&value),
-            Ok(Event::End(element)) => {
-                let name = local_name(element.name().as_ref());
-                let parent = stack.iter().rev().nth(1).map(String::as_str);
+            Event::Text(value) => push_text(&mut text, value.as_ref())?,
+            Event::CData(value) => text.push_str(&value),
+            Event::End(_) => {
+                let name = name.as_ref().expect("element event has a resolved name");
+                let parent = stack.iter().rev().nth(1);
                 if parts.in_response() {
-                    match (parent, name.as_str()) {
-                        (Some("response"), "href") => parts.href = trimmed(&text),
-                        (Some("response"), "status") => parts.response_status = trimmed(&text),
-                        (Some("propstat"), "status") => {
-                            parts.staged_status = trimmed(&text);
-                            parts.staged_success = Some(status_line_is_success(&text));
-                        }
-                        _ => sink.property(parent, &name, &text, &mut parts),
+                    if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "response"))
+                        && name.is(DAV_NAMESPACE, "href")
+                    {
+                        parts.href = trimmed(&text);
+                    } else if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "response"))
+                        && name.is(DAV_NAMESPACE, "status")
+                    {
+                        parts.response_status = trimmed(&text);
+                    } else if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "propstat"))
+                        && name.is(DAV_NAMESPACE, "status")
+                    {
+                        parts.staged_status = trimmed(&text);
+                        parts.staged_success = Some(status_line_is_success(&text));
+                    } else {
+                        sink.property(parent, name, &text, &mut parts);
                     }
                 } else {
-                    sink.document_property(parent, &name, &text);
+                    sink.document_property(parent, name, &text);
                 }
-                if name == "propstat" {
+                if name.is(DAV_NAMESPACE, "propstat") {
                     parts.commit_propstat();
                 }
-                if name == "response" {
+                if name.is(DAV_NAMESPACE, "response") {
                     parts.end_response();
                     sink.finish_response(&parts);
                 }
                 stack.pop();
                 text.clear();
             }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("XML parse error: {error}")),
+            Event::Eof => break,
+            _ => {}
         }
     }
 
@@ -507,26 +531,39 @@ pub fn parse_multistatus<S: MultiStatusSink>(xml: &str, sink: &mut S) -> Result<
 /// prop bag are ignored - only a `<status>` whose PARENT is the propstat says
 /// anything about it.
 pub fn extract_href_properties(xml: &str, property_name: &str) -> Result<Vec<String>, String> {
-    let mut reader = Reader::from_str(xml);
-    let mut stack: Vec<String> = Vec::new();
+    let mut reader = NsReader::from_str(xml);
+    let mut stack: Vec<XmlName> = Vec::new();
     let mut text = String::new();
     let mut hrefs = Vec::new();
     let mut propstat_hrefs = Vec::new();
     let mut propstat_success = None;
-
+    let target_namespace = property_namespace(property_name);
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                stack.push(local_name(element.name().as_ref()));
+        let (resolved, event) = reader
+            .read_resolved_event()
+            .map_err(|error| format!("XML parse error: {error}"))?;
+        let name = match &event {
+            Event::Start(element) | Event::Empty(element) => {
+                Some(resolved_xml_name(resolved, element.name().as_ref())?)
+            }
+            Event::End(element) => Some(resolved_xml_name(resolved, element.name().as_ref())?),
+            _ => None,
+        };
+        match event {
+            Event::Start(_) => {
+                stack.push(name.expect("element event has a resolved name"));
                 text.clear();
             }
             // An empty `<status/>` is present and unparseable, so it refuses
             // the propstat. It never reaches the `End` arm below, and without
             // this the propstat committed under the absent-status-is-success
             // rule and published hrefs the server had refused.
-            Ok(Event::Empty(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "status" && matches!(stack.last().map(String::as_str), Some("propstat"))
+            Event::Empty(_) => {
+                let name = name.as_ref().expect("element event has a resolved name");
+                if name.is(DAV_NAMESPACE, "status")
+                    && stack
+                        .last()
+                        .is_some_and(|parent| parent.is(DAV_NAMESPACE, "propstat"))
                 {
                     propstat_success = Some(false);
                 }
@@ -537,29 +574,33 @@ pub fn extract_href_properties(xml: &str, property_name: &str) -> Result<Vec<Str
                 // where the paired spelling of the same child reads `def`.
                 text.clear();
             }
-            Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
-            Ok(Event::CData(value)) => text.push_str(&value),
-            Ok(Event::End(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "href"
-                    && stack.iter().any(|tag| tag == property_name)
+            Event::Text(value) => push_text(&mut text, value.as_ref())?,
+            Event::CData(value) => text.push_str(&value),
+            Event::End(_) => {
+                let name = name.as_ref().expect("element event has a resolved name");
+                if name.is(DAV_NAMESPACE, "href")
+                    && stack
+                        .iter()
+                        .any(|tag| tag.is(target_namespace, property_name))
                     && let Some(href) = trimmed(&text)
                 {
-                    if stack.iter().any(|tag| tag == "propstat") {
+                    if stack.iter().any(|tag| tag.is(DAV_NAMESPACE, "propstat")) {
                         propstat_hrefs.push(href);
                     } else {
                         hrefs.push(href);
                     }
                 }
-                let parent = stack.iter().rev().nth(1).map(String::as_str);
-                if name == "status" && matches!(parent, Some("propstat")) {
+                let parent = stack.iter().rev().nth(1);
+                if name.is(DAV_NAMESPACE, "status")
+                    && parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "propstat"))
+                {
                     propstat_success = Some(
                         trimmed(&text)
                             .as_deref()
                             .is_some_and(status_line_is_success),
                     );
                 }
-                if name == "propstat" {
+                if name.is(DAV_NAMESPACE, "propstat") {
                     if propstat_success.unwrap_or(true) {
                         hrefs.append(&mut propstat_hrefs);
                     } else {
@@ -570,9 +611,8 @@ pub fn extract_href_properties(xml: &str, property_name: &str) -> Result<Vec<Str
                 stack.pop();
                 text.clear();
             }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("XML parse error: {error}")),
+            Event::Eof => break,
+            _ => {}
         }
     }
 
@@ -595,30 +635,44 @@ pub fn extract_href_property(xml: &str, property_name: &str) -> Result<Option<St
 /// `getctag`, and a stale token committed from a 403 block suppresses a real
 /// change.
 pub fn parse_collection_property(xml: &str, property_name: &str) -> Result<Option<String>, String> {
-    let mut reader = Reader::from_str(xml);
-    let mut stack: Vec<String> = Vec::new();
+    let mut reader = NsReader::from_str(xml);
+    let mut stack: Vec<XmlName> = Vec::new();
     let mut text = String::new();
     let mut staged = None;
     let mut staged_success = None;
     let mut committed = None;
+    let target_namespace = property_namespace(property_name);
 
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "propstat" {
+        let (resolved, event) = reader
+            .read_resolved_event()
+            .map_err(|error| format!("XML parse error: {error}"))?;
+        let name = match &event {
+            Event::Start(element) | Event::Empty(element) => {
+                Some(resolved_xml_name(resolved, element.name().as_ref())?)
+            }
+            Event::End(element) => Some(resolved_xml_name(resolved, element.name().as_ref())?),
+            _ => None,
+        };
+        match event {
+            Event::Start(_) => {
+                let name = name.as_ref().expect("element event has a resolved name");
+                if name.is(DAV_NAMESPACE, "propstat") {
                     staged = None;
                     staged_success = None;
                 }
-                stack.push(name);
+                stack.push(name.clone());
                 text.clear();
             }
             // Same rule as the driver: an empty `<status/>` is a present,
             // unparseable status, so the propstat is refused rather than
             // committing a stale token under the absent-status allowance.
-            Ok(Event::Empty(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "status" && matches!(stack.last().map(String::as_str), Some("propstat"))
+            Event::Empty(_) => {
+                let name = name.as_ref().expect("element event has a resolved name");
+                if name.is(DAV_NAMESPACE, "status")
+                    && stack
+                        .last()
+                        .is_some_and(|parent| parent.is(DAV_NAMESPACE, "propstat"))
                 {
                     staged_success = Some(false);
                 }
@@ -627,21 +681,21 @@ pub fn parse_collection_property(xml: &str, property_name: &str) -> Result<Optio
                 // text glued to the text that follows it.
                 text.clear();
             }
-            Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
-            Ok(Event::CData(value)) => text.push_str(&value),
-            Ok(Event::End(element)) => {
-                let name = local_name(element.name().as_ref());
-                let parent = stack.iter().rev().nth(1).map(String::as_str);
-                match (parent, name.as_str()) {
-                    (Some("prop"), property) if property == property_name => {
-                        staged = trimmed(&text);
-                    }
-                    (Some("propstat"), "status") => {
-                        staged_success = Some(status_line_is_success(&text));
-                    }
-                    _ => {}
+            Event::Text(value) => push_text(&mut text, value.as_ref())?,
+            Event::CData(value) => text.push_str(&value),
+            Event::End(_) => {
+                let name = name.as_ref().expect("element event has a resolved name");
+                let parent = stack.iter().rev().nth(1);
+                if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+                    && name.is(target_namespace, property_name)
+                {
+                    staged = trimmed(&text);
+                } else if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "propstat"))
+                    && name.is(DAV_NAMESPACE, "status")
+                {
+                    staged_success = Some(status_line_is_success(&text));
                 }
-                if name == "propstat" {
+                if name.is(DAV_NAMESPACE, "propstat") {
                     if staged_success.unwrap_or(true)
                         && let Some(value) = staged.take()
                     {
@@ -653,9 +707,8 @@ pub fn parse_collection_property(xml: &str, property_name: &str) -> Result<Optio
                 stack.pop();
                 text.clear();
             }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("XML parse error: {error}")),
+            Event::Eof => break,
+            _ => {}
         }
     }
 
@@ -711,26 +764,34 @@ mod tests {
 
         fn element(
             &mut self,
-            name: &str,
-            stack: &[String],
+            name: &XmlName,
+            stack: &[XmlName],
             parts: &mut ResponseParts<Self::Props>,
         ) {
-            if name == "collection" && stack.iter().any(|item| item == "resourcetype") {
+            if name.is(DAV_NAMESPACE, "collection")
+                && stack
+                    .iter()
+                    .any(|item| item.is(DAV_NAMESPACE, "resourcetype"))
+            {
                 parts.marker_mut().is_collection = true;
             }
         }
 
         fn property(
             &mut self,
-            parent: Option<&str>,
-            name: &str,
+            parent: Option<&XmlName>,
+            name: &XmlName,
             text: &str,
             parts: &mut ResponseParts<Self::Props>,
         ) {
-            match (parent, name) {
-                (Some("prop"), "getetag") => parts.staged_mut().etag = normalize_etag(text),
-                (Some("prop"), "data") => parts.staged_mut().data = trimmed(text),
-                _ => {}
+            if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+                && name.is(DAV_NAMESPACE, "getetag")
+            {
+                parts.staged_mut().etag = normalize_etag(text);
+            } else if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+                && name.is(DAV_NAMESPACE, "data")
+            {
+                parts.staged_mut().data = trimmed(text);
             }
         }
 
@@ -1071,6 +1132,21 @@ mod tests {
         assert_eq!(sink.failed_hrefs, vec!["/c/one".to_string()]);
     }
 
+    #[test]
+    fn a_foreign_status_does_not_override_the_missing_dav_status_rule() {
+        let sink = run(r#"<D:multistatus xmlns:D="DAV:" xmlns:X="urn:vendor">
+          <D:response><D:href>/c/one</D:href>
+          <D:propstat><D:prop><D:getetag>"live"</D:getetag></D:prop>
+          <X:status>HTTP/1.1 403 Forbidden</X:status></D:propstat>
+          </D:response></D:multistatus>"#);
+
+        assert_eq!(
+            sink.entries,
+            vec![("/c/one".to_string(), Some("live".to_string()))]
+        );
+        assert!(sink.failed_hrefs.is_empty());
+    }
+
     /// The same hole in the href extractor: hrefs inside a propstat whose
     /// status is an empty element were published as though the block had
     /// succeeded, which is how a refused home-set or address-set reads as a
@@ -1086,6 +1162,22 @@ mod tests {
             extract_href_properties(xml, "calendar-home-set")
                 .expect("valid XML")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn href_extraction_requires_the_property_and_href_namespaces() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:"
+            xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:X="urn:vendor">
+          <D:response><D:propstat><D:prop>
+            <X:calendar-home-set><D:href>/wrong-property</D:href></X:calendar-home-set>
+            <C:calendar-home-set><X:href>/wrong-href</X:href><D:href>/right</D:href></C:calendar-home-set>
+          </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+        </D:multistatus>"#;
+
+        assert_eq!(
+            extract_href_properties(xml, "calendar-home-set").expect("valid XML"),
+            vec!["/right".to_string()]
         );
     }
 

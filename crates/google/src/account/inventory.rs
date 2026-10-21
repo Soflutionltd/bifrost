@@ -358,14 +358,19 @@ pub(crate) fn inventory_stream_cancellable(
                         ) {
                             continue;
                         }
+                        if error::requires_stream_termination(&account_error) {
+                            // The recovery class needs stream-level action,
+                            // such as retry, reconciliation, cursor recovery,
+                            // or account authorization repair. Do not turn it
+                            // into coverage debt for this one message; the
+                            // unfinished page is discarded with the walk.
+                            yield bifrost_types::InventoryEvent::Terminated(account_error);
+                            return;
+                        }
                         // Everything else is an OBLIGATION, not a reason to
-                        // discard the walk. Terminating here cost the whole
-                        // backfill partition - every page already emitted -
-                        // for one unreadable object, repeatedly, because the
-                        // next attempt hit the same object. The walk now
-                        // continues and the checkpoint declares the gap, so
-                        // the scope converges while staying honest about what
-                        // it is missing.
+                        // discard the walk. A permanent failure attributable
+                        // to this message can be repaired by id, so the walk
+                        // continues and the checkpoint declares the gap.
                         obligations.push(bifrost_types::InventoryObligation::Object {
                             // The Gmail message id IS the stable identity, and
                             // it is stable across walks, so the same
@@ -459,12 +464,14 @@ pub(crate) fn get_stream(
 ///   token, inverting the order every other machine uses.
 /// - Failure disposition. Four lanes, four questions, not four answers to one.
 ///   A mutation batch was transmitted as a set, so the question is whether the
-///   refusal is attributable per id (`error::terminates_mutation_stream`). The
+///   shared recovery predicate allows per-id fanout or requires termination.
 ///   inventory walk owns a coverage-obligation ledger, so it has a third answer
 ///   nothing else has: discharge, defer as an obligation, or terminate on a
-///   list-page failure. A hydration item named its own id and affects no other,
-///   so it always takes a `Failed` lane while a label-vocabulary failure ahead
-///   of any transmission terminates. The lifecycle poll has no items at all and
+///   list-page failure. Each hydration request names its own id, so
+///   object-attributable permanent failures take a `Failed` lane, while a
+///   recovery class requiring stream-level action terminates after resolved
+///   sibling outcomes. A label-vocabulary failure ahead of any transmission
+///   also terminates. The lifecycle poll has no items at all and
 ///   asks only retry-or-escalate, which the `RecoveryClass` answers alone. A
 ///   `FailurePolicy::for(error, lane)` returning `Vec<ItemOutcome>` /
 ///   `InventoryObligation` / `ItemOutcome` / continue-or-stop is this match
@@ -495,11 +502,17 @@ pub(crate) fn get_stream_cancellable(
         shutdown,
         finished: false,
         emitted_done: false,
+        pending_termination: None,
     };
 
     Box::pin(stream::unfold(state, |mut state| async move {
         if state.shutdown.is_cancelled() {
             return None;
+        }
+        if let Some(error) = state.pending_termination.take() {
+            state.finished = true;
+            state.emitted_done = true;
+            return Some((SyncEvent::Terminated(error), state));
         }
         if state.finished {
             if state.emitted_done {
@@ -594,6 +607,7 @@ pub(crate) fn get_stream_cancellable(
         }))
         .buffer_unordered(HYDRATE_BATCH_SIZE);
         let mut items: Vec<ItemOutcome<HydratedObject>> = Vec::new();
+        let mut stream_error = None;
         loop {
             let next = tokio::select! {
                 () = state.shutdown.cancelled() => return None,
@@ -614,14 +628,29 @@ pub(crate) fn get_stream_cancellable(
                         err,
                         error::GmailErrorContext::hydrate_message(id_for_error.clone()),
                     );
-                    items.push(ItemOutcome::Failed(BatchFailure::new(
-                        BatchItemId(id_for_error),
-                        account_error,
-                    )));
+                    if error::requires_stream_termination(&account_error) {
+                        if stream_error.is_none() {
+                            stream_error = Some(account_error);
+                        }
+                    } else {
+                        items.push(ItemOutcome::Failed(BatchFailure::new(
+                            BatchItemId(id_for_error),
+                            account_error,
+                        )));
+                    }
                 }
             }
         }
         drop(hydrated);
+
+        if let Some(error) = stream_error {
+            state.finished = true;
+            if items.is_empty() {
+                state.emitted_done = true;
+                return Some((SyncEvent::Terminated(error), state));
+            }
+            state.pending_termination = Some(error);
+        }
 
         Some((
             SyncEvent::Batch(Batch {
@@ -648,6 +677,7 @@ struct HydrateState {
     projection: Projection,
     finished: bool,
     emitted_done: bool,
+    pending_termination: Option<bifrost_types::AccountError>,
     shutdown: CancellationToken,
 }
 
@@ -1465,11 +1495,11 @@ mod tests {
 
     /// An unreadable object costs that object, not the whole partition.
     ///
-    /// This is the defect the coverage model exists for. A classified
-    /// hydration failure that is NOT the list/get deletion race used to yield
-    /// `Terminated`, discarding every page the walk had already emitted and
-    /// leaving no cursor - so the next attempt re-walked from the start, hit
-    /// the same object, and failed the same way, forever.
+    /// This is the defect the coverage model exists for. An object-attributable
+    /// permanent hydration failure that is NOT the list/get deletion race used
+    /// to yield `Terminated`, discarding every page the walk had already emitted
+    /// and leaving no cursor - so the next attempt re-walked from the start,
+    /// hit the same object, and failed the same way, forever.
     ///
     /// The walk now keeps going and records the object as an obligation, and
     /// the checkpoint DECLARES that gap rather than certifying coverage it
@@ -1485,11 +1515,11 @@ mod tests {
             ok_json(json!({ "emailAddress": "person@example.com", "historyId": "100" })),
             ok_json(json!({ "labels": [] })),
             ok_json(json!({ "messages": [{ "id": "broken" }, { "id": "live" }] })),
-            // Not a 404: a permission failure is not evidence of absence, so
-            // nothing is discharged and an obligation is owed.
+            // Invalid input for this message is object-attributable and
+            // permanent, so it is recorded as coverage debt.
             canned(
-                StatusCode::FORBIDDEN,
-                br#"{"error":{"code":403,"message":"Forbidden","status":"PERMISSION_DENIED"}}"#,
+                StatusCode::BAD_REQUEST,
+                br#"{"error":{"code":400,"message":"Invalid argument","errors":[{"domain":"global","reason":"invalidArgument"}]}}"#,
             ),
             ok_json(json!({ "id": "live", "threadId": "thread-live" })),
         ]);
@@ -1527,10 +1557,11 @@ mod tests {
         assert!(
             matches!(
                 &obligations[0],
-                bifrost_types::InventoryObligation::Object { id, .. }
+                bifrost_types::InventoryObligation::Object { id, error, .. }
                     if id.0 == "broken"
+                        && matches!(error.recovery(), bifrost_types::RecoveryClass::ClientBug)
             ),
-            "the obligation must name the object so a repair can address it: {obligations:?}"
+            "the obligation must name the object and retain its per-object recovery class: {obligations:?}"
         );
 
         // The surviving message is still delivered, and its batch declares the
@@ -1545,6 +1576,70 @@ mod tests {
         assert_eq!(batch.items.len(), 1);
         assert_eq!(batch.items[0].id, ObjectId("live".to_string()));
         assert!(!batch.coverage.is_complete());
+    }
+
+    #[tokio::test]
+    async fn inventory_terminates_on_account_wide_permission_failure() {
+        let client = scripted_client(vec![
+            ok_json(json!({ "emailAddress": "person@example.com", "historyId": "100" })),
+            ok_json(json!({ "labels": [] })),
+            ok_json(json!({ "messages": [{ "id": "m1" }] })),
+            canned(
+                StatusCode::FORBIDDEN,
+                br#"{"error":{"code":403,"message":"Forbidden","status":"PERMISSION_DENIED"}}"#,
+            ),
+        ]);
+
+        let events = inventory_stream(
+            client,
+            Arc::new(super::super::scopes::ScopeCacheState::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            CursorScope::Account,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(events.len(), 1, "a refused walk has no batch or Done");
+        let bifrost_types::InventoryEvent::Terminated(error) = &events[0] else {
+            panic!("an account-wide permission failure must terminate inventory: {events:?}");
+        };
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::NoPermission { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn inventory_stops_on_a_throttle_instead_of_recording_an_object_obligation() {
+        let client = scripted_client(vec![
+            ok_json(json!({ "emailAddress": "person@example.com", "historyId": "100" })),
+            ok_json(json!({ "labels": [] })),
+            ok_json(json!({ "messages": [{ "id": "m1" }] })),
+            canned(
+                StatusCode::TOO_MANY_REQUESTS,
+                br#"{"error":{"code":429,"message":"rate limited","errors":[{"domain":"usageLimits","reason":"rateLimitExceeded"}]}}"#,
+            ),
+        ]);
+
+        let events = inventory_stream(
+            client,
+            Arc::new(super::super::scopes::ScopeCacheState::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            CursorScope::Account,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(events.len(), 1, "a refused walk has no batch or Done");
+        let bifrost_types::InventoryEvent::Terminated(error) = &events[0] else {
+            panic!("a throttle must terminate inventory: {events:?}");
+        };
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::Retry(_)
+        ));
     }
 
     /// The guard is only worth anything wired into the walk. A provider
@@ -1693,6 +1788,70 @@ mod tests {
         };
         assert!(matches!(batch.page_boundary, PageBoundary::Final));
         assert_eq!(batch.items.len(), 2);
+        assert!(matches!(events[1], SyncEvent::Done(None)));
+    }
+
+    #[tokio::test]
+    async fn get_stream_terminates_on_a_throttle_instead_of_failing_the_object() {
+        let client = scripted_client(vec![
+            ok_json(json!({ "labels": [] })),
+            canned(
+                StatusCode::TOO_MANY_REQUESTS,
+                br#"{"error":{"code":429,"message":"rate limited","errors":[{"domain":"usageLimits","reason":"rateLimitExceeded"}]}}"#,
+            ),
+        ]);
+        let mut events = get_stream(
+            client,
+            Arc::new(super::super::scopes::ScopeCacheState::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            Box::pin(stream::iter([ObjectId("m1".to_owned())])),
+            Projection::Metadata,
+        );
+
+        let first = events.next().await.expect("the stream must terminate");
+        let SyncEvent::Terminated(error) = first else {
+            panic!("a throttle must terminate hydration, got {first:?}");
+        };
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::Retry(_)
+        ));
+        assert!(events.next().await.is_none(), "Terminated ends hydration");
+    }
+
+    #[tokio::test]
+    async fn get_stream_keeps_object_attributable_permanent_failures_in_item_lanes() {
+        let client = scripted_client(vec![
+            ok_json(json!({ "labels": [] })),
+            canned(
+                StatusCode::NOT_FOUND,
+                br#"{"error":{"code":404,"message":"Not Found","status":"NOT_FOUND"}}"#,
+            ),
+        ]);
+        let events = get_stream(
+            client,
+            Arc::new(super::super::scopes::ScopeCacheState::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            Box::pin(stream::iter([ObjectId("m1".to_owned())])),
+            Projection::Metadata,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(events.len(), 2);
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("an object-attributable permanent error stays in a batch: {events:?}");
+        };
+        let [ItemOutcome::Failed(failure)] = batch.items.as_slice() else {
+            panic!("the failed object needs its own lane: {batch:?}");
+        };
+        assert_eq!(failure.item.0, "m1");
+        assert!(matches!(
+            failure.error.recovery(),
+            bifrost_types::RecoveryClass::ProviderRefused
+        ));
         assert!(matches!(events[1], SyncEvent::Done(None)));
     }
 

@@ -1,15 +1,71 @@
+/// A numeric sequence bound or the IMAP `*` bound.
+///
+/// RFC 3501 Section 9 permits `*` wherever a sequence number is allowed. It
+/// means the highest number in use, while `Number(u32::MAX)` is a legal
+/// numeric UID. Keeping the two forms distinct lets callers decide whether a
+/// sequence-set can be expanded without treating that legal UID as `*`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SeqBound {
+    /// A concrete non-zero sequence number or UID.
+    Number(u32),
+    /// The highest sequence number in use, whose value depends on the mailbox.
+    Star,
+}
+
 /// A UID range (e.g. `1:100`, or a single UID `42`)
 /// (RFC 3501 Section 9 / RFC 4315 Section 2.1).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct UidRange {
     /// First UID in this range (RFC 3501 Section 9 / RFC 4315 Section 2.1).
+    ///
+    /// For a parsed sequence-set, `u32::MAX` is also the numeric projection of
+    /// `*`. Use [`start_bound`](Self::start_bound) to distinguish those cases.
     pub start: u32,
     /// `None` means a single UID (not a range) (RFC 3501 Section 9 / RFC 4315 Section 2.1).
+    ///
+    /// For a parsed sequence-set, `Some(u32::MAX)` is also the numeric
+    /// projection of `*`. Use [`end_bound`](Self::end_bound) to distinguish
+    /// those cases.
     pub end: Option<u32>,
+    start_is_star: bool,
+    end_is_star: bool,
 }
 
 impl UidRange {
+    /// Return the start as an explicit numeric or `*` bound.
+    pub const fn start_bound(&self) -> SeqBound {
+        if self.start_is_star {
+            SeqBound::Star
+        } else {
+            SeqBound::Number(self.start)
+        }
+    }
+
+    /// Return the optional end as an explicit numeric or `*` bound.
+    pub const fn end_bound(&self) -> Option<SeqBound> {
+        match self.end {
+            Some(_) if self.end_is_star => Some(SeqBound::Star),
+            Some(end) => Some(SeqBound::Number(end)),
+            None => None,
+        }
+    }
+
+    /// Build a parsed sequence range, normalizing reversed endpoints.
+    pub(crate) fn from_sequence_bounds(first: SeqBound, second: Option<SeqBound>) -> Self {
+        let (start, end) = match second {
+            Some(end) if first > end => (end, Some(first)),
+            other => (first, other),
+        };
+        Self {
+            start: bound_number(start),
+            end: end.map(bound_number),
+            start_is_star: matches!(start, SeqBound::Star),
+            end_is_star: matches!(end, Some(SeqBound::Star)),
+        }
+    }
+
     /// Create a single-UID range.
     ///
     /// # Panics (debug builds only)
@@ -22,6 +78,8 @@ impl UidRange {
         Self {
             start: uid,
             end: None,
+            start_is_star: false,
+            end_is_star: false,
         }
     }
 
@@ -41,6 +99,8 @@ impl UidRange {
         Self {
             start,
             end: Some(end),
+            start_is_star: false,
+            end_is_star: false,
         }
     }
 
@@ -53,6 +113,8 @@ impl UidRange {
             Some(Self {
                 start: uid,
                 end: None,
+                start_is_star: false,
+                end_is_star: false,
             })
         }
     }
@@ -66,14 +128,23 @@ impl UidRange {
             Some(Self {
                 start,
                 end: Some(end),
+                start_is_star: false,
+                end_is_star: false,
             })
         }
     }
 }
 
+const fn bound_number(bound: SeqBound) -> u32 {
+    match bound {
+        SeqBound::Number(number) => number,
+        SeqBound::Star => u32::MAX,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::UidRange;
+    use super::{SeqBound, UidRange};
 
     #[test]
     fn single_and_range_carry_the_expected_shape() {
@@ -88,6 +159,26 @@ mod tests {
         // A one-element range is representable both ways, and the two
         // spellings are NOT equal: `end` distinguishes them.
         assert_ne!(UidRange::range(3, 3), UidRange::single(3));
+    }
+
+    #[test]
+    fn numeric_maximum_and_star_are_distinct_bounds() {
+        let numeric = UidRange::single(u32::MAX);
+        let star = UidRange::from_sequence_bounds(SeqBound::Star, None);
+
+        assert_eq!(numeric.start, star.start);
+        assert_eq!(numeric.start_bound(), SeqBound::Number(u32::MAX));
+        assert_eq!(star.start_bound(), SeqBound::Star);
+        assert_ne!(numeric, star);
+    }
+
+    #[test]
+    fn sequence_ranges_normalize_star_as_the_highest_bound() {
+        let range =
+            UidRange::from_sequence_bounds(SeqBound::Star, Some(SeqBound::Number(u32::MAX - 1)));
+
+        assert_eq!(range.start_bound(), SeqBound::Number(u32::MAX - 1));
+        assert_eq!(range.end_bound(), Some(SeqBound::Star));
     }
 
     // RFC 3501 Section 9: uniqueid = nz-number. The checked constructors

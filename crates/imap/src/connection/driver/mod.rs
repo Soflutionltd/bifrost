@@ -562,7 +562,7 @@ pub(super) async fn driver_task(
 }
 
 /// Upper bound on the terminal LOGOUT write + BYE/OK drain.
-const LOGOUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const LOGOUT_DRAIN_TIMEOUT: std::time::Duration = super::LOGOUT_DRAIN_TIMEOUT;
 
 // ---------------------------------------------------------------------------
 // Command execution

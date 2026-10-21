@@ -346,19 +346,10 @@ impl CalDavAccount {
 
     async fn event_snapshot(
         client: &CalDavClient,
-        home: Option<&str>,
         calendar: &str,
         operation: AccountOperation,
     ) -> Result<EventSnapshot, AccountError> {
-        let sync_token = match home {
-            Some(home) => client
-                .list_calendars_for_operation(home, operation)
-                .await?
-                .into_iter()
-                .find(|collection| same_url(&collection.href, calendar))
-                .and_then(|collection| collection.sync_token),
-            None => client.collection_sync_token(calendar, operation).await?,
-        };
+        let sync_token = client.collection_sync_token(calendar, operation).await?;
         // VEVENT-filtered, not the bare depth-1 PROPFIND: a VTODO or VJOURNAL
         // sharing the collection would otherwise enter the event snapshot and be
         // emitted as a created/updated event change that hydrates to nothing.
@@ -469,7 +460,6 @@ impl Account for CalDavAccount {
         scope: CursorScope,
     ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
         let client = Arc::clone(&self.client);
-        let home = self.calendar_home.clone();
         let default_calendar = self.default_calendar_url.clone();
         let calendar_urls = self.calendar_urls.clone();
         Box::pin(async move {
@@ -480,13 +470,8 @@ impl Account for CalDavAccount {
                 &calendar_urls,
                 AccountOperation::EstablishCursor,
             )?;
-            let snapshot = Self::event_snapshot(
-                &client,
-                Some(&home),
-                &calendar,
-                AccountOperation::EstablishCursor,
-            )
-            .await?;
+            let snapshot =
+                Self::event_snapshot(&client, &calendar, AccountOperation::EstablishCursor).await?;
             Ok(CursorEstablishment::Ready(cursor_from_snapshot(
                 scope, &snapshot,
             )))
@@ -494,8 +479,7 @@ impl Account for CalDavAccount {
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
-        let client = Arc::clone(&self.client);
-        let home = self.calendar_home.clone();
+        let (client, tally) = self.client.metered();
         let default_calendar = self.default_calendar_url.clone();
         let calendar_urls = self.calendar_urls.clone();
         let coverage_scope = scope.clone();
@@ -527,20 +511,16 @@ impl Account for CalDavAccount {
                     }
                 };
                 let started = Instant::now();
-                let snapshot = match Self::event_snapshot(
-                    &client,
-                    Some(&home),
-                    &calendar,
-                    AccountOperation::SyncInventory,
-                )
-                .await
-                {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        events.push(SyncEvent::Terminated(error));
-                        return events;
-                    }
-                };
+                let snapshot =
+                    match Self::event_snapshot(&client, &calendar, AccountOperation::SyncInventory)
+                        .await
+                    {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            events.push(SyncEvent::Terminated(error));
+                            return events;
+                        }
+                    };
                 let checkpoint = cursor_from_snapshot(scope, &snapshot);
                 let items = snapshot
                     .entries
@@ -551,7 +531,7 @@ impl Account for CalDavAccount {
                     items,
                     page_boundary: PageBoundary::Final,
                     server_latency: started.elapsed(),
-                    bytes_in: 0,
+                    bytes_in: tally.take(),
                     checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
                 }));
                 events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
@@ -590,7 +570,7 @@ impl Account for CalDavAccount {
     }
 
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
-        let client = Arc::clone(&self.client);
+        let (client, tally) = self.client.metered();
         Box::pin(
             stream::once(async move {
                 let mut events = Vec::new();
@@ -614,7 +594,7 @@ impl Account for CalDavAccount {
                     items: changes,
                     page_boundary: PageBoundary::Final,
                     server_latency: started.elapsed(),
-                    bytes_in: 0,
+                    bytes_in: tally.take(),
                     checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
                 }));
                 events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
@@ -1966,12 +1946,11 @@ async fn changes_from_cursor(
         let mut token = sync_token.to_string();
         // RFC 6578 s3.6: a server may answer a sync REPORT with only part of
         // the change set, marking it with a 507 response for the collection
-        // itself and a token that represents that partial progress. Stopping
-        // there and checkpointing the partial token as if it were complete
-        // loses every change beyond the truncation point until etag drift
-        // happens to surface it. iCloud and large Cyrus collections truncate in
-        // practice, so drain the rest by re-issuing the REPORT with the token
-        // the server just handed back.
+        // itself and a token that represents that partial progress. The token
+        // is still a valid continuation point, so stopping here would leave
+        // changes for the next poll rather than lose them. Drain now to reduce
+        // that latency; the round cap and same-token stop remain safe because
+        // either leaves the last valid token available for the next poll.
         for _ in 0..SYNC_TRUNCATION_ROUNDS {
             let report = client.sync_events(&previous.calendar_url, &token).await?;
             let truncated = report.truncated;
@@ -2012,7 +1991,6 @@ async fn changes_from_cursor(
     }
     let mut current = CalDavAccount::event_snapshot(
         client,
-        None,
         &previous.calendar_url,
         AccountOperation::SyncChanges,
     )
@@ -2156,6 +2134,14 @@ fn cursor_error(message: impl Into<String>) -> AccountError {
 
 fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> bool {
     if start.value.is_empty() || end.value.is_empty() || event.start.value.is_empty() {
+        return true;
+    }
+    if event.is_all_day {
+        // DATE values are floating civil dates and carry no timezone from
+        // which to construct an instant. Comparing their midnight as UTC can
+        // reject an event the server-side time-range filter returned. Keep
+        // those results: the REPORT has the calendar's timezone context that
+        // this local guard does not.
         return true;
     }
     let Some((range_start, range_end)) = time_interval(start, Some(end), false) else {
@@ -2555,8 +2541,9 @@ mod tests {
         )
     }
 
-    /// The calendar-home depth-1 answer the snapshot lane reads its collection
-    /// sync token out of.
+    /// A canned collection listing with a sync-token candidate. Snapshot tests
+    /// use it as the depth-0 token response, even though the body includes the
+    /// same properties a depth-1 calendar listing might return.
     fn home_listing() -> DavResponse {
         cal_multistatus(wrap(&[
             "<D:response><D:href>/cal/</D:href><D:propstat><D:prop>\
@@ -3421,6 +3408,17 @@ mod tests {
     }
 
     #[test]
+    fn range_filter_keeps_all_day_dates_when_the_window_has_an_offset() {
+        let event = event("2026-06-02", "2026-06-03", true);
+
+        assert!(event_in_range(
+            &event,
+            &time("2026-06-01T23:30:00+02:00"),
+            &time("2026-06-02T01:00:00+02:00")
+        ));
+    }
+
+    #[test]
     fn range_filter_includes_event_that_started_before_window() {
         let event = event("2026-06-01T23:00:00Z", "2026-06-02T01:00:00Z", false);
 
@@ -3484,7 +3482,10 @@ mod tests {
 
     #[test]
     fn range_filter_excludes_event_ending_at_window_start() {
-        let event = event("2026-06-01", "2026-06-02", true);
+        // Timed, not all-day: all-day DATE events are deliberately kept by the
+        // local guard (see `range_filter_keeps_all_day_dates_when_the_window_
+        // has_an_offset`), so the half-open end boundary is pinned with instants.
+        let event = event("2026-06-01T00:00:00Z", "2026-06-02T00:00:00Z", false);
 
         assert!(!event_in_range(
             &event,
@@ -4045,7 +4046,7 @@ mod tests {
             (
                 "https://dav.example.test/cal/%FF.ics",
                 "https://dav.example.test/cal/%FE.ics",
-                true,
+                false,
             ),
             ("relative/", "relative", true),
             (
@@ -4182,7 +4183,6 @@ mod tests {
             CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
         let snapshot = CalDavAccount::event_snapshot(
             &client,
-            Some("https://dav.example.test/"),
             "https://dav.example.test/cal/",
             AccountOperation::SyncChanges,
         )
@@ -4190,6 +4190,9 @@ mod tests {
         .expect("partial snapshot");
         assert!(snapshot.sync_token.is_none());
         assert_eq!(snapshot.failed_hrefs.len(), 1);
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].headers["Depth"], "0");
     }
 
     #[tokio::test]
@@ -4206,6 +4209,34 @@ mod tests {
             .collect::<Vec<_>>()
             .await;
         assert!(matches!(events.as_slice(), [InventoryEvent::Terminated(_)]));
+    }
+
+    #[tokio::test]
+    async fn inventory_batch_counts_token_refused_filter_and_fallback_wire_bodies() {
+        let token_response = home_listing();
+        let token_bytes = token_response.body.len() as u64;
+        let listing_response = cal_multistatus(wrap(&[queried("a")]));
+        let listing_bytes = listing_response.body.len() as u64;
+        let refusal = DavResponse {
+            status: reqwest::StatusCode::METHOD_NOT_ALLOWED,
+            headers: reqwest::header::HeaderMap::new(),
+            body: "x".repeat(5000),
+            url: String::new(),
+        };
+        let refusal_bytes = refusal.body.len() as u64;
+        let script = dav_script([token_response, refusal, listing_response]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+        let events = account
+            .inventory_stream(folder_scope())
+            .collect::<Vec<_>>()
+            .await;
+
+        let InventoryEvent::Batch(batch) = &events[0] else {
+            panic!("expected inventory batch: {events:?}");
+        };
+        assert_eq!(batch.bytes_in, token_bytes + refusal_bytes + listing_bytes);
     }
 
     #[test]
@@ -4315,9 +4346,9 @@ mod tests {
         assert_eq!(snapshot.entries[0].etag.as_deref(), Some("kept"));
     }
 
-    /// RFC 6578 s3.6: a truncated result must be drained with the partial
-    /// token it came with, or every change past the truncation point is lost
-    /// until etag drift happens to surface it.
+    /// RFC 6578 s3.6: the partial token is a valid continuation point. Draining
+    /// now reduces latency; stopping at the round cap still lets the next poll
+    /// continue from the last token.
     #[tokio::test]
     async fn a_truncated_sync_report_is_drained_before_the_cursor_advances() {
         use bifrost_dav_core::DavResponse;
@@ -4382,6 +4413,40 @@ mod tests {
         let requests = transcripts(&script);
         assert_eq!(requests.len(), 2, "the drain must re-issue the REPORT");
         assert!(requests[1].body.contains("partial"));
+    }
+
+    #[tokio::test]
+    async fn changes_batch_counts_every_drained_report_body() {
+        use bifrost_dav_core::DavResponse;
+        use bifrost_dav_core::test_support::dav_script;
+        use reqwest::StatusCode;
+        use reqwest::header::HeaderMap;
+
+        let first_body = "<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>/cal/</D:href><D:status>HTTP/1.1 507 Insufficient Storage</D:status></D:response><D:sync-token>partial</D:sync-token></D:multistatus>";
+        let second_body = "<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>/cal/one.ics</D:href><D:propstat><D:prop><D:getetag>\"a\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response><D:sync-token>complete</D:sync-token></D:multistatus>";
+        let multistatus = |body: &str| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: body.to_string(),
+            url: String::new(),
+        };
+        let expected_bytes = (first_body.len() + second_body.len()) as u64;
+        let script = dav_script([multistatus(first_body), multistatus(second_body)]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let previous = EventSnapshot {
+            calendar_url: "https://dav.example.test/cal/".to_string(),
+            sync_token: Some("start".to_string()),
+            ..EventSnapshot::default()
+        };
+        let cursor = cursor_from_snapshot(folder_scope(), &previous);
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+        let events = account.changes_stream(cursor).collect::<Vec<_>>().await;
+
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("expected changes batch: {events:?}");
+        };
+        assert_eq!(batch.bytes_in, expected_bytes);
     }
 
     /// A consumer restating the calendar it read back, in the encoding it read

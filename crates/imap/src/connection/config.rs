@@ -150,11 +150,26 @@ impl ImapConnection {
         };
 
         if let Some(keepalive) = config.keepalive {
-            conn.set_keepalive(keepalive).await?;
+            setup_keepalive_cancel_safe(&conn, conn.set_keepalive(keepalive)).await?;
         }
 
         Ok(conn)
     }
+}
+
+async fn setup_keepalive_cancel_safe<Fut>(conn: &ImapConnection, setup: Fut) -> Result<(), Error>
+where
+    Fut: std::future::Future<Output = Result<(), Error>>,
+{
+    // The driver already owns the socket here. If this direct setup caller is
+    // cancelled while the keepalive command is queued, dropping the last
+    // connection handle must abort that driver instead of detaching it.
+    let guard = conn.in_flight();
+    let result = setup.await;
+    if result.is_ok() {
+        guard.completed();
+    }
+    result
 }
 
 #[cfg(test)]

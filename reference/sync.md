@@ -2319,6 +2319,15 @@ consecutive higher-lane pulls (`SchedulerConfig::starvation_floor`,
 default 64). A configured value of zero is floored to one, so lower lanes do
 not leapfrog higher-priority work on every pull.
 
+Lane selection combines account priority and work kind for both admission
+and submitted work items. Live polls, push reconciliation and mutations retain
+the account lane. Backfill partitions, backfill barrier walks and deferred
+inventory use `WorkKind::Backfill`: Foreground and Normal accounts run this
+work in Background; Background and Bulk accounts run it in Bulk. Live sync
+and backfill share the sync budget class, so an older backfill waiter cannot
+reserve its own acquisition ahead of a later live poll. The starvation guard
+still applies, and running work is not interrupted.
+
 `LaneQueue` is bounded (default 1024 items, configurable via
 `EngineConfig::lane_capacity`). Standalone queues can select either
 `LaneShedPolicy`: `DropOldest` evicts the head and `DropNewest` rejects the

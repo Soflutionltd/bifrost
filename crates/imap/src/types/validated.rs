@@ -504,6 +504,21 @@ impl MailboxName {
         self.identity() == Self::from_decoded(self.0.clone()).identity()
     }
 
+    /// Whether two decoded mailbox addresses name the same mailbox for a
+    /// command response. Canonical encodings compare by their decoded name so
+    /// caller-created targets match responses in either encoding mode. When
+    /// either address is noncanonical, compare the retained wire identity so
+    /// lossy display decoding cannot pair two distinct mailboxes. INBOX keeps
+    /// its RFC-defined ASCII case-insensitive comparison for canonical names.
+    pub(crate) fn matches_mailbox(&self, other: &Self) -> bool {
+        if self.can_reencode() && other.can_reencode() {
+            (self.0.eq_ignore_ascii_case("INBOX") && other.0.eq_ignore_ascii_case("INBOX"))
+                || self.0 == other.0
+        } else {
+            self.identity() == other.identity()
+        }
+    }
+
     /// Construct from already-decoded bytes produced by the codec's decoder.
     /// Callers must guarantee the input has already been MUTF-7 decoded (or
     /// passed through in UTF-8 mode per RFC 6855).

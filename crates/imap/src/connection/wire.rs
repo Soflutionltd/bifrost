@@ -6,6 +6,7 @@
 //! itself is only called by the connection constructor and the stream
 //! upgrade handler.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -173,7 +174,8 @@ impl WireReader {
         let n = peer_io(self.metering.peer_timeout.clone(), read).await?;
         if self.compress_boundary {
             // The last read can contain compressed bytes after the tagged OK.
-            // Keep its grant until the upgrade identifies that uncharged suffix.
+            // Keep both counters pending until the upgrade identifies that
+            // suffix, which will be counted after decompression by the new reader.
             self.compress_read = Some((grant, n));
         } else {
             grant.finish(n);
@@ -434,6 +436,7 @@ pub(super) struct WireMetering {
     sink: Option<MeterSinkHandle>,
     budget: BandwidthBudget,
     peer_timeout: Option<PeerBudget>,
+    inbound_bytes: Arc<AtomicU64>,
 }
 
 impl WireMetering {
@@ -447,13 +450,24 @@ impl WireMetering {
             sink,
             budget: budget.unwrap_or_default(),
             peer_timeout: None,
+            inbound_bytes: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(super) fn inbound_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.inbound_bytes)
     }
 
     fn record_in(&self, n: usize) {
         if let Some(sink) = &self.sink {
             sink.record_bytes_in(u64::try_from(n).unwrap_or(u64::MAX));
         }
+        let n = u64::try_from(n).unwrap_or(u64::MAX);
+        let _ = self
+            .inbound_bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(n))
+            });
     }
 
     fn record_out(&self, n: usize) {

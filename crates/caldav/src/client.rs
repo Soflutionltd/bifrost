@@ -64,6 +64,14 @@ impl fmt::Debug for CalDavClient {
 }
 
 impl CalDavClient {
+    /// A client view whose buffered requests feed only this stream's tally.
+    pub(crate) fn metered(&self) -> (Self, bifrost_dav_core::DavByteTally) {
+        let (dav, tally) = self.dav.metered();
+        let mut client = self.clone();
+        client.dav = dav;
+        (client, tally)
+    }
+
     pub(crate) fn resolve_url(&self, href: &str) -> String {
         self.dav.resolve_url(href)
     }

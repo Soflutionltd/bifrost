@@ -74,13 +74,23 @@ impl Authorization {
         }
     }
 
+    /// Return a concrete source handle for callers that require one. Basic
+    /// transport setup must use the optional accessor below so it attaches
+    /// no bearer source.
     pub(crate) fn account_token_source(&self) -> Arc<dyn TokenSource> {
         match self {
-            // AccountNet requires a token source even when JMAP is
-            // using Basic auth. This source is intentionally inert;
-            // the request builder disables bearer injection for Basic.
+            // This inert handle is not attached to Basic transport accounts.
             Self::Basic(_) => Arc::new(StaticTokenSource::new("", None)),
             Self::Bearer(source) => Arc::clone(source),
+        }
+    }
+
+    pub(crate) fn optional_account_token_source(&self) -> Option<Arc<dyn TokenSource>> {
+        match self {
+            // Basic requests supply their own Authorization header and
+            // disable bearer injection, so they have no token source.
+            Self::Basic(_) => None,
+            Self::Bearer(_) => Some(self.account_token_source()),
         }
     }
 
@@ -462,9 +472,7 @@ impl ClientBuilder {
         )
         .map_err(crate::Error::from)?;
 
-        let session_url = well_known_session_url(url);
-        let session_bytes = transport
-            .get_session(&session_url)
+        let (session_url, session_bytes) = fetch_session(&transport, url)
             .await
             .map_err(crate::Error::from)?;
         let session: Session = serde_json::from_slice(&session_bytes)?;
@@ -499,18 +507,66 @@ impl ClientBuilder {
     }
 }
 
-/// Decision note: the well-known path is appended to WHATEVER the caller
-/// gave, deliberately. RFC 8620 puts `/.well-known/jmap` at the origin
-/// root, but real deployments mount JMAP under a path prefix and answer
-/// the well-known there; appending supports both (pass the bare origin
-/// for the RFC shape). The trade-off is that a caller holding the ACTUAL
-/// session URL cannot connect to it directly through this door.
-fn well_known_session_url(url: &str) -> String {
-    format!("{}/.well-known/jmap", url.trim_end_matches('/'))
+/// Probe the RFC 8620 origin-rooted session URL first. Some path-mounted
+/// deployments also expose discovery below the configured base path, so
+/// retain that form only as a 404 fallback when the base has a path.
+fn well_known_session_urls(url: &str) -> Vec<String> {
+    let Ok(base) = reqwest::Url::parse(url) else {
+        return vec![format!("{}/.well-known/jmap", url.trim_end_matches('/'))];
+    };
+    if base.cannot_be_a_base() {
+        return vec![format!("{}/.well-known/jmap", url.trim_end_matches('/'))];
+    }
+
+    let configured_path = base.path().trim_end_matches('/').to_string();
+    let mut origin = base.clone();
+    origin.set_path("/.well-known/jmap");
+    origin.set_query(None);
+    origin.set_fragment(None);
+
+    let mut urls = vec![origin.to_string()];
+    if !configured_path.is_empty() {
+        let mut path_fallback = base;
+        path_fallback.set_path(&format!("{configured_path}/.well-known/jmap"));
+        path_fallback.set_query(None);
+        path_fallback.set_fragment(None);
+        urls.push(path_fallback.to_string());
+    }
+    urls
+}
+
+fn is_not_found(error: &crate::core::transport::TransportError) -> bool {
+    matches!(
+        error.net.as_ref(),
+        Some(bifrost_net::Error::Status { code, .. })
+            if *code == reqwest::StatusCode::NOT_FOUND
+    )
+}
+
+async fn fetch_session<T: HttpTransport>(
+    transport: &T,
+    configured_base: &str,
+) -> Result<(String, bytes::Bytes), crate::core::transport::TransportError> {
+    let mut urls = well_known_session_urls(configured_base).into_iter();
+    let origin_url = urls
+        .next()
+        .expect("session discovery always has an origin URL");
+    match transport.get_session(&origin_url).await {
+        Ok(bytes) => Ok((origin_url, bytes)),
+        Err(error) if is_not_found(&error) => match urls.next() {
+            Some(path_url) => transport
+                .get_session(&path_url)
+                .await
+                .map(|bytes| (path_url, bytes)),
+            None => Err(error),
+        },
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
 mod session_state_tests {
+    use std::collections::VecDeque;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -520,7 +576,7 @@ mod session_state_tests {
     use serde_json::json;
     use tokio::sync::{Notify, Semaphore};
 
-    use super::{Client, Session, well_known_session_url};
+    use super::{Client, Session, fetch_session, well_known_session_urls};
     use crate::core::transport::{HttpTransport, TransportError};
 
     fn session_json(tag: &str, account: &str, state: &str) -> String {
@@ -1183,14 +1239,128 @@ mod session_state_tests {
     }
 
     #[test]
-    fn well_known_session_url_has_one_separator() {
+    fn well_known_session_urls_are_origin_rooted_with_a_path_fallback() {
         assert_eq!(
-            well_known_session_url("https://example.test/jmap"),
-            "https://example.test/jmap/.well-known/jmap"
+            well_known_session_urls("https://example.test/jmap"),
+            vec![
+                "https://example.test/.well-known/jmap",
+                "https://example.test/jmap/.well-known/jmap"
+            ]
         );
         assert_eq!(
-            well_known_session_url("https://example.test/jmap/"),
-            "https://example.test/jmap/.well-known/jmap"
+            well_known_session_urls("https://example.test/jmap/"),
+            vec![
+                "https://example.test/.well-known/jmap",
+                "https://example.test/jmap/.well-known/jmap"
+            ]
+        );
+        assert_eq!(
+            well_known_session_urls("https://example.test/?configured=1#fragment"),
+            vec!["https://example.test/.well-known/jmap"]
+        );
+    }
+
+    struct DiscoveryTransport {
+        urls: Arc<Mutex<Vec<String>>>,
+        replies: Mutex<VecDeque<Result<Bytes, TransportError>>>,
+    }
+
+    impl DiscoveryTransport {
+        fn new(replies: impl IntoIterator<Item = Result<Bytes, TransportError>>) -> Self {
+            Self {
+                urls: Arc::new(Mutex::new(Vec::new())),
+                replies: Mutex::new(replies.into_iter().collect()),
+            }
+        }
+
+        fn status(code: reqwest::StatusCode) -> TransportError {
+            TransportError::from_net(bifrost_net::Error::Status {
+                code,
+                body: Bytes::new(),
+                headers: reqwest::header::HeaderMap::new(),
+            })
+        }
+    }
+
+    impl HttpTransport for DiscoveryTransport {
+        async fn api_request(&self, _: &str, _: Vec<u8>) -> Result<Bytes, TransportError> {
+            unreachable!("session discovery does not make API requests")
+        }
+
+        async fn upload(
+            &self,
+            _: &str,
+            _: Vec<u8>,
+            _: Option<&str>,
+        ) -> Result<Bytes, TransportError> {
+            unreachable!("session discovery does not upload")
+        }
+
+        async fn download(&self, _: &str) -> Result<Bytes, TransportError> {
+            unreachable!("session discovery does not download")
+        }
+
+        async fn get_session(&self, url: &str) -> Result<Bytes, TransportError> {
+            self.urls
+                .lock()
+                .expect("discovery URL lock")
+                .push(url.to_string());
+            self.replies
+                .lock()
+                .expect("discovery reply lock")
+                .pop_front()
+                .expect("a scripted discovery reply")
+        }
+    }
+
+    #[tokio::test]
+    async fn session_discovery_uses_the_path_only_after_an_origin_404() {
+        let transport = DiscoveryTransport::new([
+            Err(DiscoveryTransport::status(reqwest::StatusCode::NOT_FOUND)),
+            Ok(Bytes::from_static(b"session")),
+        ]);
+
+        let (url, bytes) = fetch_session(&transport, "https://example.test/jmap/")
+            .await
+            .expect("the path-mounted session follows an origin 404");
+
+        assert_eq!(url, "https://example.test/jmap/.well-known/jmap");
+        assert_eq!(bytes, Bytes::from_static(b"session"));
+        assert_eq!(
+            *transport.urls.lock().expect("discovery URL lock"),
+            vec![
+                "https://example.test/.well-known/jmap",
+                "https://example.test/jmap/.well-known/jmap"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_discovery_does_not_fallback_on_other_errors_or_root_bases() {
+        let transport = DiscoveryTransport::new([Err(DiscoveryTransport::status(
+            reqwest::StatusCode::FORBIDDEN,
+        ))]);
+        assert!(
+            fetch_session(&transport, "https://example.test/jmap")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            *transport.urls.lock().expect("discovery URL lock"),
+            vec!["https://example.test/.well-known/jmap"]
+        );
+
+        let root_transport = DiscoveryTransport::new([Err(DiscoveryTransport::status(
+            reqwest::StatusCode::NOT_FOUND,
+        ))]);
+        assert!(
+            fetch_session(&root_transport, "https://example.test/")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            *root_transport.urls.lock().expect("discovery URL lock"),
+            vec!["https://example.test/.well-known/jmap"]
         );
     }
 }
@@ -1524,5 +1694,11 @@ mod bearer_lifecycle_tests {
         );
         assert_eq!(account.bearer().await.unwrap().unwrap().as_str(), "new");
         assert_eq!(auth.header_value().await.unwrap(), "Bearer new");
+    }
+
+    #[test]
+    fn basic_authorization_has_no_bearer_token_source() {
+        let auth = Authorization::from_credentials(Credentials::basic("user", "password"));
+        assert!(auth.optional_account_token_source().is_none());
     }
 }

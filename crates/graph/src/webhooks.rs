@@ -7,8 +7,18 @@ use crate::error::GraphError;
 
 use super::client::GraphClient;
 
-const DEFAULT_EXPIRATION_MINUTES: u32 = 1440;
-const MAX_EXPIRATION_MINUTES: u32 = 4230;
+// The subscription resource documents 10,080 minutes as the maximum for
+// Outlook message, event, and contact subscriptions without resource data.
+// These requests create basic notifications, so use that full lifetime for
+// more renewal margin. https://learn.microsoft.com/en-us/graph/api/resources/subscription?view=graph-rest-1.0
+const DEFAULT_EXPIRATION_MINUTES: u32 = 10_080;
+const MAX_EXPIRATION_MINUTES: u32 = 10_080;
+
+fn requested_expiration_minutes(minutes: Option<u32>) -> u32 {
+    minutes
+        .unwrap_or(DEFAULT_EXPIRATION_MINUTES)
+        .min(MAX_EXPIRATION_MINUTES)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,9 +50,7 @@ pub(crate) async fn create_subscription(
     client_state: &str,
     expiration_minutes: Option<u32>,
 ) -> Result<SubscriptionResponse, GraphError> {
-    let minutes = expiration_minutes
-        .unwrap_or(DEFAULT_EXPIRATION_MINUTES)
-        .min(MAX_EXPIRATION_MINUTES);
+    let minutes = requested_expiration_minutes(expiration_minutes);
 
     let body = GraphSubscription {
         change_type: "created,updated,deleted".to_string(),
@@ -69,9 +77,7 @@ pub(crate) async fn renew_subscription(
     subscription_id: &str,
     expiration_minutes: Option<u32>,
 ) -> Result<String, GraphError> {
-    let minutes = expiration_minutes
-        .unwrap_or(DEFAULT_EXPIRATION_MINUTES)
-        .min(MAX_EXPIRATION_MINUTES);
+    let minutes = requested_expiration_minutes(expiration_minutes);
     let requested_expiry = compute_expiry_iso8601(minutes);
     let body = RenewSubscriptionRequest {
         expiration_date_time: requested_expiry,
@@ -197,6 +203,7 @@ pub(crate) fn is_expiring_soon(expiration_iso: &str, threshold_minutes: i64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::{GraphClient, ScriptedRestResponse};
 
     #[test]
     fn subscription_request_serialization() {
@@ -304,25 +311,60 @@ mod tests {
         }
     }
 
-    #[test]
-    fn requested_expiry_is_the_minutes_offset_from_now() {
-        // `create_subscription` / `renew_subscription` clamp their argument
-        // to `MAX_EXPIRATION_MINUTES` before calling this, so pinning the
-        // offset arithmetic pins the clamp's effect too.
-        let remaining = parse_iso8601_to_unix(&compute_expiry_iso8601(MAX_EXPIRATION_MINUTES))
-            .expect("own output parses")
-            - now_unix();
-        let want = i64::from(MAX_EXPIRATION_MINUTES) * 60;
-        assert!(
-            (remaining - want).abs() <= 2,
-            "remaining {remaining} vs want {want}"
-        );
+    #[tokio::test]
+    async fn create_and_renew_request_the_seven_day_outlook_lifetime() {
+        assert_eq!(requested_expiration_minutes(None), 10_080);
+        assert_eq!(requested_expiration_minutes(Some(10_080)), 10_080);
+        assert_eq!(requested_expiration_minutes(Some(20_160)), 10_080);
+        assert_eq!(requested_expiration_minutes(Some(60)), 60);
 
-        let default_remaining =
-            parse_iso8601_to_unix(&compute_expiry_iso8601(DEFAULT_EXPIRATION_MINUTES))
-                .expect("own output parses")
-                - now_unix();
-        assert!(default_remaining < want);
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                serde_json::json!({
+                    "id": "sub-created",
+                    "expirationDateTime": "2099-01-01T00:00:00Z"
+                }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                serde_json::json!({
+                    "id": "sub-renewed",
+                    "expirationDateTime": "2099-01-01T00:00:00Z"
+                }),
+            ),
+        ]);
+
+        create_subscription(
+            &client,
+            "/me/events",
+            "https://example.com/notify",
+            "client-state",
+            None,
+        )
+        .await
+        .expect("subscription create succeeds");
+        renew_subscription(&client, "sub-created", Some(20_160))
+            .await
+            .expect("subscription renewal succeeds");
+
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[1].method, "PATCH");
+        for request in requests {
+            let body = request.body.as_ref().expect("subscription request body");
+            let expiry = body["expirationDateTime"]
+                .as_str()
+                .expect("expiration is a string");
+            let remaining = parse_iso8601_to_unix(expiry).expect("own output parses") - now_unix();
+            let want = 10_080 * 60;
+            assert!(
+                (remaining - want).abs() <= 2,
+                "remaining {remaining} vs want {want}"
+            );
+        }
     }
 
     /// `subscription_is_gone` is the gate on the renewal worker's

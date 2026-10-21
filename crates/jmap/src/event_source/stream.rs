@@ -117,13 +117,19 @@ fn flatten_push_object(object: PushObject, id: Option<&str>) -> Vec<PushNotifica
 impl<T: HttpTransport + SseTransport> Client<T> {
     pub(crate) async fn event_source(
         &self,
-        mut types: Option<impl IntoIterator<Item = DataType>>,
+        types: Option<impl IntoIterator<Item = DataType>>,
         close_after_state: bool,
         ping: Option<u32>,
         last_event_id: Option<&str>,
     ) -> crate::Result<impl Stream<Item = crate::Result<PushNotification>> + Unpin> {
         let state = self.session_state();
         let mut event_source_url = String::with_capacity(state.session().event_source_url().len());
+        let types = types.map(|types| types.into_iter().collect::<Vec<_>>());
+        if types.as_ref().is_some_and(Vec::is_empty) {
+            return Err(crate::Error::InvalidUrl(
+                "EventSource type list must contain at least one type name".to_string(),
+            ));
+        }
 
         for part in state.event_source_url()? {
             match part {
@@ -132,23 +138,29 @@ impl<T: HttpTransport + SseTransport> Client<T> {
                 }
                 URLPart::Parameter(param) => match param {
                     super::URLParameter::Types => {
-                        if let Some(types) = types.take() {
-                            // Each type is percent-encoded individually
-                            // (`DataType::Other` is arbitrary wire-derived
-                            // text; a raw `,`, `&`, or `#` would splice the
-                            // query string), while the separating commas stay
-                            // literal - the same RFC 6570 discipline the blob
-                            // templates document in `session.rs`.
-                            event_source_url.push_str(
-                                &types
-                                    .into_iter()
-                                    .map(|t| {
-                                        crate::core::session::encode_template_value(&t.to_string())
+                        if let Some(types) = types.as_ref() {
+                            // Each name uses its own substitution position,
+                            // while the commas separating names remain
+                            // literal RFC 6570 expansion delimiters.
+                            let expanded = types
+                                .iter()
+                                .map(|type_name| {
+                                    let name = type_name.to_string();
+                                    if event_source_url.contains('?')
+                                        || event_source_url.contains('#')
+                                    {
+                                        crate::core::session::encode_template_value(&name)
                                             .to_string()
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(","),
-                            );
+                                    } else {
+                                        crate::core::session::encode_template_value_at(
+                                            &name,
+                                            &event_source_url,
+                                        )
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            event_source_url.push_str(&expanded);
                         } else {
                             event_source_url.push('*');
                         }
@@ -310,6 +322,7 @@ mod tests {
     use bytes::Bytes;
     use futures::stream;
     use serde_json::json;
+    use std::sync::Arc;
 
     use crate::core::{
         session::Session,
@@ -319,7 +332,19 @@ mod tests {
     /// A transport that replays a canned list of SSE frames and refuses
     /// every other request. One frame per element, so a test can also pin
     /// how the parser behaves across frame boundaries.
-    struct ScriptedTransport(Vec<Vec<u8>>);
+    struct ScriptedTransport {
+        frames: Vec<Vec<u8>>,
+        opened_urls: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedTransport {
+        fn new(frames: Vec<Vec<u8>>) -> Self {
+            Self {
+                frames,
+                opened_urls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
 
     impl HttpTransport for ScriptedTransport {
         async fn api_request(&self, _: &str, _: Vec<u8>) -> Result<Bytes, TransportError> {
@@ -349,11 +374,15 @@ mod tests {
 
         async fn open_sse(
             &self,
-            _: &str,
+            url: &str,
             _: Option<&str>,
         ) -> Result<Self::ByteStream, TransportError> {
+            self.opened_urls
+                .lock()
+                .expect("opened URL lock")
+                .push(url.to_string());
             Ok(stream::iter(
-                self.0
+                self.frames
                     .iter()
                     .map(|frame| Ok(frame.clone()))
                     .collect::<Vec<_>>(),
@@ -372,7 +401,7 @@ mod tests {
 
     fn client_frames(script: Vec<Vec<u8>>) -> Client<ScriptedTransport> {
         Client::with_transport(
-            ScriptedTransport(script),
+            ScriptedTransport::new(script),
             session(),
             "https://example.org/.well-known/jmap",
         )
@@ -439,7 +468,7 @@ mod tests {
         }))
         .expect("test session decodes");
         let client = Client::with_transport(
-            ScriptedTransport(vec![STATE_CHANGE.as_bytes().to_vec()]),
+            ScriptedTransport::new(vec![STATE_CHANGE.as_bytes().to_vec()]),
             session,
             "https://example.org/.well-known/jmap",
         )
@@ -456,6 +485,96 @@ mod tests {
             Err(other) => panic!("expected MalformedSessionUrl, got {other:?}"),
             Ok(_) => panic!("a malformed eventSourceUrl must not open a stream"),
         }
+    }
+
+    #[tokio::test]
+    async fn repeated_types_are_expanded_and_dot_path_values_are_encoded() {
+        let transport = ScriptedTransport::new(Vec::new());
+        let opened_urls = Arc::clone(&transport.opened_urls);
+        let mut session = serde_json::to_value(session()).expect("session serializes");
+        session["eventSourceUrl"] = json!(
+            "https://example.org/es/{types}?types={types}&closeafter={closeafter}&ping={ping}"
+        );
+        let client = Client::with_transport(
+            transport,
+            serde_json::from_value(session).expect("session parses"),
+            "https://example.org/.well-known/jmap",
+        )
+        .expect("client builds");
+
+        let _events = client
+            .event_source(
+                Some(vec![
+                    DataType::Other("..".to_string()),
+                    DataType::Other("Email".to_string()),
+                ]),
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("non-empty type list opens EventSource");
+
+        assert_eq!(
+            *opened_urls.lock().expect("opened URL lock"),
+            vec!["https://example.org/es/%252E%252E,Email?types=..,Email&closeafter=no&ping=0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn dot_only_type_is_encoded_in_a_path_substitution() {
+        let transport = ScriptedTransport::new(Vec::new());
+        let opened_urls = Arc::clone(&transport.opened_urls);
+        let mut session = serde_json::to_value(session()).expect("session serializes");
+        session["eventSourceUrl"] = json!("https://example.org/es/{types}");
+        let client = Client::with_transport(
+            transport,
+            serde_json::from_value(session).expect("session parses"),
+            "https://example.org/.well-known/jmap",
+        )
+        .expect("client builds");
+
+        let _events = client
+            .event_source(
+                Some(vec![DataType::Other("..".to_string())]),
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("non-empty type list opens EventSource");
+
+        let opened = opened_urls.lock().expect("opened URL lock");
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].as_str(), "https://example.org/es/%252E%252E");
+        assert_eq!(
+            reqwest::Url::parse(&opened[0]).unwrap().path(),
+            "/es/%252E%252E"
+        );
+        assert_eq!(
+            reqwest::Url::parse("https://example.org/es/..")
+                .unwrap()
+                .path(),
+            "/"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_types_list_is_refused_before_opening_eventsource() {
+        let transport = ScriptedTransport::new(Vec::new());
+        let opened_urls = Arc::clone(&transport.opened_urls);
+        let client =
+            Client::with_transport(transport, session(), "https://example.org/.well-known/jmap")
+                .expect("client builds");
+
+        let error = client
+            .event_source(Some(Vec::<DataType>::new()), false, None, None)
+            .await
+            .err()
+            .expect("an empty type set has no valid RFC 8620 representation");
+
+        assert!(matches!(error, crate::Error::InvalidUrl(_)));
+        assert!(opened_urls.lock().expect("opened URL lock").is_empty());
     }
 
     #[tokio::test]

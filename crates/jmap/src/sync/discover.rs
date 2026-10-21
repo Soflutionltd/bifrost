@@ -15,6 +15,7 @@ use crate::mailbox::{Mailbox, MailboxChanges, MailboxGet, MailboxId, Property};
 
 use super::capabilities::CoreLimits;
 use super::state_cache::{self, StateMap};
+use super::state_walk::StateWalk;
 
 type MailAccount<T> = crate::account::Account<T>;
 
@@ -148,10 +149,10 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
         // `hasMoreChanges: true`, and a pair of states alternating
         // forever); unlike a change walk, this stream is driven for the
         // life of the account, so an unguarded spin is a permanent hot
-        // loop against one non-conformant server. The guard is dropped
+        // loop against one non-conformant server. The guard resets
         // whenever the loop reaches a poll pause, because a state legitimately
         // repeating across two polls minutes apart is not a spin.
-        let mut walk: Option<super::changes::ChangeWalkGuard> = None;
+        let mut walk: Option<StateWalk> = None;
         loop {
             if shutdown.is_cancelled() {
                 break;
@@ -171,6 +172,13 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                 poll_pause(&shutdown, &mut session_changes).await;
                 continue;
             };
+
+            let state_walk = walk.get_or_insert_with(|| {
+                StateWalk::lifecycle(
+                    CursorScope::Type(bifrost_types::ObjectType::Mailbox),
+                    &since_state,
+                )
+            });
 
             let max_changes = NonZeroUsize::new(limits.max_objects_in_get.max(1));
             let Some(max_changes) = max_changes else {
@@ -198,10 +206,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                     // `Protocol(ContractViolation)` is the honest report:
                     // the engine surfaces a non-conformant provider
                     // rather than burning a poll loop forever.
-                    let guard = walk.get_or_insert_with(
-                        || super::changes::ChangeWalkGuard::new(&since_state),
-                    );
-                    if let Some(fault) = guard.observe(
+                    if let Some(fault) = state_walk.observe_changes_page(
                         &since_state,
                         &new_state,
                         response.has_more_changes(),
@@ -356,12 +361,12 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
 
                     // Commit only after every follow-up needed to describe
                     // this changes response has completed successfully.
-                    state_cache::set(&mailbox_states, &account_id, new_state).await;
+                    state_cache::set(&mailbox_states, &account_id, new_state.clone()).await;
 
                     if !response.has_more_changes() {
                         // The burst is over; the next poll starts a new
-                        // walk, so its guard starts empty.
-                        walk = None;
+                        // walk from the just-committed state.
+                        state_walk.reset_changes_burst(&new_state);
                         poll_pause(&shutdown, &mut session_changes).await;
                     }
                 }
@@ -372,17 +377,11 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                     // the lifecycle reader cannot restart a scope on its own.
                     let acct = super::error::into_account_error(
                         err,
-                        super::error::JmapErrorContext::cursor(
+                        state_walk.error_context(
                             bifrost_types::AccountOperation::ScopeLifecycle,
-                            CursorScope::Type(bifrost_types::ObjectType::Mailbox),
                         ),
                     );
-                    if matches!(
-                        acct.kind(),
-                        bifrost_types::AccountErrorKind::SyncState(
-                            bifrost_types::SyncStateErrorKind::CursorInvalid,
-                        ),
-                    ) {
+                    if state_walk.should_snapshot_reseed(&acct) {
                         // Expired history is conforming, not a progress-guard
                         // fault. This state is private to lifecycle, so an engine
                         // scope restart cannot repair it. Reconcile a complete
@@ -405,7 +404,8 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                                 let mut previous = mailbox_names.lock().await;
                                 let mut states = mailbox_states.lock().await;
                                 *previous = names;
-                                states.insert(account_id.clone(), Some(state));
+                                states.insert(account_id.clone(), Some(state.clone()));
+                                state_walk.reset_changes_burst(&state);
                             }
                             Err(err) => {
                                 let error = super::error::into_account_error(
@@ -418,7 +418,6 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                                 break;
                             }
                         }
-                        walk = None;
                         poll_pause(&shutdown, &mut session_changes).await;
                         continue;
                     }

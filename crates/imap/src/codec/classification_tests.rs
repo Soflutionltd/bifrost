@@ -248,6 +248,73 @@ fn invariant_i5_classify_exhaustive_rfc3501() {
     }
 }
 
+#[test]
+fn status_correlation_distinguishes_noncanonical_wire_names() {
+    let target = MailboxName::new("a").unwrap();
+    let collision = MailboxName::from_wire("a".into(), b"&AGE-", false);
+    let ctx = ClassificationContext {
+        notify: NotifyFlags::default(),
+        command_target: Some(&target),
+    };
+
+    assert!(matches!(
+        classify(
+            CK::Status,
+            &UR::MailboxStatus {
+                mailbox: collision,
+                items: vec![],
+            },
+            &ctx,
+        ),
+        SolicitationRule::OnlyUnsolicited
+    ));
+    assert!(matches!(
+        classify(
+            CK::Status,
+            &UR::MailboxStatus {
+                mailbox: target.clone(),
+                items: vec![],
+            },
+            &ctx,
+        ),
+        SolicitationRule::OnlySolicited
+    ));
+}
+
+#[test]
+fn inbox_case_folding_does_not_override_noncanonical_wire_identity() {
+    let target = MailboxName::new("INBOX").unwrap();
+    let lowercase = MailboxName::new("inbox").unwrap();
+    let noncanonical = MailboxName::from_wire("INBOX".into(), b"&AEkATgBCAE8AWA-", false);
+    let ctx = ClassificationContext {
+        notify: NotifyFlags::default(),
+        command_target: Some(&target),
+    };
+
+    assert!(matches!(
+        classify(
+            CK::Status,
+            &UR::MailboxStatus {
+                mailbox: lowercase,
+                items: vec![],
+            },
+            &ctx,
+        ),
+        SolicitationRule::OnlySolicited
+    ));
+    assert!(matches!(
+        classify(
+            CK::Status,
+            &UR::MailboxStatus {
+                mailbox: noncanonical,
+                items: vec![],
+            },
+            &ctx,
+        ),
+        SolicitationRule::OnlyUnsolicited
+    ));
+}
+
 /// Invariant I5  -  classify is exhaustive for all (command, response) pairs
 /// including extensions.
 ///

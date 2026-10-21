@@ -83,6 +83,11 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
     }
 
     match error.kind() {
+        ErrorKind::Authentication => {
+            let (kind, cause) = auth_reauth();
+            let detail = name_mechanism(diagnostic.clone(), auth_mechanism(phase));
+            build_basic(&ctx, kind, cause, attempt_state, detail.as_deref(), None)
+        }
         ErrorKind::Parse => build_basic(
             &ctx,
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
@@ -100,7 +105,7 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
             // consumers route to a policy/reauth UX instead of "malformed
             // request" -> ClientBug (internal telemetry).
             //
-            // A SCRAM `e=` server error arrives here too, and that one does
+            // A SCRAM policy error arrives here too, and that one does
             // know its rung, so the support text names it.
             let detail = name_mechanism(diagnostic.clone(), auth_mechanism(phase));
             build_basic(
@@ -1429,17 +1434,41 @@ mod tests {
     }
 
     #[test]
-    fn a_scram_server_error_carries_its_rung_through_the_policy_lane() {
-        // The SCRAM `e=` failure arrives as InvalidInput on the auth lane
-        // (`From<SaslError>`), a different arm from the reply-code lane
-        // above, and it is the one local-input path that does know its rung
-        // because the driver's outer stamp fills it in.
+    fn scram_invalid_proof_matches_a_535_credential_rejection() {
+        for protocol in [Protocol::Smtp, Protocol::Lmtp] {
+            let ctx = SmtpErrorContext::send(protocol);
+            let sasl = bifrost_sasl::verify_server_final("e=invalid-proof", &[]).unwrap_err();
+            let error: SmtpError = sasl.into();
+            let account = into_account_error(
+                error.with_phase(SmtpCommandPhase::Auth {
+                    mechanism: Some("SCRAM-SHA-256-PLUS"),
+                }),
+                ctx,
+            );
+            let reply = auth_error(response(
+                Severity::PermanentNegativeCompletion,
+                Category::Unspecified3,
+                Detail::Five,
+                &["5.7.8 credentials rejected"],
+            ));
+            assert_eq!(account.kind(), reply.kind());
+            assert_eq!(account.recovery(), reply.recovery());
+            assert!(matches!(account.recovery(), RecoveryClass::AuthLost));
+            assert!(support_text(&account).iter().any(|text| {
+                text.contains("invalid-proof") && text.contains("SCRAM-SHA-256-PLUS")
+            }));
+        }
+    }
+
+    #[test]
+    fn a_scram_policy_error_carries_its_rung_through_the_policy_lane() {
+        let sasl =
+            bifrost_sasl::verify_server_final("e=channel-binding-not-supported", &[]).unwrap_err();
+        let error: SmtpError = sasl.into();
         let account = into_account_error(
-            crate::transport::smtp::error::invalid_input("invalid-proof").with_phase(
-                SmtpCommandPhase::Auth {
-                    mechanism: Some("SCRAM-SHA-256"),
-                },
-            ),
+            error.with_phase(SmtpCommandPhase::Auth {
+                mechanism: Some("SCRAM-SHA-256"),
+            }),
             ctx_smtp_send(),
         );
         assert!(matches!(
@@ -1447,9 +1476,8 @@ mod tests {
             AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)
         ));
         assert!(
-            support_text(&account)
-                .iter()
-                .any(|text| text == "invalid-proof (mechanism SCRAM-SHA-256)"),
+            support_text(&account).iter().any(|text| text
+                == "SCRAM server error: channel-binding-not-supported (mechanism SCRAM-SHA-256)"),
             "{:?}",
             support_text(&account)
         );

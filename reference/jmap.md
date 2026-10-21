@@ -22,9 +22,10 @@ With the `sync` feature enabled, consumers may use:
 - `sync::JmapAccountFactory` - registered as `Arc<dyn AccountFactory>`.
 - `sync::JmapAccountFactoryBuilder` - open-time factory builder.
 - `sync::JmapCredentials` - Basic or bearer credentials. `bearer(token)`
-  / `bearer_source(Arc<dyn TokenSource>)`; the source threads through
-  `account_token_source()` into bifrost-net, read live per request.
-  `Clone`, hand-written `Debug`, no `PartialEq`/`Eq`.
+  / `bearer_source(Arc<dyn TokenSource>)`; a bearer source threads through
+  `account_token_source()` into bifrost-net and is read live per request.
+  Basic auth supplies its own `Authorization` header and attaches without a
+  bearer token source. `Clone`, hand-written `Debug`, no `PartialEq`/`Eq`.
 - `sync::ReconnectPolicy` - WebSocket reconnect backoff config.
 
 Everything else in `crates/jmap/src/` is `pub(crate)` or narrower. Consumers reach JMAP by constructing the factory, opening an `Arc<dyn Account>`, and calling `bifrost-types::Account` methods.
@@ -105,13 +106,26 @@ let result = response.get(&handle)?;  // compile-time safe extraction
 `CallHandle<M>` validates call_id and method name. A successful response with
 the wrong echoed method name is rejected and maps to
 `Protocol(ContractViolation)` at the account boundary. `Response::get()`
-returns `Error::Method` for JMAP method-level errors. RFC 8620 s3.2 lets one call produce several responses under the same call id; `get` consumes them in the order the server sent them, so repeated reads on one handle walk the sequence and unrelated handles are unaffected. (It removes in place rather than swapping the tail into the vacated slot, which reordered every later lookup. No currently wired method produces multiple responses, but this is the generic RFC 8620 envelope.)
+returns `Error::Method` for JMAP method-level errors. RFC 8620 s3.2 lets one
+call produce several responses under the same call id; `get` consumes them in
+the order the server sent them, so repeated reads on one handle walk the
+sequence and unrelated handles are unaffected. RFC 8621 s7.5 does produce this
+shape: a successful `EmailSubmission/set` with `onSuccessUpdateEmail` or
+`onSuccessDestroyEmail` is followed by an implicit `Email/set` response under
+the submission call id. `Response::get_method` reads that response by its
+method type after the explicit submission result. In-place removal preserves
+order; swapping the tail into the vacated slot reorders later lookups.
 
 ## Internal transport abstraction
 
 `Client<T: HttpTransport = ReqwestTransport>` is generic over transport.
 
 - `HttpTransport` - api_request, upload, download, get_session (returns `Bytes`).
+- `ClientBuilder::connect` probes the RFC 8620 origin-rooted
+  `/.well-known/jmap` URL first. If the configured base has a path, only an
+  origin 404 triggers a second probe below that path. The URL that succeeds is
+  retained for session refresh. Query and fragment components do not take part
+  in discovery.
 - `SseTransport` - open_sse (EventSource, with `last_event_id` support).
   `Client::event_source()` and everything in `event_source/` (WHATWG-conformant
   SSE parser plus stream driver, hermetically pinned) are `pub(crate)`: they are
@@ -123,6 +137,11 @@ returns `Error::Method` for JMAP method-level errors. RFC 8620 s3.2 lets one cal
   `reference/jmap/DEFERRED.md`. The long-lived SSE response explicitly suppresses
   the ordinary JMAP request deadline while retaining response-header and body
   inactivity bounds.
+  Each `{types}` occurrence expands the same requested list. `None` expands to
+  `*`; an explicit empty list is rejected because RFC 8620 requires either `*`
+  or a comma-separated list of type names. Each type name is encoded at its
+  substitution position, so dot-only path components cannot navigate and
+  reserved characters cannot add template delimiters.
 
   The stream driver's failure policy is per-case, not uniform. An undecodable
   `EventType::State` payload ends the stream, because the payload was
@@ -287,16 +306,19 @@ The sync request helpers likewise take `Account<Tr>` / `Client<Tr>` with
 production specialization because WebSocket push is reqwest-specific. Factory
 tests use an armed scripted transport that records exact API JSON and derives
 each reply's error shape from the same decision table `crates/net/src/request.rs`
-walks, so a fixture cannot pin behavior against a response shape production
-cannot produce: 2xx bodies reach the protocol decoder, a passed-through 3xx
-carries status + headers AND its body (bifrost-net's redirect `PassThrough` arm
-hands the body up through the same `into_byte_stream` the redirects-disabled arm
-uses, rather than discarding it; a `Location`-less redirect carrying an
-explanatory document therefore arrives intact and `ReqwestTransport` preserves
-it on the resulting `TransportError`), a second 401 is `AuthLost`, statuses
-retryable under `RetryPolicy::default()` (429 plus the 5xx family, read off the
-policy rather than restated) come back as `RateLimited` / `RetryBudgetExhausted`
-with their final response preserved, and only a genuinely non-retryable 4xx is
+walks. A 2xx body reaches the protocol decoder. At the net layer, a
+passed-through 3xx carries status + headers AND its body (bifrost-net's redirect
+`PassThrough` arm hands the body up through the same `into_byte_stream` the
+redirects-disabled arm uses, rather than discarding it; a `Location`-less
+redirect carrying an explanatory document therefore arrives intact). The
+production `ReqwestTransport` preserves that evidence, then currently wraps
+streamed 3xx results in `bifrost_net::Error::Status`, as described under HTTP
+redirect handling below. The scripted dispatcher pins the net decision and
+response evidence, not the final classification through that JMAP wrapper. A
+second 401 is `AuthLost`; statuses retryable under `RetryPolicy::default()` (429
+plus the 5xx family, read off the policy rather than restated) come back as
+`RateLimited` / `RetryBudgetExhausted` with their final response preserved;
+only a genuinely non-retryable 4xx is returned by bifrost-net itself as
 `Error::Status`. An exhausted script reports the request ordinal rather than
 falling through to a network. Despite the test module's location,
 `AccountFactory::open` itself is not hermetically reachable: its `connect()`
@@ -325,7 +347,7 @@ Every JMAP object type under `crates/jmap/src/<type>/`:
 - `Id<T>` - phantom-typed string ID: `AccountId`, `BlobId`, `State`. Available for incremental adoption.
 - `Account<Tr>` - internal account-scoped view of `Client`. Use `account.build()` for scoped requests inside the crate.
 - `Capability` trait - typed URIs with associated `Config` type.
-- `TransportError` - crate-owned, `#[non_exhaustive]`, carries response body (`Bytes`) for ProblemDetails parsing. A local failure is marked explicitly (the private `LocalFailure`, set only by the dedicated constructors) and classifies as `Internal(_)` before the net evidence or the no-evidence `Transport(Network)` fallback is consulted; an unmarked error with no net evidence (a passed-through 3xx, an in-crate test stub) keeps the fallback. Two marks exist. `LocalFailure::InvariantViolated` (`TransportError::invariant` / `invariant_with_source`) is a state impossible by construction, raised before anything was sent, and classifies `Internal(InvariantViolated)`. `LocalFailure::LimitExceeded` (`TransportError::limit_exceeded`) is a bound this crate imposes on a response the protocol leaves unbounded - today only the EventSource over-long block cap - and classifies `Internal(LimitExceeded)`. The central mapping never retries an `Internal` kind. Without the mark, impossible-by-construction states (an unsupported method, an invalid default header, missing credentials) were retried as network faults forever, and a tripped EventSource cap classified as a retryable network fault too.
+- `TransportError` - crate-owned, `#[non_exhaustive]`, carries response body (`Bytes`) for ProblemDetails parsing. A local failure is marked explicitly (the private `LocalFailure`, set only by the dedicated constructors) and classifies as `Internal(_)` before the net evidence or the no-evidence `Transport(Network)` fallback is consulted; an unmarked error with no net evidence (for example, an in-crate test stub) keeps the fallback. A passed-through 3xx from the default streamed transport currently carries net `Status` evidence and is classified as a terminal HTTP failure (see HTTP redirect handling below). Two marks exist. `LocalFailure::InvariantViolated` (`TransportError::invariant` / `invariant_with_source`) is a state impossible by construction, raised before anything was sent, and classifies `Internal(InvariantViolated)`. `LocalFailure::LimitExceeded` (`TransportError::limit_exceeded`) is a bound this crate imposes on a response the protocol leaves unbounded - today only the EventSource over-long block cap - and classifies `Internal(LimitExceeded)`. The central mapping never retries an `Internal` kind. Without the mark, impossible-by-construction states (an unsupported method, an invalid default header, missing credentials) were retried as network faults forever, and a tripped EventSource cap classified as a retryable network fault too.
 
 ## Capabilities
 
@@ -337,7 +359,10 @@ Every JMAP object type under `crates/jmap/src/<type>/`:
 4. Add `Capability` impl in `capability.rs` with `type Config`.
 5. Add the `session_cap_accessor!` invocation, which generates both readers.
 
-`Session::typed_capability::<C>()` is a convenience bridge (serde round-trip). Hand-written accessors are zero-cost and primary.
+`Session::capability_config::<C>()` is a convenience bridge (serde round-trip).
+It returns `None` for a malformed block before reparsing its raw value, so a
+permissive config struct cannot turn the malformed lane into a present one.
+Hand-written accessors are zero-cost and primary.
 
 ### Absent, Malformed, Present - for every capability, not just core
 
@@ -482,7 +507,7 @@ The crate-internal JMAP error type uses structured variants. No
 - `Method(MethodError)` - JMAP method-level errors. `Set(SetError)` - per-object set errors.
 - Local request refusals: `RequestEncode`, `RequestCallLimit { max }`, `RequestSizeLimit { max, size }`, `NoPrimaryAccount { capability }`.
 - Response-shape failures: `ResponseDecode`, `CallNotFound`, `UnexpectedMethodResponse`, `IdNotFound`, `NotParsable`.
-- `InvalidUrl` - a URL the crate's own caller supplied is unusable. Its one remaining source is `Client::with_transport` given an empty session URL.
+- `InvalidUrl` - a URL or URL-component value the crate's own caller supplied is unusable. Sources include an empty session URL and an empty EventSource type list.
 - `MalformedSessionUrl { property, detail }` - a URL or URL template the SERVER published in its session is unusable: `apiUrl` and the `uploadUrl`, `downloadUrl` and `eventSourceUrl` templates (an unbalanced or unknown template variable, or not an absolute http or https URL; `eventSourceUrl` raises only when EventSource is used) and the WebSocket capability's `url` (an unparseable URI or a non-websocket scheme). The provider described itself wrongly, so this is never the caller's `InvalidUrl`.
 - `MalformedCapability { capability }` - an advertised capability whose object does not parse.
 - Behind the `websockets` feature: `WebSocketHandshake`, `WebSocketRuntime` (a read-side failure after the handshake), `WebSocketSend` (a failed frame write to the connection's sink), `WebSocketClosed`, `WebSocketSetup(WebSocketSetupError)`, `WebSocketNotConnected`.
@@ -523,6 +548,7 @@ crates/jmap/src/sync/
   discover.rs      - cursor_scopes / memberships / scope_lifecycle_stream
   inventory.rs     - per-scope inventory streaming
   changes.rs       - per-scope change stream dispatch
+  state_walk.rs    - shared progress guards, error contexts, and per-walk recovery policy
   hydrate.rs       - get_stream projection logic
   push.rs          - WebSocket push, ReconnectPolicy, subscribe/unsubscribe
   mutation.rs      - bulk_set_flags / bulk_move / bulk_destroy pipeline
@@ -642,7 +668,7 @@ Supported scopes for `inventory_stream` and `changes_stream`:
 - `CursorScope::Type(ObjectType::Thread)` and `CursorScope::Query(_)` are not discovered. A legacy cursor for either terminates unsupported: thread inventory derives from email inventory, and the v1 trait has no registered query definition to supply an `Email/queryChanges` filter/sort.
 - `CursorScope::Folder(FolderId(encode_foreign_account(account_id)))` - a foreign (shared/delegate) account, one account-level scope per share. Inventory paginates an UNFILTERED `Email/query` against the foreign account handle (one walk per share); changes use that account's `Email/changes`, which is account-wide and cannot be filtered by mailbox - which is exactly why the topology is one scope per account, never one per mailbox (a per-mailbox topology streamed the identical change set once per mailbox and fanned every foreign push out M ways). Per-mailbox membership is learned at hydration from the qualified `mailboxIds`, the same model the primary `Type(Email)` scope uses. A legacy per-mailbox `Folder` cursor still decodes and takes an `inMailbox`-filtered inventory walk, but is never seeded. See "Foreign (shared/delegate) accounts".
 
-Every change-stream batch carries a `Checkpoint::Change(ChangeCursor)` whose state string is the post-call `newState`. The loop continues until `hasMoreChanges` is false, then emits `SyncEvent::Done`. A forward-progress guard terminates the loop as a `Protocol(ContractViolation)` when a server answers `hasMoreChanges: true` with `newState == sinceState` (RFC 8620 s5.2 requires `newState` to reflect the served changes) - the guard fires before that page's batch, so nothing is lost: the state never moved and the next drive replays from it. A second guard covers the case the first cannot see: a server alternating between two states moves the state at every single step, so each step looks like progress while the walk paginates forever. Each change walk therefore remembers the states it has served and terminates the same way when one comes back. The Email, Mailbox and foreign `Folder` scopes all run ONE paginated walk, `changes::changes_walk`, generic over the `*/changes` method (`core::changes::ChangesMethod`, implemented by `define_changes_method!` so a new `*/changes` object gets it for free). Three things vary and are parameters, not copies: the method (whose `NAME` is also the guard's diagnostic), the `owner` tag - `Some(accountId)` only for a foreign scope, which both qualifies the emitted change ids into the owning account's namespace AND routes a permission denial into a per-scope quarantine, and with `None` reduces to the plain error mapping the primary walks always used - and the per-`accountId` state cache the scope advances. Both guards are one mechanism - `changes::ChangeWalkGuard` / `WalkFault` - shared by `changes_walk` and the scope-lifecycle poller, which paginates `Mailbox/changes` on a loop of its own and needs the identical bound (see `scope_lifecycle_stream` below); the caller supplies only the method name for the diagnostic, so the two shapes cannot drift apart per call site. The inventory walk has the analogous guard on its own loop shape: it pages `Email/query` by anchor with `anchorOffset: 1`, so the previous page's last id is excluded even when `queryState` moves; a server that re-serves it never yields the empty page that ends the walk, and the walk terminates as a `Protocol(ContractViolation)` WITHOUT a `Done`, rather than recording unproved coverage. The per-`accountId` `state_cache` maps advance compare-and-swap style (keyed by the scope's accountId) so a stale writer does not clobber a newer state.
+Every change-stream batch carries a `Checkpoint::Change(ChangeCursor)` whose state string is the post-call `newState`. The loop continues until `hasMoreChanges` is false, then emits `SyncEvent::Done`. A forward-progress guard terminates the loop as a `Protocol(ContractViolation)` when a server answers `hasMoreChanges: true` with `newState == sinceState` (RFC 8620 s5.2 requires `newState` to reflect the served changes) - the guard fires before that page's batch, so nothing is lost: the state never moved and the next drive replays from it. A second guard covers the case the first cannot see: a server alternating between two states moves the state at every single step, so each step looks like progress while the walk paginates forever. Each change walk therefore remembers the states it has served and terminates the same way when one comes back. The Email, Mailbox and foreign `Folder` scopes all run ONE paginated walk, `changes::changes_walk`, generic over the `*/changes` method (`core::changes::ChangesMethod`, implemented by `define_changes_method!` so a new `*/changes` object gets it for free). Three things vary and are parameters, not copies: the method (whose `NAME` is also the guard's diagnostic), the `owner` tag - `Some(accountId)` only for a foreign scope, which both qualifies the emitted change ids into the owning account's namespace AND routes a permission denial into a per-scope quarantine, and with `None` reduces to the plain error mapping the primary walks always used - and the per-`accountId` state cache the scope advances. `StateWalk` in `sync/state_walk.rs` owns the progress guards, recovery policy, and error context for changes, lifecycle, and inventory walks. Change and lifecycle walks share the guard for `hasMoreChanges: true` with an unmoved or repeated state; the lifecycle guard resets at each poll pause. Inventory does not send a prior state and accepts `queryState` churn, but the same type owns the anchor guard and refuses a page that re-serves the prior anchor, terminating as a `Protocol(ContractViolation)` WITHOUT a `Done` rather than recording unproved coverage. Change and lifecycle requests are marked state-based, while inventory calls carry cursor scope without that flag. State expiry in durable changes restarts the scope through the engine, lifecycle reconciles a fresh mailbox snapshot locally, and an inventory anchor loss restarts its scope. `cannotCalculateChanges` or `tooManyChanges` on a stateless inventory query or get is a `Protocol(ContractViolation)`. The per-`accountId` `state_cache` maps advance compare-and-swap style (keyed by the scope's accountId) so a stale writer does not clobber a newer state.
 
 The CAS is exact: an expected state advances only an entry containing that state. It cannot initialize an absent or explicitly empty entry. Only an advance with no expected state may initialize those shapes.
 
@@ -716,13 +742,9 @@ dropping a partial reseed leaves both unchanged so a new reader can replay it. H
 provider-contract termination. Changes entirely inside the expired interval
 with no surviving scope cannot be reconstructed from the snapshot.
 
-The delta walks and lifecycle share `ChangeWalkGuard` and the cursor-scoped
-error classifier, but not one reseed policy: engine-owned delta scopes restart,
-lifecycle reconciles names locally, and immutable-sort inventory tolerates
-query-state churn. A common walk owning all three policies would conflate
-their coverage obligations.
+`StateWalk` is the shared policy object for delta, lifecycle, and anchored inventory. It centralizes guards and request context while preserving each recovery path: engine-owned delta scopes restart, lifecycle reconciles names locally on expiry, and inventory tolerates `queryState` churn but restarts on a lost anchor.
 
-This poller paginates `Mailbox/changes` on its own loop, so it carries the same `ChangeWalkGuard` the change walks do, for the same two unbounded shapes - and with more at stake: the engine drives this one stream for the life of the account, so an unguarded spin is a permanent hot poll loop rather than one walk that dies. The guard covers the pagination BURST, not the poller's whole life: it is dropped at every poll pause, because a state legitimately recurring across two polls five minutes apart is not a spin. On a fault the stream yields `ScopeLifecycleEvent::Terminated(Protocol(ContractViolation))` and ENDS - the honest report of a non-conformant provider, and the termination is final for this account's lifecycle channel (a change walk can be restarted per scope; this stream cannot) rather than burning a poll loop forever. As in the change walks, the guard fires before anything from that page is emitted and before its state is committed, so the refused page costs nothing.
+This poller uses `StateWalk`'s changes guard for each `Mailbox/changes` pagination burst. The engine drives this stream for the account lifetime, so an unguarded spin would become a permanent hot poll loop. The guard resets at each poll pause because a state may legitimately recur across separate polls. On a guard fault, the stream yields `ScopeLifecycleEvent::Terminated(Protocol(ContractViolation))` and ends, before emitting the page or committing its state.
 
 The follow-up `Mailbox/get` batches at `maxObjectsInGet` on its own. It was previously bounded only incidentally, by the `maxChanges` the changes call happened to carry - which is fed from the same limit, but that is a fact about the call site, not a bound the read may assume. Its `notFound` and its silent omissions are ONE case and take one path: reconciliation drives from the submitted ids, so an id in either lane lands in the created-then-deleted rule below. RFC 8620 §5.1 gives both the same meaning here - the mailbox is not there any more - and a `notFound` id is by construction absent from `list`.
 
@@ -790,6 +812,11 @@ thread-routing section below); other target shapes are left to
 `resolve_target`'s `Unsupported`.
 
 `attachment_upload` stores bytes through the upload URL in the same account selected for draft editing (Submission when present, otherwise Mail), and returns an opaque handle carrying both the blob id and its source account. Blob ids are account scoped: a send to another account uses `Blob/copy` and the destination id before constructing the Email body. Handles without a source account are refused because their owner cannot be established safely. `draft_create`/`update`/`discard` use `Email/set` against Drafts and route through the primary Submission account when it exists, matching `draft_send`'s bare Email id namespace; mail-only accounts retain draft editing on their primary Mail account. `draft_update` sends only its requested fields and omits account-wide `ifInState`, like the other field and path patches. `send_message` creates the draft `Email` + `EmailSubmission` in one result-referenced request, then `onSuccessUpdateEmail` to Sent (or `onSuccessDestroyEmail` when `save_to_sent == Some(false)`). `send_raw_message` imports the uploaded blob before submitting it. The submission result is examined before the preceding Email create/import result, so a malformed Email result cannot hide an acknowledged submission. After email creation or import succeeds, only a submission `notCreated` entry or a method-level error correlated to the submission permits best-effort `Email/set destroy`. Missing, undecodable, or incomplete submission results retain the Email and report `Protocol(PartialResponse)` with acknowledged transmission evidence, requiring reconciliation before another send; a missing or empty created Email id also cannot produce an empty `ObjectId`, and after an acknowledged submission reports a partial outcome. The email state cache advances before any cleanup. `draft_send` submits an existing draft and moves it to Sent, resolving Sent and Drafts from a single `Mailbox/get` via `role_mailboxes`. Its post-submit email-state probe is best-effort because a cache refresh cannot reverse a committed send; a later Email mutation advances the cache from its response. Submission creates omit `undoStatus`, which is server-set by RFC 8621. A scheduled send with no explicit `from` can use the caller-selected `identity`'s concrete email for its envelope; when neither is supplied JMAP has no default Identity to choose, so the request needs `from` or `identity` plus at least one recipient. A `SendRequest::send_as` routes both sets to a successfully seeded foreign account that advertises Submission, resolves a concrete foreign `Identity/get` identity, and forces its `identityId`; `As` forces From to that identity and `OnBehalfOf` adds the authenticated user's Sender when known. Scheduled foreign sends are rejected because their bare submission handles cannot be safely routed through cancel/reschedule. The send-as branch runs BEFORE the primary account's Submission check, so a session whose primary lacks Submission while a seeded foreign account has it reports `pim_methods.send_message == false` with `send_as == true`, and a send-as request through it works. That is the documented contract rather than a mismatch: `send_message` describes the ordinary path only (a request with `send_as: None`), and `send_as` answers for routed sends on its own terms.
+
+After a send with an `onSuccessUpdateEmail` or `onSuccessDestroyEmail`, the
+implicit `Email/set` response carries the post-move state. The send paths use
+that state for their compare-and-swap cache advance. `draft_send` probes only
+when the implicit response cannot supply a non-empty state.
 
 When a Trash-thread destroy spans several `Email/set` requests, each response's
 `newState` guards the next batch. A later refusal or incomplete response after
@@ -995,7 +1022,21 @@ Typed `ServerFilterCreate::Rule` / `ServerFilterPatch::Rule` return `Unsupported
 
 ### HTTP redirect handling
 
-`ReqwestTransport` delegates redirects to `bifrost-net` (JMAP trusted-host allowlist, five-hop limit). `bifrost-net` strips `Authorization` on every cross-host hop, including injected Basic headers. The bearer path routes through bifrost-net; only Basic and the WebSocket handshake build a header via async `header_value()`.
+`ReqwestTransport` delegates redirects to `bifrost-net` (JMAP trusted-host
+allowlist, five-hop limit). `bifrost-net` strips `Authorization` on every
+cross-host hop, including injected Basic headers. With an empty JMAP trusted
+host list, the current net API would trust every cross-host target, so JMAP
+uses an impossible sentinel host to refuse those hops. A same-origin-only
+redirect mode requires a net API addition. The bearer path routes through
+bifrost-net; only Basic and the WebSocket handshake build a header via async
+`header_value()`.
+
+When `send_streaming` passes through a redirect that cannot be followed,
+`ReqwestTransport` currently carries its 3xx status, headers and bounded body
+through `bifrost_net::Error::Status` for both streamed downloads and
+EventSource. That variant and JMAP's account mapping are defined for terminal
+HTTP failures, so a distinct shared nonterminal response shape is needed to
+classify this case without treating it as a terminal status.
 
 ### Error translation
 
@@ -1009,15 +1050,17 @@ arrived) and, unless its primary cause already is one, the typed
 
 - `Method(stateMismatch | alreadyExists)` -> `ConcurrencyConflict` +
   `State(ConcurrencyConflict)` -> `Retry::AfterStateRefresh`.
-- `Method(cannotCalculateChanges | anchorNotFound | tooManyChanges)` ->
-  `SyncState(CursorInvalid)` -> `Engine(RestartScope)` when the caller
-  threaded an `ErrorScope::Cursor` through the context. Without one the
-  builder refuses `CursorInvalid` (`CursorInvalidWithoutScope`). Missing
-  recovery context for `cannotCalculateChanges` or `tooManyChanges` is a
-  client `Internal(InvariantViolated)`, not evidence of provider misconduct.
-  The lifecycle poller supplies the Mailbox cursor scope to this classifier
-  but consumes expiry locally by reconciling a fresh name snapshot.
-  Scope-less `anchorNotFound` retains `Protocol(ContractViolation)`.
+- `Method(cannotCalculateChanges | tooManyChanges)` ->
+  `SyncState(CursorInvalid)` -> `Engine(RestartScope)` only when the request
+  context is marked state-based and carries an `ErrorScope::Cursor`. A
+  state-based context without a cursor scope is a client
+  `Internal(InvariantViolated)`, not evidence of provider misconduct; the same
+  method errors on a stateless request are `Protocol(ContractViolation)`. The
+  changes and lifecycle walks mark their requests state-based. Lifecycle
+  handles `CursorInvalid` locally by reconciling a fresh name snapshot.
+- `Method(anchorNotFound)` -> `SyncState(CursorInvalid)` ->
+  `Engine(RestartScope)` when the caller supplies a cursor scope; without one it
+  is `Protocol(ContractViolation)`.
 - `Method(serverUnavailable | serverFail)` -> `Server(Unavailable)` ->
   `Retry::SameRequest`. `Method(serverPartialFail)` is different: some calls
   may have committed, so it is `Protocol(PartialResponse)` (the wire cause is
@@ -1109,9 +1152,8 @@ arrived) and, unless its primary cause already is one, the typed
   (`ProviderRefused`) when the scope names a resource, else
   `Protocol(MissingField)`.
 - Caller faults -> `Request(Malformed)` -> `ClientBug`: `RequestEncode`,
-  `RequestCallLimit`, `RequestSizeLimit`, and `InvalidUrl` (field `url`;
-  its one source is an empty session URL handed to
-  `Client::with_transport`).
+  `RequestCallLimit`, `RequestSizeLimit`, and `InvalidUrl` (field `url`, for
+  an empty session URL or an unusable EventSource URL component).
 - `Set` routes through the same per-item `set_error_to_account_error` as
   the `Email/set` lanes below.
 

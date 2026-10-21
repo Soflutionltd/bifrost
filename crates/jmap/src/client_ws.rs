@@ -598,6 +598,8 @@ impl Client {
     /// and leave a waiter attached to a connection that never carried the
     /// request. If the write fails, the returned handle is dropped on the
     /// error path and the registration goes with it.
+    /// This request/response lane is part of RFC 8887 even though the sync
+    /// account currently uses the WebSocket connection only for push.
     pub(crate) async fn send_ws_awaiting(
         &self,
         request: Request<'_>,

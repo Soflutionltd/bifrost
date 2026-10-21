@@ -113,7 +113,11 @@ pre-encoding response are zeroized on drop. Secret and verifier equality use
 call boundary. For IMAP: `Protocol(m)` becomes `Error::Protocol(m)` (identical
 message); `AuthFailed(m)` becomes `Error::auth_with_code(m, None)` (the
 auth-failure lane); `InvalidCredential(m)` becomes `Error::InvalidInput(m)`.
-SMTP's split is the same, into its own kinds (`reference/smtp.md`). A SCRAM
+SMTP uses `scram_server_error()` to read the original `e=` token before
+adding diagnostic attribution. `invalid-proof` becomes its credential-rejection
+kind and then `Authentication(ReauthorizationRequired)` / `AuthLost`, matching
+535. Other server errors retain SMTP's policy routing, including
+`channel-binding-not-supported` (`reference/smtp.md`). A SCRAM
 signature-verification mismatch is a protocol-class failure (`Protocol`), not
 `AuthFailed`.
 

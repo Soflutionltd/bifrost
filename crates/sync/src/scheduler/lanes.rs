@@ -30,13 +30,36 @@ impl std::fmt::Debug for WorkItem {
     }
 }
 
-/// Coarse work-kind tag used by `BudgetGate` to pick between the
-/// mutation and sync sub-pools.
+/// Work kind determines scheduling priority and the concurrency sub-pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WorkKind {
+    /// Live polling and push reconciliation, at the account priority.
     Sync,
     Mutation,
+    /// Historical partitions and deferred inventory, below live work.
+    Backfill,
+}
+
+impl WorkKind {
+    pub(crate) fn priority(self, account_priority: Priority) -> Priority {
+        if self != Self::Backfill {
+            return account_priority;
+        }
+        match account_priority {
+            Priority::Background | Priority::Bulk => Priority::Bulk,
+            _ => Priority::Background,
+        }
+    }
+
+    // Live and historical work share one budget class so a permit is always
+    // handed to the best lane, regardless of which kind queued first.
+    pub(crate) fn budget_kind(self) -> Self {
+        match self {
+            Self::Backfill => Self::Sync,
+            other => other,
+        }
+    }
 }
 
 /// Shed policy when a lane is full. `DropOldest` is the default and
@@ -159,6 +182,21 @@ mod tests {
             priority: Priority::Normal,
             kind: WorkKind::Sync,
             run: Box::new(|| {}),
+        }
+    }
+
+    #[test]
+    fn work_kind_lanes_keep_live_priority_and_lower_inventory() {
+        for (account, backfill) in [
+            (Priority::Foreground, Priority::Background),
+            (Priority::Normal, Priority::Background),
+            (Priority::Background, Priority::Bulk),
+            (Priority::Bulk, Priority::Bulk),
+        ] {
+            assert_eq!(WorkKind::Backfill.priority(account), backfill);
+            assert_eq!(WorkKind::Sync.priority(account), account);
+            assert_eq!(WorkKind::Mutation.priority(account), account);
+            assert_eq!(WorkKind::Backfill.budget_kind(), WorkKind::Sync);
         }
     }
 

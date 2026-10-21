@@ -26,6 +26,7 @@ mod pim;
 mod push;
 mod state;
 mod state_cache;
+mod state_walk;
 
 // pub: engine registration surface consumed by bifrost-sync users.
 pub use factory::{JmapAccountFactory, JmapAccountFactoryBuilder, JmapCredentials};

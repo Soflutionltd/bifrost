@@ -567,8 +567,8 @@ pub(super) fn encode_mailbox_name(name: &MailboxName, utf8: bool) -> Result<Vec<
         }
         None => encode_mailbox_str(name.as_str(), utf8).into_bytes(),
     };
-    // A mailbox string cannot carry NUL. Refuse rather than letting the
-    // general string writer strip it and silently address a different mailbox.
+    // A mailbox string cannot carry NUL. Refuse here rather than relying on
+    // the general string writer's command-final validation.
     if bytes.contains(&0) {
         return Err(crate::Error::InvalidInput(
             "mailbox wire name contains NUL".into(),

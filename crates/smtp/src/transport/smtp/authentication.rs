@@ -441,14 +441,11 @@ impl Mechanism {
 
 /// Map a `bifrost-sasl` computation failure into the SMTP error model.
 ///
-/// A SCRAM `e=` server error or a signature/exchange auth failure
-/// (`AuthFailed`) lands on the `SmtpCommandPhase::Auth` + `InvalidInput`
-/// lane that `account_error.rs` routes to `Authorization(PolicyBlocked)` -
-/// reauth/policy UX, not `ClientBug`. A malformed SASL message (`Protocol`)
-/// is a protocol-class fault and stays on `ErrorKind::Parse`. This mirrors
-/// IMAP's `From<SaslError>` split.
+/// Invalid proof is a credential rejection; other server errors retain the
+/// AUTH policy lane. Malformed messages and verifier mismatches stay parse-class.
 impl From<bifrost_sasl::SaslError> for Error {
     fn from(e: bifrost_sasl::SaslError) -> Self {
+        let credential_rejected = e.scram_server_error() == Some("invalid-proof");
         match e {
             bifrost_sasl::SaslError::Protocol(m) => error::parse(m),
             // A caller credential that fails SASLprep, refused while the
@@ -458,7 +455,12 @@ impl From<bifrost_sasl::SaslError> for Error {
             // local-refusal rule in `reference/error-model.md`.
             bifrost_sasl::SaslError::InvalidCredential(m) => error::invalid_input(m),
             bifrost_sasl::SaslError::AuthFailed(m) => {
-                error::invalid_input(m).with_phase(SmtpCommandPhase::Auth { mechanism: None })
+                let kind = if credential_rejected {
+                    error::ErrorKind::Authentication
+                } else {
+                    error::ErrorKind::InvalidInput
+                };
+                Error::new(kind, Some(m)).with_phase(SmtpCommandPhase::Auth { mechanism: None })
             }
             // `SaslError` is `#[non_exhaustive]`; any future variant is an
             // unclassified auth failure until it is mapped explicitly.
@@ -588,32 +590,24 @@ enum ScramExchangeState {
 /// client line from a decoded server continuation; it never owns the socket.
 /// The connection's `auth_scram` driver frames the wire `334` rounds and feeds
 /// each decoded continuation into [`ScramExchange::step`].
-/// Re-message a `bifrost-sasl` failure so it names the mechanism that was
-/// being driven, then route it through the existing `From<SaslError>` split.
+/// Classify a `bifrost-sasl` failure, then name the mechanism being driven.
 ///
-/// The classification is untouched - `Protocol` stays parse-class, `AuthFailed`
-/// stays on the Auth-phase lane that `account_error.rs` maps to
-/// `Authorization(PolicyBlocked)`. Only the message grows, and that message is
-/// what the translation boundary turns into SUPPORT-ONLY `DiagnosticText`. A
+/// Classification happens before diagnostic attribution: invalid proof remains
+/// a credential rejection and other server errors keep their policy routing. A
 /// mechanism token is not secret (it travels in clear on the AUTH command line
 /// and in the EHLO advertisement); it is support-only because the telemetry
 /// tier carries no free-form text at all.
 fn named_sasl_error(mechanism: &'static str, error: bifrost_sasl::SaslError) -> Error {
-    let named = match error {
-        bifrost_sasl::SaslError::Protocol(m) => {
-            bifrost_sasl::SaslError::Protocol(format!("{m} (mechanism {mechanism})"))
-        }
-        bifrost_sasl::SaslError::InvalidCredential(m) => {
-            bifrost_sasl::SaslError::InvalidCredential(format!("{m} (mechanism {mechanism})"))
-        }
-        bifrost_sasl::SaslError::AuthFailed(m) => {
-            bifrost_sasl::SaslError::AuthFailed(format!("{m} (mechanism {mechanism})"))
-        }
-        // `SaslError` is `#[non_exhaustive]`: a variant this arm cannot
-        // rebuild passes through unnamed rather than being reclassified.
-        other => other,
-    };
-    named.into()
+    // Classify the original error before adding diagnostic text to its source.
+    let mapped: Error = error.into();
+    let kind = mapped.kind().clone();
+    let phase = mapped.phase();
+    let message = mapped.diagnostic_text().unwrap_or_default();
+    let named = Error::new(kind, Some(format!("{message} (mechanism {mechanism})")));
+    match phase {
+        Some(phase) => named.with_phase(phase),
+        None => named,
+    }
 }
 
 pub(crate) struct ScramExchange {
@@ -1420,10 +1414,12 @@ mod test {
             exchange.step(&server_first).unwrap(),
             ScramStep::Reply(_)
         ));
-        // A SCRAM `e=` server error is a credential auth failure and must land
-        // on the Auth-phase InvalidInput lane (Authorization(PolicyBlocked)).
+        // A rejected proof requires new credentials, not a policy change.
         let err = exchange.step("e=invalid-proof").unwrap_err();
-        assert!(err.is_invalid_input(), "got {err:?}");
+        assert_eq!(
+            err.kind(),
+            &crate::transport::smtp::error::ErrorKind::Authentication
+        );
         assert_eq!(
             err.phase(),
             Some(SmtpCommandPhase::Auth { mechanism: None })
@@ -1435,6 +1431,22 @@ mod test {
         let text = err.diagnostic_text().unwrap_or_default();
         assert!(text.contains("invalid-proof"), "got {text}");
         assert!(text.contains("SCRAM-SHA-256"), "got {text}");
+        let account = crate::transport::smtp::account_error::into_account_error(
+            err,
+            crate::transport::smtp::account_error::SmtpErrorContext::send(
+                bifrost_types::error::Protocol::Smtp,
+            ),
+        );
+        assert!(matches!(
+            account.kind(),
+            bifrost_types::error::AccountErrorKind::Authentication(
+                bifrost_types::error::AuthErrorKind::ReauthorizationRequired
+            )
+        ));
+        assert!(matches!(
+            account.recovery(),
+            bifrost_types::error::RecoveryClass::AuthLost
+        ));
     }
 
     #[test]

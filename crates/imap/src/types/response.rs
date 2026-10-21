@@ -7,7 +7,7 @@ use super::validated::MailboxName;
 use super::{FetchResponse, Flag, MailboxInfo, StatusItem};
 
 pub use super::capability::Capability;
-pub use super::uid_range::UidRange;
+pub use super::uid_range::{SeqBound, UidRange};
 
 /// A complete response line from the IMAP server
 /// (RFC 3501 Section 2.2.2 / RFC 9051 Section 2.2.2).

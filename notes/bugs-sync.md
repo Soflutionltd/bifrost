@@ -14,14 +14,16 @@
    inline instead.
 
 Filed from the October 2026 defect hunt: the sync engine scope, plus the
-engine-side read-back finding from the sync adoption scope. Provider-side
-recovery triage that bypasses the engine is in SHARED-012 and SHARED-013.
+engine-side read-back finding from the sync adoption scope.
 
 Coverage note from the engine hunter: `cursor/coverage.rs`, `cursor/ledger.rs`,
 `cursor/ledger_envelope.rs`, `backfill/*`, `engine/lane.rs` and `repair.rs`
 were NOT covered in depth. They are the largest files and need their own pass.
 
 ## SYNC-007 - A proven non-landing write is never resubmitted
+
+**Needs a technical implementation specification** (owner, 2026-10-21): too
+consequential to resolve by ruling.
 
 Scope: sync engine. Residue: a read-back mismatch now stays pending instead of
 becoming `failed_terminal`. Once read-back proves an `Uncertain` write did not
@@ -31,6 +33,10 @@ consumer-side dedupe; a ruling is needed on whether the engine replays.
 
 ## SYNC-009 - Push ingress can still lose or unboundedly queue control events
 
+**Needs a technical implementation specification** (owner, 2026-10-21): too
+consequential to resolve by ruling. Specify together with SHARED-014, which
+reshapes how push reaches the engine.
+
 Needs a ruling. The 100 ms coalesced-send timeout can drop an invalidation and
 the per-registration ingress is still unbounded. A sticky needs-full-reconcile
 flag keeps the invalidation intent but cannot carry warning payloads,
@@ -39,6 +45,10 @@ needs a control-event overflow policy or an API change. Reasoning is at both
 code sites and a test shows the semantic loss.
 
 ## SYNC-015 - `handle_schema_incompatible` still resets only registered scopes
+
+**Needs a technical implementation specification** (owner, 2026-10-21): too
+consequential to resolve by ruling; it changes the consumer-implemented
+checkpoint store contract.
 
 Durable completion markers for scopes not in the registry survive the reset. A
 complete fix needs writer or store support for an account-wide reset or durable

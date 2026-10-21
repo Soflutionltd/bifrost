@@ -22,6 +22,8 @@ use crate::types::{
     UntaggedStatus, format_fetch_attrs,
 };
 
+pub(crate) const LOGOUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 mod append;
 mod auth;
 mod config;
@@ -302,11 +304,10 @@ pub(crate) struct ImapConnection {
     /// Receiver for asynchronous server events (ALERTs, EXISTS, etc.).
     /// Wrapped in `Mutex` so event consumption does not require `&mut self`.
     events_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<typed_event::TypedEvent>>,
-    /// Handle to the driver task. Observed on shutdown or on submit
-    /// failure to surface panics as `Error::DriverPanicked`.
-    /// Wrapped in `Mutex<Option<...>>` so that `observe_driver_panic`
-    /// can take the handle when shutting down, without needing `&mut self`.
-    driver_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Shared owner of the driver task. The pool retains this separately
+    /// from the weak connection reference so account close can join a
+    /// healthy driver's detached graceful shutdown.
+    driver_handle: Arc<DriverTask>,
     /// Server hostname, retained for STARTTLS upgrade (RFC 3501 Section6.2.1).
     ///
     /// Needed to construct the `ServerName` for TLS SNI and certificate
@@ -323,13 +324,80 @@ pub(crate) struct ImapConnection {
     abandoned: std::sync::atomic::AtomicBool,
 }
 
+pub(crate) struct DriverTask {
+    pub(crate) handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    abort_handle: Option<tokio::task::AbortHandle>,
+    inbound_bytes: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl DriverTask {
+    pub(crate) fn new(handle: Option<tokio::task::JoinHandle<()>>) -> Self {
+        Self::with_inbound_counter(handle, Arc::new(std::sync::atomic::AtomicU64::new(0)))
+    }
+
+    pub(crate) fn with_inbound_counter(
+        handle: Option<tokio::task::JoinHandle<()>>,
+        inbound_bytes: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        let abort_handle = handle.as_ref().map(tokio::task::JoinHandle::abort_handle);
+        Self {
+            handle: tokio::sync::Mutex::new(handle),
+            abort_handle,
+            inbound_bytes,
+        }
+    }
+
+    fn bytes_in(&self) -> u64 {
+        self.inbound_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn abort(&self) {
+        if let Some(handle) = &self.abort_handle {
+            handle.abort();
+        }
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.handle
+            .try_lock()
+            .map(|handle| handle.as_ref().is_none_or(tokio::task::JoinHandle::is_finished))
+            .unwrap_or(false)
+    }
+
+    /// Wait for graceful driver shutdown, aborting and joining it if the
+    /// caller's bound expires.
+    pub(crate) async fn finish_or_abort(&self, timeout: Duration) {
+        let mut handle = self.handle.lock().await;
+        let Some(task) = handle.as_mut() else {
+            return;
+        };
+        if tokio::time::timeout(timeout, &mut *task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+        handle.take();
+    }
+
+    pub(crate) async fn abort_and_join(&self) {
+        let mut handle = self.handle.lock().await;
+        let Some(task) = handle.as_mut() else {
+            return;
+        };
+        task.abort();
+        let _ = task.await;
+        handle.take();
+    }
+}
+
 impl ImapConnection {
     /// Stop the driver task and drop its transport immediately.
     pub(crate) async fn terminate(&self) {
-        if let Some(handle) = self.driver_handle.lock().await.take() {
-            handle.abort();
-            let _ = handle.await;
-        }
+        self.driver_handle.abort_and_join().await;
+    }
+
+    pub(crate) fn driver_task(&self) -> Arc<DriverTask> {
+        Arc::clone(&self.driver_handle)
     }
 }
 
@@ -350,10 +418,8 @@ impl ImapConnection {
 /// transport is gone, which `Account::close()` relies on.
 impl Drop for ImapConnection {
     fn drop(&mut self) {
-        if *self.abandoned.get_mut()
-            && let Some(handle) = self.driver_handle.get_mut().take()
-        {
-            handle.abort();
+        if *self.abandoned.get_mut() {
+            self.driver_handle.abort();
         }
     }
 }
@@ -413,6 +479,12 @@ impl ImapConnection {
     /// pool reuse must consult the command-channel liveness separately.
     pub(crate) fn is_alive(&self) -> bool {
         !self.cmd_tx.is_closed()
+    }
+
+    /// Inbound IMAP protocol octets delivered by the reader after TLS and
+    /// COMPRESS decoding, including the connection setup exchange.
+    pub(crate) fn bytes_in(&self) -> u64 {
+        self.driver_handle.bytes_in()
     }
 
     /// Whether this connection may be returned to the pool.
@@ -544,8 +616,8 @@ fn filter_store_flags(flags: &[Flag]) -> Vec<Flag> {
 /// Expansion is capped at [`MAX_EXPANDED_UIDS`] to prevent OOM when a
 /// server returns extremely large ranges (e.g. `1:4294967295`).
 ///
-/// `*` (mapped by the parser to `u32::MAX`) is special wherever it appears in
-/// a sequence-set, not only as a range endpoint (RFC 9051 Section 9:
+/// `*` is special wherever it appears in a sequence-set, not only as a range
+/// endpoint (RFC 9051 Section 9:
 /// `seq-number = nz-number / "*"`).  It means "the highest UID in the mailbox",
 /// a value unknown from the ESEARCH response alone, so any set naming it
 /// cannot be expanded at all.  Rather than return a partial result as if it
@@ -559,18 +631,21 @@ fn expand_uid_ranges(ranges: &[UidRange]) -> Result<Vec<u32>, Error> {
     /// Safety cap to prevent OOM from malicious or buggy server responses.
     const MAX_EXPANDED_UIDS: usize = 1_000_000;
 
-    /// Sentinel value the parser uses for `*` in sequence-sets
-    /// (RFC 4731 Section 3.1 / RFC 3501 Section 9).
-    const STAR_SENTINEL: u32 = u32::MAX;
-
     let mut saw_star = false;
     let mut bounds: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
     for range in ranges {
-        let end = range.end.unwrap_or(range.start);
-        if range.start == STAR_SENTINEL || end == STAR_SENTINEL {
+        let crate::types::SeqBound::Number(start) = range.start_bound() else {
             saw_star = true;
             continue;
-        }
+        };
+        let end = match range.end_bound() {
+            Some(crate::types::SeqBound::Number(end)) => end,
+            Some(crate::types::SeqBound::Star) => {
+                saw_star = true;
+                continue;
+            }
+            None => start,
+        };
         // The decoder normalizes descending ranges (Postel), so a range that
         // still arrives inverted is not a legal sequence-set element and
         // names no messages.

@@ -1,5 +1,6 @@
 use bytes::{Bytes, BytesMut};
 
+use crate::error::Error;
 use crate::types::response::Capability;
 
 /// Controls how the encoder produces literal markers.
@@ -184,6 +185,7 @@ pub(crate) struct CommandWriter {
     segments: Vec<Vec<Bytes>>,
     current: Vec<Bytes>,
     buf: BytesMut,
+    invalid_nul: bool,
 }
 
 impl CommandWriter {
@@ -194,6 +196,7 @@ impl CommandWriter {
             segments: Vec::new(),
             current: Vec::new(),
             buf: BytesMut::new(),
+            invalid_nul: false,
         }
     }
 
@@ -211,9 +214,9 @@ impl CommandWriter {
     /// Encode a byte string as a quoted string or a literal, depending on
     /// content (RFC 3501 Section 9 / RFC 9051 Section 9).
     ///
-    /// NUL bytes (%x00) are stripped first: RFC 3501 Section 9 rule (3) says
-    /// "The ASCII NUL character, %x00, MUST NOT be used at any time", and a
-    /// `tracing::warn!` makes a caller passing them visible.
+    /// NUL bytes (%x00) are rejected: RFC 3501 Section 9 rule (3) says
+    /// "The ASCII NUL character, %x00, MUST NOT be used at any time". Removing
+    /// it would silently change mailbox and metadata identities.
     ///
     /// Without `utf8`, only printable ASCII (`0x20..0x7F`) is quoted. DEL is
     /// excluded because RFC 9051 Section 9 drops it from CHAR, and control
@@ -223,17 +226,20 @@ impl CommandWriter {
     /// Section 3, or active rev2 per RFC 9051 Section 9) valid UTF-8 is also
     /// quotable, under the same control-character and DEL exclusions.
     pub(crate) fn string(&mut self, data: &[u8], utf8: bool) {
-        let data = strip_nul_bytes(data);
+        if data.contains(&0) {
+            self.invalid_nul = true;
+            return;
+        }
         let quotable = if utf8 {
-            std::str::from_utf8(&data).is_ok()
+            std::str::from_utf8(data).is_ok()
                 && data.iter().all(|&b| (b >= 0x20 && b != 0x7F) || b >= 0x80)
         } else {
             data.iter().all(|&b| (0x20..0x7F).contains(&b))
         };
         if quotable {
-            self.quoted(&data);
+            self.quoted(data);
         } else {
-            self.literal(&data, LiteralForm::Classic);
+            self.literal(data, LiteralForm::Classic);
         }
     }
 
@@ -318,30 +324,20 @@ impl CommandWriter {
 
     /// The finished command. Every command ends with its CRLF, written by the
     /// encoder, so the last segment is never empty.
-    pub(crate) fn finish(mut self) -> WireCommand {
+    pub(crate) fn finish(mut self) -> Result<WireCommand, Error> {
+        if self.invalid_nul {
+            return Err(Error::InvalidInput(
+                "IMAP string data must not contain NUL (RFC 3501 Section 9)".into(),
+            ));
+        }
         self.flush_buf();
         debug_assert!(
             !self.current.is_empty(),
             "a command always ends with syntax after its last literal"
         );
         self.segments.push(self.current);
-        WireCommand {
+        Ok(WireCommand {
             segments: self.segments,
-        }
-    }
-}
-
-/// Defensively strip NUL bytes from IMAP string data.
-///
-/// RFC 3501 Section 9: CHAR8 = %x01-ff  -  NUL (%x00) is forbidden.
-/// Returns a `Cow` to avoid allocation when no NUL bytes are present.
-fn strip_nul_bytes(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    if data.contains(&0x00) {
-        tracing::warn!(
-            "Stripped NUL bytes from IMAP string data  -  RFC 3501 Section 9 forbids %x00"
-        );
-        std::borrow::Cow::Owned(data.iter().copied().filter(|&b| b != 0x00).collect())
-    } else {
-        std::borrow::Cow::Borrowed(data)
+        })
     }
 }

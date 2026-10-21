@@ -114,6 +114,7 @@ pub(super) async fn run_fetch(
     tx: &tokio::sync::mpsc::Sender<SyncEvent<Bytes>>,
 ) -> Result<(), BlobError> {
     let mut conn = account.checkout_for_folder(folder).await?;
+    let mut previous_bytes_in = conn.connection().bytes_in();
     let folder_entry = account.folders.get(folder);
     let cursor = folder_entry.as_ref().and_then(|entry| entry.cursor());
     let shared_owner = folder_entry
@@ -229,6 +230,7 @@ pub(super) async fn run_fetch(
                         vec![Bytes::from(data)],
                         PageBoundary::Page,
                         None::<Checkpoint>,
+                        super::measured_bytes_in(connection, &mut previous_bytes_in),
                     ))
                     .await
                     .is_err()

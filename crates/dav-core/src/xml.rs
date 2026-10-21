@@ -12,7 +12,70 @@
 //! the document structure.
 
 use quick_xml::escape::unescape;
+use quick_xml::name::ResolveResult;
 use reqwest::Url;
+
+pub const DAV_NAMESPACE: &str = "DAV:";
+pub const CALDAV_NAMESPACE: &str = "urn:ietf:params:xml:ns:caldav";
+pub const CARDDAV_NAMESPACE: &str = "urn:ietf:params:xml:ns:carddav";
+pub const CALENDAR_SERVER_NAMESPACE: &str = "http://calendarserver.org/ns/";
+pub const APPLE_CALENDAR_NAMESPACE: &str = "http://apple.com/ns/ical/";
+
+/// An XML element name resolved to its namespace URI and local name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct XmlName {
+    namespace: Option<String>,
+    local: String,
+}
+
+impl XmlName {
+    #[must_use]
+    pub fn is(&self, namespace: &str, local: &str) -> bool {
+        self.namespace.as_deref() == Some(namespace) && self.local == local
+    }
+
+    #[must_use]
+    pub fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+
+    #[must_use]
+    pub fn local(&self) -> &str {
+        &self.local
+    }
+}
+
+pub(crate) fn resolved_xml_name(
+    resolved: ResolveResult<'_>,
+    full_name: &str,
+) -> Result<XmlName, String> {
+    let namespace = match resolved {
+        ResolveResult::Bound(namespace) => Some(namespace.as_ref().to_string()),
+        ResolveResult::Unbound => None,
+        ResolveResult::Unknown(prefix) => {
+            return Err(format!(
+                "XML element uses undeclared namespace prefix: {prefix}"
+            ));
+        }
+    };
+    Ok(XmlName {
+        namespace,
+        local: local_name(full_name),
+    })
+}
+
+pub(crate) fn property_namespace(property_name: &str) -> &'static str {
+    match property_name {
+        "calendar-home-set"
+        | "calendar-user-address-set"
+        | "schedule-outbox-URL"
+        | "calendar-data" => CALDAV_NAMESPACE,
+        "addressbook-home-set" | "directory-gateway" | "address-data" => CARDDAV_NAMESPACE,
+        "getctag" => CALENDAR_SERVER_NAMESPACE,
+        "calendar-color" => APPLE_CALENDAR_NAMESPACE,
+        _ => DAV_NAMESPACE,
+    }
+}
 
 /// Opaque lookup key for equivalent DAV href spellings.
 ///
@@ -28,13 +91,15 @@ enum HrefIdentity {
         scheme: String,
         host: Option<String>,
         port: Option<u16>,
-        segments: Vec<String>,
+        segments: Vec<Vec<u8>>,
         query: Option<String>,
     },
     Raw(String),
 }
 
-/// The local part of a namespaced XML name (`D:href` -> `href`).
+/// The local part of a lexical XML name (`D:href` -> `href`).
+///
+/// Protocol parsing uses [`XmlName`] from the namespace-aware reader instead.
 #[must_use]
 pub fn local_name(full: &str) -> String {
     match full.rfind(':') {
@@ -114,10 +179,8 @@ pub fn trimmed(text: &str) -> Option<String> {
 /// so an encoded separator (`%2F`) stays distinct from a real one. The query is
 /// compared verbatim and a fragment is ignored because it is not sent to the
 /// server. Anything that will not parse as an absolute URL falls back to the
-/// old slash-trimmed byte comparison. Segment decoding retains the existing
-/// lossy UTF-8 rule: distinct invalid octets such as `%FF` and `%FE` can share
-/// a key. Changing that would alter the established mutation identity rule, so
-/// this comparison index does not silently introduce a separate one.
+/// old slash-trimmed byte comparison. Decoded path segments remain bytes so
+/// distinct invalid UTF-8 octets cannot collapse to the same resource key.
 #[must_use]
 pub fn dav_href_key(href: &str) -> DavHrefKey {
     match Url::parse(href) {
@@ -143,15 +206,15 @@ pub fn same_dav_url(left: &str, right: &str) -> bool {
 
 /// Percent-decode each path segment, dropping the empty trailing segment a
 /// collection URL's slash produces so `/c` and `/c/` are one resource.
-fn decoded_path_segments(path: &str) -> Vec<String> {
-    let mut segments: Vec<String> = path.split('/').map(percent_decode).collect();
-    if segments.last().is_some_and(String::is_empty) {
+fn decoded_path_segments(path: &str) -> Vec<Vec<u8>> {
+    let mut segments: Vec<Vec<u8>> = path.split('/').map(percent_decode).collect();
+    if segments.last().is_some_and(Vec::is_empty) {
         segments.pop();
     }
     segments
 }
 
-fn percent_decode(segment: &str) -> String {
+fn percent_decode(segment: &str) -> Vec<u8> {
     let raw = segment.as_bytes();
     let mut out = Vec::with_capacity(raw.len());
     let mut index = 0;
@@ -167,7 +230,7 @@ fn percent_decode(segment: &str) -> String {
             index += 1;
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 fn hex_pair(high: u8, low: u8) -> Option<u8> {
@@ -257,6 +320,18 @@ mod tests {
             "https://dav.example.test/cal/work/"
         ));
         assert!(same_dav_url("/cal/work/", "/cal/work"));
+    }
+
+    #[test]
+    fn same_dav_url_compares_decoded_path_bytes_without_lossy_utf8() {
+        assert!(same_dav_url(
+            "https://dav.example.test/cal/%C3%A9.ics",
+            "https://dav.example.test/cal/é.ics"
+        ));
+        assert!(!same_dav_url(
+            "https://dav.example.test/cal/%FF.ics",
+            "https://dav.example.test/cal/%FE.ics"
+        ));
     }
 
     /// An encoded separator is not a separator, and neither the host nor the

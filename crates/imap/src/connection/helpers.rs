@@ -1,5 +1,6 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
+#[cfg(test)]
 pub(crate) use crate::codec::classification::mailbox_names_eq as inbox_eq;
 
 impl ImapConnection {

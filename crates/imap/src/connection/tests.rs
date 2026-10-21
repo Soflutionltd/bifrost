@@ -74,7 +74,7 @@ async fn make_driver_test_pair() -> (ImapConnection, tokio::io::DuplexStream) {
         cmd_tx,
         state_rx,
         events_rx: tokio::sync::Mutex::new(events_rx),
-        driver_handle: tokio::sync::Mutex::new(Some(handle)),
+        driver_handle: std::sync::Arc::new(super::DriverTask::new(Some(handle))),
         tls_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         abandoned: std::sync::atomic::AtomicBool::new(false),
         host: "test".into(),
@@ -138,6 +138,7 @@ async fn driver_logout_drain_is_bounded_against_a_silent_peer() {
     let (conn, mut server) = make_driver_test_pair().await;
     let handle = conn
         .driver_handle
+        .handle
         .lock()
         .await
         .take()
@@ -302,17 +303,8 @@ fn store_flag_filter_drops_server_only_and_wildcard_flags() {
 
 #[test]
 fn expand_uid_ranges_singles_and_ranges() {
-    let uids = expand_uid_ranges(&[
-        UidRange {
-            start: 1,
-            end: None,
-        },
-        UidRange {
-            start: 4,
-            end: Some(6),
-        },
-    ])
-    .expect("small ranges expand");
+    let uids = expand_uid_ranges(&[UidRange::single(1), UidRange::range(4, 6)])
+        .expect("small ranges expand");
     assert_eq!(uids, vec![1, 4, 5, 6]);
 }
 
@@ -323,13 +315,13 @@ fn expand_uid_ranges_empty_input() {
 }
 
 #[test]
-fn expand_uid_ranges_star_sentinel_is_not_expanded() {
+fn expand_uid_ranges_star_bound_is_not_expanded() {
     // RFC 4731 Section 3.1: `*` is the highest UID in the mailbox, which
     // the ESEARCH response alone does not reveal.
-    let err = expand_uid_ranges(&[UidRange {
-        start: 10,
-        end: Some(u32::MAX),
-    }])
+    let err = expand_uid_ranges(&[UidRange::from_sequence_bounds(
+        crate::types::SeqBound::Number(10),
+        Some(crate::types::SeqBound::Star),
+    )])
     .expect_err("an unexpandable `*` range must not look complete");
     assert!(matches!(
         err,
@@ -341,12 +333,18 @@ fn expand_uid_ranges_star_sentinel_is_not_expanded() {
 }
 
 #[test]
+fn expand_uid_ranges_accepts_the_largest_numeric_uid() {
+    assert_eq!(
+        expand_uid_ranges(&[UidRange::single(u32::MAX)])
+            .expect("the maximum numeric UID is concrete"),
+        vec![u32::MAX]
+    );
+}
+
+#[test]
 fn expand_uid_ranges_caps_at_one_million() {
-    let err = expand_uid_ranges(&[UidRange {
-        start: 1,
-        end: Some(3_000_000),
-    }])
-    .expect_err("an over-cap range must not be returned partially");
+    let err = expand_uid_ranges(&[UidRange::range(1, 3_000_000)])
+        .expect_err("an over-cap range must not be returned partially");
     assert!(matches!(
         err,
         Error::SearchResultTruncated {
@@ -359,11 +357,8 @@ fn expand_uid_ranges_caps_at_one_million() {
 #[test]
 fn expand_uid_ranges_inverted_range_yields_nothing() {
     // Defensive: a non-conformant server sending `10:5` must not panic.
-    let uids = expand_uid_ranges(&[UidRange {
-        start: 10,
-        end: Some(5),
-    }])
-    .expect("inverted range is empty, not incomplete");
+    let uids = expand_uid_ranges(&[UidRange::range(10, 5)])
+        .expect("inverted range is empty, not incomplete");
     assert!(uids.is_empty());
 }
 
@@ -498,17 +493,11 @@ fn selected_mailbox_keeps_only_earlier_vanished() {
     let untagged = vec![
         UntaggedResponse::Vanished {
             earlier: true,
-            uids: vec![UidRange {
-                start: 1,
-                end: Some(3),
-            }],
+            uids: vec![UidRange::range(1, 3)],
         },
         UntaggedResponse::Vanished {
             earlier: false,
-            uids: vec![UidRange {
-                start: 9,
-                end: None,
-            }],
+            uids: vec![UidRange::single(9)],
         },
     ];
     let mailbox = build_selected_mailbox(&untagged, &tagged(None), false);
@@ -1845,10 +1834,10 @@ fn mailbox_append_limit_reads_every_plausible_status_reply() {
 /// wherever it appears, and a sequence-set may repeat or overlap elements.
 #[test]
 fn expand_uid_ranges_handles_bare_star_and_overlap() {
-    let err = expand_uid_ranges(&[UidRange {
-        start: u32::MAX,
-        end: None,
-    }])
+    let err = expand_uid_ranges(&[UidRange::from_sequence_bounds(
+        crate::types::SeqBound::Star,
+        None,
+    )])
     .expect_err("a standalone `*` is not the literal id 4294967295");
     assert!(matches!(
         err,
@@ -1860,34 +1849,16 @@ fn expand_uid_ranges_handles_bare_star_and_overlap() {
 
     // Overlap is legal and must be counted once, both for the cap and for the
     // expansion itself.
-    let uids = expand_uid_ranges(&[
-        UidRange {
-            start: 1,
-            end: Some(600_000),
-        },
-        UidRange {
-            start: 1,
-            end: Some(600_000),
-        },
-    ])
-    .expect("600000 distinct UIDs are under the 1e6 cap");
+    let uids = expand_uid_ranges(&[UidRange::range(1, 600_000), UidRange::range(1, 600_000)])
+        .expect("600000 distinct UIDs are under the 1e6 cap");
     assert_eq!(uids.len(), 600_000);
 
     // Partial overlap merges rather than duplicating, and the result is
     // ascending.
     let uids = expand_uid_ranges(&[
-        UidRange {
-            start: 5,
-            end: Some(9),
-        },
-        UidRange {
-            start: 1,
-            end: Some(6),
-        },
-        UidRange {
-            start: 7,
-            end: None,
-        },
+        UidRange::range(5, 9),
+        UidRange::range(1, 6),
+        UidRange::single(7),
     ])
     .expect("small overlapping ranges expand");
     assert_eq!(uids, (1..=9).collect::<Vec<u32>>());
@@ -2012,6 +1983,7 @@ async fn wait_for_driver_exit(conn: &ImapConnection) {
     loop {
         let finished = conn
             .driver_handle
+            .handle
             .lock()
             .await
             .as_ref()

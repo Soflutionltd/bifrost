@@ -44,8 +44,10 @@ Search concatenates selectable folders in display-name order with canonical
 wire octets and mode breaking ties, keeping offset pagination stable across
 registry rebuilds.
 Canonical validated names retain their existing string ids; literal names
-beginning with the reserved prefix and control-bearing names are escaped too. Scope routing, grouping, push admission
-and error/throttle keys use this same identity. Display names remain readable.
+beginning with the reserved prefix and control-bearing names are escaped too. Scope routing, grouping, command-response correlation, push admission
+and error/throttle keys use this same identity. LIST-STATUS pairs duplicate
+responses in arrival order only when their retained mailbox identities match.
+Display names remain readable.
 Mailbox command helpers accept typed names alongside validated caller text;
 APPEND, LIST patterns and NOTIFY filters retain typed addresses through encoding.
 Hierarchy edits preserve a noncanonical parent's wire prefix for ASCII
@@ -55,7 +57,7 @@ hierarchy delimiters; unsupported non-ASCII delimiter combinations are refused.
 
 Every IMAP command - APPEND and MULTIAPPEND included - is a `types::Command`, encoded by one encoder (`codec::encode::encode_command`) into one form (`WireCommand`), and written by one sender (`driver::wire_send::send_wire_command`). There is no second payload type, no second encoder and no second send path.
 
-`WireCommand` is a list of segments, each a list of `Bytes` chunks. A segment ends exactly on a synchronizing literal marker; the sender writes every chunk of a segment, flushes once, and waits for `+` before the next segment (RFC 3501 Section 4.3). The boundaries are STRUCTURAL: `CommandWriter` records each one as it emits the marker, so no code rescans encoded bytes to rediscover framing, and marker-shaped bytes inside a literal payload cannot be mistaken for a boundary because nothing looks. `CommandWriter` is the one place literal framing is decided: `string(data, utf8)` makes the quoted-versus-literal choice (NUL stripped; printable ASCII quoted, plus valid UTF-8 in UTF-8 mode, with control characters and DEL always a literal), and `literal` / `literal_bytes` choose the `+` modifier once, from the live `EncodeOptions` - LITERAL+ any size, LITERAL- and rev2 up to 4096 octets (RFC 7888 Sections 4-5, RFC 9051 Section 4.3) - with the literal8 form (`~{n}`) additionally needing an advertised BINARY on a non-rev2 connection (RFC 7888 Section 6, RFC 9051 Section 9). What a command may CARRY stays with that command's encoder (APPEND's BINARY rule, METADATA's literal8 values); the writer owns marker choice and boundaries and nothing else. `literal_bytes` carries a payload by reference (a reference-count bump), which is how a message body reaches the socket uncopied. `WireCommand`'s `Debug` prints only its shape, and `AppendMessage`'s prints the body's length, so `?cmd` tracing cannot log a message or a credential literal.
+`WireCommand` is a list of segments, each a list of `Bytes` chunks. A segment ends exactly on a synchronizing literal marker; the sender writes every chunk of a segment, flushes once, and waits for `+` before the next segment (RFC 3501 Section 4.3). The boundaries are STRUCTURAL: `CommandWriter` records each one as it emits the marker, so no code rescans encoded bytes to rediscover framing, and marker-shaped bytes inside a literal payload cannot be mistaken for a boundary because nothing looks. `CommandWriter` is the one place literal framing is decided: `string(data, utf8)` makes the quoted-versus-literal choice (NUL is rejected when the whole command is finished, so mailbox and metadata identities are never rewritten; printable ASCII is quoted, plus valid UTF-8 in UTF-8 mode, with control characters and DEL always a literal), and `literal` / `literal_bytes` choose the `+` modifier once, from the live `EncodeOptions` - LITERAL+ any size, LITERAL- and rev2 up to 4096 octets (RFC 7888 Sections 4-5, RFC 9051 Section 4.3) - with the literal8 form (`~{n}`) additionally needing an advertised BINARY on a non-rev2 connection (RFC 7888 Section 6, RFC 9051 Section 9). What a command may CARRY stays with that command's encoder (APPEND's BINARY rule, METADATA's literal8 values); the writer owns marker choice and boundaries and nothing else. `literal_bytes` carries a payload by reference (a reference-count bump), which is how a message body reaches the socket uncopied. `WireCommand`'s `Debug` prints only its shape, and `AppendMessage`'s prints the body's length, so `?cmd` tracing cannot log a message or a credential literal.
 
 Caller-written literals in SEARCH-family criteria are the one place literal syntax enters from outside the encoder. `validate_search_criteria_crlf` judges the caller's ORIGINAL markers first (a `{n+}` the connection cannot take is `MissingCapability`, never silently rewritten); the walk (`write_criteria`) then copies every non-marker byte and every payload verbatim, skipping each payload by its declared length, and re-emits only the marker through the writer - a `~{n}` as literal8, so the literal8 rule applies. Two spellings can therefore differ from the caller's: a count with leading zeros is written canonically, and a `~{n+}` the connection may not send non-synchronizing loses its `+` and becomes a real segment boundary.
 
@@ -67,7 +69,7 @@ Encoder refusals are the crate's own `Error` variants (`MissingCapability`, word
 
 **Transmission evidence for a failed write** comes from socket progress, not from which write failed. Every transport socket is wrapped at construction in `stream::Tracked`, which counts the octets the socket accepts; it sits BELOW TLS and below COMPRESS, because neither layer above reports its own partial progress (OpenSSL can push part of an encrypted record before its `poll_write` returns `Pending`, and a later poll can fail without ever having returned `Ok(n)`). The sender reads the counter when a command begins (for a coalesced pipeline batch, when the batch begins, never reset between its commands) and stamps any write or flush failure `Unsent` exactly when the counter has not moved, else `InFlight` (`write_failure_evidence`). A saturated counter reads as progress. TLS handshake and control traffic can only inflate the count, the conservative direction. The rule rests on two invariants: a failed write retires the connection, so nothing buffered above the socket is ever sent later, and COMPRESS drains its sync-flush output inside a successful write, so a new command cannot inherit undrained output. This is what lets a stale pooled connection's first-byte EPIPE stay `Unsent` (a plain retry) while a failure after any byte of a non-idempotent command reached the socket is `InFlight` (reconcile). Writes made inside an already-started exchange - IDLE's `DONE`, an AUTHENTICATE continuation reply - stay unconditionally `InFlight`, because their command is already on the wire.
 
-ESEARCH `ALL` sets are normalized before expansion into the flat compatibility `SearchResult`: `*` is refused wherever it appears (RFC 9051 `seq-number = nz-number / "*"`), not only as a range endpoint, because its concrete value is unknowable from the response; and legal overlap or repetition is sorted and merged, so both the 1e6 safety cap and the expanded ids count each UID once. An expansion that cannot be completed is `Error::SearchResultTruncated`, never a partial list presented as complete, and the solicited ESEARCH stays consumed by the command rather than being republished as an asynchronous event.
+ESEARCH `ALL` sets are normalized before expansion into the flat compatibility `SearchResult`. Parsed sequence bounds retain `*` as `SeqBound::Star`, distinct from the legal numeric UID `4294967295`; `*` is refused wherever it appears because its concrete value is unknowable from the response. Legal numeric maximum values can therefore be expanded normally. Legal overlap or repetition is sorted and merged, so both the 1e6 safety cap and the expanded ids count each UID once. An expansion that cannot be completed is `Error::SearchResultTruncated`, never a partial list presented as complete, and the solicited ESEARCH stays consumed by the command rather than being republished as an asynchronous event.
 
 APPEND and MULTIAPPEND are `Command::Append { mailbox, messages, multi }`, encoded, validated and sent by the driver from live protocol state when the command reaches the head of the queue, exactly like every other command (see "One command path"). The handle (`ImapConnection::append` / `append_message` / `multi_append`) does only the client-side APPENDLIMIT check, then submits the command through `submit_regular` with `AppendConsumer` / `MultiAppendConsumer`; it makes no wire decision. That is the invariant: an earlier design built the bytes handle-side and queued them, which froze the mailbox encoding (modified UTF-7 versus UTF-8), the RFC 6855 `UTF8 (` wrapper, the RFC 7888 `+` markers and literal8 eligibility while the command sat behind another one. APPEND uses the driver's tag generator like every command. APPEND is not pipelinable (`CommandKind::pipelinable`): a batch does not run its APPENDLIMIT preflight, and the batch router does not hand an untagged `* OK [APPENDUID ...]` to an APPEND consumer that a head consumer claims first.
 
@@ -126,10 +128,13 @@ relies on.
 
 The driver's terminal best-effort LOGOUT (run when the last handle drops
 and the command channel closes) is time-bounded (`LOGOUT_DRAIN_TIMEOUT`,
-5s): it runs on a detached task nothing can abort, so an unbounded BYE/OK
-drain against a stalled or half-open peer would leak the task and its
-socket for the process lifetime - the same hazard the IDLE DONE handshake
-bounds. On timeout the transport is dropped without the graceful exchange.
+5s): it runs on a detached task, so an unbounded BYE/OK drain against a
+stalled or half-open peer would leak the task and its socket for the process
+lifetime, the same hazard the IDLE DONE handshake bounds. The pool retains a
+join handle for each registered driver after its connection handle disappears.
+`Pool::close` waits for that detached LOGOUT to finish, then aborts and joins
+the driver if the bound expires. On timeout the transport is dropped without
+the graceful exchange.
 
 An untagged `* BYE` is fatal in every driver read loop except single-command
 dispatch while servicing LOGOUT. RFC 3501 Section 6.1.3 requires that BYE
@@ -393,7 +398,7 @@ class, mechanism or response code, and account translation preserves it.
 
 `authenticate_best(credentials, policy)` intersects server-advertised, policy-allowed, and credentials-supported mechanisms, then runs the strongest. SASL-IR is used when advertised or implied by IMAP4rev2; malformed mechanism names are rejected before any wire write. `AuthOutcome` carries the selected mechanism.
 
-The password ladder is a pure helper `password_mechanism_ladder(profile, policy, is_encrypted)` returning `PasswordCandidate::{Attempt, Reject}` in the fixed order SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > CRAM-MD5 > LOGIN. RFC 5802 Section 6 downgrade protection: when the server advertises `SCRAM-SHA-N-PLUS`, the matching unbound `SCRAM-SHA-N` rung becomes `Reject(ChannelBindingUnavailable)` so a MITM cannot strip the binding. For a PLUS `Attempt`, `authenticate_best` resolves the `tls-server-end-point` binding once via `resolve_scram_binding()` (peer-cert DER + `bifrost_sasl::tls_server_end_point`), which delegates the policy to the pure `scram_binding_from_der(Option<&[u8]>)`. Only the *absence* of a peer certificate (plaintext, dead driver, no DER from native-tls) is a `ChannelBindingUnavailable` rejection that lets the ladder continue. A certificate that is present but whose binding cannot be computed (EdDSA leaf, unsupported sig-alg, malformed DER) is a hard `Error::Protocol` that aborts the ladder: swallowing it would let an attacker who can shape the presented leaf force the client off `-PLUS` onto unbound SCRAM or PLAIN, which is the downgrade `-PLUS` exists to stop. SMTP's `resolve_scram_binding` applies the identical rule; the two crates must not diverge here.
+The password ladder is a pure helper `password_mechanism_ladder(profile, policy, is_encrypted)` returning `PasswordCandidate::{Attempt, Reject}` in the fixed order SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > CRAM-MD5 > LOGIN. RFC 5802 Section 6 downgrade protection: when the server advertises `SCRAM-SHA-N-PLUS`, the matching unbound `SCRAM-SHA-N` rung becomes `Reject(ChannelBindingUnavailable)` so a MITM cannot strip the binding. For a PLUS `Attempt`, `authenticate_best` resolves the `tls-server-end-point` binding once via `resolve_scram_binding()` (peer-cert DER + `bifrost_sasl::tls_server_end_point`), which delegates the policy to the pure `scram_binding_from_der(Option<&[u8]>)`. Only the *absence* of a peer certificate (plaintext, dead driver, no DER from native-tls) is a `ChannelBindingUnavailable` rejection that lets the ladder continue. A certificate that is present but whose binding cannot be computed (EdDSA leaf, unsupported sig-alg, malformed DER) is a hard `Error::Protocol` that aborts the ladder. Likewise, a server rejection of an attempted mechanism is terminal; only `MissingCapability` from live capability skew falls through to a weaker rung, because retrying after an explicit rejection risks a downgrade and another credential attempt. SMTP's `resolve_scram_binding` applies the identical channel-binding rule; the two crates must not diverge here.
 
 ## Typed IDs and sets
 
@@ -404,7 +409,7 @@ Newtypes with explicit `::new` constructors. No `From<u32>`/`From<u64>` to preve
 - `ModSeq` - `u64` (0 means "no CONDSTORE state").
 - `GmailMessageId`, `GmailThreadId` - `u64`.
 
-`UidSet` and `SeqSet` wrap the validated sequence-set encoder (`from_uids`, `from_seqs`, `all()`, `saved_search()` (`$`), or range constructors). `parse(&str)` is an escape hatch bypassing the typed discipline.
+`UidSet` and `SeqSet` wrap the validated sequence-set encoder (`from_uids`, `from_seqs`, `all()`, `saved_search()` (`$`), or range constructors). `parse(&str)` is an escape hatch bypassing the typed discipline. Parsed `UidRange` bounds expose `SeqBound::{Number, Star}` so the legal numeric maximum is never confused with `*`; numeric fields remain the compatibility projection for existing consumers.
 
 The account layer's string-typed object/thread ids (`imap2:` / `imapthread2:`, with literal-folder v1 decoding)
 enforce the same `nz-number` rule at the decode boundary:
@@ -538,6 +543,9 @@ Internally, `connect_authenticated_metered(credentials, policy, meter, budget)`
 composes connect + STARTTLS-if-needed + `authenticate_best` for the factory,
 returning `(ImapConnection, AuthOutcome)` crate-only. Pool dials register the
 connection between connect and authentication, then initialize QRESYNC.
+Direct connection setup guards the post-spawn keepalive command as in-flight;
+cancellation there marks the connection abandoned so dropping its last handle
+aborts the driver instead of detaching a command that may still be queued.
 
 Connect-time STARTTLS requires both an unauthenticated greeting and an
 advertised `STARTTLS`. A cleartext PREAUTH greeting is refused as
@@ -741,9 +749,9 @@ Containers use native mailbox paths as primitive/provenance ids. `containers_lis
 
 ### Hydration accounting (`get.rs`)
 
-`get_stream` and the bulk mutation streams retain at most `TARGET_BUFFER_ITEMS` (256, in `account/mod.rs`) decoded target ids at once. A full window flushes immediately and a partial window flushes when input closes; 256 is two `BATCH_ITEMS` pages, small enough that a caller streaming millions of ids never materializes them all and large enough that a per-folder UID command still covers a useful range rather than degenerating into one command per id. Each window is grouped into per-folder UID commands, with folders visited lexically inside that window.
+`get_stream` and the bulk mutation streams retain at most `TARGET_BUFFER_ITEMS` (256, in `account/mod.rs`) decoded target ids at once. A full window flushes immediately and a partial window flushes when input closes; 256 is two `BATCH_ITEMS` pages, small enough that a caller streaming millions of ids never materializes them all and large enough that a per-folder UID command still covers a useful range rather than degenerating into one command per id. Each window is grouped into per-folder UID commands, with folders visited by display name and wire identity within that window.
 
-Output ordering is therefore input-window order, then lexical folder order within a window; FETCH response order within a folder remains server-driven. This is weaker than the previous guarantee, which drained the whole input before visiting folders lexically, so ids for one folder could previously never be split across batches. bifrost-sync tolerates the weaker contract because it keys results by `ObjectId` rather than by arrival position, and `BatchOutcome` carries its own submission-order index (`reference/error-model.md`); nothing downstream may start depending on cross-window ordering. Every requested id is still answered exactly once. Command response bodies retain their separate byte budgets.
+Output ordering is therefore input-window order, then folder display-name order with wire identity breaking ties within a window; FETCH response order within a folder remains server-driven. This is weaker than the previous guarantee, which drained the whole input before visiting folders lexically, so ids for one folder could previously never be split across batches. bifrost-sync tolerates the weaker contract because it keys results by `ObjectId` rather than by arrival position, and `BatchOutcome` carries its own submission-order index (`reference/error-model.md`); nothing downstream may start depending on cross-window ordering. Every requested id is still answered exactly once. Command response bodies retain their separate byte budgets.
 
 - Ids whose UIDVALIDITY no longer matches the selected mailbox are `Failed(Request(Malformed))` and are published *before* the hydration FETCH is issued. They are known truth already; buffering them behind a fallible command would relabel them uncertain whenever that command fails. The per-folder error path in turn only downgrades ids that still lack a published outcome (`run_folder_get` prunes the caller's unresolved set as it publishes), so a FETCH failure after the stale batch cannot put one id in two lanes.
 - A requested UID the server never returns is `Failed(NotFound(Message))` rather than being silently dropped.
@@ -862,6 +870,22 @@ finishes with the actual byte count and refunds only a current tail. Error or ca
 STARTTLS and COMPRESS rebuild the reader with cloned metering state, preserving
 the budget and observation sink. The underlying socket progress counter remains
 below TLS and COMPRESS for transmission evidence, independently of admission.
+
+Account stream batches report inbound IMAP protocol octets measured by the
+connection reader after TLS and COMPRESS decoding. Each operation snapshots the
+counter after checkout and advances it when it emits a batch, so bytes read
+since the preceding batch are reported once. Inventory, changes, hydration,
+mutations and raw-message chunks use this delta; local validation failures
+with no wire read carry zero. An operation that emits no batch has no batch
+field in which to report its reads. The delta relies on exclusive data
+checkouts: a `PoolMember` is removed from the idle list until its `PooledConn`
+drops, and IDLE workers dial separate connections. Concurrent account streams
+therefore sample different connection counters. A cancelled in-flight command
+marks its connection abandoned, preventing reuse by another checkout. The shared
+counter is not a per-command attribution API for arbitrary concurrent users of
+one `ImapConnection`. Read-ahead can put several responses into one batch's byte
+count, and trailing reads after the last emitted batch have no batch field;
+these figures are batch observations, not complete command or TCP/TLS totals.
 
 An IDLE read pre-spends a slot before waiting on the peer; it holds no budget
 lock or exclusive turn. Bootstrap greeting, CAPABILITY and STARTTLS each have
@@ -1005,7 +1029,7 @@ The interrupt therefore re-chooses BEFORE deciding (`resubscribe_action`, pure).
 
 The DONE handshake carries the account's `command_timeout`, the same bound every other command has. A peer whose TCP is alive but which never answers the tagged OK for IDLE would otherwise park the push loop past cancellation, past `account.shutdown`, and past `close()`. The bound turns that into an `Error::Timeout`, a `Disconnected` event, and a redial.
 
-Every connection minted by the pool is registered weakly, including parked, checked-out, and dedicated IDLE sessions. `Pool::close` sets the closed flag, closes the permit semaphore, drains the parked list and the registry, concurrently requests LOGOUT on every live session under one `command_timeout`, then aborts any remaining driver task and drops its transport.
+Every connection minted by the pool is registered with a weak connection handle and a shared driver-task owner, including parked, checked-out, and dedicated IDLE sessions. `Pool::close` sets the closed flag, closes the permit semaphore, drains the parked list and registry, concurrently requests LOGOUT on every live connection under one `command_timeout`, then joins each driver. Drivers whose connection handles already disappeared are already running the driver's bounded best-effort LOGOUT; close waits for it up to `LOGOUT_DRAIN_TIMEOUT` and aborts and joins on expiry.
 
 Account close records admission separately from completion. The first polled
 close starts one owned teardown task; concurrent and later callers await its
@@ -1031,7 +1055,7 @@ The `sessions` mutex is the linearization point that protects pool registration 
 
 The parking side takes the matching linearization on the other lock. `PooledConn::drop` re-checks `closed` while HOLDING the `idle` mutex, in the same critical section as its push. Reading the flag before acquiring that lock is a race with the same shape as the registration one: `close` stores the flag and only then drains `idle`, so a drop preempted between its read and its push parks a member the drain has already LOGOUT'd and terminated, leaving a dead entry on a closed pool. Under the lock only two orders exist - the push lands before the drain and is drained, or it observes the flag the drain published.
 
-Registration prunes weak entries whose connection is already gone. The registry would otherwise grow by one entry per dial for the life of the account, which a non-NOTIFY push worker reconnecting across a network outage does continuously.
+Registration prunes completed driver tasks. A missing connection handle alone does not make a registration stale: the driver may still be completing its bounded best-effort LOGOUT, and the registry keeps its join handle until that finishes. This also bounds registry growth when a non-NOTIFY push worker reconnects across a network outage.
 
 A failed dial or SELECT backs off from 5s, doubling to a 300s ceiling, and resets on the first successful SELECT. The wait races the cancel and shutdown tokens rather than sleeping through them, and `Disconnected` is emitted once per disconnection rather than once per failed attempt.
 
@@ -1042,7 +1066,9 @@ it needs the live UIDVALIDITY, not all changes since the last sync. It neither
 replays VANISHED history nor warms the MODSEQ cache from that SELECT. Existing
 cached MODSEQs remain the opportunistic STORE guards. MODIFIED response sets
 stay compact; per-item classification tests only the submitted UIDs for
-membership, even when the server names a very broad range.
+membership, even when the server names a very broad range. Because MODIFIED
+does not include the mailbox maximum or preserve endpoint order, any `*` bound
+is conservatively mapped to the full possible UID space.
 
 IMAP diverges from the `MutationSuccess::Skipped` lane other crates use for the engine's "already in this state" short-circuit: the opportunistic MODSEQ cache sends cold-cache STOREs without `UNCHANGEDSINCE`, so "already in state" cannot be observed without a full SELECT+FETCH that defeats the guard. So `STORE UNCHANGEDSINCE <modseq>` rejecting with `MODIFIED` surfaces as `ItemOutcome::Failed { kind: ConcurrencyConflict }` for the conflicting UIDs, never `Succeeded(Skipped)`.
 

@@ -496,8 +496,9 @@ impl Account for GoogleAccount {
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
-        // Emits real coverage: this walk records an unreadable object as an
-        // obligation and keeps going rather than discarding the partition.
+        // Emits real coverage: object-attributable permanent hydration
+        // failures become obligations; stream-level recovery errors terminate
+        // without claiming coverage for the unfinished page.
         inventory::inventory_stream_cancellable(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),

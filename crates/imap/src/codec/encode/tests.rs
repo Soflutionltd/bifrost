@@ -69,7 +69,7 @@ fn segment_bytes(cmd: &WireCommand) -> Vec<Vec<u8>> {
 fn written_segments(opts: &EncodeOptions, write: impl FnOnce(&mut CommandWriter)) -> Vec<Vec<u8>> {
     let mut w = CommandWriter::new(opts);
     write(&mut w);
-    segment_bytes(&w.finish())
+    segment_bytes(&w.finish().expect("valid command"))
 }
 
 /// `A001 X` followed by each payload as a classic literal, then CRLF: the
@@ -82,14 +82,25 @@ fn x_command(mode: LiteralMode, literals: &[&[u8]]) -> WireCommand {
         w.literal(literal, LiteralForm::Classic);
     }
     w.raw(b"\r\n");
-    w.finish()
+    w.finish().expect("valid command")
 }
 
 /// Run `write` against a writer for `mode` and return every byte it wrote.
 fn fragment(mode: LiteralMode, write: impl FnOnce(&mut CommandWriter)) -> Vec<u8> {
     let mut w = CommandWriter::new(&opts(mode, false));
     write(&mut w);
-    w.finish().to_vec()
+    w.finish().expect("valid command").to_vec()
+}
+
+fn assert_string_nul_rejected(data: &[u8]) {
+    let mut w = CommandWriter::new(&default_opts());
+    w.raw(b"A001 X ");
+    w.string(data, false);
+    w.raw(b"\r\n");
+    assert!(matches!(
+        w.finish(),
+        Err(crate::Error::InvalidInput(message)) if message.contains("must not contain NUL")
+    ));
 }
 
 /// As [`fragment`], for a piece that can refuse.
@@ -99,7 +110,7 @@ fn try_fragment(
 ) -> Result<Vec<u8>, crate::Error> {
     let mut w = CommandWriter::new(&opts(mode, false));
     write(&mut w)?;
-    Ok(w.finish().to_vec())
+    Ok(w.finish()?.to_vec())
 }
 
 fn push_quoted_or_literal(buf: &mut BytesMut, data: &[u8], mode: LiteralMode) {
@@ -991,11 +1002,8 @@ fn encode_uid_store_move_fallback_uses_silent() {
 }
 
 #[test]
-fn encode_quoted_with_nul_strips_nul_and_quotes() {
-    // RFC 3501 Section 9: NUL (%x00) is stripped; remaining "hasnul" is quotable.
-    let mut buf = BytesMut::new();
-    push_quoted_or_literal(&mut buf, b"has\0nul", LiteralMode::Synchronizing);
-    assert_eq!(&buf[..], b"\"hasnul\"");
+fn encode_quoted_with_nul_is_refused() {
+    assert_string_nul_rejected(b"has\0nul");
 }
 
 #[test]
@@ -2173,14 +2181,10 @@ fn encode_append_zero_length_body_is_still_a_segment() {
 
 // ===== Negative / edge-case encoding tests =====
 
-/// NUL byte in data is stripped per RFC 3501 Section 9 (CHAR8 = %x01-ff).
+/// NUL byte in data is refused per RFC 3501 Section 9 (CHAR8 = %x01-ff).
 #[test]
-fn encode_data_with_nul_byte_strips_nul() {
-    let mut buf = BytesMut::new();
-    push_quoted_or_literal(&mut buf, b"hello\x00world", LiteralMode::Synchronizing);
-    // NUL is stripped; "helloworld" is quotable ASCII.
-    assert_eq!(&buf[..], b"\"helloworld\"");
-    assert!(!buf.contains(&0x00), "output must not contain NUL bytes");
+fn encode_data_with_nul_byte_is_refused() {
+    assert_string_nul_rejected(b"hello\x00world");
 }
 
 /// Non-ASCII bytes force literal encoding.
@@ -2620,23 +2624,12 @@ fn encode_setquota_empty_resources() {
 
 // ===== Spec audit: failing tests for known deviations =====
 
-/// M4: NUL bytes in literal encoder.
-///
 /// RFC 3501 Section 9 defines CHAR8 = %x01-ff, explicitly excluding NUL (%x00).
 /// Rule (3): "The ASCII NUL... MUST NOT be used at any time."
-/// The encoder strips NUL bytes before encoding.
+/// The encoder refuses the command rather than rewriting its string.
 #[test]
-fn spec_audit_m4_nul_bytes_in_literal() {
-    let mut buf = BytesMut::new();
-    push_quoted_or_literal(&mut buf, b"has\0nul", LiteralMode::Synchronizing);
-    // RFC 3501 Section 9: NUL (%x00) MUST NOT appear in the output.
-    // The output must not contain a NUL byte, regardless of encoding form.
-    assert!(
-        !buf.contains(&0x00),
-        "encoder must reject or strip NUL bytes per RFC 3501 Section 9 (CHAR8 = %x01-ff), \
-         but the output contains NUL: {:?}",
-        &buf[..]
-    );
+fn spec_audit_nul_bytes_are_refused() {
+    assert_string_nul_rejected(b"has\0nul");
 }
 
 /// L2: \\Recent in STORE command.
@@ -4216,25 +4209,21 @@ fn encode_quoted_escapes_backslash_and_dquote() {
     assert_eq!(&buf[..], b"\"a\\\\b\\\"c\"");
 }
 
-// --- CommandWriter::string in UTF-8 mode: NUL stripping ---
+// --- CommandWriter::string: invalid NUL ---
 
-/// RFC 3501 Section 9: NUL (%x00) is forbidden and must be stripped
-/// even when UTF8=ACCEPT is active (RFC 6855 Section 3).
+/// RFC 3501 Section 9 forbids NUL in IMAP strings. Refusing the whole command
+/// preserves the caller's mailbox or metadata identity.
 #[test]
-fn encode_utf8_mode_strips_nul_bytes() {
-    let mut buf = BytesMut::new();
-    push_quoted_or_literal_utf8(
-        &mut buf,
-        b"hello\x00world",
-        true,
-        LiteralMode::Synchronizing,
-    );
-    assert_eq!(
-        &buf[..],
-        b"\"helloworld\"",
-        "NUL bytes must be stripped in UTF-8 mode per RFC 3501 Section 9"
-    );
-    assert!(!buf.contains(&0x00), "output must not contain NUL bytes");
+fn encode_string_rejects_nul_without_rewriting_the_command() {
+    let mut w = CommandWriter::new(&opts(LiteralMode::Synchronizing, true));
+    w.raw(b"A001 X ");
+    w.string(b"hello\x00world", true);
+    w.raw(b"\r\n");
+
+    assert!(matches!(
+        w.finish(),
+        Err(crate::Error::InvalidInput(message)) if message.contains("must not contain NUL")
+    ));
 }
 
 /// RFC 3501 Section 9 / RFC 6855 Section 3: backslash and double-quote
@@ -5802,7 +5791,7 @@ fn writer_literal_bytes_carries_the_payload_by_reference() {
     w.raw(b"A001 X ");
     w.literal_bytes(body.clone(), LiteralForm::Classic);
     w.raw(b"\r\n");
-    let encoded = w.finish();
+    let encoded = w.finish().expect("valid command");
     assert!(
         encoded
             .segments()

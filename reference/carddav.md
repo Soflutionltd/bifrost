@@ -208,6 +208,9 @@ its scope and action.
   base is the EFFECTIVE request URI: the DAV transport carries the post-redirect
   URL back on every response, because the redirect policy follows admitted-origin hops
   and RFC 4918 resolves against the URI that actually served the body.
+  Element identity is the resolved XML namespace URI plus local name, so prefixes
+  can vary while foreign `status`, `addressbook`, or `href` elements remain
+  separate from their DAV and CardDAV counterparts.
   Resource identification does not depend on a `.vcf` suffix or a returned
   content type. Contact PROPFIND, addressbook-query, and multiget request
   `resourcetype`, and all of their
@@ -555,6 +558,9 @@ returns Unsupported before cursor validation or I/O. `directory_enumerate`
 stays false: empty or whitespace-only queries return Unsupported. A supplied
 cursor returns local `Request(Malformed)` because this endpoint has no paging.
 An omitted limit defaults to 250; zero returns an empty complete page locally.
+If an account has the capability enabled but no admitted gateways, the search
+returns `Internal(InvariantViolated)` instead of panicking. Opened accounts do
+not create this state; the guard makes a broken internal construction visible.
 
 A non-empty query issues one depth-1 REPORT per gateway. RFC 6352 governs
 `addressbook-query`, `text-match` and truncation: the body requests
@@ -613,7 +619,8 @@ Cursor support is contact-only. `discover_cursor_scopes` returns one
 `CursorScope::Folder(FolderId(collection_href))` per discovered address book,
 and NOTHING when the home holds no collections - an empty walk is an empty
 backend, and a fabricated home scope would point every cursor and inventory
-request at a 404.
+request at a 404. Scope discovery uses cached collection URLs and sends no
+request, so its `bytes_in` is zero.
 `establish_initial_cursor`
 builds a hybrid cursor from the address book URL, the collection
 `getctag` when present, and a sorted href/etag snapshot. `changes_stream`
@@ -628,13 +635,15 @@ The poll resolves the ctag **at most once**, and hands the value it already
 has to the snapshot as `CtagSource::Known` rather than letting the snapshot
 re-derive it. `contact_snapshot` takes a `CtagSource` for exactly this
 reason: `Home(home)` picks the tag out of a depth-1 PROPFIND over the
-address book home, which is what cursor establishment and inventory want
-since they are enumerating anyway, while `Known` spends no request at all.
+address book home and also refreshes the client's observed directory URLs;
+cursor establishment and inventory currently use that path. `Known` spends no
+request at all.
 Re-deriving it from the home made a changed-ctag poll cost three round trips
 where two suffice, and that third request grows with the number of address
-books rather than staying one collection wide - the CalDAV twin
-(`event_snapshot`, taking `home: Option<&str>`) had taken the cheap path
-already, so this was drift, not a design difference.
+books rather than staying one collection wide. CalDAV now reads the collection
+token with depth 0 during establishment and inventory as well. Both account
+types keep token discovery scoped to the collection; CardDAV separately needs
+its depth-1 home response to enumerate address books.
 `poll_snapshot_never_relists_the_address_book_home` pins it against the
 request transcript.
 
@@ -649,6 +658,9 @@ and any href in `current.failed_hrefs` is preserved rather than destroyed.
 The snapshot diff and failed-href guard index temporary `DavHrefKey`
 equivalence keys, retaining an existing native href when a listing changes only
 its URL spelling. The keys never replace ids in cursors, hydration or inventory.
+Path segments in those keys are compared as decoded bytes. Encoded valid UTF-8
+matches its literal spelling, while distinct invalid UTF-8 octets remain
+distinct resources.
 The checkpoint preserves the prior entries and etags for both no-observation
 shapes while retaining the prior ctag. The shared snapshot helper returns an
 `Observation`; only complete observations advance tokens. Initial snapshots
@@ -661,6 +673,15 @@ later empty poll, since the empty observation remains ambiguous.
 the same collection scope and reports full coverage of that address book. A
 listing with refused members fails the inventory before emitting entries,
 coverage or a checkpoint, using the member status classification.
+`bytes_in` in inventory and changes batches comes from a fresh stream-local
+`DavByteTally` on the client's cloned `DavDispatch`. Each net send records a
+`RequestByteCounter` before DAV decodes or classifies its result; each batch
+takes and clears the tally. This includes the home and contact listings in
+inventory, the `getctag` response even for an unchanged poll, any subsequent
+listing, and retry, redirect and 401 bodies. These are fetched HTTP body octets,
+not decoded XML lengths or an account-wide meter delta; concurrent streams have
+separate tallies. Cloned clients share the live directory guard, so observing a
+directory marker in one stream still tightens access for every client view.
 Legacy `CursorScope::Type(Contact)` calls remain accepted for compatibility,
 target the default address book, and report only a `carddav` provider region.
 The CardDAV cursor payload is version 2. Version 2 records the request-relative

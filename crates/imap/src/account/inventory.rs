@@ -189,6 +189,7 @@ async fn run_inventory(
         .get(&folder)
         .and_then(|entry| entry.shared_owner.clone());
     let mut conn = account.checkout_for_folder(&folder).await?;
+    let mut previous_bytes_in = conn.connection().bytes_in();
     let selected = match account.select_folder(&mut conn, &folder, None, true).await {
         Ok(selected) => selected,
         // A permission denial on a shared folder quarantines just that
@@ -238,10 +239,21 @@ async fn run_inventory(
                                     .record_modseq(&folder, uidvalidity, uid, modseq)?;
                             }
                             known.push(uid);
-                            batch_items.push(fetch_to_inventory(&folder, uidvalidity, fetch, shared_owner.as_ref()));
+                            batch_items.push(fetch_to_inventory(
+                                &folder,
+                                uidvalidity,
+                                fetch,
+                                shared_owner.as_ref(),
+                            ));
                             if batch_items.len() >= BATCH_ITEMS {
                                 let out = std::mem::take(&mut batch_items);
-                                tx.send(batch(out, PageBoundary::Page, None)).await.map_err(|_| ChannelDropped)?;
+                                let bytes_in = super::measured_bytes_in(
+                                    conn.connection(),
+                                    &mut previous_bytes_in,
+                                );
+                                tx.send(batch(out, PageBoundary::Page, None, bytes_in))
+                                    .await
+                                    .map_err(|_| ChannelDropped)?;
                             }
                         }
                     }
@@ -268,7 +280,16 @@ async fn run_inventory(
 
     let known_uids = CompactUidSet::from_uids(known);
     let cursor = account.cursor_from_select(&selected.mailbox, Some(known_uids))?;
-    finish_inventory(&account.folders, &folder, cursor, batch_items, &tx).await?;
+    let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
+    finish_inventory(
+        &account.folders,
+        &folder,
+        cursor,
+        batch_items,
+        &tx,
+        bytes_in,
+    )
+    .await?;
     Ok(())
 }
 
@@ -278,6 +299,7 @@ async fn finish_inventory(
     cursor: super::FolderCursor,
     batch_items: Vec<InventoryEntry>,
     tx: &tokio::sync::mpsc::Sender<SyncEvent<InventoryEntry>>,
+    bytes_in: u64,
 ) -> Result<(), ChannelDropped> {
     let checkpoint = Some(Checkpoint::Change(encode_cursor(
         folder_scope(folder),
@@ -288,9 +310,14 @@ async fn finish_inventory(
             .await
             .map_err(|_| ChannelDropped)?;
     } else {
-        tx.send(batch(batch_items, PageBoundary::Final, checkpoint.clone()))
-            .await
-            .map_err(|_| ChannelDropped)?;
+        tx.send(batch(
+            batch_items,
+            PageBoundary::Final,
+            checkpoint.clone(),
+            bytes_in,
+        ))
+        .await
+        .map_err(|_| ChannelDropped)?;
         tx.send(SyncEvent::Done(checkpoint))
             .await
             .map_err(|_| ChannelDropped)?;
@@ -474,7 +501,7 @@ mod tests {
                 tx.send(SyncEvent::Done(None)).await.unwrap();
             }
             let mut finish = Box::pin(super::finish_inventory(
-                &folders, &folder, cursor, items, &tx,
+                &folders, &folder, cursor, items, &tx, 0,
             ));
             assert!(futures::poll!(finish.as_mut()).is_pending());
             assert!(folders.get(&folder).unwrap().cursor().is_none());
@@ -488,7 +515,7 @@ mod tests {
             };
             let (tx, _rx) = tokio::sync::mpsc::channel(2);
             assert!(
-                super::finish_inventory(&folders, &folder, cursor.clone(), Vec::new(), &tx)
+                super::finish_inventory(&folders, &folder, cursor.clone(), Vec::new(), &tx, 0)
                     .await
                     .is_ok()
             );

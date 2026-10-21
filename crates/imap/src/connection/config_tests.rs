@@ -66,3 +66,27 @@ fn debug_redacts_the_custom_connector() {
     assert!(rendered.contains("993"));
     assert!(!rendered.contains("<custom>"));
 }
+
+#[tokio::test]
+async fn cancellation_during_keepalive_setup_marks_the_connection_abandoned() {
+    let (conn, _server) =
+        crate::connection::test_support::driver_pair(b"* PREAUTH ready\r\n").await;
+    let conn = std::sync::Arc::new(conn);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let setup_conn = std::sync::Arc::clone(&conn);
+    let setup = tokio::spawn(async move {
+        super::setup_keepalive_cancel_safe(&setup_conn, async move {
+            let _ = started_tx.send(());
+            std::future::pending().await
+        })
+        .await
+    });
+    started_rx.await.expect("keepalive setup started");
+
+    setup.abort();
+    assert!(setup.await.expect_err("setup was cancelled").is_cancelled());
+    assert!(
+        !conn.is_reusable(),
+        "a dropped keepalive setup must retire the driver it may have queued"
+    );
+}

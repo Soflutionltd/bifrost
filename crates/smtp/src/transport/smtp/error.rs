@@ -335,6 +335,8 @@ pub enum ErrorKind {
     Permanent(Response),
     /// Error parsing an SMTP response.
     Parse,
+    /// The server rejected the credentials in a SASL exchange.
+    Authentication,
     /// Invalid caller input, unsupported local configuration, or local protocol state.
     InvalidInput,
     /// A requested SMTP extension feature is not advertised by the
@@ -381,6 +383,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.inner.kind {
             ErrorKind::Parse => f.write_str("SMTP response parse error")?,
+            ErrorKind::Authentication => f.write_str("SMTP authentication failed")?,
             ErrorKind::InvalidInput => f.write_str("invalid SMTP input")?,
             ErrorKind::FeatureUnsupported => {
                 f.write_str("requested SMTP feature not supported by server")?;

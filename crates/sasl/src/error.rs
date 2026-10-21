@@ -25,3 +25,14 @@ pub enum SaslError {
     #[error("SCRAM authentication failed: {0}")]
     AuthFailed(String),
 }
+
+impl SaslError {
+    /// Return the SCRAM server-final `e=` token, when this error carries one.
+    /// Protocol consumers can classify it without parsing display text.
+    pub fn scram_server_error(&self) -> Option<&str> {
+        match self {
+            Self::AuthFailed(message) => message.strip_prefix("SCRAM server error: "),
+            _ => None,
+        }
+    }
+}

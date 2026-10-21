@@ -17,28 +17,6 @@ Filed from the October 2026 defect hunt: the jmap protocol scope, the jmap
 account scope, and the net and sync adoption scopes where they reached JMAP.
 Severity labels are the hunters' own.
 
-## JMAP-004 - The EventSource template still lets `.` and `..` through
-
-Scope: net adoption. Residue: upload and download templates now use
-context-aware encoding (`encode_template_value_at`) that protects dot-only path
-values; `crates/jmap/src/event_source/stream.rs` still substitutes without it,
-so a `{types}`-style or path variable of `.` / `..` navigates. Use the same
-helper there.
-
-## JMAP-020 - Implicit `Email/set` responses exist, contradicting the "no multiple responses" claim, and leave the state cache one behind
-
-Hunter severity: P3. Scope: jmap protocol.
-
-`reference/jmap.md` (internal request/response flow) and the doc on
-`Response::get` justify not modelling multiplicity with "no currently wired
-method produces multiple responses". `sync/pim.rs` send and draft-send set
-`onSuccessUpdateEmail` / `onSuccessDestroyEmail` on `EmailSubmission/set`, so
-RFC 8621 s7.5 has the server emit an implicit `Email/set` response under the
-SAME call id after the `EmailSubmission/set` response. It works because `get`
-takes the first match, but the implicit `Email/set` carries the post-move
-`newState`, which `pim.rs` never feeds into `state_cache`; only the earlier
-explicit state is advanced, so the cache is one state behind after every send.
-
 ## JMAP-027 - WebSocket proxy inheritance and trace context need net facilities
 
 Residue: the WebSocket handshake has bounded setup, a User-Agent, refused
@@ -47,19 +25,31 @@ account proxy and sends no trace context, because `bifrost-net` exposes neither 
 proxy or tunnel connector nor a public trace-context builder; the limits are
 documented at the code sites.
 
-## JMAP-034 - Design proposals from the jmap account hunter
+## JMAP-034 - The PIM send path as a state machine with compensations
 
-Not defects; recorded with the defects they would remove.
+**Needs a technical implementation specification** (owner, 2026-10-21),
+together with GOOG-027. The push-health-as-state proposal once filed here is
+folded into SHARED-014.
 
-- Push health as state, not events: `watch<PushHealth>` plus a broadcast for
-  hints, fixing JMAP-009 structurally and making `push_stream` a projection of
-  current state.
-- One state-walk policy: `changes_walk`, `scope_lifecycle` and the inventory
-  loop each decide independently what a moved state or `cannotCalculateChanges`
-  means. One "state walk" type owning the guard, the reseed-on-expiry policy
-  and the error context (always carrying a scope or an explicit state-based
-  flag into `convert_method`) removes JMAP-008 and JMAP-011 as a class.
-- The PIM send path as a small state machine with compensations (create email
-  -> submit -> on failure destroy; cancel -> confirm -> create) instead of
-  single batched requests whose partial outcomes read as total failure
-  (JMAP-005 to JMAP-007 share this shape).
+The PIM send path as a small state machine with compensations (create email ->
+submit -> on failure destroy; cancel -> confirm -> create) instead of single
+batched requests whose partial outcomes read as total failure.
+
+## JMAP-036 - Session discovery falls back to the path form only on a 404
+
+Lateral from the origin-first well-known discovery. The path-appended
+`/.well-known/jmap` is tried only when the origin answers 404. An origin that
+answers 401, 403, a redirect to a login page, or a 200 with non-JMAP JSON makes
+discovery fail or misparse without trying the configured path, which is
+exactly the deployment the fallback exists for.
+
+## JMAP-035 - `anchorNotFound` is classified from cursor scope alone
+
+Lateral from the state-walk consolidation. `anchorNotFound` maps to
+`SyncState(CursorInvalid)` -> `RestartScope` whenever the error context carries
+a cursor scope. Inventory supplies that scope to both its query and get calls,
+and `sync/account.rs` supplies it to the empty `Email/get` and `Mailbox/get`
+state probes. RFC 8620 defines `anchorNotFound` only for a query given an
+anchor; a get has no anchor, so an unrelated method error there would restart
+the scope. Mark anchored query contexts explicitly, as the state-based flag now
+does for `cannotCalculateChanges` / `tooManyChanges`.

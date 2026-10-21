@@ -428,10 +428,7 @@ fn response_code_appenduid_set() {
         code,
         ResponseCode::AppendUid {
             uid_validity: 1234,
-            uids: vec![UidRange {
-                start: 100,
-                end: Some(102)
-            }],
+            uids: vec![UidRange::range(100, 102)],
         }
     );
 }
@@ -2254,7 +2251,7 @@ fn response_code_modified_accepts_star_range() {
     if let ResponseCode::Modified(ranges) = code {
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].start, 1);
-        assert_eq!(ranges[0].end, Some(u32::MAX));
+        assert_eq!(ranges[0].end_bound(), Some(crate::types::SeqBound::Star));
     } else {
         panic!("expected Modified, got {code:?}");
     }
@@ -2269,6 +2266,7 @@ fn response_code_modified_accepts_bare_star() {
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].start, u32::MAX);
         assert_eq!(ranges[0].end, None);
+        assert_eq!(ranges[0].start_bound(), crate::types::SeqBound::Star);
     } else {
         panic!("expected Modified, got {code:?}");
     }
@@ -5061,21 +5059,9 @@ fn uid_range_single_value() {
 fn uid_set_complex() {
     let (_, ranges) = uid_set(b"1:5,10,20:30").unwrap();
     assert_eq!(ranges.len(), 3);
-    assert_eq!(
-        ranges[0],
-        UidRange {
-            start: 1,
-            end: Some(5)
-        }
-    );
+    assert_eq!(ranges[0], UidRange::range(1, 5));
     assert_eq!(ranges[1], UidRange::single(10));
-    assert_eq!(
-        ranges[2],
-        UidRange {
-            start: 20,
-            end: Some(30)
-        }
-    );
+    assert_eq!(ranges[2], UidRange::range(20, 30));
 }
 
 /// APPENDUID with multi-message uid-set (RFC 4315 / RFC 3502).
@@ -7457,8 +7443,7 @@ fn spec_audit_esearch_all_accepts_wildcard() {
         if let UntaggedResponse::Esearch(es) = &*u {
             assert_eq!(es.all.len(), 1);
             assert_eq!(es.all[0].start, 1);
-            // u32::MAX is the sentinel for `*` per seq_number() convention
-            assert_eq!(es.all[0].end, Some(u32::MAX));
+            assert_eq!(es.all[0].end_bound(), Some(crate::types::SeqBound::Star));
         } else {
             panic!("Expected Esearch, got {u:?}");
         }
@@ -7854,18 +7839,29 @@ fn seq_range_reversed_normalized() {
 }
 
 /// RFC 3501 Section 9: `seq-range = seq-number ":" seq-number` where
-/// `seq-number` may be `*` (mapped to `u32::MAX`). When `*` appears as
-/// the first element (`*:1`), the reversed-range normalization must swap
-/// to `(1, Some(u32::MAX))` so consumers get "1 to last message".
+/// `seq-number` may be `*`. When `*` appears as the first element (`*:1`),
+/// reversed-range normalization must put it after the concrete lower bound.
 #[test]
 fn seq_range_wildcard_reversed_normalized() {
     let (_, r) = seq_range(b"*:1").unwrap();
     assert_eq!(r.start, 1, "seq_range *:1 must normalize start to 1");
     assert_eq!(
-        r.end,
-        Some(u32::MAX),
-        "seq_range *:1 must normalize end to u32::MAX (wildcard sentinel)"
+        r.end_bound(),
+        Some(crate::types::SeqBound::Star),
+        "seq_range *:1 must preserve the wildcard as a typed bound"
     );
+}
+
+#[test]
+fn seq_range_keeps_numeric_max_distinct_from_star() {
+    let (_, numeric) = seq_range(b"4294967295").unwrap();
+    let (_, star) = seq_range(b"*").unwrap();
+
+    assert_eq!(
+        numeric.start_bound(),
+        crate::types::SeqBound::Number(u32::MAX)
+    );
+    assert_eq!(star.start_bound(), crate::types::SeqBound::Star);
 }
 
 /// RFC 9051 Section 9 says nz-number for UIDVALIDITY, but real servers

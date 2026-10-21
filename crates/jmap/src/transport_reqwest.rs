@@ -58,8 +58,7 @@ impl ReqwestTransport {
         injected_net: Option<Net>,
     ) -> Result<Self, TransportError> {
         let redirect_policy = redirect_policy_from_trusted_hosts(&trusted_hosts);
-        let token_source = authorization.account_token_source();
-        let mut spec = AccountSpec::new(Some(token_source));
+        let mut spec = AccountSpec::new(authorization.optional_account_token_source());
         spec.request_timeout = Some(timeout);
         spec.user_agent = concat!("bifrost-jmap/", env!("CARGO_PKG_VERSION")).to_string();
         spec.follow_redirects = FollowRedirects::Enabled(redirect_policy);
@@ -330,6 +329,8 @@ impl crate::blob::download::BlobTransport for ReqwestTransport {
             .await
             .map_err(transport_error_from_net)?;
         if !response.status().is_success() {
+            // The streamed blob door has the same limitation as EventSource:
+            // net has no separate terminal carrier for a passed-through 3xx.
             let body = passthrough_excerpt(response.body).await;
             return Err(TransportError::from_net(bifrost_net::Error::Status {
                 code: response.status,
@@ -344,8 +345,9 @@ impl crate::blob::download::BlobTransport for ReqwestTransport {
     }
 }
 
-// Collect one byte beyond the cap to distinguish exact-size EOF from truncation.
-// Read failure is independent evidence, not evidence that the cap was reached.
+// Collect one byte beyond the cap to distinguish exact-size EOF from truncation;
+// the overflow path adds the shared truncation marker. Read failure appends its
+// own marker and is not evidence that the cap was reached.
 async fn passthrough_excerpt<S, E>(mut stream: S) -> Bytes
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -431,6 +433,10 @@ impl SseTransport for ReqwestTransport {
         // hostile or stalled body cannot hang or bloat the failure
         // path.
         let body = passthrough_excerpt(response.body).await;
+        // Net has no separate terminal carrier for a passed-through 3xx.
+        // `Status` preserves its response evidence, but its contract and the
+        // account error mapper treat it as a terminal HTTP failure. Correct
+        // classification needs a shared nonterminal response shape.
         Err(TransportError::from_net(bifrost_net::Error::Status {
             code: response.status,
             body,
@@ -482,6 +488,9 @@ fn transport_error_from_net(error: bifrost_net::Error) -> TransportError {
 fn redirect_policy_from_trusted_hosts(trusted_hosts: &HashSet<String>) -> RedirectPolicy {
     let mut policy = RedirectPolicy::with_hops(5);
     if trusted_hosts.is_empty() {
+        // Net interprets an empty allowlist as trusting every cross-host
+        // target. Until it exposes a same-origin-only mode, this impossible
+        // host keeps JMAP's default policy from following any cross-host hop.
         policy = policy.trust_host("__bifrost_jmap_no_cross_host_redirects__");
     } else {
         for host in trusted_hosts {
@@ -497,6 +506,23 @@ mod tests {
     use crate::client::Credentials;
     use bifrost_net::StaticTokenSource;
     use bifrost_net::test_support::{Canned, ScriptedDispatch, scripted_net};
+
+    #[tokio::test]
+    async fn basic_auth_attaches_without_a_bearer_token_source() {
+        let net = Net::new(bifrost_net::NetConfig::default()).expect("test net builds");
+        let transport = ReqwestTransport::new_with_net(
+            header::HeaderMap::new(),
+            Authorization::from_credentials_for_test(Credentials::basic("user", "password")),
+            AccountId("basic-without-token-source".to_owned()),
+            Duration::from_secs(30),
+            false,
+            Arc::new(HashSet::new()),
+            Some(net),
+        )
+        .expect("Basic transport builds");
+
+        assert!(transport.net.bearer().await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn blobs_bypass_json_buffer_limit_and_keep_streaming_and_buffered_doors() {

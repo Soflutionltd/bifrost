@@ -1183,14 +1183,25 @@ pub(crate) fn batch<T>(
     items: Vec<T>,
     boundary: bifrost_types::PageBoundary,
     checkpoint: Option<bifrost_types::Checkpoint>,
+    bytes_in: u64,
 ) -> SyncEvent<T> {
     SyncEvent::Batch(bifrost_types::Batch {
         items,
         page_boundary: boundary,
         server_latency: Duration::ZERO,
-        bytes_in: 0,
+        bytes_in,
         checkpoint,
     })
+}
+
+pub(crate) fn measured_bytes_in(connection: &crate::ImapConnection, previous: &mut u64) -> u64 {
+    measured_bytes_delta(connection.bytes_in(), previous)
+}
+
+fn measured_bytes_delta(current: u64, previous: &mut u64) -> u64 {
+    let bytes_in = current.saturating_sub(*previous);
+    *previous = current;
+    bytes_in
 }
 
 pub(crate) fn folder_from_scope(
@@ -1798,5 +1809,27 @@ mod directory_forwarding_tests {
                 cursor: Some(vec![4, 2]),
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_metering_tests {
+    use super::*;
+
+    #[test]
+    fn batch_carries_the_measured_inbound_bytes() {
+        let event = batch(vec![7], bifrost_types::PageBoundary::Page, None, 23);
+        let SyncEvent::Batch(batch) = event else {
+            panic!("expected a batch")
+        };
+        assert_eq!(batch.bytes_in, 23);
+    }
+
+    #[test]
+    fn measured_byte_delta_advances_each_batch_boundary() {
+        let mut previous = 10;
+        assert_eq!(measured_bytes_delta(31, &mut previous), 21);
+        assert_eq!(previous, 31);
+        assert_eq!(measured_bytes_delta(47, &mut previous), 16);
     }
 }

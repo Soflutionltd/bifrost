@@ -662,7 +662,7 @@ pub(crate) fn encode_command(
             encode_simple(&mut w, tag, "NOTIFY NONE");
         }
     }
-    Ok(w.finish())
+    w.finish()
 }
 
 /// Encode `command` and append the whole of it, as the server would receive

@@ -1,5 +1,6 @@
 use bifrost_dav_core::{
-    MultiStatusSink, PropSet, ResponseParts, classify_207, commit_if_present, normalize_etag,
+    APPLE_CALENDAR_NAMESPACE, CALDAV_NAMESPACE, DAV_NAMESPACE, MultiStatusSink, PropSet,
+    ResponseParts, XmlName, classify_207, commit_if_present, normalize_etag,
     parse_collection_property, parse_multistatus, same_dav_url, trimmed,
 };
 pub(crate) use bifrost_dav_core::{extract_href_properties, extract_href_property};
@@ -324,8 +325,12 @@ impl PropSet for EventProps {
 
 /// Mark `<collection/>` inside a `<resourcetype>`, the guard both member lanes
 /// share.
-fn mark_collection(name: &str, stack: &[String], parts: &mut ResponseParts<EventProps>) {
-    if name == "collection" && stack.iter().any(|item| item == "resourcetype") {
+fn mark_collection(name: &XmlName, stack: &[XmlName], parts: &mut ResponseParts<EventProps>) {
+    if name.is(DAV_NAMESPACE, "collection")
+        && stack
+            .iter()
+            .any(|item| item.is(DAV_NAMESPACE, "resourcetype"))
+    {
         parts.marker_mut().is_collection = true;
     }
 }
@@ -338,15 +343,26 @@ struct CalendarCollectionSink {
 impl MultiStatusSink for CalendarCollectionSink {
     type Props = CalendarCollectionProps;
 
-    fn element(&mut self, name: &str, stack: &[String], parts: &mut ResponseParts<Self::Props>) {
-        if name == "calendar" && stack.iter().any(|item| item == "resourcetype") {
+    fn element(
+        &mut self,
+        name: &XmlName,
+        stack: &[XmlName],
+        parts: &mut ResponseParts<Self::Props>,
+    ) {
+        if name.is(CALDAV_NAMESPACE, "calendar")
+            && stack
+                .iter()
+                .any(|item| item.is(DAV_NAMESPACE, "resourcetype"))
+        {
             parts.marker_mut().is_calendar = true;
         }
-        if name == "privilege" {
+        if name.is(DAV_NAMESPACE, "privilege") {
             parts.marker_mut().privilege_seen = true;
         }
-        if (name == "write" || name == "write-content" || name == "all")
-            && stack.iter().any(|item| item == "privilege")
+        if (name.is(DAV_NAMESPACE, "write")
+            || name.is(DAV_NAMESPACE, "write-content")
+            || name.is(DAV_NAMESPACE, "all"))
+            && stack.iter().any(|item| item.is(DAV_NAMESPACE, "privilege"))
         {
             parts.marker_mut().write_seen = true;
         }
@@ -354,18 +370,23 @@ impl MultiStatusSink for CalendarCollectionSink {
 
     fn property(
         &mut self,
-        parent: Option<&str>,
-        name: &str,
+        parent: Option<&XmlName>,
+        name: &XmlName,
         text: &str,
         parts: &mut ResponseParts<Self::Props>,
     ) {
-        match (parent, name) {
-            (Some("prop"), "displayname") => parts.staged_mut().display_name = trimmed(text),
-            (Some("prop"), "calendar-color") => {
-                parts.staged_mut().color = trimmed(text).map(|value| value.trim().to_string());
-            }
-            (Some("prop"), "sync-token") => parts.staged_mut().sync_token = trimmed(text),
-            _ => {}
+        if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(DAV_NAMESPACE, "displayname")
+        {
+            parts.staged_mut().display_name = trimmed(text);
+        } else if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(APPLE_CALENDAR_NAMESPACE, "calendar-color")
+        {
+            parts.staged_mut().color = trimmed(text).map(|value| value.trim().to_string());
+        } else if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(DAV_NAMESPACE, "sync-token")
+        {
+            parts.staged_mut().sync_token = trimmed(text);
         }
     }
 
@@ -401,14 +422,19 @@ struct EventListingSink {
 impl MultiStatusSink for EventListingSink {
     type Props = EventProps;
 
-    fn element(&mut self, name: &str, stack: &[String], parts: &mut ResponseParts<Self::Props>) {
+    fn element(
+        &mut self,
+        name: &XmlName,
+        stack: &[XmlName],
+        parts: &mut ResponseParts<Self::Props>,
+    ) {
         mark_collection(name, stack, parts);
     }
 
     fn property(
         &mut self,
-        parent: Option<&str>,
-        name: &str,
+        parent: Option<&XmlName>,
+        name: &XmlName,
         text: &str,
         parts: &mut ResponseParts<Self::Props>,
     ) {
@@ -418,10 +444,14 @@ impl MultiStatusSink for EventListingSink {
         // same shape the `collection` marker is staged against - would
         // otherwise poison the snapshot etag with a stale value, and the
         // snapshot diff and the inventory fingerprint both read that etag.
-        match (parent, name) {
-            (Some("prop"), "getetag") => parts.staged_mut().etag = normalize_etag(text),
-            (Some("prop"), "getcontenttype") => parts.staged_mut().content_type = trimmed(text),
-            _ => {}
+        if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(DAV_NAMESPACE, "getetag")
+        {
+            parts.staged_mut().etag = normalize_etag(text);
+        } else if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(DAV_NAMESPACE, "getcontenttype")
+        {
+            parts.staged_mut().content_type = trimmed(text);
         }
     }
 
@@ -457,14 +487,19 @@ struct MultigetSink {
 impl MultiStatusSink for MultigetSink {
     type Props = EventProps;
 
-    fn element(&mut self, name: &str, stack: &[String], parts: &mut ResponseParts<Self::Props>) {
+    fn element(
+        &mut self,
+        name: &XmlName,
+        stack: &[XmlName],
+        parts: &mut ResponseParts<Self::Props>,
+    ) {
         mark_collection(name, stack, parts);
     }
 
     fn property(
         &mut self,
-        parent: Option<&str>,
-        name: &str,
+        parent: Option<&XmlName>,
+        name: &XmlName,
         text: &str,
         parts: &mut ResponseParts<Self::Props>,
     ) {
@@ -473,10 +508,14 @@ impl MultiStatusSink for MultigetSink {
         // response-level fields here instead made the result depend on
         // propstat order: data from a failed block could be adopted, and a
         // trailing non-2xx block could discard data a successful one supplied.
-        match (parent, name) {
-            (Some("prop"), "getetag") => parts.staged_mut().etag = normalize_etag(text),
-            (Some("prop"), "calendar-data") => parts.staged_mut().calendar_data = trimmed(text),
-            _ => {}
+        if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(DAV_NAMESPACE, "getetag")
+        {
+            parts.staged_mut().etag = normalize_etag(text);
+        } else if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(CALDAV_NAMESPACE, "calendar-data")
+        {
+            parts.staged_mut().calendar_data = trimmed(text);
         }
     }
 
@@ -528,20 +567,26 @@ impl MultiStatusSink for SyncReportSink {
 
     fn property(
         &mut self,
-        parent: Option<&str>,
-        name: &str,
+        parent: Option<&XmlName>,
+        name: &XmlName,
         text: &str,
         parts: &mut ResponseParts<Self::Props>,
     ) {
-        match (parent, name) {
-            (Some("prop"), "getetag") => parts.staged_mut().etag = normalize_etag(text),
-            (Some("prop"), "getcontenttype") => parts.staged_mut().content_type = trimmed(text),
-            _ => {}
+        if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(DAV_NAMESPACE, "getetag")
+        {
+            parts.staged_mut().etag = normalize_etag(text);
+        } else if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(DAV_NAMESPACE, "getcontenttype")
+        {
+            parts.staged_mut().content_type = trimmed(text);
         }
     }
 
-    fn document_property(&mut self, parent: Option<&str>, name: &str, text: &str) {
-        if matches!(parent, Some("multistatus")) && name == "sync-token" {
+    fn document_property(&mut self, parent: Option<&XmlName>, name: &XmlName, text: &str) {
+        if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "multistatus"))
+            && name.is(DAV_NAMESPACE, "sync-token")
+        {
             self.sync_token = trimmed(text);
         }
     }
@@ -675,6 +720,21 @@ mod tests {
                 can_edit: Some(true),
                 sync_token: None,
             }]
+        );
+    }
+
+    #[test]
+    fn a_foreign_calendar_marker_does_not_classify_a_collection() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:" xmlns:X="urn:vendor">
+          <D:response><D:href>/cal/not-a-calendar/</D:href>
+          <D:propstat><D:prop><D:resourcetype><D:collection/><X:calendar/></D:resourcetype>
+          </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+        </D:multistatus>"#;
+
+        assert!(
+            parse_calendar_collections(xml)
+                .expect("valid XML")
+                .is_empty()
         );
     }
 

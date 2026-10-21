@@ -213,7 +213,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     permit = scheduler.admit(
                         account_id.clone(),
                         control.priority_snapshot(),
-                        crate::scheduler::WorkKind::Sync,
+                        crate::scheduler::WorkKind::Backfill,
                     ) => match permit {
                         Ok(permit) => permit,
                         Err(error) => {

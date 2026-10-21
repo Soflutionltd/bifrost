@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::client::Resource;
 use crate::origin::AdmittedUrl;
-use crate::types::{CONTACT_SELECT, MESSAGE_SELECT, ODataCollection};
+use crate::types::{CONTACT_SELECT, ODataCollection};
 
 use super::GraphAccount;
 use super::cursor::{
@@ -17,10 +17,28 @@ use super::cursor::{
 };
 use super::graph_error::{GraphErrorContext, cursor_error_to_account_error};
 
-const EVENT_SELECT: &str = "\
-id,subject,bodyPreview,start,end,isAllDay,location,organizer,\
-attendees,webLink,iCalUId,categories,recurrence,showAs,\
-responseStatus,isCancelled,changeKey";
+const MESSAGE_SYNC_SELECT: &str = "\
+id,parentFolderId,isRead,flag,categories,changeKey,conversationId,\
+internetMessageHeaders,internetMessageId";
+
+// Microsoft documents that calendarView delta does not support `$select`,
+// and uses `Prefer: odata.maxpagesize={x}` for page size. Its event GET docs
+// define `Prefer: outlook.timezone` for response times. Keep the page size
+// and UTC preference on every page of both inventory and changes walks.
+// https://learn.microsoft.com/en-us/graph/delta-query-events
+// https://learn.microsoft.com/en-us/graph/api/event-get?view=graph-rest-1.0
+const EVENT_DELTA_PREFER: &str = "odata.maxpagesize=50, outlook.timezone=\"UTC\"";
+
+fn delta_prefer(scope: &CursorScope) -> Option<&'static str> {
+    matches!(
+        scope,
+        CursorScope::FolderType {
+            ty: ObjectType::Event | ObjectType::CalendarEvent,
+            ..
+        }
+    )
+    .then_some(EVENT_DELTA_PREFER)
+}
 
 pub(crate) fn inventory_stream(
     account: GraphAccount,
@@ -141,7 +159,13 @@ fn inventory_stream_from(
                 ));
                 return;
             }
-            let page: ODataCollection<Value> = match fetch_page(&client, &current_url).await {
+            let page: ODataCollection<Value> = match fetch_page(
+                &client,
+                &current_url,
+                delta_prefer(&scope),
+            )
+            .await
+            {
                 Ok(page) => page,
                 Err(error) => {
                     let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
@@ -317,8 +341,9 @@ fn inventory_stream_from(
 pub(crate) async fn fetch_delta_page(
     client: &crate::client::GraphClient,
     url: &AdmittedUrl,
+    scope: &CursorScope,
 ) -> Result<ODataCollection<Value>, crate::error::GraphError> {
-    fetch_page(client, url).await
+    fetch_page(client, url, delta_prefer(scope)).await
 }
 
 pub(crate) fn inventory_entry_from_value(
@@ -505,7 +530,7 @@ fn initial_delta_request(
             match ty {
                 ObjectType::Email => Ok((
                     format!(
-                        "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SELECT}&$top=50"
+                        "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SYNC_SELECT}&$top=50"
                     ),
                     None,
                 )),
@@ -515,7 +540,7 @@ fn initial_delta_request(
                     let end = format_calendar_timestamp(end_at);
                     Ok((
                         format!(
-                            "{prefix}/calendars/{encoded}/calendarView/delta?startDateTime={start}&endDateTime={end}&$select={EVENT_SELECT}"
+                            "{prefix}/calendars/{encoded}/calendarView/delta?startDateTime={start}&endDateTime={end}"
                         ),
                         Some(end_at.as_second()),
                     ))
@@ -625,8 +650,12 @@ fn event_aliases(a: &CursorScope, b: &CursorScope) -> bool {
 async fn fetch_page(
     client: &crate::client::GraphClient,
     url: &AdmittedUrl,
+    prefer: Option<&str>,
 ) -> Result<ODataCollection<Value>, crate::error::GraphError> {
-    client.get(Resource::Outlook, url).await
+    match prefer {
+        Some(prefer) => client.get_prefer(Resource::Outlook, url, prefer).await,
+        None => client.get(Resource::Outlook, url).await,
+    }
 }
 
 fn internet_header(value: &Value, name: &str) -> Option<String> {
@@ -1135,6 +1164,12 @@ mod tests {
         let (url, end) =
             initial_delta_request(&account, &scope, now).expect("event scope is supported");
         assert!(url.starts_with("/me/calendars/calendar/calendarView/delta?"));
+        assert!(url.contains("startDateTime="), "{url}");
+        assert!(url.contains("endDateTime="), "{url}");
+        assert!(
+            !url.contains("$select"),
+            "event delta does not support $select: {url}"
+        );
         assert_eq!(
             end,
             Some(
@@ -1144,6 +1179,47 @@ mod tests {
             ),
             "the stored calendar horizon must match the URL's future end bound"
         );
+    }
+
+    #[tokio::test]
+    async fn event_inventory_sends_documented_preferences_on_each_delta_page() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [{ "id": "event-1", "changeKey": "ck1" }],
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/next?page=2"
+                }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [],
+                    "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta?token=done"
+                }),
+            ),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let scope = CursorScope::FolderType {
+            folder: FolderId("calendar".to_string()),
+            ty: ObjectType::Event,
+        };
+
+        let events: Vec<_> = inventory_stream(account, scope).collect().await;
+        assert!(matches!(
+            events.last(),
+            Some(bifrost_types::InventoryEvent::Done(_))
+        ));
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].url.contains("$select"), "{}", requests[0].url);
+        for request in requests {
+            assert_eq!(
+                request.prefer.as_deref(),
+                Some("odata.maxpagesize=50, outlook.timezone=\"UTC\"")
+            );
+        }
     }
 
     #[test]
@@ -1735,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn the_message_select_carries_every_field_the_projection_reads() {
+    fn the_message_inventory_select_is_narrow_and_carries_every_field_it_reads() {
         let account = test_account();
         let scope = CursorScope::FolderType {
             folder: FolderId("inbox".to_string()),
@@ -1756,6 +1832,12 @@ mod tests {
             "internetMessageId",
         ] {
             assert!(url.contains(field), "{field} missing from {url}");
+        }
+        for unused in ["body", "bodyPreview", "uniqueBody", "toRecipients"] {
+            assert!(
+                !url.contains(unused),
+                "{unused} unnecessarily selected: {url}"
+            );
         }
         assert!(url.contains("$top=50"));
         // `changeKey` is the documented concurrency token. The OData etag

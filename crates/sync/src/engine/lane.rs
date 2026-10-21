@@ -187,7 +187,7 @@ impl BackfillAdmission {
             permit = self.scheduler.admit(
                 self.account_id.clone(),
                 self.control.priority_snapshot(),
-                WorkKind::Sync,
+                WorkKind::Backfill,
             ) => permit,
         };
         match admitted {

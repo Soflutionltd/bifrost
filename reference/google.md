@@ -856,12 +856,16 @@ still exposes the boundary and checkpoint. A message-level
 `NotFound(Message)` during hydration is discharged as the ordinary list/get
 deletion race - the id came from this walk's own listing and the cursor is
 anchored before the walk, so absence is the correct inventory state. Every
-OTHER classified hydration failure becomes an
+remaining object-attributable permanent hydration failure becomes an
 `InventoryObligation::Object` (key `gmail:message:<id>`, stable across
 walks so the same unreadable message re-raises the same key; no
 provider-native repair token, since a Gmail message is re-readable from
-its id alone) and the walk CONTINUES. Terminating instead used to discard
-every page already emitted for one unreadable object, then hit the same
+its id alone) and the walk continues. A failure whose `RecoveryClass` requires
+stream-level action, including retry, reconciliation, engine recovery, auth
+loss, or account authorization repair, terminates the walk and discards the
+unfinished page. Inventory hydration uses the same recovery predicate as the
+mutation lane. Terminating on an object-attributable permanent failure would
+discard every page already emitted for one unreadable object, then hit the same
 object on the retry, forever. Each emitted batch and the terminal
 completion carry an `InventoryCoverageReport` over
 `CoverageDomain::full(scope)`: complete while no obligation exists,
@@ -920,8 +924,10 @@ holds. Waiting and in-flight reads select against the account shutdown token.
 and emits `AccountStream<SyncEvent<ItemOutcome<HydratedObject>>>`.
 Per-item hydration outcomes flow as `ItemOutcome::Succeeded` for a
 hydrated message and `ItemOutcome::Failed(BatchFailure)` carrying
-the classified `AccountError` for an id that Gmail refused or that
-parsed badly. A single bad id no longer poisons the stream. The
+classified object-attributable permanent `AccountError`. A recovery class
+that requires stream-level action terminates the stream instead of blaming
+one object; resolved sibling outcomes are emitted before that terminator.
+A single object-attributable failure no longer poisons the stream. The
 boundary a hydration batch carries is derived only from what draining
 the id stream already revealed: a batch cut short because the id stream
 closed is `PageBoundary::Final`, every other batch is `PageBoundary::Page`,
@@ -1752,10 +1758,11 @@ and each is also stated at the code it describes.
 - **Inventory has no per-item failed lane; unreadable objects travel as
   coverage debt instead.** `InventoryEvent` carries no `ItemOutcome` wrapper.
   The list/get deletion race (`NotFound(Message)`) is discharged outright, and
-  every other classified hydration failure is recorded as an
+  object-attributable permanent hydration failures are recorded as an
   `InventoryObligation` on the batch and completion coverage reports (see the
-  inventory section above) and repaid through `repair_inventory` - not
-  surfaced per item, and no longer a reason to terminate the walk.
+  inventory section above) and repaid through `repair_inventory`. A recovery
+  class requiring stream-level action terminates the walk and does not claim
+  coverage for the unfinished page.
 
 ## Unsupported error construction
 

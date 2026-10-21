@@ -53,7 +53,7 @@ arrived with cursor envelope v2, which forces a reseed.
 Crate root: `paging.rs` - `PageWalk`, the shared repeated-link and page-budget
 bound used by Graph collection traversals, plus the search cursor codec that
 resumes within an over-delivered page (see "Bounded `nextLink` traversal").
-- `inventory.rs` - initial `delta?$select=...` walk, page
+- `inventory.rs` - initial delta walk with per-type projections, page
   pagination, inventory entry projection from Graph JSON.
 - `changes.rs` - delta-token-driven change stream over the
   cached `@odata.deltaLink`.
@@ -1103,14 +1103,28 @@ Supported scopes:
 
 - `FolderType { folder, Email }` -> initial URL
   `/{prefix}/mailFolders/{folder}/messages/delta?$select=...&$top=50`
-  (`MESSAGE_SELECT`). `inventory_entry_from_value` pulls id, conversationId
+  (`MESSAGE_SYNC_SELECT` for a fresh inventory). It selects only id,
+  parentFolderId, read/flag state, categories, changeKey, conversationId,
+  internetMessageHeaders and internetMessageId. The broader `MESSAGE_SELECT`
+  remains for typed message hydration. Microsoft documents `$select` for
+  message delta and says initial query options are encoded in returned links,
+  so an already persisted delta link keeps the projection it was minted with
+  until that cursor is reseeded ([message delta documentation](https://learn.microsoft.com/en-us/graph/delta-query-messages)).
+  `inventory_entry_from_value`
+  pulls id, conversationId
   (thread), change-key (etag), Message-ID / References / In-Reply-To from
   `internetMessageHeaders`, and a flags hash from `isRead` / `flag.flagStatus`
   / `categories`. `size` is `None` on this projection.
 - `FolderType { folder, Event | CalendarEvent }` -> calendarView delta over
-  a [-90d, +365d] window (`EVENT_SELECT`); its cursor records the end and
-  is reseeded with a new sliding window ninety days before that end;
-  thread/message-id fields empty.
+  a [-90d, +365d] window; its cursor records the end and is reseeded with a
+  new sliding window ninety days before that end; thread/message-id fields
+  empty. The initial URL has no `$select`, because Microsoft's
+  [calendar event delta documentation](https://learn.microsoft.com/en-us/graph/delta-query-events)
+  says that parameter is unsupported and documents the `odata.maxpagesize`
+  preference. Inventory and changes requests send
+  `Prefer: odata.maxpagesize=50, outlook.timezone="UTC"` on every page; the
+  [event GET documentation](https://learn.microsoft.com/en-us/graph/api/event-get?view=graph-rest-1.0)
+  defines the UTC timezone preference.
 - `FolderType { folder, Contact }` -> initial URL
   `/{prefix}/contactFolders/{folder}/contacts/delta?$select=...&$top=250`
   (`CONTACT_SELECT`).
@@ -1603,6 +1617,11 @@ resource covers exactly one scope, which is every ordinary case now that each
 resource string is built from one folder or calendar id. `subscribe_graph` used
 to discard the scopes it grouped, leaving the engine with a terminal push
 failure it could not attribute to anything.
+
+Create and renewal requests default to 10,080 minutes and clamp explicit
+requests at that value. These are basic Outlook message, event and contact
+subscriptions without resource data, matching the seven-day maximum in the
+[Microsoft subscription resource documentation](https://learn.microsoft.com/en-us/graph/api/resources/subscription?view=graph-rest-1.0).
 
 The health latch those events are edge-triggered off is the ACCOUNT's
 (`GraphAccount::push_disconnected`), not the worker's local flag, and

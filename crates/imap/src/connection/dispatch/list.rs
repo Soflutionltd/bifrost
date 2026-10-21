@@ -1,5 +1,4 @@
 use crate::connection::NotifyFlags;
-use crate::connection::helpers::inbox_eq;
 use crate::error::Error;
 use crate::types::response::{TaggedResponse, UntaggedResponse};
 use crate::types::validated::MailboxName;
@@ -290,13 +289,13 @@ impl Consumer for ListStatusConsumer {
                 self.results.push((info, None));
             }
             UntaggedResponse::MailboxStatus { mailbox, items } => {
-                // Positional correlation: pair with the first unpaired
-                // LIST for this mailbox. Use `inbox_eq` for
-                // case-insensitive INBOX matching (RFC 3501 Section5.1).
+                // Pair with the first unpaired LIST for this mailbox address.
+                // RFC 5819 provides no occurrence id when a name is listed
+                // more than once, so exact-identity duplicates pair in order.
                 if let Some((_, status)) = self
                     .results
                     .iter_mut()
-                    .find(|(mb, s)| s.is_none() && inbox_eq(mb.name.as_str(), mailbox.as_str()))
+                    .find(|(mb, s)| s.is_none() && mb.name.matches_mailbox(&mailbox))
                 {
                     *status = Some(items);
                 } else {
@@ -336,7 +335,7 @@ impl Consumer for ListStatusConsumer {
         for (decoded, items) in self.pending_status {
             if let Some((_, status)) = results
                 .iter_mut()
-                .find(|(mb, s)| s.is_none() && inbox_eq(mb.name.as_str(), decoded.as_str()))
+                .find(|(mb, s)| s.is_none() && mb.name.matches_mailbox(&decoded))
             {
                 *status = Some(items);
             }
@@ -491,5 +490,100 @@ impl Consumer for StatusConsumer {
             },
             reclassified,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connection::dispatch::ConsumerContext;
+    use crate::types::response::{StatusKind, TaggedResponse};
+
+    fn tagged_ok() -> TaggedResponse {
+        TaggedResponse {
+            tag: "A001".into(),
+            status: StatusKind::Ok,
+            code: None,
+            text: String::new(),
+        }
+    }
+
+    #[test]
+    fn list_status_pairs_by_wire_identity_and_keeps_duplicate_order() {
+        let canonical = MailboxName::new("a").expect("valid mailbox");
+        let noncanonical = MailboxName::from_wire("a".into(), b"&AGE-", false);
+        let mut consumer = ListStatusConsumer::new();
+        let context = ConsumerContext {
+            capabilities: &[],
+            enabled: &[],
+            command_target: None,
+            command_tag: "A001",
+        };
+
+        for name in [noncanonical.clone(), canonical.clone(), canonical.clone()] {
+            consumer.on_response(
+                UntaggedResponse::List(MailboxInfo {
+                    name,
+                    ..MailboxInfo::default()
+                }),
+                NotifyFlags::default(),
+                &context,
+            );
+        }
+        for messages in [1, 2] {
+            consumer.on_response(
+                UntaggedResponse::MailboxStatus {
+                    mailbox: canonical.clone(),
+                    items: vec![StatusItem::Messages(messages)],
+                },
+                NotifyFlags::default(),
+                &context,
+            );
+        }
+
+        let finalized = Box::new(consumer).finalize(tagged_ok(), &context);
+        let results = finalized.output.expect("LIST-STATUS succeeds");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0.name, noncanonical);
+        assert!(results[0].1.is_empty());
+        assert_eq!(results[1].1, vec![StatusItem::Messages(1)]);
+        assert_eq!(results[2].1, vec![StatusItem::Messages(2)]);
+    }
+
+    #[test]
+    fn list_status_pairs_pending_status_by_wire_identity() {
+        let canonical = MailboxName::new("a").expect("valid mailbox");
+        let noncanonical = MailboxName::from_wire("a".into(), b"&AGE-", false);
+        let mut consumer = ListStatusConsumer::new();
+        let context = ConsumerContext {
+            capabilities: &[],
+            enabled: &[],
+            command_target: None,
+            command_tag: "A001",
+        };
+
+        consumer.on_response(
+            UntaggedResponse::MailboxStatus {
+                mailbox: canonical.clone(),
+                items: vec![StatusItem::Messages(7)],
+            },
+            NotifyFlags::default(),
+            &context,
+        );
+        for name in [noncanonical.clone(), canonical.clone()] {
+            consumer.on_response(
+                UntaggedResponse::List(MailboxInfo {
+                    name,
+                    ..MailboxInfo::default()
+                }),
+                NotifyFlags::default(),
+                &context,
+            );
+        }
+
+        let finalized = Box::new(consumer).finalize(tagged_ok(), &context);
+        let results = finalized.output.expect("LIST-STATUS succeeds");
+        assert!(results[0].1.is_empty());
+        assert_eq!(results[1].1, vec![StatusItem::Messages(7)]);
     }
 }

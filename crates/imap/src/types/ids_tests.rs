@@ -34,16 +34,9 @@ fn uid_set_from_ranges_emits_the_wire_form_directly() {
     assert_eq!(set.to_string(), "1:3,7,9:10");
 
     assert!(UidSet::from_ranges(&[]).is_none());
-    // 0 is not a legal UID. `UidRange::single` refuses to build one, so the
-    // skip in `from_ranges` only ever sees a hand-built struct - keep it,
-    // but the reachable contract is "empty in, None out".
-    assert!(
-        UidSet::from_ranges(&[UidRange {
-            start: 0,
-            end: None
-        }])
-        .is_none()
-    );
+    // 0 is not a legal UID. Default remains an invalid internal value, and
+    // the reachable contract is "empty in, None out".
+    assert!(UidSet::from_ranges(&[UidRange::default()]).is_none());
     // A degenerate range (end == start) is a single UID, not "4:4".
     assert_eq!(
         UidSet::from_ranges(&[UidRange::range(4, 4)])

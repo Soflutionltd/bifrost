@@ -907,7 +907,18 @@ mod tests {
     #[test]
     fn verify_server_final_surfaces_server_error_as_auth_failed() {
         let err = verify_server_final("e=invalid-proof", &[0x00]).unwrap_err();
+        assert_eq!(err.scram_server_error(), Some("invalid-proof"));
         assert!(matches!(err, SaslError::AuthFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn server_error_token_preserves_policy_and_unknown_values() {
+        for token in ["channel-binding-not-supported", "unknown-extension-error"] {
+            let err = verify_server_final(&format!("e={token}"), &[]).unwrap_err();
+            assert_eq!(err.scram_server_error(), Some(token));
+        }
+        let malformed = verify_server_final("not-a-server-final", &[]).unwrap_err();
+        assert_eq!(malformed.scram_server_error(), None);
     }
 
     #[test]

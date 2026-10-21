@@ -40,29 +40,47 @@ impl Response {
     /// `maxCallsInRequest` entries, so the shift is not worth an ordering
     /// hazard.
     ///
-    /// Multiplicity is deliberately not modelled beyond this: a `get_all`
-    /// returning every response for a handle was considered and not built,
-    /// because no method this crate wires produces more than one response
-    /// per call id, and an accessor nothing calls is dead surface. The
-    /// generic envelope only has to not scramble.
+    /// The API consumes one response at a time rather than returning a
+    /// collection. The in-crate multi-response operation is RFC 8621's
+    /// implicit `Email/set` after `EmailSubmission/set`; its caller reads
+    /// that response with `get_method` after extracting the explicit result.
+    /// A general `get_all` is not needed by current call sites.
     pub(crate) fn get<M: JmapMethod>(
         &mut self,
         handle: &CallHandle<M>,
     ) -> crate::Result<M::Response> {
+        self.get_expected::<M>(&handle.call_id, handle.method_name)
+    }
+
+    /// Extract a response for a method whose call id is known but which
+    /// was not explicitly added to the request. RFC 8621's implicit
+    /// `Email/set` response uses the `EmailSubmission/set` call id.
+    pub(crate) fn get_method<M: JmapMethod>(
+        &mut self,
+        call_id: &str,
+    ) -> crate::Result<M::Response> {
+        self.get_expected::<M>(call_id, M::NAME)
+    }
+
+    fn get_expected<M: JmapMethod>(
+        &mut self,
+        call_id: &str,
+        expected_method: &'static str,
+    ) -> crate::Result<M::Response> {
         let pos = self
             .raw
             .iter()
-            .position(|(_, _, id)| id == &handle.call_id)
-            .ok_or_else(|| crate::Error::CallNotFound(handle.call_id.clone()))?;
+            .position(|(_, _, id)| id == call_id)
+            .ok_or_else(|| crate::Error::CallNotFound(call_id.to_string()))?;
 
         let (method_name, result, call_id) = self.raw.remove(pos);
 
         match result {
             RawCallResult::Success(raw) => {
-                if method_name != handle.method_name {
+                if method_name != expected_method {
                     return Err(crate::Error::UnexpectedMethodResponse {
                         call_id,
-                        expected: handle.method_name,
+                        expected: expected_method,
                         actual: method_name,
                     });
                 }

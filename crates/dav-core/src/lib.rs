@@ -36,7 +36,9 @@ pub mod test_support;
 mod transport;
 mod xml;
 
-pub use dispatch::{DavCredentials, DavDispatch, DavRequestGuard, delete_target_already_gone};
+pub use dispatch::{
+    DavByteTally, DavCredentials, DavDispatch, DavRequestGuard, delete_target_already_gone,
+};
 
 pub use error::{
     DavProtocol, filter_unsupported, local_error, missing_field_error, not_found_error,
@@ -59,6 +61,7 @@ pub use transport::{
     DAV_CLIENT_TIMEOUT, DavBody, DavRequest, DavResponse, origin_is_secure, settle_body, url_origin,
 };
 pub use xml::{
-    DavHrefKey, append_path, dav_href_key, escape_xml, local_name, normalize_etag, push_text,
-    resolve_href, same_dav_url, trimmed,
+    APPLE_CALENDAR_NAMESPACE, CALDAV_NAMESPACE, CALENDAR_SERVER_NAMESPACE, CARDDAV_NAMESPACE,
+    DAV_NAMESPACE, DavHrefKey, XmlName, append_path, dav_href_key, escape_xml, local_name,
+    normalize_etag, push_text, resolve_href, same_dav_url, trimmed,
 };

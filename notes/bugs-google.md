@@ -13,15 +13,15 @@
    and they are never deduplicated through git history. Carry the context
    inline instead.
 
-Filed from the October 2026 defect hunt: the google scope, plus the Gmail
-per-scope push finding from the types adoption scope. Severity labels are the
-hunter's. Coverage note: `cloud.rs`, `client.rs` (quota and redirect plumbing)
-and most of `calendar.rs` got only a light read, so a clean result there means
-little. Gmail's read-back of trashed and partial-flag outcomes is SYNC-008;
-lifecycle and renewer recovery triage is SHARED-012 / SHARED-013; the private
-address parser is SHARED-004; the Retry-After parser copy is SHARED-006.
+Filed from the October 2026 defect hunt: the google scope. Coverage note:
+`cloud.rs`, `client.rs` (quota and redirect plumbing) and most of `calendar.rs`
+got only a light read, so a clean result there means little.
 
 ## GOOG-027 - The error model has no typed continuation for a failure after a committed first leg
+
+**Needs a technical implementation specification** (owner, 2026-10-21): too
+consequential to resolve by ruling. Specify together with the JMAP PIM send
+path compensation proposal (JMAP-034), which answers the same question.
 
 Needs a ruling. A calendar update that moves an event and then fails its
 destination PATCH now keeps the original recovery class and carries diagnostic

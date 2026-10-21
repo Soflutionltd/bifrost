@@ -163,6 +163,8 @@ pub(super) struct CompressedStream {
     pub(super) raw_read_buf: BytesMut,
     /// Scratch buffer used as destination during inflate operations.
     inflate_buf: Vec<u8>,
+    /// Scratch buffer reused for both compression and SyncFlush output.
+    deflate_buf: Vec<u8>,
 }
 
 /// Initial size of the raw-read buffer for compressed streams.
@@ -184,6 +186,7 @@ impl CompressedStream {
             compress: Compress::new(flate2::Compression::default(), false),
             raw_read_buf: BytesMut::with_capacity(COMPRESSED_RAW_BUF_SIZE),
             inflate_buf: vec![0u8; INFLATE_BUF_SIZE],
+            deflate_buf: vec![0u8; DEFLATE_BUF_SIZE],
         }
     }
 
@@ -257,7 +260,6 @@ impl CompressedStream {
     // is bounded by the buffer size (at most DEFLATE_BUF_SIZE = 16 KiB).
     #[allow(clippy::cast_possible_truncation)]
     async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
-        let mut deflate_buf = vec![0u8; DEFLATE_BUF_SIZE];
         let mut input_offset = 0;
 
         // Compress the input data in chunks.
@@ -266,7 +268,11 @@ impl CompressedStream {
             let before_out = self.compress.total_out();
 
             self.compress
-                .compress(&data[input_offset..], &mut deflate_buf, FlushCompress::None)
+                .compress(
+                    &data[input_offset..],
+                    &mut self.deflate_buf,
+                    FlushCompress::None,
+                )
                 .map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -282,7 +288,7 @@ impl CompressedStream {
             input_offset += consumed;
 
             if produced > 0 {
-                self.inner.write_all(&deflate_buf[..produced]).await?;
+                self.inner.write_all(&self.deflate_buf[..produced]).await?;
             }
         }
 
@@ -297,7 +303,7 @@ impl CompressedStream {
             let before_out = self.compress.total_out();
 
             self.compress
-                .compress(&[], &mut deflate_buf, flush)
+                .compress(&[], &mut self.deflate_buf, flush)
                 .map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -308,7 +314,7 @@ impl CompressedStream {
             let produced = (self.compress.total_out() - before_out) as usize;
 
             if produced > 0 {
-                self.inner.write_all(&deflate_buf[..produced]).await?;
+                self.inner.write_all(&self.deflate_buf[..produced]).await?;
             }
 
             if produced == 0 {

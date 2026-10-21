@@ -234,13 +234,7 @@ fn search_consumer_keeps_the_solicited_reply_when_uid_expansion_is_incomplete() 
     let ctx = default_ctx();
     consumer.on_response(UntaggedResponse::Exists(1), NotifyFlags::default(), &ctx);
     consumer.on_response(
-        esearch_all(
-            Some("A001"),
-            vec![UidRange {
-                start: 1,
-                end: Some(3_000_000),
-            }],
-        ),
+        esearch_all(Some("A001"), vec![UidRange::range(1, 3_000_000)]),
         NotifyFlags::default(),
         &ctx,
     );
@@ -297,13 +291,13 @@ fn search_consumer_rejects_a_bare_star_and_counts_overlap_once() {
 
     let mut consumer = SearchConsumer::new();
     consumer.on_response(
-        // `ALL *` - the parser maps a standalone `*` to start = u32::MAX.
+        // `ALL *` is kept distinct from the numeric UID maximum.
         esearch_all(
             Some("A001"),
-            vec![UidRange {
-                start: u32::MAX,
-                end: None,
-            }],
+            vec![UidRange::from_sequence_bounds(
+                crate::types::SeqBound::Star,
+                None,
+            )],
         ),
         NotifyFlags::default(),
         &ctx,
@@ -320,16 +314,7 @@ fn search_consumer_rejects_a_bare_star_and_counts_overlap_once() {
     consumer.on_response(
         esearch_all(
             Some("A001"),
-            vec![
-                UidRange {
-                    start: 1,
-                    end: Some(600_000),
-                },
-                UidRange {
-                    start: 1,
-                    end: Some(600_000),
-                },
-            ],
+            vec![UidRange::range(1, 600_000), UidRange::range(1, 600_000)],
         ),
         NotifyFlags::default(),
         &ctx,

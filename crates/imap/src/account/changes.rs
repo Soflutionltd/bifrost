@@ -263,6 +263,7 @@ async fn run_qresync(
         return Ok(());
     };
     let mut conn = account.checkout_for_folder(&folder).await?;
+    let mut previous_bytes_in = conn.connection().bytes_in();
     let selected = match account
         .select_folder(&mut conn, &folder, Some(&cursor), true)
         .await
@@ -311,8 +312,16 @@ async fn run_qresync(
             "selected mailbox has no persistent mod-sequences",
         )
         .await?;
-        return run_basic_from_selected(account, folder, known_uids, selected.mailbox, conn, tx)
-            .await;
+        return run_basic_from_selected(
+            account,
+            folder,
+            known_uids,
+            selected.mailbox,
+            conn,
+            tx,
+            &mut previous_bytes_in,
+        )
+        .await;
     }
     validate_modseq_not_reset(&folder, modseq, selected.mailbox.highest_mod_seq)?;
     // The SELECT did not use QRESYNC: the account policy was withdrawn
@@ -342,6 +351,7 @@ async fn run_qresync(
             },
             conn,
             tx,
+            &mut previous_bytes_in,
         )
         .await;
     }
@@ -359,7 +369,7 @@ async fn run_qresync(
                 changes.push(removed_change(&folder, uidvalidity, uid));
             }
             if changes.len() >= BATCH_ITEMS {
-                flush_page(&tx, &mut changes).await?;
+                flush_page(&tx, &mut changes, conn.connection(), &mut previous_bytes_in).await?;
             }
         }
     }
@@ -379,7 +389,7 @@ async fn run_qresync(
             &mut changes,
         );
         if changes.len() >= BATCH_ITEMS {
-            flush_page(&tx, &mut changes).await?;
+            flush_page(&tx, &mut changes, conn.connection(), &mut previous_bytes_in).await?;
         }
     }
     // With known UIDs supplied, SELECT need only report changes to that
@@ -391,12 +401,12 @@ async fn run_qresync(
         let diff = live_uids.diff(&current);
         for uid in diff.added {
             changes.push(added_change(&folder, uidvalidity, uid));
-            flush_page(&tx, &mut changes).await?;
+            flush_page(&tx, &mut changes, conn.connection(), &mut previous_bytes_in).await?;
         }
         for uid in diff.removed {
             account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
             changes.push(removed_change(&folder, uidvalidity, uid));
-            flush_page(&tx, &mut changes).await?;
+            flush_page(&tx, &mut changes, conn.connection(), &mut previous_bytes_in).await?;
         }
         current
     } else {
@@ -406,7 +416,8 @@ async fn run_qresync(
     // eligible for the next poll. A failed SEARCH never advances the cursor.
     warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.uid_count()).await?;
     let next = account.cursor_from_select(&selected.mailbox, Some(live_set))?;
-    finish_changes(account, folder, next, changes, tx).await
+    let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
+    finish_changes(account, folder, next, changes, tx, bytes_in).await
 }
 
 async fn run_condstore(
@@ -432,6 +443,7 @@ async fn run_condstore_with_baseline(
         return Ok(());
     };
     let mut conn = account.checkout_for_folder(&folder).await?;
+    let mut previous_bytes_in = conn.connection().bytes_in();
     let selected = account
         .select_folder(&mut conn, &folder, Some(&cursor), true)
         .await
@@ -449,8 +461,16 @@ async fn run_condstore_with_baseline(
             "selected mailbox has no persistent mod-sequences",
         )
         .await?;
-        return run_basic_from_selected(account, folder, known_uids, selected.mailbox, conn, tx)
-            .await;
+        return run_basic_from_selected(
+            account,
+            folder,
+            known_uids,
+            selected.mailbox,
+            conn,
+            tx,
+            &mut previous_bytes_in,
+        )
+        .await;
     }
     validate_modseq_not_reset(&folder, modseq, selected.mailbox.highest_mod_seq)?;
     run_condstore_from_selected(
@@ -464,6 +484,7 @@ async fn run_condstore_with_baseline(
         },
         conn,
         tx,
+        &mut previous_bytes_in,
     )
     .await
 }
@@ -499,6 +520,7 @@ async fn run_condstore_from_selected(
     baseline: SelectedBaseline,
     conn: super::PooledConn,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
+    previous_bytes_in: &mut u64,
 ) -> Result<(), ChangeError> {
     let SelectedBaseline {
         uidvalidity,
@@ -541,7 +563,7 @@ async fn run_condstore_from_selected(
                     // diff below owns additions.
                     if known_uids.contains(uid) {
                         changes.push(updated_change(&folder, uidvalidity, uid));
-                        flush_page(&tx, &mut changes).await?;
+                        flush_page(&tx, &mut changes, conn.connection(), previous_bytes_in).await?;
                     }
                 }
             }
@@ -552,15 +574,16 @@ async fn run_condstore_from_selected(
     let diff = known_uids.diff(&live_set);
     for uid in diff.added {
         changes.push(added_change(&folder, uidvalidity, uid));
-        flush_page(&tx, &mut changes).await?;
+        flush_page(&tx, &mut changes, conn.connection(), previous_bytes_in).await?;
     }
     for uid in diff.removed {
         account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
         changes.push(removed_change(&folder, uidvalidity, uid));
-        flush_page(&tx, &mut changes).await?;
+        flush_page(&tx, &mut changes, conn.connection(), previous_bytes_in).await?;
     }
     let next = account.cursor_from_select(&selected, Some(live_set))?;
-    finish_changes(account, folder, next, changes, tx).await
+    let bytes_in = super::measured_bytes_in(conn.connection(), previous_bytes_in);
+    finish_changes(account, folder, next, changes, tx, bytes_in).await
 }
 
 async fn run_basic(
@@ -575,6 +598,7 @@ async fn run_basic(
         _ => 0,
     };
     let mut conn = account.checkout_for_folder(&folder).await?;
+    let mut previous_bytes_in = conn.connection().bytes_in();
     let selected = account
         .select_folder(&mut conn, &folder, Some(&cursor), true)
         .await
@@ -603,25 +627,26 @@ async fn run_basic(
                 basic_updated_change(&folder, uidvalidity, uid, &known_uids, &live_set)?
             {
                 changes.push(change);
-                flush_page(&tx, &mut changes).await?;
+                flush_page(&tx, &mut changes, conn.connection(), &mut previous_bytes_in).await?;
             }
         }
     }
     for uid in diff.added {
         changes.push(added_change(&folder, uidvalidity, uid));
-        flush_page(&tx, &mut changes).await?;
+        flush_page(&tx, &mut changes, conn.connection(), &mut previous_bytes_in).await?;
     }
     for uid in diff.removed {
         account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
         changes.push(removed_change(&folder, uidvalidity, uid));
-        flush_page(&tx, &mut changes).await?;
+        flush_page(&tx, &mut changes, conn.connection(), &mut previous_bytes_in).await?;
     }
     let next = FolderCursor::Basic {
         uidvalidity,
         uidnext: selected.mailbox.uid_next.unwrap_or_default(),
         known_uids: live_set,
     };
-    finish_changes(account, folder, next, changes, tx).await
+    let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
+    finish_changes(account, folder, next, changes, tx, bytes_in).await
 }
 
 async fn run_basic_from_selected(
@@ -631,6 +656,7 @@ async fn run_basic_from_selected(
     selected: crate::types::SelectedMailbox,
     conn: super::PooledConn,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
+    previous_bytes_in: &mut u64,
 ) -> Result<(), ChangeError> {
     let uidvalidity = selected_uidvalidity(&selected)?;
     let live = search_all(&account, conn.connection()).await?;
@@ -649,25 +675,26 @@ async fn run_basic_from_selected(
                 basic_updated_change(&folder, uidvalidity, uid, &known_uids, &live_set)?
             {
                 changes.push(change);
-                flush_page(&tx, &mut changes).await?;
+                flush_page(&tx, &mut changes, conn.connection(), previous_bytes_in).await?;
             }
         }
     }
     for uid in diff.added {
         changes.push(added_change(&folder, uidvalidity, uid));
-        flush_page(&tx, &mut changes).await?;
+        flush_page(&tx, &mut changes, conn.connection(), previous_bytes_in).await?;
     }
     for uid in diff.removed {
         account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
         changes.push(removed_change(&folder, uidvalidity, uid));
-        flush_page(&tx, &mut changes).await?;
+        flush_page(&tx, &mut changes, conn.connection(), previous_bytes_in).await?;
     }
     let next = FolderCursor::Basic {
         uidvalidity,
         uidnext: selected.uid_next.unwrap_or_default(),
         known_uids: live_set,
     };
-    finish_changes(account, folder, next, changes, tx).await
+    let bytes_in = super::measured_bytes_in(conn.connection(), previous_bytes_in);
+    finish_changes(account, folder, next, changes, tx, bytes_in).await
 }
 
 async fn search_all(
@@ -689,15 +716,21 @@ async fn finish_changes(
     cursor: FolderCursor,
     changes: Vec<Change>,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
+    bytes_in: u64,
 ) -> Result<(), ChangeError> {
     let checkpoint = Some(Checkpoint::Change(encode_cursor(
         folder_scope(&folder),
         &cursor,
     )));
     if !changes.is_empty() {
-        tx.send(batch(changes, PageBoundary::Final, checkpoint.clone()))
-            .await
-            .map_err(|_| ChangeError::ChannelDropped)?;
+        tx.send(batch(
+            changes,
+            PageBoundary::Final,
+            checkpoint.clone(),
+            bytes_in,
+        ))
+        .await
+        .map_err(|_| ChangeError::ChannelDropped)?;
     }
     tx.send(SyncEvent::Done(checkpoint))
         .await
@@ -723,13 +756,21 @@ async fn finish_changes(
 async fn flush_page(
     tx: &tokio::sync::mpsc::Sender<SyncEvent<Change>>,
     changes: &mut Vec<Change>,
+    connection: &crate::ImapConnection,
+    previous_bytes_in: &mut u64,
 ) -> Result<(), ChangeError> {
     if changes.len() < BATCH_ITEMS {
         return Ok(());
     }
-    tx.send(batch(std::mem::take(changes), PageBoundary::Page, None))
-        .await
-        .map_err(|_| ChangeError::ChannelDropped)
+    let bytes_in = super::measured_bytes_in(connection, previous_bytes_in);
+    tx.send(batch(
+        std::mem::take(changes),
+        PageBoundary::Page,
+        None,
+        bytes_in,
+    ))
+    .await
+    .map_err(|_| ChangeError::ChannelDropped)
 }
 
 /// A non-conformant server may name the same UID in both VANISHED and FETCH.
@@ -999,6 +1040,7 @@ mod tests {
             cursor,
             vec![added_change(&folder, 7, 1)],
             tx,
+            0,
         ));
 
         let final_page = rx.recv().await.expect("final page queued");

@@ -14,6 +14,7 @@ use crate::mailbox::{Mailbox, MailboxChanges};
 use super::capabilities::CoreLimits;
 use super::state::{self, JmapScopeRepr};
 use super::state_cache::{self, StateMap};
+use super::state_walk::StateWalk;
 
 type MailAccount<T> = crate::account::Account<T>;
 
@@ -145,7 +146,7 @@ pub(crate) fn stream<T: HttpTransport>(
 /// whose only real differences are the three this signature takes:
 ///
 /// - the METHOD (`M`), which also supplies the diagnostic name
-///   `ChangeWalkGuard` reports via `M::NAME`;
+///   `StateWalkFault` reports via `M::NAME`;
 /// - `owner`, `Some(accountId)` only for a foreign (shared/delegate)
 ///   scope. It does two things at once, and both are why the parameter
 ///   exists rather than a flag: it qualifies every emitted change id into
@@ -159,18 +160,11 @@ pub(crate) fn stream<T: HttpTransport>(
 ///   Email and Mailbox states are separate JMAP `(accountId, type)`
 ///   positions and must not share a map.
 ///
-/// The third walk over `*/changes` in this crate,
-/// `discover::scope_lifecycle`, is deliberately NOT folded in here: it
-/// emits `ScopeLifecycleEvent`s rather than `SyncEvent<Change>`, reads
-/// each changed object back with a follow-up `Mailbox/get`, never
-/// checkpoints, and lives for the account rather than for one walk. It
-/// shares `ChangeWalkGuard` and the cursor-scoped error classifier. Expiry
-/// restarts an engine-owned change scope, but lifecycle must reconcile a
-/// fresh name snapshot locally: forwarding a scope restart would end its
-/// only reader without rebuilding topology. Inventory is different again:
-/// its immutable sort and stable ties allow queryState churn, while a lost
-/// anchor requires a scope restart. A single reseed policy would erase
-/// these different coverage obligations, so the three loops stay separate.
+/// `StateWalk` owns the shared progress guard and state-aware error context.
+/// Its policy keeps the different recovery obligations explicit: the engine
+/// restarts a durable change scope, lifecycle reconciles a fresh name snapshot,
+/// and anchored inventory allows queryState churn but restarts on a lost
+/// anchor. The callers retain their distinct event and coverage behavior.
 fn changes_walk<T, M, O>(
     mail: MailAccount<T>,
     account_id: String,
@@ -196,8 +190,7 @@ where
         // traffic instead of each restating a running total.
         let (mail, tally) = mail.metered();
         let max_changes = nonzero(limits.max_objects_in_get);
-        // Forward-progress + cycle guard; see `ChangeWalkGuard`.
-        let mut guard = ChangeWalkGuard::new(&since_state);
+        let mut walk = StateWalk::changes(scope.clone(), &since_state);
         loop {
             let started = Instant::now();
             let response = mail
@@ -213,17 +206,14 @@ where
                         err,
                         &scope,
                         owner.as_ref(),
-                        super::error::JmapErrorContext::cursor(
-                            bifrost_types::AccountOperation::SyncChanges,
-                            scope.clone(),
-                        ),
+                        walk.error_context(bifrost_types::AccountOperation::SyncChanges),
                     ));
                     break;
                 }
             };
 
             let new_state = response.new_state().to_string();
-            if let Some(fault) = guard.observe(
+            if let Some(fault) = walk.observe_changes_page(
                 &since_state,
                 &new_state,
                 response.has_more_changes(),
@@ -316,78 +306,6 @@ fn checkpoint_for(scope: CursorScope, state_string: String) -> ChangeCursor {
 
 fn nonzero(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value.max(1)).expect("value.max(1) is non-zero")
-}
-
-/// Why a `*/changes` walk is not making forward progress.
-#[derive(Debug, Clone, Copy)]
-pub(super) enum WalkFault {
-    /// `hasMoreChanges: true` with `newState == sinceState`.
-    Unmoved,
-    /// `hasMoreChanges: true` with a state this walk already resumed from.
-    Cycle,
-}
-
-impl WalkFault {
-    /// A diagnostic naming the JMAP method that produced the fault.
-    pub(super) fn describe(self, method: &str) -> String {
-        match self {
-            Self::Unmoved => {
-                format!("{method} reported hasMoreChanges with an unmoved state")
-            }
-            Self::Cycle => {
-                format!("{method} returned to a state this walk had already served")
-            }
-        }
-    }
-}
-
-/// Forward-progress guard for a paginated `*/changes` walk.
-///
-/// Two shapes make such a walk unbounded, and one guard cannot see both.
-/// `hasMoreChanges: true` with an unmoved `newState` is the single-step
-/// case (RFC 8620 s5.2 requires `newState` to reflect the changes just
-/// served). A server alternating between two states "moves" at every
-/// single step and still paginates forever, so the walk also remembers
-/// every state it has resumed from: a conforming `newState` names a point
-/// the server has passed and therefore never repeats within one walk.
-///
-/// Every `*/changes` loop in this crate shares this one mechanism - the
-/// generic `changes_walk` (which serves the Email, Mailbox and foreign
-/// `Folder` scopes) and `discover::scope_lifecycle`, which paginates the
-/// same method on its own loop and needs the same bound for the same
-/// reason.
-pub(super) struct ChangeWalkGuard {
-    seen: std::collections::HashSet<String>,
-}
-
-impl ChangeWalkGuard {
-    pub(super) fn new(since_state: &str) -> Self {
-        Self {
-            seen: std::iter::once(since_state.to_string()).collect(),
-        }
-    }
-
-    /// Record one answered page. Returns the fault when the walk must
-    /// terminate INSTEAD of consuming that page: the state never moved
-    /// (or moved back), so nothing is lost by refusing it - the next
-    /// drive replays from the same durable state.
-    pub(super) fn observe(
-        &mut self,
-        since_state: &str,
-        new_state: &str,
-        has_more_changes: bool,
-    ) -> Option<WalkFault> {
-        if !has_more_changes {
-            return None;
-        }
-        if new_state == since_state {
-            return Some(WalkFault::Unmoved);
-        }
-        if !self.seen.insert(new_state.to_string()) {
-            return Some(WalkFault::Cycle);
-        }
-        None
-    }
 }
 
 #[cfg(test)]

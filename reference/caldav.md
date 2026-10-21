@@ -266,6 +266,9 @@ its scope and action.
   request URI: the DAV transport carries the post-redirect URL back on
   every response, because the redirect policy follows admitted-origin hops and
   RFC 4918 resolves against the URI that actually served the body.
+  Element identity is the resolved XML namespace URI plus local name, so a
+  prefix can change without changing a DAV property, while a vendor property
+  named `status`, `calendar`, or `href` cannot impersonate the protocol element.
 - `ical.rs` - iCalendar projection between DAV resources and
   `bifrost-types` calendar events. Parsing-in uses `caldata`'s streaming
   `ContentLineParser` (RFC 5545 unfolding that strips exactly one fold WSP,
@@ -519,6 +522,9 @@ Supported calendar primitives:
   window's start is IN the window (dav-F9, ruled 2026-09-07; the strict
   duration rule alone dropped it). Invalid time bounds fail locally
   before a REPORT is sent, and the encoder preserves legal one-sided ranges.
+  All-day DATE values have no timezone with which this client can construct an
+  instant. The local guard keeps them when the REPORT returns them instead of
+  interpreting local midnight as UTC and dropping a server-matched date.
   Query REPORTs use `Depth: 1`; `calendar-multiget` REPORTs enumerate their
   hrefs in the body and use `Depth: 0`.
 
@@ -716,8 +722,10 @@ Supported calendar primitives:
   resource; a patch that RESTATES the event's current calendar is not a move and
   takes the ordinary GET-plus-PUT path. "Differing" is decided by
   `bifrost_dav_core::same_dav_url`, which normalizes percent-encoding, host case
-  and a redundant default port before comparing percent-decoded path segments -
-  a byte comparison after a slash trim read a restated id in a different
+  and a redundant default port before comparing path segments as bytes.
+  Distinct invalid UTF-8 octets stay distinct, while a percent-encoded valid
+  UTF-8 spelling matches its literal spelling. Previously, a byte comparison
+  after a slash trim read a restated id in a different
   spelling as a relocation and issued a MOVE onto the collection the resource
   already lives in, which `Overwrite: F` then refused with a spurious 412. The assertion here has been inverted
   twice - the request originally returned `Ok(())` having moved nothing, was
@@ -833,10 +841,12 @@ Cursor support is calendar-event only. `discover_cursor_scopes` returns one
 NOTHING when the calendar home holds no collections - the collection walk
 already returns the home itself when the home is a calendar, so an empty walk
 is an empty backend and fabricating a home scope would point every cursor and
-inventory request at a 404.
-`establish_initial_cursor`
-builds a hybrid cursor from the calendar URL, the collection
-`sync-token` when present, and a sorted href/etag snapshot.
+inventory request at a 404. Discovery uses cached collection URLs and sends no
+request, so its `bytes_in` is zero. `establish_initial_cursor` reads the
+collection `sync-token` with a depth-0 PROPFIND and builds a hybrid cursor from
+that token and a sorted href/etag snapshot. Inventory and tokenless polling use
+the same collection-scoped read; they do not rediscover the token from a home
+listing.
 `changes_stream` uses WebDAV `sync-collection` when the cursor carries a
 sync token, issuing the REPORT with `Depth: 0` as required by RFC 6578,
 and applies returned href/etag/status entries to the snapshot
@@ -847,7 +857,8 @@ are inserted or removed. Exact href spellings take priority; equivalent URL
 spellings reuse the first sorted existing native id without rewriting published
 ids. New hrefs therefore require a hash lookup instead of a snapshot-wide URL
 comparison scan. Keys follow `same_dav_url`, including segment-wise percent
-decoding, host case, default ports, query identity and trailing-slash handling.
+decoding to raw bytes, host case, default ports, query identity and
+trailing-slash handling.
 The sorted snapshot still incurs vector shifts on insertion and removal.
 A per-member status that is neither
 2xx nor `404`/`410` is the server declining to report on that member (403, 507,
@@ -869,15 +880,16 @@ The REPORT requests only `getetag`, so nothing but the href distinguishes it
 from a member, and left in place it becomes a snapshot entry for the collection
 plus a phantom `Created`. Its status is also the RFC 6578 s3.6 truncation
 marker: a `507` there says the server returned only part of the change set and
-the accompanying sync-token records only that partial progress. `changes_stream`
-DRAINS a truncated result, re-issuing the REPORT with each returned token until
+the accompanying sync-token records that partial progress. That token is a
+valid continuation point: stopping after the partial response leaves the
+remaining changes for the next poll. `changes_stream` drains a truncated result
+to reduce that latency, re-issuing the REPORT with each returned token until
 one comes back untruncated, bounded by `SYNC_TRUNCATION_ROUNDS` and stopped
-early if a server claims truncation while handing back the same token. Without
-the drain the partial token was checkpointed as complete and every change past
-the truncation point was lost until etag drift happened to surface it; iCloud
-and large Cyrus collections truncate in practice. Calendars without a sync token
-fall back to polling snapshot diffs. The PROPFIND-snapshot diff (not the
-sync-token path) is hardened against destroy-everything failure modes: an
+early if a server claims truncation while handing back the same token. A round
+cap or repeated token keeps the last valid token, so the next poll can continue.
+Calendars without a sync token fall back to polling snapshot diffs. The
+PROPFIND-snapshot diff (not the sync-token path) is hardened against
+destroy-everything failure modes: an
 empty multistatus against a populated prior snapshot suppresses the
 mass-delete, and any href in `current.failed_hrefs` is preserved rather
 than destroyed. The diff and failed-href guard index temporary `DavHrefKey`
@@ -902,6 +914,13 @@ coverage or a checkpoint, using the member status classification. Legacy
 `CursorScope::Type(CalendarEvent)` calls remain accepted for compatibility,
 target the default calendar, and report only a `caldav` provider region rather
 than falsely claiming whole-type coverage.
+`bytes_in` in inventory and changes batches comes from a fresh stream-local
+`DavByteTally` on the client's cloned `DavDispatch`. Each net send records a
+`RequestByteCounter` before DAV decodes or classifies its result; each batch
+takes and clears the tally. Token reads, retries, redirect and 401 bodies,
+each drained sync REPORT, and fallback listings after unsupported filtered
+queries all contribute. These are fetched HTTP body octets, not decoded XML
+lengths or an account-wide meter delta; concurrent streams have separate tallies.
 The CalDAV cursor payload is version 2. Version 2 records the request-relative
 native-id namespace; version 1 cursors are rejected so a namespace correction
 cannot surface as a delete plus create during snapshot diffing. The rejection is

@@ -34,3 +34,23 @@ async fn compressed_stream_writes_a_raw_deflate_byte_stream() {
     assert!(matches!(status, Status::Ok | Status::BufError));
     assert_eq!(&inflated[..], plaintext);
 }
+
+#[tokio::test]
+async fn compressed_stream_reuses_deflate_scratch_storage_across_writes() {
+    let (client, _server) = tokio::io::duplex(1024);
+    let mut stream = CompressedStream::new(InnerStream::Memory(Tracked::new(client)));
+    let scratch = stream.deflate_buf.as_ptr();
+
+    stream
+        .write_all(b"P001 NOOP\r\n")
+        .await
+        .expect("first write");
+    assert_eq!(stream.deflate_buf.as_ptr(), scratch);
+    stream
+        .write_all(b"P002 NOOP\r\n")
+        .await
+        .expect("second write");
+
+    assert_eq!(stream.deflate_buf.as_ptr(), scratch);
+    assert_eq!(stream.deflate_buf.len(), super::DEFLATE_BUF_SIZE);
+}

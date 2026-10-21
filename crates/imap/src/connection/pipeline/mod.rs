@@ -462,7 +462,7 @@ impl<'conn, T> Pipeline<'conn, T> {
         max_size: Option<u64>,
         depth: Option<String>,
     ) -> Pipeline<'conn, (MetadataResult, T)> {
-        let consumer = dispatch::MetadataConsumer::new(mailbox.as_str().to_owned());
+        let consumer = dispatch::MetadataConsumer::new(mailbox.clone());
         self.commands.push(Command::GetMetadata {
             mailbox,
             entries,
@@ -550,7 +550,7 @@ impl<'conn, T> Pipeline<'conn, T> {
         mut self,
         mailbox: MailboxName,
     ) -> Pipeline<'conn, (QuotaRootResponse, T)> {
-        let consumer = dispatch::QuotaRootConsumer::new(mailbox.as_str().to_owned());
+        let consumer = dispatch::QuotaRootConsumer::new(mailbox.clone());
         self.commands.push(Command::GetQuotaRoot { mailbox });
         self.pending
             .push(Box::new(consumer) as Box<dyn ConsumerErased>);
@@ -600,7 +600,7 @@ impl<'conn, T> Pipeline<'conn, T> {
 
     /// GETACL command (RFC 4314 Section3.3).
     pub fn get_acl(mut self, mailbox: MailboxName) -> Pipeline<'conn, (Vec<AclEntry>, T)> {
-        let consumer = dispatch::AclConsumer::new(mailbox.as_str().to_owned());
+        let consumer = dispatch::AclConsumer::new(mailbox.clone());
         self.commands.push(Command::GetAcl { mailbox });
         self.pending
             .push(Box::new(consumer) as Box<dyn ConsumerErased>);
@@ -618,8 +618,7 @@ impl<'conn, T> Pipeline<'conn, T> {
         mailbox: MailboxName,
         identifier: String,
     ) -> Pipeline<'conn, (ListRightsResponse, T)> {
-        let consumer =
-            dispatch::ListRightsConsumer::new(mailbox.as_str().to_owned(), identifier.clone());
+        let consumer = dispatch::ListRightsConsumer::new(mailbox.clone(), identifier.clone());
         self.commands.push(Command::ListRights {
             mailbox,
             identifier,
@@ -636,7 +635,7 @@ impl<'conn, T> Pipeline<'conn, T> {
 
     /// MYRIGHTS command (RFC 4314 Section3.5).
     pub fn my_rights(mut self, mailbox: MailboxName) -> Pipeline<'conn, (String, T)> {
-        let consumer = dispatch::MyRightsConsumer::new(mailbox.as_str().to_owned());
+        let consumer = dispatch::MyRightsConsumer::new(mailbox.clone());
         self.commands.push(Command::MyRights { mailbox });
         self.pending
             .push(Box::new(consumer) as Box<dyn ConsumerErased>);

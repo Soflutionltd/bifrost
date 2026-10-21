@@ -326,7 +326,7 @@ impl ImapConnection {
             max_size,
             depth: depth.map(str::to_owned),
         };
-        let consumer = super::dispatch::MetadataConsumer::new(mailbox_name.as_str().to_owned());
+        let consumer = super::dispatch::MetadataConsumer::new(mailbox_name.clone());
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
             .map_err(|_| Error::timeout_inflight())?
@@ -427,7 +427,7 @@ impl ImapConnection {
         let cmd = Command::GetQuotaRoot {
             mailbox: mailbox_name.clone(),
         };
-        let consumer = super::dispatch::QuotaRootConsumer::new(mailbox_name.as_str().to_owned());
+        let consumer = super::dispatch::QuotaRootConsumer::new(mailbox_name.clone());
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
             .map_err(|_| Error::timeout_inflight())?
@@ -563,7 +563,7 @@ impl ImapConnection {
         let cmd = Command::GetAcl {
             mailbox: mailbox_name.clone(),
         };
-        let consumer = super::dispatch::AclConsumer::new(mailbox_name.as_str().to_owned());
+        let consumer = super::dispatch::AclConsumer::new(mailbox_name.clone());
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
             .map_err(|_| Error::timeout_inflight())?
@@ -595,10 +595,8 @@ impl ImapConnection {
             mailbox: mailbox_name.clone(),
             identifier: identifier.to_owned(),
         };
-        let consumer = super::dispatch::ListRightsConsumer::new(
-            mailbox_name.as_str().to_owned(),
-            identifier.to_owned(),
-        );
+        let consumer =
+            super::dispatch::ListRightsConsumer::new(mailbox_name.clone(), identifier.to_owned());
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
             .map_err(|_| Error::timeout_inflight())?
@@ -627,7 +625,7 @@ impl ImapConnection {
         let cmd = Command::MyRights {
             mailbox: mailbox_name.clone(),
         };
-        let consumer = super::dispatch::MyRightsConsumer::new(mailbox_name.as_str().to_owned());
+        let consumer = super::dispatch::MyRightsConsumer::new(mailbox_name.clone());
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
             .map_err(|_| Error::timeout_inflight())?

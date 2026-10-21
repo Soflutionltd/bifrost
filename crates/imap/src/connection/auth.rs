@@ -257,6 +257,11 @@ impl ImapConnection {
                             ));
                             continue;
                         }
+                        // A server rejection is an authentication result, not
+                        // evidence that this mechanism disappeared. Retrying
+                        // with a weaker rung could turn an explicit failure
+                        // into a downgrade and can consume another credential
+                        // attempt. Only live capability skew is retryable.
                         Err(other) => return Err(other),
                     }
                     return Ok(AuthOutcome { mechanism });

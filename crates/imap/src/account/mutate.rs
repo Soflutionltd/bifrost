@@ -191,7 +191,7 @@ async fn flush_items(
         return Ok(());
     }
     if tx
-        .send(batch(std::mem::take(items), PageBoundary::Page, None))
+        .send(batch(std::mem::take(items), PageBoundary::Page, None, 0))
         .await
         .is_err()
     {
@@ -224,9 +224,9 @@ async fn flush_mutation_groups(
     //   folder and continues to the next folder.
     for (folder, ids) in sorted_mutation_groups(std::mem::take(grouped)) {
         match run_folder_mutation(account, &folder, ids, kind, move_destination).await {
-            Ok(results) => {
+            Ok((results, bytes_in)) => {
                 if tx
-                    .send(batch(results, PageBoundary::Page, None))
+                    .send(batch(results, PageBoundary::Page, None, bytes_in))
                     .await
                     .is_err()
                 {
@@ -237,7 +237,11 @@ async fn flush_mutation_groups(
             // error: nothing before the first outcome is minted consumes
             // them, so the happy path never has to clone them just to keep
             // this lane fed.
-            Err(FolderMutationFailure { error, unaccounted }) => {
+            Err(FolderMutationFailure {
+                error,
+                unaccounted,
+                bytes_in,
+            }) => {
                 // SELECT and its response describe preparation, not the
                 // STORE / MOVE / EXPUNGE represented by these ids. Preserve
                 // the failure classification but reset its attempt evidence
@@ -278,7 +282,7 @@ async fn flush_mutation_groups(
                     })
                     .collect();
                 if tx
-                    .send(batch(outcomes, PageBoundary::Page, None))
+                    .send(batch(outcomes, PageBoundary::Page, None, bytes_in))
                     .await
                     .is_err()
                 {
@@ -293,8 +297,13 @@ async fn flush_mutation_groups(
 fn sorted_mutation_groups(
     grouped: HashMap<String, (MailboxName, Vec<DecodedObjectId>)>,
 ) -> Vec<(MailboxName, Vec<DecodedObjectId>)> {
-    let mut grouped: Vec<_> = grouped.into_values().collect();
-    grouped.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+    sort_mutation_group_entries(grouped.into_values().collect())
+}
+
+fn sort_mutation_group_entries(
+    mut grouped: Vec<(MailboxName, Vec<DecodedObjectId>)>,
+) -> Vec<(MailboxName, Vec<DecodedObjectId>)> {
+    grouped.sort_by(|(left, _), (right, _)| left.cmp_account_order(right));
     grouped
 }
 
@@ -321,6 +330,12 @@ fn validated_move_destination(kind: &MutationKind) -> Result<Option<MailboxName>
 struct FolderMutationFailure {
     error: Box<crate::Error>,
     unaccounted: Vec<DecodedObjectId>,
+    bytes_in: u64,
+}
+
+struct FolderOpenFailure {
+    error: crate::Error,
+    bytes_in: u64,
 }
 
 /// Open the folder without replaying the synchronization baseline.
@@ -330,17 +345,35 @@ struct FolderMutationFailure {
 async fn open_folder_for_mutation(
     account: &ImapAccount,
     folder: &MailboxName,
-) -> Result<(super::PooledConn, u32), crate::Error> {
-    let mut conn = account.checkout_for_folder(folder).await?;
+) -> Result<(super::PooledConn, u32, u64), FolderOpenFailure> {
+    let mut conn = account
+        .checkout_for_folder(folder)
+        .await
+        .map_err(|error| FolderOpenFailure { error, bytes_in: 0 })?;
+    let previous_bytes_in = conn.connection().bytes_in();
     // Mutation admission needs the live UIDVALIDITY, not a replay of all
     // changes since the consumer's checkpoint. Keep its existing MODSEQ cache
     // as the opportunistic STORE guard rather than refreshing it from a
     // mutation's own QRESYNC SELECT before testing for a conflict.
     let selected = account
         .select_folder(&mut conn, folder, None, false)
-        .await?;
-    let uidvalidity = super::selected_uidvalidity(&selected.mailbox)?;
-    Ok((conn, uidvalidity))
+        .await
+        .map_err(|error| FolderOpenFailure {
+            bytes_in: conn
+                .connection()
+                .bytes_in()
+                .saturating_sub(previous_bytes_in),
+            error,
+        })?;
+    let uidvalidity =
+        super::selected_uidvalidity(&selected.mailbox).map_err(|error| FolderOpenFailure {
+            bytes_in: conn
+                .connection()
+                .bytes_in()
+                .saturating_sub(previous_bytes_in),
+            error,
+        })?;
+    Ok((conn, uidvalidity, previous_bytes_in))
 }
 
 async fn run_folder_mutation(
@@ -349,16 +382,18 @@ async fn run_folder_mutation(
     ids: Vec<DecodedObjectId>,
     kind: &MutationKind,
     move_destination: Option<&MailboxName>,
-) -> Result<Vec<ItemOutcome<MutationSuccess>>, FolderMutationFailure> {
-    let (conn, uidvalidity) = match open_folder_for_mutation(account, folder).await {
-        Ok(opened) => opened,
-        Err(error) => {
-            return Err(FolderMutationFailure {
-                error: Box::new(error),
-                unaccounted: ids,
-            });
-        }
-    };
+) -> Result<(Vec<ItemOutcome<MutationSuccess>>, u64), FolderMutationFailure> {
+    let (conn, uidvalidity, previous_bytes_in) =
+        match open_folder_for_mutation(account, folder).await {
+            Ok(opened) => opened,
+            Err(FolderOpenFailure { error, bytes_in }) => {
+                return Err(FolderMutationFailure {
+                    error: Box::new(error),
+                    unaccounted: ids,
+                    bytes_in,
+                });
+            }
+        };
     let (valid, stale) = split_by_uidvalidity(ids, uidvalidity);
     let stale_results = failed_all(
         stale,
@@ -368,13 +403,21 @@ async fn run_folder_mutation(
         let mut results = stale_results;
         results
             .extend(run_flag_mutation_groups(account, &conn, folder, uidvalidity, valid, op).await);
-        return Ok(results);
+        let bytes_in = conn
+            .connection()
+            .bytes_in()
+            .saturating_sub(previous_bytes_in);
+        return Ok((results, bytes_in));
     }
     if matches!(kind, MutationKind::Destroy) {
         let mut results = stale_results;
         results
             .extend(run_destroy_mutation_groups(account, &conn, folder, uidvalidity, valid).await);
-        return Ok(results);
+        let bytes_in = conn
+            .connection()
+            .bytes_in()
+            .saturating_sub(previous_bytes_in);
+        return Ok((results, bytes_in));
     }
     let operation = mutation_operation(kind);
     let target_batch = TargetBatch::new(valid);
@@ -435,7 +478,11 @@ async fn run_folder_mutation(
             }));
         }
     }
-    Ok(results)
+    let bytes_in = conn
+        .connection()
+        .bytes_in()
+        .saturating_sub(previous_bytes_in);
+    Ok((results, bytes_in))
 }
 
 async fn run_destroy_mutation_groups(
@@ -907,9 +954,21 @@ fn modified_uids(code: Option<&ResponseCode>) -> Option<CompactUidSet> {
         Some(ResponseCode::Modified(ranges)) => Some(CompactUidSet::from_ranges(
             ranges
                 .iter()
-                .map(|range| {
-                    let end = range.end.unwrap_or(range.start);
-                    crate::types::UidRange::range(range.start.min(end), range.start.max(end))
+                .map(|range| match (range.start_bound(), range.end_bound()) {
+                    (crate::types::SeqBound::Number(start), None) => {
+                        crate::types::UidRange::single(start)
+                    }
+                    (
+                        crate::types::SeqBound::Number(start),
+                        Some(crate::types::SeqBound::Number(end)),
+                    ) => crate::types::UidRange::range(start.min(end), start.max(end)),
+                    // MODIFIED does not carry the mailbox maximum or the
+                    // original endpoint order. Any `*` range therefore maps
+                    // to the whole possible UID space instead of being
+                    // mistaken for the one concrete UID u32::MAX.
+                    (_, Some(crate::types::SeqBound::Star)) | (crate::types::SeqBound::Star, _) => {
+                        crate::types::UidRange::range(1, u32::MAX)
+                    }
                 })
                 .collect(),
         )),
@@ -1159,6 +1218,27 @@ mod tests {
             .map(|(folder, _)| folder.account_id())
             .collect();
         assert_eq!(names, ["Archive", "INBOX", "Zeta"]);
+    }
+
+    #[test]
+    fn mutation_groups_with_equal_display_names_use_wire_identity_order() {
+        let canonical = MailboxName::new("a").expect("valid mailbox");
+        let noncanonical = MailboxName::from_wire("a".into(), b"&AGE-", false);
+        let groups = || {
+            vec![
+                (canonical.clone(), Vec::new()),
+                (noncanonical.clone(), Vec::new()),
+            ]
+        };
+        let expected = vec![noncanonical.account_id(), canonical.account_id()];
+        let reversed: Vec<_> = groups().into_iter().rev().collect();
+        for input in [groups(), reversed] {
+            let names: Vec<_> = sort_mutation_group_entries(input)
+                .into_iter()
+                .map(|(folder, _)| folder.account_id())
+                .collect();
+            assert_eq!(names, expected);
+        }
     }
 
     #[test]
@@ -1484,6 +1564,35 @@ mod tests {
             modified_uids(Some(&ResponseCode::Modified(Vec::new()))),
             Some(CompactUidSet::default())
         );
+    }
+
+    #[test]
+    fn modified_bare_star_is_not_treated_as_the_numeric_maximum() {
+        let code = ResponseCode::Modified(vec![UidRange::from_sequence_bounds(
+            crate::types::SeqBound::Star,
+            None,
+        )]);
+        let modified = modified_uids(Some(&code)).expect("MODIFIED keeps its conflict set");
+
+        assert!(modified.contains(1));
+        assert!(modified.contains(42));
+        assert!(modified.contains(u32::MAX));
+
+        let reversed_star = modified_uids(Some(&ResponseCode::Modified(vec![
+            UidRange::from_sequence_bounds(
+                crate::types::SeqBound::Star,
+                Some(crate::types::SeqBound::Number(u32::MAX)),
+            ),
+        ])))
+        .expect("MODIFIED keeps its conflict set");
+        assert!(reversed_star.contains(42));
+
+        let numeric_max = modified_uids(Some(&ResponseCode::Modified(vec![UidRange::single(
+            u32::MAX,
+        )])))
+        .expect("numeric UID maximum is concrete");
+        assert!(!numeric_max.contains(42));
+        assert!(numeric_max.contains(u32::MAX));
     }
 
     // A tagged-OK STORE carrying `[MODIFIED ...]` partially applied: the

@@ -1,5 +1,4 @@
 use crate::connection::NotifyFlags;
-use crate::connection::helpers::inbox_eq;
 use crate::error::Error;
 use crate::types::response::{
     AclEntry, ListRightsResponse, MetadataEntry, MetadataResult, QuotaResource, QuotaRootResponse,
@@ -7,6 +6,7 @@ use crate::types::response::{
 };
 
 use super::{Consumer, ConsumerContext, Finalized};
+use crate::types::MailboxName;
 
 /// Consumer for GETQUOTA (RFC 2087 Section4.2) and SETQUOTA (RFC 2087 Section4.1).
 ///
@@ -85,7 +85,7 @@ impl Consumer for QuotaConsumer {
 /// roots listed in the QUOTAROOT response in `finalize`.
 pub(crate) struct QuotaRootConsumer {
     /// The mailbox argument, for correlation.
-    mailbox: String,
+    mailbox: MailboxName,
     /// The QUOTAROOT response roots, if received.
     roots: Option<Vec<String>>,
     /// All QUOTA responses received.
@@ -95,7 +95,7 @@ pub(crate) struct QuotaRootConsumer {
 }
 
 impl QuotaRootConsumer {
-    pub(crate) fn new(mailbox: String) -> Self {
+    pub(crate) fn new(mailbox: MailboxName) -> Self {
         Self {
             mailbox,
             roots: None,
@@ -115,10 +115,11 @@ impl Consumer for QuotaRootConsumer {
         _ctx: &ConsumerContext,
     ) {
         match resp {
-            // RFC 2087 Section4.3: QUOTAROOT response correlates by mailbox
-            // via inbox_eq for INBOX case-insensitivity (RFC 3501 Section5.1).
+            // RFC 2087 Section 4.3: QUOTAROOT response correlates by mailbox
+            // address, preserving noncanonical wire identity and RFC 3501
+            // Section 5.1's case-insensitive INBOX rule.
             UntaggedResponse::QuotaRoot { mailbox, roots }
-                if inbox_eq(&self.mailbox, mailbox.as_str()) && self.roots.is_none() =>
+                if self.mailbox.matches_mailbox(&mailbox) && self.roots.is_none() =>
             {
                 self.roots = Some(roots);
             }
@@ -196,7 +197,7 @@ impl Consumer for QuotaRootConsumer {
 /// Accumulates the ACL response for the requested mailbox.
 pub(crate) struct AclConsumer {
     /// The mailbox argument, for correlation.
-    mailbox: String,
+    mailbox: MailboxName,
     /// The matching ACL entries, if received.
     result: Option<Vec<AclEntry>>,
     /// Non-matching responses.
@@ -204,7 +205,7 @@ pub(crate) struct AclConsumer {
 }
 
 impl AclConsumer {
-    pub(crate) fn new(mailbox: String) -> Self {
+    pub(crate) fn new(mailbox: MailboxName) -> Self {
         Self {
             mailbox,
             result: None,
@@ -222,11 +223,11 @@ impl Consumer for AclConsumer {
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
     ) {
-        // RFC 4314 Section3.3 / RFC 3501 Section5.2: correlate by mailbox via
-        // inbox_eq for INBOX case-insensitivity.
+        // RFC 4314 Section 3.3 / RFC 3501 Section 5.2: correlate by mailbox
+        // address, preserving noncanonical wire identity.
         match resp {
             UntaggedResponse::Acl { mailbox, entries }
-                if inbox_eq(&self.mailbox, mailbox.as_str()) && self.result.is_none() =>
+                if self.mailbox.matches_mailbox(&mailbox) && self.result.is_none() =>
             {
                 self.result = Some(entries);
             }
@@ -264,7 +265,7 @@ impl Consumer for AclConsumer {
 /// identifier.
 pub(crate) struct ListRightsConsumer {
     /// The mailbox argument, for correlation.
-    mailbox: String,
+    mailbox: MailboxName,
     /// The identifier argument, for correlation.
     identifier: String,
     /// The matching LISTRIGHTS response, if received.
@@ -274,7 +275,7 @@ pub(crate) struct ListRightsConsumer {
 }
 
 impl ListRightsConsumer {
-    pub(crate) fn new(mailbox: String, identifier: String) -> Self {
+    pub(crate) fn new(mailbox: MailboxName, identifier: String) -> Self {
         Self {
             mailbox,
             identifier,
@@ -300,7 +301,7 @@ impl Consumer for ListRightsConsumer {
                 identifier,
                 required,
                 optional,
-            } if inbox_eq(&self.mailbox, mailbox.as_str())
+            } if self.mailbox.matches_mailbox(&mailbox)
                 && identifier == self.identifier
                 && self.result.is_none() =>
             {
@@ -339,7 +340,7 @@ impl Consumer for ListRightsConsumer {
 /// Accumulates the MYRIGHTS response for the requested mailbox.
 pub(crate) struct MyRightsConsumer {
     /// The mailbox argument, for correlation.
-    mailbox: String,
+    mailbox: MailboxName,
     /// The matching MYRIGHTS rights string, if received.
     result: Option<String>,
     /// Non-matching responses.
@@ -347,7 +348,7 @@ pub(crate) struct MyRightsConsumer {
 }
 
 impl MyRightsConsumer {
-    pub(crate) fn new(mailbox: String) -> Self {
+    pub(crate) fn new(mailbox: MailboxName) -> Self {
         Self {
             mailbox,
             result: None,
@@ -368,7 +369,7 @@ impl Consumer for MyRightsConsumer {
         // RFC 4314 Section3.5: correlate by mailbox.
         match resp {
             UntaggedResponse::MyRights { mailbox, rights }
-                if inbox_eq(&self.mailbox, mailbox.as_str()) && self.result.is_none() =>
+                if self.mailbox.matches_mailbox(&mailbox) && self.result.is_none() =>
             {
                 self.result = Some(rights);
             }
@@ -412,7 +413,7 @@ impl Consumer for MyRightsConsumer {
 /// `MetadataResult::notify_ambiguity`.
 pub(crate) struct MetadataConsumer {
     /// The mailbox argument, for correlation.
-    mailbox: String,
+    mailbox: MailboxName,
     /// Accumulated metadata entries from same-mailbox responses.
     entries: Vec<MetadataEntry>,
     /// Whether any same-mailbox response arrived while NOTIFY metadata
@@ -425,7 +426,7 @@ pub(crate) struct MetadataConsumer {
 }
 
 impl MetadataConsumer {
-    pub(crate) fn new(mailbox: String) -> Self {
+    pub(crate) fn new(mailbox: MailboxName) -> Self {
         Self {
             mailbox,
             entries: Vec::new(),
@@ -450,7 +451,7 @@ impl Consumer for MetadataConsumer {
             // RFC 5464 Section4.2: GETMETADATA can produce multiple METADATA
             // response lines for the same mailbox.
             UntaggedResponse::Metadata { mailbox, entries }
-                if inbox_eq(&self.mailbox, mailbox.as_str()) =>
+                if self.mailbox.matches_mailbox(&mailbox) =>
             {
                 // RFC 5465 Section5.6-5.8: if NOTIFY metadata was active when
                 // this response was generated, the result is ambiguous.
@@ -504,5 +505,61 @@ impl Consumer for MetadataConsumer {
             },
             self.buffered,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connection::dispatch::ConsumerContext;
+    use crate::types::response::StatusKind;
+
+    #[test]
+    fn quota_root_correlation_uses_wire_identity() {
+        let canonical = MailboxName::new("a").expect("valid mailbox");
+        let noncanonical = MailboxName::from_wire("a".into(), b"&AGE-", false);
+        let mut consumer = QuotaRootConsumer::new(canonical.clone());
+        let context = ConsumerContext {
+            capabilities: &[],
+            enabled: &[],
+            command_target: Some(&canonical),
+            command_tag: "A001",
+        };
+        consumer.on_response(
+            UntaggedResponse::QuotaRoot {
+                mailbox: noncanonical,
+                roots: Vec::new(),
+            },
+            NotifyFlags::default(),
+            &context,
+        );
+        consumer.on_response(
+            UntaggedResponse::QuotaRoot {
+                mailbox: canonical.clone(),
+                roots: vec!["user".into()],
+            },
+            NotifyFlags::default(),
+            &context,
+        );
+        consumer.on_response(
+            UntaggedResponse::Quota {
+                root: "user".into(),
+                resources: Vec::new(),
+            },
+            NotifyFlags::default(),
+            &context,
+        );
+
+        let finalized = Box::new(consumer).finalize(
+            TaggedResponse {
+                tag: "A001".into(),
+                status: StatusKind::Ok,
+                code: None,
+                text: String::new(),
+            },
+            &context,
+        );
+        let roots = finalized.output.expect("GETQUOTAROOT succeeds");
+        assert_eq!(roots.roots, vec!["user"]);
     }
 }

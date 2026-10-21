@@ -69,6 +69,44 @@ async fn wait_until(label: &str, budget: Duration, mut ready: impl FnMut() -> bo
     .unwrap_or_else(|_| panic!("{label}"));
 }
 
+/// Queue historical work first on the same account and budget pool. If lane
+/// selection ignores work kind, FIFO grants the backfill and this test fails.
+#[tokio::test]
+async fn a_live_poll_overtakes_an_earlier_backfill_on_the_same_account() {
+    for priority in [Priority::Foreground, Priority::Normal, Priority::Background] {
+        let scheduler = scheduler(single_sync_permit());
+        let account = AccountId("work-kind-order".into());
+        let held = scheduler
+            .admit(account.clone(), priority, WorkKind::Sync)
+            .await
+            .expect("hold the only sync permit");
+
+        let backfill = scheduler.admit(account.clone(), priority, WorkKind::Backfill);
+        tokio::pin!(backfill);
+        assert!(futures::poll!(backfill.as_mut()).is_pending());
+        assert_eq!(admission_depth(&scheduler), 1, "backfill queued first");
+
+        let poll = scheduler.admit(account, priority, WorkKind::Sync);
+        tokio::pin!(poll);
+        assert!(futures::poll!(poll.as_mut()).is_pending());
+        assert_eq!(admission_depth(&scheduler), 2, "both queued before release");
+        drop(held);
+
+        // Poll both futures: under account-only FIFO the backfill becomes
+        // ready first. Holding the winner's permit makes the order observable.
+        let poll_permit = tokio::select! {
+            result = &mut backfill => {
+                let _permit = result.expect("backfill admission");
+                panic!("backfill queued first but the live poll must win");
+            }
+            result = &mut poll => result.expect("live poll admission"),
+        };
+        assert!(futures::poll!(backfill.as_mut()).is_pending());
+        drop(poll_permit);
+        let _backfill_permit = backfill.await.expect("backfill eventually admitted");
+    }
+}
+
 #[tokio::test]
 async fn a_blocked_admission_waits_in_the_scheduler_lane() {
     let scheduler = scheduler(single_sync_permit());

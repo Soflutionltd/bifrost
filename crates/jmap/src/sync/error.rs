@@ -49,6 +49,7 @@ pub(crate) struct JmapErrorContext {
     pub(crate) provider: Option<Provider>,
     pub(crate) operation: AccountOperation,
     pub(crate) scope: Option<ErrorScope>,
+    pub(crate) state_based: bool,
 }
 
 impl JmapErrorContext {
@@ -58,6 +59,7 @@ impl JmapErrorContext {
             provider: None,
             operation,
             scope: None,
+            state_based: false,
         }
     }
 
@@ -70,6 +72,17 @@ impl JmapErrorContext {
     #[must_use]
     pub(crate) fn cursor(operation: AccountOperation, scope: CursorScope) -> Self {
         Self::new(operation).with_scope(ErrorScope::Cursor(scope))
+    }
+
+    #[must_use]
+    pub(crate) fn state_cursor(operation: AccountOperation, scope: CursorScope) -> Self {
+        Self::cursor(operation, scope).with_state_based()
+    }
+
+    #[must_use]
+    pub(crate) fn with_state_based(mut self) -> Self {
+        self.state_based = true;
+        self
     }
 
     #[must_use]
@@ -1281,11 +1294,51 @@ fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<RetryHint>
     bifrost_net::request::parse_retry_after_hint(headers.get(reqwest::header::RETRY_AFTER))
 }
 
+fn state_expiry_error(
+    wire: JmapMethod,
+    ctx: &JmapErrorContext,
+) -> (AccountErrorKind, Cause, JmapMethod) {
+    if !ctx.state_based {
+        return (
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: Protocol::Jmap,
+                detail: Some(DiagnosticText::support_only(
+                    "state-expiry method error was returned for a request without prior state"
+                        .to_string(),
+                )),
+            }),
+            wire,
+        );
+    }
+
+    if matches!(ctx.scope.as_ref(), Some(ErrorScope::Cursor(_))) {
+        (
+            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+            Cause::State(StateCause::CursorInvalid),
+            wire,
+        )
+    } else {
+        (
+            AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+            Cause::Internal(InternalCause::new(
+                InternalErrorKind::InvariantViolated,
+                Some(DiagnosticText::support_only(
+                    "state-based request reached error conversion without a cursor scope"
+                        .to_string(),
+                )),
+            )),
+            wire,
+        )
+    }
+}
+
 fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext) -> AccountError {
     let method_type = method.error_type();
-    // CursorInvalid requires an engine cursor scope. State-based callers
-    // without one must handle expiry locally (the lifecycle poller reseeds),
-    // rather than interpreting absent client context as provider misconduct.
+    // A cursor scope alone does not prove that the request carried a prior
+    // state: inventory needs one for anchorNotFound, while cannotCalculateChanges
+    // only means expiry on a state-based request. The explicit flag keeps those
+    // method errors from borrowing each other's recovery policy.
     let has_cursor_scope = matches!(ctx.scope, Some(ErrorScope::Cursor(_)));
     let (kind, primary, wire) = match method_type {
         MethodErrorType::ServerUnavailable => (
@@ -1365,22 +1418,9 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
             }),
             JmapMethod::RequestTooLarge,
         ),
-        MethodErrorType::CannotCalculateChanges if has_cursor_scope => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-            JmapMethod::CannotCalculateChanges,
-        ),
-        MethodErrorType::CannotCalculateChanges => (
-            AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
-            Cause::Internal(InternalCause::new(
-                InternalErrorKind::InvariantViolated,
-                Some(DiagnosticText::support_only(
-                    "state expiry reached error conversion without a cursor scope or local reseed"
-                        .to_string(),
-                )),
-            )),
-            JmapMethod::CannotCalculateChanges,
-        ),
+        MethodErrorType::CannotCalculateChanges => {
+            state_expiry_error(JmapMethod::CannotCalculateChanges, &ctx)
+        }
         MethodErrorType::StateMismatch => (
             AccountErrorKind::ConcurrencyConflict,
             Cause::State(StateCause::ConcurrencyConflict),
@@ -1415,22 +1455,7 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
             }),
             JmapMethod::UnsupportedFilter,
         ),
-        MethodErrorType::TooManyChanges if has_cursor_scope => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-            JmapMethod::TooManyChanges,
-        ),
-        MethodErrorType::TooManyChanges => (
-            AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
-            Cause::Internal(InternalCause::new(
-                InternalErrorKind::InvariantViolated,
-                Some(DiagnosticText::support_only(
-                    "state expiry reached error conversion without a cursor scope or local reseed"
-                        .to_string(),
-                )),
-            )),
-            JmapMethod::TooManyChanges,
-        ),
+        MethodErrorType::TooManyChanges => state_expiry_error(JmapMethod::TooManyChanges, &ctx),
         MethodErrorType::Other(code) => {
             let unknown = JmapMethod::Unknown { code: code.clone() };
             (
@@ -1996,7 +2021,7 @@ mod tests {
                 let scope = CursorScope::Type(bifrost_types::ObjectType::Mailbox);
                 let err = into_account_error(
                     method_error(code),
-                    JmapErrorContext::cursor(operation, scope.clone()),
+                    JmapErrorContext::state_cursor(operation, scope.clone()),
                 );
                 assert_eq!(
                     err.kind(),
@@ -2016,18 +2041,42 @@ mod tests {
     }
 
     #[test]
-    fn state_expiry_without_recovery_context_is_a_client_invariant() {
-        // Missing client context is not evidence of a non-conforming server.
+    fn state_expiry_without_a_cursor_scope_is_a_client_invariant() {
+        // A state-based caller that omits its recovery scope is a client bug,
+        // not evidence of a non-conforming server.
         for code in ["cannotCalculateChanges", "tooManyChanges"] {
             let err = into_account_error(
                 method_error(code),
-                JmapErrorContext::new(AccountOperation::SyncChanges),
+                JmapErrorContext::new(AccountOperation::SyncChanges).with_state_based(),
             );
             assert_eq!(
                 err.kind(),
                 &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
             );
             assert!(err.recovery().is_terminal());
+        }
+    }
+
+    #[test]
+    fn state_expiry_on_a_stateless_request_is_a_contract_violation() {
+        let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
+        for code in ["cannotCalculateChanges", "tooManyChanges"] {
+            let err = into_account_error(
+                method_error(code),
+                JmapErrorContext::cursor(AccountOperation::SyncInventory, scope.clone()),
+            );
+            assert_eq!(
+                err.kind(),
+                &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+                "{code}"
+            );
+            assert!(err.recovery().is_terminal(), "{code}");
+            assert!(
+                err.chain()
+                    .iter()
+                    .any(|cause| matches!(cause, Cause::Wire(WireCause::Jmap(_)))),
+                "{code}: the typed JMAP method cause must remain in the chain"
+            );
         }
     }
 
@@ -2667,40 +2716,32 @@ mod tests {
         }
     }
 
-    /// Cursor-specific expiry methods restart THIS scope only when the
-    /// caller threaded a cursor scope. Without one, expiry of a change
-    /// cursor is an invariant error; `anchorNotFound` remains a protocol
-    /// contract violation because there is no cursor scope to restart.
+    /// A cursor-scoped anchor loss restarts this scope. A scope-less
+    /// `anchorNotFound` remains a protocol contract violation.
     #[test]
     fn cursor_method_errors_need_a_cursor_scope_to_restart_a_scope() {
         let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
-        for code in ["cannotCalculateChanges", "anchorNotFound", "tooManyChanges"] {
-            let scoped = into_account_error(
-                method_error(code),
-                JmapErrorContext::cursor(AccountOperation::SyncChanges, scope.clone()),
-            );
-            assert_eq!(
-                scoped.kind(),
-                &AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                "{code}"
-            );
-            assert_eq!(
-                scoped.recovery(),
-                &RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(scope.clone())),
-                "{code}"
-            );
+        let scoped = into_account_error(
+            method_error("anchorNotFound"),
+            JmapErrorContext::cursor(AccountOperation::SyncChanges, scope.clone()),
+        );
+        assert_eq!(
+            scoped.kind(),
+            &AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+        );
+        assert_eq!(
+            scoped.recovery(),
+            &RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(scope)),
+        );
 
-            let bare = into_account_error(
-                method_error(code),
-                JmapErrorContext::new(AccountOperation::SyncChanges),
-            );
-            let expected = if code == "anchorNotFound" {
-                AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
-            } else {
-                AccountErrorKind::Internal(bifrost_types::InternalErrorKind::InvariantViolated)
-            };
-            assert_eq!(bare.kind(), &expected, "{code}");
-        }
+        let bare = into_account_error(
+            method_error("anchorNotFound"),
+            JmapErrorContext::new(AccountOperation::SyncChanges),
+        );
+        assert_eq!(
+            bare.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+        );
     }
 
     /// A method error naming an account the session no longer resolves

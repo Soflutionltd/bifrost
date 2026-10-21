@@ -1,7 +1,8 @@
 pub(crate) use bifrost_dav_core::extract_href_property;
 pub(crate) use bifrost_dav_core::resolve_href;
 use bifrost_dav_core::{
-    MultiStatusSink, PropSet, ResponseParts, classify_207, commit_if_present, normalize_etag,
+    CALENDAR_SERVER_NAMESPACE, CARDDAV_NAMESPACE, DAV_NAMESPACE, MultiStatusSink, PropSet,
+    ResponseParts, XmlName, classify_207, commit_if_present, normalize_etag,
     parse_collection_property, parse_multistatus, trimmed,
 };
 
@@ -182,8 +183,12 @@ impl PropSet for ContactProps {
 
 /// Mark `<collection/>` inside a `<resourcetype>`, the guard both member lanes
 /// share.
-fn mark_collection(name: &str, stack: &[String], parts: &mut ResponseParts<ContactProps>) {
-    if name == "collection" && stack.iter().any(|item| item == "resourcetype") {
+fn mark_collection(name: &XmlName, stack: &[XmlName], parts: &mut ResponseParts<ContactProps>) {
+    if name.is(DAV_NAMESPACE, "collection")
+        && stack
+            .iter()
+            .any(|item| item.is(DAV_NAMESPACE, "resourcetype"))
+    {
         parts.marker_mut().is_collection = true;
     }
 }
@@ -196,26 +201,41 @@ struct AddressBookSink {
 impl MultiStatusSink for AddressBookSink {
     type Props = AddressBookProps;
 
-    fn element(&mut self, name: &str, stack: &[String], parts: &mut ResponseParts<Self::Props>) {
+    fn element(
+        &mut self,
+        name: &XmlName,
+        stack: &[XmlName],
+        parts: &mut ResponseParts<Self::Props>,
+    ) {
         // The `resourcetype` ancestor guard is not decoration: without it an
         // `<addressbook/>` named anywhere else in the prop bag - inside
         // `<D:owner>`, or in a server extension element - reads as the
         // collection's own resourcetype and mints a phantom address book. The
         // CalDAV twin has always guarded its `<calendar/>` marker; this side
         // had not, which is the drift the collapse removes.
-        if name == "addressbook" && stack.iter().any(|item| item == "resourcetype") {
+        if name.is(CARDDAV_NAMESPACE, "addressbook")
+            && stack
+                .iter()
+                .any(|item| item.is(DAV_NAMESPACE, "resourcetype"))
+        {
             parts.marker_mut().is_addressbook = true;
         }
         // Directory resourcetype is defined by
         // draft-daboo-carddav-directory-gateway-02, not RFC 6352.
-        if name == "directory" && stack.iter().any(|item| item == "resourcetype") {
+        if name.is(CARDDAV_NAMESPACE, "directory")
+            && stack
+                .iter()
+                .any(|item| item.is(DAV_NAMESPACE, "resourcetype"))
+        {
             parts.marker_mut().is_directory = true;
         }
-        if name == "privilege" {
+        if name.is(DAV_NAMESPACE, "privilege") {
             parts.marker_mut().privilege_seen = true;
         }
-        if (name == "write" || name == "write-content" || name == "all")
-            && stack.iter().any(|item| item == "privilege")
+        if (name.is(DAV_NAMESPACE, "write")
+            || name.is(DAV_NAMESPACE, "write-content")
+            || name.is(DAV_NAMESPACE, "all"))
+            && stack.iter().any(|item| item.is(DAV_NAMESPACE, "privilege"))
         {
             parts.marker_mut().write_seen = true;
         }
@@ -223,15 +243,19 @@ impl MultiStatusSink for AddressBookSink {
 
     fn property(
         &mut self,
-        parent: Option<&str>,
-        name: &str,
+        parent: Option<&XmlName>,
+        name: &XmlName,
         text: &str,
         parts: &mut ResponseParts<Self::Props>,
     ) {
-        match (parent, name) {
-            (Some("prop"), "displayname") => parts.staged_mut().display_name = trimmed(text),
-            (Some("prop"), "getctag") => parts.staged_mut().ctag = trimmed(text),
-            _ => {}
+        if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(DAV_NAMESPACE, "displayname")
+        {
+            parts.staged_mut().display_name = trimmed(text);
+        } else if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(CALENDAR_SERVER_NAMESPACE, "getctag")
+        {
+            parts.staged_mut().ctag = trimmed(text);
         }
     }
 
@@ -269,21 +293,30 @@ struct ContactListingSink {
 impl MultiStatusSink for ContactListingSink {
     type Props = ContactProps;
 
-    fn element(&mut self, name: &str, stack: &[String], parts: &mut ResponseParts<Self::Props>) {
+    fn element(
+        &mut self,
+        name: &XmlName,
+        stack: &[XmlName],
+        parts: &mut ResponseParts<Self::Props>,
+    ) {
         mark_collection(name, stack, parts);
     }
 
     fn property(
         &mut self,
-        parent: Option<&str>,
-        name: &str,
+        parent: Option<&XmlName>,
+        name: &XmlName,
         text: &str,
         parts: &mut ResponseParts<Self::Props>,
     ) {
-        match (parent, name) {
-            (Some("prop"), "getetag") => parts.staged_mut().etag = normalize_etag(text),
-            (Some("prop"), "getcontenttype") => parts.staged_mut().content_type = trimmed(text),
-            _ => {}
+        if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(DAV_NAMESPACE, "getetag")
+        {
+            parts.staged_mut().etag = normalize_etag(text);
+        } else if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(DAV_NAMESPACE, "getcontenttype")
+        {
+            parts.staged_mut().content_type = trimmed(text);
         }
     }
 
@@ -315,21 +348,30 @@ struct MultigetSink {
 impl MultiStatusSink for MultigetSink {
     type Props = ContactProps;
 
-    fn element(&mut self, name: &str, stack: &[String], parts: &mut ResponseParts<Self::Props>) {
+    fn element(
+        &mut self,
+        name: &XmlName,
+        stack: &[XmlName],
+        parts: &mut ResponseParts<Self::Props>,
+    ) {
         mark_collection(name, stack, parts);
     }
 
     fn property(
         &mut self,
-        parent: Option<&str>,
-        name: &str,
+        parent: Option<&XmlName>,
+        name: &XmlName,
         text: &str,
         parts: &mut ResponseParts<Self::Props>,
     ) {
-        match (parent, name) {
-            (Some("prop"), "getetag") => parts.staged_mut().etag = normalize_etag(text),
-            (Some("prop"), "address-data") => parts.staged_mut().address_data = trimmed(text),
-            _ => {}
+        if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(DAV_NAMESPACE, "getetag")
+        {
+            parts.staged_mut().etag = normalize_etag(text);
+        } else if parent.is_some_and(|parent| parent.is(DAV_NAMESPACE, "prop"))
+            && name.is(CARDDAV_NAMESPACE, "address-data")
+        {
+            parts.staged_mut().address_data = trimmed(text);
         }
     }
 
@@ -912,6 +954,21 @@ END:VCARD</C:address-data>
                 ctag: Some("42".to_string()),
                 can_edit: None,
             }]
+        );
+    }
+
+    #[test]
+    fn a_foreign_addressbook_marker_does_not_classify_a_collection() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:" xmlns:X="urn:vendor">
+          <D:response><D:href>/contacts/not-an-addressbook/</D:href>
+          <D:propstat><D:prop><D:resourcetype><D:collection/><X:addressbook/></D:resourcetype>
+          </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+        </D:multistatus>"#;
+
+        assert!(
+            parse_addressbook_collections(xml)
+                .expect("valid XML")
+                .is_empty()
         );
     }
 

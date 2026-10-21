@@ -54,7 +54,7 @@ pub(crate) fn detached(
         cmd_tx,
         state_rx,
         events_rx: tokio::sync::Mutex::new(events_rx),
-        driver_handle: tokio::sync::Mutex::new(None),
+        driver_handle: std::sync::Arc::new(crate::connection::DriverTask::new(None)),
         host: "test.invalid".to_owned(),
         tls_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         abandoned: std::sync::atomic::AtomicBool::new(false),
@@ -121,6 +121,7 @@ async fn driver_pair_with_capacity_and_budget(
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
     let (state_tx, state_rx) = tokio::sync::watch::channel(proto_state.snapshot());
+    let inbound_bytes = wire_reader.metering().inbound_counter();
     let handle = tokio::spawn(driver::driver_task(
         wire_reader,
         proto_state,
@@ -134,7 +135,10 @@ async fn driver_pair_with_capacity_and_budget(
         cmd_tx,
         state_rx,
         events_rx: tokio::sync::Mutex::new(events_rx),
-        driver_handle: tokio::sync::Mutex::new(Some(handle)),
+        driver_handle: std::sync::Arc::new(crate::connection::DriverTask::with_inbound_counter(
+            Some(handle),
+            inbound_bytes,
+        )),
         host: "test.invalid".to_owned(),
         tls_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         abandoned: std::sync::atomic::AtomicBool::new(false),

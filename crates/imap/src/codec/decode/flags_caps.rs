@@ -119,7 +119,13 @@ pub(super) fn uid_range(input: &[u8]) -> IResult<&[u8], UidRange> {
         Some(end) if first > end => (end, Some(first)),
         other => (first, other),
     };
-    Ok((input, UidRange { start, end }))
+    Ok((
+        input,
+        match end {
+            Some(end) => UidRange::range(start, end),
+            None => UidRange::single(start),
+        },
+    ))
 }
 
 /// Parse a comma-separated UID set (RFC 4315 Section 4).
@@ -130,23 +136,13 @@ pub(super) fn uid_set(input: &[u8]) -> IResult<&[u8], Vec<UidRange>> {
 
 /// Parse a sequence number: `seq-number = nz-number / "*"` (RFC 3501 Section 9).
 ///
-/// `*` represents the highest numbered message in the mailbox and is mapped to
-/// `u32::MAX` as a sentinel value.
-///
-/// This collides with a legal UID: 4294967295 is a valid `nz-number`, and
-/// `connection::expand_uid_ranges` treats any `u32::MAX` endpoint as `*` and
-/// returns `Error::SearchResultTruncated`. Assessed and deliberately kept. The
-/// collision fails SAFE - a refused expansion, never a wrong one - it needs a
-/// mailbox that has reached the last UID of its UIDVALIDITY epoch to trigger at
-/// all, and moving the sentinel out of band means changing `UidRange` itself,
-/// which every codec, encoder and cursor path touches. Reopening this needs new
-/// evidence, not a fresh reading.
-fn seq_number(input: &[u8]) -> IResult<&[u8], u32> {
+/// `*` remains distinct from every numeric UID, including `u32::MAX`.
+fn seq_number(input: &[u8]) -> IResult<&[u8], crate::types::SeqBound> {
     if input.first() == Some(&b'*') {
         // RFC 3501 Section 9: `"*"` refers to the largest number in use.
-        Ok((&input[1..], u32::MAX))
+        Ok((&input[1..], crate::types::SeqBound::Star))
     } else {
-        nz_number(input)
+        nz_number(input).map(|(input, number)| (input, crate::types::SeqBound::Number(number)))
     }
 }
 
@@ -162,21 +158,16 @@ pub(super) fn seq_range(input: &[u8]) -> IResult<&[u8], UidRange> {
     } else {
         (input, None)
     };
-    // Postel's law (RFC 1122 Section 1.2.2): normalize reversed ranges
-    // where start > end, consistent with `uid_range`. Non-conformant
-    // servers may emit descending ranges (e.g., `100:1`).
-    let (start, end) = match second {
-        Some(end) if first > end => (end, Some(first)),
-        other => (first, other),
-    };
-    Ok((input, UidRange { start, end }))
+    // Postel's law (RFC 1122 Section 1.2.2): normalize reversed ranges,
+    // treating `*` as greater than every numeric endpoint.
+    Ok((input, UidRange::from_sequence_bounds(first, second)))
 }
 
 /// Parse a comma-separated sequence set: `sequence-set = (seq-number / seq-range) *("," sequence-set)`
 /// (RFC 3501 Section 9).
 ///
-/// Unlike `uid_set`, this accepts `*` as a valid seq-number (mapped to `u32::MAX`).
-/// Used by ESEARCH ALL (RFC 4731 Section 3.1) and VANISHED (RFC 7162 Section 3.2.10).
+/// Unlike `uid_set`, this accepts `*` as a valid seq-number.
+/// Used by ESEARCH ALL (RFC 4731 Section 3.1) and MODIFIED (RFC 7162 Section 3.1.3).
 pub(super) fn sequence_set(input: &[u8]) -> IResult<&[u8], Vec<UidRange>> {
     separated_list1(char(','), seq_range).parse(input)
 }

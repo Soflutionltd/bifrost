@@ -139,7 +139,7 @@ pub(crate) fn changes_stream(
                 yield SyncEvent::Done(None);
                 return;
             }
-            let page = match fetch_delta_page(&client, &current_url).await {
+            let page = match fetch_delta_page(&client, &current_url, &scope).await {
                 Ok(page) => page,
                 Err(error) => {
                     let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
@@ -409,6 +409,62 @@ mod tests {
             error.kind(),
             AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
         ));
+    }
+
+    #[tokio::test]
+    async fn event_changes_send_documented_preferences_on_each_delta_page() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [{ "id": "event-1", "changeKey": "ck1" }],
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/next?page=2"
+                }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [],
+                    "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta?token=done"
+                }),
+            ),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let scope = CursorScope::FolderType {
+            folder: FolderId("calendar".to_string()),
+            ty: ObjectType::Event,
+        };
+        let end = jiff::Timestamp::new(4_102_444_800, 0)
+            .expect("fixed future test timestamp")
+            .as_second();
+        let cursor = encode_cursor(
+            scope.clone(),
+            GraphCursorPayload::new(
+                kind_for_scope(&scope).expect("event scope maps"),
+                &crate::origin::AdmittedUrl::for_tests(
+                    "https://graph.microsoft.com/v1.0/calendarView/delta?token=start",
+                ),
+                None,
+            )
+            .with_calendar_window_end_option(Some(end)),
+        )
+        .expect("cursor encodes");
+
+        let events: Vec<_> = changes_stream(account, cursor).collect().await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SyncEvent::Done(_)))
+        );
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert_eq!(
+                request.prefer.as_deref(),
+                Some("odata.maxpagesize=50, outlook.timezone=\"UTC\"")
+            );
+        }
     }
 
     /// A v4 mid-inventory cursor holds a next link and an EMPTY delta link.

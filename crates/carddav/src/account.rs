@@ -18,11 +18,11 @@ use bifrost_types::{
     DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
     ErrorScope, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
     FlagOp, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity,
-    IdentityId, IdentityPatch, Importance, InventoryEvent, InventoryPartition,
-    InventoryPartitioning, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
-    ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary, Priority, Protocol,
-    ProtocolErrorKind, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendRequest,
-    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SkippedScope,
+    IdentityId, IdentityPatch, Importance, InternalCause, InternalErrorKind, InventoryEvent,
+    InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope, Message,
+    MutationSuccess, MutationTarget, ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary,
+    Priority, Protocol, ProtocolErrorKind, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest,
+    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SkippedScope,
     SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, TransmissionState,
     VacationConfig, WatchEvent, WireCause,
 };
@@ -425,7 +425,8 @@ impl CardDavAccount {
     ///
     /// - [`CtagSource::Home`] runs the depth-1 PROPFIND over the address book
     ///   home and picks this collection out of it. Cursor establishment and
-    ///   inventory use it: they have no prior cursor to compare against.
+    ///   inventory use it: they have no prior cursor to compare against, and
+    ///   the listing also refreshes the client's observed directory URLs.
     /// - [`CtagSource::Known`] takes a value the caller already has. The poll
     ///   path uses it, because deciding whether to short-circuit at all
     ///   required asking for the ctag first - re-deriving it from a depth-1
@@ -587,7 +588,7 @@ impl Account for CardDavAccount {
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
-        let client = Arc::clone(&self.client);
+        let (client, tally) = self.client.metered();
         let home = self.addressbook_home.clone();
         let default_addressbook = self.default_addressbook_url.clone();
         let addressbook_urls = self.addressbook_urls.clone();
@@ -643,7 +644,7 @@ impl Account for CardDavAccount {
                     items,
                     page_boundary: PageBoundary::Final,
                     server_latency: started.elapsed(),
-                    bytes_in: 0,
+                    bytes_in: tally.take(),
                     checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
                 }));
                 events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
@@ -682,7 +683,7 @@ impl Account for CardDavAccount {
     }
 
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
-        let client = Arc::clone(&self.client);
+        let (client, tally) = self.client.metered();
         // No address book home is captured: the poll path resolves its ctag
         // against the collection itself, never by re-listing the home.
         Box::pin(
@@ -740,7 +741,7 @@ impl Account for CardDavAccount {
                         items: Vec::new(),
                         page_boundary: PageBoundary::Final,
                         server_latency: started.elapsed(),
-                        bytes_in: 0,
+                        bytes_in: tally.take(),
                         checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
                     }));
                     events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
@@ -777,7 +778,7 @@ impl Account for CardDavAccount {
                     items: changes,
                     page_boundary: PageBoundary::Final,
                     server_latency: started.elapsed(),
-                    bytes_in: 0,
+                    bytes_in: tally.take(),
                     checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
                 }));
                 events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
@@ -1441,7 +1442,10 @@ impl Account for CardDavAccount {
                 }
             }
             if !succeeded {
-                return Err(worst.expect("at least one admitted gateway"));
+                // Open accounts only advertise this capability when at least
+                // one gateway is admitted. Preserve an internal error if an
+                // account constructed outside open violates that invariant.
+                return Err(worst.unwrap_or_else(|| directory_gateway_invariant_error(operation)));
             }
             Ok(page)
         })
@@ -1714,6 +1718,22 @@ fn write_error(operation: AccountOperation, error: VCardWriteError) -> AccountEr
         operation,
         format!("contact {} {}", error.field, error.reason),
     )
+}
+
+fn directory_gateway_invariant_error(operation: AccountOperation) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+        Cause::Internal(InternalCause::new(
+            InternalErrorKind::InvariantViolated,
+            Some(DiagnosticText::support_only(
+                "CardDAV directory search was enabled without an admitted gateway",
+            )),
+        )),
+    )
+    .protocol(Protocol::CardDav)
+    .operation(operation)
+    .try_build()
+    .expect("valid directory-search invariant classification")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -2159,6 +2179,79 @@ mod tests {
 <D:getetag>\"{name}\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status>\
 </D:propstat></D:response>"
         )
+    }
+
+    #[tokio::test]
+    async fn inventory_batch_counts_the_response_bodies_it_consumes() {
+        let addressbook = "https://dav.example.test/books/";
+        let home_response = book_multistatus(
+            r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav" xmlns:CS="http://calendarserver.org/ns/">
+              <D:response><D:href>/books/</D:href><D:propstat><D:prop>
+                <D:resourcetype><D:collection/><C:addressbook/></D:resourcetype>
+                <CS:getctag>42</CS:getctag>
+              </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+            </D:multistatus>"#
+                .to_string(),
+        );
+        let contacts_response = book_multistatus(
+            r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href>/books/one.vcf</D:href><D:propstat><D:prop><D:getetag>"e1"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#
+                .to_string(),
+        );
+        let expected_bytes = (home_response.body.len() + contacts_response.body.len()) as u64;
+        let script = dav_script([home_response, contacts_response]);
+        let client = Arc::new(CardDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&script),
+        ));
+        let account = CardDavAccount::for_tests(client, addressbook);
+        let scope = CursorScope::Folder(bifrost_types::FolderId(addressbook.to_string()));
+        let events = account.inventory_stream(scope).collect::<Vec<_>>().await;
+
+        let InventoryEvent::Batch(batch) = &events[0] else {
+            panic!("expected inventory batch: {events:?}");
+        };
+        assert_eq!(batch.bytes_in, expected_bytes);
+    }
+
+    #[tokio::test]
+    async fn unchanged_ctag_batch_counts_redirect_and_token_bodies() {
+        let addressbook = "https://dav.example.test/books/";
+        let response = book_multistatus(
+            r#"<D:multistatus xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/">
+              <D:response><D:href>/books/</D:href><D:propstat><D:prop>
+                <CS:getctag>42</CS:getctag>
+              </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+            </D:multistatus>"#
+                .to_string(),
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::LOCATION, "/books/".parse().unwrap());
+        let redirect = bifrost_dav_core::DavResponse {
+            status: reqwest::StatusCode::TEMPORARY_REDIRECT,
+            headers,
+            body: "redirect body".to_string(),
+            url: String::new(),
+        };
+        let expected_bytes = (redirect.body.len() + response.body.len()) as u64;
+        let script = dav_script([redirect, response]);
+        let client = Arc::new(CardDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&script),
+        ));
+        let account = CardDavAccount::for_tests(client, addressbook);
+        let previous = ContactSnapshot {
+            addressbook_url: addressbook.to_string(),
+            ctag: Some("42".to_string()),
+            ..ContactSnapshot::default()
+        };
+        let scope = CursorScope::Folder(bifrost_types::FolderId(addressbook.to_string()));
+        let cursor = cursor_from_snapshot(scope, &previous);
+        let events = account.changes_stream(cursor).collect::<Vec<_>>().await;
+
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("expected changes batch: {events:?}");
+        };
+        assert_eq!(batch.bytes_in, expected_bytes);
     }
 
     fn hydrated_vcard(name: &str) -> String {
@@ -2869,6 +2962,27 @@ mod tests {
         assert_eq!(
             err.kind(),
             &AccountErrorKind::Unsupported(AccountOperation::DirectorySearch)
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_directory_search_without_gateways_is_an_internal_error() {
+        let script = dav_script_empty();
+        let client = Arc::new(CardDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&script),
+        ));
+        let mut account = CardDavAccount::for_tests(client, "https://dav.example.test/books/");
+        account.capabilities.pim_methods.directory_search = true;
+
+        let error = account
+            .directory_search("ada".to_string(), None, None)
+            .await
+            .expect_err("an impossible empty gateway set is reported, not panicked");
+
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated)
         );
     }
 

@@ -14,34 +14,27 @@
    inline instead.
 
 Filed from the October 2026 defect hunt: the graph scope, plus a Graph lateral
-from net adoption. Ordered by the hunter's confidence times impact. Where a
-finding depends on Graph wire behaviour not verifiable in-repo, it says so.
-Coverage note: public-folder EWS, autodiscover, cloud upload and search were
-not audited in depth. The push-merge chain-reclassification finding is
-SHARED-005; the Retry-After doc mismatch is SHARED-006; EWS push triage is
-SHARED-013.
+from net adoption. Coverage note: public-folder EWS, autodiscover, cloud upload
+and search were not audited in depth.
 
-## GRAPH-004 - The calendar delta request likely sends parameters Graph rejects or ignores
+## GRAPH-012 - Event delta without `$select` may not return `changeKey`
 
-Needs one live check downstream.
-
-`initial_delta_request` builds
-`/calendars/{id}/calendarView/delta?startDateTime=..&endDateTime=..&$select={EVENT_SELECT}`.
-Graph's event-delta documentation lists only `startDateTime`, `endDateTime`,
-`$deltatoken` and `$skiptoken`, says `$select` is not supported, and controls
-page size with `Prefer: odata.maxpagesize`. Either a 400 on every event scope's
-first inventory (a capability silently dead; hermetic tests only assert the URL
-string), or `$select` is ignored and delta returns its reduced property set, so
-`changeKey` (GRAPH-002, GRAPH-003) and fields like `recurrence` are absent and
-the fingerprint degrades to `Unavailable`. The reference also says calendar
-reads send `Prefer: outlook.timezone="UTC"`; the delta lane uses plain
-`client.get` with no Prefer, so start and end arrive in the mailbox zone. Claim
-at risk: event scopes are advertised as delta-synced ("event deltas per
-`calendars/{id}`").
+Needs one live check downstream. Event inventory and changes pages no longer
+send `$select` (Graph documents it as unsupported on event delta) and now
+receive Graph's default delta property set. If that set omits `changeKey` or
+`recurrence`, the event fingerprint degrades to `Unavailable`. Hermetic tests
+cannot show which.
 
 ## GRAPH-006 - Contact and calendar `If-Match` protects nothing the caller can see
 
-Needs an API ruling. Contact and calendar writes still fetch the object and
+**Ruled (owner, 2026-10-21), together with IMAP-022:** build caller-version
+optimistic concurrency across providers - an optional
+`expected_version: Option<ServerVersion>` on the shared mutation inputs, used
+when present (`If-Match` on Graph and DAV, `ifInState` on JMAP,
+`UNCHANGEDSINCE` on IMAP), behaviour unchanged when absent, advertised through
+`MutationConcurrency`. Drop the fetch-then-condition dance.
+
+Contact and calendar writes still fetch the object and
 condition the write on that fresh read, which covers only the milliseconds
 between GET and PATCH; the public methods accept no caller version and delete
 takes only an id. Real optimistic concurrency means threading the caller's etag
@@ -49,6 +42,13 @@ takes only an id. Real optimistic concurrency means threading the caller's etag
 methods. The limit is documented in code and `reference/graph.md`.
 
 ## GRAPH-011 - Two delta observations that need an engine contract
+
+**Ruled (owner, 2026-10-21):** (a) document in `reference/sync.md` that
+`Updated` is an upsert (an unknown id is a create; `Created` is an optional
+precision hint) and pin it with an engine test. (b) Add
+`removed: Vec<ObjectId>` to `InventoryBatch` so removals commit atomically with
+the page checkpoint covering them; Graph fills it, the engine applies it like a
+change-stream removal, other providers leave it empty.
 
 - `changes_stream` reports every non-removed delta value as `Updated` with
   `ScopeChange::Added`, never `Created`: Graph delta cannot tell create from

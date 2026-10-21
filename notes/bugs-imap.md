@@ -14,13 +14,15 @@
    inline instead.
 
 Filed from the October 2026 defect hunt: the imap protocol and imap account
-scopes. Push-error triage in the IDLE worker is filed with the cross-provider
-entry SHARED-013; the private address parser in `pim.rs` with SHARED-004.
-"Live" and "latent" are the hunters' labels.
+scopes.
 
 ## IMAP-022 - The MODSEQ cache records server state the consumer has not seen, so `UNCHANGEDSINCE` guards less than documented
 
 Scope: imap account.
+
+**Ruled (owner, 2026-10-21):** resolved by the caller-version optimistic
+concurrency work filed under GRAPH-006: the guard value comes from the caller's
+`expected_version` (`ServerVersion::ModSeq`), not the cache.
 
 `push.rs` `absorb_idle_event` (records from IDLE FETCH), `mutate.rs`
 `open_folder_for_mutation` (from the mutation's own SELECT QRESYNC
@@ -38,6 +40,9 @@ in inventory entries), or say plainly how narrow the window is.
 
 ## IMAP-018 - IDLE sessions are still uncounted against `pool_cap`
 
+**Needs a technical implementation specification** (owner, 2026-10-21): too
+consequential to resolve by ruling.
+
 Scope: imap account. Residue: the config docs and reference now state the real
 total (`pool_cap - 1 + idle_connection_budget`). Whether IDLE workers should
 instead draw from a shared session budget, so the footprint stays inside
@@ -54,17 +59,4 @@ stream). Still open:
   literal is still copied and nothing is emitted incrementally; splitting the
   `BytesMut` alone cannot change that.
 - Non-literal syntax and parser overhead are outside the literal ceiling.
-
-## IMAP-030 - Smaller observations after the wire identity work
-
-- Response correlation in `connection/dispatch/{select,list,quota}.rs` still
-  compares mailbox display strings rather than wire identity.
-- Weak pool registration cannot track a healthy driver's detached graceful
-  shutdown after its last connection handle drops, so account close cannot
-  wait for it.
-- `account/mutate.rs` sorts all mutation groups by display name only, so equal
-  display names leave the processing order dependent on map iteration.
-- The LIST-STATUS consumer takes the first unpaired display-name match.
-- Direct `connect_config_metered` callers keep a cancellation gap during the
-  post-spawn keepalive setup; pool dials no longer have it.
 

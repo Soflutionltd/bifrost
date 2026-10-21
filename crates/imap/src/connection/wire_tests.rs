@@ -248,6 +248,21 @@ async fn read_greeting_parses_ok_greeting() {
     assert!(reader.buffer_is_empty());
 }
 
+#[tokio::test]
+async fn wire_metering_accumulates_inbound_protocol_octets() {
+    let (mut reader, mut server) = memory_reader();
+    let counter = reader.metering().inbound_counter();
+    let greeting = b"* OK ready\r\n";
+    server.write_all(greeting).await.unwrap();
+
+    reader.read_greeting().await.expect("valid greeting");
+
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        greeting.len() as u64
+    );
+}
+
 /// The whole point of making the framing helper fallible: `read_one` must
 /// return, not park in its read loop, when the declared literal can never
 /// arrive.

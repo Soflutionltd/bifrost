@@ -379,7 +379,7 @@ pub(crate) fn mutation_error(
     ctx: GmailErrorContext,
 ) -> Result<Vec<ItemOutcome<MutationSuccess>>, AccountError> {
     let account_error = into_account_error(error, ctx);
-    if terminates_mutation_stream(&account_error) {
+    if requires_stream_termination(&account_error) {
         return Err(account_error);
     }
 
@@ -554,7 +554,11 @@ pub(crate) fn merge_delete_fallback_error(
 // Internal helpers
 // ---------------------------------------------------------------------
 
-fn terminates_mutation_stream(err: &AccountError) -> bool {
+/// Decide whether a recovery result must leave per-object lanes and
+/// terminate the current stream. Mutation, inventory hydration, and object
+/// hydration share this partition so recovery requiring caller or engine
+/// action is not reported as a permanent failure of one object.
+pub(crate) fn requires_stream_termination(err: &AccountError) -> bool {
     use bifrost_types::RecoveryClass;
     match err.recovery() {
         RecoveryClass::Retry(_)
@@ -572,7 +576,7 @@ fn terminates_mutation_stream(err: &AccountError) -> bool {
         | RecoveryClass::InternalFailure => false,
         // RecoveryClass is non-exhaustive. A newly introduced class must
         // retain its recovery verdict at the stream boundary until its
-        // mutation fan-out behavior is deliberately classified here.
+        // per-item or stream-level behavior is deliberately classified here.
         _ => true,
     }
 }

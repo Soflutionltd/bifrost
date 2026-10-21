@@ -323,9 +323,10 @@ pub(crate) enum Error {
     IdNotFound(String),
     /// Not parsable as the expected format.
     NotParsable(String),
-    /// A URL this crate's own caller supplied is unusable (a custom-transport
-    /// client built without a session URL). The caller's fault. A URL the
-    /// SERVER supplied is [`Error::MalformedSessionUrl`] instead.
+    /// A URL or URL-component value this crate's own caller supplied is
+    /// unusable (an empty custom-transport session URL or EventSource type
+    /// list, for example). The caller's fault. A URL the SERVER supplied is
+    /// [`Error::MalformedSessionUrl`] instead.
     InvalidUrl(String),
     /// A URL or URL template the server published in its session object
     /// (`uploadUrl`, `downloadUrl`, `eventSourceUrl`, the WebSocket

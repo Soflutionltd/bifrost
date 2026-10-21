@@ -230,7 +230,7 @@ impl BudgetGate {
     ) -> Result<BudgetPermit, Error> {
         let pools = self.account_pools(account)?;
         let inner_sem = match kind {
-            WorkKind::Sync => Arc::clone(&pools.sync),
+            WorkKind::Sync | WorkKind::Backfill => Arc::clone(&pools.sync),
             WorkKind::Mutation => Arc::clone(&pools.mutation),
         };
         let inner = tokio::select! {

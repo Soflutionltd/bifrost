@@ -213,6 +213,7 @@ impl ImapConnection {
         // --- Spawn the driver task ---
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
         let (state_tx, state_rx) = tokio::sync::watch::channel(proto_state.snapshot());
+        let inbound_bytes = wire_reader.metering().inbound_counter();
 
         let handle = tokio::spawn(driver::driver_task(
             wire_reader,
@@ -227,7 +228,10 @@ impl ImapConnection {
             cmd_tx,
             state_rx,
             events_rx: tokio::sync::Mutex::new(events_rx),
-            driver_handle: tokio::sync::Mutex::new(Some(handle)),
+            driver_handle: std::sync::Arc::new(super::DriverTask::with_inbound_counter(
+                Some(handle),
+                inbound_bytes,
+            )),
             host: host.to_owned(),
             tls_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 tls_mode.uses_implicit_tls() || tls_mode.uses_starttls(),
@@ -294,19 +298,19 @@ impl ImapConnection {
     /// on every outcome here - including when another caller already took
     /// the join handle, since the evidence cannot depend on being first.
     pub(super) async fn observe_driver_panic(&self, phase: TransmissionState) -> Error {
-        let mut guard = self.driver_handle.lock().await;
-        let Some(handle) = guard.take() else {
+        let mut guard = self.driver_handle.handle.lock().await;
+        let Some(handle) = guard.as_mut() else {
             return Error::driver_gone_at(phase);
         };
         // `handle.is_finished()` avoids blocking if still running.
         if !handle.is_finished() {
-            // Put it back  -  still running. The cmd_tx failure may be
-            // a TOCTOU race with the driver exiting.
-            *guard = Some(handle);
+            // The cmd_tx failure may be a TOCTOU race with the driver exiting.
             drop(guard);
             return Error::driver_gone_at(phase);
         }
-        match handle.await {
+        let result = handle.await;
+        guard.take();
+        match result {
             Err(join_err) if join_err.is_panic() => {
                 let panic_msg = join_err
                     .into_panic()

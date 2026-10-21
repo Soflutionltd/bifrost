@@ -1,5 +1,4 @@
 use crate::connection::NotifyFlags;
-use crate::connection::helpers::inbox_eq;
 use crate::error::Error;
 use crate::types::SelectedMailbox;
 use crate::types::response::{ResponseCode, StatusKind, TaggedResponse, UntaggedResponse};
@@ -197,7 +196,7 @@ fn is_select_solicited_response(
                 return false;
             }
             if let Some(target) = ctx.command_target()
-                && inbox_eq(target.as_str(), info.name.as_str())
+                && target.matches_mailbox(&info.name)
                 && !is_notify_list_event(info, true)
             {
                 *consumed_select_list = true;
@@ -249,7 +248,7 @@ fn validate_select_responses(
             // the mandatory solicited response.
             UntaggedResponse::List(info) => {
                 if let Some(target) = ctx.command_target()
-                    && inbox_eq(target.as_str(), info.name.as_str())
+                    && target.matches_mailbox(&info.name)
                     && !is_notify_list_event(info, true)
                 {
                     saw_list = true;
@@ -287,7 +286,7 @@ fn validate_select_responses(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::UidRange;
+    use crate::types::{MailboxInfo, MailboxName, UidRange};
 
     fn default_ctx() -> ConsumerContext<'static> {
         ConsumerContext {
@@ -322,6 +321,36 @@ mod tests {
                 earlier: false,
                 uids: vec![UidRange::single(11)],
             }]
+        );
+    }
+
+    #[test]
+    fn select_consumes_only_the_matching_wire_identity_list() {
+        let target = MailboxName::new("a").expect("valid mailbox");
+        let noncanonical = MailboxName::from_wire("a".into(), b"&AGE-", false);
+        let context = ConsumerContext {
+            capabilities: &[],
+            enabled: &[],
+            command_target: Some(&target),
+            command_tag: "A001",
+        };
+        let responses = vec![
+            UntaggedResponse::List(MailboxInfo {
+                name: noncanonical.clone(),
+                ..MailboxInfo::default()
+            }),
+            UntaggedResponse::List(MailboxInfo {
+                name: target.clone(),
+                ..MailboxInfo::default()
+            }),
+        ];
+
+        assert_eq!(
+            reclassify_select_responses(responses, &context),
+            vec![UntaggedResponse::List(MailboxInfo {
+                name: noncanonical,
+                ..MailboxInfo::default()
+            }),]
         );
     }
 }

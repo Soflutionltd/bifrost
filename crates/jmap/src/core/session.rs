@@ -580,6 +580,12 @@ impl Session {
             self.account(self.primary_accounts.get(C::URI)?)?
                 .capability(C::URI)?
         };
+        // A typed reader must preserve the same three-state result as the
+        // accessors. Re-parsing a malformed array through a defaulted struct
+        // can succeed even though the session deserializer rejected it.
+        if matches!(cap, Capabilities::Malformed(_)) {
+            return None;
+        }
         // Serialize the enum variant to Value, then deserialize into Config.
         // This is a one-time cost per access (session parsing is infrequent).
         let value = serde_json::to_value(cap).ok()?;
@@ -1021,7 +1027,7 @@ impl<T: URLParser> URLPart<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::Session;
+    use super::{CapabilityState, Session};
 
     fn session_with_multiple_primaries() -> Session {
         serde_json::from_value(serde_json::json!({
@@ -1066,5 +1072,31 @@ mod tests {
             let session = session_with_multiple_primaries();
             assert_eq!(session.default_account_id(), Some("calendar-account"));
         }
+    }
+
+    #[test]
+    fn capability_config_does_not_reparse_malformed_sequence_as_present() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "capabilities": {"urn:ietf:params:jmap:core": []},
+            "accounts": {},
+            "primaryAccounts": {},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap",
+            "downloadUrl": "https://example.test/download/{accountId}/{blobId}",
+            "uploadUrl": "https://example.test/upload/{accountId}",
+            "eventSourceUrl": "https://example.test/events",
+            "state": "state-1"
+        }))
+        .expect("the malformed capability is retained in the session");
+
+        assert!(matches!(
+            session.core_capability_state(),
+            CapabilityState::Malformed
+        ));
+        assert!(
+            session
+                .capability_config::<crate::core::capability::Core>()
+                .is_none()
+        );
     }
 }
