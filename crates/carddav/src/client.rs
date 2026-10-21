@@ -667,6 +667,24 @@ impl CardDavClient {
         self.dav.move_resource(from, to, operation).await
     }
 
+    /// Conditional delete never silently drops a caller's validator.
+    pub(crate) async fn delete_vcard_if_match(
+        &self,
+        url: &str,
+        etag: &str,
+        operation: AccountOperation,
+    ) -> Result<(), AccountError> {
+        self.refuse_directory_access(url, operation)?;
+        let etag = bifrost_types::ServerVersion::ETag(etag.to_string());
+        let etag = etag.expected_etag(bifrost_types::error::Protocol::CardDav, operation, true)?;
+        let etag = prepare_if_match(etag).expect("validated strong entity tag");
+        let request = self
+            .dav
+            .request(Method::DELETE, url)
+            .header("If-Match", etag);
+        self.dav.send_status_request(request, operation).await
+    }
+
     /// `DELETE` one vCard resource. Replayable, and a target already gone is a
     /// success - the dav-D1 ruling, stated in full at
     /// `DavDispatch::delete_resource`; twin of `bifrost-caldav`'s
@@ -1216,6 +1234,85 @@ mod tests {
                 } else {
                     "\"fresh\""
                 })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_contact_delete_refuses_weak_and_foreign_versions_before_io() {
+        use bifrost_types::Account;
+
+        for version in [
+            bifrost_types::ServerVersion::ETag("W/\"weak\"".into()),
+            bifrost_types::ServerVersion::ModSeq(42),
+            bifrost_types::ServerVersion::Unavailable,
+        ] {
+            let script = dav_script_empty();
+            let client = Arc::new(CardDavClient::with_account_net(
+                "https://dav.example.test",
+                scripted_dav_net(&script),
+            ));
+            let account =
+                crate::account::CardDavAccount::for_tests(client, "https://dav.example.test/book/");
+            let error = account
+                .contact_delete_if_version(
+                    bifrost_types::ContactId("https://dav.example.test/book/one.vcf".into()),
+                    Some(version),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                *error.kind(),
+                bifrost_types::AccountErrorKind::Unsupported(AccountOperation::ContactDelete)
+            );
+            assert!(transcripts(&script).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_contact_delete_version_is_conditional_and_absence_stays_unconditional() {
+        use bifrost_types::Account;
+
+        for expected in [Some("stale"), None] {
+            let script = dav_script([DavResponse {
+                status: if expected.is_some() {
+                    StatusCode::PRECONDITION_FAILED
+                } else {
+                    StatusCode::NO_CONTENT
+                },
+                headers: HeaderMap::new(),
+                body: String::new(),
+                url: String::new(),
+            }]);
+            let client = Arc::new(CardDavClient::with_account_net(
+                "https://dav.example.test",
+                scripted_dav_net(&script),
+            ));
+            let account =
+                crate::account::CardDavAccount::for_tests(client, "https://dav.example.test/book/");
+            let result = account
+                .contact_delete_if_version(
+                    bifrost_types::ContactId("https://dav.example.test/book/one.vcf".into()),
+                    expected.map(|value| bifrost_types::ServerVersion::ETag(value.into())),
+                )
+                .await;
+            if expected.is_some() {
+                assert_eq!(
+                    *result.unwrap_err().kind(),
+                    bifrost_types::AccountErrorKind::ConcurrencyConflict
+                );
+            } else {
+                result.expect("absent version preserves ordinary deletion");
+            }
+            let requests = transcripts(&script);
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method.as_str(), "DELETE");
+            assert_eq!(
+                requests[0]
+                    .headers
+                    .get("If-Match")
+                    .and_then(|value| value.to_str().ok()),
+                expected.map(|_| "\"stale\""),
             );
         }
     }

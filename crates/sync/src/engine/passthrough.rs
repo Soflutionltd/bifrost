@@ -772,6 +772,32 @@ impl SyncEngine {
             .await?)
     }
 
+    /// Delete with the caller's optional version, forwarded unchanged.
+    pub async fn contact_delete_if_version(
+        &self,
+        account_id: &AccountId,
+        contact: bifrost_types::ContactId,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .contact_delete_if_version(contact, expected_version)
+            .await?)
+    }
+
+    /// Delete with the caller's optional version, forwarded unchanged.
+    pub async fn event_delete_if_version(
+        &self,
+        account_id: &AccountId,
+        event: bifrost_types::EventId,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .event_delete_if_version(event, expected_version)
+            .await?)
+    }
+
     /// Search the organization directory (Global Address List). Forwards
     /// to [`Account::directory_search`]; gated by
     /// `capabilities().pim_methods.directory_search` at the protocol layer.

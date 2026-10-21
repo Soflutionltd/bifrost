@@ -1484,6 +1484,17 @@ impl Account for GraphAccount {
         Box::pin(async move { contacts::delete(account, contact).await })
     }
 
+    fn contact_delete_if_version(
+        &self,
+        contact: ContactId,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        let account = self.clone();
+        Box::pin(
+            async move { contacts::delete_if_version(account, contact, expected_version).await },
+        )
+    }
+
     fn contact_search(
         &self,
         request: ContactSearchRequest,
@@ -1556,6 +1567,15 @@ impl Account for GraphAccount {
     fn event_delete(&self, event: EventId) -> AccountFuture<Result<(), AccountError>> {
         let account = self.clone();
         Box::pin(async move { calendar::delete(account, event).await })
+    }
+
+    fn event_delete_if_version(
+        &self,
+        event: EventId,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { calendar::delete_if_version(account, event, expected_version).await })
     }
 
     fn event_rsvp(

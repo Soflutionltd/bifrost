@@ -20,6 +20,13 @@ Coverage note from the engine hunter: `cursor/coverage.rs`, `cursor/ledger.rs`,
 `cursor/ledger_envelope.rs`, `backfill/*`, `engine/lane.rs` and `repair.rs`
 were NOT covered in depth. They are the largest files and need their own pass.
 
+## SYNC-020 - `SyncEngine` has no plain `event_delete` passthrough
+
+Lateral from the conditional-delete work. `crates/sync/src/engine/passthrough.rs`
+gained `event_delete_if_version` and has `contact_delete` beside
+`contact_delete_if_version`, but no plain `event_delete`. Either the asymmetry
+is intended and wants a comment, or the passthrough is missing.
+
 ## SYNC-007 - A proven non-landing write is never resubmitted
 
 **Needs a technical implementation specification** (owner, 2026-10-21): too

@@ -1290,6 +1290,28 @@ impl Account for CardDavAccount {
         })
     }
 
+    fn contact_delete_if_version(
+        &self,
+        contact: ContactId,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        let Some(version) = expected_version else {
+            return self.contact_delete(contact);
+        };
+        let client = Arc::clone(&self.client);
+        Box::pin(async move {
+            let etag = version.expected_etag(
+                bifrost_types::error::Protocol::CardDav,
+                AccountOperation::ContactDelete,
+                true,
+            )?;
+            let url = client.resolve_url(&contact.0);
+            client
+                .delete_vcard_if_match(&url, etag, AccountOperation::ContactDelete)
+                .await
+        })
+    }
+
     /// Searches contacts by text, one page at a time.
     ///
     /// **An omitted `limit` defaults to `CONTACT_PAGE_SIZE` (250)**, so a

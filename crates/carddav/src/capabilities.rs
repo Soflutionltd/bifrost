@@ -14,6 +14,8 @@ pub(crate) fn carddav_capabilities() -> AccountCapabilities {
             concurrency: MutationConcurrency::ExpectedVersion {
                 contact_update: true,
                 event_update: false,
+                contact_delete: true,
+                event_delete: false,
             },
             replay_safety: MutationReplaySafety::None,
         },
@@ -70,7 +72,9 @@ mod tests {
             caps.mutation.concurrency,
             MutationConcurrency::ExpectedVersion {
                 contact_update: true,
-                event_update: false
+                event_update: false,
+                contact_delete: true,
+                event_delete: false,
             }
         );
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);

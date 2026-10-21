@@ -48,6 +48,8 @@ pub(crate) fn caldav_capabilities(event_rsvp: bool) -> AccountCapabilities {
             concurrency: MutationConcurrency::ExpectedVersion {
                 contact_update: false,
                 event_update: true,
+                contact_delete: false,
+                event_delete: true,
             },
             replay_safety: MutationReplaySafety::None,
         },

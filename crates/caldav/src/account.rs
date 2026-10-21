@@ -1187,6 +1187,29 @@ impl Account for CalDavAccount {
         })
     }
 
+    fn event_delete_if_version(
+        &self,
+        event: EventId,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        let Some(version) = expected_version else {
+            return self.event_delete(event);
+        };
+        let client = Arc::clone(&self.client);
+        Box::pin(async move {
+            let etag = version.expected_etag(
+                bifrost_types::error::Protocol::CalDav,
+                AccountOperation::EventDelete,
+                true,
+            )?;
+            reject_recurrence_instance_id(&event, AccountOperation::EventDelete)?;
+            let url = client.resolve_url(&event.0);
+            client
+                .delete_event_if_match(&url, etag, AccountOperation::EventDelete)
+                .await
+        })
+    }
+
     fn event_rsvp(
         &self,
         event: EventId,

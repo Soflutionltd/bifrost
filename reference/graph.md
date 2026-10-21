@@ -429,7 +429,9 @@ the read is part of the update operation. An absent version retains the existing
 immediate-read guard. Graph accepts HTTP entity-tag syntax and forwards the
 accepted token verbatim; the weak-tag prefix is uppercase `W/`, so lowercase
 `w/` is refused as an invalid token.
-Delete still has no caller-version input and retains its immediate-read guard.
+`contact_delete_if_version` and `event_delete_if_version` accept the same optional
+caller ETag and send it without fetching a replacement. The ordinary delete
+doors and conditional doors with no version retain their immediate-read guards.
 Other token kinds are refused as `Unsupported` before I/O.
 Updates send sparse PATCH (scalar clears as null;
 contacts emit `null`/`[]` for emptied buckets). Event organizer/status are
@@ -990,8 +992,9 @@ invalidation is exactly what `PushSource::Coalesced` exists for.
   consumer into the engine `InvalidationSink`; `push_in_process()` false);
   `EwsStreaming` -> `InProcess` (the EWS worker forwards `Invalidated` on
   `push_stream`; `push_in_process()` true).
-- `mutation.concurrency: ExpectedVersion { contact_update: true, event_update: true }`.
-  This caller-version guarantee is limited to these update doors. Bulk mail
+- `mutation.concurrency: ExpectedVersion { contact_update: true, event_update: true, contact_delete: true, event_delete: true }`.
+  This caller-version guarantee covers contact and event update and conditional
+  delete doors. Bulk mail
   retains provider-observed guards: every non-`Destroy` mutation sends
   `If-Match: <entity-tag>`; the cached etag comes from inventory/changes/get,
   refreshed from `messages/{id}?$select=id` on a cold cache.

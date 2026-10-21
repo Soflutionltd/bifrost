@@ -843,6 +843,17 @@ impl Account for ImapAccount {
         unsupported_future(AccountOperation::ContactDelete)
     }
 
+    fn contact_delete_if_version(
+        &self,
+        contact: ContactId,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        if let Some(contacts) = &self.contacts {
+            return contacts.contact_delete_if_version(contact, expected_version);
+        }
+        unsupported_future(AccountOperation::ContactDelete)
+    }
+
     fn contact_search(
         &self,
         request: ContactSearchRequest,
@@ -925,6 +936,17 @@ impl Account for ImapAccount {
     fn event_delete(&self, event: EventId) -> AccountFuture<Result<(), AccountError>> {
         if let Some(calendars) = &self.calendars {
             return calendars.event_delete(event);
+        }
+        unsupported_future(AccountOperation::EventDelete)
+    }
+
+    fn event_delete_if_version(
+        &self,
+        event: EventId,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        if let Some(calendars) = &self.calendars {
+            return calendars.event_delete_if_version(event, expected_version);
         }
         unsupported_future(AccountOperation::EventDelete)
     }

@@ -67,12 +67,14 @@ pub enum PushCapability {
 pub enum MutationConcurrency {
     /// Legacy provider-observed state guards, without a caller-version guarantee.
     StateBased,
-    /// Caller versions are enforced for the named update doors. Other doors
+    /// Caller versions are enforced for the named doors. Other doors
     /// have no caller-version guarantee. DAV relocation with a version is
     /// refused because its multi-request fallback cannot preserve the guard.
     ExpectedVersion {
         contact_update: bool,
         event_update: bool,
+        contact_delete: bool,
+        event_delete: bool,
     },
     /// No caller-version concurrency control. Supplied versions are refused.
     None,

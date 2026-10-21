@@ -10,6 +10,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Explicit proxy routing. Empty fields select direct connections.
 /// Values use the same syntax as HTTP_PROXY, HTTPS_PROXY and NO_PROXY.
+///
+/// ```
+/// let mut proxy = bifrost_net::proxy::ProxyConfig::new();
+/// proxy.https = "http://proxy.example:8080".into();
+/// proxy.no_proxy = "localhost,internal.example".into();
+/// let mut config = bifrost_net::NetConfig::new();
+/// config.proxy = Some(proxy);
+/// ```
 #[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct ProxyConfig {
@@ -19,6 +27,47 @@ pub struct ProxyConfig {
     pub https: String,
     /// Bypass list, including host suffixes, addresses and CIDR ranges.
     pub no_proxy: String,
+}
+
+impl ProxyConfig {
+    /// Construct direct routing with all proxy fields empty.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// A TLS or CONNECT refusal reported by a selected HTTP(S) proxy.
+///
+/// This is stored as the source of the `io::Error` returned by
+/// [`crate::AccountNet::connect_tunnel`]. Callers can recover it with
+/// `error.get_ref().and_then(|source| source.downcast_ref::<TunnelError>())`.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TunnelError {
+    /// TLS to the selected HTTPS proxy failed, either while building the
+    /// connector from Net's TLS policy or during the handshake itself.
+    #[error("TLS to proxy failed: {source}")]
+    ProxyTls {
+        /// Original TLS error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+    /// The proxy requires or rejected authentication for CONNECT.
+    #[error("proxy authentication required for CONNECT (HTTP 407)")]
+    ProxyAuthenticationRequired,
+    /// The proxy refused CONNECT with a status other than 2xx.
+    #[error("proxy refused CONNECT with HTTP {status}")]
+    ProxyRefused {
+        /// CONNECT response status.
+        status: u16,
+    },
+}
+
+fn proxy_tls_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
+    io::Error::other(TunnelError::ProxyTls {
+        source: Box::new(error),
+    })
 }
 
 pub(crate) struct Routing(Matcher);
@@ -100,9 +149,12 @@ impl crate::AccountNet {
         builder.build()
     }
 
-    /// Connect to a ws/wss or HTTP(S) destination using this Net's routing
-    /// snapshot. A selected HTTP(S) proxy receives CONNECT, never origin auth.
-    /// Unsupported proxy protocols fail closed rather than bypassing the proxy.
+    /// Open the raw connection used by a WebSocket upgrade or caller-managed
+    /// HTTP(S) session, using this Net's routing snapshot. This does not send an
+    /// origin request or perform origin TLS. A selected HTTP(S) proxy receives
+    /// CONNECT, never origin auth. Unsupported proxy protocols, including
+    /// SOCKS, fail closed rather than bypassing the proxy. TLS and CONNECT
+    /// refusal errors retain a [`TunnelError`] source.
     pub async fn connect_tunnel(&self, destination: &str) -> io::Result<TunnelStream> {
         self.connect_tunnel_with(destination, |host, port| async move {
             let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
@@ -148,12 +200,12 @@ impl crate::AccountNet {
             let tcp = dial(unbracket(proxy_host).to_owned(), proxy_port).await?;
             let mut stream: TunnelStream = if proxy_scheme == "https" {
                 let tls = tokio_native_tls::TlsConnector::from(
-                    self.upgrade_tls_connector().map_err(io::Error::other)?,
+                    self.upgrade_tls_connector().map_err(proxy_tls_error)?,
                 );
                 Box::pin(
                     tls.connect(unbracket(proxy_host), tcp)
                         .await
-                        .map_err(io::Error::other)?,
+                        .map_err(proxy_tls_error)?,
                 )
             } else {
                 tcp
@@ -221,7 +273,13 @@ async fn establish_connect<S: AsyncRead + AsyncWrite + Unpin>(
             match status {
                 Some(200..=299) => return Ok(()),
                 Some(100..=199) if status != Some(101) => response.clear(),
-                _ => return Err(io::Error::other("proxy refused CONNECT")),
+                Some(407) => {
+                    return Err(io::Error::other(TunnelError::ProxyAuthenticationRequired));
+                }
+                Some(status) => {
+                    return Err(io::Error::other(TunnelError::ProxyRefused { status }));
+                }
+                None => return Err(io::Error::other("invalid proxy CONNECT status")),
             }
         }
     }
@@ -294,6 +352,29 @@ mod tests {
             routing.0.intercept(&uri).unwrap().basic_auth(),
             roundtrip.intercept(&uri).unwrap().basic_auth(),
         );
+    }
+
+    #[test]
+    fn proxy_config_constructor_starts_with_direct_routing() {
+        let proxy = ProxyConfig::new();
+        assert!(proxy.http.is_empty());
+        assert!(proxy.https.is_empty());
+        assert!(proxy.no_proxy.is_empty());
+    }
+
+    #[test]
+    fn proxy_tls_failures_keep_a_typed_source() {
+        let error = proxy_tls_error(io::Error::other("certificate rejected"));
+        let tunnel_error = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<TunnelError>())
+            .expect("proxy TLS failures expose a typed source");
+        match tunnel_error {
+            TunnelError::ProxyTls { source } => {
+                assert_eq!(source.to_string(), "certificate rejected");
+            }
+            other => panic!("expected proxy TLS classification, got {other:?}"),
+        }
     }
 
     #[test]
@@ -413,6 +494,74 @@ mod tests {
             assert_eq!(&bytes, b"tunnel");
         };
         tokio::join!(peer, caller);
+    }
+
+    #[tokio::test]
+    async fn connect_classifies_authentication_and_other_proxy_refusals() {
+        for (status, expected) in [
+            (407, TunnelError::ProxyAuthenticationRequired),
+            (403, TunnelError::ProxyRefused { status: 403 }),
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(1024);
+            let peer = async move {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(server.read_u8().await.unwrap());
+                }
+                let response = format!("HTTP/1.1 {status} Refused\r\n\r\n");
+                server.write_all(response.as_bytes()).await.unwrap();
+            };
+            let caller = async {
+                let error = match establish_connect(&mut client, "mail.test:443", None).await {
+                    Err(error) => error,
+                    Ok(()) => panic!("proxy refusal unexpectedly established a tunnel"),
+                };
+                let tunnel_error = error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<TunnelError>())
+                    .expect("CONNECT refusals expose a typed source");
+                match (&expected, tunnel_error) {
+                    (
+                        TunnelError::ProxyAuthenticationRequired,
+                        TunnelError::ProxyAuthenticationRequired,
+                    ) => {}
+                    (
+                        TunnelError::ProxyRefused { status: expected },
+                        TunnelError::ProxyRefused { status },
+                    ) => assert_eq!(status, expected),
+                    (expected, actual) => {
+                        panic!("expected proxy refusal {expected:?}, got {actual:?}")
+                    }
+                }
+            };
+            tokio::join!(peer, caller);
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_socks_proxy_fails_closed_before_dialing() {
+        let config = crate::NetConfig {
+            proxy: Some(ProxyConfig {
+                https: "socks5://proxy.test:1080".into(),
+                ..ProxyConfig::default()
+            }),
+            ..crate::NetConfig::default()
+        };
+        let net = crate::Net::new(config).unwrap();
+        let account = net.attach_account(
+            crate::AccountId("socks-upgrade-test".into()),
+            crate::AccountSpec::new(None),
+        );
+        let dial =
+            |_: String, _| async { Err::<TunnelStream, _>(io::Error::other("unexpected dial")) };
+        let error = match account
+            .connect_tunnel_with("wss://mail.test/push", dial)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported proxy unexpectedly opened a tunnel"),
+        };
+        assert_eq!(error.to_string(), "upgrade proxy requires HTTP or HTTPS");
     }
 
     #[tokio::test]

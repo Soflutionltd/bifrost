@@ -42,6 +42,8 @@ pub(crate) fn build_capabilities(
             concurrency: MutationConcurrency::ExpectedVersion {
                 contact_update: true,
                 event_update: true,
+                contact_delete: true,
+                event_delete: true,
             },
             replay_safety: MutationReplaySafety::None,
         },
@@ -189,7 +191,9 @@ mod tests {
             caps.mutation.concurrency,
             MutationConcurrency::ExpectedVersion {
                 contact_update: true,
-                event_update: true
+                event_update: true,
+                contact_delete: true,
+                event_delete: true,
             }
         );
         assert_eq!(caps.batching_policy.max_items, 20);

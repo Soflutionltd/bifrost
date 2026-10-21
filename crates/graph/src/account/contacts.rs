@@ -215,18 +215,36 @@ pub(crate) async fn update(
 }
 
 pub(crate) async fn delete(account: GraphAccount, contact: ContactId) -> Result<(), AccountError> {
+    delete_if_version(account, contact, None).await
+}
+
+pub(crate) async fn delete_if_version(
+    account: GraphAccount,
+    contact: ContactId,
+    expected_version: Option<bifrost_types::ServerVersion>,
+) -> Result<(), AccountError> {
     if super::foreign::parse_public_contact(&contact.0).is_some() {
         return Err(graph_error::unsupported_account_error(
             AccountOperation::ContactDelete,
         ));
     }
-    // Delete has no caller-version input either, so its conditional write
-    // covers only the GET-to-DELETE interval when Graph supplied an etag.
-    let current = get(account.clone(), contact.clone()).await?;
+    let etag = if let Some(version) = &expected_version {
+        Some(
+            version
+                .expected_etag(
+                    bifrost_types::error::Protocol::Graph,
+                    AccountOperation::ContactDelete,
+                    false,
+                )?
+                .to_string(),
+        )
+    } else {
+        get(account.clone(), contact.clone()).await?.etag
+    };
     let prefix = account.client.api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&contact.0);
     let path = format!("{prefix}/contacts/{encoded}");
-    let result = if let Some(etag) = current.etag.as_deref() {
+    let result = if let Some(etag) = etag.as_deref() {
         account
             .client
             .delete_if_match(Resource::Outlook, &path, etag)
@@ -1307,6 +1325,51 @@ mod tests {
         assert_eq!(top_for_limit(Some(10), 250), 10);
         assert_eq!(top_for_limit(Some(9999), 250), 250);
         assert_eq!(top_for_limit(None, 999), 250);
+    }
+
+    #[tokio::test]
+    async fn caller_contact_delete_version_reaches_the_wire_without_a_read() {
+        use bifrost_types::Account;
+
+        for expected in [Some("W/\"stale\""), None] {
+            let client = crate::client::GraphClient::new("token");
+            let account = GraphAccount::new_for_tests(
+                client.clone(),
+                super::super::PushMode::GraphSubscriptions,
+            );
+            if expected.is_none() {
+                client.script_rest([
+                    crate::client::ScriptedRestResponse::json(
+                        reqwest::StatusCode::OK,
+                        serde_json::json!({"id": "one", "@odata.etag": "W/\"fresh\"", "changeKey": "fresh"}),
+                    ),
+                    crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+                ]);
+            } else {
+                client.script_rest([crate::client::ScriptedRestResponse::empty(
+                    reqwest::StatusCode::PRECONDITION_FAILED,
+                )]);
+            }
+            let result = account
+                .contact_delete_if_version(
+                    ContactId("one".into()),
+                    expected.map(|value| bifrost_types::ServerVersion::ETag(value.into())),
+                )
+                .await;
+            if expected.is_some() {
+                assert_eq!(
+                    *result.unwrap_err().kind(),
+                    bifrost_types::AccountErrorKind::ConcurrencyConflict
+                );
+            } else {
+                result.expect("absent version preserves the immediate-read delete");
+            }
+            let requests = client.take_rest_requests();
+            assert_eq!(requests.len(), if expected.is_some() { 1 } else { 2 });
+            let write = requests.last().unwrap();
+            assert_eq!(write.method, "DELETE");
+            assert_eq!(write.if_match.as_deref(), expected.or(Some("W/\"fresh\"")));
+        }
     }
 
     /// A page can over-deliver: Graph returns `$top` rows and several of

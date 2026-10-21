@@ -40,7 +40,9 @@ POST can be a mixed batch. Reasoning is at the code sites and in the references.
 Removing the second authority needs request-level context handed to net per
 request (operation, plus whether this request is a replayable leg). Related
 lateral: replaying a DAV conditional `If-Match` PUT whose first response was lost
-can turn a committed write into a 412 conflict.
+can turn a committed write into a 412 conflict. Caller-versioned deletes now
+share the shape: a versioned DAV delete retried after a dropped response sees
+404 or 412 where the unversioned delete reports success.
 
 ## SHARED-009 - The IMAP and SMTP wire meters stay private
 
@@ -53,25 +55,15 @@ and carries peer-timeout state, and SMTP's also serves blocking I/O with
 runtime-independent admission, so they were kept with comments; collapsing them
 onto the shared stream needs those two behaviours to move into it.
 
-## SHARED-019 - Proxy TLS failures and CONNECT refusals are unclassified
+## SHARED-019 - JMAP flattens typed proxy tunnel errors into `Transport(Network)`
 
-Lateral from the upgrade-routing work. Net now tunnels upgrade connections
-through the account proxy with HTTP CONNECT. A TLS failure to the proxy, a 407
-proxy-auth refusal or another non-2xx CONNECT answer all surface as a generic
-handshake I/O error, so the account cannot tell a proxy credential problem from
-a network drop. Map them to distinct TLS, proxy-auth and refused
-classifications.
-
-## SHARED-020 - The new `ProxyConfig` has no constructor or example
-
-Lateral from the upgrade-routing work. `bifrost_net::ProxyConfig` is
-`#[non_exhaustive]`, so downstream code must start from `default()` and mutate
-fields, with no constructor or doc example showing how. `connect_tunnel` is also
-newly public and takes `&str`, accepting http and https destinations as well as
-WebSocket ones; its doc should say what it is for. System proxy selection can
-also return a SOCKS proxy (ALL_PROXY), which reqwest cannot use without its
-`socks` feature; upgrades fail closed on it, and the HTTP gap predates this
-change.
+Residue: net's `connect_tunnel` now carries a typed `TunnelError` source for
+proxy TLS failures, HTTP 407 and other non-2xx CONNECT answers. The JMAP
+WebSocket handshake wraps it in `crates/jmap/src/client_ws.rs` and
+`crates/jmap/src/sync/error.rs` flattens the handshake error to a string
+classified as `Transport(Network)`, so the account still cannot tell a proxy
+credential problem from a network drop. The account error model also has no
+proxy-auth kind; decide which existing kind a 407 maps to.
 
 ## SHARED-017 - `MutationConcurrency::StateBased` has no producer left
 

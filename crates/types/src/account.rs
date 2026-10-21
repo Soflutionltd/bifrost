@@ -971,6 +971,21 @@ pub trait Account: Send + Sync {
     /// Delete one contact card.
     fn contact_delete(&self, contact: ContactId) -> AccountFuture<Result<(), AccountError>>;
 
+    /// Delete with an optional caller version. A supplied version must be
+    /// enforced or refused before I/O; it must never become a blind delete.
+    /// With no version, delegates to the ordinary delete door.
+    fn contact_delete_if_version(
+        &self,
+        contact: ContactId,
+        expected_version: Option<crate::mutation::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        if expected_version.is_some() {
+            let error = AccountError::unsupported(AccountOperation::ContactDelete, self.protocol());
+            return Box::pin(async move { Err(error) });
+        }
+        self.contact_delete(contact)
+    }
+
     /// Provider-side contact search.
     fn contact_search(
         &self,
@@ -1061,6 +1076,21 @@ pub trait Account: Send + Sync {
 
     /// Delete one event.
     fn event_delete(&self, event: EventId) -> AccountFuture<Result<(), AccountError>>;
+
+    /// Delete with an optional caller version. A supplied version must be
+    /// enforced or refused before I/O; it must never become a blind delete.
+    /// With no version, delegates to the ordinary delete door.
+    fn event_delete_if_version(
+        &self,
+        event: EventId,
+        expected_version: Option<crate::mutation::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        if expected_version.is_some() {
+            let error = AccountError::unsupported(AccountOperation::EventDelete, self.protocol());
+            return Box::pin(async move { Err(error) });
+        }
+        self.event_delete(event)
+    }
 
     /// Update the authenticated user's RSVP status for one event.
     fn event_rsvp(

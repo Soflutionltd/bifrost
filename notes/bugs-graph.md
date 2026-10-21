@@ -32,12 +32,13 @@ optimistic concurrency across providers - an optional expected version on the
 shared mutation inputs, enforced natively where present, behaviour unchanged
 when absent, advertised honestly through capabilities.
 
-Residue: `ContactPatch` and `EventPatch` carry `expected_version`; Graph and
-both DAV crates enforce it (`If-Match`; DAV refuses weak validators), JMAP and
-Google refuse a supplied version before I/O and advertise no guarantee. Still
-open: deletes (they take only an id), the other mutation inputs, bulk mail
-mutations, IMAP enforcement of a caller MODSEQ (IMAP-022), versioned DAV
-relocations, and whether the absent-version fetch-then-condition path that
-guards only the GET-to-write gap should go.
+Residue: contact and event updates and deletes carry an expected version;
+Graph and both DAV crates enforce it (`If-Match`; DAV refuses weak validators),
+JMAP and Google refuse a supplied version before I/O and advertise no
+guarantee. Versioned DAV relocations stay refused by design: copy-then-delete
+cannot enforce one atomic caller precondition. Still open: the other mutation
+inputs, per-target versions on bulk mail mutations, IMAP enforcement of a
+caller MODSEQ (IMAP-022), and whether the absent-version fetch-then-condition
+path that guards only the GET-to-write gap should go.
 
 

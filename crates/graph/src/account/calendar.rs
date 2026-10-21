@@ -357,13 +357,31 @@ fn reject_calendar_move(patch: &EventPatch, event_calendar_id: &str) -> Result<(
 }
 
 pub(crate) async fn delete(account: GraphAccount, event: EventId) -> Result<(), AccountError> {
+    delete_if_version(account, event, None).await
+}
+
+pub(crate) async fn delete_if_version(
+    account: GraphAccount,
+    event: EventId,
+    expected_version: Option<bifrost_types::ServerVersion>,
+) -> Result<(), AccountError> {
     public::reject_event(&event, AccountOperation::EventDelete)?;
-    // Delete accepts no caller version either. It uses the entity-tag from
-    // this immediate GET when Graph supplied a change key.
-    let current = get(account.clone(), event.clone()).await?;
+    let etag = if let Some(version) = &expected_version {
+        Some(
+            version
+                .expected_etag(
+                    bifrost_types::error::Protocol::Graph,
+                    AccountOperation::EventDelete,
+                    false,
+                )?
+                .to_string(),
+        )
+    } else {
+        get(account.clone(), event.clone()).await?.etag
+    };
     let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventDelete)?;
     let path = event_url(&account, &calendar_id, &event_id);
-    let result = if let Some(etag) = current.etag.as_deref() {
+    let result = if let Some(etag) = etag.as_deref() {
         account
             .client
             .delete_if_match(Resource::Outlook, &path, etag)
@@ -2462,6 +2480,51 @@ mod tests {
         GraphDateTime {
             date_time: Some(value.to_string()),
             time_zone: Some("UTC".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_event_delete_version_reaches_the_wire_without_a_read() {
+        use bifrost_types::Account;
+
+        for expected in [Some("W/\"stale\""), None] {
+            let client = crate::client::GraphClient::new("token");
+            let account = GraphAccount::new_for_tests(
+                client.clone(),
+                super::super::PushMode::GraphSubscriptions,
+            );
+            if expected.is_none() {
+                client.script_rest([
+                    crate::client::ScriptedRestResponse::json(
+                        reqwest::StatusCode::OK,
+                        serde_json::json!({"id": "one", "@odata.etag": "W/\"fresh\"", "changeKey": "fresh"}),
+                    ),
+                    crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+                ]);
+            } else {
+                client.script_rest([crate::client::ScriptedRestResponse::empty(
+                    reqwest::StatusCode::PRECONDITION_FAILED,
+                )]);
+            }
+            let result = account
+                .event_delete_if_version(
+                    EventId("calendar::one".into()),
+                    expected.map(|value| bifrost_types::ServerVersion::ETag(value.into())),
+                )
+                .await;
+            if expected.is_some() {
+                assert_eq!(
+                    *result.unwrap_err().kind(),
+                    bifrost_types::AccountErrorKind::ConcurrencyConflict
+                );
+            } else {
+                result.expect("absent version preserves the immediate-read delete");
+            }
+            let requests = client.take_rest_requests();
+            assert_eq!(requests.len(), if expected.is_some() { 1 } else { 2 });
+            let write = requests.last().unwrap();
+            assert_eq!(write.method, "DELETE");
+            assert_eq!(write.if_match.as_deref(), expected.or(Some("W/\"fresh\"")));
         }
     }
 

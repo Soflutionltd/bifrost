@@ -1466,13 +1466,34 @@ connections. Reqwest's implicit proxy discovery is disabled; a custom proxy
 uses this same snapshot, including Basic credentials. Environment changes after
 construction do not alter routing.
 
-`AccountNet::connect_tunnel` maps ws/wss to HTTP/HTTPS routing and either opens
-TCP directly or establishes HTTP CONNECT through the selected HTTP(S) proxy.
-Proxy TLS and `upgrade_tls_connector` use the owning Net's roots and certificate
-policy. CONNECT sends proxy credentials only, caps response headers at 16 KiB,
-accepts informational responses before a successful final response, and leaves
-tunnel bytes unread. Connection setup uses Net's connect timeout; JMAP also
-bounds the complete upgrade with its own timeout. Unsupported proxy schemes
-fail closed. Origin TLS and upgrade framing remain the caller's responsibility.
-JMAP reaches these APIs through its actual ReqwestTransport AccountNet, so an
-injected Net determines both HTTP and WebSocket routing and TLS trust.
+Start explicit routing from `ProxyConfig::new()` and assign the supported
+fields:
+
+```rust
+let mut proxy = bifrost_net::proxy::ProxyConfig::new();
+proxy.https = "http://proxy.example:8080".into();
+proxy.no_proxy = "localhost,internal.example".into();
+let mut config = bifrost_net::NetConfig::new();
+config.proxy = Some(proxy);
+```
+
+`AccountNet::connect_tunnel` opens a raw stream for a WebSocket upgrade or a
+caller-managed HTTP(S) session. It maps ws/wss to HTTP/HTTPS routing and either
+opens TCP directly or establishes HTTP CONNECT through the selected HTTP(S)
+proxy. It does not send an origin request or perform origin TLS. Proxy TLS and
+`upgrade_tls_connector` use the owning Net's roots and certificate policy.
+CONNECT sends proxy credentials only, caps response headers at 16 KiB, accepts
+informational responses before a successful final response, and leaves tunnel
+bytes unread. TLS failures to an HTTPS proxy, HTTP 407, and other non-2xx CONNECT
+responses carry a `proxy::TunnelError` source inside the returned `io::Error`;
+callers can inspect it with
+`error.get_ref().and_then(|source| source.downcast_ref::<proxy::TunnelError>())`.
+Connection setup uses Net's connect timeout; JMAP also bounds the complete
+upgrade with its own timeout.
+
+Only HTTP and HTTPS proxies are supported for upgrade tunnels. The system proxy
+matcher can select SOCKS URLs from environment settings such as `ALL_PROXY`,
+but `connect_tunnel` fails closed on SOCKS rather than connecting directly.
+Origin TLS and upgrade framing remain the caller's responsibility. JMAP reaches
+these APIs through its actual ReqwestTransport AccountNet, so an injected Net
+determines both HTTP and WebSocket routing and TLS trust.

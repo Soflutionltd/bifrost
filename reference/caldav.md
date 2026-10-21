@@ -732,8 +732,12 @@ Supported calendar primitives:
   version the fresh read supplies content only.
   Versioned relocations are refused before I/O because the MOVE fallback
   cannot preserve the guard across its multiple writes. Capabilities advertise
-  `MutationConcurrency::ExpectedVersion` for this update door only. Delete
-  still has no caller-version input.
+  `MutationConcurrency::ExpectedVersion` for this update door and
+  `event_delete_if_version`. The conditional delete door validates a strong
+  caller ETag before I/O, sends `If-Match` without fetching a replacement, and
+  maps 412 to `ConcurrencyConflict`. It reports a missing resource as an error;
+  ordinary deletes and conditional deletes with no version retain the existing
+  already-gone success policy.
 
   **A cross-calendar move is PERFORMED.** A `calendar_id` differing from the
   event's own collection (derived by `event_calendar_url`) relocates the

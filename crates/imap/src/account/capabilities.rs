@@ -56,6 +56,24 @@ pub(crate) fn build_capabilities(
             }
         )
     });
+    let contact_delete = contacts.is_some_and(|caps| {
+        matches!(
+            caps.mutation.concurrency,
+            MutationConcurrency::ExpectedVersion {
+                contact_delete: true,
+                ..
+            }
+        )
+    });
+    let event_delete = calendars.is_some_and(|caps| {
+        matches!(
+            caps.mutation.concurrency,
+            MutationConcurrency::ExpectedVersion {
+                event_delete: true,
+                ..
+            }
+        )
+    });
     AccountCapabilities {
         cursor_freshness: CursorFreshness::Hybrid,
         // IMAP can fetch a BODY[] section by range, but this account does
@@ -70,10 +88,12 @@ pub(crate) fn build_capabilities(
             PushCapability::None
         },
         mutation: MutationCapabilities {
-            concurrency: if contact_update || event_update {
+            concurrency: if contact_update || event_update || contact_delete || event_delete {
                 MutationConcurrency::ExpectedVersion {
                     contact_update,
                     event_update,
+                    contact_delete,
+                    event_delete,
                 }
             } else {
                 MutationConcurrency::None
@@ -191,6 +211,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn caller_delete_capabilities_follow_only_the_correct_composed_backend() {
+        let profile = ServerProfile::new(Vec::new(), Vec::new());
+        for (contact_delete, event_delete) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut contacts = crate::account::test_support::stub_capabilities();
+            contacts.mutation.concurrency = MutationConcurrency::ExpectedVersion {
+                contact_update: false,
+                event_update: false,
+                contact_delete,
+                event_delete: true,
+            };
+            let mut calendars = crate::account::test_support::stub_capabilities();
+            calendars.mutation.concurrency = MutationConcurrency::ExpectedVersion {
+                contact_update: false,
+                event_update: false,
+                contact_delete: true,
+                event_delete,
+            };
+            let caps = build_capabilities(
+                &profile,
+                &[],
+                false,
+                Some(&contacts),
+                Some(&calendars),
+                false,
+                false,
+            );
+            let expected = if contact_delete || event_delete {
+                MutationConcurrency::ExpectedVersion {
+                    contact_update: false,
+                    event_update: false,
+                    contact_delete,
+                    event_delete,
+                }
+            } else {
+                MutationConcurrency::None
+            };
+            assert_eq!(caps.mutation.concurrency, expected);
+        }
+    }
+
+    #[test]
     fn caller_version_capabilities_follow_the_composed_update_doors() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
         for (contact_update, event_update) in [(true, false), (false, true), (true, true)] {
@@ -198,11 +261,15 @@ mod tests {
             contacts.mutation.concurrency = MutationConcurrency::ExpectedVersion {
                 contact_update,
                 event_update: false,
+                contact_delete: false,
+                event_delete: false,
             };
             let mut calendars = crate::account::test_support::stub_capabilities();
             calendars.mutation.concurrency = MutationConcurrency::ExpectedVersion {
                 contact_update: false,
                 event_update,
+                contact_delete: false,
+                event_delete: false,
             };
             let caps = build_capabilities(
                 &profile,
@@ -218,6 +285,8 @@ mod tests {
                 MutationConcurrency::ExpectedVersion {
                     contact_update,
                     event_update,
+                    contact_delete: false,
+                    event_delete: false,
                 }
             );
         }

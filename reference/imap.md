@@ -1178,6 +1178,8 @@ default-method refusals.
 
 The shared `ContactPatch` and `EventPatch` carry optional `expected_version`.
 The composed DAV legs forward these patches intact and advertise their
-`ExpectedVersion` update capabilities when present. IMAP mail still advertises
+`ExpectedVersion` update and conditional delete capabilities when present.
+`contact_delete_if_version` and `event_delete_if_version` delegate to the
+composed account with the caller version unchanged. IMAP mail still advertises
 no caller-version guarantee: bulk targets carry no expected MODSEQ yet, and
 existing cached MODSEQ guards remain opportunistic.

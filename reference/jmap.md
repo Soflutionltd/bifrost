@@ -1388,3 +1388,8 @@ The shared `ContactPatch` and `EventPatch` carry optional `expected_version`.
 These update doors currently refuse supplied versions as `Unsupported` before
 I/O. Their native `ifInState` wiring remains to be implemented. Capabilities advertise `None`; the existing provider-observed bulk-mail guards
 are not a caller-version guarantee.
+
+The inherited `contact_delete_if_version` and `event_delete_if_version` doors
+likewise refuse a supplied version as `Unsupported` before I/O. With no version
+they delegate to the provider's ordinary delete implementation. No conditional
+delete guarantee is advertised.
