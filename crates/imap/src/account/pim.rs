@@ -396,7 +396,7 @@ pub(crate) fn draft_send(
         // only `parsed.body` (the transmitted bytes) strips it.
         let object_id = append_to_sent_or_fallback(
             &account,
-            raw.into(),
+            raw,
             submission.save_to_sent_default(),
             &parsed.message_id,
         )
@@ -487,7 +487,7 @@ async fn append_to_sent_or_fallback(
 async fn fetch_full_message(
     account: &ImapAccount,
     decoded: &DecodedObjectId,
-) -> Result<Vec<u8>, AccountError> {
+) -> Result<bytes::Bytes, AccountError> {
     let err = op_err(AccountOperation::DraftSend);
     let mut conn = account
         .checkout_for_folder(&decoded.folder)
@@ -3516,7 +3516,7 @@ body text\r\n";
             body_sections: vec![crate::types::fetch::BodySection {
                 section: String::new(),
                 origin: None,
-                data: Some(b"Subject: hi\r\nDate: Fri, 21 Nov 1997 09:55:06 -0600\r\nReferences: <a@test> <b@test>\r\nContent-Type: multipart/mixed; boundary=mix\r\n\r\n--mix\r\nContent-Type: multipart/alternative; boundary=alt\r\n\r\n--alt\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\ncaf=C3=A9\r\n--alt\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: base64\r\n\r\nPGI+aHRtbDwvYj4=\r\n--alt--\r\n--mix\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename*=utf-8''report%20%C3%A6.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0=\r\n--mix--\r\n".to_vec()),
+                data: Some(b"Subject: hi\r\nDate: Fri, 21 Nov 1997 09:55:06 -0600\r\nReferences: <a@test> <b@test>\r\nContent-Type: multipart/mixed; boundary=mix\r\n\r\n--mix\r\nContent-Type: multipart/alternative; boundary=alt\r\n\r\n--alt\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\ncaf=C3=A9\r\n--alt\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: base64\r\n\r\nPGI+aHRtbDwvYj4=\r\n--alt--\r\n--mix\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename*=utf-8''report%20%C3%A6.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0=\r\n--mix--\r\n".to_vec().into()),
             }],
             ..Default::default()
         };
@@ -3538,7 +3538,7 @@ body text\r\n";
 
     #[test]
     fn preview_projection_extracts_text_from_a_multipart_prefix() {
-        let fetch = crate::types::FetchResponse { uid: Some(2), body_sections: vec![crate::types::fetch::BodySection { section: String::new(), origin: None, data: Some(b"Content-Type: multipart/alternative; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\npreview prose\r\n--x--\r\n".to_vec()) }], ..Default::default() };
+        let fetch = crate::types::FetchResponse { uid: Some(2), body_sections: vec![crate::types::fetch::BodySection { section: String::new(), origin: None, data: Some(b"Content-Type: multipart/alternative; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\npreview prose\r\n--x--\r\n".to_vec().into()) }], ..Default::default() };
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
         let message = fetch_to_message(&folder, 9, fetch, HydrationProjection::Preview(200))
             .expect("uid present");
@@ -3569,7 +3569,7 @@ body text\r\n";
 
     #[test]
     fn truncated_fetch_marks_the_message_incomplete() {
-        let fetch = crate::types::FetchResponse { uid: Some(2), body_sections: vec![crate::types::fetch::BodySection { section: String::new(), origin: None, data: Some(b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: application/octet-stream\r\n\r\nprefix".to_vec()) }], ..Default::default() };
+        let fetch = crate::types::FetchResponse { uid: Some(2), body_sections: vec![crate::types::fetch::BodySection { section: String::new(), origin: None, data: Some(b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: application/octet-stream\r\n\r\nprefix".to_vec().into()) }], ..Default::default() };
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
         let message = fetch_to_message(&folder, 9, fetch, HydrationProjection::FullWithBlobs)
             .expect("uid present");

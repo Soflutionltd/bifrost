@@ -427,9 +427,9 @@ pub fn parse_multistatus<S: MultiStatusSink>(xml: &str, sink: &mut S) -> Result<
             .map_err(|error| format!("XML parse error: {error}"))?;
         let name = match &event {
             Event::Start(element) | Event::Empty(element) => {
-                Some(resolved_xml_name(resolved, element.name().as_ref())?)
+                Some(resolved_xml_name(resolved, element.name().as_ref()))
             }
-            Event::End(element) => Some(resolved_xml_name(resolved, element.name().as_ref())?),
+            Event::End(element) => Some(resolved_xml_name(resolved, element.name().as_ref())),
             _ => None,
         };
         match event {
@@ -527,26 +527,40 @@ pub fn parse_multistatus<S: MultiStatusSink>(xml: &str, sink: &mut S) -> Result<
 /// Extract every `<href>` nested inside `property_name`, honouring propstat
 /// status: hrefs found inside a REFUSED propstat are discarded.
 ///
+/// This source-compatible helper infers namespaces for the standard properties
+/// known to the DAV clients. Use [`extract_href_properties_in_namespace`] for
+/// an extension property or any name outside that set.
+///
 /// Nested `<status>` elements belonging to some other property inside the same
 /// prop bag are ignored - only a `<status>` whose PARENT is the propstat says
 /// anything about it.
 pub fn extract_href_properties(xml: &str, property_name: &str) -> Result<Vec<String>, String> {
+    extract_href_properties_in_namespace(xml, property_namespace(property_name), property_name)
+}
+
+/// Namespace-explicit form of [`extract_href_properties`]. Use this for a
+/// property outside the standard name table, including vendor extensions.
+pub fn extract_href_properties_in_namespace(
+    xml: &str,
+    property_namespace: &str,
+    property_name: &str,
+) -> Result<Vec<String>, String> {
     let mut reader = NsReader::from_str(xml);
     let mut stack: Vec<XmlName> = Vec::new();
     let mut text = String::new();
     let mut hrefs = Vec::new();
     let mut propstat_hrefs = Vec::new();
     let mut propstat_success = None;
-    let target_namespace = property_namespace(property_name);
+    let target_namespace = property_namespace;
     loop {
         let (resolved, event) = reader
             .read_resolved_event()
             .map_err(|error| format!("XML parse error: {error}"))?;
         let name = match &event {
             Event::Start(element) | Event::Empty(element) => {
-                Some(resolved_xml_name(resolved, element.name().as_ref())?)
+                Some(resolved_xml_name(resolved, element.name().as_ref()))
             }
-            Event::End(element) => Some(resolved_xml_name(resolved, element.name().as_ref())?),
+            Event::End(element) => Some(resolved_xml_name(resolved, element.name().as_ref())),
             _ => None,
         };
         match event {
@@ -620,11 +634,23 @@ pub fn extract_href_properties(xml: &str, property_name: &str) -> Result<Vec<Str
 }
 
 /// The first `<href>` inside `property_name`, under the same propstat rule as
-/// [`extract_href_properties`].
+/// [`extract_href_properties`]. Use [`extract_href_property_in_namespace`]
+/// when the property is outside the standard name table.
 pub fn extract_href_property(xml: &str, property_name: &str) -> Result<Option<String>, String> {
-    Ok(extract_href_properties(xml, property_name)?
-        .into_iter()
-        .next())
+    extract_href_property_in_namespace(xml, property_namespace(property_name), property_name)
+}
+
+/// Namespace-explicit form of [`extract_href_property`].
+pub fn extract_href_property_in_namespace(
+    xml: &str,
+    property_namespace: &str,
+    property_name: &str,
+) -> Result<Option<String>, String> {
+    Ok(
+        extract_href_properties_in_namespace(xml, property_namespace, property_name)?
+            .into_iter()
+            .next(),
+    )
 }
 
 /// Read one text property out of a depth-0 PROPFIND, committing it only from a
@@ -634,14 +660,27 @@ pub fn extract_href_property(xml: &str, property_name: &str) -> Result<Option<St
 /// change short-circuit: CalDAV reads `sync-token` this way and CardDAV reads
 /// `getctag`, and a stale token committed from a 403 block suppresses a real
 /// change.
+///
+/// This source-compatible helper infers namespaces for the standard properties
+/// known to the DAV clients. Use [`parse_collection_property_in_namespace`]
+/// for an extension property or any name outside that set.
 pub fn parse_collection_property(xml: &str, property_name: &str) -> Result<Option<String>, String> {
+    parse_collection_property_in_namespace(xml, property_namespace(property_name), property_name)
+}
+
+/// Namespace-explicit form of [`parse_collection_property`].
+pub fn parse_collection_property_in_namespace(
+    xml: &str,
+    property_namespace: &str,
+    property_name: &str,
+) -> Result<Option<String>, String> {
     let mut reader = NsReader::from_str(xml);
     let mut stack: Vec<XmlName> = Vec::new();
     let mut text = String::new();
     let mut staged = None;
     let mut staged_success = None;
     let mut committed = None;
-    let target_namespace = property_namespace(property_name);
+    let target_namespace = property_namespace;
 
     loop {
         let (resolved, event) = reader
@@ -649,9 +688,9 @@ pub fn parse_collection_property(xml: &str, property_name: &str) -> Result<Optio
             .map_err(|error| format!("XML parse error: {error}"))?;
         let name = match &event {
             Event::Start(element) | Event::Empty(element) => {
-                Some(resolved_xml_name(resolved, element.name().as_ref())?)
+                Some(resolved_xml_name(resolved, element.name().as_ref()))
             }
-            Event::End(element) => Some(resolved_xml_name(resolved, element.name().as_ref())?),
+            Event::End(element) => Some(resolved_xml_name(resolved, element.name().as_ref())),
             _ => None,
         };
         match event {
@@ -1147,6 +1186,34 @@ mod tests {
         assert!(sink.failed_hrefs.is_empty());
     }
 
+    #[test]
+    fn default_namespace_less_dav_elements_are_accepted() {
+        let sink = run(r#"<multistatus><response><href>/c/one</href>
+          <propstat><prop><getetag>live</getetag></prop>
+          <status>HTTP/1.1 200 OK</status></propstat>
+          </response></multistatus>"#);
+
+        assert_eq!(
+            sink.entries,
+            vec![("/c/one".to_string(), Some("live".to_string()))]
+        );
+    }
+
+    #[test]
+    fn undeclared_dav_prefix_is_tolerated_without_claiming_other_prefixes() {
+        let sink = run(r#"<D:multistatus><D:response><D:href>/c/one</D:href>
+          <D:propstat><D:prop><D:getetag>live</D:getetag></D:prop>
+          <X:status>HTTP/1.1 403 Forbidden</X:status></D:propstat>
+          </D:response></D:multistatus>"#);
+
+        assert_eq!(
+            sink.entries,
+            vec![("/c/one".to_string(), Some("live".to_string()))],
+            "the conventional undeclared D prefix resolves as DAV, while an unknown X prefix does not"
+        );
+        assert!(sink.failed_hrefs.is_empty());
+    }
+
     /// The same hole in the href extractor: hrefs inside a propstat whose
     /// status is an empty element were published as though the block had
     /// succeeded, which is how a refused home-set or address-set reads as a
@@ -1159,9 +1226,13 @@ mod tests {
           </D:response></D:multistatus>"#;
 
         assert!(
-            extract_href_properties(xml, "calendar-home-set")
-                .expect("valid XML")
-                .is_empty()
+            extract_href_properties_in_namespace(
+                xml,
+                "urn:ietf:params:xml:ns:caldav",
+                "calendar-home-set",
+            )
+            .expect("valid XML")
+            .is_empty()
         );
     }
 
@@ -1176,8 +1247,46 @@ mod tests {
         </D:multistatus>"#;
 
         assert_eq!(
-            extract_href_properties(xml, "calendar-home-set").expect("valid XML"),
+            extract_href_properties_in_namespace(
+                xml,
+                "urn:ietf:params:xml:ns:caldav",
+                "calendar-home-set",
+            )
+            .expect("valid XML"),
             vec!["/right".to_string()]
+        );
+    }
+
+    #[test]
+    fn href_extraction_accepts_a_caller_supplied_extension_namespace() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:" xmlns:V="urn:vendor:future">
+          <D:response><D:propstat><D:prop>
+            <D:future-home><D:href>/wrong</D:href></D:future-home>
+            <V:future-home><D:href>/right</D:href></V:future-home>
+          </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+        </D:multistatus>"#;
+
+        assert_eq!(
+            extract_href_properties_in_namespace(xml, "urn:vendor:future", "future-home")
+                .expect("valid XML"),
+            vec!["/right".to_string()]
+        );
+    }
+
+    #[test]
+    fn collection_property_accepts_a_caller_supplied_extension_namespace() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:" xmlns:V="urn:vendor:future">
+          <D:response><D:propstat><D:prop>
+            <D:future-token>wrong</D:future-token>
+            <V:future-token>right</V:future-token>
+          </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+        </D:multistatus>"#;
+
+        assert_eq!(
+            parse_collection_property_in_namespace(xml, "urn:vendor:future", "future-token")
+                .expect("valid XML")
+                .as_deref(),
+            Some("right")
         );
     }
 
@@ -1193,7 +1302,8 @@ mod tests {
           </D:response></D:multistatus>"#;
 
         assert_eq!(
-            parse_collection_property(xml, "getctag").expect("valid XML"),
+            parse_collection_property_in_namespace(xml, "http://calendarserver.org/ns/", "getctag")
+                .expect("valid XML"),
             None
         );
     }
@@ -1244,7 +1354,7 @@ mod tests {
           </D:response></D:multistatus>"#;
 
         assert_eq!(
-            extract_href_properties(href, "owner").expect("valid XML"),
+            extract_href_properties_in_namespace(href, DAV_NAMESPACE, "owner").expect("valid XML"),
             vec!["real".to_string()],
             "the empty child resets the accumulator, as a non-empty one does"
         );
@@ -1256,7 +1366,12 @@ mod tests {
           </D:response></D:multistatus>"#;
 
         assert_eq!(
-            parse_collection_property(ctag, "getctag").expect("valid XML"),
+            parse_collection_property_in_namespace(
+                ctag,
+                "http://calendarserver.org/ns/",
+                "getctag"
+            )
+            .expect("valid XML"),
             Some("fresh".to_string()),
             "and the collection reader agrees with both of its siblings"
         );
@@ -1273,7 +1388,8 @@ mod tests {
           </D:response></D:multistatus>"#;
 
         assert_eq!(
-            parse_collection_property(xml, "getctag").expect("valid XML"),
+            parse_collection_property_in_namespace(xml, "http://calendarserver.org/ns/", "getctag")
+                .expect("valid XML"),
             Some("live".to_string())
         );
     }

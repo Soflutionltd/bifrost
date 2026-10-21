@@ -608,6 +608,17 @@ impl Session {
             .max(1)
     }
 
+    /// How many upload requests this session admits at once. Missing or zero
+    /// values use a serial upload lane, matching the API concurrency reader's
+    /// safe minimum instead of creating a zero-permit gate that cannot make
+    /// progress.
+    pub(crate) fn upload_concurrency(&self) -> usize {
+        self.core_capabilities()
+            .and_then(CoreCapabilities::max_concurrent_upload)
+            .unwrap_or(1)
+            .max(1)
+    }
+
     session_cap_accessor!(
         websocket_capabilities,
         websocket_capability_state,

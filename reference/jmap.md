@@ -123,7 +123,9 @@ order; swapping the tail into the vacated slot reorders later lookups.
 - `HttpTransport` - api_request, upload, download, get_session (returns `Bytes`).
 - `ClientBuilder::connect` probes the RFC 8620 origin-rooted
   `/.well-known/jmap` URL first. If the configured base has a path, only an
-  origin 404 triggers a second probe below that path. The URL that succeeds is
+  origin 404 triggers a second probe below that path. Other origin errors are
+  preserved, and a successful HTTP response is parsed as the origin session;
+  a malformed body does not trigger a path fallback. The URL that succeeds is
   retained for session refresh. Query and fragment components do not take part
   in discovery.
 - `SseTransport` - open_sse (EventSource, with `last_event_id` support).
@@ -449,31 +451,26 @@ as `Timeout { Unsent }` without ever reaching the wire. `Unsent` is the honest
 evidence - nothing was sent, so any method may be replayed - and the recovery
 mapping treats it as such. Requests sent
 over the RFC 8887 WebSocket do not go through `bifrost-net` and are not gated.
-`the_session_limit_gates_api_requests_and_not_downloads` and
-`every_installed_session_bounds_the_transports_api_concurrency` pin both halves.
+`session_limits_gate_api_and_upload_requests_separately` and
+`every_installed_session_updates_the_transports_concurrency_limits` pin the
+separate transport gates and their session refresh.
 
-### `maxConcurrentUpload` is parsed and deliberately unread
+### Upload requests honor their own core limits
 
-`CoreCapabilities::max_concurrent_upload` has no reader, and that is the
-correct state, not an oversight. Every upload door in this crate awaits one
-upload at a time - `Account::upload` is a single request, and its callers
-(`pim::attachment_upload`, the inline/attachment loops in the send path, the
-sieve script body upload in `filters.rs`) iterate sequentially with an `await`
-per item. There is no concurrent upload for the limit to govern, so a reader
-would have to invent the fan-out first. The two places the crate does put
-overlapping requests on the wire - the foreign-account probes at open and
-the `filters_list` script-blob downloads - are governed by
-`maxConcurrentRequests` instead, which `api_request_concurrency` already
-honours (clamped to `[1, 8]`) for both.
+Separate account operations can upload at the same time even though each
+individual upload door awaits one request. `Session::upload_concurrency` reads
+`maxConcurrentUpload`, using one as the serial minimum when the member is
+omitted or zero. The client installs that value on the transport with each
+session, and `ReqwestTransport` applies it only to upload endpoint requests.
+This gate is shared across tasks using the same client. API requests continue
+to use `maxConcurrentRequests`, and downloads have no upload gate.
 
-The field stays parsed, and stays an `Option<usize>` like every other core
-limit, so that adding concurrent uploads later is a reader change rather than a
-parser change - and so an omitted limit never zero-fills into "advertised 0".
-`core_max_concurrent_upload_is_parsed_even_though_nothing_reads_it` pins the
-decode. Anything that grows a concurrent upload path must read it there; unlike
-the four limits `build` validates, an absent or zero `maxConcurrentUpload` is
-NOT a contract violation, because RFC 8620 §2 mandates the member but a client
-that never uploads concurrently has nothing to refuse.
+`Client::upload_to` checks the byte length against `maxSizeUpload` before it
+calls the transport. An oversized upload returns `Request(Malformed)` with the
+advertised and actual sizes, so the file body never reaches the server. When
+the optional parsed value is absent, there is no client-side size ceiling;
+`maxSizeUpload` remains an `Option<usize>` so absence is distinguishable from
+an advertised zero. An advertised zero permits only an empty upload.
 
 ## Feature gates
 
@@ -663,12 +660,12 @@ Validation rules in `state::decode`:
 
 Supported scopes for `inventory_stream` and `changes_stream`:
 
-- `CursorScope::Type(ObjectType::Email)` - inventory walks `Email/query` (`receivedAt` desc) then `Email/get` with the fixed inventory property set. The first query starts at position zero; every later page uses the previous page's last id as `anchor` with `anchorOffset: 1`. The walk allows `queryState` to move: immutable `receivedAt` plus the stable tie ordering required by RFC 8620 s5.5 keep surviving messages on the same side of the anchor. New arrivals or membership moves behind it are recovered through the change cursor established before inventory. A lost anchor returns `anchorNotFound`, classified as `SyncState(CursorInvalid)` -> `RestartScope`, without `Done`. Other errors likewise terminate without `Done`; only an empty query completes the walk, even if its state moved. A short page does not prove completion: RFC 8620 s5.5 permits servers to clamp the requested query limit independently. Contact and calendar page walks still pin state because their sort properties can change - see "PIM page cursors". `inventory_partitioning` reports `Full`: a positional `PageCount` plan would lose the anchor between engine partition calls and reopen the deletion-shift skip at every boundary. Explicit page partitions are refused rather than claiming coverage. Primary and foreign-account inventory share ONE loop, `inventory::email_inventory_loop`, exactly as the change walks share `changes::changes_walk`: the only parameter that varies is the `owner` tag - `Some(accountId)` for a foreign scope, which qualifies the emitted ids and memberships into the owning account's namespace AND routes a permission denial into a per-scope quarantine, and with `None` reduces to the plain error mapping the primary walk always used, since `shared_scope_error` with no owner is `into_account_error`.
+- `CursorScope::Type(ObjectType::Email)` - inventory walks `Email/query` (`receivedAt` desc) then `Email/get` with the fixed inventory property set. The first query starts at position zero; every later page uses the previous page's last id as `anchor` with `anchorOffset: 1`. The walk allows `queryState` to move: immutable `receivedAt` plus the stable tie ordering required by RFC 8620 s5.5 keep surviving messages on the same side of the anchor. New arrivals or membership moves behind it are recovered through the change cursor established before inventory. `anchorNotFound` on an Email/query that sent an anchor is classified as `SyncState(CursorInvalid)` -> `RestartScope`, without `Done`; Email/get has the same cursor scope but sends no anchor and keeps the protocol contract-violation mapping. Other errors likewise terminate without `Done`; only an empty query completes the walk, even if its state moved. A short page does not prove completion: RFC 8620 s5.5 permits servers to clamp the requested query limit independently. Contact and calendar page walks still pin state because their sort properties can change - see "PIM page cursors". `inventory_partitioning` reports `Full`: a positional `PageCount` plan would lose the anchor between engine partition calls and reopen the deletion-shift skip at every boundary. Explicit page partitions are refused rather than claiming coverage. Primary and foreign-account inventory share ONE loop, `inventory::email_inventory_loop`, exactly as the change walks share `changes::changes_walk`: the only parameter that varies is the `owner` tag - `Some(accountId)` for a foreign scope, which qualifies the emitted ids and memberships into the owning account's namespace AND routes a permission denial into a per-scope quarantine, and with `None` reduces to the plain error mapping the primary walk always used, since `shared_scope_error` with no owner is `into_account_error`.
 - `CursorScope::Type(ObjectType::Mailbox)` - inventory pages `Mailbox/query` (sortOrder, then name) by the previous page's last id as `anchor` with `anchorOffset: 1`, then fetches each page with `Mailbox/get` at `maxObjectsInGet` (Id, Name, ParentId, Role, SortOrder, totals, unread counts, IsSubscribed). It never sends an unbounded `Mailbox/get ids: null`, which can exceed the server's `maxObjectsInGet`. The walk continues after short query pages and completes only on an empty query, just like Email inventory. Changes use `Mailbox/changes`.
 - `CursorScope::Type(ObjectType::Thread)` and `CursorScope::Query(_)` are not discovered. A legacy cursor for either terminates unsupported: thread inventory derives from email inventory, and the v1 trait has no registered query definition to supply an `Email/queryChanges` filter/sort.
 - `CursorScope::Folder(FolderId(encode_foreign_account(account_id)))` - a foreign (shared/delegate) account, one account-level scope per share. Inventory paginates an UNFILTERED `Email/query` against the foreign account handle (one walk per share); changes use that account's `Email/changes`, which is account-wide and cannot be filtered by mailbox - which is exactly why the topology is one scope per account, never one per mailbox (a per-mailbox topology streamed the identical change set once per mailbox and fanned every foreign push out M ways). Per-mailbox membership is learned at hydration from the qualified `mailboxIds`, the same model the primary `Type(Email)` scope uses. A legacy per-mailbox `Folder` cursor still decodes and takes an `inMailbox`-filtered inventory walk, but is never seeded. See "Foreign (shared/delegate) accounts".
 
-Every change-stream batch carries a `Checkpoint::Change(ChangeCursor)` whose state string is the post-call `newState`. The loop continues until `hasMoreChanges` is false, then emits `SyncEvent::Done`. A forward-progress guard terminates the loop as a `Protocol(ContractViolation)` when a server answers `hasMoreChanges: true` with `newState == sinceState` (RFC 8620 s5.2 requires `newState` to reflect the served changes) - the guard fires before that page's batch, so nothing is lost: the state never moved and the next drive replays from it. A second guard covers the case the first cannot see: a server alternating between two states moves the state at every single step, so each step looks like progress while the walk paginates forever. Each change walk therefore remembers the states it has served and terminates the same way when one comes back. The Email, Mailbox and foreign `Folder` scopes all run ONE paginated walk, `changes::changes_walk`, generic over the `*/changes` method (`core::changes::ChangesMethod`, implemented by `define_changes_method!` so a new `*/changes` object gets it for free). Three things vary and are parameters, not copies: the method (whose `NAME` is also the guard's diagnostic), the `owner` tag - `Some(accountId)` only for a foreign scope, which both qualifies the emitted change ids into the owning account's namespace AND routes a permission denial into a per-scope quarantine, and with `None` reduces to the plain error mapping the primary walks always used - and the per-`accountId` state cache the scope advances. `StateWalk` in `sync/state_walk.rs` owns the progress guards, recovery policy, and error context for changes, lifecycle, and inventory walks. Change and lifecycle walks share the guard for `hasMoreChanges: true` with an unmoved or repeated state; the lifecycle guard resets at each poll pause. Inventory does not send a prior state and accepts `queryState` churn, but the same type owns the anchor guard and refuses a page that re-serves the prior anchor, terminating as a `Protocol(ContractViolation)` WITHOUT a `Done` rather than recording unproved coverage. Change and lifecycle requests are marked state-based, while inventory calls carry cursor scope without that flag. State expiry in durable changes restarts the scope through the engine, lifecycle reconciles a fresh mailbox snapshot locally, and an inventory anchor loss restarts its scope. `cannotCalculateChanges` or `tooManyChanges` on a stateless inventory query or get is a `Protocol(ContractViolation)`. The per-`accountId` `state_cache` maps advance compare-and-swap style (keyed by the scope's accountId) so a stale writer does not clobber a newer state.
+Every change-stream batch carries a `Checkpoint::Change(ChangeCursor)` whose state string is the post-call `newState`. The loop continues until `hasMoreChanges` is false, then emits `SyncEvent::Done`. A forward-progress guard terminates the loop as a `Protocol(ContractViolation)` when a server answers `hasMoreChanges: true` with `newState == sinceState` (RFC 8620 s5.2 requires `newState` to reflect the served changes) - the guard fires before that page's batch, so nothing is lost: the state never moved and the next drive replays from it. A second guard covers the case the first cannot see: a server alternating between two states moves the state at every single step, so each step looks like progress while the walk paginates forever. Each change walk therefore remembers the states it has served and terminates the same way when one comes back. The Email, Mailbox and foreign `Folder` scopes all run ONE paginated walk, `changes::changes_walk`, generic over the `*/changes` method (`core::changes::ChangesMethod`, implemented by `define_changes_method!` so a new `*/changes` object gets it for free). Three things vary and are parameters, not copies: the method (whose `NAME` is also the guard's diagnostic), the `owner` tag - `Some(accountId)` only for a foreign scope, which both qualifies the emitted change ids into the owning account's namespace AND routes a permission denial into a per-scope quarantine, and with `None` reduces to the plain error mapping the primary walks always used - and the per-`accountId` state cache the scope advances. `StateWalk` in `sync/state_walk.rs` owns the progress guards, recovery policy, and error context for changes, lifecycle, and inventory walks. Change and lifecycle walks share the guard for `hasMoreChanges: true` with an unmoved or repeated state; the lifecycle guard resets at each poll pause. Inventory does not send a prior state and accepts `queryState` churn, but the same type owns the anchor guard and refuses a page that re-serves the prior anchor, terminating as a `Protocol(ContractViolation)` WITHOUT a `Done` rather than recording unproved coverage. Change and lifecycle requests are marked state-based. Inventory query contexts also mark whether that specific query sent an anchor; get contexts carry only cursor scope. State expiry in durable changes restarts the scope through the engine, lifecycle reconciles a fresh mailbox snapshot locally, and an inventory anchor loss restarts its scope. `cannotCalculateChanges` or `tooManyChanges` on a stateless inventory query or get is a `Protocol(ContractViolation)`. The per-`accountId` `state_cache` maps advance compare-and-swap style (keyed by the scope's accountId) so a stale writer does not clobber a newer state.
 
 The CAS is exact: an expected state advances only an entry containing that state. It cannot initialize an absent or explicitly empty entry. Only an advance with no expected state may initialize those shapes.
 
@@ -1059,8 +1056,10 @@ arrived) and, unless its primary cause already is one, the typed
   changes and lifecycle walks mark their requests state-based. Lifecycle
   handles `CursorInvalid` locally by reconciling a fresh name snapshot.
 - `Method(anchorNotFound)` -> `SyncState(CursorInvalid)` ->
-  `Engine(RestartScope)` when the caller supplies a cursor scope; without one it
-  is `Protocol(ContractViolation)`.
+  `Engine(RestartScope)` only when the request context explicitly marks an
+  anchored query and carries a cursor scope. A cursor-scoped `get` or an
+  unanchored first-page query remains `Protocol(ContractViolation)`; an
+  anchored-query context without a cursor scope is an internal invariant error.
 - `Method(serverUnavailable | serverFail)` -> `Server(Unavailable)` ->
   `Retry::SameRequest`. `Method(serverPartialFail)` is different: some calls
   may have committed, so it is `Protocol(PartialResponse)` (the wire cause is

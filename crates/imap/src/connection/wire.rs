@@ -16,7 +16,7 @@ use bifrost_net::{BandwidthBudget, BandwidthDirection, MeterSinkHandle, Reservat
 use bytes::BytesMut;
 use tracing::{trace, warn};
 
-use crate::codec::decode::parse_response_utf8;
+use crate::codec::decode::parse_response_bytes;
 use crate::error::Error;
 use crate::types::Response;
 
@@ -333,7 +333,7 @@ impl WireReader {
 
     /// Try to parse a response from the internal buffer.
     ///
-    /// Uses `parse_response_utf8` in UTF-8 mode when the caller indicates
+    /// Uses the UTF-8 parser mode when the caller indicates
     /// `UTF8=ACCEPT` (RFC 6855 Section 3) or `IMAP4rev2` is active
     /// (RFC 9051 Section 7: quoted-strings carry raw UTF-8).
     fn try_parse_response_limited(
@@ -352,30 +352,31 @@ impl WireReader {
         //
         // Every IMAP response ends with \r\n. If the buffer doesn't contain
         // \r\n at all, the first response is definitely incomplete.
-        if !buffer_may_contain_complete_response_limited(&self.buf, limit)? {
+        let Some(frame_len) = response_frame_len_limited(&self.buf, limit)? else {
             return Ok(Option::None);
-        }
+        };
+        // Freeze one complete response so FETCH literals can retain slices
+        // into its allocation. Any following response bytes stay mutable.
+        let frame = self.buf.split_to(frame_len).freeze();
 
-        match parse_response_utf8(&self.buf, utf8_mode) {
+        match parse_response_bytes(&frame, utf8_mode) {
             Ok((remaining, resp)) => {
-                let consumed = self.buf.len() - remaining.len();
-                let _ = self.buf.split_to(consumed);
+                if !remaining.is_empty() {
+                    let mut restored = BytesMut::with_capacity(remaining.len() + self.buf.len());
+                    restored.extend_from_slice(remaining);
+                    restored.extend_from_slice(&self.buf);
+                    self.buf = restored;
+                }
                 Ok(Some(resp))
             }
-            Err(nom::Err::Incomplete(_)) => Ok(Option::None),
+            Err(nom::Err::Incomplete(_)) => {
+                let mut restored = BytesMut::with_capacity(frame.len() + self.buf.len());
+                restored.extend_from_slice(&frame);
+                restored.extend_from_slice(&self.buf);
+                self.buf = restored;
+                Ok(Option::None)
+            }
             Err(e) => {
-                // The parser failed even though we thought the data was
-                // complete. If the buffer doesn't end with \r\n, it's
-                // likely a partial read that our heuristic didn't catch
-                // (e.g., literal data spanning TCP segments).
-                if !self.buf.ends_with(b"\r\n") {
-                    trace!(
-                        "parse Error on buffer not ending with CRLF  -  treating as incomplete \
-                         ({} bytes buffered)",
-                        self.buf.len()
-                    );
-                    return Ok(Option::None);
-                }
                 warn!("response parse error: {e}");
                 Err(Error::Parse(format!("response parse error: {e}")))
             }
@@ -520,6 +521,12 @@ fn buffer_may_contain_complete_response_limited(
     buf: &[u8],
     limit: Option<usize>,
 ) -> Result<bool, Error> {
+    Ok(response_frame_len_limited(buf, limit)?.is_some())
+}
+
+/// Return the length of the first complete response, checking its literal
+/// budget before accepting each declared payload.
+fn response_frame_len_limited(buf: &[u8], limit: Option<usize>) -> Result<Option<usize>, Error> {
     // Bound literal payloads before asking for more octets. A response can
     // chain literals, so charge their sum, not just the largest one. Syntax
     // and the consumer's retained-object estimate are separate quantities.
@@ -542,7 +549,7 @@ fn buffer_may_contain_complete_response_limited(
     };
     // Fast path: no \r\n means definitely incomplete.
     let Some(first_crlf) = buf.windows(2).position(|w| w == b"\r\n") else {
-        return Ok(false);
+        return Ok(None);
     };
 
     // Check for a literal marker `{digits[+]}\r\n` ending at first_crlf.
@@ -618,12 +625,12 @@ fn buffer_may_contain_complete_response_limited(
         let mut pos = advance_past_literal(first_crlf, 2, literal_len)?;
         loop {
             if pos > buf.len() {
-                return Ok(false);
+                return Ok(None);
             }
             // Find the next \r\n after the current literal body.
             let remaining = &buf[pos..];
             let Some(next_crlf) = remaining.windows(2).position(|w| w == b"\r\n") else {
-                return Ok(false);
+                return Ok(None);
             };
             // Check if there's another literal marker at this CRLF.
             if let Some(next_literal_len) = try_parse_literal_marker(remaining, next_crlf)? {
@@ -633,12 +640,12 @@ fn buffer_may_contain_complete_response_limited(
                 continue;
             }
             // No more literals  -  this CRLF terminates the response.
-            return Ok(true);
+            return Ok(Some(pos + next_crlf + 2));
         }
     }
 
     // No literal  -  the first \r\n likely terminates a complete response.
-    Ok(true)
+    Ok(Some(first_crlf + 2))
 }
 
 /// Offset of the byte after a literal body that starts `marker` bytes past

@@ -423,30 +423,23 @@ impl CardDavAccount {
     /// `ctag` says where the collection tag comes from, because the callers
     /// differ in what they already know:
     ///
-    /// - [`CtagSource::Home`] runs the depth-1 PROPFIND over the address book
-    ///   home and picks this collection out of it. Cursor establishment and
-    ///   inventory use it: they have no prior cursor to compare against, and
-    ///   the listing also refreshes the client's observed directory URLs.
+    /// - [`CtagSource::Collection`] reads this collection at depth 0. Cursor
+    ///   establishment and inventory use it: they have no prior cursor to
+    ///   compare against. The response also carries `resourcetype`, allowing
+    ///   the client to observe a directory marker without listing the home.
     /// - [`CtagSource::Known`] takes a value the caller already has. The poll
     ///   path uses it, because deciding whether to short-circuit at all
-    ///   required asking for the ctag first - re-deriving it from a depth-1
-    ///   listing of the whole home made a changed-ctag poll cost three round
-    ///   trips where two suffice, and that listing grows with the number of
-    ///   address books rather than staying one collection wide.
+    ///   required asking for the ctag first, and re-deriving it would spend an
+    ///   extra request.
     pub(crate) async fn contact_snapshot(
         client: &CardDavClient,
-        ctag: CtagSource<'_>,
+        ctag: CtagSource,
         addressbook: &str,
         operation: AccountOperation,
     ) -> Result<ContactSnapshot, AccountError> {
         client.refuse_directory_access(addressbook, operation)?;
         let ctag = match ctag {
-            CtagSource::Home(home) => client
-                .list_addressbooks_for_operation(home, operation)
-                .await?
-                .into_iter()
-                .find(|collection| same_collection_url(&collection.href, addressbook))
-                .and_then(|collection| collection.ctag),
+            CtagSource::Collection => client.collection_ctag(addressbook, operation).await?,
             CtagSource::Known(ctag) => ctag,
         };
         let listing = client.list_contacts_listing(addressbook, operation).await?;
@@ -497,9 +490,9 @@ impl CardDavAccount {
 }
 
 /// Where [`CardDavAccount::contact_snapshot`] gets a collection's ctag.
-pub(crate) enum CtagSource<'a> {
-    /// Pick it out of a depth-1 PROPFIND over the address book home.
-    Home(&'a str),
+pub(crate) enum CtagSource {
+    /// Read it directly from the selected address book collection.
+    Collection,
     /// Use a value the caller already resolved, spending no request.
     Known(Option<String>),
 }
@@ -562,7 +555,6 @@ impl Account for CardDavAccount {
         scope: CursorScope,
     ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
         let client = Arc::clone(&self.client);
-        let home = self.addressbook_home.clone();
         let default_addressbook = self.default_addressbook_url.clone();
         let addressbook_urls = self.addressbook_urls.clone();
         Box::pin(async move {
@@ -575,7 +567,7 @@ impl Account for CardDavAccount {
             )?;
             let snapshot = Self::contact_snapshot(
                 &client,
-                CtagSource::Home(&home),
+                CtagSource::Collection,
                 &addressbook,
                 AccountOperation::EstablishCursor,
             )
@@ -589,7 +581,6 @@ impl Account for CardDavAccount {
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         let (client, tally) = self.client.metered();
-        let home = self.addressbook_home.clone();
         let default_addressbook = self.default_addressbook_url.clone();
         let addressbook_urls = self.addressbook_urls.clone();
         let coverage_scope = scope.clone();
@@ -622,7 +613,7 @@ impl Account for CardDavAccount {
                 let started = Instant::now();
                 let snapshot = match Self::contact_snapshot(
                     &client,
-                    CtagSource::Home(&home),
+                    CtagSource::Collection,
                     &addressbook,
                     AccountOperation::SyncInventory,
                 )
@@ -2183,27 +2174,32 @@ mod tests {
 
     #[tokio::test]
     async fn inventory_batch_counts_the_response_bodies_it_consumes() {
-        let addressbook = "https://dav.example.test/books/";
-        let home_response = book_multistatus(
-            r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav" xmlns:CS="http://calendarserver.org/ns/">
-              <D:response><D:href>/books/</D:href><D:propstat><D:prop>
+        let addressbook_home = "https://dav.example.test/books/";
+        let addressbook = "https://dav.example.test/books/ada/";
+        let collection_response = DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav" xmlns:CS="http://calendarserver.org/ns/">
+              <D:response><D:href>/books/ada/</D:href><D:propstat><D:prop>
                 <D:resourcetype><D:collection/><C:addressbook/></D:resourcetype>
                 <CS:getctag>42</CS:getctag>
               </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
             </D:multistatus>"#
                 .to_string(),
-        );
+            url: addressbook.to_string(),
+        };
         let contacts_response = book_multistatus(
-            r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href>/books/one.vcf</D:href><D:propstat><D:prop><D:getetag>"e1"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#
+            r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href>/books/ada/one.vcf</D:href><D:propstat><D:prop><D:getetag>"e1"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#
                 .to_string(),
         );
-        let expected_bytes = (home_response.body.len() + contacts_response.body.len()) as u64;
-        let script = dav_script([home_response, contacts_response]);
+        let expected_bytes = (collection_response.body.len() + contacts_response.body.len()) as u64;
+        let script = dav_script([collection_response, contacts_response]);
         let client = Arc::new(CardDavClient::with_account_net(
             "https://dav.example.test",
             scripted_dav_net(&script),
         ));
-        let account = CardDavAccount::for_tests(client, addressbook);
+        let mut account = CardDavAccount::for_tests_with_collections(client, addressbook, vec![]);
+        account.addressbook_home = addressbook_home.to_string();
         let scope = CursorScope::Folder(bifrost_types::FolderId(addressbook.to_string()));
         let events = account.inventory_stream(scope).collect::<Vec<_>>().await;
 
@@ -2211,6 +2207,86 @@ mod tests {
             panic!("expected inventory batch: {events:?}");
         };
         assert_eq!(batch.bytes_in, expected_bytes);
+
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].url, addressbook);
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("depth")
+                .and_then(|value| value.to_str().ok()),
+            Some("0")
+        );
+        assert!(requests[0].body.contains("<D:resourcetype/>"));
+        assert_eq!(requests[1].url, addressbook);
+        assert_eq!(
+            requests[1]
+                .headers
+                .get("depth")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_establishment_reads_ctag_from_its_collection() {
+        let home = "https://dav.example.test/books/";
+        let addressbook = "https://dav.example.test/books/ada/";
+        let collection = DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav" xmlns:CS="http://calendarserver.org/ns/">
+              <D:response><D:href>/books/ada/</D:href><D:propstat><D:prop>
+                <D:resourcetype><D:collection/><C:addressbook/></D:resourcetype>
+                <CS:getctag>42</CS:getctag>
+              </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+            </D:multistatus>"#
+                .to_string(),
+            url: addressbook.to_string(),
+        };
+        let contacts = DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href>/books/ada/one.vcf</D:href>
+              <D:propstat><D:prop><D:getetag>"e1"</D:getetag></D:prop>
+              <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#
+                .to_string(),
+            url: addressbook.to_string(),
+        };
+        let script = dav_script([collection, contacts]);
+        let client = Arc::new(CardDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&script),
+        ));
+        let mut account = CardDavAccount::for_tests_with_collections(client, addressbook, vec![]);
+        account.addressbook_home = home.to_string();
+
+        account
+            .establish_initial_cursor(CursorScope::Folder(bifrost_types::FolderId(
+                addressbook.to_string(),
+            )))
+            .await
+            .expect("collection cursor establishes");
+
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].url, addressbook);
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("depth")
+                .and_then(|value| value.to_str().ok()),
+            Some("0")
+        );
+        assert_eq!(requests[1].url, addressbook);
+        assert_eq!(
+            requests[1]
+                .headers
+                .get("depth")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
     }
 
     #[tokio::test]

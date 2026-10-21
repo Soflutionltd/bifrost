@@ -7136,7 +7136,7 @@ fn fetch_literal8_body_section() {
     );
     let (_, fr) = fetch_response_inner(input.as_bytes(), false).unwrap();
     assert_eq!(fr.body_sections.len(), 1);
-    assert_eq!(fr.body_sections[0].data, Some(body.to_vec()));
+    assert_eq!(fr.body_sections[0].data.as_deref(), Some(&body[..]));
 }
 
 /// literal8 in a FETCH ENVELOPE subject field.

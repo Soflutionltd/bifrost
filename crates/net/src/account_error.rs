@@ -32,19 +32,11 @@ pub struct NetErrorContext {
     pub scope: Option<ErrorScope>,
 }
 
-#[must_use]
-pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
-    let throttle_scope = legacy_throttle_scope(&ctx);
-    into_account_error_with_throttle_scope(error, ctx, throttle_scope)
-}
-
 /// Translate a transport error using the caller's provider throttle policy.
 ///
 /// Provider crates know whether a server's throttle should pause an account,
 /// mailbox, or only the current operation. This entry point lets them carry
 /// that decision through net's generic status and local-hold translation.
-/// The compatibility [`into_account_error`] entry point keeps its historical
-/// provider inference for downstream callers of that published API.
 #[must_use]
 pub fn into_account_error_with_throttle_scope(
     error: Error,
@@ -858,25 +850,6 @@ fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
     }
 }
 
-/// Preserve the old context-derived behavior for callers of
-/// `into_account_error`. Generic translation has no account-specific identity;
-/// provider funnels should use `into_account_error_with_throttle_scope` and
-/// supply their own documented policy. Workspace migration does not prove
-/// downstream callers no longer depend on this published entry point's behavior;
-/// removing the inference needs an explicit compatibility decision.
-fn legacy_throttle_scope(ctx: &NetErrorContext) -> Option<ThrottleScope> {
-    if ctx.protocol == Protocol::Graph
-        || ctx.provider == Some(Provider::Microsoft)
-        || ctx.protocol == Protocol::Gmail
-        || ctx.provider == Some(Provider::Gmail)
-        || (ctx.protocol == Protocol::Jmap && ctx.provider == Some(Provider::Fastmail))
-    {
-        Some(ThrottleScope::Account)
-    } else {
-        None
-    }
-}
-
 fn support_cause_from_source(error: &Error) -> Option<Cause> {
     match error {
         Error::AttemptHistory { source, .. } => support_cause_from_source(source),
@@ -985,7 +958,7 @@ mod retry_hint_tests {
             },
         ];
         for error in errors {
-            let error = into_account_error(
+            let error = into_account_error_with_throttle_scope(
                 error,
                 NetErrorContext {
                     provider: None,
@@ -993,6 +966,7 @@ mod retry_hint_tests {
                     operation: AccountOperation::SyncChanges,
                     scope: None,
                 },
+                None,
             );
             let RecoveryClass::Retry(advice) = error.recovery() else {
                 panic!("expected retry: {:?}", error.recovery());
@@ -1009,7 +983,7 @@ mod refresh_deadline_tests {
     #[test]
     fn refresh_transport_failure_preserves_outer_quiet_deadline() {
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1234);
-        let error = into_account_error(
+        let error = into_account_error_with_throttle_scope(
             Error::RefreshFailed {
                 retry_after: Some(at),
                 source: std::sync::Arc::new(Error::Timeout {
@@ -1022,6 +996,7 @@ mod refresh_deadline_tests {
                 operation: AccountOperation::SyncChanges,
                 scope: None,
             },
+            None,
         );
         let bifrost_types::RecoveryClass::Retry(advice) = error.recovery() else {
             panic!("refresh failure must remain retryable");
@@ -1035,7 +1010,7 @@ mod explicit_throttle_scope_tests {
     use super::*;
 
     #[test]
-    fn caller_policy_overrides_legacy_provider_inference() {
+    fn caller_policy_sets_scope_without_provider_inference() {
         let ctx = NetErrorContext {
             provider: Some(Provider::Microsoft),
             protocol: Protocol::Graph,
@@ -1052,7 +1027,7 @@ mod explicit_throttle_scope_tests {
         assert_eq!(
             unscoped.telemetry_fields().throttle_scope,
             None,
-            "an explicit lack of caller policy must not fall back to provider inference"
+            "an explicit lack of caller policy must not infer a throttle scope"
         );
 
         let scoped = into_account_error_with_throttle_scope(

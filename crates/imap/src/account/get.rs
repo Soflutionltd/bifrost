@@ -496,9 +496,7 @@ fn fetch_to_hydrated(
             fetch,
             shared_owner,
         )),
-        _ => HydratedObjectKind::RawMime(bytes::Bytes::from(
-            decode_body(&mut fetch).unwrap_or_default(),
-        )),
+        _ => HydratedObjectKind::RawMime(decode_body(&mut fetch).unwrap_or_default()),
     };
     Some(HydratedObject {
         id,
@@ -773,7 +771,7 @@ mod tests {
             body_sections: vec![crate::types::fetch::BodySection {
                 section: String::new(),
                 origin: Some(0),
-                data: Some(b"Subject: hi\r\n\r\npreview body".to_vec()),
+                data: Some(b"Subject: hi\r\n\r\npreview body".to_vec().into()),
             }],
             ..Default::default()
         };
@@ -867,7 +865,7 @@ mod tests {
         crate::types::fetch::BodySection {
             section: section.to_owned(),
             origin: None,
-            data: Some(data.to_vec()),
+            data: Some(data.to_vec().into()),
         }
     }
 

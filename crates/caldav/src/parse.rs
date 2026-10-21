@@ -1,9 +1,11 @@
 use bifrost_dav_core::{
     APPLE_CALENDAR_NAMESPACE, CALDAV_NAMESPACE, DAV_NAMESPACE, MultiStatusSink, PropSet,
-    ResponseParts, XmlName, classify_207, commit_if_present, normalize_etag,
-    parse_collection_property, parse_multistatus, same_dav_url, trimmed,
+    ResponseParts, XmlName, classify_207, commit_if_present, normalize_etag, parse_multistatus,
+    same_dav_url, trimmed,
 };
-pub(crate) use bifrost_dav_core::{extract_href_properties, extract_href_property};
+pub(crate) use bifrost_dav_core::{
+    extract_href_properties_in_namespace, extract_href_property_in_namespace,
+};
 
 /// Rebase a response href against its request URI, the one funnel every href
 /// this crate reads goes through.
@@ -622,7 +624,7 @@ pub(crate) fn parse_sync_collection_report(xml: &str) -> Result<CalDavSyncReport
 /// committed only from a successful propstat so a stale value in a refused
 /// property cannot revive an invalid cursor.
 pub(crate) fn parse_collection_sync_token(xml: &str) -> Result<Option<String>, String> {
-    parse_collection_property(xml, "sync-token")
+    bifrost_dav_core::parse_collection_property_in_namespace(xml, DAV_NAMESPACE, "sync-token")
 }
 
 #[cfg(test)]
@@ -660,8 +662,9 @@ mod tests {
 
     #[test]
     fn nested_property_status_does_not_refuse_href_property() {
-        let hrefs = extract_href_properties(
+        let hrefs = extract_href_properties_in_namespace(
             r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:response><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><C:calendar-user-address-set><D:href>mailto:right@example.test</D:href><C:extension><D:status>HTTP/1.1 404 Not Found</D:status></C:extension></C:calendar-user-address-set></D:prop></D:propstat></D:response></D:multistatus>"#,
+            CALDAV_NAMESPACE,
             "calendar-user-address-set",
         )
         .expect("valid property");
@@ -1506,8 +1509,9 @@ END:VCALENDAR</C:calendar-data>
         assert_eq!(sync.sync_token.as_deref(), Some("token-2"));
         assert_eq!(sync.entries[0].etag.as_deref(), Some("two"));
 
-        let href = extract_href_property(
+        let href = extract_href_property_in_namespace(
             r#"<D:current-user-principal xmlns:D="DAV:"><D:href><![CDATA[/principals/ada/]]></D:href></D:current-user-principal>"#,
+            DAV_NAMESPACE,
             "current-user-principal",
         )
         .expect("valid property");
@@ -1527,8 +1531,9 @@ END:VCALENDAR</C:calendar-data>
 
     #[test]
     fn address_set_extractor_returns_every_href() {
-        let hrefs = extract_href_properties(
+        let hrefs = extract_href_properties_in_namespace(
             r#"<C:calendar-user-address-set xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:href>/principals/ada/</D:href><D:href>Mailto:Ada@example.test</D:href></C:calendar-user-address-set>"#,
+            CALDAV_NAMESPACE,
             "calendar-user-address-set",
         )
         .expect("valid property");
@@ -1544,8 +1549,9 @@ END:VCALENDAR</C:calendar-data>
 
     #[test]
     fn href_extractors_ignore_failed_propstats() {
-        let hrefs = extract_href_properties(
+        let hrefs = extract_href_properties_in_namespace(
             r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:response><D:propstat><D:prop><C:calendar-user-address-set><D:href>mailto:wrong@example.test</D:href></C:calendar-user-address-set></D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat><D:propstat><D:prop><C:calendar-user-address-set><D:href>mailto:right@example.test</D:href></C:calendar-user-address-set></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
+            CALDAV_NAMESPACE,
             "calendar-user-address-set",
         )
         .expect("valid XML");

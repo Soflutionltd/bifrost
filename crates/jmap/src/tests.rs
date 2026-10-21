@@ -2917,18 +2917,17 @@ mod session_capability_fallbacks {
         }
     }
 
-    /// `maxConcurrentUpload` is parsed and, by design, has no reader (see
-    /// `reference/jmap.md`): every upload door in this crate awaits one
-    /// upload at a time, so there is no concurrency for the limit to
-    /// govern. It still has to survive the session decode, so that wiring
-    /// it later is a reader change and not a parser change.
+    /// Upload calls from separate account operations can overlap, so the
+    /// session's upload endpoint bound must survive decode and be read by the
+    /// transport setup. Missing and zero values choose the serial minimum.
     #[test]
-    fn core_max_concurrent_upload_is_parsed_even_though_nothing_reads_it() {
+    fn core_max_concurrent_upload_is_read_with_a_serial_minimum() {
         let session = session_with(json!({
             "urn:ietf:params:jmap:core": {"maxConcurrentUpload": 4}
         }));
         let core = session.core_capabilities().expect("core cap");
         assert_eq!(core.max_concurrent_upload(), Some(4));
+        assert_eq!(session.upload_concurrency(), 4);
 
         let omitted = session_with(json!({"urn:ietf:params:jmap:core": {}}));
         assert_eq!(
@@ -2939,6 +2938,12 @@ mod session_capability_fallbacks {
             None,
             "omitted must stay distinguishable from an advertised zero"
         );
+        assert_eq!(omitted.upload_concurrency(), 1);
+
+        let zero = session_with(json!({
+            "urn:ietf:params:jmap:core": {"maxConcurrentUpload": 0}
+        }));
+        assert_eq!(zero.upload_concurrency(), 1);
     }
 
     #[test]

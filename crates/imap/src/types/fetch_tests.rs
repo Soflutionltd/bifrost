@@ -121,7 +121,7 @@ fn body_section_full() {
     let section = BodySection {
         section: "HEADER".into(),
         origin: None,
-        data: Some(b"Subject: Hi\r\n".to_vec()),
+        data: Some(b"Subject: Hi\r\n".to_vec().into()),
     };
     assert_eq!(section.section, "HEADER");
     assert!(section.origin.is_none());
@@ -133,7 +133,7 @@ fn body_section_with_origin() {
     let section = BodySection {
         section: "1".into(),
         origin: Some(100),
-        data: Some(b"partial data".to_vec()),
+        data: Some(b"partial data".to_vec().into()),
     };
     assert_eq!(section.origin, Some(100));
 }
@@ -153,7 +153,7 @@ fn body_section_empty_section_string() {
     let section = BodySection {
         section: String::new(),
         origin: None,
-        data: Some(b"full message".to_vec()),
+        data: Some(b"full message".to_vec().into()),
     };
     assert!(section.section.is_empty());
 }
@@ -165,7 +165,7 @@ fn binary_section_basic() {
     let section = BinarySection {
         section: vec![1, 2, 3],
         origin: None,
-        data: Some(vec![0xFF, 0xD8, 0xFF]),
+        data: Some(vec![0xFF, 0xD8, 0xFF].into()),
     };
     assert_eq!(section.section, [1, 2, 3]);
     assert!(section.origin.is_none());
@@ -177,7 +177,7 @@ fn binary_section_with_origin() {
     let section = BinarySection {
         section: vec![1],
         origin: Some(512),
-        data: Some(vec![0x00]),
+        data: Some(vec![0x00].into()),
     };
     assert_eq!(section.origin, Some(512));
 }
@@ -202,12 +202,12 @@ fn fetch_response_multiple_body_sections() {
             BodySection {
                 section: "HEADER".into(),
                 origin: None,
-                data: Some(b"From: alice@example.com\r\n".to_vec()),
+                data: Some(b"From: alice@example.com\r\n".to_vec().into()),
             },
             BodySection {
                 section: "TEXT".into(),
                 origin: None,
-                data: Some(b"Hello world".to_vec()),
+                data: Some(b"Hello world".to_vec().into()),
             },
         ],
         ..Default::default()
@@ -481,7 +481,7 @@ fn body_section_clone_eq() {
     let section = BodySection {
         section: "1.2".into(),
         origin: Some(0),
-        data: Some(b"data".to_vec()),
+        data: Some(b"data".to_vec().into()),
     };
     let cloned = section.clone();
     assert_eq!(section, cloned);

@@ -292,6 +292,9 @@ pub(crate) enum Error {
     /// letting the server reject the whole frame with an opaque
     /// request-level `limit` problem.
     RequestSizeLimit { max: usize, size: usize },
+    /// An upload would exceed the session's advertised `maxSizeUpload`.
+    /// Raised before sending the file body to the upload endpoint.
+    UploadSizeLimit { max: usize, size: usize },
     /// Inbound JSON response decoding failure. Produced when the JMAP
     /// server's reply or session document cannot be parsed as the
     /// expected shape. Maps to `Protocol(ParseFailed)` /
@@ -492,6 +495,9 @@ impl Display for Error {
             }
             Error::RequestSizeLimit { max, size } => {
                 write!(f, "Request of {size} bytes exceeds maxSizeRequest ({max})")
+            }
+            Error::UploadSizeLimit { max, size } => {
+                write!(f, "Upload of {size} bytes exceeds maxSizeUpload ({max})")
             }
             Error::ResponseDecode(e) => write!(f, "Response decode error: {e}"),
             Error::Problem { details, .. } => write!(f, "Problem: {details}"),

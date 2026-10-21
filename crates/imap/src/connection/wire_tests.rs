@@ -343,6 +343,48 @@ async fn read_one_reassembles_a_literal_split_across_writes() {
 }
 
 #[tokio::test]
+async fn fetch_literal_fields_share_the_reader_buffer_without_copying() {
+    let (mut reader, _server) = memory_reader();
+    let wire = b"* 1 FETCH (BODY[] {5}\r\nhello BINARY[1] {4}\r\ndata)\r\nA001 OK done\r\n";
+    reader.buf.extend_from_slice(wire);
+    let buffer_start = reader.buf.as_ptr() as usize;
+    let body_start = wire
+        .windows(b"hello".len())
+        .position(|window| window == b"hello")
+        .expect("body payload is in the response");
+    let binary_start = wire
+        .windows(b"data".len())
+        .position(|window| window == b"data")
+        .expect("binary payload is in the response");
+
+    let response = reader.read_one(false).await.expect("valid FETCH response");
+    let Response::Untagged(response) = response else {
+        panic!("expected untagged FETCH response");
+    };
+    let UntaggedResponse::Fetch(fetch) = *response else {
+        panic!("expected FETCH response");
+    };
+    let body = fetch.body_sections[0]
+        .data
+        .as_ref()
+        .expect("body literal present");
+    let binary = fetch.binary_sections[0]
+        .data
+        .as_ref()
+        .expect("binary literal present");
+
+    assert_eq!(body.as_ref(), b"hello");
+    assert_eq!(binary.as_ref(), b"data");
+    assert_eq!(body.as_ptr() as usize, buffer_start + body_start);
+    assert_eq!(binary.as_ptr() as usize, buffer_start + binary_start);
+    assert!(!reader.buffer_is_empty(), "next response stays buffered");
+    assert!(matches!(
+        reader.read_one(false).await.expect("tagged completion"),
+        Response::Tagged(_)
+    ));
+}
+
+#[tokio::test]
 async fn read_one_returns_two_responses_from_one_segment() {
     let (mut reader, mut server) = memory_reader();
     server

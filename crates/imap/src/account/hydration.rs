@@ -64,7 +64,7 @@ impl FetchSelection {
 /// Decode the bytes selected from the shared FETCH surface. Both account
 /// hydration APIs start here; one returns these bytes and the other parses
 /// them through `bifrost_types::mime`.
-pub(super) fn decode_body(fetch: &mut FetchResponse) -> Option<Vec<u8>> {
+pub(super) fn decode_body(fetch: &mut FetchResponse) -> Option<bytes::Bytes> {
     fetch
         .body_sections
         .iter_mut()
@@ -239,17 +239,20 @@ mod tests {
                 BodySection {
                     section: String::new(),
                     origin: None,
-                    data: Some(b"payload".to_vec()),
+                    data: Some(b"payload".to_vec().into()),
                 },
                 BodySection {
                     section: "TEXT".to_owned(),
                     origin: None,
-                    data: Some(b"later".to_vec()),
+                    data: Some(b"later".to_vec().into()),
                 },
             ],
             ..FetchResponse::default()
         };
-        assert_eq!(decode_body(&mut fetch), Some(b"payload".to_vec()));
+        assert_eq!(
+            decode_body(&mut fetch).as_deref(),
+            Some(b"payload".as_slice())
+        );
 
         // Nothing to decode is `None`, not an empty body: the generic path
         // turns that into empty bytes while PIM skips MIME parsing entirely.

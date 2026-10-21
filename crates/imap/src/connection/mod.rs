@@ -361,7 +361,11 @@ impl DriverTask {
     pub(crate) fn is_finished(&self) -> bool {
         self.handle
             .try_lock()
-            .map(|handle| handle.as_ref().is_none_or(tokio::task::JoinHandle::is_finished))
+            .map(|handle| {
+                handle
+                    .as_ref()
+                    .is_none_or(tokio::task::JoinHandle::is_finished)
+            })
             .unwrap_or(false)
     }
 

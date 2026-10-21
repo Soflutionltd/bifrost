@@ -90,6 +90,18 @@ impl StateWalk {
         }
     }
 
+    /// The query door knows whether this page carries an anchor. A scoped
+    /// inventory walk by itself is not enough to classify `anchorNotFound`:
+    /// its `/get` call has the same cursor scope but cannot send an anchor.
+    pub(crate) fn query_error_context(&self, operation: AccountOperation) -> JmapErrorContext {
+        let context = self.error_context(operation);
+        if matches!(&self.progress, WalkProgress::Inventory { anchor: Some(_) }) {
+            context.with_anchored_query()
+        } else {
+            context
+        }
+    }
+
     pub(crate) fn recovery_policy(&self) -> ScopeRecoveryPolicy {
         self.recovery
     }
@@ -202,6 +214,11 @@ mod tests {
                 .error_context(AccountOperation::SyncInventory)
                 .state_based
         );
+        assert!(
+            !inventory
+                .query_error_context(AccountOperation::SyncInventory)
+                .anchored_query
+        );
     }
 
     #[test]
@@ -233,6 +250,17 @@ mod tests {
             None
         );
         assert_eq!(inventory.inventory_anchor(), Some("e2"));
+        assert!(
+            inventory
+                .query_error_context(AccountOperation::SyncInventory)
+                .anchored_query
+        );
+        assert!(
+            !inventory
+                .error_context(AccountOperation::SyncInventory)
+                .anchored_query,
+            "a get call keeps the cursor scope without inheriting the query anchor"
+        );
         assert_eq!(
             inventory.observe_inventory_page(&["e2".to_string()]),
             Some(StateWalkFault::RepeatedAnchor)

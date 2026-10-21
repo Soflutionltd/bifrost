@@ -17,8 +17,8 @@ use bifrost_types::{AccountError, AccountOperation};
 
 use crate::dispatch::DavDispatch;
 use crate::error::{missing_field_error, parse_error, should_fallback_discovery};
-use crate::multistatus::extract_href_property;
-use crate::xml::resolve_href;
+use crate::multistatus::extract_href_property_in_namespace;
+use crate::xml::{DAV_NAMESPACE, resolve_href};
 
 const PROPFIND_PRINCIPAL: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <D:propfind xmlns:D=\"DAV:\">\n\
@@ -85,11 +85,13 @@ impl DavDispatch {
         let response = self
             .propfind_raw(root, "0", PROPFIND_PRINCIPAL, AccountOperation::Discover)
             .await?;
-        Ok(
-            extract_href_property(&response.text, "current-user-principal")
-                .map_err(|error| parse_error(AccountOperation::Discover, error, self.protocol()))?
-                .map(|href| resolve_href(&response.url, &href)),
+        Ok(extract_href_property_in_namespace(
+            &response.text,
+            DAV_NAMESPACE,
+            "current-user-principal",
         )
+        .map_err(|error| parse_error(AccountOperation::Discover, error, self.protocol()))?
+        .map(|href| resolve_href(&response.url, &href)))
     }
 }
 

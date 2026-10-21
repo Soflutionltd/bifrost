@@ -476,10 +476,11 @@ impl ClientBuilder {
             .await
             .map_err(crate::Error::from)?;
         let session: Session = serde_json::from_slice(&session_bytes)?;
-        // Every installed session hands its limit to the transport, so the
-        // server's bound holds across all of this client's concurrent API
-        // work, not only within one call site's fan-out.
+        // Every installed session hands its API and upload limits to the
+        // transport, so both bounds hold across all callers sharing this
+        // client, not only within one call site.
         transport.set_api_concurrency(session.api_request_concurrency());
+        transport.set_upload_concurrency(session.upload_concurrency());
 
         Ok(Client {
             tally: None,
@@ -509,7 +510,10 @@ impl ClientBuilder {
 
 /// Probe the RFC 8620 origin-rooted session URL first. Some path-mounted
 /// deployments also expose discovery below the configured base path, so
-/// retain that form only as a 404 fallback when the base has a path.
+/// retain that form only as a 404 fallback when the base has a path. Other
+/// statuses are returned as origin failures, and a successful response is
+/// authoritative even if its body later fails session decoding: neither
+/// condition establishes that the origin resource is absent.
 fn well_known_session_urls(url: &str) -> Vec<String> {
     let Ok(base) = reqwest::Url::parse(url) else {
         return vec![format!("{}/.well-known/jmap", url.trim_end_matches('/'))];
@@ -553,6 +557,10 @@ async fn fetch_session<T: HttpTransport>(
         .expect("session discovery always has an origin URL");
     match transport.get_session(&origin_url).await {
         Ok(bytes) => Ok((origin_url, bytes)),
+        // A 404 is the one response that means the origin-rooted resource is
+        // absent. Authentication failures, redirects that the transport
+        // cannot follow, and other errors must retain the canonical endpoint's
+        // result instead of masking it with a path-mounted probe.
         Err(error) if is_not_found(&error) => match urls.next() {
             Some(path_url) => transport
                 .get_session(&path_url)
@@ -1083,20 +1091,21 @@ mod session_state_tests {
         assert_eq!(client.session().state(), "session-3");
     }
 
-    /// Records every API concurrency bound the client hands it, and serves a
-    /// refreshed session advertising a different one.
+    /// Records every API and upload concurrency bound the client hands it,
+    /// and serves a refreshed session advertising different ones.
     struct LimitRecordingTransport {
-        limits: Arc<Mutex<Vec<usize>>>,
+        api_limits: Arc<Mutex<Vec<usize>>>,
+        upload_limits: Arc<Mutex<Vec<usize>>>,
     }
 
-    fn session_with_limit(limit: usize, state: &str) -> String {
+    fn session_with_limits(api_limit: usize, upload_limit: usize, state: &str) -> String {
         let mut session: serde_json::Value =
             serde_json::from_str(&session_json("limit", "A1", state)).expect("fixture parses");
         session["capabilities"]["urn:ietf:params:jmap:core"] = json!({
             "maxSizeUpload": 1000,
-            "maxConcurrentUpload": 2,
+            "maxConcurrentUpload": upload_limit,
             "maxSizeRequest": 100_000,
-            "maxConcurrentRequests": limit,
+            "maxConcurrentRequests": api_limit,
             "maxCallsInRequest": 8,
             "maxObjectsInGet": 256,
             "maxObjectsInSet": 256,
@@ -1124,62 +1133,84 @@ mod session_state_tests {
         }
 
         async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Ok(Bytes::from(session_with_limit(5, "session-2")))
+            Ok(Bytes::from(session_with_limits(5, 4, "session-2")))
         }
 
         fn set_api_concurrency(&self, max_concurrent_requests: usize) {
-            self.limits
+            self.api_limits
                 .lock()
                 .expect("limit lock")
                 .push(max_concurrent_requests);
         }
+
+        fn set_upload_concurrency(&self, max_concurrent_upload: usize) {
+            self.upload_limits
+                .lock()
+                .expect("upload limit lock")
+                .push(max_concurrent_upload);
+        }
     }
 
-    /// Every session the client installs hands its `maxConcurrentRequests`
-    /// to the transport: the one it is built with, and each refresh, since
-    /// RFC 8620 lets any session property change.
+    /// Every session the client installs hands both concurrency limits to
+    /// the transport: the one it is built with, and each refresh, since RFC
+    /// 8620 lets any session property change.
     #[tokio::test]
-    async fn every_installed_session_bounds_the_transports_api_concurrency() {
-        let limits = Arc::new(Mutex::new(Vec::new()));
+    async fn every_installed_session_updates_the_transports_concurrency_limits() {
+        let api_limits = Arc::new(Mutex::new(Vec::new()));
+        let upload_limits = Arc::new(Mutex::new(Vec::new()));
         let session: Session =
-            serde_json::from_str(&session_with_limit(3, "session-1")).expect("session parses");
+            serde_json::from_str(&session_with_limits(3, 2, "session-1")).expect("session parses");
         let client = Client::with_transport(
             LimitRecordingTransport {
-                limits: Arc::clone(&limits),
+                api_limits: Arc::clone(&api_limits),
+                upload_limits: Arc::clone(&upload_limits),
             },
             session,
             "https://example.test/.well-known/jmap",
         )
         .expect("client builds");
-        assert_eq!(*limits.lock().expect("limit lock"), vec![3]);
+        assert_eq!(*api_limits.lock().expect("limit lock"), vec![3]);
+        assert_eq!(*upload_limits.lock().expect("upload limit lock"), vec![2]);
 
         client.refresh_session().await.expect("refresh succeeds");
-        assert_eq!(*limits.lock().expect("limit lock"), vec![3, 5]);
+        assert_eq!(*api_limits.lock().expect("limit lock"), vec![3, 5]);
+        assert_eq!(
+            *upload_limits.lock().expect("upload limit lock"),
+            vec![2, 4]
+        );
     }
 
-    /// A session that omits `maxConcurrentRequests` gates the transport at
-    /// one, the same reading the fan-outs take. The transport used to read
-    /// an omission as ungated while every fan-out read it as serial.
+    /// A session that omits `maxConcurrentRequests` gates the API transport
+    /// at one. The upload lane independently gets its serial minimum when its
+    /// field is omitted.
     #[test]
-    fn an_unadvertised_limit_gates_the_transport_at_one() {
-        let limits = Arc::new(Mutex::new(Vec::new()));
+    fn unadvertised_concurrency_limits_gate_the_transport_at_one() {
+        let api_limits = Arc::new(Mutex::new(Vec::new()));
+        let upload_limits = Arc::new(Mutex::new(Vec::new()));
         let mut session: serde_json::Value =
-            serde_json::from_str(&session_with_limit(3, "session-1")).expect("fixture parses");
+            serde_json::from_str(&session_with_limits(3, 2, "session-1")).expect("fixture parses");
         session["capabilities"]["urn:ietf:params:jmap:core"]
             .as_object_mut()
             .expect("core capability object")
             .remove("maxConcurrentRequests");
+        session["capabilities"]["urn:ietf:params:jmap:core"]
+            .as_object_mut()
+            .expect("core capability object")
+            .remove("maxConcurrentUpload");
         let session: Session = serde_json::from_value(session).expect("session parses");
         assert_eq!(session.api_request_concurrency(), 1);
+        assert_eq!(session.upload_concurrency(), 1);
         Client::with_transport(
             LimitRecordingTransport {
-                limits: Arc::clone(&limits),
+                api_limits: Arc::clone(&api_limits),
+                upload_limits: Arc::clone(&upload_limits),
             },
             session,
             "https://example.test/.well-known/jmap",
         )
         .expect("client builds");
-        assert_eq!(*limits.lock().expect("limit lock"), vec![1]);
+        assert_eq!(*api_limits.lock().expect("limit lock"), vec![1]);
+        assert_eq!(*upload_limits.lock().expect("upload limit lock"), vec![1]);
     }
 
     /// RFC 8620 §2 lets any Session property change. A refresh that only
@@ -1336,17 +1367,34 @@ mod session_state_tests {
     }
 
     #[tokio::test]
-    async fn session_discovery_does_not_fallback_on_other_errors_or_root_bases() {
-        let transport = DiscoveryTransport::new([Err(DiscoveryTransport::status(
+    async fn session_discovery_does_not_mask_origin_failures_or_bad_success_bodies() {
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
             reqwest::StatusCode::FORBIDDEN,
-        ))]);
-        assert!(
-            fetch_session(&transport, "https://example.test/jmap")
-                .await
-                .is_err()
-        );
+            reqwest::StatusCode::FOUND,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let transport = DiscoveryTransport::new([Err(DiscoveryTransport::status(status))]);
+            assert!(
+                fetch_session(&transport, "https://example.test/jmap")
+                    .await
+                    .is_err(),
+                "origin HTTP {status} must be preserved"
+            );
+            assert_eq!(
+                *transport.urls.lock().expect("discovery URL lock"),
+                vec!["https://example.test/.well-known/jmap"]
+            );
+        }
+
+        let malformed = DiscoveryTransport::new([Ok(Bytes::from_static(b"not a session"))]);
+        let (url, bytes) = fetch_session(&malformed, "https://example.test/jmap")
+            .await
+            .expect("a successful origin response remains authoritative");
+        assert_eq!(url, "https://example.test/.well-known/jmap");
+        assert!(serde_json::from_slice::<Session>(&bytes).is_err());
         assert_eq!(
-            *transport.urls.lock().expect("discovery URL lock"),
+            *malformed.urls.lock().expect("discovery URL lock"),
             vec!["https://example.test/.well-known/jmap"]
         );
 
@@ -1390,6 +1438,7 @@ impl<T: HttpTransport> Client<T> {
             ));
         }
         transport.set_api_concurrency(session.api_request_concurrency());
+        transport.set_upload_concurrency(session.upload_concurrency());
         Ok(Client {
             tally: None,
             inner: Arc::new(ClientInner {
@@ -1514,14 +1563,16 @@ impl<T: HttpTransport> Client<T> {
             .await
             .map_err(crate::Error::from)?;
         let session: Session = serde_json::from_slice(&bytes)?;
-        let limit = session.api_request_concurrency();
+        let api_limit = session.api_request_concurrency();
+        let upload_limit = session.upload_concurrency();
         let state = Arc::new(SessionState::derive(session)?);
-        // The limit is applied under the same lock as the state it came from,
-        // so two overlapping refreshes cannot leave one session's state beside
-        // the other's limit. `set_api_concurrency` is synchronous.
+        // Both limits are applied under the same lock as the state they came
+        // from, so two overlapping refreshes cannot leave one session beside
+        // another session's gates. The setters are synchronous.
         let mut installed = self.inner.state.lock().expect("session mutex poisoned");
         *installed = state;
-        self.inner.transport.set_api_concurrency(limit);
+        self.inner.transport.set_api_concurrency(api_limit);
+        self.inner.transport.set_upload_concurrency(upload_limit);
         self.inner.session_updated.store(true, Ordering::Release);
         drop(installed);
         Ok(())

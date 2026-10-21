@@ -50,6 +50,7 @@ pub(crate) struct JmapErrorContext {
     pub(crate) operation: AccountOperation,
     pub(crate) scope: Option<ErrorScope>,
     pub(crate) state_based: bool,
+    pub(crate) anchored_query: bool,
 }
 
 impl JmapErrorContext {
@@ -60,6 +61,7 @@ impl JmapErrorContext {
             operation,
             scope: None,
             state_based: false,
+            anchored_query: false,
         }
     }
 
@@ -82,6 +84,12 @@ impl JmapErrorContext {
     #[must_use]
     pub(crate) fn with_state_based(mut self) -> Self {
         self.state_based = true;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_anchored_query(mut self) -> Self {
+        self.anchored_query = true;
         self
     }
 
@@ -149,6 +157,17 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             Cause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only(format!(
                     "JMAP request of {size} bytes exceeds maxSizeRequest ({max})"
+                )),
+            }),
+            &ctx,
+        )
+        .try_build()
+        .expect("valid account error classification"),
+        crate::Error::UploadSizeLimit { max, size } => build(
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(format!(
+                    "JMAP upload of {size} bytes exceeds maxSizeUpload ({max})"
                 )),
             }),
             &ctx,
@@ -1335,10 +1354,11 @@ fn state_expiry_error(
 
 fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext) -> AccountError {
     let method_type = method.error_type();
-    // A cursor scope alone does not prove that the request carried a prior
-    // state: inventory needs one for anchorNotFound, while cannotCalculateChanges
-    // only means expiry on a state-based request. The explicit flag keeps those
-    // method errors from borrowing each other's recovery policy.
+    // A cursor scope alone does not prove which request contract applies:
+    // inventory needs an explicitly anchored query for anchorNotFound, while
+    // cannotCalculateChanges only means expiry on a state-based request. The
+    // two explicit flags keep those method errors from borrowing each other's
+    // recovery policy.
     let has_cursor_scope = matches!(ctx.scope, Some(ErrorScope::Cursor(_)));
     let (kind, primary, wire) = match method_type {
         MethodErrorType::ServerUnavailable => (
@@ -1431,9 +1451,19 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
             Cause::State(StateCause::ConcurrencyConflict),
             JmapMethod::AlreadyExists,
         ),
-        MethodErrorType::AnchorNotFound if has_cursor_scope => (
+        MethodErrorType::AnchorNotFound if ctx.anchored_query && has_cursor_scope => (
             AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
             Cause::State(StateCause::CursorInvalid),
+            JmapMethod::AnchorNotFound,
+        ),
+        MethodErrorType::AnchorNotFound if ctx.anchored_query => (
+            AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+            Cause::Internal(InternalCause::new(
+                InternalErrorKind::InvariantViolated,
+                Some(DiagnosticText::support_only(
+                    "anchored query reached error conversion without a cursor scope".to_string(),
+                )),
+            )),
             JmapMethod::AnchorNotFound,
         ),
         MethodErrorType::AnchorNotFound => (
@@ -1738,6 +1768,20 @@ mod tests {
             reqwest::header::HeaderValue::from_static(seconds),
         );
         headers
+    }
+
+    #[test]
+    fn oversized_upload_is_a_local_malformed_request() {
+        let error = into_account_error(
+            crate::Error::UploadSizeLimit { max: 3, size: 4 },
+            JmapErrorContext::new(AccountOperation::AttachmentUpload),
+        );
+
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Request(RequestErrorKind::Malformed)
+        );
+        assert_eq!(error.operation(), Some(AccountOperation::AttachmentUpload));
     }
 
     #[test]
@@ -2716,31 +2760,42 @@ mod tests {
         }
     }
 
-    /// A cursor-scoped anchor loss restarts this scope. A scope-less
-    /// `anchorNotFound` remains a protocol contract violation.
+    /// A cursor scope alone is not evidence that a method could return
+    /// `anchorNotFound`: only an explicitly anchored query takes the restart
+    /// lane. A scoped `/get` error remains a protocol contract violation.
     #[test]
-    fn cursor_method_errors_need_a_cursor_scope_to_restart_a_scope() {
+    fn anchor_method_errors_need_an_anchored_query_and_cursor_scope() {
         let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
-        let scoped = into_account_error(
+        let scoped_get = into_account_error(
             method_error("anchorNotFound"),
-            JmapErrorContext::cursor(AccountOperation::SyncChanges, scope.clone()),
+            JmapErrorContext::cursor(AccountOperation::SyncInventory, scope.clone()),
         );
         assert_eq!(
-            scoped.kind(),
+            scoped_get.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+        );
+
+        let anchored = into_account_error(
+            method_error("anchorNotFound"),
+            JmapErrorContext::cursor(AccountOperation::SyncInventory, scope.clone())
+                .with_anchored_query(),
+        );
+        assert_eq!(
+            anchored.kind(),
             &AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
         );
         assert_eq!(
-            scoped.recovery(),
+            anchored.recovery(),
             &RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(scope)),
         );
 
         let bare = into_account_error(
             method_error("anchorNotFound"),
-            JmapErrorContext::new(AccountOperation::SyncChanges),
+            JmapErrorContext::new(AccountOperation::SyncInventory).with_anchored_query(),
         );
         assert_eq!(
             bare.kind(),
-            &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
         );
     }
 

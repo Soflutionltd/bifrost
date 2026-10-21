@@ -53,16 +53,17 @@ and carries peer-timeout state, and SMTP's also serves blocking I/O with
 runtime-independent admission, so they were kept with comments; collapsing them
 onto the shared stream needs those two behaviours to move into it.
 
-## SHARED-008 - Net keeps its provider throttle inference, and SMTP still depends on it
+## SHARED-008 - Comments and references still name the deleted net throttle API
 
-Residue: the Graph, Google, JMAP and DAV funnels now pass explicit throttle
-policies through `into_account_error_with_throttle_scope`. Net's hard-coded
-Graph, Microsoft, Gmail and Fastmail-JMAP inference stays because SMTP still
-calls the compatibility function and downstream consumers may rely on the
-published behaviour. Migrate SMTP, then remove the inference.
-
-**Ruled (owner, 2026-10-21): delete.** Migrate SMTP to an explicit throttle
-policy, then delete net's provider throttle inference, the compatibility
-function and the duration-only `parse_retry_after`. Removal of these published
-items is approved.
+Residue: net's provider throttle inference, its `into_account_error` wrapper
+and `parse_retry_after` are deleted and SMTP passes an explicit policy. Stale
+comments still name the removed API in `crates/jmap/src/core/transport.rs`,
+`crates/jmap/src/transport_reqwest.rs`, `crates/jmap/src/sync/error.rs`,
+`crates/dav-core/src/dispatch.rs`, `crates/dav-core/src/error.rs`,
+`crates/graph/src/account/graph_error.rs`, `crates/graph/src/ews/mod.rs`,
+`crates/graph/src/ews/client.rs`, `crates/graph/src/error.rs`,
+`crates/google/src/account/error.rs` and `crates/google/src/error.rs`, and in
+the CalDAV, CardDAV, JMAP and Graph references (`reference/graph.md` has
+several, including `bifrost_net::parse_retry_after`). Grep for the removed
+names rather than trusting this list.
 

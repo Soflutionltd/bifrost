@@ -49,14 +49,24 @@ instead draw from a shared session budget, so the footprint stays inside
 `pool_cap` on providers with a low per-user connection limit, is a product
 decision.
 
-## IMAP-004 - Copy-free literals
+## IMAP-004 - Literals are not emitted incrementally
 
-Residue of the per-command literal ceiling (the reader checks cumulative
-literal declarations against the budget before reading payload, a breach is a
-fatal `Parse`, and raw-message streaming passes its budget to the budgeted
-stream). Still open:
-- FETCH response fields in `crates/types` (`fetch.rs`) own `Vec<u8>`, so the
-  literal is still copied and nothing is emitted incrementally; splitting the
-  `BytesMut` alone cannot change that.
+Residue: FETCH body and binary literals are now `Bytes` slices of the framed
+response, not copies. Still open:
+- A FETCH response is fully framed and parsed before delivery, so literals are
+  not emitted incrementally. Standalone parsers without an owned backing still
+  copy, and generic string fields still parse owned.
 - Non-literal syntax and parser overhead are outside the literal ceiling.
+
+## IMAP-031 - A retained FETCH slice pins its whole backing allocation
+
+Lateral from the copy-free literal work. Body and binary sections now share the
+frozen response buffer, so keeping one small section alive keeps the whole
+allocation alive, including spare capacity and any co-read response bytes. The
+consumer size estimate counts payload lengths plus a fixed allowance, so
+physical memory retained can exceed it. Documented in `reference/imap.md`;
+compacting small retained slices (copy below a threshold) would bound it. The
+same sharing means the reader's `BytesMut` cannot reclaim the allocation on its
+next `reserve` while a slice lives, so sustained FETCH traffic probably costs
+one fresh read-buffer allocation per retained response.
 

@@ -1,8 +1,8 @@
 use std::fmt;
 
 use bifrost_dav_core::{
-    DavDispatch, DavProtocol, DavRequest, escape_xml, filter_unsupported, normalize_http_etag,
-    prepare_if_match, worse_recovery,
+    CARDDAV_NAMESPACE, DavDispatch, DavProtocol, DavRequest, escape_xml, filter_unsupported,
+    normalize_http_etag, prepare_if_match, worse_recovery,
 };
 pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery, PutCondition};
 use bifrost_net::{AccountId, AccountNet};
@@ -13,8 +13,8 @@ use reqwest::{Method, StatusCode};
 use crate::CardDavConfig;
 use crate::parse::{
     AddressBookCollection, CardDavContactListing, CardDavFetchedVCard, CardDavMultigetReport,
-    MultigetOutcome, extract_href_property, parse_addressbook_collections, parse_multiget_report,
-    parse_propfind_contacts, resolve_href,
+    MultigetOutcome, extract_href_property_in_namespace, parse_addressbook_collections,
+    parse_multiget_report, parse_propfind_contacts, resolve_href,
 };
 
 #[derive(Debug)]
@@ -220,24 +220,31 @@ impl CardDavClient {
                 AccountOperation::Discover,
             )
             .await?;
-        let home = extract_href_property(&response.text, "addressbook-home-set")
-            .map_err(|error| parse_error(AccountOperation::Discover, error))?
-            .map(|href| resolve_href(&response.url, &href))
-            .ok_or_else(|| {
-                bifrost_dav_core::missing_field_error(
-                    AccountOperation::Discover,
-                    "missing addressbook-home-set",
-                    DAV,
-                )
-            })?;
+        let home = extract_href_property_in_namespace(
+            &response.text,
+            CARDDAV_NAMESPACE,
+            "addressbook-home-set",
+        )
+        .map_err(|error| parse_error(AccountOperation::Discover, error))?
+        .map(|href| resolve_href(&response.url, &href))
+        .ok_or_else(|| {
+            bifrost_dav_core::missing_field_error(
+                AccountOperation::Discover,
+                "missing addressbook-home-set",
+                DAV,
+            )
+        })?;
         // CARDDAV:directory-gateway is draft-daboo-carddav-directory-gateway-02,
         // not RFC 6352. There is no context-root directory fallback.
-        let mut gateways =
-            bifrost_dav_core::extract_href_properties(&response.text, "directory-gateway")
-                .map_err(|error| parse_error(AccountOperation::Discover, error))?
-                .into_iter()
-                .map(|href| resolve_href(&response.url, &href))
-                .collect::<Vec<_>>();
+        let mut gateways = bifrost_dav_core::extract_href_properties_in_namespace(
+            &response.text,
+            CARDDAV_NAMESPACE,
+            "directory-gateway",
+        )
+        .map_err(|error| parse_error(AccountOperation::Discover, error))?
+        .into_iter()
+        .map(|href| resolve_href(&response.url, &href))
+        .collect::<Vec<_>>();
         dedup_directory_urls(&mut gateways);
         Ok(AddressBookDiscovery { home, gateways })
     }
@@ -273,9 +280,10 @@ impl CardDavClient {
         Ok(collections)
     }
 
-    /// Cheap depth-0 PROPFIND for the collection `getctag`. Returns
-    /// `None` when the server omits it, so the caller falls through to a
-    /// full snapshot + diff (brick 8 ctag short-circuit).
+    /// Depth-0 PROPFIND for the collection `getctag` and `resourcetype`.
+    /// Returns `None` when the server omits `getctag`, so the caller falls
+    /// through to a full snapshot + diff. A directory marker tightens the
+    /// guard before a subsequent contact listing can be sent.
     pub(crate) async fn collection_ctag(
         &self,
         addressbook_url: &str,
@@ -285,6 +293,19 @@ impl CardDavClient {
             .dav
             .propfind_raw(addressbook_url, "0", PROPFIND_CTAG, operation)
             .await?;
+        let mut collections = parse_addressbook_collections(&response.text)
+            .map_err(|error| parse_error(operation, format!("collection metadata: {error}")))?;
+        let mut directories = Vec::new();
+        for collection in &mut collections {
+            collection.resolve_href(&response.url);
+            if collection.is_directory {
+                directories.push(collection.href.clone());
+            }
+        }
+        // The depth-0 read also asks for resourcetype, so it can tighten the
+        // directory guard for this selected collection without enumerating
+        // every address book in its home.
+        self.directory_urls.observe(directories);
         crate::parse::parse_collection_ctag(&response.text)
             .map_err(|error| parse_error(operation, format!("collection ctag: {error}")))
     }
@@ -1011,8 +1032,9 @@ const PROPFIND_ADDRESSBOOKS: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
 </D:propfind>";
 
 const PROPFIND_CTAG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
-<D:propfind xmlns:D=\"DAV:\" xmlns:CS=\"http://calendarserver.org/ns/\">\n\
+<D:propfind xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\" xmlns:CS=\"http://calendarserver.org/ns/\">\n\
   <D:prop>\n\
+    <D:resourcetype/>\n\
     <CS:getctag/>\n\
   </D:prop>\n\
 </D:propfind>";
@@ -1436,6 +1458,47 @@ mod tests {
             Some("1"),
             "the listing is the depth-1 request"
         );
+    }
+
+    #[tokio::test]
+    async fn depth_zero_ctag_read_observes_a_directory_marker() {
+        let addressbook = "https://dav.example.test/books/ada/personal/";
+        let script = dav_script([DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav" xmlns:CS="http://calendarserver.org/ns/">
+              <D:response><D:href>/books/ada/personal/</D:href><D:propstat><D:prop>
+                <D:resourcetype><D:collection/><C:directory/></D:resourcetype>
+                <CS:getctag>directory-ctag</CS:getctag>
+              </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+            </D:multistatus>"#
+                .to_string(),
+            url: addressbook.to_string(),
+        }]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+
+        assert_eq!(
+            client
+                .collection_ctag(addressbook, AccountOperation::SyncInventory)
+                .await
+                .expect("ctag response parses")
+                .as_deref(),
+            Some("directory-ctag")
+        );
+        assert!(client.is_directory_url("https://dav.example.test/books/ada/personal/one.vcf"));
+
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, addressbook);
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("depth")
+                .and_then(|value| value.to_str().ok()),
+            Some("0")
+        );
+        assert!(requests[0].body.contains("<D:resourcetype/>"));
     }
 
     /// A header the request record could not carry fails the request LOCALLY.

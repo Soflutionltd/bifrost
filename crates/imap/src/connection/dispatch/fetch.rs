@@ -28,10 +28,10 @@ pub(crate) fn estimate_fetch_response_bytes(fr: &FetchResponse) -> usize {
     // small-string heap allocations.
     let mut size: usize = 256;
     for bs in &fr.body_sections {
-        size += bs.data.as_ref().map_or(0, Vec::len);
+        size += bs.data.as_ref().map_or(0, bytes::Bytes::len);
     }
     for bin in &fr.binary_sections {
-        size += bin.data.as_ref().map_or(0, Vec::len);
+        size += bin.data.as_ref().map_or(0, bytes::Bytes::len);
     }
     // Gmail labels are unbounded server-supplied heap strings, so a
     // labels-only FETCH would otherwise contribute only the flat overhead
@@ -310,11 +310,11 @@ impl Consumer for BoundedStreamingFetchConsumer {
                 let octets = fr
                     .body_sections
                     .iter()
-                    .map(|section| section.data.as_ref().map_or(0, Vec::len))
+                    .map(|section| section.data.as_ref().map_or(0, bytes::Bytes::len))
                     .chain(
                         fr.binary_sections
                             .iter()
-                            .map(|section| section.data.as_ref().map_or(0, Vec::len)),
+                            .map(|section| section.data.as_ref().map_or(0, bytes::Bytes::len)),
                     )
                     .fold(0usize, usize::saturating_add);
                 *remaining = remaining.saturating_sub(octets);

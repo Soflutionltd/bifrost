@@ -19,6 +19,7 @@
 //! continue-req    = "+" SP (resp-text / base64) CRLF
 //! ```
 
+use bytes::Bytes;
 use nom::IResult;
 use nom::Parser;
 use nom::branch::alt;
@@ -98,10 +99,24 @@ pub(crate) fn parse_response(input: &[u8]) -> IResult<&[u8], Response> {
 /// When `utf8_mode` is `true` (UTF8=ACCEPT enabled per RFC 6855 Section 3), ENVELOPE
 /// fields contain raw UTF-8 (RFC 6532 Section 3) and RFC 2047 decoding is skipped.
 pub(crate) fn parse_response_utf8(input: &[u8], utf8_mode: bool) -> IResult<&[u8], Response> {
+    parse_response_with_backing(input, utf8_mode, None)
+}
+
+/// Parse one response backed by immutable `Bytes`, allowing FETCH literals to
+/// retain slices of the reader's response buffer.
+pub(crate) fn parse_response_bytes(input: &Bytes, utf8_mode: bool) -> IResult<&[u8], Response> {
+    parse_response_with_backing(input.as_ref(), utf8_mode, Some(input))
+}
+
+fn parse_response_with_backing<'a>(
+    input: &'a [u8],
+    utf8_mode: bool,
+    backing: Option<&Bytes>,
+) -> IResult<&'a [u8], Response> {
     alt((
         map(response::parse_continuation, Response::Continuation),
         map(
-            |i| response::parse_untagged(i, utf8_mode),
+            |i| response::parse_untagged_with_backing(i, utf8_mode, backing),
             |u| Response::Untagged(Box::new(u)),
         ),
         map(response::parse_tagged, Response::Tagged),

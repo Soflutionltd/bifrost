@@ -447,11 +447,8 @@ carry the hint. Error classification prefers the final response header over
 the transport's capped duration history. Google resolves deltas once when
 observing the response for its provider hold.
 
-The existing `bifrost_net::parse_retry_after` keeps its
-`Option<Duration>` signature for transport waits and existing consumers.
-It resolves dates against the current clock and returns `None` for elapsed
-dates, preserving its compatibility behavior. Retry waits still apply
-`honor_retry_after_cap`; that cap does not rewrite server evidence.
+Retry waits apply `honor_retry_after_cap` after parsing; that cap does not
+rewrite server evidence.
 
 ### Replay safety
 
@@ -467,8 +464,8 @@ protocol retries. Other non-connect, non-timeout reqwest failures are
 `Network { InFlight }`, preserving that uncertainty. Retrying regardless is how one Gmail
 `/messages/send` becomes two delivered messages and one JMAP
 `Email/set` create becomes two drafts, and it happened three times
-before `into_account_error` ever ran, so the `Reconcile` classification
-only ever described the final attempt.
+before `into_account_error_with_throttle_scope` ever ran, so the
+`Reconcile` classification only ever described the final attempt.
 
 Idempotency defaults to `reqwest::Method::is_idempotent()`: safe
 methods plus PUT and DELETE are replayable, POST / PATCH / extension
@@ -481,8 +478,8 @@ sees only method, URL, and opaque body bytes - so JMAP POSTs are
 conservatively non-replayable at this layer.
 
 This is not a net loss of resilience. The refused replay surfaces to
-`into_account_error`, which holds the caller's real `AccountOperation`
-and routes `InFlight` + idempotent to `Retry(SameRequest)` and
+`into_account_error_with_throttle_scope`, which holds the caller's real
+`AccountOperation` and routes `InFlight` + idempotent to `Retry(SameRequest)` and
 `InFlight` + non-idempotent to
 `Reconcile(TransportDropAfterSend, [CheckTarget])`. The retry decision
 moves up to the layer that knows what the request meant, instead of
@@ -1177,7 +1174,8 @@ provenance (`auth_self_stripped`, set when the walker removes a
 credential the request was actually carrying) and returns
 `Error::UnauthenticatedRedirectHop { message, final_response }` instead
 of letting the 401 fall through to the terminal-4xx branch. That branch
-mints `Error::Status { code: 401 }`, which `into_account_error` maps to
+mints `Error::Status { code: 401 }`, which
+`into_account_error_with_throttle_scope` maps to
 `Authentication(ReauthorizationRequired)` and thence to terminal
 `RecoveryClass::AuthLost` - telling the engine to send the user to a
 re-authorization prompt for an account whose token is fine.
@@ -1316,8 +1314,6 @@ pub struct NetErrorContext {
     pub scope: Option<ErrorScope>,
 }
 
-pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError;
-
 pub fn into_account_error_with_throttle_scope(
     error: Error,
     ctx: NetErrorContext,
@@ -1331,12 +1327,11 @@ conversion attaches `Cause::Attempt` when target-attempt evidence
 exists, preserves request / trace ids and capped body text from
 `Status`, `RateLimited`, and status-backed `RetryBudgetExhausted`,
 and leaves provider JSON interpretation to JMAP, Gmail, and Graph. The
-explicit throttle-scope entry point carries the caller's policy through net's
-generic status and local-hold mappings. Graph, Google, JMAP and DAV funnels pass their documented scope explicitly.
-`into_account_error` retains context-derived compatibility behavior for external
-callers; workspace migration alone does not authorize changing that published
-contract. The duration-only Retry-After parser also remains a published
-compatibility helper; provider classification uses `parse_retry_after_hint`.
+throttle-scope argument carries the caller's policy through net's generic
+status and local-hold mappings. Graph, Google, JMAP and DAV funnels pass their
+documented scope explicitly. `None` leaves throttle scope unset; net does not
+infer policy from the provider or protocol. `parse_retry_after_hint` is the
+shared parser for both transport waits and structured error evidence.
 
 ## Status-line helpers
 

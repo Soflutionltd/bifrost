@@ -25,13 +25,18 @@ pub const APPLE_CALENDAR_NAMESPACE: &str = "http://apple.com/ns/ical/";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XmlName {
     namespace: Option<String>,
+    prefix: Option<String>,
     local: String,
 }
 
 impl XmlName {
     #[must_use]
     pub fn is(&self, namespace: &str, local: &str) -> bool {
-        self.namespace.as_deref() == Some(namespace) && self.local == local
+        self.local == local
+            && (self.namespace.as_deref() == Some(namespace)
+                || (namespace == DAV_NAMESPACE
+                    && self.namespace.is_none()
+                    && self.prefix.is_none()))
     }
 
     #[must_use]
@@ -45,25 +50,36 @@ impl XmlName {
     }
 }
 
-pub(crate) fn resolved_xml_name(
-    resolved: ResolveResult<'_>,
-    full_name: &str,
-) -> Result<XmlName, String> {
+pub(crate) fn resolved_xml_name(resolved: ResolveResult<'_>, full_name: &str) -> XmlName {
     let namespace = match resolved {
         ResolveResult::Bound(namespace) => Some(namespace.as_ref().to_string()),
         ResolveResult::Unbound => None,
-        ResolveResult::Unknown(prefix) => {
-            return Err(format!(
-                "XML element uses undeclared namespace prefix: {prefix}"
-            ));
+        // D is the conventional DAV prefix. Some servers emit it without its
+        // declaration, which NsReader reports as Unknown. Recognize only that
+        // legacy spelling; an unknown prefix cannot safely be assigned a
+        // namespace and must not turn a foreign status or href into DAV data.
+        ResolveResult::Unknown(prefix) if prefix == "D" => {
+            Some(DAV_NAMESPACE.to_string())
         }
+        ResolveResult::Unknown(_) => None,
     };
-    Ok(XmlName {
+    let prefix = if namespace.is_none() {
+        full_name
+            .split_once(':')
+            .map(|(prefix, _)| prefix.to_string())
+    } else {
+        None
+    };
+    XmlName {
         namespace,
+        prefix,
         local: local_name(full_name),
-    })
+    }
 }
 
+/// Namespace inference retained for the original two-argument property
+/// readers. New protocol and extension call sites should use the explicit
+/// namespace variants so a property outside this list is not misclassified.
 pub(crate) fn property_namespace(property_name: &str) -> &'static str {
     match property_name {
         "calendar-home-set"

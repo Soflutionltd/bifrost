@@ -152,7 +152,7 @@ fn email_inventory_loop<T: HttpTransport>(
                         err,
                         &scope,
                         owner.as_ref(),
-                        walk.error_context(bifrost_types::AccountOperation::SyncInventory),
+                        walk.query_error_context(bifrost_types::AccountOperation::SyncInventory),
                     ));
                     return;
                 }
@@ -164,8 +164,10 @@ fn email_inventory_loop<T: HttpTransport>(
             // tie ordering between queries. Existing survivors therefore
             // cannot cross this anchor. New arrivals and membership moves
             // behind it are covered by the change cursor seeded BEFORE
-            // inventory. If the anchor itself disappears, anchorNotFound
-            // takes the cursor-invalid restart lane through the context above.
+            // inventory. If the anchor itself disappears, this query's
+            // explicitly anchored context maps anchorNotFound to the
+            // cursor-invalid restart lane. The get context below does not
+            // inherit that query-specific flag.
             let ids = query_response.ids().to_vec();
             if ids.is_empty() {
                 break;
@@ -355,7 +357,7 @@ fn mailbox_inventory<T: HttpTransport>(
                         err,
                         &scope,
                         None,
-                        walk.error_context(bifrost_types::AccountOperation::SyncInventory),
+                        walk.query_error_context(bifrost_types::AccountOperation::SyncInventory),
                     ));
                     return;
                 }
@@ -706,6 +708,7 @@ mod tests {
         Churn,
         Clamped,
         MissingAnchor,
+        GetAnchorNotFound,
     }
 
     struct InventoryTransport {
@@ -816,6 +819,16 @@ mod tests {
             let name = call[0].as_str().expect("method name").to_string();
             let call_id = call[2].as_str().expect("call id").to_string();
             let anchor = call[1]["anchor"].as_str();
+            if name == "Email/get" && matches!(self.scenario, InventoryScenario::GetAnchorNotFound)
+            {
+                return Ok(bytes::Bytes::from(
+                    serde_json::json!({
+                        "sessionState": "session-1",
+                        "methodResponses": [["error", {"type": "anchorNotFound"}, call_id]]
+                    })
+                    .to_string(),
+                ));
+            }
             if name == "Email/query" && anchor.is_some() {
                 assert_eq!(call[1]["anchorOffset"], 1);
                 if matches!(self.scenario, InventoryScenario::MissingAnchor) {
@@ -1029,9 +1042,10 @@ mod tests {
             "https://example.test/.well-known/jmap",
         )
         .expect("client builds");
+        let scope = CursorScope::Type(ObjectType::Email);
         let events = email_inventory_loop(
             crate::account::Account::new(client, "primary"),
-            CursorScope::Type(ObjectType::Email),
+            scope.clone(),
             None,
             None,
             2,
@@ -1093,6 +1107,49 @@ mod tests {
             &bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(
                 scope
             ),)
+        );
+    }
+
+    /// RFC 8620 defines `anchorNotFound` for anchored query calls, not `/get`.
+    /// Injecting it on `/get` pins that its cursor scope does not inherit the
+    /// query's anchor classification.
+    #[tokio::test]
+    async fn anchor_not_found_on_inventory_get_is_a_contract_violation() {
+        use futures::StreamExt as _;
+
+        let client = crate::client::Client::with_transport(
+            InventoryTransport {
+                scenario: InventoryScenario::GetAnchorNotFound,
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+            inventory_test_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let scope = CursorScope::Type(ObjectType::Email);
+        let events = email_inventory_loop(
+            crate::account::Account::new(client, "primary"),
+            scope.clone(),
+            None,
+            None,
+            2,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(events.len(), 1);
+        let SyncEvent::Terminated(error) = &events[0] else {
+            panic!("an impossible get anchor error must terminate, got {events:?}");
+        };
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation
+            )
+        );
+        assert_eq!(
+            error.scope(),
+            Some(&bifrost_types::ErrorScope::Cursor(scope))
         );
     }
 

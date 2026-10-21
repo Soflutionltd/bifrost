@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use bifrost_net::{
     Error, FinalResponse, MalformedRedirectKind, NetErrorContext, RangeFailureKind,
-    into_account_error,
+    into_account_error_with_throttle_scope,
 };
 use bifrost_types::{
     AccountError, AccountErrorKind, AccountOperation, AuthErrorKind, Cause, ErrorScope, Protocol,
@@ -46,7 +46,15 @@ fn message_ctx(operation: AccountOperation, id: &str) -> NetErrorContext {
 }
 
 fn convert(error: Error, context: NetErrorContext) -> AccountError {
-    into_account_error(error, context)
+    convert_with_throttle_scope(error, context, None)
+}
+
+fn convert_with_throttle_scope(
+    error: Error,
+    context: NetErrorContext,
+    throttle_scope: Option<ThrottleScope>,
+) -> AccountError {
+    into_account_error_with_throttle_scope(error, context, throttle_scope)
 }
 
 fn network(state: TransmissionState) -> Error {
@@ -178,7 +186,7 @@ fn rate_limited_preserves_body_and_headers() {
     let (name, value) = header("x-ms-ags-diagnostic", "{\"server\":\"graph\"}");
     headers.insert(name, value);
 
-    let err = convert(
+    let err = convert_with_throttle_scope(
         Error::RateLimited {
             retry_after: Some(Duration::from_secs(30)),
             final_response: final_response(
@@ -188,6 +196,7 @@ fn rate_limited_preserves_body_and_headers() {
             ),
         },
         graph_ctx(AccountOperation::Search),
+        Some(ThrottleScope::Account),
     );
 
     assert_eq!(

@@ -227,7 +227,7 @@ pub(super) async fn run_fetch(
                 }
                 if tx
                     .send(batch(
-                        vec![Bytes::from(data)],
+                        vec![data],
                         PageBoundary::Page,
                         None::<Checkpoint>,
                         super::measured_bytes_in(connection, &mut previous_bytes_in),

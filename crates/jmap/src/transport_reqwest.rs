@@ -26,6 +26,9 @@ pub(crate) struct ReqwestTransport {
     /// only. `None` until the first session is installed; the session GET
     /// that precedes it is not an API request.
     api_limit: std::sync::Mutex<Option<ConcurrencyLimit>>,
+    /// The session's `maxConcurrentUpload`, applied to upload requests
+    /// only. `None` until the first session is installed.
+    upload_limit: std::sync::Mutex<Option<ConcurrencyLimit>>,
 }
 
 impl ReqwestTransport {
@@ -78,11 +81,19 @@ impl ReqwestTransport {
             authorization,
             timeout,
             api_limit: std::sync::Mutex::new(None),
+            upload_limit: std::sync::Mutex::new(None),
         })
     }
 
     fn api_limit(&self) -> Option<ConcurrencyLimit> {
         self.api_limit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn upload_limit(&self) -> Option<ConcurrencyLimit> {
+        self.upload_limit
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -280,14 +291,36 @@ impl HttpTransport for ReqwestTransport {
         }
     }
 
+    fn set_upload_concurrency(&self, max_concurrent_upload: usize) {
+        let mut slot = self
+            .upload_limit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match slot.as_ref() {
+            // Resized in place, so uploads already holding a slot keep
+            // counting against the new bound.
+            Some(existing) => existing.set_limit(max_concurrent_upload),
+            None => *slot = Some(ConcurrencyLimit::new(max_concurrent_upload)),
+        }
+    }
+
     async fn upload(
         &self,
         url: &str,
         body: Vec<u8>,
         content_type: Option<&str>,
     ) -> Result<bytes::Bytes, TransportError> {
-        self.send("POST", url, Some(Bytes::from(body)), content_type, None)
-            .await
+        Ok(self
+            .send_measured(
+                "POST",
+                url,
+                Some(Bytes::from(body)),
+                content_type,
+                None,
+                self.upload_limit(),
+            )
+            .await?
+            .0)
     }
 
     async fn download(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
@@ -626,6 +659,7 @@ mod tests {
             )),
             timeout: Duration::from_secs(30),
             api_limit: std::sync::Mutex::new(None),
+            upload_limit: std::sync::Mutex::new(None),
         }
     }
 
@@ -634,7 +668,7 @@ mod tests {
     /// uploads and downloads limits of their own. The dispatcher yields
     /// before answering, so an ungated burst is genuinely concurrent.
     #[tokio::test]
-    async fn the_session_limit_gates_api_requests_and_not_downloads() {
+    async fn session_limits_gate_api_and_upload_requests_separately() {
         let ok = || bifrost_net::test_support::canned(reqwest::StatusCode::OK, b"{}");
 
         let api_script = ScriptedDispatch::yielding((0..4).map(|_| ok()));
@@ -657,6 +691,26 @@ mod tests {
             blob_script.peak_in_flight(),
             4,
             "downloads are not API requests and are not gated by the API limit"
+        );
+
+        let upload_script = ScriptedDispatch::yielding((0..4).map(|_| ok()));
+        let uploads = scripted_transport(&upload_script);
+        uploads.set_api_concurrency(1);
+        uploads.set_upload_concurrency(2);
+        let calls = (0..4).map(|_| {
+            uploads.upload(
+                "https://jmap.test/upload",
+                b"blob".to_vec(),
+                Some("application/octet-stream"),
+            )
+        });
+        for result in futures::future::join_all(calls).await {
+            result.expect("upload request");
+        }
+        assert_eq!(
+            upload_script.peak_in_flight(),
+            2,
+            "uploads use maxConcurrentUpload, independent of maxConcurrentRequests"
         );
     }
 
@@ -739,6 +793,7 @@ mod tests {
             )),
             timeout: Duration::from_secs(30),
             api_limit: std::sync::Mutex::new(None),
+            upload_limit: std::sync::Mutex::new(None),
         };
 
         transport
@@ -776,6 +831,7 @@ mod tests {
             )),
             timeout: Duration::from_secs(30),
             api_limit: std::sync::Mutex::new(None),
+            upload_limit: std::sync::Mutex::new(None),
         };
 
         let err = match transport.open_sse("https://push.test/events", None).await {

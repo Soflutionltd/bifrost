@@ -209,8 +209,14 @@ its scope and action.
   URL back on every response, because the redirect policy follows admitted-origin hops
   and RFC 4918 resolves against the URI that actually served the body.
   Element identity is the resolved XML namespace URI plus local name, so prefixes
-  can vary while foreign `status`, `addressbook`, or `href` elements remain
-  separate from their DAV and CardDAV counterparts.
+  can vary while foreign-namespaced `status`, `addressbook`, or `href` elements
+  remain separate from their DAV and CardDAV counterparts. DAV structural tags also
+  accept unqualified spelling and the conventional undeclared `D` prefix used
+  by some servers. An undeclared prefix other than `D` is left unresolved and
+  never treated as DAV; a declared foreign namespace always remains foreign.
+  Protocol readers use namespace-explicit href and collection-property
+  variants; these also let an extension caller supply its own namespace without
+  editing a name table. The original name-only helpers remain source-compatible.
   Resource identification does not depend on a `.vcf` suffix or a returned
   content type. Contact PROPFIND, addressbook-query, and multiget request
   `resourcetype`, and all of their
@@ -634,24 +640,28 @@ polls the current snapshot and diffs hrefs/etags. Full WebDAV
 The poll resolves the ctag **at most once**, and hands the value it already
 has to the snapshot as `CtagSource::Known` rather than letting the snapshot
 re-derive it. `contact_snapshot` takes a `CtagSource` for exactly this
-reason: `Home(home)` picks the tag out of a depth-1 PROPFIND over the
-address book home and also refreshes the client's observed directory URLs;
-cursor establishment and inventory currently use that path. `Known` spends no
-request at all.
+reason: `Collection` reads the selected collection at depth 0, while `Known`
+spends no request. Cursor establishment and inventory use `Collection`, so
+their ctag request scales with the selected address book rather than the size
+of its home. That request asks for both `getctag` and `resourcetype`; a
+CardDAV directory marker is observed by the monotone directory guard before
+the following contact listing is sent. The depth-1 home walk remains in
+`address_books_list`, where enumerating every address book is the requested
+operation.
 Re-deriving it from the home made a changed-ctag poll cost three round trips
 where two suffice, and that third request grows with the number of address
 books rather than staying one collection wide. CalDAV now reads the collection
 token with depth 0 during establishment and inventory as well. Both account
-types keep token discovery scoped to the collection; CardDAV separately needs
-its depth-1 home response to enumerate address books.
+types keep token discovery scoped to the collection; CardDAV separately uses
+its depth-1 home response when it needs to enumerate address books.
 `poll_snapshot_never_relists_the_address_book_home` pins it against the
 request transcript.
 
 The depth-0 request is issued whether or not the prior cursor carried a
-ctag. A cursor without one previously had to recover it from the home
-listing, which is dearer and comes back empty when the collection does not
-appear in its own home; asking the collection directly seeds the tag, so a
-cursor that starts without one does not stay without one. The PROPFIND-snapshot diff is hardened against
+ctag. Reading the selected collection directly can seed a missing ctag even
+when that collection does not appear in the depth-1 home listing. When the
+server omits the tag, the snapshot keeps `None` and falls through to the full
+listing and diff. The PROPFIND-snapshot diff is hardened against
 destroy-everything failure modes: an empty multistatus against a populated
 prior snapshot suppresses the mass-delete (treated as "no observation"),
 and any href in `current.failed_hrefs` is preserved rather than destroyed.
@@ -676,10 +686,11 @@ coverage or a checkpoint, using the member status classification.
 `bytes_in` in inventory and changes batches comes from a fresh stream-local
 `DavByteTally` on the client's cloned `DavDispatch`. Each net send records a
 `RequestByteCounter` before DAV decodes or classifies its result; each batch
-takes and clears the tally. This includes the home and contact listings in
-inventory, the `getctag` response even for an unchanged poll, any subsequent
-listing, and retry, redirect and 401 bodies. These are fetched HTTP body octets,
-not decoded XML lengths or an account-wide meter delta; concurrent streams have
+takes and clears the tally. This includes the depth-0 collection metadata and
+contact listing in inventory, the `getctag` response even for an unchanged
+poll, any subsequent listing, and retry, redirect and 401 bodies. These are
+fetched HTTP body octets, not decoded XML lengths or an account-wide meter
+delta; concurrent streams have
 separate tallies. Cloned clients share the live directory guard, so observing a
 directory marker in one stream still tightens access for every client view.
 Legacy `CursorScope::Type(Contact)` calls remain accepted for compatibility,
@@ -800,7 +811,7 @@ implementations - `AddressBookProps` (`<addressbook/>`, `<directory/>`, the priv
 lane runs through `bifrost_dav_core::parse_multistatus`: address-book discovery,
 the depth-1 contact PROPFIND, and the `addressbook-multiget` /
 `addressbook-query` REPORT. The depth-0 `getctag` read is
-`parse_collection_property(xml, "getctag")`, and the snapshot codec, diff,
+`parse_collection_property_in_namespace(xml, CALENDAR_SERVER_NAMESPACE, "getctag")`, and the snapshot codec, diff,
 inventory projection and watermark slicer (`slice_after_watermark`) are the
 shared ones, parameterized only by the `CDAVCTAG1` magic and this crate's
 `cursor_error`. `CardDavFailedResource` and `MultigetOutcome` are now aliases of

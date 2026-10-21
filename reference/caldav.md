@@ -268,7 +268,15 @@ its scope and action.
   RFC 4918 resolves against the URI that actually served the body.
   Element identity is the resolved XML namespace URI plus local name, so a
   prefix can change without changing a DAV property, while a vendor property
-  named `status`, `calendar`, or `href` cannot impersonate the protocol element.
+  in its own namespace named `status`, `calendar`, or `href` cannot impersonate
+  the protocol element.
+  DAV structural tags also accept unqualified spelling and the conventional
+  undeclared `D` prefix used by some servers. An undeclared prefix other than
+  `D` is left unresolved and never treated as DAV; a declared foreign namespace
+  always remains foreign. Protocol readers use namespace-explicit href and
+  collection-property variants; these also let an extension caller supply its
+  own namespace without editing a name table. The original name-only helpers
+  remain source-compatible.
 - `ical.rs` - iCalendar projection between DAV resources and
   `bifrost-types` calendar events. Parsing-in uses `caldata`'s streaming
   `ContentLineParser` (RFC 5545 unfolding that strips exactly one fold WSP,
@@ -1291,8 +1299,9 @@ successful propstat merges them) and its entry constructors. CalDAV has two:
 machine: the depth-1 PROPFIND, the `calendar-multiget` / `calendar-query`
 REPORT, the `sync-collection` REPORT, and calendar discovery. The depth-0 token
 reads (`sync-token` here, `getctag` in CardDAV) share
-`parse_collection_property`, and both crates' `current-user-principal` /
-home-set walks share `extract_href_property` / `extract_href_properties`.
+`parse_collection_property_in_namespace`, and both crates' `current-user-principal` /
+home-set walks share the namespace-explicit `extract_href_property_in_namespace` /
+`extract_href_properties_in_namespace` variants.
 
 `take_collection_response` stays here: it is CalDAV-specific post-processing,
 dropping the collection's own response from a sync report and reading its RFC

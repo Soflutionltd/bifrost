@@ -48,8 +48,9 @@ pub use error::{
 pub use etag::{PutCondition, normalize_http_etag, prepare_if_match, response_etag};
 pub use multistatus::{
     FailedResource, MultiStatusOutcome, MultiStatusSink, PropSet, ResponseParts, classify_207,
-    commit_if_present, extract_href_properties, extract_href_property, parse_collection_property,
-    parse_multistatus,
+    commit_if_present, extract_href_properties, extract_href_properties_in_namespace,
+    extract_href_property, extract_href_property_in_namespace, parse_collection_property,
+    parse_collection_property_in_namespace, parse_multistatus,
 };
 pub use query::{FilteredHrefs, HrefQuery, sorted_candidate_hrefs};
 pub use snapshot::{

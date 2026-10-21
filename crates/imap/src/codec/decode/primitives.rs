@@ -2,6 +2,7 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use bytes::Bytes;
 
 /// CRLF terminator (RFC 3501 Section 9 / RFC 9051 Section 9).
 pub(super) fn crlf(input: &[u8]) -> IResult<&[u8], &[u8]> {
@@ -324,7 +325,7 @@ pub(super) fn quoted_string(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
 ///
 /// Also handles LITERAL+ non-synchronizing literals `{count+}` (RFC 7888 Section 4)
 /// and literal8 `~{count}\r\n<bytes>` (RFC 6855 Section 4).
-pub(super) fn literal(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
+fn literal_payload(input: &[u8]) -> IResult<&[u8], &[u8]> {
     // Optional '~' prefix for literal8 (RFC 6855 Section 4)
     let (input, _is_literal8) = opt(char('~')).parse(input)?;
     let (input, _) = char('{').parse(input)?;
@@ -355,13 +356,45 @@ pub(super) fn literal(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
     let (input, _has_plus) = opt(char('+')).parse(input)?;
     let (input, _) = char('}').parse(input)?;
     let (input, _) = crlf(input)?;
-    let (input, data) = take(count).parse(input)?;
-    // The parser accepts borrowed slices and string/nstring as well as FETCH
-    // response fields own Vec<u8>. Freezing WireReader's buffer alone cannot
-    // make these zero-copy: that requires changing those response types and
-    // threading the backing Bytes through the parser. It also would not emit
-    // a section until the complete response has been framed and parsed.
+    take(count).parse(input)
+}
+
+/// Preserve the owned form used by ordinary string and nstring fields.
+pub(super) fn literal(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
+    let (input, data) = literal_payload(input)?;
     Ok((input, data.to_vec()))
+}
+
+/// Parse a literal into a `Bytes` slice of the immutable response backing
+/// when one is available. Standalone parser entry points have no owned
+/// backing buffer and retain their historical copy behavior.
+pub(super) fn literal_bytes<'a>(input: &'a [u8], backing: Option<&Bytes>) -> IResult<&'a [u8], Bytes> {
+    let (input, data) = literal_payload(input)?;
+    let Some(backing) = backing else {
+        return Ok((input, Bytes::copy_from_slice(data)));
+    };
+
+    let base = backing.as_ptr() as usize;
+    let payload = data.as_ptr() as usize;
+    let Some(start) = payload.checked_sub(base) else {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            data,
+            nom::error::ErrorKind::Verify,
+        )));
+    };
+    let Some(end) = start.checked_add(data.len()) else {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            data,
+            nom::error::ErrorKind::Verify,
+        )));
+    };
+    if end > backing.len() {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            data,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+    Ok((input, backing.slice(start..end)))
 }
 
 /// Parse a `string`: quoted string or literal (RFC 3501 Section 9).
@@ -418,6 +451,20 @@ pub(super) fn nil_token(input: &[u8]) -> IResult<&[u8], &[u8]> {
 /// Parse an `nstring`: NIL or string (RFC 3501 Section 9 / RFC 9051 Section 9).
 pub(super) fn nstring(input: &[u8]) -> IResult<&[u8], Option<Vec<u8>>> {
     alt((value(None, nil_token), map(string, Some))).parse(input)
+}
+
+/// Parse an nstring for FETCH body fields, retaining literal data by slicing
+/// the response backing when the reader supplies it.
+pub(super) fn nstring_bytes<'a>(
+    input: &'a [u8],
+    backing: Option<&Bytes>,
+) -> IResult<&'a [u8], Option<Bytes>> {
+    alt((
+        value(None, nil_token),
+        map(quoted_string, |data| Some(Bytes::from(data))),
+        map(|i| literal_bytes(i, backing), Some),
+    ))
+    .parse(input)
 }
 
 /// Parse a number: 1*DIGIT (RFC 3501 Section 9 / RFC 9051 Section 9).

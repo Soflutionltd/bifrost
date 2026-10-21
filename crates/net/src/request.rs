@@ -1558,8 +1558,8 @@ fn build_reqwest(
 /// becomes two drafts.
 ///
 /// Refusing the replay is not the end of the retry story. The error
-/// surfaces to `into_account_error`, which has the caller's real
-/// `AccountOperation` and routes `InFlight` + non-idempotent to
+/// surfaces to `into_account_error_with_throttle_scope`, which has the
+/// caller's real `AccountOperation` and routes `InFlight` + non-idempotent to
 /// `Reconcile(TransportDropAfterSend)` and `InFlight` + idempotent to
 /// `Retry(SameRequest)`. The decision moves up to the layer that knows
 /// what the request meant, instead of being taken three times by a
@@ -1901,18 +1901,6 @@ pub fn parse_retry_after_hint(value: Option<&HeaderValue>) -> Option<bifrost_typ
         .map(bifrost_types::RetryHint::At)
 }
 
-/// Compatibility duration projection of [`parse_retry_after_hint`].
-///
-/// HTTP-dates are resolved against the clock here. As before, elapsed dates
-/// return `None`. Error classification should retain the structured hint instead.
-pub fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
-    match parse_retry_after_hint(value)? {
-        bifrost_types::RetryHint::After(delay) => Some(delay),
-        bifrost_types::RetryHint::At(at) => at.duration_since(std::time::SystemTime::now()).ok(),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2045,7 +2033,7 @@ mod tests {
     /// non-connect, non-timeout reqwest failure as
     /// `Network { InFlight }` - the side effect may already have landed
     /// - and the loop used to replay it anyway, three times, before
-    /// `into_account_error` ever ran. Against Gmail's
+    /// `into_account_error_with_throttle_scope` ever ran. Against Gmail's
     /// `/messages/send` that is a duplicate delivered message; against
     /// JMAP's `Email/set` it is a duplicate create.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -3055,73 +3043,75 @@ mod tests {
         assert_eq!(parse_retry_after_hint(None), None);
     }
 
-    // ---- parse_retry_after -------------------------------------------
-
     #[test]
-    fn retry_after_absent_header_is_none() {
-        assert_eq!(parse_retry_after(None), None);
+    fn retry_after_hint_absent_header_is_none() {
+        assert_eq!(parse_retry_after_hint(None), None);
     }
 
     #[test]
-    fn retry_after_parses_delta_seconds() {
+    fn retry_after_hint_parses_delta_seconds() {
+        use bifrost_types::RetryHint;
+
         assert_eq!(
-            parse_retry_after(Some(&hv("30"))),
-            Some(Duration::from_secs(30))
+            parse_retry_after_hint(Some(&hv("30"))),
+            Some(RetryHint::After(Duration::from_secs(30)))
         );
         assert_eq!(
-            parse_retry_after(Some(&hv("0"))),
-            Some(Duration::ZERO),
+            parse_retry_after_hint(Some(&hv("0"))),
+            Some(RetryHint::After(Duration::ZERO)),
             "a zero hint is a real instruction, not an absent one"
         );
     }
 
     #[test]
-    fn retry_after_trims_surrounding_whitespace() {
+    fn retry_after_hint_trims_surrounding_whitespace() {
+        use bifrost_types::RetryHint;
+
         assert_eq!(
-            parse_retry_after(Some(&hv("  45  "))),
-            Some(Duration::from_secs(45))
+            parse_retry_after_hint(Some(&hv("  45  "))),
+            Some(RetryHint::After(Duration::from_secs(45)))
         );
     }
 
     #[test]
-    fn retry_after_rejects_negative_and_garbage() {
-        assert_eq!(parse_retry_after(Some(&hv("-5"))), None);
-        assert_eq!(parse_retry_after(Some(&hv("soon"))), None);
-        assert_eq!(parse_retry_after(Some(&hv(""))), None);
-        assert_eq!(parse_retry_after(Some(&hv("1.5"))), None);
+    fn retry_after_hint_rejects_negative_and_garbage() {
+        assert_eq!(parse_retry_after_hint(Some(&hv("-5"))), None);
+        assert_eq!(parse_retry_after_hint(Some(&hv("soon"))), None);
+        assert_eq!(parse_retry_after_hint(Some(&hv(""))), None);
+        assert_eq!(parse_retry_after_hint(Some(&hv("1.5"))), None);
     }
 
-    /// An HTTP-date already in the past yields `None` (the header
-    /// carries no useful wait), and a future date yields the remaining
-    /// delta.
     #[test]
-    fn retry_after_parses_http_dates_relative_to_now() {
+    fn retry_after_hint_preserves_http_dates_without_resolving_them() {
+        use bifrost_types::RetryHint;
+
+        let date = "Fri, 01 Jan 2100 00:00:00 GMT";
+        let at = httpdate::parse_http_date(date).expect("fixed HTTP-date");
         assert_eq!(
-            parse_retry_after(Some(&hv("Wed, 21 Oct 2015 07:28:00 GMT"))),
-            None,
-            "a date in the past is not a wait"
+            parse_retry_after_hint(Some(&hv(date))),
+            Some(RetryHint::At(at)),
+            "the parser preserves the server deadline without resolving it against local time"
         );
-        let future =
-            httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(3600));
-        let parsed = parse_retry_after(Some(&hv(&future))).expect("future date parses");
-        assert!(parsed <= Duration::from_secs(3600));
-        assert!(parsed > Duration::from_secs(3000));
     }
 
-    /// The parser deliberately does NOT cap: an absurd server hint is
-    /// returned verbatim and the retry loop applies
-    /// `policy.honor_retry_after_cap` as the single capping site. This
-    /// pins that the cap lives with the caller, not here.
     #[test]
-    fn retry_after_does_not_cap_absurd_server_hints() {
+    fn retry_after_wait_caps_absurd_server_hints() {
         assert_eq!(
-            parse_retry_after(Some(&hv("31536000"))),
-            Some(Duration::from_secs(31_536_000)),
-            "a one-year hint survives the parser; capping is the policy's job"
+            parse_retry_after_hint(Some(&hv("31536000"))),
+            Some(bifrost_types::RetryHint::After(Duration::from_secs(
+                31_536_000
+            ))),
+            "the parsed evidence keeps the server's full hint"
         );
-        let capped = parse_retry_after(Some(&hv("31536000")))
-            .map(|d| d.min(RetryPolicy::default().honor_retry_after_cap));
-        assert_eq!(capped, Some(Duration::from_secs(60)));
+        assert_eq!(
+            retry_after_delay(
+                Some(&hv("31536000")),
+                std::time::SystemTime::UNIX_EPOCH,
+                RetryPolicy::default().honor_retry_after_cap,
+            ),
+            Some(Duration::from_secs(60)),
+            "the retry policy caps the wait without rewriting the evidence"
+        );
     }
 
     // ---- cost resolution ---------------------------------------------
@@ -3287,7 +3277,7 @@ mod tests {
         assert_eq!(final_response.status, StatusCode::UNAUTHORIZED);
         assert_eq!(final_response.body, Bytes::from_static(b"no credential"));
 
-        let classified = crate::account_error::into_account_error(
+        let classified = crate::account_error::into_account_error_with_throttle_scope(
             error,
             crate::account_error::NetErrorContext {
                 provider: None,
@@ -3295,6 +3285,7 @@ mod tests {
                 operation: bifrost_types::AccountOperation::Hydrate,
                 scope: None,
             },
+            None,
         );
         assert_eq!(
             *classified.recovery(),

@@ -1,9 +1,9 @@
-pub(crate) use bifrost_dav_core::extract_href_property;
+pub(crate) use bifrost_dav_core::extract_href_property_in_namespace;
 pub(crate) use bifrost_dav_core::resolve_href;
 use bifrost_dav_core::{
     CALENDAR_SERVER_NAMESPACE, CARDDAV_NAMESPACE, DAV_NAMESPACE, MultiStatusSink, PropSet,
-    ResponseParts, XmlName, classify_207, commit_if_present, normalize_etag,
-    parse_collection_property, parse_multistatus, trimmed,
+    ResponseParts, XmlName, classify_207, commit_if_present, normalize_etag, parse_multistatus,
+    trimmed,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -434,7 +434,11 @@ pub(crate) fn parse_directory_report(
 /// suppress a real change; the shared reader commits only from a successful
 /// propstat, exactly as the depth-1 parser does.
 pub(crate) fn parse_collection_ctag(xml: &str) -> Result<Option<String>, String> {
-    parse_collection_property(xml, "getctag")
+    bifrost_dav_core::parse_collection_property_in_namespace(
+        xml,
+        CALENDAR_SERVER_NAMESPACE,
+        "getctag",
+    )
 }
 
 #[cfg(test)]
@@ -902,14 +906,16 @@ END:VCARD</C:address-data>
   </D:response>
 </D:multistatus>"#;
 
-        let href = extract_href_property(xml, "current-user-principal").expect("valid XML");
+        let href = extract_href_property_in_namespace(xml, DAV_NAMESPACE, "current-user-principal")
+            .expect("valid XML");
         assert_eq!(href.as_deref(), Some("/principals/user/"));
     }
 
     #[test]
     fn nested_property_status_does_not_refuse_href_property() {
-        let href = extract_href_property(
+        let href = extract_href_property_in_namespace(
             r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav"><D:response><D:propstat><D:status>HTTP/1.1 200 OK</D:status><D:prop><C:addressbook-home-set><D:href>/right/</D:href><C:extension><D:status>HTTP/1.1 404 Not Found</D:status></C:extension></C:addressbook-home-set></D:prop></D:propstat></D:response></D:multistatus>"#,
+            CARDDAV_NAMESPACE,
             "addressbook-home-set",
         )
         .expect("valid property");
@@ -919,8 +925,9 @@ END:VCARD</C:address-data>
 
     #[test]
     fn href_extractor_ignores_failed_propstat() {
-        let href = extract_href_property(
+        let href = extract_href_property_in_namespace(
             r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav"><D:response><D:propstat><D:prop><C:addressbook-home-set><D:href>/wrong/</D:href></C:addressbook-home-set></D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat><D:propstat><D:prop><C:addressbook-home-set><D:href>/right/</D:href></C:addressbook-home-set></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
+            CARDDAV_NAMESPACE,
             "addressbook-home-set",
         )
         .expect("valid XML");
@@ -1081,8 +1088,9 @@ END:VCARD]]></C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:pr
         .expect("valid ctag");
         assert_eq!(ctag.as_deref(), Some("tag-2"));
 
-        let href = extract_href_property(
+        let href = extract_href_property_in_namespace(
             r#"<D:current-user-principal xmlns:D="DAV:"><D:href><![CDATA[/principals/ada/]]></D:href></D:current-user-principal>"#,
+            DAV_NAMESPACE,
             "current-user-principal",
         )
         .expect("valid property");

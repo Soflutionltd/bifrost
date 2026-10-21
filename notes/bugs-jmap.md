@@ -35,21 +35,11 @@ The PIM send path as a small state machine with compensations (create email ->
 submit -> on failure destroy; cancel -> confirm -> create) instead of single
 batched requests whose partial outcomes read as total failure.
 
-## JMAP-036 - Session discovery falls back to the path form only on a 404
+## JMAP-037 - Upload size limits do not bound buffering, and may be absent
 
-Lateral from the origin-first well-known discovery. The path-appended
-`/.well-known/jmap` is tried only when the origin answers 404. An origin that
-answers 401, 403, a redirect to a login page, or a 200 with non-JMAP JSON makes
-discovery fail or misparse without trying the configured path, which is
-exactly the deployment the fallback exists for.
-
-## JMAP-035 - `anchorNotFound` is classified from cursor scope alone
-
-Lateral from the state-walk consolidation. `anchorNotFound` maps to
-`SyncState(CursorInvalid)` -> `RestartScope` whenever the error context carries
-a cursor scope. Inventory supplies that scope to both its query and get calls,
-and `sync/account.rs` supplies it to the empty `Email/get` and `Mailbox/get`
-state probes. RFC 8620 defines `anchorNotFound` only for a query given an
-anchor; a get has no anchor, so an unrelated method error there would restart
-the scope. Mark anchored query contexts explicitly, as the state-based flag now
-does for `cannotCalculateChanges` / `tooManyChanges`.
+Laterals from the upload-limit work. `upload_to` now refuses a body over
+`maxSizeUpload` before transport, but `sync/pim.rs` `attachment_upload` buffers
+the whole input stream first, so the check stops an oversized network upload
+without limiting peak memory. And `validate_session` (`sync/capabilities.rs`)
+does not require `maxSizeUpload`, so when a server omits it uploads have no
+local size ceiling at all.

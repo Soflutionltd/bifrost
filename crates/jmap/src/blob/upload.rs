@@ -44,6 +44,20 @@ impl<Tr: HttpTransport> Client<Tr> {
         content_type: Option<&str>,
     ) -> crate::Result<UploadResponse> {
         let state = self.session_state();
+        let data: Vec<u8> = data.into();
+        // Refuse a known oversize file before handing its bytes to the
+        // transport; the server's maxSizeUpload applies per upload request.
+        if let Some(max) = state
+            .session()
+            .core_capabilities()
+            .and_then(crate::core::session::CoreCapabilities::max_size_upload)
+            && data.len() > max
+        {
+            return Err(crate::Error::UploadSizeLimit {
+                max,
+                size: data.len(),
+            });
+        }
         let mut upload_url =
             String::with_capacity(state.session().upload_url().len() + account_id.as_str().len());
 
@@ -61,7 +75,7 @@ impl<Tr: HttpTransport> Client<Tr> {
 
         let bytes = self
             .transport()
-            .upload(&upload_url, data.into(), content_type)
+            .upload(&upload_url, data, content_type)
             .await
             .map_err(crate::Error::from)?;
         serde_json::from_slice::<UploadResponse>(&bytes).map_err(std::convert::Into::into)
@@ -182,6 +196,23 @@ mod tests {
         .expect("session fixture parses")
     }
 
+    fn session_with_upload_limit(max_size_upload: usize) -> Session {
+        serde_json::from_value(json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {"maxSizeUpload": max_size_upload}
+            },
+            "accounts": {},
+            "primaryAccounts": {},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/api",
+            "downloadUrl": "https://example.test/dl/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://example.test/upload?account={accountId}",
+            "eventSourceUrl": "https://example.test/eventsource",
+            "state": "session-1"
+        }))
+        .expect("session fixture parses")
+    }
+
     /// Same RFC 6570 §3.2.2 rule as the download template: the account
     /// id is expanded with everything outside the unreserved set
     /// percent-encoded, not just the two query delimiters.
@@ -205,5 +236,43 @@ mod tests {
             url,
             "https://example.test/upload?account=a%26b%3Dc%2Bd%3Be%40f"
         );
+    }
+
+    #[tokio::test]
+    async fn upload_larger_than_the_session_limit_never_reaches_the_transport() {
+        let captured = Arc::new(Mutex::new(None));
+        let client = Client::with_transport(
+            UrlCapture(Arc::clone(&captured)),
+            session_with_upload_limit(3),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+
+        let error = client
+            .upload_to(&AccountId::new("a"), b"four".to_vec(), None)
+            .await
+            .expect_err("the advertised maximum is enforced locally");
+        assert!(matches!(
+            error,
+            crate::Error::UploadSizeLimit { max: 3, size: 4 }
+        ));
+        assert_eq!(*captured.lock().expect("capture lock"), None);
+    }
+
+    #[tokio::test]
+    async fn upload_equal_to_the_session_limit_is_allowed() {
+        let captured = Arc::new(Mutex::new(None));
+        let client = Client::with_transport(
+            UrlCapture(Arc::clone(&captured)),
+            session_with_upload_limit(4),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+
+        client
+            .upload_to(&AccountId::new("a"), b"four".to_vec(), None)
+            .await
+            .expect("an upload at the advertised maximum is allowed");
+        assert!(captured.lock().expect("capture lock").is_some());
     }
 }

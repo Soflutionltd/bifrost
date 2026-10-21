@@ -1,6 +1,8 @@
 //! Top-level response parsing (RFC 3501 Section 7 / RFC 9051 Section 7).
 
-use super::envelope_fetch::fetch_response_inner;
+use bytes::Bytes;
+
+use super::envelope_fetch::fetch_response_inner_with_backing;
 use super::extensions::{
     parse_untagged_acl, parse_untagged_listrights, parse_untagged_metadata,
     parse_untagged_myrights, parse_untagged_quota, parse_untagged_quotaroot, parse_untagged_thread,
@@ -99,11 +101,19 @@ pub(super) fn parse_tagged(input: &[u8]) -> IResult<&[u8], TaggedResponse> {
 ///
 /// When `utf8_mode` is true, ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
 pub(super) fn parse_untagged(input: &[u8], utf8_mode: bool) -> IResult<&[u8], UntaggedResponse> {
+    parse_untagged_with_backing(input, utf8_mode, None)
+}
+
+pub(super) fn parse_untagged_with_backing<'a>(
+    input: &'a [u8],
+    utf8_mode: bool,
+    backing: Option<&Bytes>,
+) -> IResult<&'a [u8], UntaggedResponse> {
     let (input, _) = tag(&b"* "[..]).parse(input)?;
     alt((
         alt((
             parse_untagged_status,
-            |i| parse_untagged_numbered(i, utf8_mode),
+            |i| parse_untagged_numbered_with_backing(i, utf8_mode, backing),
             parse_untagged_capability,
             parse_untagged_flags,
             |i| parse_untagged_list(i, utf8_mode),
@@ -171,6 +181,14 @@ pub(super) fn parse_untagged_numbered(
     input: &[u8],
     utf8_mode: bool,
 ) -> IResult<&[u8], UntaggedResponse> {
+    parse_untagged_numbered_with_backing(input, utf8_mode, None)
+}
+
+fn parse_untagged_numbered_with_backing<'a>(
+    input: &'a [u8],
+    utf8_mode: bool,
+    backing: Option<&Bytes>,
+) -> IResult<&'a [u8], UntaggedResponse> {
     let num_start = input; // Save position for leading-zero check
     let (input, n) = number(input)?;
     let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
@@ -223,7 +241,7 @@ pub(super) fn parse_untagged_numbered(
     // message-data: nz-number SP msg-att (RFC 3501 Section 7.4.2)
     let (input, _) = tag_no_case(&b"FETCH"[..]).parse(input)?;
     let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
-    let (input, mut fr) = fetch_response_inner(input, utf8_mode)?;
+    let (input, mut fr) = fetch_response_inner_with_backing(input, utf8_mode, backing)?;
     let (input, _) = crlf(input)?;
     fr.seq = n;
     Ok((input, UntaggedResponse::Fetch(Box::new(fr))))

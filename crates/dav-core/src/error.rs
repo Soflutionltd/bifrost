@@ -706,7 +706,7 @@ mod tests {
     }
 
     fn into_redirect_loop(protocol: DavProtocol) -> AccountError {
-        bifrost_net::into_account_error(
+        bifrost_net::into_account_error_with_throttle_scope(
             bifrost_net::Error::RedirectLoop { hops: 11 },
             bifrost_net::NetErrorContext {
                 provider: None,
@@ -714,6 +714,7 @@ mod tests {
                 operation: AccountOperation::Discover,
                 scope: None,
             },
+            None,
         )
     }
 

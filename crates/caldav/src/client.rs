@@ -2,8 +2,8 @@ use std::fmt;
 
 pub(crate) use bifrost_dav_core::PutCondition;
 use bifrost_dav_core::{
-    DavDispatch, DavProtocol, escape_xml, filter_unsupported, prepare_if_match, response_etag,
-    worse_recovery,
+    CALDAV_NAMESPACE, DavDispatch, DavProtocol, escape_xml, filter_unsupported, prepare_if_match,
+    response_etag, worse_recovery,
 };
 pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery};
 use bifrost_net::{AccountId, AccountNet};
@@ -17,8 +17,9 @@ use reqwest::{Method, StatusCode};
 use crate::CalDavConfig;
 use crate::parse::{
     CalDavFetchedEvent, CalDavMultigetReport, CalDavSyncReport, CalendarCollection,
-    MultigetOutcome, extract_href_properties, extract_href_property, parse_calendar_collections,
-    parse_multiget_report, parse_propfind_events, parse_sync_collection_report, resolve_href,
+    MultigetOutcome, extract_href_properties_in_namespace, extract_href_property_in_namespace,
+    parse_calendar_collections, parse_multiget_report, parse_propfind_events,
+    parse_sync_collection_report, resolve_href,
 };
 
 const MULTIGET_BATCH_SIZE: usize = 50;
@@ -143,22 +144,28 @@ impl CalDavClient {
             .await?;
         let body = response.text;
         let base = response.url;
-        let calendar_home = extract_href_property(&body, "calendar-home-set")
-            .map_err(|error| parse_error(AccountOperation::Discover, error))?
-            .map(|href| resolve_href(&base, &href))
-            .ok_or_else(|| {
-                bifrost_dav_core::missing_field_error(
-                    AccountOperation::Discover,
-                    "missing calendar-home-set",
-                    DAV,
-                )
-            })?;
-        let hrefs = extract_href_properties(&body, "calendar-user-address-set")
-            .map_err(|error| parse_error(AccountOperation::Discover, error))?;
+        let calendar_home =
+            extract_href_property_in_namespace(&body, CALDAV_NAMESPACE, "calendar-home-set")
+                .map_err(|error| parse_error(AccountOperation::Discover, error))?
+                .map(|href| resolve_href(&base, &href))
+                .ok_or_else(|| {
+                    bifrost_dav_core::missing_field_error(
+                        AccountOperation::Discover,
+                        "missing calendar-home-set",
+                        DAV,
+                    )
+                })?;
+        let hrefs = extract_href_properties_in_namespace(
+            &body,
+            CALDAV_NAMESPACE,
+            "calendar-user-address-set",
+        )
+        .map_err(|error| parse_error(AccountOperation::Discover, error))?;
         let calendar_user_email = hrefs.iter().find_map(|href| mailto_email(href));
-        let schedule_outbox_url = extract_href_property(&body, "schedule-outbox-URL")
-            .map_err(|error| parse_error(AccountOperation::Discover, error))
-            .map(|href| href.map(|href| resolve_href(&base, &href)))?;
+        let schedule_outbox_url =
+            extract_href_property_in_namespace(&body, CALDAV_NAMESPACE, "schedule-outbox-URL")
+                .map_err(|error| parse_error(AccountOperation::Discover, error))
+                .map(|href| href.map(|href| resolve_href(&base, &href)))?;
         Ok(CalDavDiscovery {
             calendar_home,
             calendar_user_email,

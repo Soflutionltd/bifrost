@@ -90,7 +90,7 @@ async fn bearer_auth_without_a_token_source_fails_locally_and_sends_nothing() {
         "no unauthenticated request may reach the transport"
     );
 
-    let account_error = bifrost_net::into_account_error(
+    let account_error = bifrost_net::into_account_error_with_throttle_scope(
         error,
         bifrost_net::NetErrorContext {
             provider: None,
@@ -98,6 +98,7 @@ async fn bearer_auth_without_a_token_source_fails_locally_and_sends_nothing() {
             operation: bifrost_types::AccountOperation::Discover,
             scope: None,
         },
+        None,
     );
     assert!(
         matches!(

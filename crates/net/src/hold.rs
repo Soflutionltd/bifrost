@@ -205,7 +205,7 @@ mod tests {
                 .await
                 .err()
                 .expect("held request fails");
-            let error = crate::into_account_error(
+            let error = crate::into_account_error_with_throttle_scope(
                 error,
                 crate::NetErrorContext {
                     operation: AccountOperation::SyncInventory,
@@ -213,6 +213,7 @@ mod tests {
                     protocol: Protocol::Gmail,
                     scope: None,
                 },
+                Some(bifrost_types::ThrottleScope::Account),
             );
             let Cause::Server(bifrost_types::ServerCause::RateLimited { retry_hint }) =
                 error.chain().outermost()
@@ -319,7 +320,7 @@ mod tests {
         assert!(
             matches!(&attempts[0], Error::Status { code, body, .. } if *code == status && body.as_ref() == b"provider quota")
         );
-        let error = crate::into_account_error(
+        let error = crate::into_account_error_with_throttle_scope(
             error,
             crate::NetErrorContext {
                 operation: AccountOperation::Send,
@@ -327,6 +328,7 @@ mod tests {
                 protocol: Protocol::Gmail,
                 scope: None,
             },
+            Some(bifrost_types::ThrottleScope::Account),
         );
         let states: Vec<_> = error
             .chain()
@@ -487,7 +489,7 @@ mod tests {
         assert!(
             matches!(attempts.as_slice(), [Error::Network { transmission_state: TransmissionState::InFlight, message, .. }] if message == "earlier inflight reset")
         );
-        let error = crate::into_account_error(
+        let error = crate::into_account_error_with_throttle_scope(
             error,
             crate::NetErrorContext {
                 operation: AccountOperation::Send,
@@ -495,6 +497,7 @@ mod tests {
                 protocol: Protocol::Gmail,
                 scope: None,
             },
+            Some(bifrost_types::ThrottleScope::Account),
         );
         assert!(
             matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(advice) if advice.reason == bifrost_types::ReconcileReason::ThrottledMidFlight)
@@ -598,7 +601,7 @@ mod tests {
         assert!(
             matches!(&error, Error::LocalHold { attempts, .. } if matches!(attempts.as_slice(), [Error::Status { code, body, .. }] if *code == status && body.as_ref() == b"mutation outcome"))
         );
-        let error = crate::into_account_error(
+        let error = crate::into_account_error_with_throttle_scope(
             error,
             crate::NetErrorContext {
                 operation: AccountOperation::Send,
@@ -606,6 +609,7 @@ mod tests {
                 protocol: Protocol::Gmail,
                 scope: None,
             },
+            Some(bifrost_types::ThrottleScope::Account),
         );
         assert!(
             matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(advice) if advice.reason == bifrost_types::ReconcileReason::ThrottledMidFlight),
@@ -686,7 +690,7 @@ mod tests {
         review_r1_streaming(StatusCode::TEMPORARY_REDIRECT, false).await;
     }
     fn final_review_reconciles(error: Error) {
-        let error = crate::into_account_error(
+        let error = crate::into_account_error_with_throttle_scope(
             error,
             crate::NetErrorContext {
                 operation: AccountOperation::Send,
@@ -694,6 +698,7 @@ mod tests {
                 protocol: Protocol::Gmail,
                 scope: None,
             },
+            Some(bifrost_types::ThrottleScope::Account),
         );
         assert!(
             matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(_)),
@@ -748,7 +753,7 @@ mod tests {
             .err()
             .expect("replacement token timed out");
         if status == StatusCode::UNAUTHORIZED {
-            let error = crate::into_account_error(
+            let error = crate::into_account_error_with_throttle_scope(
                 error,
                 crate::NetErrorContext {
                     operation: AccountOperation::Send,
@@ -756,6 +761,7 @@ mod tests {
                     protocol: Protocol::Gmail,
                     scope: None,
                 },
+                Some(bifrost_types::ThrottleScope::Account),
             );
             assert!(
                 matches!(
@@ -997,7 +1003,7 @@ mod tests {
             matches!(&error, Error::AttemptHistory { attempts, may_have_committed: false, .. }
             if matches!(attempts.as_slice(), [Error::Network { transmission_state: TransmissionState::Unsent, .. }]))
         );
-        let classified = crate::into_account_error(
+        let classified = crate::into_account_error_with_throttle_scope(
             error,
             crate::NetErrorContext {
                 operation: AccountOperation::Send,
@@ -1005,6 +1011,7 @@ mod tests {
                 protocol: Protocol::Gmail,
                 scope: None,
             },
+            None,
         );
         assert!(matches!(
             classified.kind(),

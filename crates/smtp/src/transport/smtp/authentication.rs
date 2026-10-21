@@ -241,7 +241,8 @@ impl Credentials {
 /// turn it into a terminal policy block at the SMTP account boundary.
 fn oauth_token_error(error: bifrost_net::Error) -> Error {
     let message = format!("failed to read OAuth access token: {error}");
-    let account_error = bifrost_net::into_account_error(
+    // A token endpoint throttle has no SMTP transaction scope to name.
+    let account_error = bifrost_net::into_account_error_with_throttle_scope(
         error,
         NetErrorContext {
             provider: None,
@@ -249,6 +250,7 @@ fn oauth_token_error(error: bifrost_net::Error) -> Error {
             operation: bifrost_types::error::AccountOperation::Send,
             scope: None,
         },
+        None,
     );
     error::invalid_input(message)
         .with_preclassified_account_error(account_error)

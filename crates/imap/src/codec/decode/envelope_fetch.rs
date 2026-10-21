@@ -1,5 +1,7 @@
 //! ENVELOPE + FETCH response parsing (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
 
+use bytes::Bytes;
+
 use super::bodystructure::body_structure;
 use super::decode_rfc2047;
 use super::flags_caps::flag_list;
@@ -152,6 +154,14 @@ pub(super) fn envelope(input: &[u8], utf8_mode: bool) -> IResult<&[u8], Envelope
 /// Called after `* <n> FETCH ` is consumed.
 /// When `utf8_mode` is true, ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
 pub(super) fn fetch_response_inner(input: &[u8], utf8_mode: bool) -> IResult<&[u8], FetchResponse> {
+    fetch_response_inner_with_backing(input, utf8_mode, None)
+}
+
+pub(super) fn fetch_response_inner_with_backing<'a>(
+    input: &'a [u8],
+    utf8_mode: bool,
+    backing: Option<&Bytes>,
+) -> IResult<&'a [u8], FetchResponse> {
     let (input, _) = char('(').parse(input)?;
     let mut fr = FetchResponse::default();
     let mut input = input;
@@ -171,7 +181,7 @@ pub(super) fn fetch_response_inner(input: &[u8], utf8_mode: bool) -> IResult<&[u
         let upper = String::from_utf8_lossy(attr_name).to_ascii_uppercase();
 
         input = rest;
-        let parsed = fetch_attr_value(&upper, input, utf8_mode, &mut fr);
+        let parsed = fetch_attr_value(&upper, input, utf8_mode, backing, &mut fr);
         let (rest, ()) = parsed?;
         input = rest;
     }
@@ -373,10 +383,11 @@ fn fetch_attr_value<'a>(
     upper: &str,
     input: &'a [u8],
     utf8_mode: bool,
+    backing: Option<&Bytes>,
     fr: &mut FetchResponse,
 ) -> IResult<&'a [u8], ()> {
     let strict = has_closed_grammar(upper, input);
-    let parsed = fetch_attr_value_inner(upper, input, utf8_mode, fr);
+    let parsed = fetch_attr_value_inner(upper, input, utf8_mode, backing, fr);
     if strict {
         // Keep this decision at the value boundary. `alt` may otherwise turn
         // an error in a recognised response into `Unknown`, which the driver
@@ -394,6 +405,7 @@ fn fetch_attr_value_inner<'a>(
     upper: &str,
     input: &'a [u8],
     utf8_mode: bool,
+    backing: Option<&Bytes>,
     fr: &mut FetchResponse,
 ) -> IResult<&'a [u8], ()> {
     match upper {
@@ -435,7 +447,7 @@ fn fetch_attr_value_inner<'a>(
             // RFC 3501 Section 7.4.2: RFC822 SP nstring
             // Functionally equivalent to BODY[] (entire message).
             let (rest, _) = attr_sp(input)?;
-            let (rest, data) = nstring(rest)?;
+            let (rest, data) = nstring_bytes(rest, backing)?;
             fr.body_sections.push(BodySection {
                 section: String::new(),
                 origin: None,
@@ -447,7 +459,7 @@ fn fetch_attr_value_inner<'a>(
             // RFC 3501 Section 7.4.2: RFC822.HEADER SP nstring
             // Functionally equivalent to BODY[HEADER].
             let (rest, _) = attr_sp(input)?;
-            let (rest, data) = nstring(rest)?;
+            let (rest, data) = nstring_bytes(rest, backing)?;
             fr.body_sections.push(BodySection {
                 section: "HEADER".to_owned(),
                 origin: None,
@@ -459,7 +471,7 @@ fn fetch_attr_value_inner<'a>(
             // RFC 3501 Section 7.4.2: RFC822.TEXT SP nstring
             // Functionally equivalent to BODY[TEXT].
             let (rest, _) = attr_sp(input)?;
-            let (rest, data) = nstring(rest)?;
+            let (rest, data) = nstring_bytes(rest, backing)?;
             fr.body_sections.push(BodySection {
                 section: "TEXT".to_owned(),
                 origin: None,
@@ -596,7 +608,7 @@ fn fetch_attr_value_inner<'a>(
             // BINARY[section]<origin> nstring (RFC 3516 Section 4.2)
             let (rest, (section_parts, origin)) = binary_section_with_origin(input)?;
             let (rest, _) = attr_sp(rest)?;
-            let (rest, data) = nstring(rest)?;
+            let (rest, data) = nstring_bytes(rest, backing)?;
             fr.binary_sections.push(BinarySection {
                 section: section_parts,
                 origin,
@@ -608,7 +620,7 @@ fn fetch_attr_value_inner<'a>(
             // BODY[section]<origin> nstring (RFC 3501 Section 7.4.2)
             let (rest, section) = body_section_spec(input)?;
             let (rest, _) = attr_sp(rest)?;
-            let (rest, data) = nstring(rest)?;
+            let (rest, data) = nstring_bytes(rest, backing)?;
             fr.body_sections.push(BodySection {
                 section: section.0,
                 origin: section.1,

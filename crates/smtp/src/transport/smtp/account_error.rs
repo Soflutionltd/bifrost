@@ -1080,6 +1080,10 @@ mod tests {
             account.kind(),
             AccountErrorKind::Server(ServerErrorKind::QuotaExhausted)
         ));
+        assert_eq!(
+            account.telemetry_fields().throttle_scope,
+            Some(ThrottleScope::Account)
+        );
         // Acknowledged + non-idempotent Send falls through to retry by table.
         assert!(account.recovery().is_retryable() || account.recovery().requires_reconciliation());
     }
@@ -1114,6 +1118,10 @@ mod tests {
             account.kind(),
             AccountErrorKind::Server(ServerErrorKind::RateLimited)
         ));
+        assert_eq!(
+            account.telemetry_fields().throttle_scope,
+            Some(ThrottleScope::Account)
+        );
     }
 
     #[test]

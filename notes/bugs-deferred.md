@@ -56,17 +56,6 @@ once.
 
 # Low value or not defects
 
-## JMAP-025 - `maxConcurrentUpload` / `maxSizeUpload` are not consulted, and the stated rationale is stale
-
-Hunter severity: P3 (documentation inconsistency today). Scope: jmap protocol.
-
-`reference/jmap.md` leaves `maxConcurrentUpload` unread because "every upload
-door awaits one upload at a time". True per call site, but the engine can run
-several `attachment_upload` / send operations at once on one account, and
-uploads are not gated by the API `ConcurrencyLimit`. Concurrent uploads happen
-from different callers, the same overlap argument the doc uses to justify the
-client-wide API gate. The gate belongs on the transport for the same reason.
-
 ## JMAP-032 - JMAP observations that need net facilities
 
 Residue; both need a `bifrost-net` addition first, and the current behaviour is

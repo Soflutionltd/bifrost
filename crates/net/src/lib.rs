@@ -46,9 +46,7 @@ pub(crate) mod trace;
 mod upload;
 pub mod url;
 
-pub use account_error::{
-    NetErrorContext, into_account_error, into_account_error_with_throttle_scope,
-};
+pub use account_error::{NetErrorContext, into_account_error_with_throttle_scope};
 pub use auth::{AccessToken, OAuthRefresher, RefreshState, StaticTokenSource, TokenSource};
 pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink, MeterSinkHandle};
 pub use budget::{BandwidthBudget, BandwidthDirection, BandwidthRegistry, Reservation};
@@ -76,8 +74,6 @@ pub use rate::{RateGeneration, RateLimit, RateLimitGovernor, RequestCost};
 pub use redirect::{
     DEFAULT_MAX_HOPS, FollowRedirects, RedirectAction, RedirectPolicy, RedirectStep,
 };
-pub use request::{
-    ByteStream, RequestBuilder, RequestByteCounter, Response, StreamingResponse, parse_retry_after,
-};
+pub use request::{ByteStream, RequestBuilder, RequestByteCounter, Response, StreamingResponse};
 pub use retry::RetryPolicy;
 pub use status_line::{status_line_code, status_line_is_success};

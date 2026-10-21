@@ -6,6 +6,7 @@
 //! BINARY extension is defined in RFC 3516.
 
 use super::{BodyStructure, Envelope, Flag};
+use bytes::Bytes;
 
 /// A parsed FETCH response for a single message
 /// (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
@@ -93,7 +94,7 @@ pub struct BinarySection {
     /// to support messages > 4 GiB.
     pub origin: Option<u64>,
     /// The decoded binary data, or `None` if the server returned NIL.
-    pub data: Option<Vec<u8>>,
+    pub data: Option<Bytes>,
 }
 
 /// A single fetched body section (RFC 3501 Section 6.4.5).
@@ -108,7 +109,7 @@ pub struct BodySection {
     /// to support messages > 4 GiB.
     pub origin: Option<u64>,
     /// The raw body data, or `None` if the server returned NIL.
-    pub data: Option<Vec<u8>>,
+    pub data: Option<Bytes>,
 }
 
 /// FETCH item attributes the client can request
