@@ -635,7 +635,8 @@ Reopen is engine-delegated: on drop or `close()`, the engine calls `JmapAccountF
 
 - `cursor_freshness: ServerIssued`; `blob_range: No`; `blob_digest_pre_download: false`.
 - `push: InProcess` when the session advertises `urn:ietf:params:jmap:websocket` with `supportsPush: true`, else `None`.
-- `mutation.concurrency: ExpectedVersion` enables mail flags, move and destroy.
+- `mutation.concurrency: ExpectedVersion` enables mail flags, move and destroy,
+  plus supported contact/event updates, deletes and event RSVP.
   Versioned bulk mail accepts caller `StateAt` and sends it as `ifInState` on
   the owning account's `Email/set`. The first `stateMismatch` is a per-target
   conflict, without a state probe or refresh/retry. With no caller token,
@@ -1403,21 +1404,25 @@ funnel, retaining their provider, scope and diagnostic decoration.
 `Account::protocol` returns `Protocol::Jmap`, including for inherited
 default-method refusals.
 
-## Caller versions on contact and event updates
+## Caller versions on contact and event mutations
 
-The shared `ContactPatch` and `EventPatch` carry optional `expected_version`.
-These update doors currently refuse supplied versions as `Unsupported` before
-I/O. Their native `ifInState` wiring remains to be implemented. Only the mail
-flags/move/destroy doors advertise caller-version enforcement.
-
-The inherited `contact_delete_if_version` and `event_delete_if_version` doors
-likewise refuse a supplied version as `Unsupported` before I/O. With no version
-they delegate to the provider's ordinary delete implementation. No conditional
-delete guarantee is advertised.
+Contact and event update patches, conditional deletes and conditional RSVP
+accept a nonempty `ServerVersion::StateAt` and send it as native `ifInState`.
+RFC 8620 Section 5.3 requires a mismatching state to reject the entire set
+without changes. State belongs to the selected account and object type, not
+an individual object's ETag or query state. Reads needed to construct a patch
+never replace the caller state; a mismatch propagates as `ConcurrencyConflict`
+without a refresh or retry. Other version kinds and empty states are refused
+before I/O. Absent versions retain the ordinary unconditional paths.
+Capabilities advertise these doors only when the corresponding PIM account
+is supported. Contact and event reads still expose no shared type-state field;
+callers must already possess the appropriate native type state.
 
 The bulk caller-state contract follows RFC 8620 Section 5.3:
 https://www.rfc-editor.org/rfc/rfc8620.html#section-5.3
-An Email state belongs to one account, not one message. Each caller target is
-submitted independently; if several targets carry one old state, an earlier
-successful write can make later targets conflict. No automatic token advance
-is allowed on the caller's behalf.
+An Email state belongs to one account, not one message. Ready targets with the
+same owner and optional caller state share one `Email/set`, bounded by
+`maxObjectsInSet` and the local 500-object cap. Different owners or states
+never share a set. A pending input flushes a partial chunk. A later chunk
+carrying the same old state can still conflict after an earlier success;
+no automatic token advance is allowed on the caller's behalf.

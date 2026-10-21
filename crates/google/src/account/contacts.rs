@@ -292,26 +292,42 @@ pub(crate) fn update(
         let mut person = get_person(&client, &contact, AccountOperation::ContactUpdate).await?;
         let fields_updated = !update_fields.is_empty();
         if !update_fields.is_empty() {
-            // updateContact enforces metadata.sources.etag for the CONTACT
-            // source, not Person.etag (the merged resource's cache token):
+            // updateContact requires source metadata and compares the CONTACT
+            // source etag. The docs do not say which source to choose when
+            // there are several CONTACT sources, so unversioned updates keep
+            // the prior merged-Person-etag behavior when no unique source
+            // token is available. Person.etag is documented only for resource
+            // cache validation, so omit it when sending a source token.
             // https://developers.google.com/people/api/rest/v1/people/updateContact
+            // https://developers.google.com/people/api/rest/v1/people#Person
             // https://developers.google.com/people/api/rest/v1/people#Source
-            // Preserve source identity, but never replace a caller token with
-            // the GET's newer token or refresh and retry a rejected token.
-            let observed = require_person_etag(&person)?;
-            let etag = expected.unwrap_or(observed);
-            let source = person
-                .metadata
-                .as_mut()
-                .and_then(|metadata| metadata.get_mut("sources"))
-                .and_then(Value::as_array_mut)
-                .and_then(|sources| {
-                    sources
-                        .iter_mut()
-                        .find(|source| source["type"] == "CONTACT")
-                })
-                .expect("validated contact source");
-            source["etag"] = Value::String(etag);
+            // A caller token is never replaced with the GET's newer token or
+            // refreshed after a rejected update.
+            if expected.is_some() || contact_source_etag(&person).is_some() {
+                let observed = require_person_etag(&person)?;
+                let etag = expected.unwrap_or(observed);
+                let source = unique_contact_source_mut(&mut person)
+                    .expect("validated unique contact source");
+                source["etag"] = Value::String(etag);
+                person.etag = None;
+            } else {
+                if has_contact_source(&person) {
+                    // This preserves the old unversioned request when source
+                    // metadata has CONTACT sources but no unique token. Do
+                    // not invent a source etag from the merged Person cache
+                    // validator.
+                    require_merged_person_etag(&person)?;
+                } else {
+                    // updateContact documents a refusal when the person has
+                    // no CONTACT source. In particular, OTHER_CONTACT is
+                    // not writable through this method.
+                    return Err(local_error_with_field(
+                        AccountOperation::ContactUpdate,
+                        "contactEtag",
+                        "Google People updateContact requires a CONTACT source etag".to_string(),
+                    ));
+                }
+            }
             apply_patch_to_person(&mut person, &patch);
             person.resource_name = Some(contact.0.clone());
             let encoded = encode_resource_name_path(&contact.0);
@@ -1065,18 +1081,52 @@ fn patched_names(names: Option<Vec<Name>>, display_name: &str) -> Vec<Name> {
     vec![replacement]
 }
 
-// Person and Source expose distinct ETags. Only a CONTACT source token
-// can condition updateContact; never fall back to the merged Person token.
+// Person and Source expose distinct ETags. A unique CONTACT source token is
+// the update precondition; the merged Person token is only a cache validator.
 // https://developers.google.com/people/api/rest/v1/people#Person
 // https://developers.google.com/people/api/rest/v1/people#Source
 fn contact_source_etag(person: &Person) -> Option<&str> {
+    unique_contact_source(person)?
+        .get("etag")?
+        .as_str()
+        .filter(|etag| !etag.is_empty())
+}
+
+fn has_contact_source(person: &Person) -> bool {
+    person
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("sources"))
+        .and_then(Value::as_array)
+        .is_some_and(|sources| sources.iter().any(|source| source["type"] == "CONTACT"))
+}
+
+fn unique_contact_source(person: &Person) -> Option<&Value> {
     let sources = person.metadata.as_ref()?.get("sources")?.as_array()?;
-    let mut contacts = sources.iter().filter(|source| source["type"] == "CONTACT");
-    let source = contacts.next()?;
-    if contacts.next().is_some() {
-        return None;
+    sources.get(unique_contact_source_index(sources)?)
+}
+
+fn unique_contact_source_mut(person: &mut Person) -> Option<&mut Value> {
+    let sources = person
+        .metadata
+        .as_mut()?
+        .get_mut("sources")?
+        .as_array_mut()?;
+    let index = unique_contact_source_index(sources)?;
+    sources.get_mut(index)
+}
+
+fn unique_contact_source_index(sources: &[Value]) -> Option<usize> {
+    let mut contact_index = None;
+    for (index, source) in sources.iter().enumerate() {
+        if source["type"] == "CONTACT" {
+            if contact_index.is_some() {
+                return None;
+            }
+            contact_index = Some(index);
+        }
     }
-    source.get("etag")?.as_str().filter(|etag| !etag.is_empty())
+    contact_index
 }
 
 fn require_person_etag(person: &Person) -> Result<String, AccountError> {
@@ -1089,6 +1139,16 @@ fn require_person_etag(person: &Person) -> Result<String, AccountError> {
                 "Google People updateContact requires a CONTACT source etag".to_string(),
             )
         })
+}
+
+fn require_merged_person_etag(person: &Person) -> Result<(), AccountError> {
+    person.etag.as_ref().map(|_| ()).ok_or_else(|| {
+        local_error_with_field(
+            AccountOperation::ContactUpdate,
+            "contactEtag",
+            "Google People updateContact requires an etag".to_string(),
+        )
+    })
 }
 
 // COUPLING: every field named here must also be carried by the `Person` DTO,
@@ -1459,9 +1519,83 @@ mod tests {
                 body["metadata"]["sources"][1]["etag"],
                 expected.unwrap_or("source-new")
             );
+            assert!(body.get("etag").is_none());
             assert_eq!(body["metadata"]["sources"][1]["id"], "c1");
             assert_eq!(body["metadata"]["sources"][0]["etag"], "profile");
         }
+    }
+
+    #[tokio::test]
+    async fn unversioned_field_update_falls_back_when_contact_source_token_is_not_unique() {
+        for sources in [
+            serde_json::json!([
+                {"type":"CONTACT","id":"c1","etag":"source-one"},
+                {"type":"CONTACT","id":"c2","etag":"source-two"}
+            ]),
+            serde_json::json!([
+                {"type":"CONTACT","id":"c1"}
+            ]),
+        ] {
+            let get_body = serde_json::json!({
+                "resourceName": "people/c1",
+                "etag": "merged",
+                "metadata": {"sources": sources}
+            })
+            .to_string();
+            let (client, script) = scripted_client_steps(vec![
+                Canned::Response {
+                    status: StatusCode::OK,
+                    headers: reqwest::header::HeaderMap::new(),
+                    body: Bytes::from(get_body),
+                },
+                Canned::Response {
+                    status: StatusCode::OK,
+                    headers: reqwest::header::HeaderMap::new(),
+                    body: Bytes::from_static(b"{}"),
+                },
+            ]);
+
+            update(
+                client,
+                ContactId("people/c1".into()),
+                ContactPatch {
+                    display_name: Some(Some("Ada".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unversioned update retains the prior fallback");
+
+            let requests = script.requests();
+            assert_eq!(requests.len(), 2);
+            let body: Value = serde_json::from_slice(requests[1].body.as_ref().unwrap()).unwrap();
+            assert_eq!(body["etag"], "merged");
+            assert_eq!(body["metadata"]["sources"], sources);
+        }
+    }
+
+    #[tokio::test]
+    async fn versioned_field_update_does_not_fall_back_for_ambiguous_contact_sources() {
+        let (client, script) = scripted_client_steps(vec![Canned::Response {
+            status: StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from_static(br#"{"resourceName":"people/c1","etag":"merged","metadata":{"sources":[{"type":"CONTACT","id":"c1","etag":"one"},{"type":"CONTACT","id":"c2","etag":"two"}]}}"#),
+        }]);
+
+        let error = update(
+            client,
+            ContactId("people/c1".into()),
+            ContactPatch {
+                display_name: Some(Some("Ada".into())),
+                expected_version: Some(bifrost_types::ServerVersion::ETag("caller-old".into())),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("caller version cannot be mapped to one CONTACT source");
+
+        assert_eq!(error.operation(), Some(AccountOperation::ContactUpdate));
+        assert_eq!(script.requests().len(), 1);
     }
 
     #[test]
@@ -1472,10 +1606,18 @@ mod tests {
                 Some("source"),
             ),
             (
+                serde_json::json!({"sources":[{"type":"CONTACT","etag":"source-one"},{"type":"CONTACT","etag":"source-two"}]}),
+                None,
+            ),
+            (
                 serde_json::json!({"sources":[{"type":"PROFILE","etag":"profile"}]}),
                 None,
             ),
             (serde_json::json!({"sources":[{"type":"CONTACT"}]}), None),
+            (
+                serde_json::json!({"sources":[{"type":"OTHER_CONTACT","etag":"other"}]}),
+                None,
+            ),
         ] {
             let person = Person {
                 etag: Some("merged".into()),

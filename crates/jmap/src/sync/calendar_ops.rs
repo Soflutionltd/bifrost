@@ -196,12 +196,10 @@ pub(crate) fn update<T: HttpTransport>(
     patch: EventPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        if patch.expected_version.is_some() {
-            return Err(AccountError::unsupported(
-                AccountOperation::EventUpdate,
-                bifrost_types::error::Protocol::Jmap,
-            ));
-        }
+        let expected = super::mutation::caller_state(
+            patch.expected_version.as_ref(),
+            AccountOperation::EventUpdate,
+        )?;
         let calendars = require_calendars(calendars, AccountOperation::EventUpdate)?;
         let id = CalendarEventId::new(event.0);
         // A patch that changes only the recurrence rule carries neither the
@@ -233,6 +231,9 @@ pub(crate) fn update<T: HttpTransport>(
         let jmap_patch =
             jmap_patch_from_event_patch(&patch, &context, AccountOperation::EventUpdate)?;
         let mut set = CalendarEventSet::new();
+        if let Some(state) = expected {
+            set = set.if_in_state(state);
+        }
         set.update_item(id.clone(), jmap_patch);
         let mut response = calendars
             .call(set)
@@ -249,10 +250,25 @@ pub(crate) fn delete<T: HttpTransport>(
     calendars: Option<CalendarAccount<T>>,
     event: EventId,
 ) -> AccountFuture<Result<(), AccountError>> {
+    delete_if_version(calendars, event, None)
+}
+
+pub(crate) fn delete_if_version<T: HttpTransport>(
+    calendars: Option<CalendarAccount<T>>,
+    event: EventId,
+    expected_version: Option<bifrost_types::ServerVersion>,
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        let expected = super::mutation::caller_state(
+            expected_version.as_ref(),
+            AccountOperation::EventDelete,
+        )?;
         let calendars = require_calendars(calendars, AccountOperation::EventDelete)?;
         let id = CalendarEventId::new(event.0);
-        let set = CalendarEventSet::new().destroy([id.clone()]);
+        let mut set = CalendarEventSet::new().destroy([id.clone()]);
+        if let Some(state) = expected {
+            set = set.if_in_state(state);
+        }
         let mut response = calendars
             .call(set)
             .await
@@ -269,13 +285,28 @@ pub(crate) fn rsvp<T: HttpTransport>(
     event: EventId,
     status: RsvpStatus,
 ) -> AccountFuture<Result<(), AccountError>> {
+    rsvp_if_version(calendars, self_emails, event, status, None)
+}
+
+pub(crate) fn rsvp_if_version<T: HttpTransport>(
+    calendars: Option<CalendarAccount<T>>,
+    self_emails: Vec<String>,
+    event: EventId,
+    status: RsvpStatus,
+    expected_version: Option<bifrost_types::ServerVersion>,
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        let expected =
+            super::mutation::caller_state(expected_version.as_ref(), AccountOperation::EventRsvp)?;
         let calendars = require_calendars(calendars, AccountOperation::EventRsvp)?;
         let id = CalendarEventId::new(event.0);
         let current = get_raw_event(&calendars, id.clone(), AccountOperation::EventRsvp).await?;
         let patch = jmap_rsvp_patch_from_participants(current.participants(), &self_emails, status)
             .map_err(|message| unsupported(AccountOperation::EventRsvp, message))?;
         let mut set = CalendarEventSet::new();
+        if let Some(state) = expected {
+            set = set.if_in_state(state);
+        }
         set.update_item(id.clone(), patch);
         let mut response = calendars
             .call(set)
@@ -2237,22 +2268,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caller_event_versions_are_refused_before_io() {
+    async fn caller_event_state_is_enforced_without_replacing_it() {
+        for state in [Some("old"), Some("s1"), None] {
+            let transport = ScriptedQueryTransport::new(Vec::new());
+            let expected = state.map(|state| bifrost_types::ServerVersion::StateAt(state.into()));
+            let stale = state == Some("old");
+            let result = update(
+                Some(transport.account()),
+                EventId("one".into()),
+                EventPatch {
+                    expected_version: expected.clone(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            if stale {
+                assert_eq!(
+                    *result.unwrap_err().kind(),
+                    bifrost_types::AccountErrorKind::ConcurrencyConflict
+                );
+            } else {
+                result.unwrap();
+            }
+            let result = delete_if_version(
+                Some(transport.account()),
+                EventId("one".into()),
+                expected.clone(),
+            )
+            .await;
+            if stale {
+                assert_eq!(
+                    *result.unwrap_err().kind(),
+                    bifrost_types::AccountErrorKind::ConcurrencyConflict
+                );
+            } else {
+                result.unwrap();
+            }
+
+            let result = rsvp_if_version(
+                Some(transport.account()),
+                Vec::new(),
+                EventId("one".into()),
+                RsvpStatus::Accepted,
+                expected.clone(),
+            )
+            .await;
+            if stale {
+                assert_eq!(
+                    *result.unwrap_err().kind(),
+                    bifrost_types::AccountErrorKind::ConcurrencyConflict
+                );
+            } else {
+                result.unwrap();
+            }
+
+            let calls = transport.calls();
+            for (_, args) in calls
+                .iter()
+                .filter(|(method, _)| method == "CalendarEvent/set")
+            {
+                assert_eq!(args.get("ifInState").and_then(Value::as_str), state);
+            }
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(method, _)| method == "CalendarEvent/set")
+                    .count(),
+                3
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_event_version_kind_is_refused_before_io() {
         let transport = ScriptedQueryTransport::new(Vec::new());
-        let error = update(
-            Some(transport.account()),
-            EventId("one".into()),
-            EventPatch {
-                expected_version: Some(bifrost_types::ServerVersion::StateAt("old".into())),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            *error.kind(),
-            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
-        );
+        for expected_version in [
+            bifrost_types::ServerVersion::ETag("s1".into()),
+            bifrost_types::ServerVersion::StateAt(String::new()),
+        ] {
+            let error = update(
+                Some(transport.account()),
+                EventId("one".into()),
+                EventPatch {
+                    expected_version: Some(expected_version),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                *error.kind(),
+                bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+            );
+        }
         assert!(transport.calls().is_empty());
     }
 
@@ -2784,46 +2892,68 @@ mod tests {
                 .lock()
                 .expect("calls")
                 .push((name.clone(), call[1].clone()));
-            let arguments = match name.as_str() {
-                "CalendarEvent/query" => {
-                    let page = self
-                        .pages
-                        .lock()
-                        .expect("pages")
-                        .pop_front()
-                        .expect("script has a page for this query");
-                    json!({
-                        "accountId": "primary",
-                        "queryState": page.query_state,
-                        "canCalculateChanges": false,
-                        "position": page.position,
-                        "total": page.total,
-                        "ids": page.ids
-                    })
-                }
-                "CalendarEvent/get" => {
-                    let list: Vec<Value> = call[1]["ids"]
-                        .as_array()
-                        .expect("ids")
-                        .iter()
-                        .map(|id| {
-                            json!({
-                                "id": id,
-                                "calendarIds": {"cal": true},
-                                "start": "2026-06-01T09:00:00",
-                                "duration": "PT1H"
-                            })
+            let arguments =
+                match name.as_str() {
+                    "CalendarEvent/query" => {
+                        let page = self
+                            .pages
+                            .lock()
+                            .expect("pages")
+                            .pop_front()
+                            .expect("script has a page for this query");
+                        json!({
+                            "accountId": "primary",
+                            "queryState": page.query_state,
+                            "canCalculateChanges": false,
+                            "position": page.position,
+                            "total": page.total,
+                            "ids": page.ids
                         })
-                        .collect();
-                    json!({
-                        "accountId": "primary",
-                        "state": "s1",
-                        "list": list,
-                        "notFound": []
-                    })
-                }
-                other => panic!("unexpected method {other}"),
-            };
+                    }
+                    "CalendarEvent/get" => {
+                        let list: Vec<Value> = call[1]["ids"]
+                            .as_array()
+                            .expect("ids")
+                            .iter()
+                            .map(|id| {
+                                json!({
+                                    "id": id,
+                                    "calendarIds": {"cal": true},
+                                    "start": "2026-06-01T09:00:00",
+                                    "duration": "PT1H",
+                                    "participants": {"p1": {
+                                        "email": "attendee@example.test",
+                                        "roles": {"attendee": true},
+                                        "participationStatus": "needs-action"
+                                    }}
+                                })
+                            })
+                            .collect();
+                        json!({
+                            "accountId": "primary",
+                            "state": "s1",
+                            "list": list,
+                            "notFound": []
+                        })
+                    }
+                    "CalendarEvent/set" => {
+                        // A fixed server state, independent of the production guard wiring.
+                        if call[1]
+                            .get("ifInState")
+                            .is_some_and(|state| state.as_str() != Some("s1"))
+                        {
+                            return Ok(bytes::Bytes::from(json!({
+                            "sessionState": "session-1",
+                            "methodResponses": [["error", {"type": "stateMismatch"}, call_id]]
+                        }).to_string()));
+                        }
+                        json!({
+                            "accountId": "primary", "oldState": "s1", "newState": "s2",
+                            "updated": {"one": null}, "destroyed": ["one"]
+                        })
+                    }
+                    other => panic!("unexpected method {other}"),
+                };
             let response = json!({
                 "sessionState": "session-1",
                 "methodResponses": [[name, arguments, call_id]]

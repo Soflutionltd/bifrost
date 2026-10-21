@@ -1341,6 +1341,14 @@ impl Account for JmapAccount {
         contacts::delete(self.contacts.clone(), contact)
     }
 
+    fn contact_delete_if_version(
+        &self,
+        contact: ContactId,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        contacts::delete_if_version(self.contacts.clone(), contact, expected_version)
+    }
+
     fn contact_search(
         &self,
         request: ContactSearchRequest,
@@ -1418,6 +1426,14 @@ impl Account for JmapAccount {
         calendar_ops::delete(self.calendars.clone(), event)
     }
 
+    fn event_delete_if_version(
+        &self,
+        event: EventId,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        calendar_ops::delete_if_version(self.calendars.clone(), event, expected_version)
+    }
+
     fn event_rsvp(
         &self,
         event: EventId,
@@ -1428,6 +1444,21 @@ impl Account for JmapAccount {
             self.self_emails.clone(),
             event,
             status,
+        )
+    }
+
+    fn event_rsvp_if_version(
+        &self,
+        event: EventId,
+        status: RsvpStatus,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        calendar_ops::rsvp_if_version(
+            self.calendars.clone(),
+            self.self_emails.clone(),
+            event,
+            status,
+            expected_version,
         )
     }
 

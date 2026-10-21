@@ -2684,3 +2684,18 @@ purposes. The ordinary contact/event and bulk-mail paths retain their current
 cache or GET-derived conditions when no version is supplied. They guard only
 changes since that observation, not the consumer's earlier view. Removing them
 would widen the existing race window and change absent-version behavior.
+
+Graph mail move and permanentDelete caller versions remain refused before I/O.
+Their action documentation specifies no If-Match precondition contract:
+https://learn.microsoft.com/en-us/graph/api/message-move and
+https://learn.microsoft.com/en-us/graph/api/message-permanentdelete.
+Legacy observed headers remain unchanged, but are not advertised as atomic
+caller-version enforcement; `mail_move` and `mail_destroy` stay false.
+
+Versioned bulk flag writes combine ready targets into one JSON batch (up to
+20 subrequests), preserving each target's own If-Match. Caller versions bypass
+cache and refresh; absent versions retain cache-or-GET guards. A 412 remains
+an individual conflict while successful siblings remain successful. Repeated
+IDs start another envelope so distinct caller preconditions cannot overwrite
+each other in the ID-keyed guard map. JSON batching is not a transaction:
+https://learn.microsoft.com/en-us/graph/json-batching.

@@ -61,36 +61,69 @@ pub(crate) fn bulk_set_flags_if_version_stream(
     account: GraphAccount,
     targets: AccountStream<bifrost_types::MailMutationTarget>,
     op: FlagOp,
-    key: IdempotencyKey,
+    _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-    bifrost_types::mutation::versioned_mail_stream(targets, move |target| {
-        let Some(version) = target.expected_version else {
-            return bulk_set_flags_stream(
-                account.clone(),
-                Box::pin(futures::stream::iter([target.id])),
-                op.clone(),
-                key.clone(),
-            );
-        };
-        let expected = match version.expected_etag(
-            bifrost_types::Protocol::Graph,
-            AccountOperation::UpdateFlags,
-            false,
-        ) {
-            Ok(etag) => etag.to_owned(),
-            Err(error) => return bifrost_types::mutation::refused_mail_target(target.id, error),
-        };
-        if let Err(error) = op.validate_for_account(bifrost_types::Protocol::Graph) {
-            return bifrost_types::mutation::refused_mail_target(target.id, error);
-        }
-        let account = account.clone();
-        let kind = MutationKind::SetFlags(op.clone());
-        Box::pin(async_stream::stream! {
-            match submit_batch_with_version(&account, &[target.id], &kind, Some(&expected)).await {
-                Ok(events) => for event in events { yield event; },
-                Err(error) => yield SyncEvent::Terminated(into_account_error(error, GraphErrorContext::graph(AccountOperation::UpdateFlags))),
+    Box::pin(async_stream::stream! {
+        // Graph JSON batching carries headers on each subrequest, so one
+        // envelope can preserve distinct caller ETags. This is not an atomic
+        // transaction: a stale target's 412 does not reject its siblings.
+        // https://learn.microsoft.com/en-us/graph/json-batching
+        let mut chunks = targets.ready_chunks(account.capabilities.batching_policy.max_items.clamp(1, 20));
+        while let Some(chunk) = chunks.next().await {
+            let mut groups: Vec<(Vec<ObjectId>, HashMap<String, String>)> =
+                vec![(Vec::new(), HashMap::new())];
+            let mut rejected = Vec::new();
+            for target in chunk {
+                let version = op.validate_for_account(bifrost_types::Protocol::Graph).and_then(|()| {
+                    target.expected_version.as_ref().map(|version| {
+                        version.expected_etag(
+                            bifrost_types::Protocol::Graph, AccountOperation::UpdateFlags, false,
+                        ).map(str::to_owned)
+                    }).transpose()
+                });
+                match version {
+                    Ok(version) => {
+                        // A repeated ID may carry a different caller version.
+                        // Submit it in a later envelope so a map keyed by ID
+                        // can never replace the earlier target's precondition.
+                        if groups.last().is_some_and(|(ids, _)| ids.contains(&target.id)) {
+                            groups.push((Vec::new(), HashMap::new()));
+                        }
+                        let (ids, expected) = groups.last_mut().expect("one group exists");
+                        if let Some(etag) = version {
+                            expected.insert(target.id.0.clone(), etag);
+                        }
+                        ids.push(target.id);
+                    }
+                    Err(error) => rejected.push(ItemOutcome::Failed(BatchFailure::new(
+                        BatchItemId(target.id.0), error,
+                    ))),
+                }
             }
-        })
+            if !rejected.is_empty() {
+                yield SyncEvent::Batch(Batch {
+                    items: rejected,
+                    page_boundary: PageBoundary::Page,
+                    server_latency: Duration::ZERO,
+                    bytes_in: 0,
+                    checkpoint: None,
+                });
+            }
+            for (ids, expected) in groups {
+                match submit_batch_with_version(
+                    &account, &ids, &MutationKind::SetFlags(op.clone()), Some(&expected),
+                ).await {
+                    Ok(events) => for event in events { yield event; },
+                    Err(error) => {
+                        yield SyncEvent::Terminated(into_account_error(
+                            error, GraphErrorContext::graph(AccountOperation::UpdateFlags),
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+        yield SyncEvent::Done(None);
     })
 }
 
@@ -131,7 +164,6 @@ fn bulk_mutation_stream(
                     Err(error) => {
                         let ctx = GraphErrorContext::graph(operation_for_kind(&kind));
                         yield SyncEvent::Terminated(into_account_error(error, ctx));
-                        yield SyncEvent::Done(None);
                         return;
                     }
                 }
@@ -149,7 +181,6 @@ fn bulk_mutation_stream(
                 Err(error) => {
                     let ctx = GraphErrorContext::graph(operation_for_kind(&kind));
                     yield SyncEvent::Terminated(into_account_error(error, ctx));
-                    yield SyncEvent::Done(None);
                     return;
                 }
             }
@@ -179,7 +210,7 @@ async fn submit_batch_with_version(
     account: &GraphAccount,
     ids: &[ObjectId],
     kind: &MutationKind,
-    expected: Option<&str>,
+    expected: Option<&HashMap<String, String>>,
 ) -> Result<Vec<SyncEvent<ItemOutcome<MutationSuccess>>>, crate::error::GraphError> {
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -223,23 +254,20 @@ async fn submit_batch_with_version(
     // under-report a cold chunk by most of its traffic.
     let (metered, tally) = account.metered();
     let account = &metered;
-    let mut etags = HashMap::new();
-    let mut preflight_outcomes = if let Some(expected) = expected {
+    let mut etags = expected.cloned().unwrap_or_default();
+    {
+        let mut cache = account.etag_index.write().await;
         for id in ids {
-            etags.insert(id.0.clone(), expected.to_owned());
-        }
-        Vec::new()
-    } else {
-        {
-            let mut cache = account.etag_index.write().await;
-            for id in ids {
-                if let Some(etag) = cache.get(&id.0) {
-                    etags.insert(id.0.clone(), etag);
-                }
+            // A caller precondition is immutable. Only absent versions may
+            // use the legacy observation-to-write guard from cache or GET.
+            if !etags.contains_key(&id.0)
+                && let Some(etag) = cache.get(&id.0)
+            {
+                etags.insert(id.0.clone(), etag);
             }
         }
-        refresh_missing_etags(account, ids, kind, &mut etags).await
-    };
+    }
+    let mut preflight_outcomes = refresh_missing_etags(account, ids, kind, &mut etags).await;
     let mut requests = Vec::new();
     let mut request_ids = Vec::new();
     for id in ids {
@@ -687,6 +715,12 @@ fn request_for_mutation(
             }))
         }
         MutationKind::Move(destination) => {
+            // The move action documents Authorization and Content-Type only,
+            // with no If-Match precondition contract:
+            // https://learn.microsoft.com/en-us/graph/api/message-move
+            // Keep the legacy observed guard, but the inherited versioned
+            // door refuses caller versions and mail_move stays false. Merely
+            // sending this header cannot establish atomic caller enforcement.
             let Some(etag) = etags.get(&id.0) else {
                 return Ok(None);
             };
@@ -716,6 +750,11 @@ fn request_for_mutation(
             }))
         }
         MutationKind::Destroy => {
+            // permanentDelete is a POST action with no documented conditional
+            // header (https://learn.microsoft.com/en-us/graph/api/message-permanentdelete).
+            // Do not infer If-Match support from PATCH or DELETE semantics.
+            // The inherited versioned door refuses caller versions before I/O;
+            // mail_destroy stays false, while unversioned behavior is retained.
             if let Some(etag) = etags.get(&id.0) {
                 headers.insert("If-Match".to_string(), etag.clone());
             }
@@ -915,9 +954,10 @@ mod tests {
             .insert("m1".into(), "W/\"new\"".into());
         account.client.script_rest([crate::client::ScriptedRestResponse::json(
             reqwest::StatusCode::OK,
-            json!({"responses": [{"id": "0", "status": 412, "body": {"error": {"code": "ErrorIrresolvableConflict", "message": "stale"}}}]}),
-        ), crate::client::ScriptedRestResponse::json(
-            reqwest::StatusCode::OK, json!({"responses": [{"id": "0", "status": 200, "body": {"id": "m2"}}]}),
+            json!({"responses": [
+                {"id": "0", "status": 412, "body": {"error": {"code": "ErrorIrresolvableConflict", "message": "stale"}}},
+                {"id": "1", "status": 200, "body": {"id": "m2"}}
+            ]}),
         )]);
         let events = bulk_set_flags_if_version_stream(
             account.clone(),
@@ -938,38 +978,160 @@ mod tests {
         )
         .collect::<Vec<_>>()
         .await;
-        let [
-            SyncEvent::Batch(batch),
-            SyncEvent::Batch(second),
-            SyncEvent::Done(None),
-        ] = events.as_slice()
-        else {
+        let [SyncEvent::Batch(batch), SyncEvent::Done(None)] = events.as_slice() else {
             panic!("{events:?}");
         };
-        let [ItemOutcome::Failed(failure)] = batch.items.as_slice() else {
+        let [
+            ItemOutcome::Failed(failure),
+            ItemOutcome::Succeeded(success),
+        ] = batch.items.as_slice()
+        else {
             panic!("{batch:?}");
         };
         assert_eq!(
             failure.error.kind(),
             &bifrost_types::AccountErrorKind::ConcurrencyConflict
         );
-        assert!(
-            matches!(second.items.as_slice(), [ItemOutcome::Succeeded(success)] if success.item.0 == "m2")
-        );
+        assert_eq!(success.item.0, "m2");
         let requests = account.client.take_rest_requests();
         assert_eq!(
             requests.len(),
-            2,
-            "caller ETags must not trigger refresh GETs"
+            1,
+            "caller ETags share one envelope and must not trigger refresh GETs"
         );
         assert_eq!(
             requests[0].body.as_ref().unwrap()["requests"][0]["headers"]["If-Match"],
             "W/\"old\""
         );
         assert_eq!(
-            requests[1].body.as_ref().unwrap()["requests"][0]["headers"]["If-Match"],
+            requests[0].body.as_ref().unwrap()["requests"][1]["headers"]["If-Match"],
             "W/\"current\""
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_targets_keep_distinct_guards_and_absent_versions_use_cache() {
+        let account = shared_account();
+        account
+            .etag_index
+            .write()
+            .await
+            .insert("m2".into(), "W/\"cached\"".into());
+        account.client.script_rest([
+            crate::client::ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({
+                "responses": [{"id": "0", "status": 200, "body": {"id": "m1"}}]
+            })),
+            crate::client::ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({
+                "responses": [
+                    {"id": "0", "status": 412, "body": {"error": {"code": "ErrorIrresolvableConflict", "message": "stale"}}},
+                    {"id": "1", "status": 200, "body": {"id": "m2"}}
+                ]
+            })),
+        ]);
+        let events = bulk_set_flags_if_version_stream(
+            account.clone(),
+            Box::pin(futures::stream::iter([
+                bifrost_types::MailMutationTarget {
+                    id: ObjectId("m1".into()),
+                    expected_version: Some(bifrost_types::ServerVersion::ETag(
+                        "W/\"first\"".into(),
+                    )),
+                },
+                bifrost_types::MailMutationTarget {
+                    id: ObjectId("m1".into()),
+                    expected_version: Some(bifrost_types::ServerVersion::ETag(
+                        "W/\"second\"".into(),
+                    )),
+                },
+                bifrost_types::MailMutationTarget {
+                    id: ObjectId("m2".into()),
+                    expected_version: None,
+                },
+            ])),
+            FlagOp::Add(HashSet::from(["\\seen".into()])),
+            idempotency_key(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let [
+            SyncEvent::Batch(first),
+            SyncEvent::Batch(second),
+            SyncEvent::Done(None),
+        ] = events.as_slice()
+        else {
+            panic!("{events:?}");
+        };
+        assert!(matches!(
+            first.items.as_slice(),
+            [ItemOutcome::Succeeded(_)]
+        ));
+        let [ItemOutcome::Failed(conflict), ItemOutcome::Succeeded(_)] = second.items.as_slice()
+        else {
+            panic!("{second:?}");
+        };
+        assert_eq!(
+            *conflict.error.kind(),
+            bifrost_types::AccountErrorKind::ConcurrencyConflict
+        );
+        let calls = account.client.take_rest_requests();
+        assert_eq!(
+            calls.len(),
+            2,
+            "absent versions retain the cached guard without GETs"
+        );
+        assert_eq!(
+            calls[0].body.as_ref().unwrap()["requests"][0]["headers"]["If-Match"],
+            "W/\"first\""
+        );
+        assert_eq!(
+            calls[1].body.as_ref().unwrap()["requests"][0]["headers"]["If-Match"],
+            "W/\"second\""
+        );
+        assert_eq!(
+            calls[1].body.as_ref().unwrap()["requests"][1]["headers"]["If-Match"],
+            "W/\"cached\""
+        );
+    }
+
+    #[tokio::test]
+    async fn action_versions_are_refused_before_io() {
+        let account = std::sync::Arc::new(shared_account());
+        let target = || -> AccountStream<bifrost_types::MailMutationTarget> {
+            Box::pin(futures::stream::iter([bifrost_types::MailMutationTarget {
+                id: ObjectId("m1".into()),
+                expected_version: Some(bifrost_types::ServerVersion::ETag("W/\"old\"".into())),
+            }]))
+        };
+        let streams = [
+            bifrost_types::Account::bulk_move_if_version(
+                std::sync::Arc::clone(&account),
+                target(),
+                MembershipScope::Mailbox(bifrost_types::MailboxId("archive".into())),
+                idempotency_key(),
+            ),
+            bifrost_types::Account::bulk_destroy_if_version(
+                std::sync::Arc::clone(&account),
+                target(),
+                idempotency_key(),
+            ),
+        ];
+        for (stream, operation) in streams
+            .into_iter()
+            .zip([AccountOperation::BulkMove, AccountOperation::BulkDestroy])
+        {
+            let events = stream.collect::<Vec<_>>().await;
+            let [SyncEvent::Batch(batch), SyncEvent::Done(None)] = events.as_slice() else {
+                panic!("{events:?}");
+            };
+            let [ItemOutcome::Failed(failure)] = batch.items.as_slice() else {
+                panic!("{batch:?}");
+            };
+            assert_eq!(
+                *failure.error.kind(),
+                bifrost_types::AccountErrorKind::Unsupported(operation)
+            );
+        }
+        assert!(account.client.take_rest_requests().is_empty());
     }
 
     #[tokio::test]

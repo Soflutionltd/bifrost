@@ -156,12 +156,10 @@ pub(crate) fn update<T: HttpTransport>(
     patch: ContactPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        if patch.expected_version.is_some() {
-            return Err(AccountError::unsupported(
-                AccountOperation::ContactUpdate,
-                bifrost_types::error::Protocol::Jmap,
-            ));
-        }
+        let expected = super::mutation::caller_state(
+            patch.expected_version.as_ref(),
+            AccountOperation::ContactUpdate,
+        )?;
         let contacts = require_contacts(contacts, AccountOperation::ContactUpdate)?;
         if patch.photo.is_some() {
             return Err(unsupported(
@@ -196,6 +194,9 @@ pub(crate) fn update<T: HttpTransport>(
             None
         };
         let mut set = ContactCardSet::new();
+        if let Some(state) = expected {
+            set = set.if_in_state(state);
+        }
         set.update_item(
             id.clone(),
             jmap_patch_from_contact_patch(&patch, current_address_book.as_ref()),
@@ -215,10 +216,25 @@ pub(crate) fn delete<T: HttpTransport>(
     contacts: Option<ContactAccount<T>>,
     contact: ContactId,
 ) -> AccountFuture<Result<(), AccountError>> {
+    delete_if_version(contacts, contact, None)
+}
+
+pub(crate) fn delete_if_version<T: HttpTransport>(
+    contacts: Option<ContactAccount<T>>,
+    contact: ContactId,
+    expected_version: Option<bifrost_types::ServerVersion>,
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        let expected = super::mutation::caller_state(
+            expected_version.as_ref(),
+            AccountOperation::ContactDelete,
+        )?;
         let contacts = require_contacts(contacts, AccountOperation::ContactDelete)?;
         let id = ContactCardId::new(contact.0);
-        let set = ContactCardSet::new().destroy([id.clone()]);
+        let mut set = ContactCardSet::new().destroy([id.clone()]);
+        if let Some(state) = expected {
+            set = set.if_in_state(state);
+        }
         let mut response = contacts
             .call(set)
             .await
@@ -1163,39 +1179,56 @@ mod tests {
                 .lock()
                 .expect("calls")
                 .push((name.clone(), call[1].clone()));
-            let arguments = match name.as_str() {
-                "ContactCard/query" => {
-                    let page = self
-                        .pages
-                        .lock()
-                        .expect("pages")
-                        .pop_front()
-                        .expect("script has a page for this query");
-                    json!({
-                        "accountId": "primary",
-                        "queryState": page.query_state,
-                        "canCalculateChanges": false,
-                        "position": page.position,
-                        "total": page.total,
-                        "ids": page.ids
-                    })
-                }
-                "ContactCard/get" => {
-                    let list: Vec<Value> = call[1]["ids"]
-                        .as_array()
-                        .expect("ids")
-                        .iter()
-                        .map(|id| json!({"id": id}))
-                        .collect();
-                    json!({
-                        "accountId": "primary",
-                        "state": "s1",
-                        "list": list,
-                        "notFound": []
-                    })
-                }
-                other => panic!("unexpected method {other}"),
-            };
+            let arguments =
+                match name.as_str() {
+                    "ContactCard/query" => {
+                        let page = self
+                            .pages
+                            .lock()
+                            .expect("pages")
+                            .pop_front()
+                            .expect("script has a page for this query");
+                        json!({
+                            "accountId": "primary",
+                            "queryState": page.query_state,
+                            "canCalculateChanges": false,
+                            "position": page.position,
+                            "total": page.total,
+                            "ids": page.ids
+                        })
+                    }
+                    "ContactCard/get" => {
+                        let list: Vec<Value> = call[1]["ids"]
+                            .as_array()
+                            .expect("ids")
+                            .iter()
+                            .map(|id| json!({"id": id}))
+                            .collect();
+                        json!({
+                            "accountId": "primary",
+                            "state": "s1",
+                            "list": list,
+                            "notFound": []
+                        })
+                    }
+                    "ContactCard/set" => {
+                        // A fixed server state, independent of the production guard wiring.
+                        if call[1]
+                            .get("ifInState")
+                            .is_some_and(|state| state.as_str() != Some("s1"))
+                        {
+                            return Ok(bytes::Bytes::from(json!({
+                            "sessionState": "session-1",
+                            "methodResponses": [["error", {"type": "stateMismatch"}, call_id]]
+                        }).to_string()));
+                        }
+                        json!({
+                            "accountId": "primary", "oldState": "s1", "newState": "s2",
+                            "updated": {"one": null}, "destroyed": ["one"]
+                        })
+                    }
+                    other => panic!("unexpected method {other}"),
+                };
             let response = json!({
                 "sessionState": "session-1",
                 "methodResponses": [[name, arguments, call_id]]
@@ -1273,22 +1306,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caller_contact_versions_are_refused_before_io() {
+    async fn caller_contact_state_is_enforced_without_replacing_it() {
+        for state in [Some("old"), Some("s1"), None] {
+            let transport = ScriptedQueryTransport::new(Vec::new());
+            let expected = state.map(|state| bifrost_types::ServerVersion::StateAt(state.into()));
+            let stale = state == Some("old");
+            let result = update(
+                Some(transport.account()),
+                ContactId("one".into()),
+                ContactPatch {
+                    expected_version: expected.clone(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            if stale {
+                assert_eq!(
+                    *result.unwrap_err().kind(),
+                    bifrost_types::AccountErrorKind::ConcurrencyConflict
+                );
+            } else {
+                result.unwrap();
+            }
+            let result = delete_if_version(
+                Some(transport.account()),
+                ContactId("one".into()),
+                expected.clone(),
+            )
+            .await;
+            if stale {
+                assert_eq!(
+                    *result.unwrap_err().kind(),
+                    bifrost_types::AccountErrorKind::ConcurrencyConflict
+                );
+            } else {
+                result.unwrap();
+            }
+
+            let calls = transport.calls();
+            for (_, args) in calls
+                .iter()
+                .filter(|(method, _)| method == "ContactCard/set")
+            {
+                assert_eq!(args.get("ifInState").and_then(Value::as_str), state);
+            }
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(method, _)| method == "ContactCard/set")
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_contact_version_kind_is_refused_before_io() {
         let transport = ScriptedQueryTransport::new(Vec::new());
-        let error = update(
-            Some(transport.account()),
-            ContactId("one".into()),
-            ContactPatch {
-                expected_version: Some(bifrost_types::ServerVersion::StateAt("old".into())),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            *error.kind(),
-            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::ContactUpdate)
-        );
+        for expected_version in [
+            bifrost_types::ServerVersion::ETag("s1".into()),
+            bifrost_types::ServerVersion::StateAt(String::new()),
+        ] {
+            let error = update(
+                Some(transport.account()),
+                ContactId("one".into()),
+                ContactPatch {
+                    expected_version: Some(expected_version),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                *error.kind(),
+                bifrost_types::AccountErrorKind::Unsupported(AccountOperation::ContactUpdate)
+            );
+        }
         assert!(transport.calls().is_empty());
     }
 

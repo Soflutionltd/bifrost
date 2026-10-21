@@ -612,7 +612,8 @@ pub trait Account: Send + Sync {
 
     /// Per-target caller-version form of [`Self::bulk_set_flags`].
     /// Supplied versions must be enforced atomically or refused per target.
-    /// Targets are submitted independently; the unversioned door retains batching.
+    /// Providers may batch compatible targets without replacing caller versions.
+    /// The default submits targets independently; the ordinary door retains batching.
     fn bulk_set_flags_if_version(
         self: Arc<Self>,
         targets: AccountStream<crate::MailMutationTarget>,
@@ -639,7 +640,8 @@ pub trait Account: Send + Sync {
 
     /// Per-target caller-version form of [`Self::bulk_move`].
     /// Supplied versions must be enforced atomically or refused per target.
-    /// Targets are submitted independently; the unversioned door retains batching.
+    /// Providers may batch compatible targets without replacing caller versions.
+    /// The default submits targets independently; the ordinary door retains batching.
     fn bulk_move_if_version(
         self: Arc<Self>,
         targets: AccountStream<crate::MailMutationTarget>,
@@ -666,7 +668,8 @@ pub trait Account: Send + Sync {
 
     /// Per-target caller-version form of [`Self::bulk_move_from`].
     /// Supplied versions must be enforced atomically or refused per target.
-    /// Targets are submitted independently; the unversioned door retains batching.
+    /// Providers may batch compatible targets without replacing caller versions.
+    /// The default submits targets independently; the ordinary door retains batching.
     fn bulk_move_from_if_version(
         self: Arc<Self>,
         targets: AccountStream<crate::MailMutationTarget>,
@@ -695,7 +698,8 @@ pub trait Account: Send + Sync {
 
     /// Per-target caller-version form of [`Self::bulk_destroy`].
     /// Supplied versions must be enforced atomically or refused per target.
-    /// Targets are submitted independently; the unversioned door retains batching.
+    /// Providers may batch compatible targets without replacing caller versions.
+    /// The default submits targets independently; the ordinary door retains batching.
     fn bulk_destroy_if_version(
         self: Arc<Self>,
         targets: AccountStream<crate::MailMutationTarget>,

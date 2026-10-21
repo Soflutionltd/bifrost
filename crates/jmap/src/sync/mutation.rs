@@ -98,6 +98,30 @@ pub(crate) fn destroy<T: HttpTransport>(
     )
 }
 
+// RFC 8620 Section 5.3 requires a mismatching ifInState to reject the
+// entire /set without changes. The token is for (accountId, object type),
+// not an object's ETag or a queryState. Never refresh a caller's token.
+// https://www.rfc-editor.org/rfc/rfc8620.html#section-5.3
+// RFC 9610 Section 3.5 (ContactCard/set) and calendars draft-26 Section
+// 5.9 (CalendarEvent/set) explicitly adopt this standard /set contract:
+// https://www.rfc-editor.org/rfc/rfc9610.html#section-3.5
+// https://datatracker.ietf.org/doc/html/draft-ietf-jmap-calendars-26#section-5.9
+pub(super) fn caller_state(
+    version: Option<&bifrost_types::ServerVersion>,
+    operation: AccountOperation,
+) -> Result<Option<&str>, bifrost_types::AccountError> {
+    match version {
+        None => Ok(None),
+        Some(bifrost_types::ServerVersion::StateAt(state)) if !state.is_empty() => {
+            Ok(Some(state.as_str()))
+        }
+        Some(_) => Err(bifrost_types::AccountError::unsupported(
+            operation,
+            bifrost_types::Protocol::Jmap,
+        )),
+    }
+}
+
 pub(super) fn versioned_stream<T: HttpTransport>(
     mail: MailAccount<T>,
     foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
@@ -106,59 +130,76 @@ pub(super) fn versioned_stream<T: HttpTransport>(
     targets: AccountStream<bifrost_types::MailMutationTarget>,
     kind: MutationKind,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-    bifrost_types::mutation::versioned_mail_stream(targets, move |target| {
-        if let MutationKind::Flags(op) = &kind
-            && let Err(error) = op.validate_for_account(bifrost_types::Protocol::Jmap)
-        {
-            return bifrost_types::mutation::refused_mail_target(target.id, error);
-        }
-        let Some(version) = target.expected_version else {
-            return mutation_stream(
-                mail.clone(),
-                Arc::clone(&foreign_mail),
-                limits,
-                Arc::clone(&email_states),
-                Box::pin(futures::stream::iter([target.id])),
-                kind.clone(),
-            );
-        };
-        let expected = match version {
-            bifrost_types::ServerVersion::StateAt(state) if !state.is_empty() => state,
-            _ => {
-                return bifrost_types::mutation::refused_mail_target(
-                    target.id,
-                    bifrost_types::AccountError::unsupported(
-                        operation_for_kind(&kind),
-                        bifrost_types::Protocol::Jmap,
-                    ),
-                );
+    Box::pin(async_stream::stream! {
+        // RFC 8620 Section 5.3 guards the entire Email/set. Submitting each
+        // target separately would let the first success invalidate siblings
+        // carrying the same caller state. Group by owner AND caller state,
+        // within the advertised object limit, without advancing caller tokens.
+        // ready_chunks flushes when input is pending, so a live producer does
+        // not have to fill the limit before seeing a result.
+        let mut chunks = targets.ready_chunks(limits.max_objects_in_set.clamp(1, 500));
+        while let Some(chunk) = chunks.next().await {
+            let mut groups: Vec<(String, Option<String>, Vec<ObjectId>)> = Vec::new();
+            let mut rejected = Vec::new();
+            for target in chunk {
+                let validation = if let MutationKind::Flags(op) = &kind {
+                    op.validate_for_account(bifrost_types::Protocol::Jmap)
+                } else {
+                    Ok(())
+                };
+                let expected = validation.and_then(|()| {
+                    caller_state(target.expected_version.as_ref(), operation_for_kind(&kind))
+                        .map(|state| state.map(str::to_owned))
+                });
+                let expected = match expected {
+                    Ok(expected) => expected,
+                    Err(error) => {
+                        rejected.push(ItemOutcome::Failed(BatchFailure::new(
+                            BatchItemId(target.id.0), error,
+                        )));
+                        continue;
+                    }
+                };
+                if let Some(outcome) = destination_rejection(&kind, &target.id) {
+                    rejected.push(outcome);
+                    continue;
+                }
+                let owner = account_id_for_target(&target.id, mail.id_str(), &foreign_mail);
+                if let Some((_, _, ids)) = groups.iter_mut().find(|(account, state, _)| {
+                    account == &owner && state == &expected
+                }) {
+                    ids.push(target.id);
+                } else {
+                    groups.push((owner, expected, vec![target.id]));
+                }
             }
-        };
-        let account_id = account_id_for_target(&target.id, mail.id_str(), &foreign_mail);
-        if let Some(outcome) = destination_rejection(&kind, &target.id) {
-            return Box::pin(futures::stream::once(async move {
-                SyncEvent::Batch(Batch {
-                    items: vec![outcome],
+            if !rejected.is_empty() {
+                yield SyncEvent::Batch(Batch {
+                    items: rejected,
                     page_boundary: PageBoundary::Page,
                     server_latency: std::time::Duration::ZERO,
                     bytes_in: 0,
                     checkpoint: None,
-                })
-            }));
-        }
-        let owner = mail_for_account(&mail, &foreign_mail, &account_id).clone();
-        let foreign = account_id != mail.id_str();
-        let states = Arc::clone(&email_states);
-        let kind = kind.clone();
-        Box::pin(async_stream::stream! {
-            let mut ids = vec![target.id];
-            match apply_batch_with_version(&owner, &states, &account_id, foreign, &kind, &mut ids, Some(&expected)).await {
-                Ok(Some(batch)) => yield SyncEvent::Batch(batch),
-                Ok(None) => {},
-                Err(error) => yield super::error::terminated(super::error::into_account_error(error,
-                    super::error::JmapErrorContext::new(operation_for_kind(&kind)))),
+                });
             }
-        })
+            for (account_id, expected, mut ids) in groups {
+                let owner = mail_for_account(&mail, &foreign_mail, &account_id);
+                match apply_batch_with_version(
+                    owner, &email_states, &account_id, account_id != mail.id_str(),
+                    &kind, &mut ids, expected.as_deref(),
+                ).await {
+                    Ok(Some(batch)) => yield SyncEvent::Batch(batch),
+                    Ok(None) => {},
+                    Err(error) => {
+                        yield super::error::terminated(super::error::into_account_error(
+                            error, super::error::JmapErrorContext::new(operation_for_kind(&kind)),
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+        yield SyncEvent::Done(None);
     })
 }
 
@@ -1061,6 +1102,7 @@ mod tests {
 
     #[derive(Clone)]
     struct CallerStateTransport {
+        accept: bool,
         requests: Arc<StdMutex<Vec<serde_json::Value>>>,
     }
 
@@ -1081,6 +1123,18 @@ mod tests {
                 call[1]["ifInState"], "caller-old",
                 "never substitute a newer cached state"
             );
+            if self.accept {
+                return Ok(bytes::Bytes::from(
+                    serde_json::json!({
+                        "sessionState": "session-1",
+                        "methodResponses": [["Email/set", {
+                            "accountId": "primary", "oldState": "caller-old", "newState": "next",
+                            "updated": {"m1": null, "m2": null}, "destroyed": ["m1", "m2"]
+                        }, call[2]]]
+                    })
+                    .to_string(),
+                ));
+            }
             Ok(bytes::Bytes::from(
                 serde_json::json!({
                     "sessionState": "session-1",
@@ -1112,6 +1166,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn caller_state_siblings_share_one_guarded_set() {
+        for kind in [
+            MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
+            MutationKind::Move(MailboxId::new("archive")),
+            MutationKind::Destroy,
+        ] {
+            for accept in [true, false] {
+                let requests = Arc::new(StdMutex::new(Vec::new()));
+                let (primary, foreign) = mutation_accounts(CallerStateTransport {
+                    accept,
+                    requests: Arc::clone(&requests),
+                });
+                let events = versioned_stream(
+                    primary,
+                    foreign,
+                    CoreLimits {
+                        max_objects_in_get: 256,
+                        max_objects_in_set: 10,
+                    },
+                    Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                    Box::pin(futures::stream::iter(["m1", "m2"].map(|id| {
+                        bifrost_types::MailMutationTarget {
+                            id: ObjectId(id.into()),
+                            expected_version: Some(bifrost_types::ServerVersion::StateAt(
+                                "caller-old".into(),
+                            )),
+                        }
+                    }))),
+                    kind.clone(),
+                )
+                .collect::<Vec<_>>()
+                .await;
+                let [SyncEvent::Batch(batch), SyncEvent::Done(None)] = events.as_slice() else {
+                    panic!("{events:?}");
+                };
+                assert_eq!(batch.items.len(), 2);
+                for item in &batch.items {
+                    if accept {
+                        assert!(matches!(item, ItemOutcome::Succeeded(_)));
+                    } else {
+                        let ItemOutcome::Failed(failure) = item else {
+                            panic!("{item:?}")
+                        };
+                        assert_eq!(
+                            *failure.error.kind(),
+                            bifrost_types::AccountErrorKind::ConcurrencyConflict
+                        );
+                    }
+                }
+                let calls = requests.lock().unwrap();
+                assert_eq!(
+                    calls.len(),
+                    1,
+                    "siblings must not invalidate each other's state"
+                );
+                let args = &calls[0]["methodCalls"][0][1];
+                if matches!(kind, MutationKind::Destroy) {
+                    assert_eq!(args["destroy"].as_array().unwrap().len(), 2);
+                } else {
+                    assert_eq!(args["update"].as_object().unwrap().len(), 2);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn caller_state_conflicts_once_for_every_bulk_mail_door() {
         for kind in [
             MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
@@ -1121,6 +1241,7 @@ mod tests {
         ] {
             let requests = Arc::new(StdMutex::new(Vec::new()));
             let (primary, foreign) = mutation_accounts(CallerStateTransport {
+                accept: false,
                 requests: Arc::clone(&requests),
             });
             let states = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
@@ -1204,6 +1325,44 @@ mod tests {
             arguments["update"]["m1"]["keywords/$seen"],
             serde_json::json!(true)
         );
+    }
+
+    #[tokio::test]
+    async fn absent_bulk_caller_state_keeps_the_unconditional_keyword_path() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let (primary, foreign) = mutation_accounts(SuccessfulSetTransport {
+            requests: Arc::clone(&requests),
+        });
+        let events = versioned_stream(
+            primary,
+            foreign,
+            CoreLimits {
+                max_objects_in_get: 256,
+                max_objects_in_set: 10,
+            },
+            Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            Box::pin(futures::stream::iter([bifrost_types::MailMutationTarget {
+                id: ObjectId("m1".into()),
+                expected_version: None,
+            }])),
+            MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let [SyncEvent::Batch(batch), SyncEvent::Done(None)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert!(matches!(
+            batch.items.as_slice(),
+            [ItemOutcome::Succeeded(_)]
+        ));
+        let calls = requests.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "absent state on a keyword patch needs no probe"
+        );
+        assert!(calls[0]["methodCalls"][0][1].get("ifInState").is_none());
     }
 
     #[test]

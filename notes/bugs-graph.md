@@ -43,9 +43,15 @@ refused. Google People contact field updates enforce the caller's CONTACT
 source ETag; People deletes and photo changes stay refused because the API
 documents no precondition for them. The absent-version fetch-or-cache
 conditions were kept, because they still guard the narrower
-observation-to-write window. Still open: JMAP contact and event caller state,
-Graph move and permanent-delete guarantees, caller-version surfaces for other
-mutation families, and versioned bulk streams submitting targets independently
-rather than as one guarded batch.
+observation-to-write window. JMAP guards contact and event updates, deletes and
+RSVP with caller state through `ifInState`, and batches versioned bulk targets
+that share owner and state; Graph batches versioned flag writes with distinct
+ETags. Graph versioned moves and permanent deletes stay refused: Graph documents
+no conditional-header guarantee for those actions. Still open: JMAP PIM reads
+expose no caller type-state field, so a consumer has nothing to hand back,
+although JMAP capabilities already advertise `ExpectedVersion` on those doors
+(advertising an unusable guarantee is a product question for the owner);
+IMAP versioned flag writes are still submitted per target; other mutation
+families have no caller-version surface.
 
 

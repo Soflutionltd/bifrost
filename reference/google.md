@@ -1784,8 +1784,15 @@ never the merged `Person.etag` cache token. People `updateContact` requires
 contact source metadata and rejects a stale source ETag with 400
 `failedPrecondition`. Field updates preserve the fetched source identity and
 send the caller's `ContactPatch.expected_version` ETag in that source when
-supplied, without refresh-and-retry; unversioned updates use the fetched source
-ETag. Contact update concurrency is advertised for these field writes.
+supplied, without refresh-and-retry. Caller-versioned updates require exactly
+one CONTACT source carrying an ETag and fail locally otherwise. Unversioned
+updates use that source ETag when it is unique and present, and then omit the
+merged `Person.etag` from the body; when CONTACT sources exist but their token
+is missing or ambiguous, they keep the merged-`Person.etag` request and leave
+source metadata unchanged, because the API does not say which of several
+sources a write targets. `ContactCard.etag` is absent for ambiguous or missing
+source tokens and for OTHER_CONTACT. Contact update concurrency is advertised
+for these field writes.
 Versioned empty patches and any versioned patch containing a photo action are
 refused before I/O, since the separate photo actions cannot enforce that token.
 The resource definitions distinguish the two ETags:
