@@ -206,17 +206,19 @@ where
     Ok(result)
 }
 
-/// `urn:ietf:params:jmap:core` limits.
+/// `urn:ietf:params:jmap:core` limits and required properties.
 ///
-/// Every limit is `Option<usize>`, not a zero-filled `usize`. RFC 8620 §2
-/// makes all of them mandatory members of the core object, so an omitted
-/// one and an advertised `0` are two different server bugs with two
+/// Every numeric limit is `Option<usize>`, not a zero-filled `usize`. RFC
+/// 8620 §2 makes all of them mandatory members of the core object, so an
+/// omitted one and an advertised `0` are two different server bugs with two
 /// different honest readings - "the server told us nothing" versus "the
 /// server told us a limit that forbids every request" - and a blanket
 /// `#[serde(default)]` merged them into the same zero. The readers that
 /// enforce a bound (`CallLimit`, the WebSocket frame-size guard) and the
 /// reader that validates the session (`sync::capabilities::build`) need the
-/// distinction to land in the right lane.
+/// distinction to land in the right lane. The required `collationAlgorithms`
+/// array also preserves presence, while its existing accessor keeps returning
+/// an empty slice for callers that only need the list.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct CoreCapabilities {
@@ -242,7 +244,21 @@ pub(crate) struct CoreCapabilities {
     max_objects_in_set: Option<usize>,
 
     #[serde(rename = "collationAlgorithms")]
-    collation_algorithms: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_collation_algorithms")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collation_algorithms: Option<Vec<String>>,
+}
+
+/// An absent member defaults to `None`, while a present member must be an
+/// array. Using `Option<Vec<_>>::deserialize` directly would also accept JSON
+/// `null` as absence, even though RFC 8620 requires an array.
+fn deserialize_collation_algorithms<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer).map(Some)
 }
 
 /// The three states a modelled capability block can be in, which the
@@ -827,7 +843,11 @@ impl CoreCapabilities {
     }
 
     pub(crate) fn collation_algorithms(&self) -> &[String] {
-        &self.collation_algorithms
+        self.collation_algorithms.as_deref().unwrap_or_default()
+    }
+
+    pub(crate) fn has_collation_algorithms(&self) -> bool {
+        self.collation_algorithms.is_some()
     }
 }
 

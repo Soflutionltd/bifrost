@@ -261,7 +261,22 @@ pub(crate) fn update(
     patch: ContactPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        if patch.expected_version.is_some() {
+        // People carries an opaque source token in JSON, not an If-Match
+        // header. Preserve it verbatim rather than applying HTTP quoting.
+        let expected = match patch.expected_version.as_ref() {
+            Some(bifrost_types::ServerVersion::ETag(etag)) if !etag.is_empty() => {
+                Some(etag.clone())
+            }
+            None => None,
+            Some(_) => {
+                return Err(AccountError::unsupported(
+                    AccountOperation::ContactUpdate,
+                    bifrost_types::error::Protocol::Gmail,
+                ));
+            }
+        };
+        let update_fields = update_fields_for_patch(&patch);
+        if expected.is_some() && (patch.photo.is_some() || update_fields.is_empty()) {
             return Err(AccountError::unsupported(
                 AccountOperation::ContactUpdate,
                 bifrost_types::error::Protocol::Gmail,
@@ -275,16 +290,30 @@ pub(crate) fn update(
         )?;
         reject_photo_url_patch(&patch)?;
         let mut person = get_person(&client, &contact, AccountOperation::ContactUpdate).await?;
-        let update_fields = update_fields_for_patch(&patch);
         let fields_updated = !update_fields.is_empty();
         if !update_fields.is_empty() {
-            // The People `updateContact` call needs the server etag; a
-            // photo-only patch (handled below via `updateContactPhoto`)
-            // does not, so only require it when a modeled field is written.
-            let etag = require_person_etag(&person)?;
+            // updateContact enforces metadata.sources.etag for the CONTACT
+            // source, not Person.etag (the merged resource's cache token):
+            // https://developers.google.com/people/api/rest/v1/people/updateContact
+            // https://developers.google.com/people/api/rest/v1/people#Source
+            // Preserve source identity, but never replace a caller token with
+            // the GET's newer token or refresh and retry a rejected token.
+            let observed = require_person_etag(&person)?;
+            let etag = expected.unwrap_or(observed);
+            let source = person
+                .metadata
+                .as_mut()
+                .and_then(|metadata| metadata.get_mut("sources"))
+                .and_then(Value::as_array_mut)
+                .and_then(|sources| {
+                    sources
+                        .iter_mut()
+                        .find(|source| source["type"] == "CONTACT")
+                })
+                .expect("validated contact source");
+            source["etag"] = Value::String(etag);
             apply_patch_to_person(&mut person, &patch);
             person.resource_name = Some(contact.0.clone());
-            person.etag = Some(etag);
             let encoded = encode_resource_name_path(&contact.0);
             let url = format!(
                 "{}/{encoded}:updateContact?updatePersonFields={}&personFields={}",
@@ -415,6 +444,10 @@ pub(crate) fn delete(
     contact: ContactId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        // deleteContact accepts only resourceName and an empty body, with
+        // no documented ETag precondition. Keep the inherited versioned
+        // delete refusal; a GET comparison would leave a write race.
+        // https://developers.google.com/people/api/rest/v1/people/deleteContact
         let encoded = encode_resource_name_path(&contact.0);
         let url = format!("{}/{encoded}:deleteContact", client.people_base());
         client
@@ -834,6 +867,7 @@ fn person_in_group(person: &Person, group: Option<&str>) -> bool {
 }
 
 fn contact_from_person(person: Person, corpus: ContactCorpus) -> ContactCard {
+    let etag = contact_source_etag(&person).map(str::to_owned);
     let native = person.resource_name.unwrap_or_default();
     let book_id = book_id_for_corpus(corpus);
     let display_name = person
@@ -845,7 +879,7 @@ fn contact_from_person(person: Person, corpus: ContactCorpus) -> ContactCard {
         id: ContactId(native.clone()),
         address_book_id: Some(AddressBookId(book_id.to_string())),
         native_id: native.clone(),
-        etag: person.etag,
+        etag,
         provenance: ContactProvenance {
             provider: ProtocolKind::Gmail,
             native,
@@ -918,6 +952,7 @@ fn person_from_create(contact: &ContactCreate) -> Person {
     Person {
         resource_name: None,
         etag: None,
+        metadata: None,
         names: contact
             .display_name
             .as_ref()
@@ -1030,14 +1065,30 @@ fn patched_names(names: Option<Vec<Name>>, display_name: &str) -> Vec<Name> {
     vec![replacement]
 }
 
+// Person and Source expose distinct ETags. Only a CONTACT source token
+// can condition updateContact; never fall back to the merged Person token.
+// https://developers.google.com/people/api/rest/v1/people#Person
+// https://developers.google.com/people/api/rest/v1/people#Source
+fn contact_source_etag(person: &Person) -> Option<&str> {
+    let sources = person.metadata.as_ref()?.get("sources")?.as_array()?;
+    let mut contacts = sources.iter().filter(|source| source["type"] == "CONTACT");
+    let source = contacts.next()?;
+    if contacts.next().is_some() {
+        return None;
+    }
+    source.get("etag")?.as_str().filter(|etag| !etag.is_empty())
+}
+
 fn require_person_etag(person: &Person) -> Result<String, AccountError> {
-    person.etag.clone().ok_or_else(|| {
-        local_error_with_field(
-            AccountOperation::ContactUpdate,
-            "contactEtag",
-            "Google People updateContact requires an etag".to_string(),
-        )
-    })
+    contact_source_etag(person)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            local_error_with_field(
+                AccountOperation::ContactUpdate,
+                "contactEtag",
+                "Google People updateContact requires a CONTACT source etag".to_string(),
+            )
+        })
 }
 
 // COUPLING: every field named here must also be carried by the `Person` DTO,
@@ -1158,6 +1209,8 @@ struct Person {
     resource_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     etag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     names: Option<Vec<Name>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1368,7 +1421,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caller_contact_versions_are_refused_before_io() {
+    async fn field_update_sends_contact_source_and_preserves_caller_precondition() {
+        for expected in [None, Some("caller-old")] {
+            let (client, script) = scripted_client_steps(vec![
+                Canned::Response {
+                    status: StatusCode::OK,
+                    headers: reqwest::header::HeaderMap::new(),
+                    body: Bytes::from_static(br#"{"resourceName":"people/c1","etag":"merged","metadata":{"sources":[{"type":"PROFILE","id":"p1","etag":"profile"},{"type":"CONTACT","id":"c1","etag":"source-new"}]}}"#),
+                },
+                Canned::Response {
+                    status: StatusCode::BAD_REQUEST,
+                    headers: reqwest::header::HeaderMap::new(),
+                    body: Bytes::from_static(br#"{"error":{"code":400,"message":"stale","errors":[{"reason":"failedPrecondition"}]}}"#),
+                },
+            ]);
+            let error = update(
+                client,
+                ContactId("people/c1".into()),
+                ContactPatch {
+                    display_name: Some(Some("Ada".into())),
+                    expected_version: expected
+                        .map(|etag| bifrost_types::ServerVersion::ETag(etag.into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(*error.kind(), AccountErrorKind::ConcurrencyConflict);
+            let requests = script.requests();
+            assert_eq!(
+                requests.len(),
+                2,
+                "stale tokens must not be refreshed and retried"
+            );
+            let body: Value = serde_json::from_slice(requests[1].body.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                body["metadata"]["sources"][1]["etag"],
+                expected.unwrap_or("source-new")
+            );
+            assert_eq!(body["metadata"]["sources"][1]["id"], "c1");
+            assert_eq!(body["metadata"]["sources"][0]["etag"], "profile");
+        }
+    }
+
+    #[test]
+    fn contact_cards_expose_source_tokens_and_never_fall_back_to_person_etag() {
+        for (metadata, expected) in [
+            (
+                serde_json::json!({"sources":[{"type":"PROFILE","etag":"profile"},{"type":"CONTACT","etag":"source"}]}),
+                Some("source"),
+            ),
+            (
+                serde_json::json!({"sources":[{"type":"PROFILE","etag":"profile"}]}),
+                None,
+            ),
+            (serde_json::json!({"sources":[{"type":"CONTACT"}]}), None),
+        ] {
+            let person = Person {
+                etag: Some("merged".into()),
+                metadata: Some(metadata),
+                ..Default::default()
+            };
+            assert_eq!(contact_source_etag(&person), expected);
+            assert_eq!(require_person_etag(&person).is_ok(), expected.is_some());
+            assert_eq!(
+                contact_from_person(person, ContactCorpus::Main)
+                    .etag
+                    .as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn versioned_photo_patch_is_refused_before_io() {
+        let (client, script) = scripted_client_steps(Vec::new());
+        let error = update(
+            client,
+            ContactId("people/c1".into()),
+            ContactPatch {
+                display_name: Some(Some("Ada".into())),
+                photo: Some(None),
+                expected_version: Some(bifrost_types::ServerVersion::ETag("old".into())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            *error.kind(),
+            AccountErrorKind::Unsupported(AccountOperation::ContactUpdate)
+        );
+        assert!(script.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn versioned_empty_contact_patch_is_refused_before_io() {
         let (client, script) = scripted_client_steps(Vec::new());
         let error = update(
             client,
@@ -1439,7 +1587,7 @@ mod tests {
             Canned::Response {
                 status: StatusCode::OK,
                 headers: reqwest::header::HeaderMap::new(),
-                body: Bytes::from_static(br#"{"resourceName":"people/c1","etag":"etag-1"}"#),
+                body: Bytes::from_static(br#"{"resourceName":"people/c1","etag":"etag-1","metadata":{"sources":[{"type":"CONTACT","id":"c1","etag":"source-1"}]}}"#),
             },
             Canned::Response {
                 status: StatusCode::OK,
@@ -1581,6 +1729,7 @@ mod tests {
         let person = Person {
             resource_name: Some("people/c1".to_string()),
             etag: Some("etag".to_string()),
+            metadata: None,
             names: Some(vec![Name {
                 display_name: Some("Ada Lovelace".to_string()),
                 given_name: None,

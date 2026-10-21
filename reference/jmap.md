@@ -394,6 +394,14 @@ whether the account DEPENDS on the block:
   out, with the URI in the diagnostic.
   Not `SyncState(CapabilityChanged)`: nothing about this session changes on a
   reopen, so that lane buys an endless reopen loop.
+
+  Account open requires every RFC 8620 §2 core member:
+  `maxSizeUpload`, `maxConcurrentUpload`, `maxSizeRequest`,
+  `maxConcurrentRequests`, `maxCallsInRequest`, `maxObjectsInGet`,
+  `maxObjectsInSet`, and `collationAlgorithms`. A missing member is refused as
+  `Protocol(ContractViolation)`. Zero `maxSizeUpload` permits empty uploads;
+  zero concurrency limits and an empty `collationAlgorithms` array are valid.
+  The request-size, call-count and object-count limits must be positive.
 - **Optional.** Everything else the crate models (websocket, submission, sieve,
   quota, blob, calendars, contacts, principals, principals:owner). The family
   degrades to off, and `build` warns per malformed URI via

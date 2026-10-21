@@ -17,14 +17,6 @@ Filed from the October 2026 defect hunt: the google scope. Coverage note:
 `cloud.rs`, `client.rs` (quota and redirect plumbing) and most of `calendar.rs`
 got only a light read, so a clean result there means little.
 
-## GOOG-028 - People contact writes use the top-level `Person.etag`
-
-Lateral from the bulk caller-version work. The People `updateContact`
-documentation specifies the concurrency token as `metadata.sources.etag` on the
-contact source, but the account uses the top-level `Person.etag`. Verify which
-the API actually enforces before wiring caller versions into People writes;
-until then Google contact writes refuse a supplied version.
-
 ## GOOG-027 - The error model has no typed continuation for a failure after a committed first leg
 
 **Needs a technical implementation specification** (owner, 2026-10-21): too

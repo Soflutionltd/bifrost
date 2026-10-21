@@ -27,18 +27,3 @@ The PIM send path as a small state machine with compensations (create email ->
 submit -> on failure destroy; cancel -> confirm -> create) instead of single
 batched requests whose partial outcomes read as total failure.
 
-## JMAP-038 - An omitted `collationAlgorithms` is indistinguishable from an empty one
-
-Residue: `validate_session` now refuses an absent `maxSizeUpload`,
-`maxConcurrentUpload` or `maxConcurrentRequests` (zero stays valid). RFC 8620
-section 2 also requires `collationAlgorithms`, but `CoreCapabilities` in
-`crates/jmap/src/core/session.rs` parses it as a defaulted `Vec<String>`, so an
-omitted field and a valid empty array look the same. The model must preserve
-presence before the validator can refuse omission. A fixer needs
-`core/session.rs` and `sync/capabilities.rs` together. When it lands,
-`reference/jmap.md` should state that account open requires the RFC 8620 core
-members (`maxSizeUpload`, `maxConcurrentUpload`, `maxSizeRequest`,
-`maxConcurrentRequests`, `maxCallsInRequest`, `maxObjectsInGet`,
-`maxObjectsInSet`, `collationAlgorithms`), refuses a missing one as
-`Protocol(ContractViolation)`, and accepts zero concurrency and an empty
-`collationAlgorithms`.

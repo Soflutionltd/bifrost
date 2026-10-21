@@ -247,6 +247,8 @@ impl ImapConnection {
     /// Returns a bounded receiver and the driver-side future that must be
     /// polled to execute the command. When the receiver is not drained, the
     /// driver stops reading before the bounded channel fills further.
+    /// Each item is a complete, parsed response; channel capacity does not
+    /// bound the size of a single response or emit a literal incrementally.
     #[allow(clippy::type_complexity)]
     pub fn uid_fetch_stream<'a>(
         &'a self,

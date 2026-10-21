@@ -2743,6 +2743,17 @@ mod session_capability_fallbacks {
         assert_eq!(core.max_objects_in_get(), None);
         assert_eq!(core.max_objects_in_set(), None);
         assert!(core.collation_algorithms().is_empty());
+        assert!(!core.has_collation_algorithms());
+    }
+
+    #[test]
+    fn core_collation_algorithms_preserves_present_empty_array() {
+        let session = session_with(json!({
+            "urn:ietf:params:jmap:core": {"collationAlgorithms": []}
+        }));
+        let core = session.core_capabilities().expect("core cap");
+        assert!(core.has_collation_algorithms());
+        assert!(core.collation_algorithms().is_empty());
     }
 
     /// A present-but-unparseable core block keeps its own state. `Other`

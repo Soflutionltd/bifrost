@@ -619,7 +619,8 @@ on the provider.
 `contact_create` requires the successful response's `resourceName`; an absent
 field is `Protocol(MissingField)` and an empty value is `Protocol(ParseFailed)`,
 both with acknowledged response evidence.
-Update fetches the raw `Person`, requires the server ETag, and replaces only
+Update fetches the raw `Person`, preserves its CONTACT source identity and
+requires that source's ETag, and replaces only
 fields named by the shared `ContactPatch`. Display-name updates rewrite the
 first modeled name's given/family split while preserving unmodeled People name
 fields and additional name entries. Custom email and phone labels use People
@@ -1778,12 +1779,26 @@ empty versioned event patches are refused. There is no refresh-and-retry of
 a rejected caller token. Native contract:
 https://developers.google.com/workspace/calendar/api/guides/version-resources
 
-`ContactPatch.expected_version` and `contact_delete_if_version` still refuse
-supplied versions before I/O. People field updates currently fetch a Person
-and use its provider-observed ETag, which is not the caller's precondition;
-photos use separate actions. A source-ETag design must account for People's
-`person.metadata.sources.etag` requirement before advertising contact update:
+`ContactCard.etag` exposes the CONTACT source's `metadata.sources.etag`,
+never the merged `Person.etag` cache token. People `updateContact` requires
+contact source metadata and rejects a stale source ETag with 400
+`failedPrecondition`. Field updates preserve the fetched source identity and
+send the caller's `ContactPatch.expected_version` ETag in that source when
+supplied, without refresh-and-retry; unversioned updates use the fetched source
+ETag. Contact update concurrency is advertised for these field writes.
+Versioned empty patches and any versioned patch containing a photo action are
+refused before I/O, since the separate photo actions cannot enforce that token.
+The resource definitions distinguish the two ETags:
+https://developers.google.com/people/api/rest/v1/people#Person
+https://developers.google.com/people/api/rest/v1/people#Source
+The update precondition is explicit:
 https://developers.google.com/people/api/rest/v1/people/updateContact
+
+`contact_delete_if_version` continues to refuse supplied versions before I/O,
+and conditional contact deletion is not advertised. `deleteContact` documents
+only the resource name and an empty body, with no ETag precondition. A local
+GET-and-compare cannot enforce a precondition across the deletion race:
+https://developers.google.com/people/api/rest/v1/people/deleteContact
 
 Gmail history IDs cannot condition `batchModify` or `batchDelete`; inherited
 versioned bulk methods refuse supplied mail versions per target and send only

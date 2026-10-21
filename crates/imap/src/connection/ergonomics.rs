@@ -164,6 +164,8 @@ impl ImapConnection {
     /// payload is read and retires the connection, because the unread literal
     /// cannot be skipped safely. Callers that need strict back-pressure should
     /// use [`uid_fetch_each`](Self::uid_fetch_each).
+    /// Both paths frame and parse a whole response before delivery. The
+    /// budget is not a ceiling on syntax, parser allocations or peak memory.
     ///
     /// Direct API counterpart to Account get/blob streams for buffered callers.
     pub async fn uid_fetch_limited(

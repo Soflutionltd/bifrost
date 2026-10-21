@@ -334,6 +334,33 @@ event sequence it summarizes.
 
 Streaming never drops responses. The driver-side consumer is a bounded pipe (`BoundedStreamingPipe`, default capacity 64) that pre-reserves an `OwnedPermit` *before* each socket read, so a slow consumer applies TCP backpressure instead of either buffering without limit or silently discarding under a failed `try_send`.
 
+The unit of delivery and backpressure is a complete `FetchResponse`, not a
+literal chunk. `WireReader::read_one_limited` waits for
+`response_frame_len_limited` to find the response's final CRLF before invoking
+the complete-mode parser. `dispatch_response_loop` then applies side effects
+and routes that response to the consumer. `account::blob::run_fetch` splits
+that completed response into body sections; `open_raw_rfc822` therefore also
+buffers a whole response before emitting any body bytes. A bounded channel
+limits response count, not the memory or latency of one response.
+
+Incremental body delivery requires a separate chunk-aware decoding and
+dispatch contract that preserves UID/section identity, response side-effect
+ordering, tagged completion failures, and framing when a receiver disappears
+mid-literal. Removing the framing pre-check alone cannot provide it: the nom
+parser builds an owned response and treats truncated input as a parse error.
+Likewise, standalone borrowed-input parsers must copy body octets to return
+owned `Bytes`; callers with owned backing already have `parse_response_bytes`.
+Generic string fields still decode into owned values.
+
+The literal budget deliberately measures declared payload octets. Charging
+syntax against that same number would change its meaning, including refusing
+an exact-budget body because of its FETCH wrapper. There is currently no
+separate syntax or parser-allocation ceiling: long quoted strings, repeated
+attributes and structured metadata can allocate outside the literal budget.
+The buffered consumer's estimate is applied after parsing and is not a bound
+on those allocations. A total-memory guarantee needs independent framing and
+parser limits as well as accounting for retained backing capacity.
+
 Three entry points:
 
 - `uid_fetch_streaming()` / `fetch_streaming()` - caller supplies an unbounded sender; the bounded receiver is drained onto it internally.

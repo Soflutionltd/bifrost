@@ -156,9 +156,9 @@ pub(crate) fn validate_session(session: &Session) -> Result<CoreLimits, AccountE
     // Three lanes, not two. An ABSENT core block is a capability change
     // (the server dropped a capability the session previously claimed):
     // reopen. A block that is present but unparseable, or present with a
-    // zero or missing mandatory limit, is a contract violation: the server
-    // is answering `urn:ietf:params:jmap:core` with something that is not
-    // one. Collapsing malformed into absent would send the engine into a
+    // zero or missing mandatory core member is a contract violation: the
+    // server is answering `urn:ietf:params:jmap:core` with something that is
+    // not one. Collapsing malformed into absent would send the engine into a
     // reopen loop against a server that will keep sending the same bad
     // session forever.
     let core = match session.core_capability_state() {
@@ -176,6 +176,9 @@ pub(crate) fn validate_session(session: &Session) -> Result<CoreLimits, AccountE
     // `UnsignedInt`, so zero is a valid advertised value; only absence is
     // rejected here.
     if core.max_concurrent_upload().is_none() || core.max_concurrent_requests().is_none() {
+        return Err(unusable_core_limits());
+    }
+    if !core.has_collation_algorithms() {
         return Err(unusable_core_limits());
     }
 
@@ -844,13 +847,11 @@ mod tests {
         );
     }
 
-    /// An OMITTED mandatory limit is not an advertised zero, but it is
-    /// equally unusable, and blanket `#[serde(default)]` zero-filling used
-    /// to erase the difference. Each required limit must be refused when it
-    /// is missing entirely - and refused as a contract violation, since
-    /// RFC 8620 §2 makes every one of them a mandatory member.
+    /// An OMITTED mandatory member is not the same as an advertised zero or
+    /// empty array. RFC 8620 §2 requires each member, so omission is a contract
+    /// violation even where its value may validly be zero or empty.
     #[test]
-    fn any_omitted_required_core_limit_is_a_contract_violation() {
+    fn any_omitted_required_core_member_is_a_contract_violation() {
         for field in [
             "maxCallsInRequest",
             "maxObjectsInGet",
@@ -859,6 +860,7 @@ mod tests {
             "maxSizeUpload",
             "maxConcurrentUpload",
             "maxConcurrentRequests",
+            "collationAlgorithms",
         ] {
             let mut core = serde_json::json!({
                 "maxSizeUpload": 1000,
@@ -899,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_core_concurrency_limits_are_valid_unsigned_ints() {
+    fn zero_core_concurrency_limits_and_empty_collation_list_are_valid() {
         let session = session_with_core(serde_json::json!({
             "maxSizeUpload": 1000,
             "maxConcurrentUpload": 0,

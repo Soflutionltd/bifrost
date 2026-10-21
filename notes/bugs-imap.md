@@ -30,7 +30,11 @@ decision.
 ## IMAP-004 - Literals are not emitted incrementally
 
 Residue: FETCH body and binary literals are now `Bytes` slices of the framed
-response, not copies. Still open:
+response, not copies, and the code and reference no longer overstate streaming
+or the memory budget. Incremental delivery needs a chunk-aware parser and
+dispatch contract, which is design work rather than a fix; the orchestrator has
+suggested moving it to the technical-specification track, pending the owner.
+Still open:
 - A FETCH response is fully framed and parsed before delivery, so literals are
   not emitted incrementally. Standalone parsers without an owned backing still
   copy, and generic string fields still parse owned.

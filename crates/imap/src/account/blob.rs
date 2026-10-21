@@ -31,9 +31,11 @@ impl From<crate::Error> for BlobError {
 /// Every other body path carries a budget (hydration 256 MiB, draft fetch
 /// 64 MiB) because the response size is the server's to choose: a corrupt
 /// or adversarial peer can answer a single `BODY.PEEK[]` with an arbitrary
-/// number of octets. This lane streams, so the budget bounds what one
-/// message may cost in total rather than what is held at once; crossing it
-/// is `Error::FetchLimit`.
+/// number of octets. The budget bounds delivered body octets in total and
+/// declared literal octets before parsing. It is not a peak-memory bound:
+/// one complete response is buffered before delivery, and syntax, parsed
+/// objects and retained backing capacity add overhead. Crossing the body
+/// budget is `Error::FetchLimit`.
 const RAW_FETCH_BUDGET: usize = 256 * 1024 * 1024;
 
 /// Open a message's assembled RFC822 octets (`BODY.PEEK[]`).
@@ -43,8 +45,9 @@ const RAW_FETCH_BUDGET: usize = 256 * 1024 * 1024;
 /// `OpenRawRfc822`. It shares no code with the `Account::open_blob` entry
 /// point, which IMAP answers `Unsupported`.
 ///
-/// The FETCH is streamed: each response's body sections are forwarded to
-/// the consumer as they arrive off the socket, under `RAW_FETCH_BUDGET`.
+/// Each complete FETCH response's body sections are forwarded under
+/// `RAW_FETCH_BUDGET`. A section is not emitted while its literal is still
+/// arriving: framing and parsing finish before the response is delivered.
 pub(crate) fn open_raw_rfc822(
     account: ImapAccount,
     message: ObjectId,
@@ -195,12 +198,13 @@ pub(super) async fn run_fetch(
         Some(budget),
         account.command_timeout(),
     )?;
-    // Forward each body section as it comes off the socket. The bounded
-    // receiver is the back-pressure: a slow consumer stalls this drain,
-    // which stalls the driver's next `reserve_owned`, which stalls the
-    // socket read. Dropping `rx` on the way out (every exit below) is what
-    // releases the driver to read through the tagged completion instead of
-    // parking on a permit that will never be taken.
+    // Forward sections from each fully framed and parsed response. The bounded
+    // receiver applies back-pressure between responses, not within a literal:
+    // a slow consumer stalls this drain, which stalls the driver's next
+    // `reserve_owned`, which stalls the socket read. Dropping `rx` on the way
+    // out (every exit below) is what releases the driver to read through the
+    // tagged completion instead of parking on a permit that will never be
+    // taken.
     let drain = async {
         let mut streamed: usize = 0;
         let mut outcome: Result<(), BlobError> = Ok(());
