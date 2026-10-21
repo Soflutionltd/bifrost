@@ -49,7 +49,7 @@ let account = net.attach_account(account_id, spec);     // per-account
   explicitly.
 
 `NetConfig` contains only client-instance settings: pool sizing, keepalive,
-connection setup timeout, and TLS trust. `AccountSpec` contains request behavior:
+connection setup timeout, proxy routing, and TLS trust. `AccountSpec` contains request behavior:
 response-header and body timeouts, optional total timeout, User-Agent,
 buffered-body ceiling, redirect policy, token max-age, retry policy, token source,
 and rate declarations.
@@ -631,8 +631,8 @@ handle between HTTP and WebSocket authentication; its factory retains it across
 reopens. Coordinating sources supplied to Graph and Google are likewise retained
 by account attachment.
 WebSocket setup has the JMAP timeout, a User-Agent and one rejected-token-aware
-401 refresh retry. The WebSocket library uses direct TCP, refuses redirects,
-and does not inherit reqwest proxies. It emits trace context through
+401 refresh retry. WebSocket setup shares the owning Net's proxy snapshot and
+TLS trust, uses CONNECT when a proxy applies, and refuses redirects. It emits trace context through
 `trace::current_traceparent()`.
 
 `TokenSource::snapshot()` returns `Result<auth::TokenSnapshot, Error>` without
@@ -1457,18 +1457,22 @@ origin-aware decision the request pipeline uses. A known same-origin hop is
 admitted before applying the cross-host filter; an unknown departing URL is
 handled conservatively as cross-origin.
 
-## Upgrade connector limitation
+## Proxy routing and upgrades
 
-`NetConfig` exposes no explicit proxy input. Reqwest's default connector owns
-implicit environment/system proxy selection, while JMAP WebSocket setup uses
-direct TCP. There is no shared proxy resolution or CONNECT tunnel facility yet.
-A WebSocket connector must share routing selection, bypass rules, proxy
-credentials and proxy TLS handling before it can claim HTTP proxy inheritance.
+Net snapshots hyper-util's system/environment proxy matcher when constructed.
+`NetConfig::proxy` optionally supplies `proxy::ProxyConfig` with HTTP and HTTPS
+proxy URLs and a NO_PROXY bypass list. An empty explicit config selects direct
+connections. Reqwest's implicit proxy discovery is disabled; a custom proxy
+uses this same snapshot, including Basic credentials. Environment changes after
+construction do not alter routing.
 
-JMAP's upgrade implementation cannot currently reach the HTTP transport's
-`AccountNet`: `ReqwestTransport` keeps that field private and exposes only
-bandwidth budget and meter access for WebSockets. Sharing proxy routing requires
-an account-handle bridge there as well as the resolver and tunnel connector.
-Constructing a separate shared Net would lose an injected Net's identity and
-configuration, and rereading environment variables would lose the HTTP client's
-construction-time snapshot. Neither is a substitute for that bridge.
+`AccountNet::connect_tunnel` maps ws/wss to HTTP/HTTPS routing and either opens
+TCP directly or establishes HTTP CONNECT through the selected HTTP(S) proxy.
+Proxy TLS and `upgrade_tls_connector` use the owning Net's roots and certificate
+policy. CONNECT sends proxy credentials only, caps response headers at 16 KiB,
+accepts informational responses before a successful final response, and leaves
+tunnel bytes unread. Connection setup uses Net's connect timeout; JMAP also
+bounds the complete upgrade with its own timeout. Unsupported proxy schemes
+fail closed. Origin TLS and upgrade framing remain the caller's responsibility.
+JMAP reaches these APIs through its actual ReqwestTransport AccountNet, so an
+injected Net determines both HTTP and WebSocket routing and TLS trust.

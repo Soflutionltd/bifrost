@@ -1040,15 +1040,13 @@ this as an acknowledged protocol contract violation. These bodies bypass JMAP
 Problem Details parsing so they cannot replace that classification.
 
 The WebSocket handshake uses the public `bifrost_net::trace::current_traceparent`
-builder, sharing HTTP's current trace policy. It still connects directly:
-`NetConfig` has no explicit proxy configuration, and reqwest's implicit
-system/environment proxy selection is internal to its HTTP connector. A shared
-proxy resolver and tunnel connector remain necessary for WebSocket parity;
-copying only environment variables would not establish equivalent routing.
-WebSocket proxy adoption also requires access to the HTTP transport's
-`AccountNet`, currently private to `ReqwestTransport`. A separate `Net` or a
-fresh environment lookup cannot preserve an injected `Net`'s configuration and
-construction-time proxy selection.
+builder, sharing HTTP's current trace policy. Its ReqwestTransport exposes the
+actual AccountNet internally for upgrade setup. Net owns the construction-time
+proxy snapshot used by reqwest and by `AccountNet::connect_tunnel`: ws/wss use
+HTTP/HTTPS routing and bypass rules, with CONNECT through an HTTP(S) proxy or
+direct TCP when no proxy applies. Both proxy TLS and origin TLS use the owning
+Net's trust configuration, including an injected Net's roots and certificate
+policy. Proxy credentials are confined to CONNECT. Redirects remain refused.
 
 ### Error translation
 

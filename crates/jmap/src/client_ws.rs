@@ -6,7 +6,6 @@ use futures::{SinkExt, Stream, StreamExt, stream::SplitSink};
 use http::{HeaderValue, Uri, header};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tokio::net::TcpStream;
 use tokio_websockets::{ClientBuilder, Connector, MaybeTlsStream, Message, WebSocketStream};
 
 use crate::{
@@ -209,8 +208,10 @@ pub(crate) enum WebSocketMessage {
     Pong,
 }
 
+type UpgradeStream = bifrost_net::MeteredStream<MaybeTlsStream<bifrost_net::proxy::TunnelStream>>;
+
 pub(crate) struct WsStream {
-    tx: SplitSink<WebSocketStream<bifrost_net::MeteredStream<MaybeTlsStream<TcpStream>>>, Message>,
+    tx: SplitSink<WebSocketStream<UpgradeStream>, Message>,
 }
 
 /// Callers waiting for a WebSocket response, keyed by the RFC 8887
@@ -473,15 +474,12 @@ impl Client {
         // malformed session, not something to hand the connector.
         let scheme = uri.scheme_str().map(str::to_ascii_lowercase);
         let connector = match scheme.as_deref() {
-            Some("wss") => {
-                let native = native_tls::TlsConnector::builder()
-                    .danger_accept_invalid_certs(self.accept_invalid_certs)
-                    .build()
-                    .map_err(crate::Error::from_tls)?;
-                Some(Connector::NativeTls(tokio_native_tls::TlsConnector::from(
-                    native,
-                )))
-            }
+            Some("wss") => Some(Connector::NativeTls(tokio_native_tls::TlsConnector::from(
+                self.transport()
+                    .websocket_net()
+                    .upgrade_tls_connector()
+                    .map_err(crate::Error::from_tls)?,
+            ))),
             Some("ws") => None,
             _ => {
                 return Err(crate::Error::MalformedSessionUrl {
@@ -491,17 +489,7 @@ impl Client {
             }
         };
 
-        // This connector does not follow redirects: an upgrade target cannot
-        // carry credentials onward to a Location supplied by a different host.
-        // It uses a direct TCP connection; reqwest proxy configuration applies
-        // only to HTTP; Net exposes no proxy resolution or tunnel connector.
-        // Routing must come from this transport's AccountNet, including an
-        // injected Net. ReqwestTransport keeps that handle private in its
-        // defining module and exposes only budget/meter handles here. Picking
-        // a new shared Net or rereading environment variables here would not
-        // establish parity with the HTTP client's construction-time routing.
-        // Adoption requires an account-handle bridge in transport_reqwest.rs
-        // plus one routing snapshot shared by reqwest and the tunnel setup.
+        // Redirects are refused; routing and TLS trust belong to the HTTP Net.
         let builder = ClientBuilder::from_uri(uri.clone())
             .add_header(
                 header::USER_AGENT,
@@ -529,14 +517,10 @@ impl Client {
             })?
             .trim_start_matches('[')
             .trim_end_matches(']');
-        let port = uri
-            .port_u16()
-            .unwrap_or(if scheme.as_deref() == Some("wss") {
-                443
-            } else {
-                80
-            });
-        let tcp = TcpStream::connect((host, port))
+        let tcp = self
+            .transport()
+            .websocket_net()
+            .connect_tunnel(&url)
             .await
             .map_err(|e| crate::Error::WebSocketHandshake(e.into()))?;
         let stream = connector

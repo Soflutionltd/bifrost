@@ -56,18 +56,3 @@ once.
 
 # Low value or not defects
 
-## SHARED-016 - `FlagOp::validate_for_account` fixes the operation for its caller
-
-Scope: types adoption (lateral in bifrost-types). Minor.
-
-Verified incorrect (2026-10-21): every caller (IMAP, JMAP, Graph, Google,
-CalDAV and CardDAV `bulk_set_flags`) runs under `UpdateFlags`, reached only
-through the engine's `SetFlags` pipeline; single-item conveniences dispatch
-through other `Account` methods. Owed before removal: a comment at
-`FlagOp::validate_for_account` in `crates/types/src/mutation.rs` saying the
-stamped operation is correct because every caller is a `bulk_set_flags` door.
-
-It always stamps `AccountOperation::UpdateFlags` and no provider, but providers
-call it from `bulk_set_flags` paths whose engine-side operation may differ in
-telemetry: a shared constructor choosing the operation for its caller, the
-shape the `validate_batch_input` lesson in the error model warns about.

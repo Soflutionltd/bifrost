@@ -53,6 +53,26 @@ and carries peer-timeout state, and SMTP's also serves blocking I/O with
 runtime-independent admission, so they were kept with comments; collapsing them
 onto the shared stream needs those two behaviours to move into it.
 
+## SHARED-019 - Proxy TLS failures and CONNECT refusals are unclassified
+
+Lateral from the upgrade-routing work. Net now tunnels upgrade connections
+through the account proxy with HTTP CONNECT. A TLS failure to the proxy, a 407
+proxy-auth refusal or another non-2xx CONNECT answer all surface as a generic
+handshake I/O error, so the account cannot tell a proxy credential problem from
+a network drop. Map them to distinct TLS, proxy-auth and refused
+classifications.
+
+## SHARED-020 - The new `ProxyConfig` has no constructor or example
+
+Lateral from the upgrade-routing work. `bifrost_net::ProxyConfig` is
+`#[non_exhaustive]`, so downstream code must start from `default()` and mutate
+fields, with no constructor or doc example showing how. `connect_tunnel` is also
+newly public and takes `&str`, accepting http and https destinations as well as
+WebSocket ones; its doc should say what it is for. System proxy selection can
+also return a SOCKS proxy (ALL_PROXY), which reqwest cannot use without its
+`socks` feature; upgrades fail closed on it, and the HTTP gap predates this
+change.
+
 ## SHARED-017 - `MutationConcurrency::StateBased` has no producer left
 
 **Awaiting the owner** (2026-10-21): keep or remove is the owner's decision,

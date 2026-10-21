@@ -32,6 +32,7 @@ pub mod error;
 pub mod hold;
 mod metered_stream;
 pub mod net;
+pub mod proxy;
 pub mod rate;
 pub mod redirect;
 pub mod request;

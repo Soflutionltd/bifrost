@@ -279,8 +279,6 @@ pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
     session_changes: tokio::sync::watch::Sender<u64>,
 
     pub(crate) timeout: Duration,
-    #[cfg(feature = "websockets")]
-    pub(crate) accept_invalid_certs: bool,
 
     #[cfg(feature = "websockets")]
     pub(crate) authorization: Authorization,
@@ -493,8 +491,6 @@ impl ClientBuilder {
                 session_changes: tokio::sync::watch::channel(0).0,
                 timeout: self.timeout,
                 transport,
-                #[cfg(feature = "websockets")]
-                accept_invalid_certs: self.accept_invalid_certs,
                 #[cfg(feature = "websockets")]
                 authorization,
                 #[cfg(feature = "websockets")]
@@ -1450,8 +1446,6 @@ impl<T: HttpTransport> Client<T> {
                 session_changes: tokio::sync::watch::channel(0).0,
                 timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
                 transport,
-                #[cfg(feature = "websockets")]
-                accept_invalid_certs: false,
                 #[cfg(feature = "websockets")]
                 authorization: Authorization::Basic(String::new()),
                 #[cfg(feature = "websockets")]

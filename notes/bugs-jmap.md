@@ -17,18 +17,6 @@ Filed from the October 2026 defect hunt: the jmap protocol scope, the jmap
 account scope, and the net and sync adoption scopes where they reached JMAP.
 Severity labels are the hunters' own.
 
-## JMAP-027 - The WebSocket handshake does not inherit the account proxy
-
-Residue: the handshake now sends trace context through net's public
-`trace::current_traceparent()`. It still opens a direct TCP connection, because
-reqwest owns implicit proxy selection and `bifrost-net` has no shared proxy
-resolver or tunnel connector the handshake could use. A fix also needs the
-HTTP transport's `AccountNet`, private to `ReqwestTransport` in
-`crates/jmap/src/transport_reqwest.rs`: a separate `Net` or a fresh environment
-lookup cannot preserve an injected `Net`'s proxy selection. A fixer needs
-`crates/net`, `client_ws.rs` and `transport_reqwest.rs` together. Documented at
-the code site and in both references.
-
 ## JMAP-034 - The PIM send path as a state machine with compensations
 
 **Needs a technical implementation specification** (owner, 2026-10-21),
@@ -39,9 +27,18 @@ The PIM send path as a small state machine with compensations (create email ->
 submit -> on failure destroy; cancel -> confirm -> create) instead of single
 batched requests whose partial outcomes read as total failure.
 
-## JMAP-038 - Session validation skips other RFC-required core capability fields
+## JMAP-038 - An omitted `collationAlgorithms` is indistinguishable from an empty one
 
-Lateral from the upload-limit work. `validate_session` in
-`crates/jmap/src/sync/capabilities.rs` now requires `maxSizeUpload`, but RFC
-8620 section 2 also requires `maxConcurrentUpload`, `maxConcurrentRequests` and
-`collationAlgorithms`, and their absence is not refused.
+Residue: `validate_session` now refuses an absent `maxSizeUpload`,
+`maxConcurrentUpload` or `maxConcurrentRequests` (zero stays valid). RFC 8620
+section 2 also requires `collationAlgorithms`, but `CoreCapabilities` in
+`crates/jmap/src/core/session.rs` parses it as a defaulted `Vec<String>`, so an
+omitted field and a valid empty array look the same. The model must preserve
+presence before the validator can refuse omission. A fixer needs
+`core/session.rs` and `sync/capabilities.rs` together. When it lands,
+`reference/jmap.md` should state that account open requires the RFC 8620 core
+members (`maxSizeUpload`, `maxConcurrentUpload`, `maxSizeRequest`,
+`maxConcurrentRequests`, `maxCallsInRequest`, `maxObjectsInGet`,
+`maxObjectsInSet`, `collationAlgorithms`), refuses a missing one as
+`Protocol(ContractViolation)`, and accepts zero concurrency and an empty
+`collationAlgorithms`.

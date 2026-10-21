@@ -68,9 +68,7 @@ impl ReqwestTransport {
         // TLS trust belongs to the Net's reqwest client, not AccountSpec.
         // Without an injected Net, choose the process-shared client matching
         // the factory's TLS setting. With one, the supplied Net owns HTTP
-        // trust and process coordination; accept_invalid_certs still controls
-        // the separately built WebSocket TLS connection when that support is
-        // enabled.
+        // trust and process coordination, including WebSocket routing and TLS.
         let net = injected_net
             .unwrap_or_else(|| Net::shared_for_tls(accept_invalid_certs))
             .attach_account(account_id, spec);
@@ -83,6 +81,11 @@ impl ReqwestTransport {
             api_limit: std::sync::Mutex::new(None),
             upload_limit: std::sync::Mutex::new(None),
         })
+    }
+
+    #[cfg(feature = "websockets")]
+    pub(crate) fn websocket_net(&self) -> &AccountNet {
+        &self.net
     }
 
     fn api_limit(&self) -> Option<ConcurrencyLimit> {
@@ -645,6 +648,8 @@ mod tests {
 
         assert_eq!(transport.net.account(), &account_id);
         assert!(transport.net.shares_transport_with(&witness));
+        #[cfg(feature = "websockets")]
+        assert!(transport.websocket_net().shares_transport_with(&witness));
     }
 
     fn scripted_transport(script: &Arc<ScriptedDispatch>) -> ReqwestTransport {

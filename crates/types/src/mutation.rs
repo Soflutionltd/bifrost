@@ -318,7 +318,9 @@ impl FlagOp {
     }
 
     /// Validate at an [`Account`](crate::Account) implementation boundary and
-    /// return the shared classified caller-error shape.
+    /// return the shared classified caller-error shape. Every caller enters
+    /// through its `bulk_set_flags` door, reached by the engine's `SetFlags`
+    /// pipeline, so `UpdateFlags` is the correct operation stamp here.
     pub fn validate_for_account(
         &self,
         protocol: crate::error::Protocol,

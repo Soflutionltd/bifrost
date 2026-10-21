@@ -1699,6 +1699,7 @@ mod tests {
             "capabilities": {
                 "urn:ietf:params:jmap:core": {
                     "maxSizeUpload": 1000,
+                    "maxConcurrentUpload": 2,
                     "maxSizeRequest": 100_000,
                     "maxConcurrentRequests": 4,
                     "maxCallsInRequest": 8,

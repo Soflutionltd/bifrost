@@ -43,7 +43,7 @@ type SharedNetResources = (
 /// clone via the inner `Arc`.
 #[derive(Clone)]
 pub struct Net {
-    inner: Arc<NetInner>,
+    pub(crate) inner: Arc<NetInner>,
 }
 
 /// Backing state for `Net`. Kept private so the Phase 2
@@ -54,6 +54,7 @@ pub(crate) struct NetInner {
     pub(crate) config: NetConfig,
     /// Shared reqwest client built from `config` at `Net::new`.
     pub(crate) client: reqwest::Client,
+    pub(crate) proxy: Arc<crate::proxy::Routing>,
     /// Crate-private wire dispatch seam. Production delegates to
     /// reqwest; unit tests install a scripted in-process dispatcher.
     pub(crate) dispatch: Arc<dyn Dispatch>,
@@ -135,7 +136,10 @@ impl Net {
         dispatch: Arc<dyn Dispatch>,
         bandwidth_registry: Arc<BandwidthRegistry>,
     ) -> Result<Self, Error> {
+        let proxy = Arc::new(crate::proxy::Routing::new(config.proxy.as_ref()));
         let mut builder = reqwest::ClientBuilder::new()
+            .no_proxy()
+            .proxy(proxy.reqwest_proxy())
             .pool_idle_timeout(config.pool_idle_timeout)
             .pool_max_idle_per_host(config.pool_max_idle_per_host)
             .http2_keep_alive_interval(config.http2_keep_alive_interval)
@@ -180,6 +184,7 @@ impl Net {
             inner: Arc::new(NetInner {
                 config,
                 client,
+                proxy,
                 dispatch,
                 governor: RateLimitGovernor::new(),
                 meter: Arc::new(BandwidthMeter::new()),

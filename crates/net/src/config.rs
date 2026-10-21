@@ -14,6 +14,9 @@ pub const DEFAULT_MAX_BUFFERED_RESPONSE: usize = 64 * 1024 * 1024;
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct NetConfig {
+    /// Proxy overrides. None snapshots system/environment routing at construction.
+    /// Some with empty fields disables proxies.
+    pub proxy: Option<crate::proxy::ProxyConfig>,
     /// Deadline for DNS resolution and establishing the TCP/TLS
     /// connection. Reqwest can therefore report expiry before any
     /// target-request bytes were transmitted.
@@ -41,6 +44,7 @@ pub struct NetConfig {
 impl Default for NetConfig {
     fn default() -> Self {
         Self {
+            proxy: None,
             connect_timeout: Some(Duration::from_secs(10)),
             pool_idle_timeout: Duration::from_secs(60),
             pool_max_idle_per_host: 8,

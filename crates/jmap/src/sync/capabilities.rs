@@ -42,21 +42,20 @@ pub(crate) fn session_state_changed() -> AccountError {
     .expect("valid account error classification")
 }
 
-/// Server advertises the core capability but with one or more unusable
-/// limits (`maxCallsInRequest`, `maxObjectsInGet`, `maxObjectsInSet`,
-/// `maxSizeRequest`) - zero-valued, or omitted entirely from a block RFC
-/// 8620 §2 makes them mandatory members of. That is a
-/// `Protocol(ContractViolation)`: the server claimed conformance and then
-/// lied about, or withheld, the lower bounds the spec requires it to
-/// advertise. An omitted `maxSizeUpload` takes the same lane, while zero
-/// is a valid upload size limit. It is not a capability change.
+/// Server advertises the core capability but omits a required field or gives
+/// zero for one of the request limits this account requires to be positive.
+/// That is a `Protocol(ContractViolation)`: the server claimed conformance
+/// and then withheld required information or advertised an unusable limit.
+/// Zero is valid for `maxSizeUpload` and the concurrency limits because they
+/// are `UnsignedInt`; an omitted `maxSizeUpload` takes the same error lane.
+/// It is not a capability change.
 fn unusable_core_limits() -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
         Cause::Wire(WireCause::MalformedResponse {
             protocol: Protocol::Jmap,
             detail: Some(DiagnosticText::support_only(
-                "JMAP core capability advertises zero-valued or omitted limits",
+                "JMAP core capability omits required fields or advertises unusable limits",
             )),
         }),
     )
@@ -173,6 +172,13 @@ pub(crate) fn validate_session(session: &Session) -> Result<CoreLimits, AccountE
     };
 
     upload_size_limit(session)?;
+    // RFC 8620 §2 requires both concurrency fields. Their type is
+    // `UnsignedInt`, so zero is a valid advertised value; only absence is
+    // rejected here.
+    if core.max_concurrent_upload().is_none() || core.max_concurrent_requests().is_none() {
+        return Err(unusable_core_limits());
+    }
+
     let usable = |limit: Option<usize>| limit.is_some_and(|value| value > 0);
     if !usable(core.max_calls_in_request())
         || !usable(core.max_objects_in_get())
@@ -717,9 +723,9 @@ mod tests {
         assert_eq!(err.operation(), Some(AccountOperation::Discover));
     }
 
-    /// Each of the four core limits is independently load-bearing: a zero
-    /// in any one of them is a contract violation, not just in
-    /// `maxCallsInRequest`.
+    /// Each of the four positive request limits is independently
+    /// load-bearing: a zero in any one of them is a contract violation, not
+    /// just in `maxCallsInRequest`.
     #[test]
     fn any_zero_core_limit_is_a_contract_violation() {
         for field in [
@@ -823,13 +829,15 @@ mod tests {
     /// is missing entirely - and refused as a contract violation, since
     /// RFC 8620 §2 makes every one of them a mandatory member.
     #[test]
-    fn any_omitted_core_limit_is_a_contract_violation() {
+    fn any_omitted_required_core_limit_is_a_contract_violation() {
         for field in [
             "maxCallsInRequest",
             "maxObjectsInGet",
             "maxObjectsInSet",
             "maxSizeRequest",
             "maxSizeUpload",
+            "maxConcurrentUpload",
+            "maxConcurrentRequests",
         ] {
             let mut core = serde_json::json!({
                 "maxSizeUpload": 1000,
@@ -857,13 +865,32 @@ mod tests {
     fn zero_upload_size_is_a_valid_limit() {
         let session = session_with_core(serde_json::json!({
             "maxSizeUpload": 0,
+            "maxConcurrentUpload": 2,
             "maxSizeRequest": 100_000,
+            "maxConcurrentRequests": 4,
             "maxCallsInRequest": 8,
             "maxObjectsInGet": 256,
-            "maxObjectsInSet": 256
+            "maxObjectsInSet": 256,
+            "collationAlgorithms": []
         }));
         validate_session(&session).expect("zero only disallows nonempty uploads");
         assert_eq!(upload_size_limit(&session).expect("required limit"), 0);
+    }
+
+    #[test]
+    fn zero_core_concurrency_limits_are_valid_unsigned_ints() {
+        let session = session_with_core(serde_json::json!({
+            "maxSizeUpload": 1000,
+            "maxConcurrentUpload": 0,
+            "maxSizeRequest": 100_000,
+            "maxConcurrentRequests": 0,
+            "maxCallsInRequest": 8,
+            "maxObjectsInGet": 256,
+            "maxObjectsInSet": 256,
+            "collationAlgorithms": []
+        }));
+
+        validate_session(&session).expect("zero concurrency is still an advertised limit");
     }
 
     /// A session document with a legal core block plus whatever other

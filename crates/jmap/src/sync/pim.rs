@@ -4170,9 +4170,8 @@ mod tests {
                     .into_iter()
                     .map(|chunk| Ok(Bytes::from_static(chunk.as_bytes()))),
             );
-            let tail = futures::stream::poll_fn(|_| {
-                panic!("oversize upload must not poll another chunk")
-            });
+            let tail =
+                futures::stream::poll_fn(|_| panic!("oversize upload must not poll another chunk"));
             let error = attachment_upload(
                 attachment_account(Some(3)),
                 Box::pin(prefix.chain(tail)),
