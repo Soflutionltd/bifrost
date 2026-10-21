@@ -71,10 +71,15 @@ pub enum MutationConcurrency {
     /// have no caller-version guarantee. DAV relocation with a version is
     /// refused because its multi-request fallback cannot preserve the guard.
     ExpectedVersion {
+        /// Mail flag writes. IMAP refuses a versioned two-sided patch.
+        mail_set_flags: bool,
+        mail_move: bool,
+        mail_destroy: bool,
         contact_update: bool,
         event_update: bool,
         contact_delete: bool,
         event_delete: bool,
+        event_rsvp: bool,
     },
     /// No caller-version concurrency control. Supplied versions are refused.
     None,

@@ -57,6 +57,43 @@ pub(crate) fn bulk_destroy_stream(
     bulk_mutation_stream(account, targets, MutationKind::Destroy)
 }
 
+pub(crate) fn bulk_set_flags_if_version_stream(
+    account: GraphAccount,
+    targets: AccountStream<bifrost_types::MailMutationTarget>,
+    op: FlagOp,
+    key: IdempotencyKey,
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+    bifrost_types::mutation::versioned_mail_stream(targets, move |target| {
+        let Some(version) = target.expected_version else {
+            return bulk_set_flags_stream(
+                account.clone(),
+                Box::pin(futures::stream::iter([target.id])),
+                op.clone(),
+                key.clone(),
+            );
+        };
+        let expected = match version.expected_etag(
+            bifrost_types::Protocol::Graph,
+            AccountOperation::UpdateFlags,
+            false,
+        ) {
+            Ok(etag) => etag.to_owned(),
+            Err(error) => return bifrost_types::mutation::refused_mail_target(target.id, error),
+        };
+        if let Err(error) = op.validate_for_account(bifrost_types::Protocol::Graph) {
+            return bifrost_types::mutation::refused_mail_target(target.id, error);
+        }
+        let account = account.clone();
+        let kind = MutationKind::SetFlags(op.clone());
+        Box::pin(async_stream::stream! {
+            match submit_batch_with_version(&account, &[target.id], &kind, Some(&expected)).await {
+                Ok(events) => for event in events { yield event; },
+                Err(error) => yield SyncEvent::Terminated(into_account_error(error, GraphErrorContext::graph(AccountOperation::UpdateFlags))),
+            }
+        })
+    })
+}
+
 /// Chunk the target stream and submit one `$batch` per chunk.
 ///
 /// Every batch is tagged `PageBoundary::Page`, including the last one, and
@@ -135,6 +172,15 @@ async fn submit_batch(
     ids: &[ObjectId],
     kind: &MutationKind,
 ) -> Result<Vec<SyncEvent<ItemOutcome<MutationSuccess>>>, crate::error::GraphError> {
+    submit_batch_with_version(account, ids, kind, None).await
+}
+
+async fn submit_batch_with_version(
+    account: &GraphAccount,
+    ids: &[ObjectId],
+    kind: &MutationKind,
+    expected: Option<&str>,
+) -> Result<Vec<SyncEvent<ItemOutcome<MutationSuccess>>>, crate::error::GraphError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -178,15 +224,22 @@ async fn submit_batch(
     let (metered, tally) = account.metered();
     let account = &metered;
     let mut etags = HashMap::new();
-    {
-        let mut cache = account.etag_index.write().await;
+    let mut preflight_outcomes = if let Some(expected) = expected {
         for id in ids {
-            if let Some(etag) = cache.get(&id.0) {
-                etags.insert(id.0.clone(), etag);
+            etags.insert(id.0.clone(), expected.to_owned());
+        }
+        Vec::new()
+    } else {
+        {
+            let mut cache = account.etag_index.write().await;
+            for id in ids {
+                if let Some(etag) = cache.get(&id.0) {
+                    etags.insert(id.0.clone(), etag);
+                }
             }
         }
-    }
-    let mut preflight_outcomes = refresh_missing_etags(account, ids, kind, &mut etags).await;
+        refresh_missing_etags(account, ids, kind, &mut etags).await
+    };
     let mut requests = Vec::new();
     let mut request_ids = Vec::new();
     for id in ids {
@@ -851,6 +904,73 @@ mod tests {
     use crate::account::foreign::{encode_foreign, encode_message_id};
     use crate::client::GraphClient;
     use bifrost_types::{CursorScope, FolderId, ObjectType};
+
+    #[tokio::test]
+    async fn caller_etag_bypasses_newer_cache_and_reports_conflict_without_get() {
+        let account = shared_account();
+        account
+            .etag_index
+            .write()
+            .await
+            .insert("m1".into(), "W/\"new\"".into());
+        account.client.script_rest([crate::client::ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({"responses": [{"id": "0", "status": 412, "body": {"error": {"code": "ErrorIrresolvableConflict", "message": "stale"}}}]}),
+        ), crate::client::ScriptedRestResponse::json(
+            reqwest::StatusCode::OK, json!({"responses": [{"id": "0", "status": 200, "body": {"id": "m2"}}]}),
+        )]);
+        let events = bulk_set_flags_if_version_stream(
+            account.clone(),
+            Box::pin(futures::stream::iter([
+                bifrost_types::MailMutationTarget {
+                    id: ObjectId("m1".into()),
+                    expected_version: Some(bifrost_types::ServerVersion::ETag("W/\"old\"".into())),
+                },
+                bifrost_types::MailMutationTarget {
+                    id: ObjectId("m2".into()),
+                    expected_version: Some(bifrost_types::ServerVersion::ETag(
+                        "W/\"current\"".into(),
+                    )),
+                },
+            ])),
+            FlagOp::Add(HashSet::from(["\\seen".into()])),
+            idempotency_key(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let [
+            SyncEvent::Batch(batch),
+            SyncEvent::Batch(second),
+            SyncEvent::Done(None),
+        ] = events.as_slice()
+        else {
+            panic!("{events:?}");
+        };
+        let [ItemOutcome::Failed(failure)] = batch.items.as_slice() else {
+            panic!("{batch:?}");
+        };
+        assert_eq!(
+            failure.error.kind(),
+            &bifrost_types::AccountErrorKind::ConcurrencyConflict
+        );
+        assert!(
+            matches!(second.items.as_slice(), [ItemOutcome::Succeeded(success)] if success.item.0 == "m2")
+        );
+        let requests = account.client.take_rest_requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "caller ETags must not trigger refresh GETs"
+        );
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["requests"][0]["headers"]["If-Match"],
+            "W/\"old\""
+        );
+        assert_eq!(
+            requests[1].body.as_ref().unwrap()["requests"][0]["headers"]["If-Match"],
+            "W/\"current\""
+        );
+    }
 
     #[tokio::test]
     async fn delta_and_refresh_produce_identical_if_match_bytes() {

@@ -538,6 +538,15 @@ impl Account for ImapAccount {
         mutate::bulk_set_flags(self.clone(), targets, op, key)
     }
 
+    fn bulk_set_flags_if_version(
+        self: std::sync::Arc<Self>,
+        targets: AccountStream<bifrost_types::MailMutationTarget>,
+        op: bifrost_types::FlagOp,
+        key: IdempotencyKey,
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+        mutate::bulk_set_flags_if_version(self.as_ref().clone(), targets, op, key)
+    }
+
     // Account: maps shared membership moves to UID MOVE; direct users call uid_move_messages().
     fn bulk_move(
         &self,

@@ -12,10 +12,14 @@ pub(crate) fn carddav_capabilities() -> AccountCapabilities {
         push: PushCapability::None,
         mutation: MutationCapabilities {
             concurrency: MutationConcurrency::ExpectedVersion {
+                mail_set_flags: false,
+                mail_move: false,
+                mail_destroy: false,
                 contact_update: true,
                 event_update: false,
                 contact_delete: true,
                 event_delete: false,
+                event_rsvp: false,
             },
             replay_safety: MutationReplaySafety::None,
         },
@@ -71,10 +75,14 @@ mod tests {
         assert_eq!(
             caps.mutation.concurrency,
             MutationConcurrency::ExpectedVersion {
+                mail_set_flags: false,
+                mail_move: false,
+                mail_destroy: false,
                 contact_update: true,
                 event_update: false,
                 contact_delete: true,
                 event_delete: false,
+                event_rsvp: false,
             }
         );
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);

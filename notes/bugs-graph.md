@@ -25,20 +25,25 @@ receive Graph's default delta property set. If that set omits `changeKey` or
 `recurrence`, the event fingerprint degrades to `Unavailable`. Hermetic tests
 cannot show which.
 
-## GRAPH-006 - Caller-version optimistic concurrency covers only contact and event updates
+## GRAPH-006 - Caller-version optimistic concurrency has gaps in JMAP PIM, People and other mutation families
 
-**Ruled (owner, 2026-10-21), together with IMAP-022:** caller-version
-optimistic concurrency across providers - an optional expected version on the
-shared mutation inputs, enforced natively where present, behaviour unchanged
-when absent, advertised honestly through capabilities.
+**Ruled (owner, 2026-10-21):** caller-version optimistic concurrency across
+providers - an optional expected version on the shared mutation inputs,
+enforced natively where present, behaviour unchanged when absent, advertised
+honestly through capabilities.
 
-Residue: contact and event updates and deletes carry an expected version;
-Graph and both DAV crates enforce it (`If-Match`; DAV refuses weak validators),
-JMAP and Google refuse a supplied version before I/O and advertise no
-guarantee. Versioned DAV relocations stay refused by design: copy-then-delete
-cannot enforce one atomic caller precondition. Still open: the other mutation
-inputs, per-target versions on bulk mail mutations, IMAP enforcement of a
-caller MODSEQ (IMAP-022), and whether the absent-version fetch-then-condition
-path that guards only the GET-to-write gap should go.
+Residue: contact and event updates and deletes, bulk mail mutations (per-target
+`MailMutationTarget`) and event RSVP carry caller versions. IMAP takes
+`UNCHANGEDSINCE` from the caller ModSeq for flag STOREs; JMAP enforces caller
+Email state for flags, moves and destroys; Graph enforces caller ETags on PIM
+writes and flag PATCHes; DAV enforces strong ETags on PIM writes; Google
+enforces caller ETags on calendar update, delete and RSVP. Versioned DAV
+relocations and versioned IMAP moves, destroys and two-sided patches stay
+refused. The absent-version fetch-or-cache conditions were kept, because they
+still guard the narrower observation-to-write window. Still open: JMAP contact
+and event caller state, the Google People source-ETag design (GOOG-028),
+Graph move and permanent-delete guarantees, caller-version surfaces for other
+mutation families, and versioned bulk streams submitting targets independently
+rather than as one guarded batch.
 
 

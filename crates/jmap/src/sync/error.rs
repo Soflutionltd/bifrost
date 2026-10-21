@@ -21,6 +21,9 @@
 //! not unused API. This module opts back in so the compiler reports one.
 #![warn(dead_code)]
 
+#[cfg(feature = "websockets")]
+use std::error::Error as StdError;
+
 #[cfg(test)]
 use std::time::Duration;
 
@@ -289,7 +292,7 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         .try_build()
         .expect("valid account error classification"),
         #[cfg(feature = "websockets")]
-        crate::Error::WebSocketHandshake(err) => websocket_handshake_error(err.to_string(), ctx),
+        crate::Error::WebSocketHandshake(err) => websocket_handshake_error(err, ctx),
         #[cfg(feature = "websockets")]
         crate::Error::WebSocketRuntime(err) => websocket_runtime_error(err.to_string(), ctx),
         #[cfg(feature = "websockets")]
@@ -1720,25 +1723,72 @@ fn websocket_send_error(err: &tokio_websockets::Error, ctx: JmapErrorContext) ->
     .expect("valid account error classification")
 }
 
-/// Pre-handshake WebSocket failure. Classification is
-/// `Transport(Network) + Attempt(Unsent)` - no bytes from the JMAP
-/// request itself crossed the side-effect boundary. The blanket
-/// `From<tokio_websockets::Error>` impl that previously routed every
-/// websocket error through `websocket_runtime_error` mis-classified
-/// handshake-time TCP/TLS drops.
+/// Pre-handshake WebSocket failure. A typed proxy tunnel source is kept
+/// specific; all other handshake failures are `Transport(Network)` with
+/// `Attempt(Unsent)`, since no bytes from the JMAP request crossed the
+/// side-effect boundary.
 #[cfg(feature = "websockets")]
-fn websocket_handshake_error(message: String, ctx: JmapErrorContext) -> AccountError {
-    build(
-        AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause::new(
-            TransportKind::Network,
-            Some(DiagnosticText::support_only(message)),
-        )),
-        &ctx,
-    )
-    .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
-    .try_build()
-    .expect("valid account error classification")
+fn websocket_handshake_error(err: tokio_websockets::Error, ctx: JmapErrorContext) -> AccountError {
+    let message = err.to_string();
+    let tunnel_error = StdError::source(&err)
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::get_ref)
+        .and_then(|source| source.downcast_ref::<bifrost_net::proxy::TunnelError>());
+
+    let (kind, primary, status, detail) = match tunnel_error {
+        Some(bifrost_net::proxy::TunnelError::ProxyAuthenticationRequired) => {
+            // The shared taxonomy has no proxy-credential kind. This is the
+            // closest existing credential classification and gives the
+            // consumer an AuthLost/Reauthorize result. Keep the text explicit
+            // that these credentials belong to the proxy, not the JMAP origin.
+            (
+                AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
+                Cause::Auth(AuthCause::ReauthorizationRequired),
+                Some(407),
+                format!("proxy authentication failed for WebSocket CONNECT: {message}"),
+            )
+        }
+        Some(bifrost_net::proxy::TunnelError::ProxyTls { .. }) => (
+            AccountErrorKind::Transport(TransportErrorKind::Tls),
+            Cause::Transport(TransportCause::new(
+                TransportKind::Tls,
+                Some(DiagnosticText::support_only(message.clone())),
+            )),
+            None,
+            message,
+        ),
+        Some(bifrost_net::proxy::TunnelError::ProxyRefused { status }) => {
+            // CONNECT returned an HTTP response. Retaining its status in the
+            // existing server-error lane lets central recovery distinguish
+            // permanent refusals from transient 5xx proxy failures.
+            (
+                AccountErrorKind::Server(ServerErrorKind::Error {
+                    status: Some(*status),
+                }),
+                Cause::Server(ServerCause::Error {
+                    status: Some(*status),
+                }),
+                Some(*status),
+                format!("proxy refused WebSocket CONNECT: {message}"),
+            )
+        }
+        Some(_) | None => (
+            AccountErrorKind::Transport(TransportErrorKind::Network),
+            Cause::Transport(TransportCause::new(
+                TransportKind::Network,
+                Some(DiagnosticText::support_only(message.clone())),
+            )),
+            None,
+            message,
+        ),
+    };
+
+    build(kind, primary, &ctx)
+        .status(status)
+        .text(DiagnosticText::support_only(detail))
+        .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
+        .try_build()
+        .expect("valid account error classification")
 }
 
 #[cfg(test)]
@@ -1749,6 +1799,16 @@ mod tests {
         AccessErrorKind, AccountErrorKind, AccountOperation, ProtocolErrorKind, RecoveryClass,
         RetryDisposition, ServerErrorKind, SyncStateErrorKind, ThrottleScope,
     };
+
+    #[cfg(feature = "websockets")]
+    use bifrost_types::AuthErrorKind;
+
+    #[cfg(feature = "websockets")]
+    fn proxy_tunnel_handshake_error(tunnel_error: bifrost_net::proxy::TunnelError) -> crate::Error {
+        crate::Error::WebSocketHandshake(tokio_websockets::Error::Io(std::io::Error::other(
+            tunnel_error,
+        )))
+    }
 
     fn method_error(kind: &str) -> crate::Error {
         let err: MethodError = serde_json::from_str(&format!(r#"{{"type":"{kind}"}}"#)).unwrap();
@@ -2541,7 +2601,10 @@ mod tests {
         // failure path. We can't easily build one directly, so synthesize
         // the classification helper and assert its shape.
         let ctx = JmapErrorContext::new(AccountOperation::PushSubscribe);
-        let err = websocket_handshake_error("handshake aborted".to_string(), ctx);
+        let err = websocket_handshake_error(
+            tokio_websockets::Error::Io(std::io::Error::other("handshake aborted")),
+            ctx,
+        );
         assert_eq!(
             err.kind(),
             &AccountErrorKind::Transport(TransportErrorKind::Network)
@@ -2561,6 +2624,82 @@ mod tests {
             }
             other => panic!("expected Retry::SameRequest, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "websockets")]
+    #[test]
+    fn proxy_connect_authentication_is_a_proxy_credential_failure() {
+        let err = into_account_error(
+            proxy_tunnel_handshake_error(
+                bifrost_net::proxy::TunnelError::ProxyAuthenticationRequired,
+            ),
+            JmapErrorContext::new(AccountOperation::PushSubscribe),
+        );
+
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired)
+        );
+        assert_eq!(err.recovery(), &RecoveryClass::AuthLost);
+        assert_eq!(err.telemetry_fields().status, Some(407));
+        assert_eq!(
+            err.suggested_remediation(),
+            Some(&bifrost_types::RemediationAction::Reauthorize)
+        );
+        assert!(err.chain().iter().any(|cause| matches!(
+            cause,
+            Cause::Attempt(attempt)
+                if attempt.transmission_state == TransmissionState::Unsent
+        )));
+    }
+
+    #[cfg(feature = "websockets")]
+    #[test]
+    fn proxy_tls_failure_is_a_tls_transport_error() {
+        let err = into_account_error(
+            proxy_tunnel_handshake_error(bifrost_net::proxy::TunnelError::ProxyTls {
+                source: Box::new(std::io::Error::other("certificate rejected")),
+            }),
+            JmapErrorContext::new(AccountOperation::PushSubscribe),
+        );
+
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Transport(TransportErrorKind::Tls)
+        );
+        assert!(matches!(
+            err.recovery(),
+            RecoveryClass::Retry(advice)
+                if advice.disposition == RetryDisposition::SameRequest
+        ));
+        assert!(err.chain().iter().any(|cause| matches!(
+            cause,
+            Cause::Attempt(attempt)
+                if attempt.transmission_state == TransmissionState::Unsent
+        )));
+    }
+
+    #[cfg(feature = "websockets")]
+    #[test]
+    fn proxy_connect_refusal_preserves_status_and_server_recovery() {
+        let err = into_account_error(
+            proxy_tunnel_handshake_error(bifrost_net::proxy::TunnelError::ProxyRefused {
+                status: 403,
+            }),
+            JmapErrorContext::new(AccountOperation::PushSubscribe),
+        );
+
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Server(ServerErrorKind::Error { status: Some(403) })
+        );
+        assert_eq!(err.telemetry_fields().status, Some(403));
+        assert_eq!(err.recovery(), &RecoveryClass::ProviderRefused);
+        assert!(err.chain().iter().any(|cause| matches!(
+            cause,
+            Cause::Attempt(attempt)
+                if attempt.transmission_state == TransmissionState::Unsent
+        )));
     }
 
     /// jmap-D1: WebSocket post-handshake (runtime) failures classify as

@@ -199,14 +199,33 @@ pub(crate) fn update(
     patch: EventPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        if patch.expected_version.is_some() {
-            return Err(AccountError::unsupported(
-                AccountOperation::EventUpdate,
-                bifrost_types::error::Protocol::Gmail,
-            ));
-        }
+        let expected = patch
+            .expected_version
+            .as_ref()
+            .map(|version| {
+                version
+                    .expected_etag(
+                        bifrost_types::Protocol::Gmail,
+                        AccountOperation::EventUpdate,
+                        false,
+                    )
+                    .map(str::to_owned)
+            })
+            .transpose()?;
         let (mut calendar_id, native_event_id) =
             split_event_id(&event.0, AccountOperation::EventUpdate)?;
+        if expected.is_some()
+            && (patch
+                .calendar_id
+                .as_ref()
+                .is_some_and(|id| id.0 != calendar_id)
+                || !event_patch_has_non_move_fields(&patch))
+        {
+            return Err(AccountError::unsupported(
+                AccountOperation::EventUpdate,
+                bifrost_types::Protocol::Gmail,
+            ));
+        }
         let has_field_patch = event_patch_has_non_move_fields(&patch);
         // Validate and encode the field patch before a move. The patch's
         // times and attendee statuses cannot be repaired by moving the event,
@@ -255,7 +274,16 @@ pub(crate) fn update(
         // consumer to look at a resource that is no longer there.
         let target_event_id = join_event_id(&calendar_id, &native_event_id);
         let google_patch = google_patch.expect("a field patch was prepared before the move");
-        let _: GoogleEvent = client.patch(&url, &google_patch).await.map_err(|error| {
+        let response = client
+            .execute_if_match(&url, "PATCH", Some(&google_patch), expected.as_deref())
+            .await;
+        let result = match response {
+            Ok(response) => {
+                crate::client::parse_json_response::<GoogleEvent>(response, "Calendar API").await
+            }
+            Err(error) => Err(error),
+        };
+        result.map_err(|error| {
             let error = event_error(error, AccountOperation::EventUpdate, target_event_id);
             if moved {
                 event_move_patch_error(error)
@@ -271,12 +299,34 @@ pub(crate) fn delete(
     client: Arc<GmailClient>,
     event: EventId,
 ) -> AccountFuture<Result<(), AccountError>> {
+    delete_if_version(client, event, None)
+}
+
+pub(crate) fn delete_if_version(
+    client: Arc<GmailClient>,
+    event: EventId,
+    expected: Option<bifrost_types::ServerVersion>,
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventDelete)?;
-        client
-            .delete(&event_url(client.calendar_base(), &calendar_id, &event_id))
+        let expected = expected
+            .as_ref()
+            .map(|version| {
+                version.expected_etag(
+                    bifrost_types::Protocol::Gmail,
+                    AccountOperation::EventDelete,
+                    false,
+                )
+            })
+            .transpose()?;
+        let (calendar_id, native_id) = split_event_id(&event.0, AccountOperation::EventDelete)?;
+        let url = event_url(client.calendar_base(), &calendar_id, &native_id);
+        let response = client
+            .execute_if_match(&url, "DELETE", None::<&()>, expected)
             .await
-            .map_err(|error| event_error(error, AccountOperation::EventDelete, event.0.clone()))
+            .map_err(|error| event_error(error, AccountOperation::EventDelete, event.0.clone()))?;
+        crate::client::check_response_status(response, "Calendar API")
+            .await
+            .map_err(|error| event_error(error, AccountOperation::EventDelete, event.0))
     })
 }
 
@@ -286,7 +336,27 @@ pub(crate) fn rsvp(
     event: EventId,
     status: RsvpStatus,
 ) -> AccountFuture<Result<(), AccountError>> {
+    rsvp_if_version(client, self_email, event, status, None)
+}
+
+pub(crate) fn rsvp_if_version(
+    client: Arc<GmailClient>,
+    self_email: String,
+    event: EventId,
+    status: RsvpStatus,
+    expected: Option<bifrost_types::ServerVersion>,
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        let expected = expected
+            .as_ref()
+            .map(|version| {
+                version.expected_etag(
+                    bifrost_types::Protocol::Gmail,
+                    AccountOperation::EventRsvp,
+                    false,
+                )
+            })
+            .transpose()?;
         // Validate the requested status before the GET so an unrepresentable
         // shared value can never turn into an accidental `needsAction` write.
         let response_status = rsvp_request_value(status)?;
@@ -296,14 +366,20 @@ pub(crate) fn rsvp(
             .await
             .map_err(|error| event_error(error, AccountOperation::EventRsvp, event.0.clone()))?;
         rsvp_google_attendees_for_self(&mut current.attendees, &self_email, response_status)?;
-        let _: GoogleEvent = client
-            .patch(
+        let patch = GoogleEventPatch {
+            attendees: current.attendees,
+            ..GoogleEventPatch::default()
+        };
+        let response = client
+            .execute_if_match(
                 &event_url(client.calendar_base(), &calendar_id, &event_id),
-                &GoogleEventPatch {
-                    attendees: current.attendees,
-                    ..GoogleEventPatch::default()
-                },
+                "PATCH",
+                Some(&patch),
+                expected,
             )
+            .await
+            .map_err(|error| event_error(error, AccountOperation::EventRsvp, event.0.clone()))?;
+        let _: GoogleEvent = crate::client::parse_json_response(response, "Calendar API")
             .await
             .map_err(|error| event_error(error, AccountOperation::EventRsvp, event.0.clone()))?;
         Ok(())
@@ -1607,13 +1683,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn caller_event_etags_reach_patch_and_delete_and_conflict() {
+        for delete in [false, true] {
+            let (client, script) = scripted_client(vec![canned_json(
+                StatusCode::PRECONDITION_FAILED,
+                json!({"error": {"code": 412, "message": "stale", "errors": [{"reason": "conditionNotMet"}]}}),
+            )]);
+            let expected = Some(bifrost_types::ServerVersion::ETag("\"caller-old\"".into()));
+            let error = if delete {
+                delete_if_version(client, EventId("primary::e1".into()), expected).await
+            } else {
+                update(
+                    client,
+                    EventId("primary::e1".into()),
+                    EventPatch {
+                        expected_version: expected,
+                        title: Some(Some("new title".into())),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::ConcurrencyConflict
+            );
+            let requests = script.requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].headers.get("If-Match").unwrap(),
+                "\"caller-old\""
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_event_version_keeps_unconditional_patch_and_delete() {
+        for delete in [false, true] {
+            let (client, script) = scripted_client(vec![canned_json(StatusCode::OK, json!({}))]);
+            if delete {
+                delete_if_version(client, EventId("primary::e1".into()), None)
+                    .await
+                    .unwrap();
+            } else {
+                update(
+                    client,
+                    EventId("primary::e1".into()),
+                    EventPatch {
+                        title: Some(Some("new title".into())),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let requests = script.requests();
+            assert_eq!(requests.len(), 1);
+            assert!(!requests[0].headers.contains_key("If-Match"));
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_event_version_refuses_relocation_before_io() {
+        let (client, script) = scripted_client(Vec::new());
+        let error = update(
+            client,
+            EventId("primary::e1".into()),
+            EventPatch {
+                expected_version: Some(bifrost_types::ServerVersion::ETag("\"old\"".into())),
+                calendar_id: Some(CalendarId("other".into())),
+                title: Some(Some("new title".into())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+        );
+        assert!(script.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn caller_rsvp_etag_is_not_replaced_by_the_preflight_read() {
+        let (client, script) = scripted_client(vec![
+            canned_json(
+                StatusCode::OK,
+                json!({
+                    "etag": "\"new\"", "attendees": [{"email": "self@example.test", "self": true, "responseStatus": "needsAction"}]
+                }),
+            ),
+            canned_json(
+                StatusCode::PRECONDITION_FAILED,
+                json!({"error": {"code": 412, "message": "stale"}}),
+            ),
+        ]);
+        let error = rsvp_if_version(
+            client,
+            "self@example.test".into(),
+            EventId("primary::e1".into()),
+            RsvpStatus::Accepted,
+            Some(bifrost_types::ServerVersion::ETag("\"old\"".into())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::ConcurrencyConflict
+        );
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].headers.contains_key("If-Match"));
+        assert_eq!(requests[1].headers.get("If-Match").unwrap(), "\"old\"");
+    }
+
+    #[tokio::test]
     async fn caller_event_versions_are_refused_before_io() {
         let (client, script) = scripted_client(Vec::new());
         let error = update(
             client,
             EventId("calendar::one".into()),
             EventPatch {
-                expected_version: Some(bifrost_types::ServerVersion::ETag("\"old\"".into())),
+                expected_version: Some(bifrost_types::ServerVersion::HistoryAt(1)),
                 ..Default::default()
             },
         )

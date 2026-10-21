@@ -20,12 +20,16 @@ Coverage note from the engine hunter: `cursor/coverage.rs`, `cursor/ledger.rs`,
 `cursor/ledger_envelope.rs`, `backfill/*`, `engine/lane.rs` and `repair.rs`
 were NOT covered in depth. They are the largest files and need their own pass.
 
-## SYNC-020 - `SyncEngine` has no plain `event_delete` passthrough
+## SYNC-021 - `SyncEngine` exposes almost no calendar primitives
 
-Lateral from the conditional-delete work. `crates/sync/src/engine/passthrough.rs`
-gained `event_delete_if_version` and has `contact_delete` beside
-`contact_delete_if_version`, but no plain `event_delete`. Either the asymmetry
-is intended and wants a comment, or the passthrough is missing.
+Lateral from the passthrough work. `SyncEngine` forwards contact primitives,
+but of the calendar `Account` methods only `event_delete` and
+`event_delete_if_version` (`crates/sync/src/engine/passthrough.rs`). List,
+range, get, create, update, RSVP and search have no passthrough, and the new
+`event_rsvp_if_version` needs one too:
+`pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
+Whether the engine is meant to be the consumer's single door for calendar, as
+it is for contacts, decides whether this is an omission.
 
 ## SYNC-007 - A proven non-landing write is never resubmitted
 

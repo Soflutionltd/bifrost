@@ -992,9 +992,13 @@ invalidation is exactly what `PushSource::Coalesced` exists for.
   consumer into the engine `InvalidationSink`; `push_in_process()` false);
   `EwsStreaming` -> `InProcess` (the EWS worker forwards `Invalidated` on
   `push_stream`; `push_in_process()` true).
-- `mutation.concurrency: ExpectedVersion { contact_update: true, event_update: true, contact_delete: true, event_delete: true }`.
-  This caller-version guarantee covers contact and event update and conditional
-  delete doors. Bulk mail
+- `mutation.concurrency: ExpectedVersion` enables mail flags and contact/event
+  update and delete, with mail move/destroy disabled.
+  `bulk_set_flags_if_version` sends the target's ETag in the message PATCH's
+  `If-Match`, without reading or replacing it from the shared cache. A 412 is
+  a per-target conflict. Unsupported token kinds are refused locally. The
+  move and permanentDelete action POSTs have no established caller-precondition
+  guarantee and refuse supplied versions. Ordinary bulk mail
   retains provider-observed guards: every non-`Destroy` mutation sends
   `If-Match: <entity-tag>`; the cached etag comes from inventory/changes/get,
   refreshed from `messages/{id}?$select=id` on a cold cache.
@@ -2674,3 +2678,9 @@ Local refusal helpers use `AccountError::unsupported` through the shared error
 funnel, retaining their provider, scope and diagnostic decoration.
 `Account::protocol` returns `Protocol::Graph`, including for inherited
 default-method refusals.
+
+Caller versions and ordinary fetch-then-condition guards serve different
+purposes. The ordinary contact/event and bulk-mail paths retain their current
+cache or GET-derived conditions when no version is supplied. They guard only
+changes since that observation, not the consumer's earlier view. Removing them
+would widen the existing race window and change absent-version behavior.

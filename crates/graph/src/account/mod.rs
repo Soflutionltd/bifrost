@@ -1121,6 +1121,15 @@ impl Account for GraphAccount {
         mutate::bulk_set_flags_stream(self.clone(), targets, op, key)
     }
 
+    fn bulk_set_flags_if_version(
+        self: Arc<Self>,
+        targets: AccountStream<bifrost_types::MailMutationTarget>,
+        op: bifrost_types::FlagOp,
+        key: IdempotencyKey,
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+        mutate::bulk_set_flags_if_version_stream(self.as_ref().clone(), targets, op, key)
+    }
+
     fn bulk_move(
         &self,
         targets: AccountStream<ObjectId>,

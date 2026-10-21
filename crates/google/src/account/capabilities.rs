@@ -35,7 +35,16 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
         blob_digest_pre_download: false,
         push: PushCapability::OutOfProcessPubsub,
         mutation: MutationCapabilities {
-            concurrency: MutationConcurrency::None,
+            concurrency: MutationConcurrency::ExpectedVersion {
+                mail_set_flags: false,
+                mail_move: false,
+                mail_destroy: false,
+                contact_update: false,
+                event_update: true,
+                contact_delete: false,
+                event_delete: true,
+                event_rsvp: true,
+            },
             replay_safety: MutationReplaySafety::None,
         },
         batching_policy: BatchingPolicy {
@@ -151,7 +160,19 @@ mod tests {
         assert!(!caps.blob_digest_pre_download);
         assert_eq!(caps.push, PushCapability::OutOfProcessPubsub);
         assert!(!caps.push_in_process());
-        assert_eq!(caps.mutation.concurrency, MutationConcurrency::None);
+        assert_eq!(
+            caps.mutation.concurrency,
+            MutationConcurrency::ExpectedVersion {
+                mail_set_flags: false,
+                mail_move: false,
+                mail_destroy: false,
+                contact_update: false,
+                event_update: true,
+                contact_delete: false,
+                event_delete: true,
+                event_rsvp: true,
+            }
+        );
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
         assert_eq!(caps.batching_policy.max_items, 1000);
         assert!(caps.historyid_expires_after.is_none());

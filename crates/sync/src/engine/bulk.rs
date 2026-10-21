@@ -128,6 +128,92 @@ impl SyncEngine {
         .await
     }
 
+    /// Caller-version campaign. Preconditions remain frozen across retries.
+    /// A rejected caller precondition is reported without read-back or replay.
+    pub async fn bulk_set_flags_if_version(
+        &self,
+        account_id: &AccountId,
+        targets: Vec<bifrost_types::MailMutationTarget>,
+        op: bifrost_types::FlagOp,
+        vendor: &crate::mutation::IdempotencyVendor,
+        protocol: bifrost_types::ProtocolKind,
+    ) -> Result<crate::mutation::MutationCounters, Error> {
+        self.run_bulk_pipeline(
+            account_id,
+            BulkTargets::versioned(targets)?,
+            BulkPipelineOp::SetFlags(op),
+            vendor,
+            protocol,
+        )
+        .await
+    }
+
+    /// Caller-version campaign. Preconditions remain frozen across retries.
+    /// A rejected caller precondition is reported without read-back or replay.
+    pub async fn bulk_move_if_version(
+        &self,
+        account_id: &AccountId,
+        targets: Vec<bifrost_types::MailMutationTarget>,
+        destination: MembershipScope,
+        vendor: &crate::mutation::IdempotencyVendor,
+        protocol: bifrost_types::ProtocolKind,
+    ) -> Result<crate::mutation::MutationCounters, Error> {
+        self.run_bulk_pipeline(
+            account_id,
+            BulkTargets::versioned(targets)?,
+            BulkPipelineOp::Move {
+                destination,
+                source: None,
+            },
+            vendor,
+            protocol,
+        )
+        .await
+    }
+
+    /// Caller-version campaign. Preconditions remain frozen across retries.
+    /// A rejected caller precondition is reported without read-back or replay.
+    pub async fn bulk_move_from_if_version(
+        &self,
+        account_id: &AccountId,
+        targets: Vec<bifrost_types::MailMutationTarget>,
+        destination: MembershipScope,
+        source: Option<MembershipScope>,
+        vendor: &crate::mutation::IdempotencyVendor,
+        protocol: bifrost_types::ProtocolKind,
+    ) -> Result<crate::mutation::MutationCounters, Error> {
+        self.run_bulk_pipeline(
+            account_id,
+            BulkTargets::versioned(targets)?,
+            BulkPipelineOp::Move {
+                destination,
+                source,
+            },
+            vendor,
+            protocol,
+        )
+        .await
+    }
+
+    /// Caller-version campaign. Preconditions remain frozen across retries.
+    /// A rejected caller precondition is reported without read-back or replay.
+    pub async fn bulk_destroy_if_version(
+        &self,
+        account_id: &AccountId,
+        targets: Vec<bifrost_types::MailMutationTarget>,
+        vendor: &crate::mutation::IdempotencyVendor,
+        protocol: bifrost_types::ProtocolKind,
+    ) -> Result<crate::mutation::MutationCounters, Error> {
+        self.run_bulk_pipeline(
+            account_id,
+            BulkTargets::versioned(targets)?,
+            BulkPipelineOp::Destroy,
+            vendor,
+            protocol,
+        )
+        .await
+    }
+
     /// Schedule bulk mutations as independently ready throttle cohorts.
     /// Targets are deduplicated and grouped by their singleton declarations;
     /// each cohort owns one vended key and its own retry and read-back state.
@@ -135,12 +221,16 @@ impl SyncEngine {
     async fn run_bulk_pipeline(
         &self,
         account_id: &AccountId,
-        targets: Vec<bifrost_types::ObjectId>,
+        targets: impl Into<BulkTargets>,
         op: BulkPipelineOp,
         vendor: &crate::mutation::IdempotencyVendor,
         protocol: bifrost_types::ProtocolKind,
     ) -> Result<crate::mutation::MutationCounters, Error> {
         use crate::recovery::{RecoveryPlan, plan_recovery};
+        let BulkTargets {
+            ids: targets,
+            expected_versions,
+        } = targets.into();
         let slot = self
             .accounts
             .get(account_id)
@@ -170,6 +260,7 @@ impl SyncEngine {
         let mut dedupe_count = 0;
         let mut forwarded_directives = HashSet::new();
         let mut first_error = None;
+        let mut caller_conflict = None;
         let mut blocked_by_engine = false;
         let mut cursor = 0;
 
@@ -386,6 +477,25 @@ impl SyncEngine {
                 continue;
             };
             if cohort.readback {
+                // Observed state cannot prove an uncertain caller-guarded
+                // write passed its precondition. Leave those targets pending.
+                let remaining = remaining
+                    .into_iter()
+                    .filter(|id| {
+                        if expected_versions.contains_key(id) {
+                            outcomes.insert(id.clone(), MutationBucket::Unresolved);
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if remaining.is_empty() {
+                    cohort.done = true;
+                    drop(activity);
+                    drop(admission);
+                    continue;
+                }
                 use crate::mutation::readback::{ReadbackTarget, run_object_readback};
                 let target = match &op {
                     BulkPipelineOp::SetFlags(flags) => ReadbackTarget::Flags(flags),
@@ -424,22 +534,55 @@ impl SyncEngine {
             let key = cohort.key.clone();
             let mut retry_ids = Vec::new();
             let mut reconcile_at = cohort.reconcile_at;
-            let target_stream: AccountStream<bifrost_types::ObjectId> =
-                Box::pin(futures::stream::iter(remaining.clone()));
-            let mut stream = match &op {
-                BulkPipelineOp::SetFlags(flag_op) => {
-                    account.bulk_set_flags(target_stream, flag_op.clone(), key.clone())
+            let guarded = remaining
+                .iter()
+                .any(|id| expected_versions.contains_key(id));
+            let mut stream = if guarded {
+                let targets = remaining
+                    .iter()
+                    .cloned()
+                    .map(|id| bifrost_types::MailMutationTarget {
+                        expected_version: expected_versions.get(&id).cloned(),
+                        id,
+                    })
+                    .collect::<Vec<_>>();
+                let target_stream = Box::pin(futures::stream::iter(targets));
+                let account = Arc::clone(account.as_ref());
+                match &op {
+                    BulkPipelineOp::SetFlags(flags) => {
+                        account.bulk_set_flags_if_version(target_stream, flags.clone(), key.clone())
+                    }
+                    BulkPipelineOp::Move {
+                        destination,
+                        source,
+                    } => account.bulk_move_from_if_version(
+                        target_stream,
+                        destination.clone(),
+                        source.clone(),
+                        key.clone(),
+                    ),
+                    BulkPipelineOp::Destroy => {
+                        account.bulk_destroy_if_version(target_stream, key.clone())
+                    }
                 }
-                BulkPipelineOp::Move {
-                    destination,
-                    source,
-                } => account.bulk_move_from(
-                    target_stream,
-                    destination.clone(),
-                    source.clone(),
-                    key.clone(),
-                ),
-                BulkPipelineOp::Destroy => account.bulk_destroy(target_stream, key.clone()),
+            } else {
+                let target_stream: AccountStream<bifrost_types::ObjectId> =
+                    Box::pin(futures::stream::iter(remaining.clone()));
+                match &op {
+                    BulkPipelineOp::SetFlags(flag_op) => {
+                        account.bulk_set_flags(target_stream, flag_op.clone(), key.clone())
+                    }
+                    BulkPipelineOp::Move {
+                        destination,
+                        source,
+                    } => account.bulk_move_from(
+                        target_stream,
+                        destination.clone(),
+                        source.clone(),
+                        key.clone(),
+                    ),
+                    BulkPipelineOp::Destroy => account.bulk_destroy(target_stream, key.clone()),
+                }
             };
             // Read-back membership comes from the outcome map, so an id
             // parked there survives attempts that resubmit its siblings.
@@ -457,6 +600,23 @@ impl SyncEngine {
                 match event {
                     bifrost_types::SyncEvent::Batch(batch) => {
                         for item in batch.items {
+                            if let ItemOutcome::Failed(failure) = &item {
+                                let id = bifrost_types::ObjectId(failure.item.0.clone());
+                                if expected_versions.contains_key(&id)
+                                    && matches!(
+                                        failure.error.kind(),
+                                        bifrost_types::AccountErrorKind::ConcurrencyConflict
+                                    )
+                                {
+                                    // A read-back can observe the requested state without proving
+                                    // that this caller's precondition ever held. Keep the refusal.
+                                    outcomes.insert(id, MutationBucket::FailedTerminal);
+                                    caller_conflict
+                                        .get_or_insert(Error::Account(failure.error.clone()));
+                                    continue;
+                                }
+                            }
+
                             if let ItemOutcome::Succeeded(success) = &item
                                 && let MutationSuccess::Downgraded { actual } = &success.output
                             {
@@ -719,10 +879,50 @@ impl SyncEngine {
             }
         }
         let mut totals = counters_from_outcomes(&outcomes);
-        totals.error = first_error.map(Arc::new);
+        totals.error = first_error.or(caller_conflict).map(Arc::new);
         totals.effects = effects.into_iter().collect();
         totals.dedupe_by_client_id = dedupe_count;
         Ok(totals)
+    }
+}
+
+struct BulkTargets {
+    ids: Vec<bifrost_types::ObjectId>,
+    expected_versions: HashMap<bifrost_types::ObjectId, bifrost_types::ServerVersion>,
+}
+
+impl From<Vec<bifrost_types::ObjectId>> for BulkTargets {
+    fn from(ids: Vec<bifrost_types::ObjectId>) -> Self {
+        Self {
+            ids,
+            expected_versions: HashMap::new(),
+        }
+    }
+}
+
+impl BulkTargets {
+    fn versioned(targets: Vec<bifrost_types::MailMutationTarget>) -> Result<Self, Error> {
+        let mut ids = Vec::new();
+        let mut versions = HashMap::new();
+        for target in targets {
+            if let Some(previous) = versions.get(&target.id) {
+                if previous != &target.expected_version {
+                    return Err(Error::Other(
+                        "one mutation target has conflicting caller versions".into(),
+                    ));
+                }
+                continue;
+            }
+            ids.push(target.id.clone());
+            versions.insert(target.id, target.expected_version);
+        }
+        Ok(Self {
+            ids,
+            expected_versions: versions
+                .into_iter()
+                .filter_map(|(id, version)| version.map(|version| (id, version)))
+                .collect(),
+        })
     }
 }
 
@@ -1262,6 +1462,83 @@ mod campaign_tests {
         assert_eq!(counters.skipped, 1);
         assert_eq!(counters.pending_retry, 2);
         assert_eq!(counters.failed_terminal, 0);
+    }
+
+    #[tokio::test]
+    async fn caller_conflict_is_preserved_instead_of_read_back_as_success() {
+        let engine = SyncEngine::builder().build().expect("engine");
+        let id = AccountId("caller-conflict".into());
+        let mut stub = crate::test_common::StubAccount::new(Vec::new());
+        stub.versioned_flags_error = Some(
+            bifrost_types::AccountErrorBuilder::new(
+                bifrost_types::AccountErrorKind::ConcurrencyConflict,
+                bifrost_types::Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
+            )
+            .protocol(bifrost_types::Protocol::Imap)
+            .operation(bifrost_types::AccountOperation::UpdateFlags)
+            .try_build()
+            .expect("valid conflict"),
+        );
+        let account = Arc::new(stub);
+        engine
+            .attach(
+                id.clone(),
+                Arc::new(crate::test_common::StubFactory::queue(vec![Arc::clone(
+                    &account,
+                )])),
+            )
+            .await
+            .expect("attach");
+        let vendor = crate::mutation::IdempotencyVendor::with_run_id(
+            bifrost_types::RunId("caller-version".into()),
+            Box::new(|_| bifrost_types::ProtocolSalt::Imap),
+        );
+        let counters = engine
+            .bulk_set_flags_if_version(
+                &id,
+                vec![bifrost_types::MailMutationTarget {
+                    id: ObjectId("one".into()),
+                    expected_version: Some(bifrost_types::ServerVersion::ModSeq(100)),
+                }],
+                bifrost_types::FlagOp::Add(HashSet::from(["$seen".into()])),
+                &vendor,
+                bifrost_types::ProtocolKind::Imap,
+            )
+            .await
+            .expect("campaign accounting");
+        assert_eq!(counters.failed_terminal, 1);
+        assert_eq!(counters.pending_retry, 0);
+        assert_eq!(counters.skipped, 0);
+        assert!(
+            matches!(counters.error.as_deref(), Some(Error::Account(error))
+            if matches!(error.kind(), bifrost_types::AccountErrorKind::ConcurrencyConflict))
+        );
+        {
+            let seen = account.versioned_flags_seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "a rejected caller token is never replayed");
+            assert_eq!(
+                seen[0].expected_version,
+                Some(bifrost_types::ServerVersion::ModSeq(100))
+            );
+        }
+        engine.detach(&id).await.expect("detach");
+    }
+
+    #[test]
+    fn duplicate_targets_cannot_silently_choose_different_preconditions() {
+        assert!(
+            BulkTargets::versioned(vec![
+                bifrost_types::MailMutationTarget {
+                    id: ObjectId("one".into()),
+                    expected_version: None
+                },
+                bifrost_types::MailMutationTarget {
+                    id: ObjectId("one".into()),
+                    expected_version: Some(bifrost_types::ServerVersion::ModSeq(100))
+                },
+            ])
+            .is_err()
+        );
     }
 
     #[tokio::test]

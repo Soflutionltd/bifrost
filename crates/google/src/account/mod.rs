@@ -1194,6 +1194,17 @@ impl Account for GoogleAccount {
         )
     }
 
+    fn event_delete_if_version(
+        &self,
+        event: EventId,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        self.shutdown_future(
+            AccountOperation::EventDelete,
+            calendar::delete_if_version(Arc::clone(&self.client), event, expected_version),
+        )
+    }
+
     fn event_rsvp(
         &self,
         event: EventId,
@@ -1206,6 +1217,24 @@ impl Account for GoogleAccount {
                 self.profile.email_address.clone(),
                 event,
                 status,
+            ),
+        )
+    }
+
+    fn event_rsvp_if_version(
+        &self,
+        event: EventId,
+        status: RsvpStatus,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        self.shutdown_future(
+            AccountOperation::EventRsvp,
+            calendar::rsvp_if_version(
+                Arc::clone(&self.client),
+                self.profile.email_address.clone(),
+                event,
+                status,
+                expected_version,
             ),
         )
     }

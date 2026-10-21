@@ -51,8 +51,58 @@ pub(crate) fn bulk_destroy(
     mutation_stream(account, targets, MutationKind::Destroy)
 }
 
+pub(crate) fn bulk_set_flags_if_version(
+    account: ImapAccount,
+    targets: AccountStream<bifrost_types::MailMutationTarget>,
+    op: FlagOp,
+    key: IdempotencyKey,
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+    bifrost_types::mutation::versioned_mail_stream(targets, move |target| {
+        let Some(version) = target.expected_version else {
+            return bulk_set_flags(
+                account.clone(),
+                Box::pin(futures::stream::iter([target.id])),
+                op.clone(),
+                key.clone(),
+            );
+        };
+        let kind = match version {
+            bifrost_types::ServerVersion::ModSeq(modseq)
+                if modseq > 0 && single_store_flag_op(&op) =>
+            {
+                MutationKind::ConditionalFlags(op.clone(), modseq)
+            }
+            _ => {
+                return bifrost_types::mutation::refused_mail_target(
+                    target.id,
+                    AccountError::unsupported(AccountOperation::UpdateFlags, Protocol::Imap),
+                );
+            }
+        };
+        if let Err(error) = op.validate_for_account(Protocol::Imap) {
+            return bifrost_types::mutation::refused_mail_target(target.id, error);
+        }
+        mutation_stream(
+            account.clone(),
+            Box::pin(futures::stream::iter([target.id])),
+            kind,
+        )
+    })
+}
+
+// Two-sided PATCH needs two STOREs; the second cannot reuse the caller's
+// MODSEQ after our first write, so it has no atomic caller-version guarantee.
+fn single_store_flag_op(op: &FlagOp) -> bool {
+    match op {
+        FlagOp::Add(_) | FlagOp::Remove(_) | FlagOp::Set(_) => true,
+        FlagOp::Patch { add, remove } => add.is_empty() != remove.is_empty(),
+        _ => false,
+    }
+}
+
 pub(super) enum MutationKind {
     Flags(FlagOp),
+    ConditionalFlags(FlagOp, u64),
     Move(MembershipScope),
     Destroy,
 }
@@ -79,7 +129,9 @@ fn stream_terminating(err: &AccountError) -> bool {
 
 fn mutation_operation(kind: &MutationKind) -> AccountOperation {
     match kind {
-        MutationKind::Flags(_) => AccountOperation::UpdateFlags,
+        MutationKind::Flags(_) | MutationKind::ConditionalFlags(_, _) => {
+            AccountOperation::UpdateFlags
+        }
         MutationKind::Move(_) => AccountOperation::BulkMove,
         MutationKind::Destroy => AccountOperation::BulkDestroy,
     }
@@ -345,7 +397,7 @@ struct FolderOpenFailure {
 async fn open_folder_for_mutation(
     account: &ImapAccount,
     folder: &MailboxName,
-) -> Result<(super::PooledConn, u32, u64), FolderOpenFailure> {
+) -> Result<(super::PooledConn, u32, u64, bool), FolderOpenFailure> {
     let mut conn = account
         .checkout_for_folder(folder)
         .await
@@ -373,7 +425,8 @@ async fn open_folder_for_mutation(
                 .saturating_sub(previous_bytes_in),
             error,
         })?;
-    Ok((conn, uidvalidity, previous_bytes_in))
+    let has_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
+    Ok((conn, uidvalidity, previous_bytes_in, has_modseq))
 }
 
 async fn run_folder_mutation(
@@ -383,7 +436,7 @@ async fn run_folder_mutation(
     kind: &MutationKind,
     move_destination: Option<&MailboxName>,
 ) -> Result<(Vec<ItemOutcome<MutationSuccess>>, u64), FolderMutationFailure> {
-    let (conn, uidvalidity, previous_bytes_in) =
+    let (conn, uidvalidity, previous_bytes_in, has_modseq) =
         match open_folder_for_mutation(account, folder).await {
             Ok(opened) => opened,
             Err(FolderOpenFailure { error, bytes_in }) => {
@@ -399,10 +452,29 @@ async fn run_folder_mutation(
         stale,
         uidvalidity_changed_error(mutation_operation(kind), folder),
     );
-    if let MutationKind::Flags(op) = kind {
+    if matches!(kind, MutationKind::ConditionalFlags(_, _)) && !has_modseq {
         let mut results = stale_results;
-        results
-            .extend(run_flag_mutation_groups(account, &conn, folder, uidvalidity, valid, op).await);
+        results.extend(failed_all(
+            valid,
+            AccountError::unsupported(AccountOperation::UpdateFlags, Protocol::Imap),
+        ));
+        return Ok((
+            results,
+            conn.connection()
+                .bytes_in()
+                .saturating_sub(previous_bytes_in),
+        ));
+    }
+    if let MutationKind::Flags(op) | MutationKind::ConditionalFlags(op, _) = kind {
+        let expected = match kind {
+            MutationKind::ConditionalFlags(_, modseq) => Some(*modseq),
+            _ => None,
+        };
+        let mut results = stale_results;
+        results.extend(
+            run_flag_mutation_groups(account, &conn, folder, uidvalidity, valid, op, expected)
+                .await,
+        );
         let bytes_in = conn
             .connection()
             .bytes_in()
@@ -430,7 +502,9 @@ async fn run_folder_mutation(
     let outcome = match wire_set {
         None => None,
         Some(uid_set) => Some(match kind {
-            MutationKind::Flags(_) => unreachable!("flags handled above"),
+            MutationKind::Flags(_) | MutationKind::ConditionalFlags(_, _) => {
+                unreachable!("flags handled above")
+            }
             MutationKind::Move(_) => {
                 let destination =
                     move_destination.expect("bulk-move destination validated before folder loop");
@@ -585,9 +659,15 @@ async fn run_flag_mutation_groups(
     uidvalidity: u32,
     ids: Vec<DecodedObjectId>,
     op: &FlagOp,
+    expected: Option<u64>,
 ) -> Vec<ItemOutcome<MutationSuccess>> {
     let mut results = Vec::new();
-    for (unchanged_since, ids) in partition_by_modseq(account, folder, uidvalidity, ids) {
+    // A caller guard must never be advanced from a push, SELECT or read cache.
+    let groups = match expected {
+        Some(modseq) => vec![(Some(modseq), ids)],
+        None => partition_by_modseq(account, folder, uidvalidity, ids),
+    };
+    for (unchanged_since, ids) in groups {
         let target_batch = TargetBatch::new(ids);
         let uids: Vec<u32> = target_batch.uids().to_vec();
         let Some(uid_set) = target_batch.uid_set().cloned() else {

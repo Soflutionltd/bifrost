@@ -46,10 +46,14 @@ pub(crate) fn caldav_capabilities(event_rsvp: bool) -> AccountCapabilities {
         push: PushCapability::None,
         mutation: MutationCapabilities {
             concurrency: MutationConcurrency::ExpectedVersion {
+                mail_set_flags: false,
+                mail_move: false,
+                mail_destroy: false,
                 contact_update: false,
                 event_update: true,
                 contact_delete: false,
                 event_delete: true,
+                event_rsvp: false,
             },
             replay_safety: MutationReplaySafety::None,
         },

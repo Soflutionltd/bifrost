@@ -418,6 +418,16 @@ impl GmailClient {
         method: &str,
         body: Option<&B>,
     ) -> Result<Response> {
+        self.execute_if_match(url, method, body, None).await
+    }
+
+    pub(crate) async fn execute_if_match<B: Serialize>(
+        &self,
+        url: &str,
+        method: &str,
+        body: Option<&B>,
+        expected: Option<&str>,
+    ) -> Result<Response> {
         // This shared Gmail/People/Calendar funnel has no AccountOperation.
         // POST covers both reads/actions and creates; operation labels cannot
         // be recovered from the HTTP verb. Keep the conservative wire default
@@ -456,6 +466,9 @@ impl GmailClient {
             builder = builder.json(b);
         }
 
+        if let Some(expected) = expected {
+            builder = builder.header("If-Match", expected);
+        }
         self.send_recorded(builder, self.surface_for_url(url)).await
     }
 
@@ -650,7 +663,7 @@ pub(crate) async fn parse_json_response<T: DeserializeOwned>(
     })
 }
 
-async fn check_response_status(response: Response, _service: &str) -> Result<()> {
+pub(crate) async fn check_response_status(response: Response, _service: &str) -> Result<()> {
     let status = response.status();
     if status.is_success() {
         return Ok(());

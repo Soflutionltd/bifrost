@@ -658,7 +658,7 @@ local overflow beyond the global caller limit. A skipped gateway uses
 
 ## Caller mutation preconditions
 
-A supplied shared patch `expected_version` must either reach a native atomic
+A supplied shared patch or bulk target `expected_version` must either reach a native atomic
 precondition or be refused with `Unsupported(operation)` before I/O. Unsupported
 token kinds, weak DAV validators and multi-request relocations that cannot keep
 the guard use that refusal, never a blind write. A server precondition rejection

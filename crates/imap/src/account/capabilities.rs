@@ -34,6 +34,7 @@ pub(crate) fn build_capabilities(
             || super::folder_registry::leaf_name(folder.name.as_str(), folder.delimiter)
                 .eq_ignore_ascii_case("drafts")
     });
+    let mail_set_flags = profile.supports_condstore();
     let can_expunge_by_uid = profile.supports(Capability::UidPlus);
     let has_thread_references = profile.capabilities.iter().any(
         |cap| matches!(cap, Capability::Thread(alg) if alg.eq_ignore_ascii_case("REFERENCES")),
@@ -88,12 +89,21 @@ pub(crate) fn build_capabilities(
             PushCapability::None
         },
         mutation: MutationCapabilities {
-            concurrency: if contact_update || event_update || contact_delete || event_delete {
+            concurrency: if mail_set_flags
+                || contact_update
+                || event_update
+                || contact_delete
+                || event_delete
+            {
                 MutationConcurrency::ExpectedVersion {
+                    mail_set_flags,
+                    mail_move: false,
+                    mail_destroy: false,
                     contact_update,
                     event_update,
                     contact_delete,
                     event_delete,
+                    event_rsvp: false,
                 }
             } else {
                 MutationConcurrency::None
@@ -218,17 +228,25 @@ mod tests {
         {
             let mut contacts = crate::account::test_support::stub_capabilities();
             contacts.mutation.concurrency = MutationConcurrency::ExpectedVersion {
+                mail_set_flags: false,
+                mail_move: false,
+                mail_destroy: false,
                 contact_update: false,
                 event_update: false,
                 contact_delete,
                 event_delete: true,
+                event_rsvp: false,
             };
             let mut calendars = crate::account::test_support::stub_capabilities();
             calendars.mutation.concurrency = MutationConcurrency::ExpectedVersion {
+                mail_set_flags: false,
+                mail_move: false,
+                mail_destroy: false,
                 contact_update: false,
                 event_update: false,
                 contact_delete: true,
                 event_delete,
+                event_rsvp: false,
             };
             let caps = build_capabilities(
                 &profile,
@@ -241,10 +259,14 @@ mod tests {
             );
             let expected = if contact_delete || event_delete {
                 MutationConcurrency::ExpectedVersion {
+                    mail_set_flags: false,
+                    mail_move: false,
+                    mail_destroy: false,
                     contact_update: false,
                     event_update: false,
                     contact_delete,
                     event_delete,
+                    event_rsvp: false,
                 }
             } else {
                 MutationConcurrency::None
@@ -259,17 +281,25 @@ mod tests {
         for (contact_update, event_update) in [(true, false), (false, true), (true, true)] {
             let mut contacts = crate::account::test_support::stub_capabilities();
             contacts.mutation.concurrency = MutationConcurrency::ExpectedVersion {
+                mail_set_flags: false,
+                mail_move: false,
+                mail_destroy: false,
                 contact_update,
                 event_update: false,
                 contact_delete: false,
                 event_delete: false,
+                event_rsvp: false,
             };
             let mut calendars = crate::account::test_support::stub_capabilities();
             calendars.mutation.concurrency = MutationConcurrency::ExpectedVersion {
+                mail_set_flags: false,
+                mail_move: false,
+                mail_destroy: false,
                 contact_update: false,
                 event_update,
                 contact_delete: false,
                 event_delete: false,
+                event_rsvp: false,
             };
             let caps = build_capabilities(
                 &profile,
@@ -283,10 +313,14 @@ mod tests {
             assert_eq!(
                 caps.mutation.concurrency,
                 MutationConcurrency::ExpectedVersion {
+                    mail_set_flags: false,
+                    mail_move: false,
+                    mail_destroy: false,
                     contact_update,
                     event_update,
                     contact_delete: false,
                     event_delete: false,
+                    event_rsvp: false,
                 }
             );
         }
@@ -302,7 +336,19 @@ mod tests {
         assert_eq!(caps.cursor_freshness, CursorFreshness::Hybrid);
         assert_eq!(caps.blob_range, BlobRangeSupport::No);
         assert_eq!(caps.push, PushCapability::InProcess);
-        assert_eq!(caps.mutation.concurrency, MutationConcurrency::None);
+        assert_eq!(
+            caps.mutation.concurrency,
+            MutationConcurrency::ExpectedVersion {
+                mail_set_flags: true,
+                mail_move: false,
+                mail_destroy: false,
+                contact_update: false,
+                event_update: false,
+                contact_delete: false,
+                event_delete: false,
+                event_rsvp: false,
+            }
+        );
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
         assert_eq!(caps.filter_rule_shape, FilterRuleShape::None);
         assert!(!caps.pim_methods.filters_list);

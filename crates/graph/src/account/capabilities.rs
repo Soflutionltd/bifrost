@@ -40,10 +40,14 @@ pub(crate) fn build_capabilities(
         },
         mutation: MutationCapabilities {
             concurrency: MutationConcurrency::ExpectedVersion {
+                mail_set_flags: true,
+                mail_move: false,
+                mail_destroy: false,
                 contact_update: true,
                 event_update: true,
                 contact_delete: true,
                 event_delete: true,
+                event_rsvp: false,
             },
             replay_safety: MutationReplaySafety::None,
         },
@@ -190,10 +194,14 @@ mod tests {
         assert_eq!(
             caps.mutation.concurrency,
             MutationConcurrency::ExpectedVersion {
+                mail_set_flags: true,
+                mail_move: false,
+                mail_destroy: false,
                 contact_update: true,
                 event_update: true,
                 contact_delete: true,
                 event_delete: true,
+                event_rsvp: false,
             }
         );
         assert_eq!(caps.batching_policy.max_items, 20);

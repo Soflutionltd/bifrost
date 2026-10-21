@@ -404,9 +404,9 @@ awaits session cleanup rather than dropping the multi-request future.
 - `push: PushCapability::OutOfProcessPubsub`. Push lives on Cloud Pub/Sub, not a
   connection bifrost owns; `push_in_process()` is false and consumers wire their
   own subscriber feeding `InvalidationSink`.
-- `mutation.concurrency: MutationConcurrency::None`. No
-  optimistic-concurrency primitive on `batchModify`; the engine's
-  read-back guard is the lost-update safety net.
+- `mutation.concurrency: ExpectedVersion` enables event update, delete and RSVP
+  only. Gmail `batchModify` has no conditional history-ID primitive; versioned
+  bulk mail refuses supplied tokens before I/O.
 - `mutation.replay_safety: MutationReplaySafety::None`. No client-mintable
   dedup token; the shared `IdempotencyKey` is held engine-side.
 - `batching_policy: BatchingPolicy { max_items: 1000, max_wait:
@@ -794,14 +794,13 @@ Create and update attendee payloads accept only Google's `accepted`,
 `Unsupported(EventCreate | EventUpdate)` before any request; an update checks
 them before moving the event so it cannot strand the event after the move.
 
-Calendar mutations advertise `MutationConcurrency::None` and write blind:
-`event_update`/`event_delete`/`event_rsvp` send PATCH/DELETE without
-`If-Match`, so the read `GoogleEvent.etag` does not guard the write.
-`event_rsvp` reads the event, mutates one attendee's `responseStatus`, and
-writes the whole attendee array back, so a concurrent attendee edit between
-read and write is clobbered (a lost-update window). This matches the
-no-optimistic-concurrency posture; the engine's read-back guard is the
-safety net, and wiring `If-Match` is a deferred concurrency-model decision.
+Calendar event updates and `event_delete_if_version` accept caller ETags via
+`If-Match`. A stale token maps to `ConcurrencyConflict`; unsupported token
+kinds and versioned relocations are refused before I/O. No-version event
+writes keep their previous behavior. `event_rsvp_if_version` reads the attendee array but preserves the caller's
+ETag on the resulting PATCH, even if the GET returns a newer tag. A stale
+caller therefore conflicts. Ordinary `event_rsvp` keeps its existing
+unconditional behavior and lost-update window.
 
 ## Cursor envelope
 
@@ -1688,9 +1687,9 @@ already changed the message.
 - Only `CursorScope::Account`; non-Account scopes return `Unsupported`.
 - No blob range (`BlobRangeSupport::No`); push requires a consumer-supplied
   Pub/Sub topic (`with_pubsub_config`), else `push_subscribe` is `Unsupported`.
-- `historyId` expiry is reactive (no advertised TTL); mutation concurrency and
-  replay safety are `None` (no `If-Match`, no dedup header on `batchModify`,
-  calendar writes blind) - the read-back-after-retry path is the safety net.
+- `historyId` expiry is reactive (no advertised TTL). Gmail mail concurrency
+  and replay safety remain unavailable. Calendar update/delete/RSVP support caller
+  ETags; other no-version writes retain their existing behavior.
 - No independent message attachment-upload primitive (callers send inline bytes;
   over-limit attachments go through `host_attachment` -> Drive); flat labels, so
   `container_move` is unsupported; no storage-quota bytes, so `quota_get` is
@@ -1773,13 +1772,19 @@ default-method refusals.
 
 ## Caller versions on contact and event updates
 
-The shared `ContactPatch` and `EventPatch` carry optional `expected_version`.
-These update doors currently refuse supplied versions as `Unsupported` before
-I/O. `MutationConcurrency::None` remains accurate. Native Calendar If-Match and
-People etag wiring need separate implementation; Gmail history IDs are not a
-conditional batchModify primitive. No token is silently ignored.
+`EventPatch.expected_version`, `event_delete_if_version` and
+`event_rsvp_if_version` enforce caller ETags through Calendar's native `If-Match` support. Compound relocations and
+empty versioned event patches are refused. There is no refresh-and-retry of
+a rejected caller token. Native contract:
+https://developers.google.com/workspace/calendar/api/guides/version-resources
 
-The inherited `contact_delete_if_version` and `event_delete_if_version` doors
-likewise refuse a supplied version as `Unsupported` before I/O. With no version
-they delegate to the provider's ordinary delete implementation. No conditional
-delete guarantee is advertised.
+`ContactPatch.expected_version` and `contact_delete_if_version` still refuse
+supplied versions before I/O. People field updates currently fetch a Person
+and use its provider-observed ETag, which is not the caller's precondition;
+photos use separate actions. A source-ETag design must account for People's
+`person.metadata.sources.etag` requirement before advertising contact update:
+https://developers.google.com/people/api/rest/v1/people/updateContact
+
+Gmail history IDs cannot condition `batchModify` or `batchDelete`; inherited
+versioned bulk methods refuse supplied mail versions per target and send only
+unversioned targets through the ordinary mail implementation.

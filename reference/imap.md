@@ -1065,8 +1065,9 @@ A failed dial or SELECT backs off from 5s, doubling to a 300s ceiling, and reset
 
 Mutation preparation uses a plain read-write SELECT with no QRESYNC baseline:
 it needs the live UIDVALIDITY, not all changes since the last sync. It neither
-replays VANISHED history nor warms the MODSEQ cache from that SELECT. Existing
-cached MODSEQs remain the opportunistic STORE guards. MODIFIED response sets
+replays VANISHED history nor warms the MODSEQ cache from that SELECT. Absent a caller version, existing
+cached MODSEQs remain opportunistic STORE guards. They can advance through push
+or reads ahead of the consumer; they are not caller-version protection. MODIFIED response sets
 stay compact; per-item classification tests only the submitted UIDs for
 membership, even when the server names a very broad range. Because MODIFIED
 does not include the mailbox maximum or preserve endpoint order, any `*` bound
@@ -1180,6 +1181,16 @@ The shared `ContactPatch` and `EventPatch` carry optional `expected_version`.
 The composed DAV legs forward these patches intact and advertise their
 `ExpectedVersion` update and conditional delete capabilities when present.
 `contact_delete_if_version` and `event_delete_if_version` delegate to the
-composed account with the caller version unchanged. IMAP mail still advertises
-no caller-version guarantee: bulk targets carry no expected MODSEQ yet, and
-existing cached MODSEQ guards remain opportunistic.
+composed account with the caller version unchanged.
+
+`bulk_set_flags_if_version` accepts `MailMutationTarget` with a positive
+`ServerVersion::ModSeq`. `UNCHANGEDSINCE` comes directly from that target,
+regardless of the MODSEQ cache. A `MODIFIED` rejection is a per-target
+`ConcurrencyConflict`. Mail flag concurrency is advertised when CONDSTORE is
+supported (including QRESYNC implication); a selected NOMODSEQ mailbox is
+refused before STORE. Two-sided `FlagOp::Patch` is refused with a version:
+its second STORE cannot reuse the caller MODSEQ after the first write, and
+sending it unguarded would lose the atomic guarantee. MOVE and destroy likewise
+refuse caller versions because their complete operation has no atomic MODSEQ
+precondition. No-version operations retain the cached guards and existing
+compound behavior.

@@ -627,8 +627,13 @@ Reopen is engine-delegated: on drop or `close()`, the engine calls `JmapAccountF
 
 - `cursor_freshness: ServerIssued`; `blob_range: No`; `blob_digest_pre_download: false`.
 - `push: InProcess` when the session advertises `urn:ietf:params:jmap:websocket` with `supportsPush: true`, else `None`.
-- `mutation.concurrency: None` (no caller-version guarantee; provider-observed
-  `ifInState` protects the whole-property replacements `FlagOp::Set` and `bulk_move`; dotted keyword and mailbox-membership patches plus destroy omit the account-wide precondition so unrelated Email changes do not reject them); `mutation.replay_safety: None`.
+- `mutation.concurrency: ExpectedVersion` enables mail flags, move and destroy.
+  Versioned bulk mail accepts caller `StateAt` and sends it as `ifInState` on
+  the owning account's `Email/set`. The first `stateMismatch` is a per-target
+  conflict, without a state probe or refresh/retry. With no caller token,
+  provider-observed `ifInState` still protects whole-property replacements
+  `FlagOp::Set` and `bulk_move`; dotted patches and destroy omit that guard.
+  `mutation.replay_safety: None`.
 - `batching_policy`: `max_items = core.maxObjectsInSet` clamped `[1,500]`, `max_wait: 100ms`, `flush_on_input_close: true`.
 - `rate_limit_class: Generous`; `quota_signal: None` (quota via `quota_get`); `requires_uidvalidity_recheck: false`; `historyid_/delta_token_expires_after: None`; `discovers_foreign_namespaces_on_rediscovery: true` unconditionally, because shared-account scopes are discovered from the session at open, there is no foreign scope-lifecycle stream, and no session signal can prove a server will never grant a share (the accounts list is only the current grants; RFC 9670 principals support is sufficient but not necessary evidence of sharing).
 - `pim_methods` advertises mailbox membership add/remove, keyword/read-state mutation, `set_importance`, attachment upload, draft lifecycle, search, mailbox CRUD, identity list/update (Submission), vacation get/set (VacationResponse), quota get (Quota), and thread/message hydration. `scheduled_send` is true iff the selected submission account's `accountCapabilities` block is PRESENT, parseable, and advertises `maxDelayedSend > 0` (onto `PimSupport.max_delayed_send` for boundary validation). The session-level Submission object is an empty support marker. A malformed account-level Submission block does not degrade to `maxDelayedSend = 0`: `SubmissionCapabilities` is not `#[serde(default)]` at the container level, so a block omitting the mandatory RFC 8621 s1.3.2 `maxDelayedSend` fails to parse and lands in the malformed lane, where the family gate takes the whole submission family (send, drafts send, identities, `scheduled_send`) off with a named warning. A well-formed block advertising `maxDelayedSend: 0` is a different server and keeps the family, with only `scheduled_send` false. Gmail labels, Graph categories/extended properties are false.
@@ -1125,8 +1130,16 @@ arrived) and, unless its primary cause already is one, the typed
   where the wire failed, so the central mapping picks `Retry::SameRequest`
   for idempotent ops and `Reconcile` for non-idempotent ops caught mid-flight. With
   neither, the fallback is `Transport(Network)` with no attempt cause.
+- A handshake routed through a proxy CONNECT tunnel keeps net's typed
+  `TunnelError` in the source chain, and it is classified before the generic
+  handshake mapping: a 407 -> `Authentication(ReauthorizationRequired)`
+  (`AuthLost`), with support detail naming the proxy as the credential owner,
+  because the shared taxonomy has no proxy-specific credential kind; TLS to the
+  proxy -> `Transport(Tls)`, retried as the same unsent request; any other
+  CONNECT refusal -> `Server(Error { status })`, so recovery follows the status.
 - WebSocket errors split by handshake position: `WebSocketHandshake`
-  (pre-handshake) -> `Transport(Network)` + `Attempt(Unsent)`;
+  (pre-handshake, no typed tunnel source) -> `Transport(Network)` +
+  `Attempt(Unsent)`;
   `WebSocketRuntime` (post-handshake read side) and `WebSocketClosed` ->
   `Protocol(PartialResponse)` + `Attempt(Acknowledged)`. `WebSocketSend` (every
   sink write) -> `Transport(Network)` with `Attempt(Unsent)` for
@@ -1386,10 +1399,17 @@ default-method refusals.
 
 The shared `ContactPatch` and `EventPatch` carry optional `expected_version`.
 These update doors currently refuse supplied versions as `Unsupported` before
-I/O. Their native `ifInState` wiring remains to be implemented. Capabilities advertise `None`; the existing provider-observed bulk-mail guards
-are not a caller-version guarantee.
+I/O. Their native `ifInState` wiring remains to be implemented. Only the mail
+flags/move/destroy doors advertise caller-version enforcement.
 
 The inherited `contact_delete_if_version` and `event_delete_if_version` doors
 likewise refuse a supplied version as `Unsupported` before I/O. With no version
 they delegate to the provider's ordinary delete implementation. No conditional
 delete guarantee is advertised.
+
+The bulk caller-state contract follows RFC 8620 Section 5.3:
+https://www.rfc-editor.org/rfc/rfc8620.html#section-5.3
+An Email state belongs to one account, not one message. Each caller target is
+submitted independently; if several targets carry one old state, an earlier
+successful write can make later targets conflict. No automatic token advance
+is allowed on the caller's behalf.

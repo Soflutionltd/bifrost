@@ -195,6 +195,10 @@ pub type UnsubscribeErrorHook =
 /// `Unsupported` or an empty stream.
 pub struct StubAccount {
     pub caps: AccountCapabilities,
+    /// Optional failure returned by the caller-version flag door.
+    pub versioned_flags_error: Option<AccountError>,
+    /// Targets delivered to that door, including their original tokens.
+    pub versioned_flags_seen: Arc<Mutex<Vec<bifrost_types::MailMutationTarget>>>,
     /// Scopes yielded by `discover_cursor_scopes`.
     pub scopes: Vec<CursorScope>,
     /// How `establish_initial_cursor` answers. Default: `Ready` with a fresh
@@ -458,6 +462,8 @@ impl StubAccount {
             scopes,
             establishment: |scope| CursorEstablishment::Ready(cursor_for(scope, b"stub-ready")),
             partitioning: InventoryPartitioning::Full,
+            versioned_flags_error: None,
+            versioned_flags_seen: Arc::new(Mutex::new(Vec::new())),
             partition_hook: None,
             inventory_hook: None,
             resume_inventory: false,
@@ -865,6 +871,36 @@ impl Account for StubAccount {
         _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         Box::pin(stream::empty())
+    }
+
+    fn bulk_set_flags_if_version(
+        self: Arc<Self>,
+        targets: AccountStream<bifrost_types::MailMutationTarget>,
+        op: FlagOp,
+        key: IdempotencyKey,
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+        bifrost_types::mutation::versioned_mail_stream(targets, move |target| {
+            self.versioned_flags_seen
+                .lock()
+                .unwrap()
+                .push(target.clone());
+            if target.expected_version.is_some() {
+                return bifrost_types::mutation::refused_mail_target(
+                    target.id,
+                    self.versioned_flags_error.clone().unwrap_or_else(|| {
+                        AccountError::unsupported(
+                            bifrost_types::AccountOperation::UpdateFlags,
+                            self.protocol(),
+                        )
+                    }),
+                );
+            }
+            self.bulk_set_flags(
+                Box::pin(futures::stream::iter([target.id])),
+                op.clone(),
+                key.clone(),
+            )
+        })
     }
 
     fn bulk_move(

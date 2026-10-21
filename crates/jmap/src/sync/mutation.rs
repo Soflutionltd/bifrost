@@ -98,7 +98,72 @@ pub(crate) fn destroy<T: HttpTransport>(
     )
 }
 
-enum MutationKind {
+pub(super) fn versioned_stream<T: HttpTransport>(
+    mail: MailAccount<T>,
+    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
+    limits: CoreLimits,
+    email_states: StateMap,
+    targets: AccountStream<bifrost_types::MailMutationTarget>,
+    kind: MutationKind,
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+    bifrost_types::mutation::versioned_mail_stream(targets, move |target| {
+        if let MutationKind::Flags(op) = &kind
+            && let Err(error) = op.validate_for_account(bifrost_types::Protocol::Jmap)
+        {
+            return bifrost_types::mutation::refused_mail_target(target.id, error);
+        }
+        let Some(version) = target.expected_version else {
+            return mutation_stream(
+                mail.clone(),
+                Arc::clone(&foreign_mail),
+                limits,
+                Arc::clone(&email_states),
+                Box::pin(futures::stream::iter([target.id])),
+                kind.clone(),
+            );
+        };
+        let expected = match version {
+            bifrost_types::ServerVersion::StateAt(state) if !state.is_empty() => state,
+            _ => {
+                return bifrost_types::mutation::refused_mail_target(
+                    target.id,
+                    bifrost_types::AccountError::unsupported(
+                        operation_for_kind(&kind),
+                        bifrost_types::Protocol::Jmap,
+                    ),
+                );
+            }
+        };
+        let account_id = account_id_for_target(&target.id, mail.id_str(), &foreign_mail);
+        if let Some(outcome) = destination_rejection(&kind, &target.id) {
+            return Box::pin(futures::stream::once(async move {
+                SyncEvent::Batch(Batch {
+                    items: vec![outcome],
+                    page_boundary: PageBoundary::Page,
+                    server_latency: std::time::Duration::ZERO,
+                    bytes_in: 0,
+                    checkpoint: None,
+                })
+            }));
+        }
+        let owner = mail_for_account(&mail, &foreign_mail, &account_id).clone();
+        let foreign = account_id != mail.id_str();
+        let states = Arc::clone(&email_states);
+        let kind = kind.clone();
+        Box::pin(async_stream::stream! {
+            let mut ids = vec![target.id];
+            match apply_batch_with_version(&owner, &states, &account_id, foreign, &kind, &mut ids, Some(&expected)).await {
+                Ok(Some(batch)) => yield SyncEvent::Batch(batch),
+                Ok(None) => {},
+                Err(error) => yield super::error::terminated(super::error::into_account_error(error,
+                    super::error::JmapErrorContext::new(operation_for_kind(&kind)))),
+            }
+        })
+    })
+}
+
+#[derive(Clone)]
+pub(super) enum MutationKind {
     Flags(FlagOp),
     Move(MailboxId),
     Destroy,
@@ -412,6 +477,27 @@ async fn apply_batch<T: HttpTransport>(
     kind: &MutationKind,
     batch: &mut Vec<ObjectId>,
 ) -> crate::Result<Option<Batch<ItemOutcome<MutationSuccess>>>> {
+    apply_batch_with_version(
+        mail,
+        email_states,
+        account_id,
+        foreign_account,
+        kind,
+        batch,
+        None,
+    )
+    .await
+}
+
+async fn apply_batch_with_version<T: HttpTransport>(
+    mail: &MailAccount<T>,
+    email_states: &StateMap,
+    account_id: &str,
+    foreign_account: bool,
+    kind: &MutationKind,
+    batch: &mut Vec<ObjectId>,
+    expected: Option<&str>,
+) -> crate::Result<Option<Batch<ItemOutcome<MutationSuccess>>>> {
     let started = Instant::now();
     let ids = std::mem::take(batch);
     if ids.is_empty() {
@@ -425,8 +511,10 @@ async fn apply_batch<T: HttpTransport>(
     // path report its real cost instead of only the last call's.
     let (mail, tally) = mail.metered();
     let mail = &mail;
-    let guarded = uses_if_in_state(kind);
-    let mut state = if guarded {
+    let guarded = expected.is_some() || uses_if_in_state(kind);
+    let mut state = if let Some(expected) = expected {
+        Some(expected.to_owned())
+    } else if guarded {
         Some(current_or_probe_state(mail, email_states, account_id).await?)
     } else {
         state_cache::get(email_states, account_id).await
@@ -436,6 +524,15 @@ async fn apply_batch<T: HttpTransport>(
     let mut response = match send_set(mail, if_in_state, &ids, kind, foreign_account).await {
         Ok(response) => response,
         Err(err) => {
+            if expected.is_some() && super::error::is_state_mismatch(&err) {
+                return Ok(Some(state_mismatch_failed_batch(
+                    err,
+                    kind,
+                    ids,
+                    started,
+                    tally.take(),
+                )));
+            }
             if !guarded || !super::error::is_state_mismatch(&err) {
                 return Err(err);
             }
@@ -960,6 +1057,110 @@ mod tests {
 
         assert_eq!(set_flags["ifInState"], serde_json::json!("state-7"));
         assert_eq!(move_message["ifInState"], serde_json::json!("state-7"));
+    }
+
+    #[derive(Clone)]
+    struct CallerStateTransport {
+        requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+
+    impl HttpTransport for CallerStateTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            self.requests.lock().unwrap().push(request.clone());
+            let call = &request["methodCalls"][0];
+            assert_eq!(
+                call[0], "Email/set",
+                "caller preconditions need no state probe"
+            );
+            assert_eq!(
+                call[1]["ifInState"], "caller-old",
+                "never substitute a newer cached state"
+            );
+            Ok(bytes::Bytes::from(
+                serde_json::json!({
+                    "sessionState": "session-1",
+                    "methodResponses": [["error", {"type": "stateMismatch"}, call[2]]]
+                })
+                .to_string(),
+            ))
+        }
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            unreachable!()
+        }
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            unreachable!()
+        }
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_state_conflicts_once_for_every_bulk_mail_door() {
+        for kind in [
+            MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
+            MutationKind::Flags(FlagOp::Set(flags(&["$seen"]))),
+            MutationKind::Move(MailboxId::new("archive")),
+            MutationKind::Destroy,
+        ] {
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            let (primary, foreign) = mutation_accounts(CallerStateTransport {
+                requests: Arc::clone(&requests),
+            });
+            let states = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+                "primary".into(),
+                Some("cache-new".into()),
+            )])));
+            let events = versioned_stream(
+                primary,
+                foreign,
+                CoreLimits {
+                    max_objects_in_get: 256,
+                    max_objects_in_set: 10,
+                },
+                states,
+                Box::pin(futures::stream::iter([bifrost_types::MailMutationTarget {
+                    id: ObjectId("m1".into()),
+                    expected_version: Some(bifrost_types::ServerVersion::StateAt(
+                        "caller-old".into(),
+                    )),
+                }])),
+                kind,
+            )
+            .collect::<Vec<_>>()
+            .await;
+            let [SyncEvent::Batch(batch), SyncEvent::Done(None)] = events.as_slice() else {
+                panic!("{events:?}");
+            };
+            let [ItemOutcome::Failed(failure)] = batch.items.as_slice() else {
+                panic!("{batch:?}");
+            };
+            assert_eq!(
+                failure.error.kind(),
+                &bifrost_types::AccountErrorKind::ConcurrencyConflict
+            );
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                1,
+                "a caller mismatch must never refresh and retry"
+            );
+        }
     }
 
     #[tokio::test]

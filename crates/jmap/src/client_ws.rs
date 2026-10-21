@@ -522,7 +522,11 @@ impl Client {
             .websocket_net()
             .connect_tunnel(&url)
             .await
-            .map_err(|e| crate::Error::WebSocketHandshake(e.into()))?;
+            .map_err(|error| {
+                // Keep the io::Error in tokio-websockets' source chain so
+                // the account boundary can inspect a typed proxy TunnelError.
+                crate::Error::WebSocketHandshake(tokio_websockets::Error::Io(error))
+            })?;
         let stream = connector
             .unwrap_or(Connector::Plain)
             .wrap(host, tcp)

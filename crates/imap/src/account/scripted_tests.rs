@@ -3226,3 +3226,73 @@ async fn mutation_select_omits_qresync_baseline_and_keeps_cached_store_guard() {
     assert_eq!(drain_mutation_batches(output).await, vec![vec![id(5, 2)]]);
     let _server = script.await.unwrap();
 }
+
+/// A cache that has advanced beyond the consumer cannot replace its guard.
+#[tokio::test]
+async fn caller_modseq_rejects_stale_flags_while_absent_keeps_cached_guard() {
+    use bifrost_types::{
+        Account, AccountErrorKind, FlagOp, ItemOutcome, MailMutationTarget, ServerVersion,
+        SyncEvent,
+    };
+    use futures::StreamExt;
+
+    for expected in [Some(100), None] {
+        let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 CONDSTORE")).await;
+        let account = scripted_sync_account(conn, 1, false, None, inbox_registry());
+        account
+            .folders
+            .get(&inbox())
+            .unwrap()
+            .record_modseq(5, 2, 900)
+            .unwrap();
+        let script = tokio::spawn(async move {
+            let select = read_line(&mut server).await;
+            respond(&mut server, &format!(
+                "{SELECT_PREAMBLE}* 1 EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 3] ok\r\n* OK [HIGHESTMODSEQ 900] ok\r\n{} OK [READ-WRITE] selected\r\n",
+                tag_of(&select))).await;
+            let store = read_line(&mut server).await;
+            assert!(
+                store.contains(&format!(
+                    "UID STORE 2 (UNCHANGEDSINCE {})",
+                    expected.unwrap_or(900)
+                )),
+                "{store}"
+            );
+            let status = if expected.is_some() {
+                "OK [MODIFIED 2] stale"
+            } else {
+                "OK stored"
+            };
+            respond(&mut server, &format!("{} {status}\r\n", tag_of(&store))).await;
+            server
+        });
+        let key = bifrost_types::IdempotencyKey {
+            run_id: bifrost_types::RunId("caller-version".into()),
+            sequence: 0,
+            protocol_salt: bifrost_types::ProtocolSalt::Imap,
+        };
+        let events = Arc::new(account)
+            .bulk_set_flags_if_version(
+                Box::pin(futures::stream::iter([MailMutationTarget {
+                    id: super::encode_object_id(&inbox(), 5, 2),
+                    expected_version: expected.map(ServerVersion::ModSeq),
+                }])),
+                FlagOp::Add(std::collections::HashSet::from(["$flagged".into()])),
+                key,
+            )
+            .collect::<Vec<_>>()
+            .await;
+        let [SyncEvent::Batch(batch), SyncEvent::Done(None)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(batch.items.len(), 1);
+        match (&batch.items[0], expected) {
+            (ItemOutcome::Failed(failure), Some(_)) => {
+                assert_eq!(failure.error.kind(), &AccountErrorKind::ConcurrencyConflict);
+            }
+            (ItemOutcome::Succeeded(_), None) => {}
+            other => panic!("unexpected result: {other:?}"),
+        }
+        let _server = script.await.unwrap();
+    }
+}

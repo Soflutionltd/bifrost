@@ -55,15 +55,15 @@ and carries peer-timeout state, and SMTP's also serves blocking I/O with
 runtime-independent admission, so they were kept with comments; collapsing them
 onto the shared stream needs those two behaviours to move into it.
 
-## SHARED-019 - JMAP flattens typed proxy tunnel errors into `Transport(Network)`
+## SHARED-019 - A proxy 407 maps to `AuthLost`, implying the wrong remedy
 
-Residue: net's `connect_tunnel` now carries a typed `TunnelError` source for
-proxy TLS failures, HTTP 407 and other non-2xx CONNECT answers. The JMAP
-WebSocket handshake wraps it in `crates/jmap/src/client_ws.rs` and
-`crates/jmap/src/sync/error.rs` flattens the handshake error to a string
-classified as `Transport(Network)`, so the account still cannot tell a proxy
-credential problem from a network drop. The account error model also has no
-proxy-auth kind; decide which existing kind a 407 maps to.
+Residue: JMAP now classifies net's typed `TunnelError` (407 ->
+`Authentication(ReauthorizationRequired)` / `AuthLost`, proxy TLS ->
+`Transport(Tls)`, other refusals by status). The error model has no
+proxy-credential kind, so a 407 asks the consumer to reauthorize the mail
+account when it is the proxy's credentials that are wrong; only support detail
+says so. Decide whether the taxonomy gains a proxy-credential kind or a
+different existing kind fits better.
 
 ## SHARED-017 - `MutationConcurrency::StateBased` has no producer left
 

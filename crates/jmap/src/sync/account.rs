@@ -756,6 +756,74 @@ impl Account for JmapAccount {
         )
     }
 
+    fn bulk_set_flags_if_version(
+        self: Arc<Self>,
+        targets: AccountStream<bifrost_types::MailMutationTarget>,
+        op: bifrost_types::FlagOp,
+        _key: IdempotencyKey,
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+        mutation::versioned_stream(
+            self.mail.clone(),
+            Arc::clone(&self.foreign_mail),
+            self.core_limits,
+            Arc::clone(&self.email_states),
+            targets,
+            mutation::MutationKind::Flags(op),
+        )
+    }
+
+    fn bulk_move_if_version(
+        self: Arc<Self>,
+        targets: AccountStream<bifrost_types::MailMutationTarget>,
+        destination: MembershipScope,
+        _key: IdempotencyKey,
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+        let MembershipScope::Mailbox(mailbox) = destination else {
+            return bifrost_types::mutation::versioned_mail_stream(targets, |target| {
+                bifrost_types::mutation::refused_mail_target(
+                    target.id,
+                    bifrost_types::AccountError::unsupported(
+                        bifrost_types::AccountOperation::BulkMove,
+                        bifrost_types::Protocol::Jmap,
+                    ),
+                )
+            });
+        };
+        mutation::versioned_stream(
+            self.mail.clone(),
+            Arc::clone(&self.foreign_mail),
+            self.core_limits,
+            Arc::clone(&self.email_states),
+            targets,
+            mutation::MutationKind::Move(crate::mailbox::MailboxId::new(mailbox.0)),
+        )
+    }
+
+    fn bulk_destroy_if_version(
+        self: Arc<Self>,
+        targets: AccountStream<bifrost_types::MailMutationTarget>,
+        _key: IdempotencyKey,
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+        mutation::versioned_stream(
+            self.mail.clone(),
+            Arc::clone(&self.foreign_mail),
+            self.core_limits,
+            Arc::clone(&self.email_states),
+            targets,
+            mutation::MutationKind::Destroy,
+        )
+    }
+
+    fn bulk_move_from_if_version(
+        self: Arc<Self>,
+        targets: AccountStream<bifrost_types::MailMutationTarget>,
+        destination: MembershipScope,
+        _source: Option<MembershipScope>,
+        key: IdempotencyKey,
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+        self.bulk_move_if_version(targets, destination, key)
+    }
+
     fn bulk_move(
         &self,
         targets: AccountStream<ObjectId>,

@@ -44,7 +44,7 @@ follows:
 | cursor discovery, lifecycle, inventory, hydration stream, and changes | 12 |
 | push | 3 |
 | blob and raw-message reads | 3 |
-| streaming bulk mutation | 4 |
+| streaming bulk mutation | 8 |
 | mail mutation primitives | 8 |
 | compose, attachment, draft, and scheduled-send operations | 10 |
 | search | 2 |
@@ -52,7 +52,7 @@ follows:
 | settings | 5 |
 | filters | 5 |
 | contacts and directory | 10 |
-| calendar | 8 |
+| calendar | 9 |
 | typed thread and message hydration | 2 |
 | convenience operations | 11 |
 | close | 1 |
@@ -431,3 +431,35 @@ crates/types/src/
   page.rs             Page envelope + SkippedScope skip lane
   error/              structured error, recovery, batch, warning model
 ```
+
+## Caller versions on bulk mail
+
+`MailMutationTarget { id, expected_version }` carries an independent optional
+`ServerVersion` for each target. The `Account` methods
+`bulk_set_flags_if_version`, `bulk_move_if_version`,
+`bulk_move_from_if_version` and `bulk_destroy_if_version` take `self: Arc<Self>`
+and a stream of these targets, plus the same operation arguments and
+`IdempotencyKey` as their unversioned counterparts. Existing methods remain.
+The versioned methods submit targets independently with bounded memory and
+backpressure; callers that do not need preconditions can retain bulk batching
+through the existing methods. Each pulled target gets its own outcome, local
+refusals do not poison siblings, and a terminal error stops further admission.
+
+`MutationConcurrency::ExpectedVersion` names `mail_set_flags`, `mail_move` and
+`mail_destroy` separately from contact and event update/delete and event RSVP. A true door may
+still refuse a compound form that cannot preserve one native atomic guard.
+Unsupported version kinds are refused; a stale supported version is a
+`ConcurrencyConflict`. No supplied version is refreshed and retried silently.
+
+IMAP accepts caller MODSEQ for single-STORE flags. Graph accepts caller ETag for
+message PATCH. JMAP accepts caller account Email state for flags, move and
+destroy (`bulk_move_from_if_version` ignores `source`, as the unversioned
+JMAP move does); an unrelated account change can also
+reject that state. Google mail and the standalone DAV accounts refuse supplied
+bulk mail versions. An absent version uses the existing mutation behavior.
+
+`event_rsvp_if_version(event, status, expected_version)` defaults to local
+refusal for a supplied token and delegates to ordinary RSVP for `None`.
+Google Calendar enforces the caller ETag on its attendee PATCH. CalDAV RSVP
+sends a scheduling reply before a local resource PUT, so it cannot promise
+one atomic caller precondition for the whole operation and refuses tokens.

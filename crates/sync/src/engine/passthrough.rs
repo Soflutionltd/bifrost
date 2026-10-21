@@ -785,6 +785,15 @@ impl SyncEngine {
             .await?)
     }
 
+    /// Delete one calendar event. Forwards to [`Account::event_delete`].
+    pub async fn event_delete(
+        &self,
+        account_id: &AccountId,
+        event: bifrost_types::EventId,
+    ) -> Result<(), Error> {
+        Ok(self.live_account(account_id)?.event_delete(event).await?)
+    }
+
     /// Delete with the caller's optional version, forwarded unchanged.
     pub async fn event_delete_if_version(
         &self,
@@ -962,5 +971,40 @@ impl SyncEngine {
         account_id: &AccountId,
     ) -> Result<Option<bifrost_types::QuotaInfo>, Error> {
         Ok(self.live_account(account_id)?.quota_get().await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn event_delete_forwards_account_error() {
+        let account = Arc::new(crate::test_common::StubAccount::new(Vec::new()));
+        let engine = SyncEngine::builder().build().expect("engine");
+        let account_id = AccountId("event-delete".to_owned());
+        let factory = Arc::new(crate::test_common::StubFactory::queue(vec![Arc::clone(
+            &account,
+        )]));
+        engine
+            .attach(account_id.clone(), factory)
+            .await
+            .expect("attach");
+
+        let error = engine
+            .event_delete(&account_id, bifrost_types::EventId("event".to_owned()))
+            .await
+            .expect_err("stub event delete is unsupported");
+        let Error::Account(error) = error else {
+            panic!("expected the account error to be forwarded");
+        };
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(
+                bifrost_types::AccountOperation::EventDelete
+            )
+        );
+
+        engine.detach(&account_id).await.expect("detach");
     }
 }

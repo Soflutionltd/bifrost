@@ -71,6 +71,75 @@ impl ServerVersion {
     }
 }
 
+/// One bulk mail target and the version observed by its caller.
+/// `None` preserves the provider's ordinary mutation behavior.
+#[derive(Debug, Clone)]
+pub struct MailMutationTarget {
+    pub id: ObjectId,
+    pub expected_version: Option<ServerVersion>,
+}
+
+impl From<ObjectId> for MailMutationTarget {
+    fn from(id: ObjectId) -> Self {
+        Self {
+            id,
+            expected_version: None,
+        }
+    }
+}
+
+/// Compose per-target mutation streams, preserving backpressure and one final
+/// completion marker. Providers use this for independently guarded targets.
+pub fn versioned_mail_stream(
+    targets: crate::AccountStream<MailMutationTarget>,
+    apply: impl FnMut(
+        MailMutationTarget,
+    ) -> crate::AccountStream<
+        crate::SyncEvent<crate::ItemOutcome<crate::MutationSuccess>>,
+    > + Send
+    + 'static,
+) -> crate::AccountStream<crate::SyncEvent<crate::ItemOutcome<crate::MutationSuccess>>> {
+    use futures::StreamExt;
+    let flattened = targets.flat_map(apply);
+    // `Terminated` ends a stream, so no `Done` follows it: the completion
+    // marker is emitted only when every target ran to its own completion.
+    let events = futures::stream::unfold(Some(Box::pin(flattened)), |state| async move {
+        let mut stream = state?;
+        loop {
+            let Some(event) = stream.next().await else {
+                return Some((crate::SyncEvent::Done(None), None));
+            };
+            if matches!(event, crate::SyncEvent::Done(_)) {
+                continue;
+            }
+            if matches!(event, crate::SyncEvent::Terminated(_)) {
+                return Some((event, None));
+            }
+            return Some((event, Some(stream)));
+        }
+    });
+    Box::pin(events)
+}
+
+/// A local refusal correlated to a single bulk mail target.
+pub fn refused_mail_target(
+    id: ObjectId,
+    error: crate::AccountError,
+) -> crate::AccountStream<crate::SyncEvent<crate::ItemOutcome<crate::MutationSuccess>>> {
+    Box::pin(futures::stream::once(async move {
+        crate::SyncEvent::Batch(crate::Batch {
+            items: vec![crate::ItemOutcome::Failed(crate::BatchFailure::new(
+                crate::BatchItemId(id.0),
+                error,
+            ))],
+            page_boundary: crate::PageBoundary::Page,
+            server_latency: std::time::Duration::ZERO,
+            bytes_in: 0,
+            checkpoint: None,
+        })
+    }))
+}
+
 /// Cross-protocol inventory diff fingerprint. The consumer compares
 /// `local.fingerprint != server.fingerprint` to decide whether to
 /// refetch. `size` is `Option` because Graph does not expose message
@@ -419,5 +488,40 @@ mod tests {
             Err(FlagOpValidationError::ContradictoryPatch)
         );
         assert!(FlagOp::Set(HashSet::new()).validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod versioned_mail_tests {
+    use super::*;
+    use futures::{FutureExt, StreamExt};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn terminal_versioned_mutation_does_not_pull_the_next_target() {
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&pulled);
+        let targets = futures::stream::iter([ObjectId("first".into()), ObjectId("second".into())])
+            .inspect(move |_| {
+                count.fetch_add(1, Ordering::Relaxed);
+            })
+            .map(MailMutationTarget::from);
+        let events = versioned_mail_stream(Box::pin(targets), |_| {
+            Box::pin(futures::stream::once(async {
+                crate::SyncEvent::Terminated(crate::AccountError::unsupported(
+                    crate::AccountOperation::UpdateFlags,
+                    crate::Protocol::Imap,
+                ))
+            }))
+        })
+        .collect::<Vec<_>>()
+        .now_or_never()
+        .expect("in-memory streams are ready");
+        assert!(matches!(
+            events.as_slice(),
+            [crate::SyncEvent::Terminated(_)]
+        ));
+        assert_eq!(pulled.load(Ordering::Relaxed), 1);
     }
 }

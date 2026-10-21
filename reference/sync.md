@@ -3802,8 +3802,34 @@ Contact and event update patches forward optional `expected_version` intact to
 the account. `MutationConcurrency::ExpectedVersion` identifies the individual
 update and conditional delete doors that enforce it.
 `contact_delete_if_version` and `event_delete_if_version` forward the optional
-caller version unchanged. Their account defaults refuse a supplied version
+caller version unchanged. `event_delete` and `event_delete_if_version` are the
+only calendar primitives `SyncEngine` exposes; both resolve the current account
+handle and forward directly. Their account defaults refuse a supplied version
 before I/O and delegate an absent version to the ordinary delete door.
 `StateBased` retains its legacy meaning of
-provider-observed guards; it is not a caller-version promise. Bulk mutation
-inputs and the other delete methods do not yet carry caller versions.
+provider-observed guards; it is not a caller-version promise. Bulk mail
+mutations carry caller versions only through the campaigns below; the other
+delete methods do not yet carry them.
+
+## Caller-version mutation campaigns
+
+`bulk_set_flags_if_version`, `bulk_move_if_version`,
+`bulk_move_from_if_version` and `bulk_destroy_if_version` accept
+`Vec<MailMutationTarget>` with the same operation arguments, vendor and
+protocol as the ordinary campaigns. Caller versions stay frozen across
+cohorts, reopen/routing changes and retries. Conflicting versions for duplicate
+target IDs are refused before submission. A cohort without any versions uses
+the existing bulk path; a guarded cohort forwards each target's version to the
+Account versioned door.
+
+An explicit per-target `ConcurrencyConflict` for a caller-guarded target is
+counted as failed, retained in `MutationCounters::error`, and never replayed or
+converted to read-back success. Observing the requested state does not prove
+that the rejected caller precondition held. Other targets remain independent;
+a recorded caller conflict does not abort their admission. Ordinary campaigns
+retain their existing conflict/read-back policy.
+
+Read-back also cannot prove an uncertain guarded write passed its precondition.
+Guarded targets that exhaust safe retries or require read-back remain pending
+instead of being promoted to observed success; unversioned targets retain the
+ordinary read-back path.

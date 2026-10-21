@@ -610,6 +610,111 @@ pub trait Account: Send + Sync {
         key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>;
 
+    /// Per-target caller-version form of [`Self::bulk_set_flags`].
+    /// Supplied versions must be enforced atomically or refused per target.
+    /// Targets are submitted independently; the unversioned door retains batching.
+    fn bulk_set_flags_if_version(
+        self: Arc<Self>,
+        targets: AccountStream<crate::MailMutationTarget>,
+        op: FlagOp,
+        key: IdempotencyKey,
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>
+    where
+        Self: 'static,
+    {
+        crate::mutation::versioned_mail_stream(targets, move |target| {
+            if target.expected_version.is_some() {
+                return crate::mutation::refused_mail_target(
+                    target.id,
+                    AccountError::unsupported(AccountOperation::UpdateFlags, self.protocol()),
+                );
+            }
+            self.bulk_set_flags(
+                Box::pin(futures::stream::iter([target.id])),
+                op.clone(),
+                key.clone(),
+            )
+        })
+    }
+
+    /// Per-target caller-version form of [`Self::bulk_move`].
+    /// Supplied versions must be enforced atomically or refused per target.
+    /// Targets are submitted independently; the unversioned door retains batching.
+    fn bulk_move_if_version(
+        self: Arc<Self>,
+        targets: AccountStream<crate::MailMutationTarget>,
+        destination: MembershipScope,
+        key: IdempotencyKey,
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>
+    where
+        Self: 'static,
+    {
+        crate::mutation::versioned_mail_stream(targets, move |target| {
+            if target.expected_version.is_some() {
+                return crate::mutation::refused_mail_target(
+                    target.id,
+                    AccountError::unsupported(AccountOperation::BulkMove, self.protocol()),
+                );
+            }
+            self.bulk_move(
+                Box::pin(futures::stream::iter([target.id])),
+                destination.clone(),
+                key.clone(),
+            )
+        })
+    }
+
+    /// Per-target caller-version form of [`Self::bulk_move_from`].
+    /// Supplied versions must be enforced atomically or refused per target.
+    /// Targets are submitted independently; the unversioned door retains batching.
+    fn bulk_move_from_if_version(
+        self: Arc<Self>,
+        targets: AccountStream<crate::MailMutationTarget>,
+        destination: MembershipScope,
+        source: Option<MembershipScope>,
+        key: IdempotencyKey,
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>
+    where
+        Self: 'static,
+    {
+        crate::mutation::versioned_mail_stream(targets, move |target| {
+            if target.expected_version.is_some() {
+                return crate::mutation::refused_mail_target(
+                    target.id,
+                    AccountError::unsupported(AccountOperation::BulkMove, self.protocol()),
+                );
+            }
+            self.bulk_move_from(
+                Box::pin(futures::stream::iter([target.id])),
+                destination.clone(),
+                source.clone(),
+                key.clone(),
+            )
+        })
+    }
+
+    /// Per-target caller-version form of [`Self::bulk_destroy`].
+    /// Supplied versions must be enforced atomically or refused per target.
+    /// Targets are submitted independently; the unversioned door retains batching.
+    fn bulk_destroy_if_version(
+        self: Arc<Self>,
+        targets: AccountStream<crate::MailMutationTarget>,
+        key: IdempotencyKey,
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>
+    where
+        Self: 'static,
+    {
+        crate::mutation::versioned_mail_stream(targets, move |target| {
+            if target.expected_version.is_some() {
+                return crate::mutation::refused_mail_target(
+                    target.id,
+                    AccountError::unsupported(AccountOperation::BulkDestroy, self.protocol()),
+                );
+            }
+            self.bulk_destroy(Box::pin(futures::stream::iter([target.id])), key.clone())
+        })
+    }
+
     // ------------------------------------------------------------
     // Mail mutation primitives (S1-W1)
     //
@@ -1098,6 +1203,25 @@ pub trait Account: Send + Sync {
         event: EventId,
         status: RsvpStatus,
     ) -> AccountFuture<Result<(), AccountError>>;
+
+    /// Respond with a caller version, enforced atomically or refused before I/O.
+    fn event_rsvp_if_version(
+        &self,
+        event: EventId,
+        status: RsvpStatus,
+        expected_version: Option<crate::ServerVersion>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        if expected_version.is_some() {
+            let protocol = self.protocol();
+            return Box::pin(async move {
+                Err(AccountError::unsupported(
+                    AccountOperation::EventRsvp,
+                    protocol,
+                ))
+            });
+        }
+        self.event_rsvp(event, status)
+    }
 
     /// Provider-side event search.
     fn event_search(
