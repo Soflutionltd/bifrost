@@ -734,6 +734,24 @@ to the boundary wait without spending a retry attempt.
 
 ## Stream contract: broadcast + consumer ack
 
+### Object changes and inventory removals
+
+`ObjectChangeKind::Updated` is an upsert. An unknown id is a create;
+`Created` is an optional precision hint, and consumers must tolerate either
+kind for an existing or unknown id. The engine forwards live object kinds
+unchanged and keeps no object-existence index. Consumers hydrate and insert
+or refresh the object before acknowledging the batch.
+
+`InventoryBatch::removed` carries removals observed while walking inventory.
+Both `InventoryFusion` and `BackfillRunner` put them in the SAME synthetic
+change batch as the page entries and accepted checkpoint. Folder and
+folder-type scopes emit `ScopeChange::Removed` for that folder; query scopes
+remove query membership; account and type scopes emit `ObjectChange::Destroyed`.
+A scope removal does not assert global destruction. Consumers apply the whole
+batch, including removals, and its checkpoint in one transaction before acking.
+A barrier page still delivers removals, but carries no accepted checkpoint.
+Graph fills this lane from delta tombstones; other providers leave it empty.
+
 ### Batch boundary validation
 
 Before anything else, `drive_changes_stream` and `InventoryFusion::run_stream`
@@ -2680,7 +2698,7 @@ together, and the second's report overwrites the first's. Keying by `Checkpoint`
 VALUE is also unsound, because `Checkpoint: Eq` is value equality and never
 promised to identify a publication:
 
-- `BackfillRunner` counts only entries a page MATERIALIZED, so a page whose
+- `BackfillRunner` counts materialized entries and explicit removals, so a page whose
   content was entirely unrepresentable increments nothing, and with no progress
   marker the next `BackfillCheckpoint` is byte-identical to its predecessor while
   describing a different boundary and a different report;
@@ -2799,7 +2817,7 @@ waiters, so nothing wedges. Nothing durable is invented; the snapshot is not
 advanced. Pinned by
 `a_withheld_completion_sentinel_is_not_announced_durable`.
 
-Note `seen` counts only entries a page materialized, so an object that never
+Note `seen` counts materialized entries and explicit removals, so an object that never
 became an entry is not in that total - the count cannot be used to detect any of
 this.
 
@@ -3280,7 +3298,8 @@ sled / sqlite default; storage is consumer-owned.
 use the greatest parsed page upper bound, then lexicographically
 greatest opaque partition bytes, so equal-sized page windows resume
 deterministically from the furthest one. Page checkpoint
-`items_done` counts entries observed before `LiveSupersedes` filtering;
+`items_done` counts entries observed before `LiveSupersedes` filtering plus
+explicit removals;
 filtering therefore cannot make a full inventory window look short and
 falsely signal exhaustion.
 

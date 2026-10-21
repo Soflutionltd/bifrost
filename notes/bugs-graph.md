@@ -41,22 +41,3 @@ takes only an id. Real optimistic concurrency means threading the caller's etag
 (`ContactCard` / `CalendarEvent`) through the shared patch types and `Account`
 methods. The limit is documented in code and `reference/graph.md`.
 
-## GRAPH-011 - Two delta observations that need an engine contract
-
-**Ruled (owner, 2026-10-21):** (a) document in `reference/sync.md` that
-`Updated` is an upsert (an unknown id is a create; `Created` is an optional
-precision hint) and pin it with an engine test. (b) Add
-`removed: Vec<ObjectId>` to `InventoryBatch` so removals commit atomically with
-the page checkpoint covering them; Graph fills it, the engine applies it like a
-change-stream removal, other providers leave it empty.
-
-- `changes_stream` reports every non-removed delta value as `Updated` with
-  `ScopeChange::Added`, never `Created`: Graph delta cannot tell create from
-  update and the account holds no per-scope id set to compare. Documented, with
-  a test pinning the shape. `reference/sync.md` does not say how a consumer
-  treats `Updated` for an unknown id; settle that.
-- Inventory drops `@removed` values apart from mail etag eviction, so a removal
-  between pages of a resumed inventory reaches the engine only if the following
-  delta repeats it. Forwarding removals needs a shared inventory event and an
-  engine contract that can represent them.
-

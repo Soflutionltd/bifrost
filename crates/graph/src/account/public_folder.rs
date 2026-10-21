@@ -1208,6 +1208,7 @@ pub(crate) fn public_folder_inventory_stream(
         let checkpoint = Checkpoint::Change(cursor.clone());
         yield super::inventory::inventory_batch(
             entries,
+            Vec::new(),
             PageBoundary::Final,
             Some(cursor),
             bifrost_types::InventoryCoverageReport::complete(

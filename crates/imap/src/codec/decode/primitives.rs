@@ -368,7 +368,10 @@ pub(super) fn literal(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
 /// Parse a literal into a `Bytes` slice of the immutable response backing
 /// when one is available. Standalone parser entry points have no owned
 /// backing buffer and retain their historical copy behavior.
-pub(super) fn literal_bytes<'a>(input: &'a [u8], backing: Option<&Bytes>) -> IResult<&'a [u8], Bytes> {
+pub(super) fn literal_bytes<'a>(
+    input: &'a [u8],
+    backing: Option<&Bytes>,
+) -> IResult<&'a [u8], Bytes> {
     let (input, data) = literal_payload(input)?;
     let Some(backing) = backing else {
         return Ok((input, Bytes::copy_from_slice(data)));

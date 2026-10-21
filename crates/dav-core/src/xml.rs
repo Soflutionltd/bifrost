@@ -58,9 +58,7 @@ pub(crate) fn resolved_xml_name(resolved: ResolveResult<'_>, full_name: &str) ->
         // declaration, which NsReader reports as Unknown. Recognize only that
         // legacy spelling; an unknown prefix cannot safely be assigned a
         // namespace and must not turn a foreign status or href into DAV data.
-        ResolveResult::Unknown(prefix) if prefix == "D" => {
-            Some(DAV_NAMESPACE.to_string())
-        }
+        ResolveResult::Unknown(prefix) if prefix == "D" => Some(DAV_NAMESPACE.to_string()),
         ResolveResult::Unknown(_) => None,
     };
     let prefix = if namespace.is_none() {

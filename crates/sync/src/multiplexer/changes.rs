@@ -850,6 +850,68 @@ mod tests {
         }
     }
 
+    /// An unknown Updated reaches consumers unchanged and can create a row.
+    /// A second Updated refreshes that same row without a Created prerequisite.
+    #[tokio::test]
+    async fn updated_is_an_upsert_without_a_created_prerequisite() {
+        use crate::test_common::{StubAccount, cursor_for};
+        use bifrost_types::{
+            Batch, Change, Checkpoint, CursorScope, ObjectChange, ObjectChangeKind, ObjectId,
+            PageBoundary, SyncEvent,
+        };
+        use std::sync::Arc;
+
+        let scope = CursorScope::Account;
+        let initial = cursor_for(&scope, b"initial");
+        let cursors = Arc::new(crate::cursor::CursorRegistry::new());
+        cursors.put(initial.clone());
+        let mut account = StubAccount::new(vec![scope.clone()]);
+        account.changes_hook = Some(Arc::new(|cursor| {
+            (1..=2)
+                .map(|version| {
+                    SyncEvent::Batch(Batch {
+                        items: vec![Change::ObjectChange(ObjectChange {
+                            id: ObjectId("previously-unknown".into()),
+                            kind: ObjectChangeKind::Updated,
+                        })],
+                        page_boundary: PageBoundary::Page,
+                        server_latency: std::time::Duration::ZERO,
+                        bytes_in: 0,
+                        checkpoint: Some(Checkpoint::Change(cursor_for(&cursor.scope, &[version]))),
+                    })
+                })
+                .collect()
+        }));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let delivery = Arc::new(crate::multiplexer::ChangeDelivery::new(tx));
+        let (_boundary, view) = crate::cancel::Boundary::new();
+        super::drive_changes_stream(
+            &account, scope, initial, cursors, delivery, view, None, None,
+        )
+        .await
+        .expect("drive");
+        let mut rows = std::collections::HashMap::new();
+        for version in 1..=2 {
+            let event = rx.try_recv().expect("Updated delivered");
+            let SyncEvent::Batch(batch) = event.event.as_ref() else {
+                panic!("expected change batch")
+            };
+            assert_eq!(batch.items.len(), 1);
+            let Change::ObjectChange(change) = &batch.items[0] else {
+                panic!("expected object upsert")
+            };
+            assert_eq!(change.kind, ObjectChangeKind::Updated);
+            // Model the consumer transaction, using the covering cursor as
+            // the observed revision rather than assuming Created came first.
+            assert_eq!(
+                rows.insert(change.id.clone(), version),
+                (version == 2).then_some(1)
+            );
+            assert_eq!(rows.len(), 1);
+        }
+        assert_eq!(rows.get(&ObjectId("previously-unknown".into())), Some(&2));
+    }
+
     #[test]
     fn published_termination_wins_over_every_boundary() {
         let error = crate::recovery::restart_scope_error(

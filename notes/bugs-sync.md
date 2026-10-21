@@ -54,3 +54,17 @@ Durable completion markers for scopes not in the registry survive the reset. A
 complete fix needs writer or store support for an account-wide reset or durable
 enumeration; the limitation is documented in the reference.
 
+## SYNC-018 - Inventory removals panic on an unknown cursor scope and bypass `LiveSupersedes`
+
+Laterals from the inventory-removals work.
+- `crates/sync/src/inventory_walk.rs` `removals` matches `CursorScope` with a
+  `_ => panic!(..)` arm. The enum is `#[non_exhaustive]` in `bifrost-types`, so
+  a new variant becomes a runtime panic inside an engine task instead of a
+  compile error. Unreachable today. Neither fallback is obviously right
+  (`Destroyed` asserts a global delete; dropping loses a deletion), so the arm
+  wants an `Internal` termination of the walk rather than a panic.
+- `BackfillRunner` filters entries through `LiveSupersedes` but not removals,
+  so once anything calls `LiveSupersedes::add`, a stale inventory removal could
+  reach consumers after a newer live re-add of the same id. Latent: no
+  production path calls `add` today.
+

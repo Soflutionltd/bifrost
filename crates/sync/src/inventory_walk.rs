@@ -32,6 +32,38 @@ use bifrost_types::{Checkpoint, InventoryCoverageReport};
 
 use crate::error::Error;
 
+/// Project inventory tombstones into the same removal vocabulary as changes.
+/// Keep these in the page's synthetic batch so its checkpoint cannot be
+/// acknowledged independently of the removals it covers.
+pub(crate) fn removals(
+    scope: &bifrost_types::CursorScope,
+    removed: &[bifrost_types::ObjectId],
+) -> impl Iterator<Item = bifrost_types::Change> {
+    use bifrost_types::{
+        Change, CursorScope, MembershipScope, ObjectChange, ObjectChangeKind, ScopeChange,
+        ScopeChangeKind,
+    };
+    let membership = match scope {
+        CursorScope::Folder(folder) | CursorScope::FolderType { folder, .. } => {
+            Some(MembershipScope::Folder(folder.clone()))
+        }
+        CursorScope::Query(query) => Some(MembershipScope::Query(query.clone())),
+        CursorScope::Account | CursorScope::Type(_) => None,
+        _ => panic!("unsupported inventory removal scope"),
+    };
+    removed.iter().cloned().map(move |id| match &membership {
+        Some(membership) => Change::ScopeChange(ScopeChange {
+            id,
+            membership: membership.clone(),
+            kind: ScopeChangeKind::Removed,
+        }),
+        None => Change::ObjectChange(ObjectChange {
+            id,
+            kind: ObjectChangeKind::Destroyed,
+        }),
+    })
+}
+
 pub(crate) enum WalkDecision {
     Advance,
     StopAtBarrier { resume_from: Option<Checkpoint> },

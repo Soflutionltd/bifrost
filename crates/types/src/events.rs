@@ -328,6 +328,11 @@ impl std::error::Error for BatchBoundaryError {}
 #[derive(Debug, Clone)]
 pub struct InventoryBatch {
     pub items: Vec<InventoryEntry>,
+    /// Objects removed from this inventory scope. Apply with the entries and
+    /// accepted page checkpoint in one consumer transaction. Folder and query
+    /// scopes remove membership; account and type scopes remove the object.
+    /// Providers without inventory tombstones leave this empty.
+    pub removed: Vec<ObjectId>,
     pub page_boundary: PageBoundary,
     pub server_latency: Duration,
     pub bytes_in: u64,
@@ -337,6 +342,8 @@ pub struct InventoryBatch {
 
 impl InventoryBatch {
     /// Build a page, deriving the [`PageCheckpoint`] variant from `coverage`.
+    /// Initializes `removed` empty; providers with tombstones fill it before
+    /// emitting the page.
     pub fn try_new(
         items: Vec<InventoryEntry>,
         page_boundary: PageBoundary,
@@ -347,6 +354,7 @@ impl InventoryBatch {
     ) -> Result<Self, BatchBoundaryError> {
         let batch = Self {
             items,
+            removed: Vec::new(),
             page_boundary,
             server_latency,
             bytes_in,
@@ -606,6 +614,7 @@ mod inventory_completion_tests {
     fn a_checkpoint_that_disagrees_with_its_coverage_is_refused() {
         let clean = InventoryCoverageReport::complete(CoverageDomain::full(CursorScope::Account));
         let advance_over_barrier = InventoryBatch {
+            removed: Vec::new(),
             items: Vec::new(),
             page_boundary: PageBoundary::Page,
             server_latency: Duration::ZERO,
@@ -721,6 +730,7 @@ pub fn lift_complete_walk(
         SyncEvent::Batch(batch) => {
             seen_any |= !batch.items.is_empty();
             InventoryEvent::Batch(InventoryBatch {
+                removed: Vec::new(),
                 items: batch.items,
                 page_boundary: batch.page_boundary,
                 server_latency: batch.server_latency,
@@ -795,7 +805,9 @@ pub struct ObjectChange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ObjectChangeKind {
+    /// Optional precision hint. Consumers must also tolerate an existing id.
     Created,
+    /// Upsert: refresh an existing object or create one for an unknown id.
     Updated,
     Destroyed,
 }

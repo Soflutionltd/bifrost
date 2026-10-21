@@ -187,6 +187,7 @@ fn assert_contract_violation(
 async fn a_page_whose_checkpoint_disagrees_with_its_coverage_fails_the_partition() {
     let scope = CursorScope::Account;
     let page = InventoryEvent::Batch(InventoryBatch {
+        removed: Vec::new(),
         items: Vec::new(),
         page_boundary: PageBoundary::Page,
         server_latency: Duration::ZERO,

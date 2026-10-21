@@ -394,6 +394,7 @@ pub(crate) fn inventory_stream_cancellable(
             if final_page {
                 let coverage = coverage_of(&scope, &obligations);
                 yield bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
+                    removed: Vec::new(),
                     items,
                     page_boundary: PageBoundary::Final,
                     server_latency: started.elapsed(),
@@ -413,6 +414,7 @@ pub(crate) fn inventory_stream_cancellable(
             if !items.is_empty() {
                 let coverage = coverage_of(&scope, &obligations);
                 yield bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
+                    removed: Vec::new(),
                     items,
                     page_boundary: PageBoundary::Page,
                     server_latency: started.elapsed(),

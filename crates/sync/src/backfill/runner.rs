@@ -305,8 +305,8 @@ pub struct BackfillPartitionOutcome {
     /// `false` means the partition finished but left obligations open, so the
     /// orchestrator must NOT write a completion sentinel for the scope: the
     /// sentinel makes the next attach skip the walk entirely, which would turn
-    /// a declared gap into a permanent one. Note `seen` counts only entries a
-    /// page materialized, so an object that never became an entry is not even
+    /// a declared gap into a permanent one. Note `seen` counts materialized
+    /// entries and explicit removals, so an unaccounted object is not even
     /// in that total - the count cannot be used to detect this.
     pub complete: bool,
     /// Whether the enclosing scope walk may request another partition.
@@ -437,7 +437,8 @@ impl BackfillRunner {
                         }
                         return Err(Error::Account(error));
                     }
-                    let seen = u64::try_from(batch.items.len()).unwrap_or(u64::MAX);
+                    let seen = u64::try_from(batch.items.len().saturating_add(batch.removed.len()))
+                        .unwrap_or(u64::MAX);
                     seen_total = seen_total.saturating_add(seen);
                     let kept = filter_supersedes(&batch.items, live);
                     let kept_count = u64::try_from(kept.len()).unwrap_or(u64::MAX);
@@ -471,6 +472,7 @@ impl BackfillRunner {
                                         kind: ObjectChangeKind::Created,
                                     })
                                 })
+                                .chain(crate::inventory_walk::removals(&scope, &batch.removed))
                                 .collect();
                             let synthetic = Batch {
                                 items: changes,
@@ -577,6 +579,7 @@ impl BackfillRunner {
                                     kind: ObjectChangeKind::Created,
                                 })
                             })
+                            .chain(crate::inventory_walk::removals(&scope, &batch.removed))
                             .collect();
                         let synthetic = Batch {
                             items: changes,

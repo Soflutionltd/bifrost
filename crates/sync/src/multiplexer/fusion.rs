@@ -509,6 +509,7 @@ impl InventoryFusion {
                     kind: ObjectChangeKind::Created,
                 })
             })
+            .chain(crate::inventory_walk::removals(scope, &batch.removed))
             .collect();
         let synthetic = bifrost_types::Batch {
             items: changes,
@@ -1013,6 +1014,7 @@ mod tests {
             envelope_version: 1,
         });
         let page = bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
+            removed: Vec::new(),
             items: Vec::new(),
             page_boundary: bifrost_types::PageBoundary::Page,
             server_latency: std::time::Duration::ZERO,

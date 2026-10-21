@@ -185,6 +185,13 @@ one combination that cannot describe such a transaction, and `try_new` /
 `validate_boundary` name it on both `Batch` and `InventoryBatch`
 (`BatchBoundaryError::PartialCarriesCheckpoint`).
 
+`InventoryBatch::removed` names objects removed from the inventory scope.
+Entries, removals and the accepted checkpoint form one consumer transaction.
+Folder and query removals remove membership; account and type removals destroy
+the object. The constructor and `lift_complete_walk` initialize this lane empty;
+providers with inventory tombstones fill it explicitly. `ObjectChangeKind::Updated`
+is an upsert for both known and unknown ids; `Created` is an optional precision hint.
+
 An inventory page or completion carries a `PageCheckpoint` rather than an
 `Option<Checkpoint>`: `None`, `Advance(checkpoint)`, or `Withheld(Option<..>)`.
 The variant is a function of the coverage beside it - `Withheld` exactly when

@@ -1142,26 +1142,22 @@ then a `Final` Batch + ordinary `Checkpoint::Change`. The payload stores the
 next link without inventing a delta link, and `changes_stream` rejects that
 state defensively. A page with neither link is a contract violation, never a
 successful cursor-less completion.
-`@removed` entries are skipped and evict their cached change key; harvested
-etags fold into the bounded LRU `account.etag_index` for the next `If-Match`.
-Inventory batches have no per-object removal event, so an inventory tombstone
-is not projected as a delete; `InventoryFusion` turns inventory entries into
-`Created` signals and has no removed-id lane. The delta change stream emits
-`ScopeChange::Removed` for tombstones it sees there. Preserving a tombstone
-seen during inventory requires a shared inventory event and engine forwarding
-contract that carries removal ids to consumers; a warning cannot make the
-deletion durable.
+`@removed` entries populate `InventoryBatch::removed` using the same scoped
+object ids as live entries, and mail removals evict their cached change key.
+Harvested etags fold into the bounded LRU `account.etag_index` for the next
+`If-Match`. Both engine inventory paths emit these tombstones as
+`ScopeChange::Removed` in the same batch as the page's accepted checkpoint.
+The consumer persists the removals and checkpoint atomically before acking,
+exactly as for a removal on the live change stream.
 
 `changes_stream(cursor)` decodes the payload, asserts `scope_matches_payload`,
 and walks `delta_link` (or `advanced_through.next_link` on resume). Each
 non-removed entry emits `ObjectChange { Updated }` + `ScopeChange { Added }`
 (Graph delta has no created/updated split, and the account keeps no complete
 per-scope id set to diff against); `@removed` emits one `ScopeChange
-{ Removed }`. The live engine driver forwards object kinds unchanged, so a
-consumer that receives `Updated` for an unknown id must decide how to apply it.
-Changing these events to `Created` would misclassify ordinary edits; solving
-the unknown-id case requires a consumer or engine contract for upsert semantics,
-not a Graph-only mapping change. Its page marker's `last_seen_id` uses the same
+{ Removed }`. The live engine driver forwards object kinds unchanged. Under the shared
+sync contract, `Updated` is an upsert: an unknown id is a create and
+`Created` is only an optional precision hint. Its page marker's `last_seen_id` uses the same
 projected id form as inventory markers, including calendar composites and
 foreign mailbox tags; the id is diagnostic, and resume follows only
 `next_link`. Page batches

@@ -201,25 +201,21 @@ fn inventory_stream_from(
             let mut entries = Vec::new();
             let mut etags = Vec::new();
             let mut removed_etag_ids = Vec::new();
+            let mut removed = Vec::new();
             for value in page.value {
-                if is_removed(&value) {
-                    // InventoryEvent batches carry live InventoryEntry values,
-                    // not per-object removals. A tombstone cannot be encoded
-                    // as a live entry without asserting the deleted object is
-                    // present; ScopeChange::Removed belongs to changes_stream.
-                    // InventoryFusion turns entries into Created signals and
-                    // has no removed-id lane, so a warning cannot make this
-                    // deletion durable either. Forwarding inventory tombstones
-                    // needs a shared event and engine contract that carries
-                    // removals through to consumers.
-                    if is_mail_scope(&scope)
-                        && let Some(id) = value.get("id").and_then(Value::as_str) {
-                        removed_etag_ids.push(super::foreign::encode_message_id(&scope, id).0);
+                if is_removed(&value)
+                    && let Some(id) = value.get("id").and_then(Value::as_str) {
+                    let id = sync_object_id(&scope, id);
+                    if is_mail_scope(&scope) {
+                        removed_etag_ids.push(id.0.clone());
                     }
+                    removed.push(id);
                     continue;
                 }
+                // An unidentifiable tombstone needs the same checkpoint
+                // barrier as an unidentifiable live value below.
                 let Some(mut entry) = inventory_entry_from_value(&scope, &value) else {
-                    // A non-removed value with no usable `id`. It used to be
+                    // A value with no usable `id`. It used to be
                     // dropped silently while the delta link advanced past it,
                     // which violates the checkpoint contract: the walk cannot
                     // name, retry, or later reconcile the thing it skipped.
@@ -302,7 +298,7 @@ fn inventory_stream_from(
                         return;
                     }
                 };
-                yield inventory_batch(entries, PageBoundary::Page, Some(checkpoint_cursor), coverage_of(&scope, &obligations), tally.take());
+                yield inventory_batch(entries, removed, PageBoundary::Page, Some(checkpoint_cursor), coverage_of(&scope, &obligations), tally.take());
                 current_url = next_link;
             } else if let Some(delta_link) = delta_link {
                 let cursor = match encode_cursor(
@@ -319,7 +315,7 @@ fn inventory_stream_from(
                     }
                 };
                 let checkpoint = Checkpoint::Change(cursor.clone());
-                yield inventory_batch(entries, PageBoundary::Final, Some(cursor), coverage_of(&scope, &obligations), tally.take());
+                yield inventory_batch(entries, removed, PageBoundary::Final, Some(cursor), coverage_of(&scope, &obligations), tally.take());
                 yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(Some(checkpoint), coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                 return;
             } else {
@@ -581,6 +577,7 @@ fn format_calendar_timestamp(at: jiff::Timestamp) -> String {
 /// change streams, where coverage is meaningless.
 pub(crate) fn inventory_batch(
     items: Vec<InventoryEntry>,
+    removed: Vec<ObjectId>,
     page_boundary: PageBoundary,
     cursor: Option<ChangeCursor>,
     coverage: bifrost_types::InventoryCoverageReport,
@@ -588,6 +585,7 @@ pub(crate) fn inventory_batch(
 ) -> bifrost_types::InventoryEvent {
     bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
         items,
+        removed,
         page_boundary,
         server_latency: Duration::default(),
         bytes_in,
@@ -1012,8 +1010,55 @@ mod tests {
             batch.items.is_empty(),
             "a tombstone is not a live inventory entry"
         );
+        assert_eq!(batch.removed, vec![ObjectId("gone".into())]);
+        assert!(batch.checkpoint.accepted(false).is_some());
         let _ = stream.next().await;
         assert_eq!(account.etag_index.write().await.get("gone"), None);
+    }
+
+    #[tokio::test]
+    async fn inventory_tombstones_keep_the_scope_object_identity_on_page_checkpoints() {
+        for (scope, expected) in [
+            (
+                CursorScope::FolderType {
+                    folder: super::super::foreign::encode_foreign("owner", "inbox"),
+                    ty: ObjectType::Email,
+                },
+                ObjectId(super::super::foreign::encode_foreign("owner", "gone").0),
+            ),
+            (
+                CursorScope::FolderType {
+                    folder: FolderId("calendar".into()),
+                    ty: ObjectType::Event,
+                },
+                ObjectId("calendar::gone".into()),
+            ),
+        ] {
+            let client = GraphClient::new("token");
+            client.script_rest([ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [{"id":"gone", "@removed":{"reason":"deleted"}}],
+                    "@odata.nextLink":"https://graph.microsoft.com/v1.0/next"
+                }),
+            )]);
+            let account = GraphAccount::new_for_tests_with_shared(
+                client,
+                PushMode::GraphSubscriptions,
+                &["owner".into()],
+            );
+            let mut stream = inventory_stream(account, scope.clone());
+            let Some(bifrost_types::InventoryEvent::Batch(batch)) = stream.next().await else {
+                panic!("expected tombstone page")
+            };
+            assert!(batch.items.is_empty());
+            assert_eq!(batch.removed, vec![expected]);
+            let Some(Checkpoint::Change(cursor)) = batch.checkpoint.accepted(false) else {
+                panic!("removal and page checkpoint must travel together")
+            };
+            assert_eq!(cursor.scope, scope);
+            assert!(resumable_inventory_payload(cursor).is_some());
+        }
     }
 
     #[tokio::test]
