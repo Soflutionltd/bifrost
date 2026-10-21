@@ -495,6 +495,13 @@ impl Client {
         // carry credentials onward to a Location supplied by a different host.
         // It uses a direct TCP connection; reqwest proxy configuration applies
         // only to HTTP; Net exposes no proxy resolution or tunnel connector.
+        // Routing must come from this transport's AccountNet, including an
+        // injected Net. ReqwestTransport keeps that handle private in its
+        // defining module and exposes only budget/meter handles here. Picking
+        // a new shared Net or rereading environment variables here would not
+        // establish parity with the HTTP client's construction-time routing.
+        // Adoption requires an account-handle bridge in transport_reqwest.rs
+        // plus one routing snapshot shared by reqwest and the tunnel setup.
         let builder = ClientBuilder::from_uri(uri.clone())
             .add_header(
                 header::USER_AGENT,

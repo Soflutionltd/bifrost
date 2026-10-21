@@ -193,8 +193,9 @@ its scope and action.
   bifrost-net's `DEFAULT_MAX_HOPS`.
   A redirect the walk will not follow - a chain past that cap, a `Location`
   that will not resolve against the effective URL, or one that is not valid
-  UTF-8 - is classified through `bifrost_net::into_account_error` exactly as
-  the transport classifies its own redirect failures:
+  UTF-8 - is classified through
+  `bifrost_net::into_account_error_with_throttle_scope` with DAV's explicit
+  account throttle policy, matching the transport's own redirect classification:
   `Protocol(ContractViolation)` with `Attempt(Acknowledged)`, deriving
   `ProviderContractViolation`. Each is raised after the server answered a hop
   and is about what it answered. They were `Request(Malformed)` -> `ClientBug`
@@ -1236,8 +1237,9 @@ no request left the process, so it derives `Retry(SameRequest)` rather than
 sending the consumer probing a target nothing was ever written to. That is right
 for a transient read failure and wrong for a dead credential, so `auth_headers`
 does not fold every `TokenSource::current()` failure into it: a
-`bifrost_net::Error::AuthLost` or `RefreshFailed` is handed to
-`bifrost_net::into_account_error` - the same funnel the wire path uses - and
+`bifrost_net::Error::AuthLost` or `RefreshFailed` goes through
+`bifrost_net::into_account_error_with_throttle_scope` with DAV's explicit
+account throttle policy, the same shared translation used by the wire path, and
 comes out `Authentication(ReauthorizationRequired)` or
 `Authentication(RefreshTransient)`. Only the remainder keeps the `Unsent`
 transport classification. Without the split a permanently revoked bearer token

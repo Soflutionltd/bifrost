@@ -74,7 +74,8 @@ impl EwsClient {
     ///
     /// Transport failures preserve the `bifrost_net::Error` so the
     /// account boundary classifies them through
-    /// `bifrost_net::into_account_error` with `Protocol::Ews` context.
+    /// `bifrost_net::into_account_error_with_throttle_scope` with
+    /// `Protocol::Ews` context and an explicit account throttle scope.
     /// HTTP error statuses carry the status + raw body; SOAP faults
     /// carry the structured `SoapFaultCode` plus `<faultstring>`
     /// detail.

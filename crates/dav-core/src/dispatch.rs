@@ -438,9 +438,10 @@ impl DavDispatch {
     /// It now claims `Unsent`, which derives `Retry(SameRequest)`, and a
     /// PERMANENT credential failure retried as a transport blip is a retry storm
     /// that never emits the reauthorization signal the consumer needs. So the
-    /// two auth-bearing net errors are handed to the same funnel the wire path
-    /// uses, `bifrost_net::into_account_error`, which maps `AuthLost` to
-    /// `Auth(ReauthorizationRequired)` and `RefreshFailed` to
+    /// two auth-bearing net errors go through `net_account_error`, which passes
+    /// DAV's explicit account throttle scope to
+    /// `bifrost_net::into_account_error_with_throttle_scope`. It maps `AuthLost`
+    /// to `Auth(ReauthorizationRequired)` and `RefreshFailed` to
     /// `Auth(RefreshTransient)`. Only the remainder keeps the `Unsent` transport
     /// classification, which is correct for it: no request left this process and
     /// there is nothing at the target to reconcile against.
@@ -2378,8 +2379,9 @@ mod tests {
     /// wrong for a permanently revoked token: folding every `TokenSource`
     /// failure into it turns a dead credential into a retry storm that never
     /// raises a reauthorization signal. So the two auth-bearing net errors go
-    /// through `bifrost_net::into_account_error`, and only the remainder keeps
-    /// the `Unsent` transport classification.
+    /// through `net_account_error`, which passes DAV's explicit account
+    /// throttle scope to `bifrost_net::into_account_error_with_throttle_scope`,
+    /// and only the remainder keeps the `Unsent` transport classification.
     ///
     /// Nothing is scripted, so a case that reaches the wire panics on an
     /// exhausted script rather than passing.

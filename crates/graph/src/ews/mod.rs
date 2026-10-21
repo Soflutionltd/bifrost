@@ -136,7 +136,8 @@ impl EwsItemShape {
 pub(crate) enum EwsError {
     /// The HTTP request failed. Carries the underlying
     /// `bifrost_net::Error` so the account boundary can route through
-    /// `bifrost_net::into_account_error` with `Protocol::Ews` context.
+    /// `bifrost_net::into_account_error_with_throttle_scope` with
+    /// `Protocol::Ews` context and an explicit account throttle scope.
     Transport(bifrost_net::Error),
 
     /// The HTTP request completed with a non-success status. Carries

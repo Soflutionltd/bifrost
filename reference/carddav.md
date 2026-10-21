@@ -170,7 +170,8 @@ its scope and action.
   way to restore it. A 303 is not followed, and the walk is bounded by
   bifrost-net's `DEFAULT_MAX_HOPS`. A redirect the walk will not follow (past
   that cap, or a `Location` that will not resolve or is not valid UTF-8) is
-  classified through `bifrost_net::into_account_error` as the transport
+  classified through `bifrost_net::into_account_error_with_throttle_scope`
+  with DAV's explicit account throttle policy, matching how the transport
   classifies its own: `Protocol(ContractViolation)` with
   `Attempt(Acknowledged)`, not the `Request(Malformed)` it used to be. The
   refused hop to an unadmitted origin stays a local `Request(Malformed)`, now

@@ -6,9 +6,10 @@
 //! Gmail-internal failure through that builder, deriving recovery
 //! centrally rather than emitting `RecoveryClass` values directly.
 //!
-//! Transport-only signals delegate to `bifrost_net::into_account_error`
-//! so the net layer's transmission-state evidence and retry-after
-//! parsing are not duplicated. Where Gmail has a more precise
+//! Transport-only signals use
+//! `bifrost_net::into_account_error_with_throttle_scope` with Gmail's
+//! explicit throttle policy, reusing the net layer's transmission-state
+//! evidence and parsed `RetryHint`. Where Gmail has a more precise
 //! interpretation (Gmail JSON error reason, history-id staleness,
 //! cursor envelope failure), this module builds directly with
 //! `AccountErrorBuilder` and attaches `WireCause::Gmail(signal)`.

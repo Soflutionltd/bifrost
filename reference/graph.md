@@ -2285,8 +2285,9 @@ The `GraphError::Net` arm re-decodes Graph's error envelope before
 delegating. `bifrost-net` never hands a 4xx or 5xx back as a response - its
 retry loop converts one into `Status` / `RateLimited` /
 `RetryBudgetExhausted`, body preserved - so classifying those through
-`bifrost_net::into_account_error` alone reads the HTTP status and throws the
-typed `error.code` away. The whole `GraphSignal` table below then applied to
+`bifrost_net::into_account_error_with_throttle_scope` with Graph's explicit
+account throttle scope alone reads the HTTP status and throws the typed
+`error.code` away. The whole `GraphSignal` table below then applied to
 `$batch` subresponses and to nothing else: a live 400 `InvalidDeltaToken`,
 the documented delta-expiry signal, classified `Request(Malformed)` ->
 terminal `ClientBug` instead of `SyncState(CursorInvalid)` ->
@@ -2341,7 +2342,8 @@ facility failed, the entropy source behind `new_handle`) ->
 `Internal(RuntimeFailure)`.
 `GraphErrorContext::ews(op)`
 is the EWS constructor; `ews_error_to_account_error` routes
-`EwsError::Transport` through `bifrost_net::into_account_error`, `HttpStatus`
+`EwsError::Transport` through `bifrost_net::into_account_error_with_throttle_scope`
+with Graph's explicit account throttle scope, `HttpStatus`
 through the REST `response_to_account_error` path, `SoapFault` onto
 `SoapFaultCode` (Server -> Unavailable, Client/MustUnderstand/VersionMismatch
 -> 400, Unknown -> ContractViolation), and `MalformedXml` to
@@ -2407,8 +2409,9 @@ Mapping highlights:
 - `Gone` / 410 / `InvalidDeltaToken` / `SyncStateNotFound` ->
   `SyncState(CursorInvalid)` -> `Engine(RestartScope(scope))`.
 - `TooManyRequests` / 429 -> `Server(RateLimited)`, `throttle_scope: Account`,
-  `retry_hint: After(_)` from `Retry-After` (seconds + HTTP-date via
-  `bifrost_net::parse_retry_after`), plus the Outlook mailbox
+  `retry_hint: After(_)` from `Retry-After` (seconds + HTTP-date parsed as a
+  `RetryHint` via `bifrost_net::request::parse_retry_after_hint`), plus the
+  Outlook mailbox
   `ThrottleBudget` wherever the request can be attributed (see "Throttle
   budgets" below); 503 / 504 -> `Server(Unavailable)` ->
   `Retry::SameRequest`.

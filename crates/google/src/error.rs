@@ -535,9 +535,11 @@ impl StdError for Error {
 impl From<bifrost_net::Error> for Error {
     fn from(err: bifrost_net::Error) -> Self {
         // Preserve the structured net error. The account-side
-        // translation boundary in `account/error.rs` is responsible
-        // for inspecting Status bodies, retry-after, and transmission
-        // state via `bifrost_net::into_account_error`. We deliberately
+        // translation boundary in `account/error.rs` uses structured net
+        // evidence to refine Status bodies and delegates generic mapping,
+        // parsed RetryHint, and transmission state to
+        // `bifrost_net::into_account_error_with_throttle_scope` with Gmail's
+        // explicit throttle policy. We deliberately
         // do NOT promote `Error::Status` into `Error::Response` here:
         // the body parsing happens after the net error has been
         // contextualized with the Gmail operation/scope.

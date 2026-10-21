@@ -31,9 +31,12 @@ use super::ImapStream;
 pub(crate) struct WireReader {
     stream: ImapStream,
     buf: BytesMut,
+    consumed: usize,
     metering: WireMetering,
     compress_read: Option<(Reservation, usize)>,
     compress_boundary: bool,
+    #[cfg(test)]
+    compacted_bytes: usize,
 }
 
 impl WireReader {
@@ -46,9 +49,12 @@ impl WireReader {
         Self {
             stream,
             buf: BytesMut::with_capacity(8 * 1024),
+            consumed: 0,
             metering: WireMetering::disabled(),
             compress_read: None,
             compress_boundary: false,
+            #[cfg(test)]
+            compacted_bytes: 0,
         }
     }
 
@@ -60,9 +66,12 @@ impl WireReader {
         Self {
             stream,
             buf: BytesMut::with_capacity(8 * 1024),
+            consumed: 0,
             metering: WireMetering::new(sink, bandwidth_budget),
             compress_read: None,
             compress_boundary: false,
+            #[cfg(test)]
+            compacted_bytes: 0,
         }
     }
 
@@ -70,9 +79,12 @@ impl WireReader {
         Self {
             stream,
             buf: BytesMut::with_capacity(8 * 1024),
+            consumed: 0,
             metering,
             compress_read: None,
             compress_boundary: false,
+            #[cfg(test)]
+            compacted_bytes: 0,
         }
     }
 
@@ -253,7 +265,7 @@ impl WireReader {
 
     /// Whether the internal parse buffer is empty.
     pub(crate) fn buffer_is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.consumed == self.buf.len()
     }
 
     /// Set TCP keepalive on the underlying socket (RFC 1122 Section 4.2.3.6).
@@ -290,7 +302,38 @@ impl WireReader {
     /// already buffered are compressed data that must be preserved in
     /// the new `CompressedStream`'s raw read buffer.
     pub(super) fn take_buffer(&mut self) -> bytes::BytesMut {
-        self.buf.split_off(0)
+        let remaining = self.buf.split_off(self.consumed);
+        self.buf = BytesMut::new();
+        self.consumed = 0;
+        remaining
+    }
+
+    /// Mark a parsed prefix as consumed without moving the unread suffix.
+    /// Compact only after the dead prefix occupies more than half the
+    /// allocation, so a run of small co-read responses moves the suffix only
+    /// occasionally instead of once per response.
+    fn consume_prefix(&mut self, len: usize) {
+        self.consumed += len;
+        if self.consumed == self.buf.len() {
+            self.buf.clear();
+            self.consumed = 0;
+        } else if self.consumed > self.buf.capacity() / 2 {
+            self.compact_prefix();
+        }
+    }
+
+    fn compact_prefix(&mut self) {
+        if self.consumed == 0 {
+            return;
+        }
+        let remaining = self.buf.len() - self.consumed;
+        self.buf.copy_within(self.consumed.., 0);
+        self.buf.truncate(remaining);
+        self.consumed = 0;
+        #[cfg(test)]
+        {
+            self.compacted_bytes = self.compacted_bytes.saturating_add(remaining);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -303,20 +346,17 @@ impl WireReader {
     /// Try to parse a greeting from the internal buffer (RFC 3501 Section7.1).
     fn try_parse_greeting_inner(&mut self) -> Result<Option<Response>, Error> {
         use crate::codec::decode::parse_greeting;
-        if self.buf.is_empty() {
+        if self.buffer_is_empty() {
             return Ok(Option::None);
         }
-        if !buffer_may_contain_complete_response(&self.buf)? {
+        let unread = &self.buf[self.consumed..];
+        if !buffer_may_contain_complete_response(unread)? {
             return Ok(Option::None);
         }
-        match parse_greeting(&self.buf) {
+        match parse_greeting(unread) {
             Ok((remaining, resp)) => {
-                let consumed = self.buf.len() - remaining.len();
-                // Keep the allocation rooted at its start so later capacity
-                // checks include all storage a shared FETCH frame would pin.
-                let len = self.buf.len();
-                self.buf.copy_within(consumed..len, 0);
-                self.buf.truncate(len - consumed);
+                let consumed = unread.len() - remaining.len();
+                self.consume_prefix(consumed);
                 Ok(Some(resp))
             }
             Err(nom::Err::Incomplete(_)) => Ok(Option::None),
@@ -325,7 +365,7 @@ impl WireReader {
                     trace!(
                         "greeting parse Error on buffer not ending with CRLF  -  \
                          treating as incomplete ({} bytes buffered)",
-                        self.buf.len()
+                        self.buf.len() - self.consumed
                     );
                     return Ok(Option::None);
                 }
@@ -345,7 +385,7 @@ impl WireReader {
         utf8_mode: bool,
         limit: Option<usize>,
     ) -> Result<Option<Response>, Error> {
-        if self.buf.is_empty() {
+        if self.buffer_is_empty() {
             return Ok(Option::None);
         }
 
@@ -356,18 +396,17 @@ impl WireReader {
         //
         // Every IMAP response ends with \r\n. If the buffer doesn't contain
         // \r\n at all, the first response is definitely incomplete.
-        let Some(frame_len) = response_frame_len_limited(&self.buf, limit)? else {
+        let unread = &self.buf[self.consumed..];
+        let Some(frame_len) = response_frame_len_limited(unread, limit)? else {
             return Ok(Option::None);
         };
         // Small responses own their small literals and leave the read allocation
         // reusable, even while the consumer retains every response.
         if frame_len < 4096 {
-            return match parse_response_utf8(&self.buf[..frame_len], utf8_mode) {
+            return match parse_response_utf8(&unread[..frame_len], utf8_mode) {
                 Ok((remaining, resp)) => {
                     let consumed = frame_len - remaining.len();
-                    let len = self.buf.len();
-                    self.buf.copy_within(consumed..len, 0);
-                    self.buf.truncate(len - consumed);
+                    self.consume_prefix(consumed);
                     Ok(Some(resp))
                 }
                 Err(nom::Err::Incomplete(_)) => Ok(None),
@@ -380,15 +419,19 @@ impl WireReader {
         // A retained slice must not pin arbitrary spare capacity or co-read
         // responses. Move the suffix to a fresh reader, and compact an oversized
         // allocation before handing the frame to the slice-aware parser.
-        let suffix = &self.buf[frame_len..];
+        let unread_start = self.consumed;
+        let suffix_start = unread_start + frame_len;
+        let suffix = &self.buf[suffix_start..];
         let mut next = BytesMut::with_capacity(suffix.len().max(8192));
         next.extend_from_slice(suffix);
         let mut buffer = std::mem::replace(&mut self.buf, next);
+        self.consumed = 0;
         let frame = if buffer.capacity() > frame_len.saturating_mul(2) {
-            bytes::Bytes::copy_from_slice(&buffer[..frame_len])
+            bytes::Bytes::copy_from_slice(&buffer[unread_start..suffix_start])
         } else {
-            buffer.truncate(frame_len);
-            buffer.freeze()
+            let mut frame = buffer.split_off(unread_start);
+            frame.truncate(frame_len);
+            frame.freeze()
         };
 
         match parse_response_bytes(&frame, utf8_mode) {

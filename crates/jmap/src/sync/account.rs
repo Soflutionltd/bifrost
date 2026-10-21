@@ -2127,7 +2127,18 @@ mod tests {
     async fn draft_attachment_upload_uses_draft_namespace_with_mail_fallback() {
         for (has_submission, expected_account) in [(true, "submission"), (false, "mail")] {
             let session = serde_json::from_value(serde_json::json!({
-                "capabilities": {},
+                "capabilities": {
+                    "urn:ietf:params:jmap:core": {
+                        "maxSizeUpload": 50_000_000,
+                        "maxConcurrentUpload": 4,
+                        "maxSizeRequest": 10_000_000,
+                        "maxConcurrentRequests": 4,
+                        "maxCallsInRequest": 16,
+                        "maxObjectsInGet": 500,
+                        "maxObjectsInSet": 500,
+                        "collationAlgorithms": []
+                    }
+                },
                 "accounts": {},
                 "primaryAccounts": {},
                 "username": "user@example.test",

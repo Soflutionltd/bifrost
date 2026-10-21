@@ -297,9 +297,11 @@ impl BackfillScopeWalk {
 /// Outcome for one partition pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackfillPartitionOutcome {
-    /// Inventory entries observed before the live-supersedes filter.
+    /// Inventory entries and explicit removals observed before the
+    /// live-supersedes filter.
     pub seen: u64,
     /// Inventory entries forwarded after the live-supersedes filter.
+    /// Explicit removals are not included in this count.
     pub kept: u64,
     /// Whether the walk exhausted its space with everything accounted for.
     ///
@@ -347,8 +349,8 @@ impl BackfillRunner {
     /// Does NOT write to `CheckpointStore`: durable advance is
     /// consumer-ack-driven (see module docs). Checkpoint progress counts
     /// entries observed before filtering because it describes the
-    /// inventory position, while the returned outcome reports both the
-    /// observed and forwarded totals.
+    /// inventory position, while the returned outcome reports observed
+    /// entries and removals plus forwarded entries.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_partition(
         account: &dyn Account,

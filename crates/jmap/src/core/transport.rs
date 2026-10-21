@@ -122,8 +122,9 @@ impl TransportError {
 
     /// Construct a `TransportError` from a `bifrost_net::Error`,
     /// preserving the original net error so the JMAP conversion
-    /// boundary can delegate to `bifrost_net::into_account_error`
-    /// for pure transport failures.
+    /// boundary can classify net evidence through
+    /// `bifrost_net::into_account_error_with_throttle_scope` with its
+    /// explicit account throttle scope.
     pub(crate) fn from_net(error: bifrost_net::Error) -> Self {
         let message = error.to_string();
         match error {

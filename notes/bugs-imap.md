@@ -40,16 +40,6 @@ guard that, as wired, protects only the sub-second SELECT-to-STORE window.
 Take the guard value from the consumer (`ServerVersion::ModSeq` already travels
 in inventory entries), or say plainly how narrow the window is.
 
-## IMAP-032 - Small-response compaction memmoves the whole unread suffix
-
-Lateral from the retained-slice work. `crates/imap/src/connection/wire.rs`
-greeting and small-response paths replaced an O(1) `split_to` with
-`copy_within(consumed..len, 0)` to keep the allocation rooted for the later
-capacity check. Every small response then moves the whole unread suffix, so a
-large read followed by many small untagged lines is quadratic in that read's
-size. Compact only once the consumed prefix passes half the capacity. Not a
-correctness defect.
-
 ## IMAP-018 - IDLE sessions are still uncounted against `pool_cap`
 
 **Needs a technical implementation specification** (owner, 2026-10-21): too

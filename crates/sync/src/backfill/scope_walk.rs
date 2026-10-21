@@ -146,7 +146,8 @@ impl ScopeWalkDriver {
         self.walk.stopped()
     }
 
-    /// Inventory entries observed across every partition walked.
+    /// Inventory entries and explicit removals observed across every
+    /// partition walked.
     #[must_use]
     pub fn total_seen(&self) -> u64 {
         self.total_seen

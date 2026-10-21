@@ -386,6 +386,39 @@ async fn small_fetch_literals_leave_the_reader_allocation_reusable() {
     ));
 }
 
+#[test]
+fn many_co_read_small_responses_move_the_unread_suffix_amortized() {
+    let (mut reader, _peer) = memory_reader();
+    let line = b"* 1 EXISTS\r\n";
+    let response_count = 16_384;
+    let mut wire = Vec::with_capacity(line.len() * response_count);
+    for _ in 0..response_count {
+        wire.extend_from_slice(line);
+    }
+    let wire_len = wire.len();
+    reader.buf = BytesMut::with_capacity(wire_len);
+    reader.buf.extend_from_slice(&wire);
+    assert_eq!(reader.buf.capacity(), wire_len);
+
+    for _ in 0..response_count {
+        let response = reader
+            .try_parse_response_limited(false, None)
+            .expect("valid response")
+            .expect("response already buffered");
+        let Response::Untagged(response) = response else {
+            panic!("expected untagged response");
+        };
+        assert!(matches!(*response, UntaggedResponse::Exists(1)));
+    }
+
+    assert!(reader.buffer_is_empty());
+    assert!(
+        reader.compacted_bytes <= wire_len / 2,
+        "compacted {} bytes from a {wire_len}-byte co-read buffer",
+        reader.compacted_bytes
+    );
+}
+
 #[tokio::test]
 async fn read_one_returns_two_responses_from_one_segment() {
     let (mut reader, mut server) = memory_reader();

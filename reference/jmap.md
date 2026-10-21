@@ -467,10 +467,15 @@ to use `maxConcurrentRequests`, and downloads have no upload gate.
 
 `Client::upload_to` checks the byte length against `maxSizeUpload` before it
 calls the transport. An oversized upload returns `Request(Malformed)` with the
-advertised and actual sizes, so the file body never reaches the server. When
-the optional parsed value is absent, there is no client-side size ceiling;
-`maxSizeUpload` remains an `Option<usize>` so absence is distinguishable from
-an advertised zero. An advertised zero permits only an empty upload.
+advertised and actual sizes, so the file body never reaches the server.
+`maxSizeUpload` remains an `Option<usize>` at the protocol layer so absence is
+distinguishable from an advertised zero, but account session validation
+requires it, as mandated by RFC 8620 section 2: an omitted value is
+`Protocol(ContractViolation)`. An advertised zero permits only an empty upload.
+Attachment uploads check each chunk before copying or growing the buffer, stop
+polling at the first overflow, and bound requested buffer capacity by the
+advertised maximum. Caller-owned chunks and allocator overhead remain outside
+that bound; the `upload_to` check still guards the transport boundary.
 
 ## Feature gates
 
@@ -1040,6 +1045,10 @@ builder, sharing HTTP's current trace policy. It still connects directly:
 system/environment proxy selection is internal to its HTTP connector. A shared
 proxy resolver and tunnel connector remain necessary for WebSocket parity;
 copying only environment variables would not establish equivalent routing.
+WebSocket proxy adoption also requires access to the HTTP transport's
+`AccountNet`, currently private to `ReqwestTransport`. A separate `Net` or a
+fresh environment lookup cannot preserve an injected `Net`'s configuration and
+construction-time proxy selection.
 
 ### Error translation
 
@@ -1112,10 +1121,11 @@ arrived) and, unless its primary cause already is one, the typed
 - `Transport(_)` is decided in three steps, in order. A `LocalFailure`
   mark wins: `InvariantViolated` -> `Internal(InvariantViolated)`,
   `LimitExceeded` -> `Internal(LimitExceeded)`, never retried. Otherwise
-  bifrost-net evidence delegates to `bifrost_net::into_account_error`,
-  which carries `AttemptCause::transmission_state` from where the wire
-  failed, so the central mapping picks `Retry::SameRequest` for idempotent
-  ops and `Reconcile` for non-idempotent ops caught mid-flight. With
+  bifrost-net evidence goes through
+  `bifrost_net::into_account_error_with_throttle_scope` with JMAP's explicit
+  account throttle scope, carrying `AttemptCause::transmission_state` from
+  where the wire failed, so the central mapping picks `Retry::SameRequest`
+  for idempotent ops and `Reconcile` for non-idempotent ops caught mid-flight. With
   neither, the fallback is `Transport(Network)` with no attempt cause.
 - WebSocket errors split by handshake position: `WebSocketHandshake`
   (pre-handshake) -> `Transport(Network)` + `Attempt(Unsent)`;

@@ -2,7 +2,8 @@
 //!
 //! Every `crate::Error` exits the JMAP crate through
 //! [`into_account_error`]. Transport-level failures from the default
-//! reqwest transport delegate to `bifrost_net::into_account_error`;
+//! reqwest transport use `bifrost_net::into_account_error_with_throttle_scope`
+//! with JMAP's explicit account throttle scope;
 //! parsed JMAP method errors, problem-details responses, set-error
 //! responses, and local crate errors all funnel through
 //! `AccountErrorBuilder` here with operation, scope, and

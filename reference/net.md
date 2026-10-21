@@ -632,7 +632,8 @@ reopens. Coordinating sources supplied to Graph and Google are likewise retained
 by account attachment.
 WebSocket setup has the JMAP timeout, a User-Agent and one rejected-token-aware
 401 refresh retry. The WebSocket library uses direct TCP, refuses redirects,
-and does not inherit reqwest proxies or emit net's trace context.
+and does not inherit reqwest proxies. It emits trace context through
+`trace::current_traceparent()`.
 
 `TokenSource::snapshot()` returns `Result<auth::TokenSnapshot, Error>` without
 refreshing, polling async work, or waiting for a cache lock. The three snapshot
@@ -1446,6 +1447,16 @@ crates/net/src/
                   // parent_collection_url; origin-rooted well_known_url
 ```
 
+## Redirect predicate contract
+
+`RedirectPolicy::allows_host` is a cross-host filter, not a complete redirect
+predicate. With `same_origin_only`, it returns false for every host, including
+the departing host, because a host alone cannot establish matching scheme and
+effective port. Call `RedirectPolicy::admits_hop(prior, next)` for the same
+origin-aware decision the request pipeline uses. A known same-origin hop is
+admitted before applying the cross-host filter; an unknown departing URL is
+handled conservatively as cross-origin.
+
 ## Upgrade connector limitation
 
 `NetConfig` exposes no explicit proxy input. Reqwest's default connector owns
@@ -1453,3 +1464,11 @@ implicit environment/system proxy selection, while JMAP WebSocket setup uses
 direct TCP. There is no shared proxy resolution or CONNECT tunnel facility yet.
 A WebSocket connector must share routing selection, bypass rules, proxy
 credentials and proxy TLS handling before it can claim HTTP proxy inheritance.
+
+JMAP's upgrade implementation cannot currently reach the HTTP transport's
+`AccountNet`: `ReqwestTransport` keeps that field private and exposes only
+bandwidth budget and meter access for WebSockets. Sharing proxy routing requires
+an account-handle bridge there as well as the resolver and tunnel connector.
+Constructing a separate shared Net would lose an injected Net's identity and
+configuration, and rereading environment variables would lose the HTTP client's
+construction-time snapshot. Neither is a substitute for that bridge.

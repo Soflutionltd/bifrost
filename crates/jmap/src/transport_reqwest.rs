@@ -513,9 +513,9 @@ impl Unpin for ReqwestByteStream {}
 
 fn transport_error_from_net(error: bifrost_net::Error) -> TransportError {
     // Preserve the original net error so the JMAP conversion boundary
-    // can delegate to bifrost_net::into_account_error for pure
-    // transport-level signals. `TransportError::from_net` also lifts the
-    // response body out of whichever variant carries it (`Status`
+    // can classify it through bifrost_net::into_account_error_with_throttle_scope
+    // with JMAP's explicit account throttle scope. `TransportError::from_net`
+    // also lifts the response body out of whichever variant carries it (`Status`
     // directly, `RateLimited` / `RetryBudgetExhausted` from the
     // preserved final response) so ProblemDetails parsing still works
     // for the statuses the retry loop consumed.

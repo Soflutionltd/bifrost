@@ -798,9 +798,27 @@ pub(crate) fn attachment_upload<T: HttpTransport>(
     mime: String,
 ) -> AccountFuture<Result<bifrost_types::AttachmentHandle, AccountError>> {
     Box::pin(async move {
+        let state = mail.client().session_state();
+        let max = super::capabilities::upload_size_limit(state.session())?;
         let mut data = Vec::new();
         while let Some(chunk) = bytes.next().await {
             let chunk = chunk?;
+            // Check before copying or allocating. Subtraction avoids overflow
+            // even when the advertised maximum is usize::MAX.
+            if chunk.len() > max - data.len() {
+                return Err(to_acct_err(AccountOperation::AttachmentUpload)(
+                    crate::Error::UploadSizeLimit {
+                        max,
+                        size: data.len().saturating_add(chunk.len()),
+                    },
+                ));
+            }
+            // Keep geometric growth within the advertised limit.
+            let size = data.len() + chunk.len();
+            if size > data.capacity() {
+                let capacity = data.capacity().saturating_mul(2).max(size).min(max);
+                data.reserve_exact(capacity - data.len());
+            }
             data.extend_from_slice(&chunk);
         }
         let blob = mail
@@ -4124,6 +4142,90 @@ fn unix_to_system_time(timestamp: i64) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn attachment_account(max: Option<usize>) -> MailAccount<SendTransport> {
+        let mut session = serde_json::to_value(search_session()).expect("session serializes");
+        let core = session["capabilities"]["urn:ietf:params:jmap:core"]
+            .as_object_mut()
+            .expect("core object");
+        if let Some(max) = max {
+            core.insert("maxSizeUpload".to_string(), serde_json::json!(max));
+        } else {
+            core.remove("maxSizeUpload");
+        }
+        let client = crate::client::Client::with_transport(
+            SendTransport::new(false, false, false, false),
+            serde_json::from_value(session).expect("session parses"),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        crate::account::Account::new(client, "primary")
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_stops_polling_at_the_first_oversize_chunk() {
+        for chunks in [vec!["four"], vec!["ab", "cd"]] {
+            let prefix = futures::stream::iter(
+                chunks
+                    .into_iter()
+                    .map(|chunk| Ok(Bytes::from_static(chunk.as_bytes()))),
+            );
+            let tail = futures::stream::poll_fn(|_| {
+                panic!("oversize upload must not poll another chunk")
+            });
+            let error = attachment_upload(
+                attachment_account(Some(3)),
+                Box::pin(prefix.chain(tail)),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect_err("oversize stream is refused before it is drained");
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed,
+                ),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_requires_the_limit_before_polling_input() {
+        let input = futures::stream::poll_fn(|_| {
+            panic!("invalid session must not poll the caller's input")
+        });
+        let error = attachment_upload(
+            attachment_account(None),
+            Box::pin(input),
+            "text/plain".to_string(),
+        )
+        .await
+        .expect_err("missing upload limit is a session contract violation");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation,
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_accepts_the_exact_limit_and_empty_zero_limit() {
+        for (max, chunks) in [(4, vec!["ab", "cd"]), (0, vec![])] {
+            let input = futures::stream::iter(
+                chunks
+                    .into_iter()
+                    .map(|chunk| Ok(Bytes::from_static(chunk.as_bytes()))),
+            );
+            attachment_upload(
+                attachment_account(Some(max)),
+                Box::pin(input),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("upload within the advertised limit succeeds");
+        }
+    }
 
     fn mailbox_json(id: &str, parent: Option<&str>, rights: serde_json::Value) -> Mailbox {
         let mut value = serde_json::json!({

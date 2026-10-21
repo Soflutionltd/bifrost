@@ -28,8 +28,9 @@ pub(crate) enum GraphError {
 
     /// Transport / retry / auth-loss / rate-limit failure surfaced by
     /// `bifrost-net`. The original error is preserved so the account
-    /// boundary can delegate to `bifrost_net::into_account_error` with
-    /// Graph context.
+    /// boundary can classify net evidence through
+    /// `bifrost_net::into_account_error_with_throttle_scope` with Graph
+    /// context and an explicit account throttle scope.
     Net(bifrost_net::Error),
 
     /// Graph returned a non-success status. The response is parsed

@@ -54,12 +54,4 @@ Durable completion markers for scopes not in the registry survive the reset. A
 complete fix needs writer or store support for an account-wide reset or durable
 enumeration; the limitation is documented in the reference.
 
-## SYNC-019 - Docs miscount and under-list inventory removals
-
-Laterals from the removal-filter work. The `BackfillPartitionOutcome` docs in
-`crates/sync/src/backfill/runner.rs` describe `seen` as entries, but the runner
-counts entries plus removals while `kept` counts entries only. The
-`InventoryBatch` docs in `crates/types/src/events.rs` omit `FolderType` from
-the scopes whose removals drop membership, although the projection and
-`reference/sync.md` include it.
 

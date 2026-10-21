@@ -48,7 +48,8 @@ pub(crate) fn session_state_changed() -> AccountError {
 /// 8620 §2 makes them mandatory members of. That is a
 /// `Protocol(ContractViolation)`: the server claimed conformance and then
 /// lied about, or withheld, the lower bounds the spec requires it to
-/// advertise. It is not a capability change.
+/// advertise. An omitted `maxSizeUpload` takes the same lane, while zero
+/// is a valid upload size limit. It is not a capability change.
 fn unusable_core_limits() -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
@@ -102,6 +103,18 @@ fn malformed_required_capability(uri: &str) -> AccountError {
 }
 
 use crate::core::session::Session;
+
+/// RFC 8620 section 2 requires maxSizeUpload. Zero permits only empty files;
+/// the suggested minimum is not a mandatory lower bound.
+pub(crate) fn upload_size_limit(session: &Session) -> Result<usize, AccountError> {
+    match session.core_capability_state() {
+        crate::core::session::CoreCapabilityState::Absent => Err(missing_core_capability()),
+        crate::core::session::CoreCapabilityState::Malformed => Err(malformed_core_capability()),
+        crate::core::session::CoreCapabilityState::Present(core) => {
+            core.max_size_upload().ok_or_else(unusable_core_limits)
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CoreLimits {
@@ -159,6 +172,7 @@ pub(crate) fn validate_session(session: &Session) -> Result<CoreLimits, AccountE
         crate::core::session::CoreCapabilityState::Present(core) => core,
     };
 
+    upload_size_limit(session)?;
     let usable = |limit: Option<usize>| limit.is_some_and(|value| value > 0);
     if !usable(core.max_calls_in_request())
         || !usable(core.max_objects_in_get())
@@ -805,7 +819,7 @@ mod tests {
 
     /// An OMITTED mandatory limit is not an advertised zero, but it is
     /// equally unusable, and blanket `#[serde(default)]` zero-filling used
-    /// to erase the difference. Each of the four must be refused when it
+    /// to erase the difference. Each required limit must be refused when it
     /// is missing entirely - and refused as a contract violation, since
     /// RFC 8620 §2 makes every one of them a mandatory member.
     #[test]
@@ -815,6 +829,7 @@ mod tests {
             "maxObjectsInGet",
             "maxObjectsInSet",
             "maxSizeRequest",
+            "maxSizeUpload",
         ] {
             let mut core = serde_json::json!({
                 "maxSizeUpload": 1000,
@@ -836,6 +851,19 @@ mod tests {
                 "omitted {field}"
             );
         }
+    }
+
+    #[test]
+    fn zero_upload_size_is_a_valid_limit() {
+        let session = session_with_core(serde_json::json!({
+            "maxSizeUpload": 0,
+            "maxSizeRequest": 100_000,
+            "maxCallsInRequest": 8,
+            "maxObjectsInGet": 256,
+            "maxObjectsInSet": 256
+        }));
+        validate_session(&session).expect("zero only disallows nonempty uploads");
+        assert_eq!(upload_size_limit(&session).expect("required limit"), 0);
     }
 
     /// A session document with a legal core block plus whatever other

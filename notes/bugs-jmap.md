@@ -22,8 +22,12 @@ Severity labels are the hunters' own.
 Residue: the handshake now sends trace context through net's public
 `trace::current_traceparent()`. It still opens a direct TCP connection, because
 reqwest owns implicit proxy selection and `bifrost-net` has no shared proxy
-resolver or tunnel connector the handshake could use. Documented at the code
-site and in both references.
+resolver or tunnel connector the handshake could use. A fix also needs the
+HTTP transport's `AccountNet`, private to `ReqwestTransport` in
+`crates/jmap/src/transport_reqwest.rs`: a separate `Net` or a fresh environment
+lookup cannot preserve an injected `Net`'s proxy selection. A fixer needs
+`crates/net`, `client_ws.rs` and `transport_reqwest.rs` together. Documented at
+the code site and in both references.
 
 ## JMAP-034 - The PIM send path as a state machine with compensations
 
@@ -35,11 +39,9 @@ The PIM send path as a small state machine with compensations (create email ->
 submit -> on failure destroy; cancel -> confirm -> create) instead of single
 batched requests whose partial outcomes read as total failure.
 
-## JMAP-037 - Upload size limits do not bound buffering, and may be absent
+## JMAP-038 - Session validation skips other RFC-required core capability fields
 
-Laterals from the upload-limit work. `upload_to` now refuses a body over
-`maxSizeUpload` before transport, but `sync/pim.rs` `attachment_upload` buffers
-the whole input stream first, so the check stops an oversized network upload
-without limiting peak memory. And `validate_session` (`sync/capabilities.rs`)
-does not require `maxSizeUpload`, so when a server omits it uploads have no
-local size ceiling at all.
+Lateral from the upload-limit work. `validate_session` in
+`crates/jmap/src/sync/capabilities.rs` now requires `maxSizeUpload`, but RFC
+8620 section 2 also requires `maxConcurrentUpload`, `maxConcurrentRequests` and
+`collationAlgorithms`, and their absence is not refused.

@@ -130,7 +130,12 @@ impl RedirectPolicy {
 
     /// True iff `host` is acceptable as a cross-host redirect
     /// target. When the allowlist is empty, every host is
-    /// acceptable.
+    /// acceptable unless `same_origin_only` is set. In that mode this
+    /// returns false for every host, including the departing host: a host
+    /// alone cannot establish equality of scheme and effective port.
+    /// This predicate does not decide same-origin hops; the redirect
+    /// classifier admits those before consulting this cross-host rule. Use
+    /// [`Self::admits_hop`] when both URLs are available.
     #[must_use]
     pub fn allows_host(&self, host: &str) -> bool {
         if self.same_origin_only {
@@ -149,7 +154,8 @@ impl RedirectPolicy {
     /// A same-origin hop is always admitted; the allowlist governs
     /// cross-origin hops only. `prior` is `None` when the departing URL
     /// is unknown, which is treated conservatively as cross-origin.
-    fn admits_hop(&self, prior: Option<&reqwest::Url>, next: &reqwest::Url) -> bool {
+    #[must_use]
+    pub fn admits_hop(&self, prior: Option<&reqwest::Url>, next: &reqwest::Url) -> bool {
         if prior.is_some_and(|prior| same_origin(prior, next)) {
             return true;
         }

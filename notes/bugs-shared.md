@@ -64,26 +64,4 @@ Removing a published variant needs the owner. The `IdempotencyKey` doc in
 `crates/types/src/mutation.rs` still contrasts itself with `StateBased` as
 "optimistic concurrency on the wire".
 
-## SHARED-018 - `RedirectPolicy::allows_host` changed meaning under same-origin mode
-
-Lateral from the same-origin redirect work. The published
-`RedirectPolicy::allows_host` now returns `false` for every host, the departing
-one included, when `same_origin_only` is set, while `admits_hop` admits
-same-origin hops. A caller using `allows_host` as a standalone predicate gets a
-different answer than redirect classification does. At minimum the method doc
-must say so; better, make `allows_host` agree with the hop rule.
-
-## SHARED-008 - Comments and references still name the deleted net throttle API
-
-Residue: net's provider throttle inference, its `into_account_error` wrapper
-and `parse_retry_after` are deleted and SMTP passes an explicit policy. Stale
-comments still name the removed API in `crates/jmap/src/core/transport.rs`,
-`crates/jmap/src/transport_reqwest.rs`, `crates/jmap/src/sync/error.rs`,
-`crates/dav-core/src/dispatch.rs`, `crates/dav-core/src/error.rs`,
-`crates/graph/src/account/graph_error.rs`, `crates/graph/src/ews/mod.rs`,
-`crates/graph/src/ews/client.rs`, `crates/graph/src/error.rs`,
-`crates/google/src/account/error.rs` and `crates/google/src/error.rs`, and in
-the CalDAV, CardDAV, JMAP and Graph references (`reference/graph.md` has
-several, including `bifrost_net::parse_retry_after`). Grep for the removed
-names rather than trusting this list.
 

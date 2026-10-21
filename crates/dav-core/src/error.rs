@@ -203,7 +203,8 @@ pub fn parse_error(
 /// `Reconcile(CheckTarget)` and sent the consumer probing for a resource that was
 /// never written; `Unsent` derives `Retry(SameRequest)`, which is what a failed
 /// token read deserves. Wire-level transmission evidence comes from
-/// `bifrost_net::into_account_error`, which carries the state the transport
+/// `bifrost_net::into_account_error_with_throttle_scope`, called with DAV's
+/// explicit account throttle policy, which carries the state the transport
 /// actually observed.
 #[must_use]
 pub fn transport_error(

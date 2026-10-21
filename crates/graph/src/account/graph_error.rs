@@ -2,9 +2,10 @@
 //!
 //! Every Graph-side failure that leaves a streaming helper or
 //! `Account` method passes through `into_account_error` (REST) or
-//! `ews_error_to_account_error` (EWS). Transport variants delegate to
-//! `bifrost_net::into_account_error` with Graph provider/protocol
-//! context. Graph response variants build the `AccountError` directly
+//! `ews_error_to_account_error` (EWS). Transport variants use
+//! `bifrost_net::into_account_error_with_throttle_scope` with Graph
+//! provider/protocol context and an explicit account throttle scope.
+//! Graph response variants build the `AccountError` directly
 //! through `AccountErrorBuilder`, classified by the typed
 //! `GraphSignal`. No path in this module looks at `error.message` text
 //! for control flow.
@@ -206,8 +207,9 @@ fn internal(kind: InternalErrorKind, message: String, ctx: &GraphErrorContext) -
 /// `bifrost-net` never hands a 4xx or 5xx back as a response: the retry
 /// loop converts it into `Status`, `RateLimited`, or
 /// `RetryBudgetExhausted` with the body preserved. Delegating those
-/// straight to `bifrost_net::into_account_error` classifies them on the
-/// HTTP status alone and throws Graph's typed `error.code` away, so the
+/// straight to `bifrost_net::into_account_error_with_throttle_scope` with
+/// Graph's explicit account throttle scope classifies them on the HTTP
+/// status alone and throws Graph's typed `error.code` away, so the
 /// whole `GraphSignal` table below applied only to `$batch` subresponses
 /// and never to an ordinary REST call: a 400 `InvalidDeltaToken` - the
 /// documented delta-expiry signal - landed on `Request(Malformed)` ->
@@ -318,8 +320,9 @@ fn apply_idempotency_override(error: AccountError, ctx: &GraphErrorContext) -> A
 
 /// Convert a structured `EwsError` into the opaque `AccountError`.
 /// Stamps `Protocol::Ews` on every produced error and delegates
-/// transport variants to `bifrost_net::into_account_error` with the
-/// EWS context so the recovery taxonomy is identical to REST.
+/// transport variants to `bifrost_net::into_account_error_with_throttle_scope`
+/// with the EWS context and explicit account throttle scope so the recovery
+/// taxonomy is identical to REST.
 #[must_use]
 pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext) -> AccountError {
     debug_assert!(matches!(ctx.protocol, Protocol::Ews));

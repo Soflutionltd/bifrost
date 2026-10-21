@@ -329,8 +329,9 @@ impl std::error::Error for BatchBoundaryError {}
 pub struct InventoryBatch {
     pub items: Vec<InventoryEntry>,
     /// Objects removed from this inventory scope. Apply with the entries and
-    /// accepted page checkpoint in one consumer transaction. Folder and query
-    /// scopes remove membership; account and type scopes remove the object.
+    /// accepted page checkpoint in one consumer transaction. Folder and
+    /// folder-type scopes remove folder membership; query scopes remove query
+    /// membership. Account and type scopes remove the object.
     /// Providers without inventory tombstones leave this empty.
     pub removed: Vec<ObjectId>,
     pub page_boundary: PageBoundary,
