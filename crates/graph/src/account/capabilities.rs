@@ -39,7 +39,10 @@ pub(crate) fn build_capabilities(
             PushMode::EwsStreaming => PushCapability::InProcess,
         },
         mutation: MutationCapabilities {
-            concurrency: MutationConcurrency::StateBased,
+            concurrency: MutationConcurrency::ExpectedVersion {
+                contact_update: true,
+                event_update: true,
+            },
             replay_safety: MutationReplaySafety::None,
         },
         batching_policy: BatchingPolicy {
@@ -182,7 +185,13 @@ mod tests {
         assert_eq!(caps.blob_range, BlobRangeSupport::Conditional);
         assert_eq!(caps.push, PushCapability::WebhookOrEwsStream);
         assert!(!caps.push_in_process());
-        assert_eq!(caps.mutation.concurrency, MutationConcurrency::StateBased);
+        assert_eq!(
+            caps.mutation.concurrency,
+            MutationConcurrency::ExpectedVersion {
+                contact_update: true,
+                event_update: true
+            }
+        );
         assert_eq!(caps.batching_policy.max_items, 20);
         assert!(caps.delta_token_expires_after.is_none());
     }

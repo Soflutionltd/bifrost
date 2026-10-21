@@ -1201,6 +1201,18 @@ impl Account for CardDavAccount {
         let client = Arc::clone(&self.client);
         let default_addressbook_url = self.default_addressbook_url.clone();
         Box::pin(async move {
+            let expected_etag = patch
+                .expected_version
+                .as_ref()
+                .map(|version| {
+                    version.expected_etag(
+                        bifrost_types::error::Protocol::CardDav,
+                        AccountOperation::ContactUpdate,
+                        true,
+                    )
+                })
+                .transpose()?;
+
             client.refuse_directory_access(
                 &client.resolve_url(&contact.0),
                 AccountOperation::ContactUpdate,
@@ -1229,6 +1241,9 @@ impl Account for CardDavAccount {
                 .as_ref()
                 .map(|target| client.resolve_url(&target.0))
                 .filter(|target| !same_collection_url(target, &addressbook));
+            if expected_etag.is_some() && relocation.is_some() {
+                return Err(unsupported_error(AccountOperation::ContactUpdate));
+            }
             let raw =
                 Self::fetch_contact_resource(&client, &contact, AccountOperation::ContactUpdate)
                     .await?;
@@ -1247,7 +1262,10 @@ impl Account for CardDavAccount {
                     .put_vcard(
                         &url,
                         data,
-                        put_condition(current.etag.as_deref()),
+                        expected_etag.map_or_else(
+                            || put_condition(current.etag.as_deref()),
+                            PutCondition::IfMatch,
+                        ),
                         AccountOperation::ContactUpdate,
                     )
                     .await
@@ -1553,6 +1571,7 @@ fn unsupported_stream<T: Send + 'static>(
 fn patch_changes_content(patch: &ContactPatch) -> bool {
     let content = ContactPatch {
         address_book_id: None,
+        expected_version: None,
         ..patch.clone()
     };
     content != ContactPatch::default()

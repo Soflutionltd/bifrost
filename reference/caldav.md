@@ -721,9 +721,18 @@ Supported calendar primitives:
   projected through the tzdb; an unknown zone falls back to the UTC wall
   clock): emitting the UTC wall clock under a TZID would shift the event by
   the zone offset on the wire.
-- `event_update` - fetches the current event, applies the shared
-  `EventPatch`, and writes the replacement resource with `If-Match`
-  when a strong etag was present.
+- `event_update` - fetches the current resource to preserve its content and
+  applies `EventPatch`. `expected_version: Some(ServerVersion::ETag(...))`
+  sends the caller's strong validator as `If-Match`, accepting the unquoted
+  strong ETags returned by DAV reads. A stale validator produces
+  `ConcurrencyConflict`. Weak validators and other token kinds are refused
+  as `Unsupported`; they never degrade to unconditional writes. With no caller
+  version the existing fresh-read strong ETag guard is retained. With a caller
+  version the fresh read supplies content only.
+  Versioned relocations are refused before I/O because the MOVE fallback
+  cannot preserve the guard across its multiple writes. Capabilities advertise
+  `MutationConcurrency::ExpectedVersion` for this update door only. Delete
+  still has no caller-version input.
 
   **A cross-calendar move is PERFORMED.** A `calendar_id` differing from the
   event's own collection (derived by `event_calendar_url`) relocates the

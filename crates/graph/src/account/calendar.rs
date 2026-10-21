@@ -301,9 +301,15 @@ pub(crate) async fn update(
     }
     let (event_calendar_id, native_event_id) = split_event_id(&event.0, operation)?;
     reject_calendar_move(&patch, &event_calendar_id)?;
-    // This public door has no expected-version input. The fetched change key
-    // only guards the interval between this GET and PATCH; it cannot detect a
-    // caller's stale read from before this method began.
+    let etag = patch
+        .expected_version
+        .as_ref()
+        .map(|version| {
+            version.expected_etag(bifrost_types::error::Protocol::Graph, operation, false)
+        })
+        .transpose()?;
+    // Recurrence serialization may need the existing series anchor. This
+    // read supplies content only; it never replaces the caller's validator.
     let current = fetch_graph_event(&account, &event_calendar_id, &native_event_id).await?;
     let series = CurrentSeries {
         recurrence: current.recurrence.as_ref(),
@@ -311,15 +317,12 @@ pub(crate) async fn update(
     };
     let body = graph_event_from_patch(&patch, series)?;
     let path = event_url(&account, &event_calendar_id, &native_event_id);
-    // `changeKey` is the opaque payload of Graph's weak entity-tag, not an
-    // HTTP entity-tag by itself.
-    let etag = current
+    let legacy_etag = current
         .change_key
         .as_deref()
         .map(super::inventory::graph_change_key_etag);
-    // Without a change key there is no conditional version to send, so keep
-    // the provider's current unconditional-write behavior.
-    let result = if let Some(etag) = etag.as_deref() {
+    let etag = etag.or(legacy_etag.as_deref());
+    let result = if let Some(etag) = etag {
         account
             .client
             .patch_if_match(Resource::Outlook, &path, etag, &body)
@@ -2451,6 +2454,54 @@ mod tests {
         GraphDateTime {
             date_time: Some(value.to_string()),
             time_zone: Some("UTC".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_event_version_is_not_replaced_by_the_content_read() {
+        for expected in [Some("W/\"stale\""), None] {
+            let client = crate::client::GraphClient::new("token");
+            client.script_rest([
+                crate::client::ScriptedRestResponse::json(
+                    reqwest::StatusCode::OK,
+                    serde_json::json!({"id": "event-1", "changeKey": "fresh"}),
+                ),
+                crate::client::ScriptedRestResponse::empty(if expected.is_some() {
+                    reqwest::StatusCode::PRECONDITION_FAILED
+                } else {
+                    reqwest::StatusCode::NO_CONTENT
+                }),
+            ]);
+            let account = GraphAccount::new_for_tests(
+                client.clone(),
+                super::super::PushMode::GraphSubscriptions,
+            );
+            let result = update(
+                account,
+                EventId("cal::event-1".into()),
+                EventPatch {
+                    expected_version: expected
+                        .map(|etag| bifrost_types::ServerVersion::ETag(etag.into())),
+                    title: Some(Some("changed".into())),
+                    ..Default::default()
+                },
+            )
+            .await;
+            if expected.is_some() {
+                assert_eq!(
+                    *result.unwrap_err().kind(),
+                    bifrost_types::AccountErrorKind::ConcurrencyConflict
+                );
+            } else {
+                result.expect("an absent version keeps ordinary writes working");
+            }
+            let requests = client.take_rest_requests();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1].method, "PATCH");
+            assert_eq!(
+                requests[1].if_match.as_deref(),
+                expected.or(Some("W/\"fresh\""))
+            );
         }
     }
 

@@ -1029,6 +1029,111 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn unenforceable_event_versions_are_refused_before_io() {
+        use bifrost_types::account::Account as _;
+
+        for (version, moving) in [
+            (
+                bifrost_types::ServerVersion::ETag("W/\"weak\"".into()),
+                false,
+            ),
+            (bifrost_types::ServerVersion::ModSeq(1), false),
+            (bifrost_types::ServerVersion::ETag("strong".into()), true),
+        ] {
+            let script = dav_script_empty();
+            let client = Arc::new(CalDavClient::with_account_net(
+                "https://dav.example.test",
+                scripted_dav_net(&script),
+            ));
+            let account =
+                crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/book/");
+            let error = account
+                .event_update(
+                    bifrost_types::EventId("https://dav.example.test/book/one".into()),
+                    bifrost_types::EventPatch {
+                        expected_version: Some(version),
+                        calendar_id: moving.then(|| {
+                            bifrost_types::CalendarId("https://dav.example.test/other/".into())
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                *error.kind(),
+                bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+            );
+            assert!(transcripts(&script).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_event_version_controls_the_put() {
+        use bifrost_types::account::Account as _;
+
+        for expected in [Some("stale"), None] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "etag",
+                reqwest::header::HeaderValue::from_static("\"fresh\""),
+            );
+            let script = dav_script([
+                DavResponse {
+                    status: StatusCode::OK,
+                    headers,
+                    body: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:One\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".to_string(),
+                    url: String::new(),
+                },
+                DavResponse {
+                    status: if expected.is_some() { StatusCode::PRECONDITION_FAILED } else { StatusCode::NO_CONTENT },
+                    headers: HeaderMap::new(),
+                    body: String::new(),
+                    url: String::new(),
+                },
+            ]);
+            let client = Arc::new(CalDavClient::with_account_net(
+                "https://dav.example.test",
+                scripted_dav_net(&script),
+            ));
+            let account =
+                crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/book/");
+            let result = account
+                .event_update(
+                    bifrost_types::EventId("https://dav.example.test/book/one.ics".into()),
+                    bifrost_types::EventPatch {
+                        expected_version: expected
+                            .map(|etag| bifrost_types::ServerVersion::ETag(etag.into())),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if expected.is_some() {
+                assert_eq!(
+                    *result.unwrap_err().kind(),
+                    bifrost_types::AccountErrorKind::ConcurrencyConflict
+                );
+            } else {
+                result.expect("an absent version keeps ordinary writes working");
+            }
+            let requests = transcripts(&script);
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1].method.as_str(), "PUT");
+            assert_eq!(
+                requests[1]
+                    .headers
+                    .get("If-Match")
+                    .and_then(|value| value.to_str().ok()),
+                Some(if expected.is_some() {
+                    "\"stale\""
+                } else {
+                    "\"fresh\""
+                })
+            );
+        }
+    }
+
     /// A create-PUT must not be replayed after a mid-flight drop.
     ///
     /// Twin of `bifrost-carddav`'s

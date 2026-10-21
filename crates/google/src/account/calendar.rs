@@ -199,6 +199,12 @@ pub(crate) fn update(
     patch: EventPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        if patch.expected_version.is_some() {
+            return Err(AccountError::unsupported(
+                AccountOperation::EventUpdate,
+                bifrost_types::error::Protocol::Gmail,
+            ));
+        }
         let (mut calendar_id, native_event_id) =
             split_event_id(&event.0, AccountOperation::EventUpdate)?;
         let has_field_patch = event_patch_has_non_move_fields(&patch);
@@ -1598,6 +1604,26 @@ mod tests {
         .expect_err("missing start should fail");
 
         assert_eq!(error.operation(), Some(AccountOperation::EventGet));
+    }
+
+    #[tokio::test]
+    async fn caller_event_versions_are_refused_before_io() {
+        let (client, script) = scripted_client(Vec::new());
+        let error = update(
+            client,
+            EventId("calendar::one".into()),
+            EventPatch {
+                expected_version: Some(bifrost_types::ServerVersion::ETag("\"old\"".into())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            *error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+        );
+        assert!(script.requests().is_empty());
     }
 
     #[tokio::test]

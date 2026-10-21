@@ -65,10 +65,16 @@ pub enum PushCapability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MutationConcurrency {
-    /// JMAP `ifInState`, Graph `If-Match: <etag>`, IMAP
-    /// `STORE UNCHANGEDSINCE`.
+    /// Legacy provider-observed state guards, without a caller-version guarantee.
     StateBased,
-    /// No protocol-level concurrency control. Last write wins.
+    /// Caller versions are enforced for the named update doors. Other doors
+    /// have no caller-version guarantee. DAV relocation with a version is
+    /// refused because its multi-request fallback cannot preserve the guard.
+    ExpectedVersion {
+        contact_update: bool,
+        event_update: bool,
+    },
+    /// No caller-version concurrency control. Supplied versions are refused.
     None,
 }
 

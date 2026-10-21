@@ -156,6 +156,12 @@ pub(crate) fn update<T: HttpTransport>(
     patch: ContactPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        if patch.expected_version.is_some() {
+            return Err(AccountError::unsupported(
+                AccountOperation::ContactUpdate,
+                bifrost_types::error::Protocol::Jmap,
+            ));
+        }
         let contacts = require_contacts(contacts, AccountOperation::ContactUpdate)?;
         if patch.photo.is_some() {
             return Err(unsupported(
@@ -1264,6 +1270,26 @@ mod tests {
             "state": "session-1"
         }))
         .expect("session parses")
+    }
+
+    #[tokio::test]
+    async fn caller_contact_versions_are_refused_before_io() {
+        let transport = ScriptedQueryTransport::new(Vec::new());
+        let error = update(
+            Some(transport.account()),
+            ContactId("one".into()),
+            ContactPatch {
+                expected_version: Some(bifrost_types::ServerVersion::StateAt("old".into())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            *error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::ContactUpdate)
+        );
+        assert!(transport.calls().is_empty());
     }
 
     /// The happy path, and the only shape a continuation is allowed to

@@ -1108,6 +1108,18 @@ impl Account for CalDavAccount {
         let client = Arc::clone(&self.client);
         let default_calendar_url = self.default_calendar_url.clone();
         Box::pin(async move {
+            let expected_etag = patch
+                .expected_version
+                .as_ref()
+                .map(|version| {
+                    version.expected_etag(
+                        bifrost_types::error::Protocol::CalDav,
+                        AccountOperation::EventUpdate,
+                        true,
+                    )
+                })
+                .transpose()?;
+
             let (resource, instance) = split_event_id(&event.0);
             let url = client.resolve_url(resource);
             // A `calendar_id` naming a collection other than the event's own is
@@ -1129,6 +1141,9 @@ impl Account for CalDavAccount {
                      calendar: the move would relocate the whole series resource",
                 ));
             }
+            if expected_etag.is_some() && relocation.is_some() {
+                return Err(unsupported_error(AccountOperation::EventUpdate));
+            }
             let current = Self::fetch_event_from_url(
                 Arc::clone(&client),
                 default_calendar_url,
@@ -1144,7 +1159,10 @@ impl Account for CalDavAccount {
                     .put_event(
                         &url,
                         body,
-                        put_condition(current.etag.as_deref()),
+                        expected_etag.map_or_else(
+                            || put_condition(current.etag.as_deref()),
+                            PutCondition::IfMatch,
+                        ),
                         AccountOperation::EventUpdate,
                     )
                     .await?;
@@ -1554,6 +1572,7 @@ fn rsvp_local_write_error(error: AccountError) -> AccountError {
 fn patch_changes_content(patch: &EventPatch) -> bool {
     let content = EventPatch {
         calendar_id: None,
+        expected_version: None,
         ..patch.clone()
     };
     content != EventPatch::default()

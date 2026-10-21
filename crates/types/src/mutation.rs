@@ -21,7 +21,7 @@ use crate::ids::{ObjectId, RunId};
 pub enum ServerVersion {
     /// IMAP CONDSTORE / QRESYNC per-message MODSEQ.
     ModSeq(u64),
-    /// Microsoft Graph entity tag.
+    /// HTTP entity tag, including Graph wire tags and DAV normalized tags.
     ETag(String),
     /// Gmail historyId snapshot covering this item.
     HistoryAt(u64),
@@ -29,6 +29,46 @@ pub enum ServerVersion {
     StateAt(String),
     /// IMAP Basic, or any protocol without a server version stamp.
     Unavailable,
+}
+
+impl ServerVersion {
+    /// Validate a caller version for an entity-tag conditional update.
+    ///
+    /// DAV accepts its normalized unquoted strong ETags as well as wire ETags.
+    /// Unsupported token kinds and weak DAV
+    /// validators are refused locally rather than downgraded to a blind write.
+    pub fn expected_etag(
+        &self,
+        protocol: crate::error::Protocol,
+        operation: crate::error::AccountOperation,
+        strong: bool,
+    ) -> Result<&str, crate::error::AccountError> {
+        if let Self::ETag(etag) = self {
+            let weak = etag
+                .get(..2)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"));
+            if strong
+                && !weak
+                && etag
+                    .bytes()
+                    .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte) || byte >= 0x80)
+            {
+                return Ok(etag);
+            }
+            let value = etag.strip_prefix("W/").unwrap_or(etag);
+            if (!strong || !etag.starts_with("W/"))
+                && value.starts_with('"')
+                && value.ends_with('"')
+                && value.len() >= 2
+                && value[1..value.len() - 1]
+                    .bytes()
+                    .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte) || byte >= 0x80)
+            {
+                return Ok(etag);
+            }
+        }
+        Err(crate::error::AccountError::unsupported(operation, protocol))
+    }
 }
 
 /// Cross-protocol inventory diff fingerprint. The consumer compares
@@ -305,6 +345,46 @@ impl FlagOp {
 mod tests {
     use super::{FlagOp, FlagOpValidationError, canonical_flags_hash};
     use std::collections::HashSet;
+
+    #[test]
+    fn caller_etags_cannot_turn_into_a_blind_or_wildcard_condition() {
+        use super::ServerVersion;
+        use crate::error::{AccountErrorKind, AccountOperation, Protocol};
+
+        let operation = AccountOperation::ContactUpdate;
+        for version in [
+            ServerVersion::Unavailable,
+            ServerVersion::ModSeq(1),
+            ServerVersion::ETag("W/\"weak\"".into()),
+            ServerVersion::ETag("w/\"weak\"".into()),
+            ServerVersion::ETag("bad\r\nvalue".into()),
+        ] {
+            assert_eq!(
+                *version
+                    .expected_etag(Protocol::CardDav, operation, true)
+                    .unwrap_err()
+                    .kind(),
+                AccountErrorKind::Unsupported(operation)
+            );
+        }
+        assert_eq!(
+            ServerVersion::ETag("normalized".into())
+                .expected_etag(Protocol::CardDav, operation, true)
+                .unwrap(),
+            "normalized"
+        );
+        assert!(
+            ServerVersion::ETag("*".into())
+                .expected_etag(Protocol::Graph, operation, false)
+                .is_err()
+        );
+        assert_eq!(
+            ServerVersion::ETag("W/\"opaque\"".into())
+                .expected_etag(Protocol::Graph, operation, false)
+                .unwrap(),
+            "W/\"opaque\""
+        );
+    }
 
     #[test]
     fn canonical_flag_hash_ignores_order_case_and_duplicates() {

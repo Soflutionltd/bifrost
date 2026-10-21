@@ -53,6 +53,17 @@ and carries peer-timeout state, and SMTP's also serves blocking I/O with
 runtime-independent admission, so they were kept with comments; collapsing them
 onto the shared stream needs those two behaviours to move into it.
 
+## SHARED-017 - `MutationConcurrency::StateBased` has no producer left
+
+**Awaiting the owner** (2026-10-21): keep or remove is the owner's decision,
+to be made later. Not for a fixer.
+
+Lateral from the caller-version work. JMAP, CalDAV, CardDAV and Graph moved off
+`MutationConcurrency::StateBased`, so no provider in the workspace advertises it.
+Removing a published variant needs the owner. The `IdempotencyKey` doc in
+`crates/types/src/mutation.rs` still contrasts itself with `StateBased` as
+"optimistic concurrency on the wire".
+
 ## SHARED-008 - Comments and references still name the deleted net throttle API
 
 Residue: net's provider throttle inference, its `into_account_error` wrapper

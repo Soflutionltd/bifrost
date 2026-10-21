@@ -3788,3 +3788,11 @@ downstream constructing one. `BackfillConfig` gained `lane_capacity`, and
 `WriterRequest` a `DiscardBackfillProgress` variant (crate-internal - that enum
 is not re-exported). Everything else the lane work touched is `pub(crate)` or
 narrower.
+
+## Caller versions on PIM updates
+
+Contact and event update patches forward optional `expected_version` intact to
+the account. `MutationConcurrency::ExpectedVersion` identifies the individual
+update doors that enforce it. `StateBased` retains its legacy meaning of
+provider-observed guards; it is not a caller-version promise. Bulk mutation
+inputs and delete methods do not yet carry caller versions.

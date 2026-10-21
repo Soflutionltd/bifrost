@@ -38,6 +38,24 @@ pub(crate) fn build_capabilities(
     let has_thread_references = profile.capabilities.iter().any(
         |cap| matches!(cap, Capability::Thread(alg) if alg.eq_ignore_ascii_case("REFERENCES")),
     );
+    let contact_update = contacts.is_some_and(|caps| {
+        matches!(
+            caps.mutation.concurrency,
+            MutationConcurrency::ExpectedVersion {
+                contact_update: true,
+                ..
+            }
+        )
+    });
+    let event_update = calendars.is_some_and(|caps| {
+        matches!(
+            caps.mutation.concurrency,
+            MutationConcurrency::ExpectedVersion {
+                event_update: true,
+                ..
+            }
+        )
+    });
     AccountCapabilities {
         cursor_freshness: CursorFreshness::Hybrid,
         // IMAP can fetch a BODY[] section by range, but this account does
@@ -52,7 +70,14 @@ pub(crate) fn build_capabilities(
             PushCapability::None
         },
         mutation: MutationCapabilities {
-            concurrency: MutationConcurrency::None,
+            concurrency: if contact_update || event_update {
+                MutationConcurrency::ExpectedVersion {
+                    contact_update,
+                    event_update,
+                }
+            } else {
+                MutationConcurrency::None
+            },
             replay_safety: MutationReplaySafety::None,
         },
         batching_policy: BatchingPolicy {
@@ -164,6 +189,39 @@ pub(crate) fn build_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caller_version_capabilities_follow_the_composed_update_doors() {
+        let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
+        for (contact_update, event_update) in [(true, false), (false, true), (true, true)] {
+            let mut contacts = crate::account::test_support::stub_capabilities();
+            contacts.mutation.concurrency = MutationConcurrency::ExpectedVersion {
+                contact_update,
+                event_update: false,
+            };
+            let mut calendars = crate::account::test_support::stub_capabilities();
+            calendars.mutation.concurrency = MutationConcurrency::ExpectedVersion {
+                contact_update: false,
+                event_update,
+            };
+            let caps = build_capabilities(
+                &profile,
+                &[],
+                false,
+                Some(&contacts),
+                Some(&calendars),
+                false,
+                false,
+            );
+            assert_eq!(
+                caps.mutation.concurrency,
+                MutationConcurrency::ExpectedVersion {
+                    contact_update,
+                    event_update,
+                }
+            );
+        }
+    }
 
     #[test]
     fn capability_builder_sets_imap_tier_values() {

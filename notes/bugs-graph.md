@@ -25,19 +25,34 @@ receive Graph's default delta property set. If that set omits `changeKey` or
 `recurrence`, the event fingerprint degrades to `Unavailable`. Hermetic tests
 cannot show which.
 
-## GRAPH-006 - Contact and calendar `If-Match` protects nothing the caller can see
+## GRAPH-006 - Caller-version optimistic concurrency covers only contact and event updates
 
-**Ruled (owner, 2026-10-21), together with IMAP-022:** build caller-version
-optimistic concurrency across providers - an optional
-`expected_version: Option<ServerVersion>` on the shared mutation inputs, used
-when present (`If-Match` on Graph and DAV, `ifInState` on JMAP,
-`UNCHANGEDSINCE` on IMAP), behaviour unchanged when absent, advertised through
-`MutationConcurrency`. Drop the fetch-then-condition dance.
+**Ruled (owner, 2026-10-21), together with IMAP-022:** caller-version
+optimistic concurrency across providers - an optional expected version on the
+shared mutation inputs, enforced natively where present, behaviour unchanged
+when absent, advertised honestly through capabilities.
 
-Contact and calendar writes still fetch the object and
-condition the write on that fresh read, which covers only the milliseconds
-between GET and PATCH; the public methods accept no caller version and delete
-takes only an id. Real optimistic concurrency means threading the caller's etag
-(`ContactCard` / `CalendarEvent`) through the shared patch types and `Account`
-methods. The limit is documented in code and `reference/graph.md`.
+Residue: `ContactPatch` and `EventPatch` carry `expected_version`; Graph and
+both DAV crates enforce it (`If-Match`; DAV refuses weak validators), JMAP and
+Google refuse a supplied version before I/O and advertise no guarantee. Still
+open: deletes (they take only an id), the other mutation inputs, bulk mail
+mutations, IMAP enforcement of a caller MODSEQ (IMAP-022), versioned DAV
+relocations, and whether the absent-version fetch-then-condition path that
+guards only the GET-to-write gap should go.
+
+## GRAPH-013 - Graph calendar update preflight errors are labelled `EventGet`
+
+Lateral from the caller-version work. In `crates/graph/src/account/calendar.rs`
+an update's preflight read failure is attributed to the `EventGet` operation
+rather than the update the caller made, so telemetry and recovery context name
+the wrong operation.
+
+## GRAPH-014 - A versioned Graph contact update that changes folder is not checked
+
+Lateral from the caller-version work. DAV refuses a caller-versioned update that
+relocates the object. A Graph contact update whose `address_book_id` names a
+different folder was not traced: if it moves the contact, the caller's ETag
+guards the PATCH but not the move, and it should be refused the same way.
+Separately, Graph's `expected_etag` accepts `W/"x"` but not lowercase `w/"x"`
+because the weak check is case-insensitive while the strip is not.
 

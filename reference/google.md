@@ -1770,3 +1770,11 @@ Local refusal helpers use `AccountError::unsupported` through the shared error
 funnel, retaining their provider, scope and diagnostic decoration.
 `Account::protocol` returns `Protocol::Gmail`, including for inherited
 default-method refusals.
+
+## Caller versions on contact and event updates
+
+The shared `ContactPatch` and `EventPatch` carry optional `expected_version`.
+These update doors currently refuse supplied versions as `Unsupported` before
+I/O. `MutationConcurrency::None` remains accurate. Native Calendar If-Match and
+People etag wiring need separate implementation; Gmail history IDs are not a
+conditional batchModify primitive. No token is silently ignored.

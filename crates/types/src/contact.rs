@@ -196,6 +196,10 @@ pub struct ContactCreate {
 /// collection when present.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ContactPatch {
+    /// Caller-observed version. Providers must enforce this atomically or
+    /// refuse with `Unsupported`; they must never silently discard it.
+    /// `None` retains the provider's ordinary update behavior.
+    pub expected_version: Option<crate::mutation::ServerVersion>,
     pub address_book_id: Option<AddressBookId>,
     pub display_name: Option<Option<String>>,
     pub emails: Option<Vec<ContactEmail>>,

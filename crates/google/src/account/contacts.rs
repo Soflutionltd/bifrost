@@ -261,6 +261,12 @@ pub(crate) fn update(
     patch: ContactPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        if patch.expected_version.is_some() {
+            return Err(AccountError::unsupported(
+                AccountOperation::ContactUpdate,
+                bifrost_types::error::Protocol::Gmail,
+            ));
+        }
         // Pure-local guards first: fail an invalid request cheaply, before
         // the network GET + etag round trip.
         validate_address_book(
@@ -1359,6 +1365,26 @@ mod tests {
             Arc::new(GmailClient::with_account_net("https://gmail.test", net)),
             script,
         )
+    }
+
+    #[tokio::test]
+    async fn caller_contact_versions_are_refused_before_io() {
+        let (client, script) = scripted_client_steps(Vec::new());
+        let error = update(
+            client,
+            ContactId("calendar::one".into()),
+            ContactPatch {
+                expected_version: Some(bifrost_types::ServerVersion::ETag("\"old\"".into())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            *error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::ContactUpdate)
+        );
+        assert!(script.requests().is_empty());
     }
 
     #[tokio::test]

@@ -1173,3 +1173,11 @@ Local refusal helpers use `AccountError::unsupported` through the shared error
 funnel, retaining their provider, scope and diagnostic decoration.
 `Account::protocol` returns `Protocol::Imap`, including for inherited
 default-method refusals.
+
+## Caller versions on contact and event updates
+
+The shared `ContactPatch` and `EventPatch` carry optional `expected_version`.
+The composed DAV legs forward these patches intact and advertise their
+`ExpectedVersion` update capabilities when present. IMAP mail still advertises
+no caller-version guarantee: bulk targets carry no expected MODSEQ yet, and
+existing cached MODSEQ guards remain opportunistic.

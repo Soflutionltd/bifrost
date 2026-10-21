@@ -196,6 +196,12 @@ pub(crate) fn update<T: HttpTransport>(
     patch: EventPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        if patch.expected_version.is_some() {
+            return Err(AccountError::unsupported(
+                AccountOperation::EventUpdate,
+                bifrost_types::error::Protocol::Jmap,
+            ));
+        }
         let calendars = require_calendars(calendars, AccountOperation::EventUpdate)?;
         let id = CalendarEventId::new(event.0);
         // A patch that changes only the recurrence rule carries neither the
@@ -2228,6 +2234,26 @@ mod tests {
         )
         .expect("client builds");
         JmapProtoAccount::new(client, "primary")
+    }
+
+    #[tokio::test]
+    async fn caller_event_versions_are_refused_before_io() {
+        let transport = ScriptedQueryTransport::new(Vec::new());
+        let error = update(
+            Some(transport.account()),
+            EventId("one".into()),
+            EventPatch {
+                expected_version: Some(bifrost_types::ServerVersion::StateAt("old".into())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            *error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+        );
+        assert!(transport.calls().is_empty());
     }
 
     /// The server total counts the unfiltered query result, so it is not

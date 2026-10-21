@@ -171,12 +171,19 @@ pub(crate) async fn update(
                 .expect("valid account error classification"),
         );
     }
-    // This public door has no expected-version input. The fetched etag only
-    // guards the interval between this GET and PATCH; it cannot detect a
-    // caller's stale read from before this method began. Graph omitting an
-    // etag still leaves this write unconditional.
-    let current = get(account.clone(), contact.clone()).await?;
-    let etag = current.etag.clone();
+    let etag = if let Some(version) = &patch.expected_version {
+        Some(
+            version
+                .expected_etag(
+                    bifrost_types::error::Protocol::Graph,
+                    AccountOperation::ContactUpdate,
+                    false,
+                )?
+                .to_string(),
+        )
+    } else {
+        get(account.clone(), contact.clone()).await?.etag
+    };
     let prefix = account.client.api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&contact.0);
     let path = format!("{prefix}/contacts/{encoded}");
@@ -1353,11 +1360,56 @@ mod tests {
         (client, account)
     }
 
-    /// The account API has no expected-etag parameter for contact writes, so
-    /// each operation can only condition its write on the etag from its own
-    /// preflight read. This pins both update and delete to that narrow guard.
     #[tokio::test]
-    async fn contact_update_and_delete_use_their_immediate_read_etag() {
+    async fn caller_contact_version_is_used_without_a_fresh_read() {
+        for expected in [Some("W/\"stale\""), None] {
+            let (client, account) = test_account();
+            let status = if expected.is_some() {
+                reqwest::StatusCode::PRECONDITION_FAILED
+            } else {
+                reqwest::StatusCode::NO_CONTENT
+            };
+            if expected.is_none() {
+                client.script_rest([
+                    crate::client::ScriptedRestResponse::json(
+                        reqwest::StatusCode::OK,
+                        serde_json::json!({"id": "contact-1", "@odata.etag": "W/\"fresh\""}),
+                    ),
+                    crate::client::ScriptedRestResponse::empty(status),
+                ]);
+            } else {
+                client.script_rest([crate::client::ScriptedRestResponse::empty(status)]);
+            }
+            let result = update(
+                account,
+                ContactId("contact-1".into()),
+                ContactPatch {
+                    expected_version: expected
+                        .map(|etag| bifrost_types::ServerVersion::ETag(etag.into())),
+                    display_name: Some(Some("Ada".into())),
+                    ..Default::default()
+                },
+            )
+            .await;
+            if expected.is_some() {
+                assert_eq!(
+                    *result.unwrap_err().kind(),
+                    bifrost_types::AccountErrorKind::ConcurrencyConflict
+                );
+            } else {
+                result.expect("an absent version keeps ordinary writes working");
+            }
+            let requests = client.take_rest_requests();
+            assert_eq!(requests.len(), if expected.is_some() { 1 } else { 2 });
+            let write = requests.last().unwrap();
+            assert_eq!(write.method, "PATCH");
+            assert_eq!(write.if_match.as_deref(), expected.or(Some("W/\"fresh\"")));
+        }
+    }
+
+    /// Without a caller version, preserve both immediate-read guards.
+    #[tokio::test]
+    async fn unversioned_contact_update_and_delete_keep_their_immediate_read_etag() {
         let client = crate::client::GraphClient::new("token");
         client.script_rest([
             crate::client::ScriptedRestResponse::json(

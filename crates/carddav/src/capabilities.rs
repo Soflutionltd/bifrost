@@ -11,7 +11,10 @@ pub(crate) fn carddav_capabilities() -> AccountCapabilities {
         blob_digest_pre_download: false,
         push: PushCapability::None,
         mutation: MutationCapabilities {
-            concurrency: MutationConcurrency::StateBased,
+            concurrency: MutationConcurrency::ExpectedVersion {
+                contact_update: true,
+                event_update: false,
+            },
             replay_safety: MutationReplaySafety::None,
         },
         batching_policy: BatchingPolicy {
@@ -63,7 +66,13 @@ mod tests {
         assert_eq!(caps.blob_range, BlobRangeSupport::No);
         assert_eq!(caps.push, PushCapability::None);
         assert!(!caps.push_in_process());
-        assert_eq!(caps.mutation.concurrency, MutationConcurrency::StateBased);
+        assert_eq!(
+            caps.mutation.concurrency,
+            MutationConcurrency::ExpectedVersion {
+                contact_update: true,
+                event_update: false
+            }
+        );
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
         assert!(caps.pim_methods.address_books_list);
         assert!(caps.pim_methods.contacts_list);

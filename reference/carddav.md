@@ -390,16 +390,18 @@ Supported contact primitives:
   method and URL against the request transcript.
 - `contact_create` - creates a vCard 4.0 resource with a UUID-backed
   `.vcf` path using `PUT`.
-- `contact_update` - fetches the current vCard, applies the shared
-  `ContactPatch`, preserves unmodeled vCard lines for unrelated field
-  changes, and writes the replacement vCard with `If-Match` when a strong
-  etag was present. Weak ETags retain their `W/` marker for snapshot
-  comparison but make the PUT unconditional because If-Match requires
-  strong comparison (RFC 7232), so a weak validator has no conforming
-  conditional form. Against a server that only ever emits weak ETags this
-  means `contact_update` has no lost-update protection at all; a consumer
-  that needs the guarantee needs an application-level revision check. Inline `ContactPatch.photo` replaces or clears vCard
-  PHOTO data.
+- `contact_update` - fetches the current resource to preserve its content and
+  applies `ContactPatch`. `expected_version: Some(ServerVersion::ETag(...))`
+  sends the caller's strong validator as `If-Match`, accepting the unquoted
+  strong ETags returned by DAV reads. A stale validator produces
+  `ConcurrencyConflict`. Weak validators and other token kinds are refused
+  as `Unsupported`; they never degrade to unconditional writes. With no caller
+  version the existing fresh-read strong ETag guard is retained. With a caller
+  version the fresh read supplies content only.
+  Versioned relocations are refused before I/O because the MOVE fallback
+  cannot preserve the guard across its multiple writes. Capabilities advertise
+  `MutationConcurrency::ExpectedVersion` for this update door only. Delete
+  still has no caller-version input.
 
   **A cross-address-book move is PERFORMED**, by the same machinery and with
   the same guarantees as `bifrost-caldav::event_update`; see

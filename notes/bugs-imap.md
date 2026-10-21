@@ -22,11 +22,13 @@ Scope: imap account.
 
 **Ruled (owner, 2026-10-21):** resolved by the caller-version optimistic
 concurrency work filed under GRAPH-006: the guard value comes from the caller's
-`expected_version` (`ServerVersion::ModSeq`), not the cache.
+`expected_version` (`ServerVersion::ModSeq`), not the cache. Not yet built: the
+shared caller version reaches only contact and event patches so far. The
+mutation's own SELECT no longer warms the cache; push, inventory and changes
+reads still do.
 
-`push.rs` `absorb_idle_event` (records from IDLE FETCH), `mutate.rs`
-`open_folder_for_mutation` (from the mutation's own SELECT QRESYNC
-`changed_messages`), and inventory and changes recording as they stream.
+`push.rs` `absorb_idle_event` (records from IDLE FETCH) and inventory and
+changes recording as they stream.
 `UNCHANGEDSINCE` exists to reject a write based on a stale view, but the cache
 advances from any server read, including the SELECT immediately before the
 STORE and push events not yet reconciled. A concurrent change by another

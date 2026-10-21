@@ -45,7 +45,10 @@ pub(crate) fn caldav_capabilities(event_rsvp: bool) -> AccountCapabilities {
         blob_digest_pre_download: false,
         push: PushCapability::None,
         mutation: MutationCapabilities {
-            concurrency: MutationConcurrency::StateBased,
+            concurrency: MutationConcurrency::ExpectedVersion {
+                contact_update: false,
+                event_update: true,
+            },
             replay_safety: MutationReplaySafety::None,
         },
         batching_policy: BatchingPolicy {

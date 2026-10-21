@@ -622,7 +622,8 @@ Reopen is engine-delegated: on drop or `close()`, the engine calls `JmapAccountF
 
 - `cursor_freshness: ServerIssued`; `blob_range: No`; `blob_digest_pre_download: false`.
 - `push: InProcess` when the session advertises `urn:ietf:params:jmap:websocket` with `supportsPush: true`, else `None`.
-- `mutation.concurrency: StateBased` (`ifInState` protects the whole-property replacements `FlagOp::Set` and `bulk_move`; dotted keyword and mailbox-membership patches plus destroy omit the account-wide precondition so unrelated Email changes do not reject them); `mutation.replay_safety: None`.
+- `mutation.concurrency: None` (no caller-version guarantee; provider-observed
+  `ifInState` protects the whole-property replacements `FlagOp::Set` and `bulk_move`; dotted keyword and mailbox-membership patches plus destroy omit the account-wide precondition so unrelated Email changes do not reject them); `mutation.replay_safety: None`.
 - `batching_policy`: `max_items = core.maxObjectsInSet` clamped `[1,500]`, `max_wait: 100ms`, `flush_on_input_close: true`.
 - `rate_limit_class: Generous`; `quota_signal: None` (quota via `quota_get`); `requires_uidvalidity_recheck: false`; `historyid_/delta_token_expires_after: None`; `discovers_foreign_namespaces_on_rediscovery: true` unconditionally, because shared-account scopes are discovered from the session at open, there is no foreign scope-lifecycle stream, and no session signal can prove a server will never grant a share (the accounts list is only the current grants; RFC 9670 principals support is sufficient but not necessary evidence of sharing).
 - `pim_methods` advertises mailbox membership add/remove, keyword/read-state mutation, `set_importance`, attachment upload, draft lifecycle, search, mailbox CRUD, identity list/update (Submission), vacation get/set (VacationResponse), quota get (Quota), and thread/message hydration. `scheduled_send` is true iff the selected submission account's `accountCapabilities` block is PRESENT, parseable, and advertises `maxDelayedSend > 0` (onto `PimSupport.max_delayed_send` for boundary validation). The session-level Submission object is an empty support marker. A malformed account-level Submission block does not degrade to `maxDelayedSend = 0`: `SubmissionCapabilities` is not `#[serde(default)]` at the container level, so a block omitting the mandatory RFC 8621 s1.3.2 `maxDelayedSend` fails to parse and lands in the malformed lane, where the family gate takes the whole submission family (send, drafts send, identities, `scheduled_send`) off with a named warning. A well-formed block advertising `maxDelayedSend: 0` is a different server and keeps the family, with only `scheduled_send` false. Gmail labels, Graph categories/extended properties are false.
@@ -1367,3 +1368,10 @@ Local refusal helpers use `AccountError::unsupported` through the shared error
 funnel, retaining their provider, scope and diagnostic decoration.
 `Account::protocol` returns `Protocol::Jmap`, including for inherited
 default-method refusals.
+
+## Caller versions on contact and event updates
+
+The shared `ContactPatch` and `EventPatch` carry optional `expected_version`.
+These update doors currently refuse supplied versions as `Unsupported` before
+I/O. Their native `ifInState` wiring remains to be implemented. Capabilities advertise `None`; the existing provider-observed bulk-mail guards
+are not a caller-version guarantee.

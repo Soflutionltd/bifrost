@@ -655,3 +655,11 @@ A missing `next_cursor` means terminal, not necessarily complete. CardDAV
 directory gateways use this signal for collection-level 507 truncation and
 local overflow beyond the global caller limit. A skipped gateway uses
 `ErrorScope::DirectoryGateway { url }`, so its omission is identifiable.
+
+## Caller mutation preconditions
+
+A supplied shared patch `expected_version` must either reach a native atomic
+precondition or be refused with `Unsupported(operation)` before I/O. Unsupported
+token kinds, weak DAV validators and multi-request relocations that cannot keep
+the guard use that refusal, never a blind write. A server precondition rejection
+is `ConcurrencyConflict`, deriving `Retry(AfterStateRefresh, ConcurrencyConflict)`.

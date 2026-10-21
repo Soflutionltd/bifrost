@@ -417,13 +417,14 @@ as `Request(Malformed)` with field `event`. A server-derived organizer, a
 non-`Confirmed` status, and an RSVP value Graph has no action for stay
 `Unsupported`. `responseStatus` maps to
 `self_response`; RSVP uses native `accept`/`decline`/`tentativelyAccept`.
-Calendar/contact update/delete fetch the current object and use its etag for
-`If-Match` when Graph supplies one. Contacts pass the returned `@odata.etag`;
-calendar change keys are wrapped as the weak entity-tag `W/"<changeKey>"`.
-Without an etag, the write is unconditional. These account methods accept no
-expected-version token from the caller, so the condition only covers the
-interval between their GET and write; it cannot detect that the caller's
-earlier read is stale. Updates send sparse PATCH (scalar clears as null;
+Contact and calendar patches accept `expected_version: Option<ServerVersion>`.
+An `ETag` is sent verbatim as `If-Match`; a 412 is `ConcurrencyConflict`.
+A versioned contact update no longer fetches a validator. Calendar update still reads series
+content for recurrence serialization, but never substitutes that read's change
+key for the caller token. An absent version retains the existing immediate-read guard.
+Delete still has no caller-version input and retains its immediate-read guard.
+Other token kinds are refused as `Unsupported` before I/O.
+Updates send sparse PATCH (scalar clears as null;
 contacts emit `null`/`[]` for emptied buckets). Event organizer/status are
 server-derived. Event search uses the Graph Search API for
 unscoped non-empty default-mailbox searches, else local; composite `EventId`s
@@ -982,7 +983,9 @@ invalidation is exactly what `PushSource::Coalesced` exists for.
   consumer into the engine `InvalidationSink`; `push_in_process()` false);
   `EwsStreaming` -> `InProcess` (the EWS worker forwards `Invalidated` on
   `push_stream`; `push_in_process()` true).
-- `mutation.concurrency: StateBased`. Every non-`Destroy` mutation sends
+- `mutation.concurrency: ExpectedVersion { contact_update: true, event_update: true }`.
+  This caller-version guarantee is limited to these update doors. Bulk mail
+  retains provider-observed guards: every non-`Destroy` mutation sends
   `If-Match: <entity-tag>`; the cached etag comes from inventory/changes/get,
   refreshed from `messages/{id}?$select=id` on a cold cache.
 - `mutation.replay_safety: None`. No client-mintable replay token; the read-back

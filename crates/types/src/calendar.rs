@@ -259,6 +259,10 @@ pub struct EventCreate {
 /// Partial event update payload.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EventPatch {
+    /// Caller-observed version. Providers must enforce this atomically or
+    /// refuse with `Unsupported`; they must never silently discard it.
+    /// `None` retains the provider's ordinary update behavior.
+    pub expected_version: Option<crate::mutation::ServerVersion>,
     pub calendar_id: Option<CalendarId>,
     pub title: Option<Option<String>>,
     pub description: Option<Option<String>>,
