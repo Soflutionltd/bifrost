@@ -111,7 +111,9 @@ impl ImapConnection {
                             // on the ladder; a certificate we cannot bind to
                             // aborts the ladder outright rather than falling
                             // through to unbound SCRAM (RFC 5802 Section 6).
-                            let Some(resolved) = self.resolve_scram_binding().await? else {
+                            // The lookup spends the attempt's own deadline.
+                            let deadline = tokio::time::Instant::now() + timeout;
+                            let Some(resolved) = self.resolve_scram_binding(deadline).await? else {
                                 rejected.push(AuthMechanismRejection::new(
                                     mechanism,
                                     AuthMechanismRejectionReason::ChannelBindingUnavailable,
@@ -147,7 +149,7 @@ impl ImapConnection {
                                 hash,
                                 bifrost_sasl::ChannelBinding::TlsServerEndPoint,
                                 Some(resolved),
-                                timeout,
+                                deadline,
                             )
                             .await
                         }
@@ -159,7 +161,8 @@ impl ImapConnection {
                             };
                             // Binding must be checked even without a PLUS advertisement:
                             // RFC 5802 section 6 then requires y, not n.
-                            let available = self.resolve_scram_binding().await?;
+                            let deadline = tokio::time::Instant::now() + timeout;
+                            let available = self.resolve_scram_binding(deadline).await?;
                             let data = match &available {
                                 Some(bifrost_sasl::ScramChannelBinding::TlsServerEndPoint(
                                     data,
@@ -189,7 +192,7 @@ impl ImapConnection {
                                 hash,
                                 bifrost_sasl::ChannelBinding::None,
                                 Some(binding),
-                                timeout,
+                                deadline,
                             )
                             .await
                         }
@@ -618,7 +621,7 @@ impl ImapConnection {
             bifrost_sasl::ScramHash::Sha1,
             bifrost_sasl::ChannelBinding::None,
             None,
-            timeout,
+            tokio::time::Instant::now() + timeout,
         )
         .await
     }
@@ -636,7 +639,7 @@ impl ImapConnection {
             bifrost_sasl::ScramHash::Sha256,
             bifrost_sasl::ChannelBinding::None,
             None,
-            timeout,
+            tokio::time::Instant::now() + timeout,
         )
         .await
     }
@@ -650,6 +653,10 @@ impl ImapConnection {
     /// thread it in). A direct caller that omits `resolved` and whose binding
     /// cannot be resolved gets a typed `Error::AuthPolicy` carrying a single
     /// `ChannelBindingUnavailable` rejection rather than a silent fall-through.
+    ///
+    /// `deadline` bounds the whole attempt, binding resolution included, so
+    /// a caller that resolved the binding first passes the deadline it
+    /// resolved under rather than a fresh timeout.
     async fn authenticate_scram_with_binding(
         &self,
         user: &str,
@@ -657,7 +664,7 @@ impl ImapConnection {
         hash: bifrost_sasl::ScramHash,
         binding: bifrost_sasl::ChannelBinding,
         resolved: Option<bifrost_sasl::ScramChannelBinding>,
-        timeout: Duration,
+        deadline: tokio::time::Instant,
     ) -> Result<(), Error> {
         use bifrost_sasl::{ChannelBinding, ScramChannelBinding};
 
@@ -672,7 +679,7 @@ impl ImapConnection {
         let scram_binding = match binding {
             ChannelBinding::TlsServerEndPoint => match resolved {
                 Some(resolved) => resolved,
-                None => self.resolve_scram_binding().await?.ok_or_else(|| {
+                None => self.resolve_scram_binding(deadline).await?.ok_or_else(|| {
                     // `ScramHash` is `#[non_exhaustive]`; SHA-1 maps to its
                     // PLUS variant, SHA-256 (and any future hash) to the
                     // SHA-256 PLUS variant for the audit/display rejection.
@@ -716,7 +723,6 @@ impl ImapConnection {
             initial_response,
         };
 
-        let deadline = tokio::time::Instant::now() + timeout;
         let caps_provided = self
             .submit_with_continuations(cmd, consumer, Some(deadline))
             .await?;
@@ -739,10 +745,20 @@ impl ImapConnection {
     /// onto unbound SCRAM or PLAIN, which is the downgrade the `PLUS`
     /// mechanisms exist to prevent (RFC 5802 Section 6). SMTP resolves this the
     /// same way; the two crates must not differ here.
+    ///
+    /// The lookup is a driver request queued like any other, so a stalled
+    /// head command would hold it indefinitely. It runs under the
+    /// attempt's `deadline`, and expiry is `Timeout` / `Unsent` (no
+    /// AUTHENTICATE byte has been written), never `Ok(None)`: reading a slow
+    /// lookup as "no certificate" would walk the ladder down to a weaker rung.
     async fn resolve_scram_binding(
         &self,
+        deadline: tokio::time::Instant,
     ) -> Result<Option<bifrost_sasl::ScramChannelBinding>, Error> {
-        scram_binding_from_der(self.peer_certificate_der().await.as_deref())
+        let der = tokio::time::timeout_at(deadline, self.peer_certificate_der())
+            .await
+            .map_err(|_| Error::timeout().with_attempt(TransmissionState::Unsent))?;
+        scram_binding_from_der(der.as_deref())
     }
 
     /// Finalize authentication: refresh capabilities if the server did

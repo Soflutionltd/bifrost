@@ -875,6 +875,45 @@ async fn dropping_a_command_waiting_for_channel_capacity_does_not_abandon_connec
     );
 }
 
+/// The channel-binding lookup a SCRAM rung makes before AUTHENTICATE is a
+/// driver request, so it queues behind a stalled head command. It must spend
+/// the attempt's deadline and fail `Timeout` / `Unsent` there, not wait out
+/// the stalled command and then authenticate past the deadline.
+#[tokio::test(start_paused = true)]
+async fn a_scram_binding_lookup_behind_a_stalled_command_honours_the_auth_deadline() {
+    use std::sync::Arc;
+
+    let greeting = b"* OK [CAPABILITY IMAP4rev1 AUTH=SCRAM-SHA-256] ready\r\n";
+    let (conn, mut server) = crate::connection::test_support::driver_pair(greeting).await;
+    let conn = Arc::new(conn);
+    let stalled = Arc::clone(&conn);
+    let _stalled = tokio::spawn(async move { stalled.noop(Duration::from_secs(600)).await });
+    let noop = read_line(&mut server).await;
+    assert!(noop.contains("NOOP"), "unexpected command: {noop}");
+
+    let started = tokio::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        conn.authenticate_best(
+            &crate::types::Credentials::password("user", "pass"),
+            &crate::types::AuthPolicy::default(),
+            Duration::from_secs(1),
+        ),
+    )
+    .await
+    .expect("authentication must end at its own deadline");
+    let error = outcome.expect_err("the binding lookup cannot complete");
+    assert!(matches!(error, Error::Timeout { .. }), "got {error:?}");
+    assert_eq!(
+        error.attempt(),
+        Some(bifrost_types::TransmissionState::Unsent)
+    );
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_secs(1)
+    );
+}
+
 /// A SCRAM server-final error is returned while AUTHENTICATE still awaits its
 /// tagged completion. Cancel and drain that completion before the next command.
 #[tokio::test]

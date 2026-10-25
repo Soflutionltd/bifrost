@@ -135,12 +135,6 @@ PUBLISHED SURFACE fence apply.
   abandoned one first: a nested checkout waits forever at pool_cap = 1 or
   when data capacity is exhausted. Its permit returns only at driver exit.
 
-## IMAP peer certificate lookup outside authentication deadline
-
-- `resolve_scram_binding` awaits `peer_certificate_der` before SCRAM-PLUS.
-  That non-wire request uses unbounded channel admission and reply waits, so
-  it can wait behind a stalled head command beyond the authentication deadline.
-
 ## IMAP push: same-session NOTIFY extension is uncovered until registration
 
 - In the Reidle branch, a newly added folder is watched only after the
