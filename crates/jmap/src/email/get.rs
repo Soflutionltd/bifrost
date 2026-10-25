@@ -38,6 +38,10 @@ impl Email {
             .unwrap_or_default()
     }
 
+    pub(crate) fn has_keywords(&self) -> bool {
+        self.keywords.is_some()
+    }
+
     pub(crate) fn keywords(&self) -> Vec<&str> {
         self.keywords
             .as_ref()

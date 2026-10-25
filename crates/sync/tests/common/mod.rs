@@ -114,6 +114,7 @@ pub fn caps() -> AccountCapabilities {
         mutation: MutationCapabilities {
             concurrency: MutationConcurrency::None,
             replay_safety: MutationReplaySafety::None,
+            reassertion: bifrost_types::MutationReassertion::NONE,
         },
         batching_policy: BatchingPolicy {
             max_items: 100,

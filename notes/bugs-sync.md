@@ -31,17 +31,6 @@ range, get, create, update, RSVP and search have no passthrough, and the new
 Whether the engine is meant to be the consumer's single door for calendar, as
 it is for contacts, decides whether this is an omission.
 
-## SYNC-007 - A proven non-landing write is never resubmitted
-
-**Needs a technical implementation specification** (owner, 2026-10-21): too
-consequential to resolve by ruling.
-
-Scope: sync engine. Residue: a read-back mismatch now stays pending instead of
-becoming `failed_terminal`. Once read-back proves an `Uncertain` write did not
-land, replay is the safe case the uncertainty lane protected, yet the pipeline
-still never resubmits it. Replay was deferred because reconciliation can need
-consumer-side dedupe; a ruling is needed on whether the engine replays.
-
 ## SYNC-009 - Push ingress can still lose or unboundedly queue control events
 
 **Needs a technical implementation specification** (owner, 2026-10-21): too

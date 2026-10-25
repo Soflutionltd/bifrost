@@ -936,6 +936,51 @@ fn flag_op_requires_category_rmw(op: &FlagOp) -> bool {
     }
 }
 
+/// The Graph flag judge behind `GraphAccount::flag_target`. Every op token is
+/// canonicalized the way `patch_for_flags` writes it (`graph_flag_field`
+/// aliases; a case-SENSITIVE `category:` prefix, exactly like
+/// `categories_from_flags`), and any token the write does not model makes the
+/// op `Indeterminate`, even beside modeled ones. Public-folder items are
+/// observed through EWS, which carries only `\seen`, so any other token on
+/// such an item is `Indeterminate` too. `flagStatus == complete` observes as
+/// "not `\flagged`" by vocabulary, so `Remove(\Flagged)` is satisfied by it.
+pub(crate) fn graph_flag_target(
+    target: &ObjectId,
+    observed: &HashSet<String>,
+    op: &FlagOp,
+) -> bifrost_types::FlagTargetState {
+    use bifrost_types::FlagTargetState;
+    let canonicalize = |flags: &HashSet<String>| -> Option<HashSet<String>> {
+        flags
+            .iter()
+            .map(|flag| {
+                let canonical = match graph_flag_field(flag) {
+                    Some(GraphFlagField::Read) => "\\seen".to_string(),
+                    Some(GraphFlagField::Flagged) => "\\flagged".to_string(),
+                    None if flag.starts_with("category:") => flag.clone(),
+                    None => return None,
+                };
+                if super::pim::ews_read_folder(target).is_some() && canonical != "\\seen" {
+                    return None;
+                }
+                Some(canonical)
+            })
+            .collect()
+    };
+    let canonical = match op {
+        FlagOp::Add(s) => canonicalize(s).map(FlagOp::Add),
+        FlagOp::Remove(s) => canonicalize(s).map(FlagOp::Remove),
+        FlagOp::Set(s) => canonicalize(s).map(FlagOp::Set),
+        FlagOp::Patch { add, remove } => canonicalize(add)
+            .zip(canonicalize(remove))
+            .map(|(add, remove)| FlagOp::Patch { add, remove }),
+        _ => None,
+    };
+    canonical.map_or(FlagTargetState::Indeterminate, |op| {
+        bifrost_types::flag_target_state(observed, &op)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,6 +988,88 @@ mod tests {
     use crate::account::foreign::{encode_foreign, encode_message_id};
     use crate::client::GraphClient;
     use bifrost_types::{CursorScope, FolderId, ObjectType};
+
+    fn target_set(flags: &[&str]) -> HashSet<String> {
+        flags.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn graph_flag_target_canonicalizes_aliases() {
+        for alias in ["read", "\\Seen"] {
+            assert_eq!(
+                graph_flag_target(
+                    &ObjectId("m1".into()),
+                    &target_set(&["\\seen"]),
+                    &FlagOp::Add(target_set(&[alias]))
+                ),
+                bifrost_types::FlagTargetState::Satisfied
+            );
+        }
+        for alias in ["starred", "flagged", "\\Flagged"] {
+            assert_eq!(
+                graph_flag_target(
+                    &ObjectId("m1".into()),
+                    &target_set(&["\\flagged"]),
+                    &FlagOp::Add(target_set(&[alias]))
+                ),
+                bifrost_types::FlagTargetState::Satisfied
+            );
+        }
+        // Only the category NAME compares case-insensitively.
+        assert_eq!(
+            graph_flag_target(
+                &ObjectId("m1".into()),
+                &target_set(&["category:work"]),
+                &FlagOp::Add(target_set(&["category:Work"]))
+            ),
+            bifrost_types::FlagTargetState::Satisfied
+        );
+    }
+
+    #[test]
+    fn graph_flag_target_refuses_unmodeled_tokens() {
+        for token in ["\\answered", "Category:Work"] {
+            assert_eq!(
+                graph_flag_target(
+                    &ObjectId("m1".into()),
+                    &target_set(&[]),
+                    &FlagOp::Add(target_set(&[token]))
+                ),
+                bifrost_types::FlagTargetState::Indeterminate
+            );
+        }
+        // A modeled token beside an unmodeled one does not make it decidable:
+        // the write would silently drop the unmodeled half.
+        assert_eq!(
+            graph_flag_target(
+                &ObjectId("m1".into()),
+                &target_set(&["\\seen"]),
+                &FlagOp::Add(target_set(&["\\Seen", "\\answered"]))
+            ),
+            bifrost_types::FlagTargetState::Indeterminate
+        );
+    }
+
+    #[test]
+    fn graph_flag_target_restricts_ews_public_items_to_seen() {
+        let id = super::super::foreign::encode_public_item_id(&FolderId("folder".into()), "item");
+        assert_eq!(
+            graph_flag_target(
+                &id,
+                &target_set(&[]),
+                &FlagOp::Remove(target_set(&["read"]))
+            ),
+            bifrost_types::FlagTargetState::Satisfied
+        );
+        assert_eq!(
+            graph_flag_target(
+                &id,
+                &target_set(&[]),
+                &FlagOp::Remove(target_set(&["flagged"]))
+            ),
+            bifrost_types::FlagTargetState::Indeterminate
+        );
+    }
 
     #[tokio::test]
     async fn caller_etag_bypasses_newer_cache_and_reports_conflict_without_get() {

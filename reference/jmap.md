@@ -642,7 +642,10 @@ Reopen is engine-delegated: on drop or `close()`, the engine calls `JmapAccountF
   conflict, without a state probe or refresh/retry. With no caller token,
   provider-observed `ifInState` still protects whole-property replacements
   `FlagOp::Set` and `bulk_move`; dotted patches and destroy omit that guard.
-  `mutation.replay_safety: None`.
+  `mutation.replay_safety: None`. `mutation.reassertion` declares
+  `set_flags` and `destroy`: ids are immutable and `Email/set` keyword patches,
+  keyword replacement and destroy converge when reapplied (see "Flag
+  observation and reassertion capability").
 - `batching_policy`: `max_items = core.maxObjectsInSet` clamped `[1,500]`, `max_wait: 100ms`, `flush_on_input_close: true`.
 - `rate_limit_class: Generous`; `quota_signal: None` (quota via `quota_get`); `requires_uidvalidity_recheck: false`; `historyid_/delta_token_expires_after: None`; `discovers_foreign_namespaces_on_rediscovery: true` unconditionally, because shared-account scopes are discovered from the session at open, there is no foreign scope-lifecycle stream, and no session signal can prove a server will never grant a share (the accounts list is only the current grants; RFC 9670 principals support is sufficient but not necessary evidence of sharing).
 - `pim_methods` advertises mailbox membership add/remove, keyword/read-state mutation, `set_importance`, attachment upload, draft lifecycle, search, mailbox CRUD, identity list/update (Submission), vacation get/set (VacationResponse), quota get (Quota), and thread/message hydration. `scheduled_send` is true iff the selected submission account's `accountCapabilities` block is PRESENT, parseable, and advertises `maxDelayedSend > 0` (onto `PimSupport.max_delayed_send` for boundary validation). The session-level Submission object is an empty support marker. A malformed account-level Submission block does not degrade to `maxDelayedSend = 0`: `SubmissionCapabilities` is not `#[serde(default)]` at the container level, so a block omitting the mandatory RFC 8621 s1.3.2 `maxDelayedSend` fails to parse and lands in the malformed lane, where the family gate takes the whole submission family (send, drafts send, identities, `scheduled_send`) off with a named warning. A well-formed block advertising `maxDelayedSend: 0` is a different server and keeps the family, with only `scheduled_send` false. Gmail labels, Graph categories/extended properties are false.
@@ -812,7 +815,7 @@ short batch cannot be held to end-of-input by a busy one; the wait is capped
 at the same input volume a full batch already accepts. A route holding only
 locally-rejected targets emits them without probing Email state.
 
-`IdempotencyKey` is a wire no-op, so replay safety stays `None` (read-back guard protects against double-apply). Per-id outcomes flow from `SetResponse::updated`/`destroyed`; an id the server names in neither the success nor error collection becomes `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so idempotent flag work retries and possibly-applied moves/destroys reconcile rather than being fabricated as `NotFound`. A `stateMismatch` surviving retry emits `Failed(ConcurrencyConflict)`; real per-id set errors map through `classify_set_item`. Empty additive/subtractive flag operations, wholly empty patches, and patches naming the same flag in both sets are rejected up front as `Terminated(Request(Malformed))` rather than transmitting empty patches. `bulk_move` accepts only `MembershipScope::Mailbox`.
+`IdempotencyKey` is a wire no-op, so replay safety stays `None` (read-back observes current state; eligible targets may reassert within bounds). Per-id outcomes flow from `SetResponse::updated`/`destroyed`; an id the server names in neither the success nor error collection becomes `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so idempotent flag work retries and possibly-applied moves/destroys reconcile rather than being fabricated as `NotFound`. A `stateMismatch` surviving retry emits `Failed(ConcurrencyConflict)`; real per-id set errors map through `classify_set_item`. Empty additive/subtractive flag operations, wholly empty patches, and patches naming the same flag in both sets are rejected up front as `Terminated(Request(Malformed))` rather than transmitting empty patches. `bulk_move` accepts only `MembershipScope::Mailbox`.
 
 ### PIM primitives and conveniences
 
@@ -1341,7 +1344,7 @@ a whole new share still waits for reopen.
   supported, but scheduled foreign submission is not.
 - Raw-MIME projections unsupported; only `FlagsOnly` and `Metadata` work. Sync-layer push is WebSocket-subprotocol only; against a server without RFC 8887 the engine falls back to polling. The client-level EventSource API exists but is not wired in as a push fallback (deliberate; see `reference/jmap/DEFERRED.md`).
 - `BlobRangeSupport::No`; `open_blob_range` fatals `Error::Unsupported` even when the handle advertises range support (no transport `Range` hook). Its one non-capability refusal, a `range.start` past the known blob size, is `Request(Malformed)` (-> `ClientBug`) instead: that is a caller argument fault, and reporting it as `Unsupported` would tell the engine the protocol has no ranged read at all.
-- `MutationReplaySafety::None`; `IdempotencyKey` is a wire no-op (read-back guard is the only lost-update protection).
+- `MutationReplaySafety::None`; `IdempotencyKey` is a wire no-op (the read-back guard observes current target state; it is no lost-update protection).
 - `bulk_move` only `MembershipScope::Mailbox`; `inventory_partitioning` is `Full` for every scope, and any explicit
   `InventoryPartition` other than `Full` is refused as
   `Unsupported(SyncInventory)` without sending a request.
@@ -1426,3 +1429,15 @@ same owner and optional caller state share one `Email/set`, bounded by
 never share a set. A pending input flushes a partial chunk. A later chunk
 carrying the same old state can still conflict after an earlier success;
 no automatic token advance is allowed on the caller's behalf.
+
+## Flag observation and reassertion capability
+
+The account declares flag and destroy desired-state reassertion safe on stable
+server ids. FlagsOnly hydration requires an explicit keywords property; its
+absence is a per-item Protocol MissingField failure. The generic flag judge
+uses the same ASCII-case-insensitive keyword identity as writes.
+
+A server can re-add maintained keywords, such as attachment annotations,
+after a Set. After an uncertain write, an unsatisfiable target can spend its
+remaining attempt budget on writes that cannot stick. This bounded futility
+is accepted; reassertion supplies no lost-update guarantee.

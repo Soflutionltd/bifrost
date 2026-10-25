@@ -1,8 +1,8 @@
 //! Mutation pipeline.
 //!
 //! The engine deduplicates campaign targets into throttle cohorts and schedules
-//! one ready submission, retry, or read-back action at a time. It wraps each
-//! `Account::bulk_*` call with:
+//! one ready submission, retry, read-back, or desired-state reassertion action
+//! at a time. It wraps each `Account::bulk_*` call with:
 //! - one frozen, vended `IdempotencyKey` per cohort (run_id + monotonic
 //!   sequence + protocol salt),
 //! - per-id accumulation through `ItemOutcome<MutationSuccess>` lanes
@@ -12,8 +12,12 @@
 //!   deadline and resubmitting with its frozen key, within a campaign-wide
 //!   retry target allowance,
 //! - the read-back guard, which re-fetches each pending-readback id via
-//!   `account.get_stream(_, Projection::FlagsOnly)` and reconciles
-//!   apparent failures against actual server state.
+//!   `account.get_stream` (`FlagsOnly` for flags, `Metadata` for moves and
+//!   destroys) and reconciles apparent failures against actual server state,
+//!   judging flags through `Account::flag_target`,
+//! - bounded reassertion of declared unversioned flag and destroy targets after
+//!   valid unsatisfied observations, sharing the retry budget and target slots.
+//!   Moves, caller guards and consumer dedupe guidance never authorize it.
 
 pub mod idempotency;
 pub mod readback;
@@ -53,7 +57,7 @@ pub struct MutationCounters {
     pub failed_terminal: u64,
     pub blocked_by_engine: u64,
     /// Unresolved targets, including known-unsent work, exhausted retries,
-    /// observed non-landing writes, and inconclusive observations.
+    /// observed mismatches not reasserted, and inconclusive observations.
     pub pending_retry: u64,
     pub dedupe_by_client_id: u64,
 }

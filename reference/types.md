@@ -117,7 +117,7 @@ fields include:
 
 - `cursor_freshness`;
 - `push: PushCapability`;
-- mutation concurrency and replay safety;
+- mutation concurrency, replay safety and reassertion (below);
 - batching and rate-limit hints;
 - blob-range support;
 - protocol expiry hints;
@@ -139,6 +139,16 @@ fields include:
 Consumers should inspect capabilities before presenting an operation.
 An implementation must still return a structured error if an advertised
 operation fails or support changes at runtime.
+
+`MutationCapabilities::reassertion` is a `MutationReassertion { set_flags,
+destroy }`, default off (`MutationReassertion::NONE`). Declaring a door says
+it may be reapplied, after a valid observation shows the target unsatisfied,
+to the same object: it requires stable, never-reused object identity and a
+door whose reapplication converges on the requested state without a second,
+different side effect. It authorizes desired-state reassertion only. It is
+not replay-token deduplication (`replay_safety`) and supplies no lost-update
+guarantee: a reassertion may overwrite a concurrent writer's later change.
+Moves have no field and are never reasserted.
 
 ## Cursor scopes and memberships
 
@@ -275,6 +285,21 @@ add/remove deltas and an entirely empty patch are invalid; `Set(empty)` means
 "clear all flags". A patch may not name the same flag in both sets under
 ASCII-case-insensitive identity. Invalid operations are caller errors and must
 be rejected before provider I/O.
+
+`Account::flag_target(target, observed, op)` judges one complete `FlagsOnly`
+observation against a flag operation and returns a `FlagTargetState`:
+`Satisfied`, `Unsatisfied`, or `Indeterminate`. It is pure and judges in the
+provider's own write vocabulary; a token the write does not model or the
+observation cannot see is `Indeterminate`. The default is
+`flag_target_state`: an invalid operation is `Indeterminate`, and flag
+identity is ASCII-case-insensitive, so `Set({"\Seen", "\SEEN"})` equals an
+observed `{"\seen"}`. Providers whose write translates flags override it.
+
+The judge relies on a `get_stream` contract: a `FlagsOnly` success carries
+the object's whole flag state. When a provider cannot establish that from
+the response, the item is a per-item `Failed(Protocol(MissingField |
+ParseFailed))`, never an empty set. A wire that legitimately omits an empty
+flag collection (Gmail's `labelIds`) reports the empty set it means.
 
 Batch and streaming mutations use the same closed three-lane model:
 

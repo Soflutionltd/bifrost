@@ -3124,6 +3124,7 @@ fn retryable_stream_termination_requeues_every_unresolved_target() {
     let outcomes = std::collections::HashMap::from([
         (applied, MutationBucket::Applied),
         (explicit_retry.clone(), MutationBucket::PendingRetry),
+        (unseen.clone(), MutationBucket::InFlight),
     ]);
     let mut retry_ids = vec![explicit_retry.clone()];
 
@@ -3144,8 +3145,12 @@ fn retry_sweep_leaves_readback_and_engine_blocked_ids_alone() {
     let unseen = bifrost_types::ObjectId("unseen".into());
     let remaining = vec![uncertain.clone(), blocked.clone(), unseen.clone()];
     let outcomes = std::collections::HashMap::from([
-        (uncertain, MutationBucket::PendingReadback),
+        (
+            uncertain,
+            MutationBucket::PendingReadback(super::bulk::ReadbackOrigin::Reassertable),
+        ),
         (blocked, MutationBucket::BlockedByEngine),
+        (unseen.clone(), MutationBucket::InFlight),
     ]);
     let mut retry_ids = Vec::new();
 
@@ -3331,7 +3336,7 @@ fn readback_queue_is_every_still_pending_id() {
         ),
         (
             bifrost_types::ObjectId("readback".into()),
-            MutationBucket::PendingReadback,
+            MutationBucket::PendingReadback(super::bulk::ReadbackOrigin::Reassertable),
         ),
     ]);
 

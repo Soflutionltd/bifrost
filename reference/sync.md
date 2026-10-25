@@ -2155,8 +2155,8 @@ method and final read-back guard. Campaign flow:
    declaration changes is re-routed; submitted and uncertain targets retain
    their cohort and execution identity.
 
-3. Schedule one ready action at a time: a submission, retry, or read-back
-   for one cohort. Save its state after the action and return to the
+3. Schedule one ready action at a time: a submission, retry, read-back, or
+   reassertion for one cohort. Save its state after the action and return to the
    scheduler. Readiness combines the current declared-key holds, retry
    deadline, and local reconcile deadline. When every action is held,
    sleep until the earliest readiness, selecting on shutdown. A replacement
@@ -2177,14 +2177,27 @@ method and final read-back guard. Campaign flow:
    are reserved when retries are scheduled, before readiness waits, so a
    held cohort can consume slots before another cohort retries.
 
-4. Read back unresolved submitted objects per cohort. Observations return
-   per-object results and merge into the campaign's outcome map.
-   Matching objects become `Skipped`; observed mismatches remain
-   `PendingRetry` for a later consumer campaign, even after the retry budget
-   or retry-target allowance is exhausted. An observation cannot manufacture
-   a terminal provider failure. Failed or missing observations remain explicitly
-   unresolved. Partial observations survive a stream termination.
-   Final object counters derive from the merged map.
+4. Read back unresolved submitted objects per cohort. Satisfied observations
+   become `Skipped`; failed, missing or indeterminate observations become
+   `Unresolved`. A valid unsatisfied observation may schedule `ReadyReassert`
+   only for an unversioned flag or destroy target on an account declaring
+   that door in `MutationReassertion`, with reassertable origin, no campaign
+   error or engine block, and remaining attempt and retry-target allowance.
+   Reserve the retry slot in original target order. `ReadyReassert` consumes
+   its observation and is never read back before resubmission. Revalidate the
+   declaration on the account loaded after admission. Ineligible mismatches
+   become final `Mismatched`, counted as pending rather than terminal failure.
+
+   Each submission writes `InFlight` over its targets before calling the
+   account, so a fresh omission cannot retain a previous round's final state.
+   Every omission then enters read-back. Retries and reassertions share the
+   cohort's attempt count and the campaign's distinct-target retry slots.
+   A cohort makes at most `mutation_max_retries + 1` mutation-door calls and
+   at most that many read-back `get_stream` calls. This bounds Account calls,
+   not provider-internal chunks, state probes, or multi-command sequences.
+   Partial observations survive termination, but the termination is recorded
+   before eligibility is judged and prevents further reassertion.
+   Final counters derive from the per-object map.
 
 5. Preserve the first error and stop further mutation submissions.
    Submitted cohorts with unresolved work receive at most one read-back
@@ -2200,7 +2213,10 @@ method and final read-back guard. Campaign flow:
 
 An engine directive also stops further submissions. Remaining retry work
 becomes `BlockedByEngine`, while `PendingReadback` remains protected:
-uncertain writes are observed rather than replayed or guessed at.
+uncertain writes are observed rather than replayed or guessed at. A scheduled
+`ReadyReassert` is finalized before another round can start, without being
+observed twice: `Mismatched` when the campaign aborts, `BlockedByEngine`
+under an engine block.
 Forwarded directives are deduplicated across the campaign by directive
 variant and target scope.
 
@@ -2217,11 +2233,13 @@ Unknown future success variants remain protected in the read-back lane.
 `MutationCounters` buckets `ItemOutcome::Failed` outcomes via
 `crate::recovery::plan_recovery`:
 - `Retry { SameRequest | AfterAuthRefresh }` -> `pending_retry`.
-- `Retry { AfterStateRefresh }` and
-  `Reconcile { CheckTarget }` -> `pending_retry` then the
-  read-back guard reclassifies into `skipped` or leaves the item pending.
-  A mismatch does not trigger automatic replay: reconcile guidance can also
-  require consumer-side dedupe.
+- `Retry { AfterStateRefresh }` and `Reconcile { CheckTarget }` enter
+  read-back with reassertable origin. A valid unsatisfied target can be
+  reasserted under the declaration and shared bounds above. Any reconcile
+  action other than CheckTarget makes the origin protected, observed only.
+  A protected stream termination protects every read-back id of its round,
+  including items already answered into reassertable read-back. Same-round
+  per-item blind retry candidates retain their existing retry policy.
 - `Reconcile { DedupeByClientId }` increments
   `dedupe_by_client_id` and broadcasts a
   `Warning::OperatorAttentionNeeded` (the dedupe lives at the
@@ -2242,8 +2260,33 @@ Unknown future success variants remain protected in the read-back lane.
   swallowing a later `DisableScope`).
 - terminal recovery -> `failed_terminal`.
 
-`ItemOutcome::Uncertain` always queues for read-back so a
-non-idempotent transport drop never replays blindly.
+`ItemOutcome::Uncertain` always queues for read-back. Retry advice with a
+known disposition or CheckTarget-only reconcile advice permits bounded
+reassertion after observation; dedupe guidance, engine, terminal, or unknown
+recovery protects the target from reassertion. Failed engine and terminal
+items retain their existing blocked and terminal lanes without read-back.
+
+A stream AfterStateRefresh termination routes unanswered unguarded ids to
+read-back. Guarded ids retain the safe retry through the versioned door with
+their frozen versions. Per-item read-back delays honor reconcile advice,
+state-refresh retry advice (including its fallback), and other retry advice
+when it carries a hint, including operation-local hints that do not enter
+the shared throttle bucket. Read-back engine failures block reassertion;
+their directives are deduplicated per campaign and forwarded after releasing
+the activity and admission guards.
+
+Reassertion is desired-state enforcement: it may overwrite a concurrent
+writer's later change and supplies no lost-update guarantee. Destroy
+reachability depends on the original recovery evidence:
+
+| Destroy outcome | Read-back origin |
+|---|---|
+| Graph missing permanentDelete subresponse or JMAP unanswered destroy id, Protocol PartialResponse | Protected: CheckTarget plus DedupeByClientId |
+| In-flight transport drop, throttle, quota, unavailable, or internal failure with CheckTarget-only advice | Reassertable |
+| Bare omission without a termination | Reassertable |
+
+Thus Graph and JMAP's usual partial-response destroy ambiguity remains
+observation-only. Replay-token semantics and error derivation are unchanged.
 
 `SyncEngine::bulk_move` and `SyncEngine::bulk_move_from` use the move
 arm, which submits through
@@ -2256,6 +2299,8 @@ part of the move itself, so the trait's default impl forwards to
 workaround. The read-back guard is unchanged either way - it
 reconciles membership of `destination`, the property that says the
 move landed, and does not separately re-verify absence from `source`.
+Moves never reassert: source membership cannot authorize another COPY after
+partial completion.
 
 `IdempotencyKey` is `{ run_id, sequence, protocol_salt }`. `run_id`
 is consumer-minted and consumer-persisted across process restarts
@@ -3418,13 +3463,15 @@ because the in-memory store keys on it.
 
 ## Read-back guard
 
-Applies to all four protocols today (every protocol declares
-`MutationReplaySafety::None`; the engine reads back after retry to
-disambiguate ambiguous transport failures). The guard re-fetches
-affected ids via `Account::get_stream(ids, Projection::FlagsOnly)`
-and reconciles against the intended mutation. Destroy read-back treats
-only an explicit `AccountErrorKind::NotFound` as proof that the object
-is absent; any other per-item fetch failure remains uncertain.
+The read-back report preserves requested ids and partial progress through a
+stream termination. The engine checks envelope and hydrated identity, then
+requires FlagsOnly for flags and Metadata for moves. The account's pure
+`flag_target` judges flag state in its own write vocabulary. Move observations
+check destination membership. Destroy treats presence as unsatisfied and
+explicit NotFound as satisfied. Missing, failed, incomplete, wrong-projection,
+and indeterminate observations remain unresolved. Equal duplicates agree;
+disagreeing duplicates remain unresolved even if later observations agree.
+Per-item engine failures are retained alongside the observations.
 
 ## Error / Terminated / Warning
 
@@ -3830,7 +3877,8 @@ crates/sync/src/
     mod.rs                // MutationCounters,
                           // fanout::partition_by_account
     idempotency.rs        // IdempotencyKey vending
-    readback.rs           // Projection::FlagsOnly read-back guard
+    readback.rs           // per-object read-back report, flags judged
+                          // through Account::flag_target
   cursor/
     mod.rs                // CursorRegistry + membership index
     coverage.rs           // PendingCoverage: the publication ledger -
@@ -3937,3 +3985,7 @@ Read-back also cannot prove an uncertain guarded write passed its precondition.
 Guarded targets that exhaust safe retries or require read-back remain pending
 instead of being promoted to observed success; unversioned targets retain the
 ordinary read-back path.
+
+Caller-guarded targets are never reasserted. An explicit conflict in this
+contract means refusal of the caller's expected version; provider-observed
+conflicts on unversioned targets may refresh through read-back and reassert.

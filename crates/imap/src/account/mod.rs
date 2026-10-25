@@ -480,6 +480,16 @@ impl Account for ImapAccount {
         get::get_stream(self.clone(), ids, projection)
     }
 
+    // Account: judges FlagsOnly read-backs; `\Recent` is server-owned.
+    fn flag_target(
+        &self,
+        _target: &ObjectId,
+        observed: &std::collections::HashSet<String>,
+        op: &bifrost_types::FlagOp,
+    ) -> bifrost_types::FlagTargetState {
+        inventory::imap_flag_target(observed, op)
+    }
+
     // Account: advances opaque cursors; direct users call sync_fetch() or UID commands.
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
         changes::changes_stream(self.clone(), cursor)

@@ -438,11 +438,39 @@ pub trait Account: Send + Sync {
     /// remotely-rejected ids emit `Failed`, transport drops that
     /// leave the item state ambiguous emit `Uncertain`. This is the
     /// same lane shape every other streaming bulk surface uses.
+    ///
+    /// A `FlagsOnly` success carries the object's whole flag state. When the
+    /// provider cannot establish the object's whole flag state from the
+    /// response, the item is a per-item
+    /// `Failed(Protocol(MissingField | ParseFailed))`, never an empty set. A
+    /// provider whose wire legitimately omits an empty flag collection
+    /// (Gmail's `labelIds`) reports that omission as the empty set it means.
     fn get_stream(
         &self,
         ids: AccountStream<ObjectId>,
         projection: Projection,
     ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>>;
+
+    /// Judge one flag observation of `target`, already validated by the caller
+    /// as a complete `Projection::FlagsOnly` hydration of that id, against
+    /// `op`. `Satisfied` means the observed state, read in this provider's
+    /// flag vocabulary, already is the state this provider's `bulk_set_flags`
+    /// would establish. Return `Indeterminate` whenever `op` names a token the
+    /// write does not model or the observation cannot see. Pure: no I/O, no
+    /// blocking.
+    ///
+    /// The default is [`crate::flag_target_state`]. Providers whose write
+    /// translates flags (aliases, label polarity, server-owned flags)
+    /// override it.
+    fn flag_target(
+        &self,
+        target: &ObjectId,
+        observed: &std::collections::HashSet<String>,
+        op: &FlagOp,
+    ) -> crate::FlagTargetState {
+        let _ = target;
+        crate::flag_target_state(observed, op)
+    }
 
     /// Post-cursor diff. Yields `Change` (the sum of `ObjectChange`
     /// and `ScopeChange`).

@@ -253,3 +253,34 @@ PUBLISHED SURFACE fence apply.
   engine plumbing whose epochs and generations mean nothing to a consumer,
   on a `pub` enum re-exported from `lib.rs`. Moving them to a crate-private
   request enum removes published variants, so it needs the owner's ruling.
+
+## Mutation outcomes carry no per-id detail
+
+- `MutationCounters::pending_retry` is a single count that lumps unsent work,
+  exhausted retries, read-back mismatches and inconclusive read-backs, with no
+  object ids. A consumer that wants to replay or report precisely can only
+  re-run the whole campaign.
+
+## Read-back reassertion laterals
+
+- Uncertain mutation items carrying Engine recovery are observed but do not
+  forward the directive (`classify_item_outcome` in sync engine bulk). The
+  reassertion path protects these ids; forwarding remains separate work.
+- Graph mixed flag operations silently discard unmodeled tokens while
+  reporting Applied (`patch_for_flags` and `flag_op_is_unexpressible`). The
+  new flag judge refuses to decide these operations; the write outcome still
+  needs its own ruling.
+- BulkDestroy PartialResponse derives DedupeByClientId even though destroy
+  has no client-id deduplication. This protects Graph/JMAP's usual ambiguous
+  destroy answers from reassertion. An operation-aware derivation requires
+  an error-model ruling.
+- Existing submission-item and stream directive sends await bounded reopen_tx
+  while holding campaign activity and admission. A handler waiting for
+  activity drain could wait on the sender. New read-back forwarding releases
+  both guards first; the existing paths need a separate lifetime review.
+- Legacy imap1 object ids decode but outcomes re-encode imap2, so legacy ids
+  fail correlation in mutation and hydration. The new hydrated-id check does
+  not introduce this mismatch.
+- A dedupe-bearing stream termination leaves same-round per-item
+  SameRequest/AfterAuthRefresh blind retry candidates eligible, as before.
+  Whether whole-submission dedupe should suppress these retries needs a ruling.

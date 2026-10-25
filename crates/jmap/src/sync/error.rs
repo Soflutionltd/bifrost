@@ -1572,6 +1572,30 @@ pub(crate) fn get_id_unanswered(id: &str, ctx: JmapErrorContext) -> AccountError
     .expect("valid account error classification")
 }
 
+/// An `Email/get` answer that omitted a property the requested projection
+/// needs. A `FlagsOnly` hydration without `keywords` cannot establish the
+/// object's whole flag state, so it fails per item instead of reading as an
+/// empty keyword set.
+#[must_use]
+pub(crate) fn missing_property(
+    id: String,
+    property: &'static str,
+    ctx: JmapErrorContext,
+) -> AccountError {
+    build(
+        AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Jmap,
+            detail: Some(DiagnosticText::support_only(format!(
+                "Email {id} response omitted {property}"
+            ))),
+        }),
+        &ctx,
+    )
+    .try_build()
+    .expect("valid missing property classification")
+}
+
 /// An id a `/query` returned that the hydrating `/get` then failed to
 /// materialize - either declared `notFound` or answered in neither lane.
 ///

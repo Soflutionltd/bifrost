@@ -300,8 +300,8 @@ pub enum ProtocolSalt {
     /// Microsoft Graph has no documented wire replay token;
     /// `client-request-id` is debugging correlation only.
     Graph(String),
-    /// IMAP carries no replay token; engine relies on the read-back
-    /// guard after retry.
+    /// IMAP carries no replay token; the engine relies on read-back of
+    /// uncertain writes and declared desired-state reassertion.
     Imap,
     /// CardDAV carries no replay token; consumers use etags where
     /// available and the engine keeps idempotency local.
@@ -409,6 +409,56 @@ impl FlagOp {
             .try_build()
             .expect("valid flag operation error classification")
         })
+    }
+}
+
+/// Whether an observed flag state already is the state a flag operation
+/// asks for, judged in the observing provider's own flag vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FlagTargetState {
+    /// The observed state is the requested target state.
+    Satisfied,
+    /// The observed state is not the requested target state, and applying
+    /// the operation would change it.
+    Unsatisfied,
+    /// The observation cannot decide: the operation names something the
+    /// observation cannot see or the write does not model, or the operation
+    /// is invalid or unknown.
+    Indeterminate,
+}
+
+/// The generic flag judge: ASCII-case-insensitive flag identity, matching
+/// [`FlagOp::validate`] and [`canonical_flags_hash`]. An operation that fails
+/// validation is `Indeterminate`.
+///
+/// The match below deliberately has no wildcard arm: `#[non_exhaustive]` does
+/// not apply inside this crate, so a future `FlagOp` variant fails to compile
+/// here and must be classified on purpose.
+#[must_use]
+pub fn flag_target_state(observed: &HashSet<String>, op: &FlagOp) -> FlagTargetState {
+    if op.validate().is_err() {
+        return FlagTargetState::Indeterminate;
+    }
+    let fold = |flags: &HashSet<String>| {
+        flags
+            .iter()
+            .map(|f| f.to_ascii_lowercase())
+            .collect::<HashSet<_>>()
+    };
+    let observed = fold(observed);
+    let matches = match op {
+        FlagOp::Add(flags) => fold(flags).is_subset(&observed),
+        FlagOp::Remove(flags) => fold(flags).is_disjoint(&observed),
+        FlagOp::Set(flags) => fold(flags) == observed,
+        FlagOp::Patch { add, remove } => {
+            fold(add).is_subset(&observed) && fold(remove).is_disjoint(&observed)
+        }
+    };
+    if matches {
+        FlagTargetState::Satisfied
+    } else {
+        FlagTargetState::Unsatisfied
     }
 }
 
@@ -523,5 +573,105 @@ mod versioned_mail_tests {
             [crate::SyncEvent::Terminated(_)]
         ));
         assert_eq!(pulled.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn add_target_matches_when_subset_present() {
+        let obs = set(&["\\Seen", "\\Flagged"]);
+        let op = FlagOp::Add(set(&["\\Seen"]));
+        assert_eq!(flag_target_state(&obs, &op), FlagTargetState::Satisfied);
+    }
+
+    #[test]
+    fn add_target_does_not_match_when_missing() {
+        let obs = set(&["\\Flagged"]);
+        let op = FlagOp::Add(set(&["\\Seen"]));
+        assert_eq!(flag_target_state(&obs, &op), FlagTargetState::Unsatisfied);
+    }
+
+    #[test]
+    fn remove_target_matches_when_absent() {
+        let obs = set(&["\\Flagged"]);
+        let op = FlagOp::Remove(set(&["\\Seen"]));
+        assert_eq!(flag_target_state(&obs, &op), FlagTargetState::Satisfied);
+    }
+
+    #[test]
+    fn set_target_requires_exact_match() {
+        let obs = set(&["\\Seen"]);
+        let op = FlagOp::Set(set(&["\\Seen"]));
+        assert_eq!(flag_target_state(&obs, &op), FlagTargetState::Satisfied);
+        let op2 = FlagOp::Set(set(&["\\Seen", "\\Flagged"]));
+        assert_eq!(flag_target_state(&obs, &op2), FlagTargetState::Unsatisfied);
+    }
+
+    #[test]
+    fn patch_requires_both_sides() {
+        let obs = set(&["\\Seen"]);
+        let op = FlagOp::Patch {
+            add: set(&["\\Seen"]),
+            remove: set(&["\\Flagged"]),
+        };
+        assert_eq!(flag_target_state(&obs, &op), FlagTargetState::Satisfied);
+        let op2 = FlagOp::Patch {
+            add: set(&["\\Seen"]),
+            remove: set(&["\\Seen"]),
+        };
+        assert_eq!(
+            flag_target_state(&obs, &op2),
+            FlagTargetState::Indeterminate
+        );
+    }
+
+    #[test]
+    fn flag_target_state_is_ascii_case_insensitive_for_every_op() {
+        let observed = set(&["\\seen"]);
+        for op in [
+            FlagOp::Add(set(&["\\Seen"])),
+            FlagOp::Remove(set(&["\\FLAGGED"])),
+            FlagOp::Set(set(&["\\SEEN"])),
+            FlagOp::Patch {
+                add: set(&["\\Seen"]),
+                remove: set(&["\\Flagged"]),
+            },
+        ] {
+            assert_eq!(
+                flag_target_state(&observed, &op),
+                FlagTargetState::Satisfied
+            );
+        }
+    }
+
+    #[test]
+    fn flag_target_state_set_equality_folds_case_duplicates() {
+        assert_eq!(
+            flag_target_state(&set(&["\\seen"]), &FlagOp::Set(set(&["\\Seen", "\\SEEN"]))),
+            FlagTargetState::Satisfied
+        );
+    }
+
+    #[test]
+    fn flag_target_state_refuses_invalid_ops() {
+        for op in [
+            FlagOp::Add(set(&[])),
+            FlagOp::Patch {
+                add: set(&["x"]),
+                remove: set(&["X"]),
+            },
+        ] {
+            assert_eq!(
+                flag_target_state(&set(&[]), &op),
+                FlagTargetState::Indeterminate
+            );
+        }
     }
 }

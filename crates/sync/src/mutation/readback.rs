@@ -1,15 +1,7 @@
-//! Read-back guard for `MutationReplaySafety::None` protocols.
-//!
-//! After a retry, the engine cannot tell whether the server applied
-//! the original attempt or just the retry. The read-back guard
-//! re-fetches each retried batch via
-//! `account.get_stream(_, Projection::FlagsOnly)` and reconciles
-//! `Failed` outcomes against actual server state: if the flags now
-//! match the intended target, the failure is downgraded to `Skipped`
-//! (the original apply succeeded).
-//!
-//! Applies to all four protocols today; the
-//! `MutationReplaySafety::ReplayToken` variant is reserved but unused.
+//! Per-object read-back of uncertain writes, preserving partial observations.
+//! Identity and projection are checked here; accounts judge their own flag
+//! vocabulary. Campaigns may reassert declared unversioned flag and destroy
+//! targets after valid unsatisfied observations, within shared retry limits.
 
 use std::collections::{HashMap, HashSet};
 
@@ -28,26 +20,18 @@ pub struct ReadbackOutcome {
     /// target. These were applied (possibly by the pre-retry attempt)
     /// and are downgraded to `Skipped`.
     pub skipped: u64,
-    /// Items whose state did NOT match the target. The protocol's
-    /// `Failed` outcome stands.
+    /// Valid observations whose current state does not satisfy the target.
+    /// This does not prove that an earlier write never landed.
     pub still_failed: u64,
-    /// Items the read-back could not classify because the protocol
-    /// reported `ItemOutcome::Failed` / `Uncertain` for the hydrated
-    /// fetch itself. The original mutation `Failed` outcome stands.
+    /// Targets with missing, failed, indeterminate or invalid observations,
+    /// including conflicting duplicates and inconsistent hydrated identities.
     pub uncertain: u64,
 }
 
-/// Run the read-back guard against a set of ids and a target flag-op.
-///
-/// `account.get_stream(ids, Projection::FlagsOnly)` yields
-/// `HydratedObjectKind::FlagsOnly(HashSet<String>)` per id. The guard
-/// compares each id's hydrated flags against the target state encoded
-/// in `op`:
-///
-/// - `Add(set)` -> target satisfied iff every flag in `set` is present.
-/// - `Remove(set)` -> target satisfied iff no flag in `set` is present.
-/// - `Set(set)` -> target satisfied iff hydrated == `set`.
-/// - `Patch { add, remove }` -> add + remove must both hold.
+/// Run the read-back guard against a set of ids and a target flag operation.
+/// Complete FlagsOnly observations are judged through `Account::flag_target`.
+/// Invalid projections, inconsistent identities and conflicting duplicates
+/// remain uncertain. This guard only observes; campaigns own reassertion.
 pub async fn run_readback_guard(
     account: &dyn Account,
     ids: Vec<ObjectId>,
@@ -83,44 +67,24 @@ pub(crate) async fn run_readback_guard_observed(
     op: &FlagOp,
     sink: ReadbackErrorSink<'_>,
 ) -> Result<ReadbackOutcome, Error> {
-    let (objects, error) = run_object_readback(account, ids, ReadbackTarget::Flags(op), sink).await;
-    if let Some(error) = error {
+    guard_outcome(run_object_readback(account, ids, ReadbackTarget::Flags(op), sink).await)
+}
+
+/// The published guards' accounting over one report: a stream termination is
+/// the guard's `Err`; otherwise every requested id lands in exactly one count.
+fn guard_outcome(report: ReadbackReport) -> Result<ReadbackOutcome, Error> {
+    if let Some(error) = report.termination {
         return Err(error);
     }
     let mut outcome = ReadbackOutcome::default();
-    for result in objects.values() {
+    for result in report.objects.values() {
         match result {
-            ObjectReadback::Matched => outcome.skipped += 1,
-            ObjectReadback::Mismatched => outcome.still_failed += 1,
+            ObjectReadback::Satisfied => outcome.skipped += 1,
+            ObjectReadback::Unsatisfied => outcome.still_failed += 1,
             ObjectReadback::Unresolved => outcome.uncertain += 1,
         }
     }
     Ok(outcome)
-}
-
-fn matches_target(hydrated: &HydratedObject, op: &FlagOp) -> bool {
-    let HydratedObjectKind::FlagsOnly(observed) = &hydrated.kind else {
-        // Wrong projection - cannot reconcile. Be safe: treat as not
-        // matched so the original `Failed` outcome stands.
-        return false;
-    };
-    matches_target_set(observed, op)
-}
-
-#[must_use]
-pub(crate) fn matches_target_set(observed: &HashSet<String>, op: &FlagOp) -> bool {
-    match op {
-        FlagOp::Add(set) => set.iter().all(|f| observed.contains(f)),
-        FlagOp::Remove(set) => set.iter().all(|f| !observed.contains(f)),
-        FlagOp::Set(set) => observed == set,
-        FlagOp::Patch { add, remove } => {
-            add.iter().all(|f| observed.contains(f)) && remove.iter().all(|f| !observed.contains(f))
-        }
-        // `FlagOp` is `#[non_exhaustive]`; an unknown operation cannot
-        // be reconciled against observed flags, so the original
-        // `Failed` outcome stands.
-        _ => false,
-    }
 }
 
 /// Read-back guard for a bulk-move campaign.
@@ -151,20 +115,7 @@ pub(crate) async fn run_move_readback_guard_observed(
     destination: &MembershipScope,
     sink: ReadbackErrorSink<'_>,
 ) -> Result<ReadbackOutcome, Error> {
-    let (objects, error) =
-        run_object_readback(account, ids, ReadbackTarget::Move(destination), sink).await;
-    if let Some(error) = error {
-        return Err(error);
-    }
-    let mut outcome = ReadbackOutcome::default();
-    for result in objects.values() {
-        match result {
-            ObjectReadback::Matched => outcome.skipped += 1,
-            ObjectReadback::Mismatched => outcome.still_failed += 1,
-            ObjectReadback::Unresolved => outcome.uncertain += 1,
-        }
-    }
-    Ok(outcome)
+    guard_outcome(run_object_readback(account, ids, ReadbackTarget::Move(destination), sink).await)
 }
 
 /// Read-back guard for a bulk-destroy campaign.
@@ -183,8 +134,8 @@ pub(crate) async fn run_move_readback_guard_observed(
 ///   stands.
 ///
 /// An id the protocol simply omits from the hydrated stream (rather than
-/// emitting `Failed` for) produces no outcome here and stays counted as
-/// `pending_retry`. That is the conservative bias: a destroy is only
+/// emitting `Failed` for) counts as `uncertain` here and `pending_retry` in
+/// the campaign. A destroy is only
 /// reclassified as `Skipped` on an explicit not-found signal.
 pub async fn run_destroy_readback_guard(
     account: &dyn Account,
@@ -198,27 +149,15 @@ pub(crate) async fn run_destroy_readback_guard_observed(
     ids: Vec<ObjectId>,
     sink: ReadbackErrorSink<'_>,
 ) -> Result<ReadbackOutcome, Error> {
-    let (objects, error) = run_object_readback(account, ids, ReadbackTarget::Destroy, sink).await;
-    if let Some(error) = error {
-        return Err(error);
-    }
-    let mut outcome = ReadbackOutcome::default();
-    for result in objects.values() {
-        match result {
-            ObjectReadback::Matched => outcome.skipped += 1,
-            ObjectReadback::Mismatched => outcome.still_failed += 1,
-            ObjectReadback::Unresolved => outcome.uncertain += 1,
-        }
-    }
-    Ok(outcome)
+    guard_outcome(run_object_readback(account, ids, ReadbackTarget::Destroy, sink).await)
 }
 
 /// Per-object observations retain identity and partial progress even when the
 /// hydration stream terminates. Missing ids remain explicitly unresolved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ObjectReadback {
-    Matched,
-    Mismatched,
+    Satisfied,
+    Unsatisfied,
     Unresolved,
 }
 
@@ -228,17 +167,34 @@ pub(crate) enum ReadbackTarget<'a> {
     Destroy,
 }
 
+pub(crate) struct ReadbackReport {
+    /// One entry per requested id, pre-filled `Unresolved`; the placeholder is
+    /// not an observation.
+    pub(crate) objects: HashMap<ObjectId, ObjectReadback>,
+    /// Per-item hydration failures whose recovery is `Engine(_)`, including
+    /// failures for ids that were never requested.
+    pub(crate) engine_failures: Vec<bifrost_types::AccountError>,
+    /// A stream-level termination, returned as before.
+    pub(crate) termination: Option<Error>,
+}
+
 pub(crate) async fn run_object_readback(
     account: &dyn Account,
     ids: Vec<ObjectId>,
     target: ReadbackTarget<'_>,
     sink: ReadbackErrorSink<'_>,
-) -> (HashMap<ObjectId, ObjectReadback>, Option<Error>) {
-    let mut objects: HashMap<_, _> = ids
-        .iter()
-        .cloned()
-        .map(|id| (id, ObjectReadback::Unresolved))
-        .collect();
+) -> ReadbackReport {
+    let mut report = ReadbackReport {
+        objects: ids
+            .iter()
+            .cloned()
+            .map(|id| (id, ObjectReadback::Unresolved))
+            .collect(),
+        engine_failures: Vec::new(),
+        termination: None,
+    };
+    let mut observed = HashSet::new();
+    let mut disputed = HashSet::new();
     let projection = match target {
         ReadbackTarget::Flags(_) => Projection::FlagsOnly,
         _ => Projection::Metadata,
@@ -248,63 +204,94 @@ pub(crate) async fn run_object_readback(
         match event {
             SyncEvent::Batch(batch) => {
                 for item in batch.items {
+                    // Even an unrequested failure can carry account-wide engine
+                    // evidence or a shared throttle; report it before identity checks.
                     observe(sink, &item);
+                    let error = match &item {
+                        ItemOutcome::Failed(f) => Some(&f.error),
+                        ItemOutcome::Uncertain(u) => Some(&u.error),
+                        ItemOutcome::Succeeded(_) => None,
+                    };
+                    if let Some(error) = error
+                        && matches!(error.recovery(), bifrost_types::RecoveryClass::Engine(_))
+                    {
+                        report.engine_failures.push(error.clone());
+                    }
                     let (id, observation) = match item {
                         ItemOutcome::Succeeded(success) => {
-                            let matched = match target {
-                                ReadbackTarget::Flags(op) => matches_target(&success.output, op),
-                                ReadbackTarget::Move(destination) => {
-                                    membership_contains(&success.output, destination)
+                            let id = ObjectId(success.item.0);
+                            if !report.objects.contains_key(&id) {
+                                continue;
+                            }
+                            let result = if success.output.id != id {
+                                ObjectReadback::Unresolved
+                            } else {
+                                match (&target, &success.output.kind) {
+                                    (
+                                        ReadbackTarget::Flags(op),
+                                        HydratedObjectKind::FlagsOnly(flags),
+                                    ) => match account.flag_target(&id, flags, op) {
+                                        bifrost_types::FlagTargetState::Satisfied => {
+                                            ObjectReadback::Satisfied
+                                        }
+                                        bifrost_types::FlagTargetState::Unsatisfied => {
+                                            ObjectReadback::Unsatisfied
+                                        }
+                                        _ => ObjectReadback::Unresolved,
+                                    },
+                                    (
+                                        ReadbackTarget::Move(destination),
+                                        HydratedObjectKind::Metadata(entry),
+                                    ) => {
+                                        if entry.memberships.contains(destination) {
+                                            ObjectReadback::Satisfied
+                                        } else {
+                                            ObjectReadback::Unsatisfied
+                                        }
+                                    }
+                                    (ReadbackTarget::Destroy, _) => ObjectReadback::Unsatisfied,
+                                    _ => ObjectReadback::Unresolved,
                                 }
-                                ReadbackTarget::Destroy => false,
                             };
-                            (
-                                ObjectId(success.item.0),
-                                if matched {
-                                    ObjectReadback::Matched
-                                } else {
-                                    ObjectReadback::Mismatched
-                                },
-                            )
+                            (id, result)
                         }
-                        ItemOutcome::Failed(failure) => {
+                        ItemOutcome::Failed(f) => {
                             let result = if matches!(target, ReadbackTarget::Destroy)
-                                && destroy_readback_saw_absence(&failure.error)
+                                && destroy_readback_saw_absence(&f.error)
                             {
-                                ObjectReadback::Matched
+                                ObjectReadback::Satisfied
                             } else {
                                 ObjectReadback::Unresolved
                             };
-                            (ObjectId(failure.item.0), result)
+                            (ObjectId(f.item.0), result)
                         }
-                        ItemOutcome::Uncertain(uncertain) => {
-                            (ObjectId(uncertain.item.0), ObjectReadback::Unresolved)
+                        ItemOutcome::Uncertain(u) => {
+                            (ObjectId(u.item.0), ObjectReadback::Unresolved)
                         }
                     };
-                    if let Some(value) = objects.get_mut(&id) {
-                        *value = observation;
+                    if let Some(value) = report.objects.get_mut(&id) {
+                        if observed.insert(id.clone()) {
+                            *value = observation;
+                        } else if *value != observation || disputed.contains(&id) {
+                            disputed.insert(id);
+                            *value = ObjectReadback::Unresolved;
+                        }
                     }
                 }
             }
             SyncEvent::Done(_) => break,
-            SyncEvent::Terminated(error) => return (objects, Some(Error::Account(error))),
+            SyncEvent::Terminated(error) => {
+                report.termination = Some(Error::Account(error));
+                break;
+            }
             _ => {}
         }
     }
-    (objects, None)
+    report
 }
 
 fn destroy_readback_saw_absence(error: &bifrost_types::AccountError) -> bool {
     matches!(error.kind(), AccountErrorKind::NotFound(_))
-}
-
-fn membership_contains(hydrated: &HydratedObject, destination: &MembershipScope) -> bool {
-    let HydratedObjectKind::Metadata(entry) = &hydrated.kind else {
-        // Wrong projection - cannot reconcile. Be safe: treat as not
-        // matched so the original `Failed` outcome stands.
-        return false;
-    };
-    entry.memberships.iter().any(|m| m == destination)
 }
 
 #[cfg(test)]
@@ -313,56 +300,6 @@ mod tests {
     use bifrost_types::{
         AccountErrorBuilder, AccountErrorKind, Cause, ResourceKind, ServerCause, ServerErrorKind,
     };
-    use std::collections::HashSet;
-
-    fn set(items: &[&str]) -> HashSet<String> {
-        items.iter().map(|s| (*s).to_string()).collect()
-    }
-
-    #[test]
-    fn add_target_matches_when_subset_present() {
-        let obs = set(&["\\Seen", "\\Flagged"]);
-        let op = FlagOp::Add(set(&["\\Seen"]));
-        assert!(matches_target_set(&obs, &op));
-    }
-
-    #[test]
-    fn add_target_does_not_match_when_missing() {
-        let obs = set(&["\\Flagged"]);
-        let op = FlagOp::Add(set(&["\\Seen"]));
-        assert!(!matches_target_set(&obs, &op));
-    }
-
-    #[test]
-    fn remove_target_matches_when_absent() {
-        let obs = set(&["\\Flagged"]);
-        let op = FlagOp::Remove(set(&["\\Seen"]));
-        assert!(matches_target_set(&obs, &op));
-    }
-
-    #[test]
-    fn set_target_requires_exact_match() {
-        let obs = set(&["\\Seen"]);
-        let op = FlagOp::Set(set(&["\\Seen"]));
-        assert!(matches_target_set(&obs, &op));
-        let op2 = FlagOp::Set(set(&["\\Seen", "\\Flagged"]));
-        assert!(!matches_target_set(&obs, &op2));
-    }
-
-    #[test]
-    fn patch_requires_both_sides() {
-        let obs = set(&["\\Seen"]);
-        let op = FlagOp::Patch {
-            add: set(&["\\Seen"]),
-            remove: set(&["\\Flagged"]),
-        };
-        assert!(matches_target_set(&obs, &op));
-        let op2 = FlagOp::Patch {
-            add: set(&["\\Seen"]),
-            remove: set(&["\\Seen"]),
-        };
-        assert!(!matches_target_set(&obs, &op2));
-    }
 
     #[test]
     fn destroy_readback_only_accepts_not_found_as_absence() {
@@ -386,3 +323,7 @@ mod tests {
         assert!(!destroy_readback_saw_absence(&rate_limited));
     }
 }
+
+#[cfg(test)]
+#[path = "readback_tests.rs"]
+mod observation_tests;

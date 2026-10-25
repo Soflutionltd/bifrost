@@ -409,6 +409,9 @@ awaits session cleanup rather than dropping the multi-request future.
   bulk mail refuses supplied tokens before I/O.
 - `mutation.replay_safety: MutationReplaySafety::None`. No client-mintable
   dedup token; the shared `IdempotencyKey` is held engine-side.
+- `mutation.reassertion: { set_flags: true, destroy: true }`. Gmail ids are
+  immutable and `batchModify` / `batchDelete` converge when reapplied; the flag
+  judge is described under "Flag observation and reassertion capability".
 - `batching_policy: BatchingPolicy { max_items: 1000, max_wait:
   75ms, flush_on_input_close: true }`. 1000 = Gmail's `batchModify`
   cap.
@@ -1390,9 +1393,11 @@ that produced it.
     `Applied` they came back on the next inventory or history pass, were
     destroyed again, and the account sat in a permanent reconcile loop - on
     the ordinary `gmail.modify` scope, which triggers this fallback by design
-    rather than by misconfiguration. `bifrost-sync` read-back-verifies the
-    `Downgraded` lane instead of trusting it, and a trashed message still
-    hydrates, so the guard files it `still_failed`: honest, and terminal.
+    rather than by misconfiguration. `bifrost-sync` treats the reported
+    `Downgraded` effect as final and never reads it back against the original
+    destroy target. An uncertain fallback observed as present may reassert,
+    repeat the fallback, and end `Downgraded`; a reasserted `batchDelete` that
+    now succeeds instead fulfils the original request.
 
     Before dispatching the fallback, the driver sets its actual effect in the
     shared progress ledger. Each successful trash sub-batch is recorded there as
@@ -1432,8 +1437,8 @@ Result classification:
   `Unsupported(UpdateFlags)` -> `RecoveryClass::Unsupported`, alongside the same
   warning. `Downgraded` is not available here - its published contract in
   `crates/types/src/error/stream.rs` requires that the target actually changed,
-  and `bifrost-sync` files every downgrade as `PendingReadback`, which would
-  schedule a read-back for a mutation that never ran. `Skipped` is equally wrong:
+  and `bifrost-sync` treats every downgrade as a final reported effect,
+  which would falsely claim a mutation ran. `Skipped` is equally wrong:
   it claims the target was already in the requested state.
 - A retry-class or auth-class error -> stream-level
   `SyncEvent::Terminated(AccountError)` so the engine can re-issue
@@ -1810,3 +1815,19 @@ https://developers.google.com/people/api/rest/v1/people/deleteContact
 Gmail history IDs cannot condition `batchModify` or `batchDelete`; inherited
 versioned bulk methods refuse supplied mail versions per target and send only
 unversioned targets through the ordinary mail implementation.
+
+## Flag observation and reassertion capability
+
+The account declares flag and destroy desired-state reassertion safe on stable
+Gmail ids. Its flag judge uses the label snapshot and write translator,
+compares labels by id rather than display name, and interprets Seen as the
+inverse of UNREAD. Named Draft, unsupported tokens, invalid operations, and
+an unfetched vocabulary are Indeterminate. Set leaves classifier categories,
+omitted Draft, and observed labels outside the snapshot alone, as writes do.
+A stale snapshot can cause bounded futile reassertion. The pure judge clones
+the vocabulary and translates once per observed id, costing O(ids x labels).
+
+Gmail's classifier can re-add IMPORTANT after a write, making a target
+unsatisfiable. After an uncertain write, such a target can spend its remaining
+attempt budget on writes that cannot stick. This bounded futility is accepted,
+like label-snapshot staleness.

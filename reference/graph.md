@@ -1002,8 +1002,11 @@ invalidation is exactly what `PushSource::Coalesced` exists for.
   retains provider-observed guards: every non-`Destroy` mutation sends
   `If-Match: <entity-tag>`; the cached etag comes from inventory/changes/get,
   refreshed from `messages/{id}?$select=id` on a cold cache.
-- `mutation.replay_safety: None`. No client-mintable replay token; the read-back
-  guard is the lost-update net.
+- `mutation.replay_safety: None`. No client-mintable replay token; read-back
+  observes the current target state and makes no lost-update claim.
+- `mutation.reassertion: { set_flags: true, destroy: true }`. Message ids are
+  never reused and a `PATCH` of absolute fields or a `permanentDelete`
+  converges when reapplied; see "Flag observation and reassertion capability".
 - `batching_policy: { max_items: 20, max_wait: 100ms, flush_on_input_close: true }`
   (the 20 ceiling matches Graph's `/$batch` limit).
 - `rate_limit_class: Tiered` (per-mailbox concurrency + per-app throttle budget);
@@ -1476,6 +1479,13 @@ inventory-entry projection) for the body-bearing projections, `FlagsOnly` for
 `FlagsOnly`, plus one blob handle per attachment descriptor. Body-bearing
 projections degrade to `Metadata` for the same reason the REST arm does -
 `RawMime` means assembled RFC822, and `GetItem` returns a parsed HTML body.
+
+The EWS `FlagsOnly` observation carries only `\seen`, and the EWS parser
+defaults `is_read` to `false` when `IsRead` is missing. That is a recorded
+exception to the `get_stream` contract that a `FlagsOnly` success is the
+object's whole flag state. It is harmless for reassertion: the mutation door
+does not route public-folder items to EWS, so they never reach a reassertable
+outcome, and the flag judge refuses any token other than `\seen` on them.
 
 Attachment bytes route through `open_blob`: the blob locator carries the
 folder-qualified message id, so `GraphBlobKind::Ews` fetches via SOAP
@@ -2700,3 +2710,19 @@ an individual conflict while successful siblings remain successful. Repeated
 IDs start another envelope so distinct caller preconditions cannot overwrite
 each other in the ID-keyed guard map. JSON batching is not a transaction:
 https://learn.microsoft.com/en-us/graph/json-batching.
+
+## Flag observation and reassertion capability
+
+The account declares flag and destroy desired-state reassertion safe on its
+non-reused message ids. REST FlagsOnly hydration requires boolean isRead,
+an object flag with recognized string flagStatus (notFlagged, flagged, or
+complete), and a categories array containing only strings. Missing fields
+fail with Protocol MissingField; malformed fields with ParseFailed. Invalid
+bodies contribute no etag to the mutation cache.
+
+The flag judge canonicalizes read/\seen and starred/flagged/\flagged aliases,
+and accepts categories only with the write's case-sensitive `category:`
+prefix. Category names compare ASCII-case-insensitively. Unmodeled tokens
+are Indeterminate, even beside modeled tokens. Completed flags observe as
+unflagged. Public EWS items can judge only seen (see "Public-folder
+hydration" for the EWS `IsRead` exception).

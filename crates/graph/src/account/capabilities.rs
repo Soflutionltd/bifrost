@@ -50,6 +50,10 @@ pub(crate) fn build_capabilities(
                 event_rsvp: false,
             },
             replay_safety: MutationReplaySafety::None,
+            reassertion: bifrost_types::MutationReassertion {
+                set_flags: true,
+                destroy: true,
+            },
         },
         batching_policy: BatchingPolicy {
             max_items: 20,
@@ -231,6 +235,13 @@ mod tests {
     fn mutation_replay_safety_is_none() {
         let caps = build_capabilities(PushMode::GraphSubscriptions);
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
+        assert_eq!(
+            caps.mutation.reassertion,
+            bifrost_types::MutationReassertion {
+                set_flags: true,
+                destroy: true
+            }
+        );
     }
 
     #[test]

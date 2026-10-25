@@ -56,6 +56,7 @@ pub(crate) fn caldav_capabilities(event_rsvp: bool) -> AccountCapabilities {
                 event_rsvp: false,
             },
             replay_safety: MutationReplaySafety::None,
+            reassertion: bifrost_types::MutationReassertion::NONE,
         },
         batching_policy: BatchingPolicy {
             max_items: 0,

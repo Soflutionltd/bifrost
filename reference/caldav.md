@@ -497,7 +497,9 @@ its scope and action.
   delta on the far side) but strictly correct for the master instant. An
   unknown / unparseable zone omits the offset sub-block rather than asserting
   a misleading `+0000`.
-- `capabilities.rs` - calendar-only `AccountCapabilities`.
+- `capabilities.rs` - calendar-only `AccountCapabilities`. Mutation
+  reassertion is `MutationReassertion::NONE`: the account has no mail bulk
+  doors.
 
 ## Account behavior
 

@@ -115,6 +115,10 @@ pub(crate) fn build_capabilities(
                 MutationConcurrency::None
             },
             replay_safety: MutationReplaySafety::None,
+            reassertion: bifrost_types::MutationReassertion {
+                set_flags: true,
+                destroy: true,
+            },
         },
         batching_policy: BatchingPolicy {
             max_items: 1024,
@@ -358,6 +362,13 @@ mod tests {
             }
         );
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
+        assert_eq!(
+            caps.mutation.reassertion,
+            bifrost_types::MutationReassertion {
+                set_flags: true,
+                destroy: true
+            }
+        );
         assert_eq!(caps.filter_rule_shape, FilterRuleShape::None);
         assert!(!caps.pim_methods.filters_list);
         assert!(!caps.pim_methods.address_books_list);

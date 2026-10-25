@@ -89,8 +89,8 @@ pub enum MutationConcurrency {
 ///
 /// `ReplayToken` is reserved for a future protocol that documents a
 /// real dedup primitive; no protocol today qualifies. Every current
-/// Account impl declares `None` and the engine reads back affected
-/// items after retry.
+/// Account impl declares `None`. See `MutationReassertion` for desired-state
+/// reassertion after observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MutationReplaySafety {
@@ -98,12 +98,36 @@ pub enum MutationReplaySafety {
     None,
 }
 
-/// Two distinct mutation concerns: lost-update prevention (concurrency)
-/// and double-apply prevention (replay safety). Independent axes.
+/// Which unversioned bulk mail doors this account declares safe to reapply,
+/// after a valid observation shows the target unsatisfied, to the same
+/// object. A declaration requires stable, never-reused object identity and a
+/// door whose reapplication converges on the requested state without a
+/// second, different side effect. It is NOT server deduplication and gives no
+/// lost-update guarantee; it authorizes desired-state reassertion only. Moves
+/// have no field: the move door is never reasserted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MutationReassertion {
+    /// `bulk_set_flags` may be reapplied to an unversioned target.
+    pub set_flags: bool,
+    /// `bulk_destroy` may be reapplied to an unversioned target.
+    pub destroy: bool,
+}
+
+impl MutationReassertion {
+    /// No door is declared reassertable; the default.
+    pub const NONE: Self = Self {
+        set_flags: false,
+        destroy: false,
+    };
+}
+
+/// Independent declarations for mutation concurrency, wire deduplication,
+/// and desired-state reassertion after observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MutationCapabilities {
     pub concurrency: MutationConcurrency,
     pub replay_safety: MutationReplaySafety,
+    pub reassertion: MutationReassertion,
 }
 
 /// How the protocol crate's bulk methods batch their input stream.

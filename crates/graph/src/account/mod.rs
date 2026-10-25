@@ -1052,6 +1052,15 @@ impl Account for GraphAccount {
         inventory::resume_inventory_stream(self.clone(), cursor)
     }
 
+    fn flag_target(
+        &self,
+        target: &ObjectId,
+        observed: &std::collections::HashSet<String>,
+        op: &bifrost_types::FlagOp,
+    ) -> bifrost_types::FlagTargetState {
+        mutate::graph_flag_target(target, observed, op)
+    }
+
     fn get_stream(
         &self,
         ids: AccountStream<ObjectId>,

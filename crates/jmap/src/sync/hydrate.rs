@@ -409,6 +409,20 @@ fn reconcile_hydration(
             )));
             continue;
         };
+        if matches!(projection, Projection::FlagsOnly) && !email.has_keywords() {
+            items.push(ItemOutcome::Failed(bifrost_types::BatchFailure::new(
+                BatchItemId(id.0.clone()),
+                super::error::missing_property(
+                    id.0.clone(),
+                    "keywords",
+                    super::error::JmapErrorContext::message(
+                        bifrost_types::AccountOperation::Hydrate,
+                        id.0.clone(),
+                    ),
+                ),
+            )));
+            continue;
+        }
         let id = id.clone();
         let kind = match projection {
             Projection::FlagsOnly => HydratedObjectKind::FlagsOnly(
@@ -471,6 +485,30 @@ mod tests {
 
     use super::*;
     use crate::core::transport::{HttpTransport, TransportError};
+
+    #[test]
+    fn flags_only_email_without_keywords_is_a_missing_field_failure() {
+        let requested = [ObjectId("m1".into()), ObjectId("m2".into())];
+        let items = reconcile_hydration(
+            &requested,
+            vec![
+                serde_json::from_value(json!({ "id": "m1" })).unwrap(),
+                email("m2"),
+            ],
+            &[],
+            Projection::FlagsOnly,
+            "s1",
+            None,
+        );
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[0], ItemOutcome::Failed(f) if matches!(
+            f.error.kind(),
+            bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::MissingField
+            )
+        )));
+        assert!(matches!(&items[1], ItemOutcome::Succeeded(_)));
+    }
 
     struct HydrationTransport {
         requests: Arc<Mutex<Vec<Value>>>,

@@ -51,8 +51,8 @@ pub use blob::{BlobCapabilities, BlobEncoding, BlobHandle, ByteRange, Digest, Di
 pub use capabilities::{
     AccountCapabilities, BatchingPolicy, BlobRangeSupport, CapabilityChange, CapabilityDelta,
     CapabilityKey, CapabilityValue, ConvenienceShape, CursorFreshness, MutationCapabilities,
-    MutationConcurrency, MutationReplaySafety, PimMethodSupport, PushCapability, QuotaSignal,
-    RateLimitClass, StarredFlagShape,
+    MutationConcurrency, MutationReassertion, MutationReplaySafety, PimMethodSupport,
+    PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape,
 };
 
 // Calendar primitives.
@@ -172,8 +172,9 @@ pub use ids::{
 
 // Mutation + projection + hydration types.
 pub use mutation::{
-    Fingerprint, FlagOp, FlagOpValidationError, HydratedObject, HydratedObjectKind, IdempotencyKey,
-    MailMutationTarget, Projection, ProtocolSalt, ServerVersion, canonical_flags_hash,
+    Fingerprint, FlagOp, FlagOpValidationError, FlagTargetState, HydratedObject,
+    HydratedObjectKind, IdempotencyKey, MailMutationTarget, Projection, ProtocolSalt,
+    ServerVersion, canonical_flags_hash, flag_target_state,
 };
 
 // Pagination.

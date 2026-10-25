@@ -22,6 +22,7 @@ pub(crate) fn carddav_capabilities() -> AccountCapabilities {
                 event_rsvp: false,
             },
             replay_safety: MutationReplaySafety::None,
+            reassertion: bifrost_types::MutationReassertion::NONE,
         },
         batching_policy: BatchingPolicy {
             max_items: 0,
@@ -86,6 +87,10 @@ mod tests {
             }
         );
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
+        assert_eq!(
+            caps.mutation.reassertion,
+            bifrost_types::MutationReassertion::NONE
+        );
         assert!(caps.pim_methods.address_books_list);
         assert!(caps.pim_methods.contacts_list);
         assert!(caps.pim_methods.contact_get);

@@ -276,6 +276,10 @@ pub(crate) fn build(
                 event_rsvp: support.calendar,
             },
             replay_safety: MutationReplaySafety::None,
+            reassertion: bifrost_types::MutationReassertion {
+                set_flags: true,
+                destroy: true,
+            },
         },
         batching_policy: BatchingPolicy {
             max_items,
@@ -451,6 +455,13 @@ mod tests {
             }
         );
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
+        assert_eq!(
+            caps.mutation.reassertion,
+            bifrost_types::MutationReassertion {
+                set_flags: true,
+                destroy: true
+            }
+        );
         assert_eq!(caps.batching_policy.max_items, 500);
         assert!(caps.pim_methods.add_to_container);
         assert!(caps.pim_methods.send_message);

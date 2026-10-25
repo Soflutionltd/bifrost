@@ -696,7 +696,7 @@ the engine's read-back path.
 - A two-sided `FlagOp::Patch` (non-empty add and remove) is two STOREs, and every id is accounted per UID across both. The guard rides the first (add) STORE; UIDs it rejects with `MODIFIED` are `Failed(ConcurrencyConflict)` and are excluded from the second STORE. Only the add-applied subset receives the unguarded remove, and only that subset may report `Succeeded(Applied)` - a second STORE that errors or comes back non-applied never reports success for those ids: transmission evidence decides the lane (`InFlight` evidence is `Uncertain`, an `Unsent` or server-acknowledged failure is `Failed`), per the mutation error-lane rule below. A wire error on the first STORE is confined to its own MODSEQ group: outcomes already established for earlier groups survive it and are never downgraded by the folder-level error path.
 - `bulk_move` validates the destination mailbox NAME once (syntax via `MailboxName::new`), before any source folder is opened; a syntactically invalid destination fails every target `Request(Malformed)` up front. Existence and selectability are not preflighted: a well-formed but nonexistent destination flows into the per-folder path and surfaces as per-item outcomes from the server's `NO [TRYCREATE]`.
 
-Capabilities advertise `MutationConcurrency::None`: the MODSEQ cache is opportunistic (cold cache = unprotected STORE), so `StateBased` would let the engine assume UNCHANGEDSINCE is always wired. The engine's read-back-after-retry path is the lost-update safety net.
+Capabilities advertise `MutationConcurrency::None`: the MODSEQ cache is opportunistic (cold cache = unprotected STORE), so `StateBased` would let the engine assume UNCHANGEDSINCE is always wired. The engine reads back uncertain writes and may reassert declared unversioned targets; this supplies no lost-update guarantee. `mutation.reassertion` declares `set_flags` and `destroy` (see "Flag observation and reassertion capability").
 
 ### PIM primitives
 
@@ -713,6 +713,9 @@ message metadata and parses selected bytes through `bifrost-types::mime`.
 The per-folder PIM primitives (`copy_messages`, `delete_messages`, `set_flag`, `hydrate_decoded`) stamp failures in the folder's PREPARATION (checkout, SELECT/EXAMINE, UIDVALIDITY read) `Unsent` through `preflight_err`, relative to the operation: the SELECT's own evidence (a tagged NO is `Acknowledged`) is about the SELECT, not the COPY / STORE / FETCH that was never sent, and publishing it would make recovery reconcile a non-idempotent mutation that never reached the server. It speaks for the folder being prepared only; earlier folders of a multi-folder call may already have been mutated, which these `Result<(), _>` lanes cannot express.
 
 Every path that removes messages (sync-side `bulk_destroy`, PIM `delete_messages`) goes through `expunge_uids_or_fall_back`. It issues `UID EXPUNGE` (RFC 4315 Section 2), and on `MissingCapability` - a server with neither UIDPLUS nor IMAP4rev2 - falls back to plain `EXPUNGE` only when `UID SEARCH DELETED` shows the mailbox's `\Deleted` set is a subset of the UIDs this batch just marked. Plain EXPUNGE names no messages: running it with a foreign `\Deleted` present would silently destroy another client's mail, so that case keeps the `MissingCapability` failure with the batch left flagged.
+
+A reasserted destroy repeats this non-atomic plain-EXPUNGE fallback check
+once per attempt; the existing limitation applies to every reassertion.
 
 The SEARCH check is not atomic with the following `EXPUNGE`. Another client
 can mark a message `\Deleted` in that interval, and IMAP has no command to
@@ -1255,3 +1258,17 @@ sending it unguarded would lose the atomic guarantee. MOVE and destroy likewise
 refuse caller versions because their complete operation has no atomic MODSEQ
 precondition. No-version operations retain the cached guards and existing
 compound behavior.
+
+## Flag observation and reassertion capability
+
+The account declares flag and destroy desired-state reassertion safe on its
+folder/UIDVALIDITY/UID identities. FlagsOnly FETCH responses lacking FLAGS
+fail per item with Protocol MissingField after response fragments are merged.
+The flag judge compares ASCII-case-insensitively, ignores server-owned
+`\Recent` in observed Set equality, and returns Indeterminate for operations
+explicitly naming `\Recent`.
+
+A server can re-add maintained keywords or accept but not retain a new
+keyword when PERMANENTFLAGS lacks the wildcard grant. After an uncertain
+write, an unsatisfiable target can spend its remaining attempt budget on
+writes that cannot stick. This bounded futility is accepted.

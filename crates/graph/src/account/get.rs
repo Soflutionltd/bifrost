@@ -479,6 +479,23 @@ fn reconcile_hydration_responses(
             outcomes.push(ItemOutcome::Failed(BatchFailure::new(batch_id, error)));
             continue;
         };
+        // A FlagsOnly success must carry the whole flag state. A body that
+        // fails validation is not trusted for the etag the next `If-Match`
+        // would send either, so the check runs before the harvest below.
+        if matches!(projection, Projection::FlagsOnly)
+            && let Err((kind, detail)) = validate_flags_value(&body)
+        {
+            let error = super::graph_error::protocol_violation(
+                kind,
+                AccountOperation::Hydrate,
+                Some(ErrorScope::Message {
+                    id: (id.0.clone()).into(),
+                }),
+                format!("Graph FlagsOnly hydration for {}: {detail}", id.0),
+            );
+            outcomes.push(ItemOutcome::Failed(BatchFailure::new(batch_id, error)));
+            continue;
+        }
         if let Some(etag) = graph_etag(&body) {
             etags.push((id.0.clone(), etag));
         }
@@ -660,6 +677,44 @@ fn hydrate_url_for_id(
     Ok(format!("{prefix}/messages/{enc_id}?$select={select}"))
 }
 
+/// Completeness check for a REST `FlagsOnly` body. `flags_from_value` stays a
+/// total mapper that reads an absent field as "not set"; this is what keeps a
+/// partial body from being reported as a valid observation of an empty flag
+/// state. Every field `flags_from_value` reads must be present and well typed.
+fn validate_flags_value(
+    value: &Value,
+) -> Result<(), (bifrost_types::ProtocolErrorKind, &'static str)> {
+    use bifrost_types::ProtocolErrorKind::{MissingField, ParseFailed};
+    let read = value
+        .get("isRead")
+        .ok_or((MissingField, "missing isRead"))?;
+    if !read.is_boolean() {
+        return Err((ParseFailed, "invalid isRead"));
+    }
+    let flag = value.get("flag").ok_or((MissingField, "missing flag"))?;
+    let flag = flag.as_object().ok_or((ParseFailed, "invalid flag"))?;
+    let status = flag
+        .get("flagStatus")
+        .ok_or((MissingField, "missing flagStatus"))?;
+    let status = status.as_str().ok_or((ParseFailed, "invalid flagStatus"))?;
+    if !["notFlagged", "flagged", "complete"]
+        .iter()
+        .any(|s| status.eq_ignore_ascii_case(s))
+    {
+        return Err((ParseFailed, "unknown flagStatus"));
+    }
+    let categories = value
+        .get("categories")
+        .ok_or((MissingField, "missing categories"))?;
+    let categories = categories
+        .as_array()
+        .ok_or((ParseFailed, "invalid categories"))?;
+    if categories.iter().any(|v| !v.is_string()) {
+        return Err((ParseFailed, "invalid category"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,6 +722,80 @@ mod tests {
     use crate::client::GraphClient;
     use crate::types::BatchResponseItem;
     use serde_json::json;
+
+    // Lives beside `flags_from_value` rather than the judge so the vocabulary
+    // it pins is the real REST mapper's, not a hand-written observation.
+    #[test]
+    fn graph_flag_target_reads_complete_as_unflagged() {
+        let observed = flags_from_value(&json!({ "flag": { "flagStatus": "complete" } }));
+        assert_eq!(
+            super::super::mutate::graph_flag_target(
+                &ObjectId("m1".into()),
+                &observed,
+                &bifrost_types::FlagOp::Remove(["\\Flagged".to_string()].into_iter().collect())
+            ),
+            bifrost_types::FlagTargetState::Satisfied
+        );
+    }
+
+    #[test]
+    fn rest_flags_only_requires_every_modeled_field() {
+        use bifrost_types::ProtocolErrorKind::{MissingField, ParseFailed};
+        let valid = json!({"id":"m1", "isRead":false, "flag":{"flagStatus":"complete"}, "categories":[], "@odata.etag":"etag"});
+        let mut cases = Vec::new();
+        for (field, kind) in [
+            ("isRead", MissingField),
+            ("flag", MissingField),
+            ("categories", MissingField),
+        ] {
+            let mut v = valid.clone();
+            v.as_object_mut().unwrap().remove(field);
+            cases.push((v, kind));
+        }
+        for (field, value) in [
+            ("isRead", json!("false")),
+            ("flag", json!({"flagStatus":"unknown"})),
+            ("categories", json!([1])),
+        ] {
+            let mut v = valid.clone();
+            v[field] = value;
+            cases.push((v, ParseFailed));
+        }
+        for (value, expected) in cases {
+            let mut outcomes = Vec::new();
+            let etags = reconcile_hydration_responses(
+                &[ObjectId("m1".into())],
+                vec![BatchResponseItem {
+                    id: "0".into(),
+                    status: 200,
+                    headers: None,
+                    body: Some(value),
+                }],
+                Projection::FlagsOnly,
+                &mut outcomes,
+                &|_| None,
+            );
+            assert!(etags.is_empty());
+            assert_eq!(outcomes.len(), 1);
+            assert!(matches!(&outcomes[0], ItemOutcome::Failed(f)
+                    if f.error.kind() == &bifrost_types::AccountErrorKind::Protocol(expected)));
+        }
+        let mut outcomes = Vec::new();
+        let etags = reconcile_hydration_responses(
+            &[ObjectId("m1".into())],
+            vec![BatchResponseItem {
+                id: "0".into(),
+                status: 200,
+                headers: None,
+                body: Some(valid),
+            }],
+            Projection::FlagsOnly,
+            &mut outcomes,
+            &|_| None,
+        );
+        assert_eq!(etags.len(), 1);
+        assert!(matches!(&outcomes[0], ItemOutcome::Succeeded(_)));
+    }
 
     fn ok_response(id: &str, message_id: &str) -> BatchResponseItem {
         BatchResponseItem {

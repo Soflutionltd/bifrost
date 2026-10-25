@@ -419,12 +419,186 @@ fn push_unique(items: &mut Vec<String>, item: String) {
     }
 }
 
+/// The Gmail flag judge behind `GoogleAccount::flag_target`.
+///
+/// Judges through the same `translate_flag_op` the write uses, against the
+/// label snapshot: the observed flag set is mapped back to label ids (`\Seen`
+/// is the absence of `UNREAD`; `$gmail-label:<id>:<name>` compares by id, the
+/// name being advisory) and the target is satisfied iff every label the patch
+/// adds is present and none it removes is. An observed label outside the
+/// snapshot is never in the remove list, exactly as the write leaves it alone.
+/// An invalid op, a missing vocabulary, a named `\Draft` and any flag the
+/// translation cannot express are `Indeterminate`.
+pub(crate) fn gmail_flag_target(
+    snapshot: &super::scopes::ScopeSnapshot,
+    observed: &HashSet<String>,
+    op: &FlagOp,
+) -> bifrost_types::FlagTargetState {
+    use bifrost_types::FlagTargetState;
+    // A contradictory patch would otherwise translate to overlapping add and
+    // remove lists and read Unsatisfied forever.
+    if op.validate().is_err() || snapshot.fetched_at.is_none() {
+        return FlagTargetState::Indeterminate;
+    }
+    let draft = |s: &HashSet<String>| s.iter().any(|f| eq_flag(f, FLAG_DRAFT));
+    let names_draft = match op {
+        FlagOp::Add(s) | FlagOp::Remove(s) | FlagOp::Set(s) => draft(s),
+        FlagOp::Patch { add, remove } => draft(add) || draft(remove),
+        _ => return FlagTargetState::Indeterminate,
+    };
+    if names_draft {
+        return FlagTargetState::Indeterminate;
+    }
+    let patch = translate_flag_op(op, &snapshot.labels);
+    if !patch.unsupported_flags.is_empty() {
+        return FlagTargetState::Indeterminate;
+    }
+    let mut labels = HashSet::new();
+    if !contains_flag(observed, FLAG_SEEN) {
+        labels.insert(LABEL_UNREAD.to_string());
+    }
+    for flag in observed {
+        if eq_flag(flag, FLAG_FLAGGED) {
+            labels.insert(LABEL_STARRED.to_string());
+        } else if eq_flag(flag, FLAG_IMPORTANT) {
+            labels.insert(LABEL_IMPORTANT.to_string());
+        } else if eq_flag(flag, FLAG_DRAFT) {
+            labels.insert(LABEL_DRAFT.to_string());
+        } else if let Some((id, _advisory_name)) = flag
+            .strip_prefix(USER_LABEL_FLAG_PREFIX)
+            .and_then(|s| s.split_once(':'))
+        {
+            labels.insert(id.to_string());
+        }
+    }
+    if patch.add_label_ids.iter().all(|id| labels.contains(id))
+        && patch.remove_label_ids.iter().all(|id| !labels.contains(id))
+    {
+        FlagTargetState::Satisfied
+    } else {
+        FlagTargetState::Unsatisfied
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn set(items: &[&str]) -> HashSet<String> {
         items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    fn target_snapshot() -> super::super::scopes::ScopeSnapshot {
+        super::super::scopes::ScopeSnapshot {
+            fetched_at: Some(std::time::Instant::now()),
+            labels: vec![GmailLabel {
+                id: "Label_1".into(),
+                name: "Old".into(),
+                label_type: Some("user".into()),
+                color: None,
+            }],
+        }
+    }
+    #[test]
+    fn gmail_flag_target_compares_labels_by_id_not_name() {
+        assert_eq!(
+            gmail_flag_target(
+                &target_snapshot(),
+                &set(&["$gmail-label:Label_1:Renamed"]),
+                &FlagOp::Add(set(&["$gmail-label:Label_1:Old"]))
+            ),
+            bifrost_types::FlagTargetState::Satisfied
+        );
+    }
+    #[test]
+    fn gmail_flag_target_set_ignores_categories_and_omitted_draft() {
+        assert_eq!(
+            gmail_flag_target(
+                &target_snapshot(),
+                &set(&["\\Seen", "\\Draft", "$gmail-label:CATEGORY_SOCIAL:Social"]),
+                &FlagOp::Set(set(&["\\Seen"]))
+            ),
+            bifrost_types::FlagTargetState::Satisfied
+        );
+    }
+    #[test]
+    fn gmail_flag_target_refuses_named_draft_and_unsupported_flags() {
+        for token in ["\\Draft", "unknown"] {
+            assert_eq!(
+                gmail_flag_target(&target_snapshot(), &set(&[]), &FlagOp::Add(set(&[token]))),
+                bifrost_types::FlagTargetState::Indeterminate
+            );
+        }
+        assert_eq!(
+            gmail_flag_target(
+                &target_snapshot(),
+                &set(&[]),
+                &FlagOp::Patch {
+                    add: set(&["\\Seen"]),
+                    remove: set(&["\\seen"])
+                }
+            ),
+            bifrost_types::FlagTargetState::Indeterminate
+        );
+    }
+    #[test]
+    fn gmail_flag_target_without_a_label_snapshot_is_indeterminate() {
+        assert_eq!(
+            gmail_flag_target(
+                &super::super::scopes::ScopeSnapshot::empty(),
+                &set(&[]),
+                &FlagOp::Add(set(&["\\Seen"]))
+            ),
+            bifrost_types::FlagTargetState::Indeterminate
+        );
+    }
+    #[test]
+    fn gmail_flag_target_leaves_an_unknown_observed_label_alone() {
+        assert_eq!(
+            gmail_flag_target(
+                &target_snapshot(),
+                &set(&["\\Seen", "$gmail-label:Label_9:x"]),
+                &FlagOp::Set(set(&["\\Seen"]))
+            ),
+            bifrost_types::FlagTargetState::Satisfied
+        );
+        // The contrast: a snapshot user label the Set omits is one the write
+        // removes, so its presence leaves the target unsatisfied.
+        assert_eq!(
+            gmail_flag_target(
+                &target_snapshot(),
+                &set(&["\\Seen", "$gmail-label:Label_1:Old"]),
+                &FlagOp::Set(set(&["\\Seen"]))
+            ),
+            bifrost_types::FlagTargetState::Unsatisfied
+        );
+    }
+    #[test]
+    fn gmail_flag_target_reads_seen_as_unread_polarity() {
+        assert_eq!(
+            gmail_flag_target(
+                &target_snapshot(),
+                &set(&["\\Seen"]),
+                &FlagOp::Add(set(&["\\Seen"]))
+            ),
+            bifrost_types::FlagTargetState::Satisfied
+        );
+        assert_eq!(
+            gmail_flag_target(
+                &target_snapshot(),
+                &set(&[]),
+                &FlagOp::Remove(set(&["\\Seen"]))
+            ),
+            bifrost_types::FlagTargetState::Satisfied
+        );
+        assert_eq!(
+            gmail_flag_target(
+                &target_snapshot(),
+                &set(&[]),
+                &FlagOp::Add(set(&["\\Seen"]))
+            ),
+            bifrost_types::FlagTargetState::Unsatisfied
+        );
     }
 
     #[test]

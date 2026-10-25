@@ -46,6 +46,10 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
                 event_rsvp: true,
             },
             replay_safety: MutationReplaySafety::None,
+            reassertion: bifrost_types::MutationReassertion {
+                set_flags: true,
+                destroy: true,
+            },
         },
         batching_policy: BatchingPolicy {
             max_items: GMAIL_BATCH_MODIFY_LIMIT,
@@ -174,6 +178,13 @@ mod tests {
             }
         );
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
+        assert_eq!(
+            caps.mutation.reassertion,
+            bifrost_types::MutationReassertion {
+                set_flags: true,
+                destroy: true
+            }
+        );
         assert_eq!(caps.batching_policy.max_items, 1000);
         assert!(caps.historyid_expires_after.is_none());
     }

@@ -4,7 +4,8 @@ use super::*;
 
 impl SyncEngine {
     /// Drive a single-account bulk-flag campaign against an attached
-    /// account, applying the read-back guard to the retry candidates.
+    /// account, observing uncertain writes and reasserting eligible unsatisfied
+    /// targets within the shared retry budget.
     ///
     /// Returns the per-batch counters aggregated across the run. Once a
     /// campaign starts, failures are retained in `MutationCounters::error`
@@ -218,6 +219,8 @@ impl SyncEngine {
     /// Targets are deduplicated and grouped by their singleton declarations;
     /// each cohort owns one vended key and its own retry and read-back state.
     /// The per-object outcome map and retry allowance belong to the campaign.
+    /// Retries and desired-state reassertions share the same attempt budget,
+    /// frozen cohort key and distinct-target slots. Moves never reassert.
     async fn run_bulk_pipeline(
         &self,
         account_id: &AccountId,
@@ -341,6 +344,18 @@ impl SyncEngine {
                         cohort.done = true;
                         continue;
                     }
+                    for id in &cohort.targets {
+                        if matches!(outcomes.get(id), Some(MutationBucket::ReadyReassert)) {
+                            outcomes.insert(
+                                id.clone(),
+                                if aborting {
+                                    MutationBucket::Mismatched
+                                } else {
+                                    MutationBucket::BlockedByEngine
+                                },
+                            );
+                        }
+                    }
                     if blocked_by_engine && !aborting {
                         for id in &cohort.targets {
                             if matches!(outcomes.get(id), Some(MutationBucket::PendingRetry)) {
@@ -401,7 +416,7 @@ impl SyncEngine {
                 earliest =
                     Some(earliest.map_or(ready_at, |old: tokio::time::Instant| old.min(ready_at)));
             }
-            let Some((index, remaining)) = selected else {
+            let Some((index, mut remaining)) = selected else {
                 let Some(deadline) = earliest else {
                     break;
                 };
@@ -510,25 +525,112 @@ impl SyncEngine {
                     _ = boundary.changed(), if aborting => None,
                     result = run_object_readback(account.as_ref().as_ref(), remaining.clone(), target, Some(&record)) => Some(result),
                 };
-                if let Some((objects, error)) = result {
-                    for (id, result) in objects {
-                        outcomes.insert(id, observation_bucket(result));
+                let mut directives = Vec::new();
+                if let Some(report) = result {
+                    for error in report.engine_failures {
+                        blocked_by_engine = true;
+                        if let bifrost_types::RecoveryClass::Engine(directive) = error.recovery()
+                            && should_forward_engine_recovery(&mut forwarded_directives, directive)
+                        {
+                            directives
+                                .push((crate::recovery::directive_target_scope(directive), error));
+                        }
                     }
-                    if let Some(error) = error {
+                    if let Some(error) = report.termination {
                         if let Error::Account(error) = &error {
                             record(error);
                         }
                         first_error.get_or_insert(error);
                     }
+                    for id in &remaining {
+                        let origin = outcomes.get(id).copied();
+                        let result = report
+                            .objects
+                            .get(id)
+                            .copied()
+                            .unwrap_or(crate::mutation::readback::ObjectReadback::Unresolved);
+                        let eligible = matches!(
+                            origin,
+                            Some(
+                                MutationBucket::PendingReadback(ReadbackOrigin::Reassertable)
+                                    | MutationBucket::PendingRetry
+                            )
+                        ) && !expected_versions.contains_key(id)
+                            && reassertion_declared(
+                                &op,
+                                &account.capabilities().mutation.reassertion,
+                            )
+                            && first_error.is_none()
+                            && !blocked_by_engine
+                            && retry_available(cohort.attempt, max_retries)
+                            && (retry_owners.contains(id) || retry_slots > 0);
+                        use crate::mutation::readback::ObjectReadback;
+                        let bucket = match result {
+                            ObjectReadback::Satisfied => MutationBucket::Skipped,
+                            ObjectReadback::Unresolved => MutationBucket::Unresolved,
+                            ObjectReadback::Unsatisfied if eligible => {
+                                if retry_owners.insert(id.clone()) {
+                                    retry_slots -= 1;
+                                }
+                                MutationBucket::ReadyReassert
+                            }
+                            ObjectReadback::Unsatisfied => MutationBucket::Mismatched,
+                        };
+                        outcomes.insert(id.clone(), bucket);
+                    }
                 } else {
-                    for id in remaining {
-                        outcomes.insert(id, MutationBucket::Unresolved);
+                    for id in &remaining {
+                        outcomes.insert(id.clone(), MutationBucket::Unresolved);
                     }
                 }
+                cohort.remaining = remaining
+                    .into_iter()
+                    .filter(|id| matches!(outcomes.get(id), Some(MutationBucket::ReadyReassert)))
+                    .collect();
+                if cohort.remaining.is_empty() {
+                    cohort.done = true;
+                } else {
+                    cohort.readback = false;
+                    cohort.retry_at = tokio::time::Instant::now();
+                }
+                drop(activity);
+                drop(admission);
+                for (scope, error) in directives {
+                    let _ = slot
+                        .reopen_tx
+                        .send(ReopenRequest::Recovery { scope, error })
+                        .await;
+                }
+                continue;
+            }
+            // A reopen can replace the account while admission is pending.
+            remaining.retain(|id| {
+                if matches!(outcomes.get(id), Some(MutationBucket::ReadyReassert))
+                    && (first_error.is_some()
+                        || blocked_by_engine
+                        || !reassertion_declared(&op, &account.capabilities().mutation.reassertion))
+                {
+                    outcomes.insert(
+                        id.clone(),
+                        if blocked_by_engine && first_error.is_none() {
+                            MutationBucket::BlockedByEngine
+                        } else {
+                            MutationBucket::Mismatched
+                        },
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+            if remaining.is_empty() {
                 cohort.done = true;
                 drop(activity);
                 drop(admission);
                 continue;
+            }
+            for id in &remaining {
+                outcomes.insert(id.clone(), MutationBucket::InFlight);
             }
             cohort.submitted = true;
             let key = cohort.key.clone();
@@ -626,39 +728,19 @@ impl SyncEngine {
                                 );
                             }
                             let error = match &item {
-                                ItemOutcome::Failed(failure) => Some(&failure.error),
-                                ItemOutcome::Uncertain(uncertain) => Some(&uncertain.error),
+                                ItemOutcome::Failed(failure) => Some(failure.error.clone()),
+                                ItemOutcome::Uncertain(uncertain) => Some(uncertain.error.clone()),
                                 _ => None,
                             };
-                            if let Some(error) = error {
-                                record_error_throttle(&slot.throttles, account_id, error);
-                                let delay = match error.recovery() {
-                                    bifrost_types::RecoveryClass::Reconcile(advice) => {
-                                        Some(crate::recovery::reconcile_delay(
-                                            advice,
-                                            std::time::SystemTime::now(),
-                                            Duration::from_secs(1),
-                                        ))
-                                    }
-                                    bifrost_types::RecoveryClass::Retry(advice)
-                                        if matches!(
-                                            advice.disposition,
-                                            bifrost_types::RetryDisposition::AfterStateRefresh
-                                        ) =>
-                                    {
-                                        Some(crate::recovery::retry_delay(
-                                            advice,
-                                            std::time::SystemTime::now(),
-                                            Duration::from_secs(1),
-                                        ))
-                                    }
-                                    _ => None,
-                                };
-                                if let Some(delay) = delay {
-                                    reconcile_at =
-                                        reconcile_at.max(tokio::time::Instant::now() + delay);
+                            let item_id = match &item {
+                                ItemOutcome::Succeeded(s) => {
+                                    bifrost_types::ObjectId(s.item.0.clone())
                                 }
-                            }
+                                ItemOutcome::Failed(f) => bifrost_types::ObjectId(f.item.0.clone()),
+                                ItemOutcome::Uncertain(u) => {
+                                    bifrost_types::ObjectId(u.item.0.clone())
+                                }
+                            };
                             if let Some((directive, error)) = classify_item_outcome(
                                 item,
                                 &mut outcomes,
@@ -680,13 +762,93 @@ impl SyncEngine {
                                 }
                                 blocked_by_engine = true;
                             }
+                            if let Some(error) = error {
+                                record_error_throttle(&slot.throttles, account_id, &error);
+                                let delay = if matches!(
+                                    outcomes.get(&item_id),
+                                    Some(MutationBucket::PendingReadback(_))
+                                ) {
+                                    match error.recovery() {
+                                        bifrost_types::RecoveryClass::Reconcile(advice) => {
+                                            Some(crate::recovery::reconcile_delay(
+                                                advice,
+                                                std::time::SystemTime::now(),
+                                                Duration::from_secs(1),
+                                            ))
+                                        }
+                                        bifrost_types::RecoveryClass::Retry(advice)
+                                            if matches!(
+                                                advice.disposition,
+                                                bifrost_types::RetryDisposition::AfterStateRefresh
+                                            ) || advice.retry_hint.is_some() =>
+                                        {
+                                            Some(crate::recovery::retry_delay(
+                                                advice,
+                                                std::time::SystemTime::now(),
+                                                Duration::from_secs(1),
+                                            ))
+                                        }
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                };
+                                if let Some(delay) = delay {
+                                    reconcile_at =
+                                        reconcile_at.max(tokio::time::Instant::now() + delay);
+                                }
+                            }
                         }
                     }
                     bifrost_types::SyncEvent::Terminated(err) => {
                         let original = err.clone();
                         match plan_recovery(err) {
                             RecoveryPlan::Retry(advice) => {
-                                queue_unresolved_for_retry(&remaining, &outcomes, &mut retry_ids);
+                                if matches!(
+                                    advice.disposition,
+                                    bifrost_types::RetryDisposition::SameRequest
+                                        | bifrost_types::RetryDisposition::AfterAuthRefresh
+                                ) {
+                                    queue_unresolved_for_retry(
+                                        &remaining,
+                                        &outcomes,
+                                        &mut retry_ids,
+                                    );
+                                } else {
+                                    let origin = if matches!(
+                                        advice.disposition,
+                                        bifrost_types::RetryDisposition::AfterStateRefresh
+                                    ) {
+                                        ReadbackOrigin::Reassertable
+                                    } else {
+                                        ReadbackOrigin::Protected
+                                    };
+                                    for id in &remaining {
+                                        if expected_versions.contains_key(id) {
+                                            queue_unresolved_for_retry(
+                                                std::slice::from_ref(id),
+                                                &outcomes,
+                                                &mut retry_ids,
+                                            );
+                                        } else if matches!(
+                                            outcomes.get(id),
+                                            Some(MutationBucket::InFlight)
+                                        ) {
+                                            outcomes.insert(
+                                                id.clone(),
+                                                MutationBucket::PendingReadback(origin),
+                                            );
+                                        }
+                                    }
+                                    reconcile_at = reconcile_at.max(
+                                        tokio::time::Instant::now()
+                                            + crate::recovery::retry_delay(
+                                                &advice,
+                                                std::time::SystemTime::now(),
+                                                Duration::from_secs(1),
+                                            ),
+                                    );
+                                }
                                 // Share the throttle deadline before the
                                 // next attempt sleeps it off locally.
                                 crate::recovery::record_throttle(
@@ -721,19 +883,21 @@ impl SyncEngine {
                                         _ => {}
                                     }
                                 }
+                                let origin = reconcile_origin(&advice);
                                 for id in &remaining {
-                                    if !matches!(
-                                        outcomes.get(id),
-                                        Some(
-                                            MutationBucket::Applied
-                                                | MutationBucket::Downgraded
-                                                | MutationBucket::Skipped
-                                                | MutationBucket::FailedTerminal
-                                                | MutationBucket::PendingReadback
-                                        )
-                                    ) {
-                                        outcomes
-                                            .insert(id.clone(), MutationBucket::PendingReadback);
+                                    if matches!(outcomes.get(id), Some(MutationBucket::InFlight))
+                                        || (origin == ReadbackOrigin::Protected
+                                            && matches!(
+                                                outcomes.get(id),
+                                                Some(MutationBucket::PendingReadback(
+                                                    ReadbackOrigin::Reassertable
+                                                ))
+                                            ))
+                                    {
+                                        outcomes.insert(
+                                            id.clone(),
+                                            MutationBucket::PendingReadback(origin),
+                                        );
                                     }
                                 }
                                 if wants_dedupe {
@@ -768,14 +932,10 @@ impl SyncEngine {
                                 }
                                 blocked_by_engine = true;
                                 for id in &remaining {
-                                    if !matches!(
+                                    if matches!(
                                         outcomes.get(id),
                                         Some(
-                                            MutationBucket::Applied
-                                                | MutationBucket::Downgraded
-                                                | MutationBucket::Skipped
-                                                | MutationBucket::FailedTerminal
-                                                | MutationBucket::PendingReadback
+                                            MutationBucket::InFlight | MutationBucket::PendingRetry
                                         )
                                     ) {
                                         outcomes
@@ -819,25 +979,30 @@ impl SyncEngine {
             // Every submitted target must occupy a lane, even when a stream
             // ends without reporting it. Such an omission is uncertain.
             for id in &remaining {
-                outcomes.entry(id.clone()).or_insert(if blocked_by_engine {
-                    MutationBucket::BlockedByEngine
-                } else {
-                    MutationBucket::PendingReadback
-                });
+                if matches!(outcomes.get(id), Some(MutationBucket::InFlight)) {
+                    outcomes.insert(
+                        id.clone(),
+                        if slot.shutdown.is_cancelled() {
+                            MutationBucket::Unresolved
+                        } else if blocked_by_engine {
+                            MutationBucket::BlockedByEngine
+                        } else {
+                            MutationBucket::PendingReadback(ReadbackOrigin::Reassertable)
+                        },
+                    );
+                }
             }
             let retry_set: HashSet<_> = retry_ids.into_iter().collect();
             let mut next = Vec::new();
-            for id in &remaining {
-                if retry_set.contains(id) {
-                    outcomes.insert(id.clone(), MutationBucket::PendingRetry);
-                    if retry_available(cohort.attempt, max_retries)
-                        && (retry_owners.contains(id) || retry_slots > 0)
-                    {
-                        if retry_owners.insert(id.clone()) {
-                            retry_slots -= 1;
-                        }
-                        next.push(id.clone());
+            for id in retry_candidates(&remaining, &retry_set, &outcomes) {
+                outcomes.insert(id.clone(), MutationBucket::PendingRetry);
+                if retry_available(cohort.attempt, max_retries)
+                    && (retry_owners.contains(&id) || retry_slots > 0)
+                {
+                    if retry_owners.insert(id.clone()) {
+                        retry_slots -= 1;
                     }
+                    next.push(id);
                 }
             }
             if first_error.is_some() || blocked_by_engine || next.is_empty() {
@@ -871,9 +1036,13 @@ impl SyncEngine {
                         .or_insert(MutationBucket::Unresolved);
                     if matches!(
                         value,
-                        MutationBucket::PendingRetry | MutationBucket::PendingReadback
+                        MutationBucket::PendingRetry
+                            | MutationBucket::PendingReadback(_)
+                            | MutationBucket::InFlight
                     ) {
                         *value = MutationBucket::Unresolved;
+                    } else if matches!(value, MutationBucket::ReadyReassert) {
+                        *value = MutationBucket::Mismatched;
                     }
                 }
             }
@@ -992,11 +1161,10 @@ fn route_target(
 
 /// Which bulk mutation a [`SyncEngine::run_bulk_pipeline`] run drives.
 ///
-/// Selects the two op-specific seams in the shared pipeline: the wire
-/// submit call and the
-/// matching read-back guard (membership vs absence). Everything else in
-/// the idempotency / retry / recovery loop is identical to
-/// operation-specific read-back guard.
+/// Selects the op-specific seams in the shared pipeline: the wire submit
+/// call, the matching read-back target (flag judge, membership or absence)
+/// and the reassertion declaration it reads. Everything else in the
+/// idempotency / retry / recovery loop is shared.
 enum BulkPipelineOp {
     /// Apply `op` through `Account::bulk_set_flags`.
     SetFlags(bifrost_types::FlagOp),
@@ -1063,17 +1231,86 @@ fn record_error_throttle(
     }
 }
 
-/// Per-id mutation bookkeeping bucket. Reflects the campaign's final
-/// resolution for each id; `PendingRetry` items get the read-back
-/// guard before counters are reported back to the consumer.
+/// What a valid unsatisfied observation of a read-back id may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadbackOrigin {
+    /// A valid unsatisfied observation may authorize reassertion.
+    Reassertable,
+    /// Observed only: dedupe guidance, engine or terminal recovery on an
+    /// uncertain item, or a class this engine does not know.
+    Protected,
+}
+
+/// Reassertable iff every reconcile action is `CheckTarget`: any other action
+/// (today `DedupeByClientId`) is consumer guidance that dominates the origin.
+fn reconcile_origin(advice: &bifrost_types::ReconcileAdvice) -> ReadbackOrigin {
+    if advice
+        .guidance
+        .actions
+        .iter()
+        .all(|a| matches!(a, ReconcileAction::CheckTarget))
+    {
+        ReadbackOrigin::Reassertable
+    } else {
+        ReadbackOrigin::Protected
+    }
+}
+
+/// The origin of an `Uncertain` item. Retry advice with a known disposition is
+/// reassertable after observation (the uncertainty lane only replaced the
+/// blind retry with an observation); reconcile advice follows
+/// `reconcile_origin`; engine, terminal and unknown recovery are protected.
+fn uncertain_origin(error: &AccountError) -> ReadbackOrigin {
+    use bifrost_types::{RecoveryClass, RetryDisposition};
+    match error.recovery() {
+        RecoveryClass::Reconcile(advice) => reconcile_origin(advice),
+        RecoveryClass::Retry(advice)
+            if matches!(
+                advice.disposition,
+                RetryDisposition::SameRequest
+                    | RetryDisposition::AfterAuthRefresh
+                    | RetryDisposition::AfterStateRefresh
+            ) =>
+        {
+            ReadbackOrigin::Reassertable
+        }
+        _ => ReadbackOrigin::Protected,
+    }
+}
+
+/// The account's declaration for this campaign's door. Checked when a
+/// reassertion is scheduled and again on the account loaded after admission.
+fn reassertion_declared(op: &BulkPipelineOp, caps: &bifrost_types::MutationReassertion) -> bool {
+    match op {
+        BulkPipelineOp::SetFlags(_) => caps.set_flags,
+        BulkPipelineOp::Destroy => caps.destroy,
+        BulkPipelineOp::Move { .. } => false,
+    }
+}
+
+/// Per-id campaign state; the outcome map is the single source of truth for
+/// which lane an id is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MutationBucket {
     Applied,
     Downgraded,
     Skipped,
     FailedTerminal,
+    /// A retry candidate (and, once retries end, a read-back id).
     PendingRetry,
-    PendingReadback,
+    /// Awaiting observation; the origin decides what an unsatisfied
+    /// observation may do.
+    PendingReadback(ReadbackOrigin),
+    /// Observed unsatisfied and scheduled for reassertion: observation
+    /// consumed, attempt budget checked and retry slot reserved. Never read
+    /// back again before it is resubmitted.
+    ReadyReassert,
+    /// Written for every id of a submission round immediately before the
+    /// mutation door is called; never survives the round.
+    InFlight,
+    /// Observed unsatisfied and not (or no longer) eligible. Final, counted
+    /// pending rather than terminal.
+    Mismatched,
     /// A submitted write could not be observed conclusively.
     Unresolved,
     BlockedByEngine,
@@ -1089,13 +1326,12 @@ pub(super) enum MutationBucket {
 /// counted, and the campaign reports success for work that never
 /// happened.
 ///
-/// Deliberately narrower than the `Reconcile` / `Engine` termination
-/// sweeps, which claim every id that is not already resolved. An id
+/// Only fresh unanswered submissions and explicit retry candidates qualify. An id
 /// sitting in `PendingReadback` is owned by the read-back guard -
 /// that lane exists precisely so a write whose first attempt may have
 /// landed is verified rather than replayed - and a `BlockedByEngine`
 /// id is waiting on an engine directive. Neither is ours to resubmit,
-/// so only ids the stream never resolved (`None`) or explicitly asked
+/// so only ids the stream never resolved (`InFlight`) or explicitly asked
 /// us to retry (`PendingRetry`) are queued.
 pub(super) fn queue_unresolved_for_retry(
     remaining: &[bifrost_types::ObjectId],
@@ -1107,11 +1343,33 @@ pub(super) fn queue_unresolved_for_retry(
     // exact path (a large bulk that trips a rate limit) where it hurts.
     let mut queued: HashSet<bifrost_types::ObjectId> = retry_ids.iter().cloned().collect();
     for id in remaining {
-        let eligible = matches!(outcomes.get(id), None | Some(MutationBucket::PendingRetry));
+        let eligible = matches!(
+            outcomes.get(id),
+            Some(MutationBucket::InFlight | MutationBucket::PendingRetry)
+        );
         if eligible && queued.insert(id.clone()) {
             retry_ids.push(id.clone());
         }
     }
+}
+
+/// The ids of this round to write back as `PendingRetry`, in round order. An
+/// id an `Engine` termination already swept to `BlockedByEngine` is skipped,
+/// so the round-end loop cannot rewrite it, whatever the top-of-loop sweep
+/// would later repair.
+fn retry_candidates(
+    remaining: &[bifrost_types::ObjectId],
+    retry_set: &HashSet<bifrost_types::ObjectId>,
+    outcomes: &HashMap<bifrost_types::ObjectId, MutationBucket>,
+) -> Vec<bifrost_types::ObjectId> {
+    remaining
+        .iter()
+        .filter(|id| {
+            retry_set.contains(*id)
+                && !matches!(outcomes.get(*id), Some(MutationBucket::BlockedByEngine))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Every id whose campaign outcome is still unresolved once the retry
@@ -1129,7 +1387,7 @@ pub(super) fn unresolved_readback_ids(
     for (id, bucket) in outcomes {
         if matches!(
             bucket,
-            MutationBucket::PendingRetry | MutationBucket::PendingReadback
+            MutationBucket::PendingRetry | MutationBucket::PendingReadback(_)
         ) {
             ids.push(id.clone());
         }
@@ -1172,7 +1430,8 @@ fn keep_longer_advice(current: &mut Option<RetryAdvice>, candidate: RetryAdvice)
 /// - `Uncertain { error }` always -> read-back, even if the carried
 ///   recovery says retryable; the uncertainty lane exists precisely
 ///   to avoid blindly replaying writes whose first attempt may have
-///   landed.
+///   landed. Reconcile dedupe, engine and terminal guidance protects such
+///   uncertain targets from desired-state reassertion after observation.
 pub(super) fn classify_item_outcome(
     item: ItemOutcome<MutationSuccess>,
     outcomes: &mut HashMap<bifrost_types::ObjectId, MutationBucket>,
@@ -1205,7 +1464,7 @@ pub(super) fn classify_item_outcome(
                 // be classified deliberately, not folded into `Applied` - that
                 // is how a downgrade got reported as a clean success in the
                 // first place.
-                _ => MutationBucket::PendingReadback,
+                _ => MutationBucket::PendingReadback(ReadbackOrigin::Protected),
             };
             outcomes.insert(id, bucket);
             None
@@ -1222,7 +1481,10 @@ pub(super) fn classify_item_outcome(
                     crate::recovery::record_throttle(throttles, account_id, &advice, &original);
                     match advice.disposition {
                         bifrost_types::RetryDisposition::AfterStateRefresh => {
-                            outcomes.insert(id, MutationBucket::PendingReadback);
+                            outcomes.insert(
+                                id,
+                                MutationBucket::PendingReadback(ReadbackOrigin::Reassertable),
+                            );
                             None
                         }
                         bifrost_types::RetryDisposition::SameRequest
@@ -1236,7 +1498,10 @@ pub(super) fn classify_item_outcome(
                         // default to read-back (the safe path) and require
                         // explicit handling here when added.
                         _ => {
-                            outcomes.insert(id, MutationBucket::PendingReadback);
+                            outcomes.insert(
+                                id,
+                                MutationBucket::PendingReadback(ReadbackOrigin::Protected),
+                            );
                             None
                         }
                     }
@@ -1250,36 +1515,15 @@ pub(super) fn classify_item_outcome(
                             *dedupe_count = dedupe_count.saturating_add(1);
                         }
                     }
-                    // Both reconcile shapes land in the same lane.
-                    // `CheckTarget` asks for exactly what the read-back
-                    // guard performs; without it the consumer must
-                    // dedupe before any retry, so the engine cannot
-                    // resolve the item automatically either. Either way
-                    // pending-readback is the honest state and surfaces
-                    // the id through the counters.
-                    //
-                    // The unconditional read-back here is correct rather
-                    // than an over-reach, and that rests on a PRODUCER
-                    // invariant rather than on anything this crate can
-                    // check: every `ReconcileAdvice` that can actually be
-                    // produced carries `CheckTarget`, because `try_build`
-                    // always routes through `recovery::derive` and both of
-                    // derive's `Reconcile` arms include it - a
-                    // `DedupeByClientId` without `CheckTarget` cannot be
-                    // minted. That invariant is pinned in `bifrost-types`
-                    // by `every_producible_reconcile_requests_check_target`;
-                    // if that test ever goes away or starts to fail, this
-                    // arm has to grow a `CheckTarget` branch.
-                    //
-                    // Known coverage limit, accepted: there is no
-                    // engine-half test driving a real failing
-                    // non-idempotent mutation through here and observing
-                    // both the read-back queue and the warning. It would
-                    // pin behaviour that is correct BECAUSE of the
-                    // producer invariant already pinned, so it earns
-                    // little on its own; worth adding only if the
-                    // mutation-loop harness grows for some other reason.
-                    outcomes.insert(id, MutationBucket::PendingReadback);
+                    // Every reconcile shape lands in read-back. That rests on a
+                    // PRODUCER invariant, pinned in `bifrost-types` by
+                    // `every_producible_reconcile_requests_check_target`: every
+                    // producible `ReconcileAdvice` carries `CheckTarget`. Any
+                    // further action protects the id from reassertion.
+                    outcomes.insert(
+                        id,
+                        MutationBucket::PendingReadback(reconcile_origin(&advice)),
+                    );
                     None
                 }
                 RecoveryPlan::Engine(directive) => {
@@ -1294,7 +1538,10 @@ pub(super) fn classify_item_outcome(
         }
         ItemOutcome::Uncertain(uncertain) => {
             let id = bifrost_types::ObjectId(uncertain.item.0);
-            outcomes.insert(id, MutationBucket::PendingReadback);
+            outcomes.insert(
+                id,
+                MutationBucket::PendingReadback(uncertain_origin(&uncertain.error)),
+            );
             None
         }
     }
@@ -1357,13 +1604,19 @@ pub(super) fn counters_from_outcomes(
     let mut counters = crate::mutation::MutationCounters::default();
     for bucket in outcomes.values() {
         match bucket {
+            MutationBucket::InFlight => {
+                debug_assert!(false, "submission round left an in-flight target");
+                counters.record_pending();
+            }
             MutationBucket::Applied => counters.record_applied(),
             MutationBucket::Downgraded => counters.downgraded += 1,
             MutationBucket::Skipped => counters.record_skipped(),
             MutationBucket::FailedTerminal => counters.record_failed(),
             MutationBucket::BlockedByEngine => counters.record_blocked_by_engine(),
             MutationBucket::PendingRetry
-            | MutationBucket::PendingReadback
+            | MutationBucket::PendingReadback(_)
+            | MutationBucket::ReadyReassert
+            | MutationBucket::Mismatched
             | MutationBucket::Unresolved => {
                 counters.record_pending();
             }
@@ -1379,23 +1632,116 @@ fn retry_available(attempts: u64, max_retries: u32) -> bool {
     attempts <= u64::from(max_retries)
 }
 
-fn observation_bucket(result: crate::mutation::readback::ObjectReadback) -> MutationBucket {
-    use crate::mutation::readback::ObjectReadback;
-    match result {
-        ObjectReadback::Matched => MutationBucket::Skipped,
-        // Observation of non-landing cannot manufacture a terminal provider
-        // failure. Keep it pending for a later consumer campaign, including
-        // exhausted retries and state-refresh reconciliation. Do not blindly
-        // replay here: reconciliation may also require consumer-side dedupe.
-        ObjectReadback::Mismatched => MutationBucket::PendingRetry,
-        ObjectReadback::Unresolved => MutationBucket::Unresolved,
-    }
-}
-
 #[cfg(test)]
 mod campaign_tests {
     use super::*;
     use bifrost_types::{BatchItemId, BatchSuccess, MutationEffect, ObjectId};
+
+    #[test]
+    fn retry_candidates_skip_engine_blocked_ids() {
+        let id = ObjectId("blocked".into());
+        let outcomes = HashMap::from([(id.clone(), MutationBucket::BlockedByEngine)]);
+        let candidates = retry_candidates(
+            std::slice::from_ref(&id),
+            &HashSet::from([id.clone()]),
+            &outcomes,
+        );
+        assert!(candidates.is_empty());
+        assert_eq!(outcomes[&id], MutationBucket::BlockedByEngine);
+    }
+    fn origin_error(
+        kind: bifrost_types::AccountErrorKind,
+        cause: bifrost_types::Cause,
+    ) -> AccountError {
+        bifrost_types::AccountErrorBuilder::new(kind, cause)
+            .scope(bifrost_types::ErrorScope::Cursor(CursorScope::Account))
+            .try_build()
+            .unwrap()
+    }
+    #[test]
+    fn uncertain_origin_protects_dedupe_engine_and_terminal() {
+        use bifrost_types::*;
+        let dedupe = AccountErrorBuilder::new(
+            AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: Protocol::Graph,
+                detail: None,
+            }),
+        )
+        .operation(AccountOperation::BulkDestroy)
+        .try_build()
+        .unwrap();
+        let engine = origin_error(
+            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+            Cause::State(StateCause::CursorInvalid),
+        );
+        let terminal = AccountError::unsupported(AccountOperation::UpdateFlags, Protocol::Imap);
+        for error in [&dedupe, &engine, &terminal] {
+            assert_eq!(uncertain_origin(error), ReadbackOrigin::Protected);
+        }
+        let transport = AccountErrorBuilder::new(
+            AccountErrorKind::Transport(TransportErrorKind::Network),
+            Cause::Transport(TransportCause::new(TransportKind::Network, None)),
+        )
+        .operation(AccountOperation::BulkDestroy)
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::InFlight,
+        )))
+        .try_build()
+        .unwrap();
+        assert_eq!(uncertain_origin(&transport), ReadbackOrigin::Reassertable);
+        let conflict = origin_error(
+            AccountErrorKind::ConcurrencyConflict,
+            Cause::State(StateCause::ConcurrencyConflict),
+        );
+        assert_eq!(uncertain_origin(&conflict), ReadbackOrigin::Reassertable);
+        // An idempotent transport failure derives Retry(SameRequest): the
+        // uncertainty lane replaced the blind retry with an observation.
+        let same_request = AccountErrorBuilder::new(
+            AccountErrorKind::Transport(TransportErrorKind::Network),
+            Cause::Transport(TransportCause::new(TransportKind::Network, None)),
+        )
+        .operation(AccountOperation::UpdateFlags)
+        .try_build()
+        .unwrap();
+        assert!(matches!(
+            same_request.recovery(),
+            RecoveryClass::Retry(advice) if advice.disposition == RetryDisposition::SameRequest
+        ));
+        assert_eq!(
+            uncertain_origin(&same_request),
+            ReadbackOrigin::Reassertable
+        );
+    }
+    #[test]
+    fn failed_engine_and_terminal_items_never_enter_read_back() {
+        use bifrost_types::*;
+        let engine = origin_error(
+            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+            Cause::State(StateCause::CursorInvalid),
+        );
+        let terminal = AccountError::unsupported(AccountOperation::UpdateFlags, Protocol::Imap);
+        for (error, expected) in [
+            (engine, MutationBucket::BlockedByEngine),
+            (terminal, MutationBucket::FailedTerminal),
+        ] {
+            let mut outcomes = HashMap::new();
+            let mut retry = Vec::new();
+            let mut dedupe = 0;
+            let mut advice = None;
+            classify_item_outcome(
+                ItemOutcome::Failed(BatchFailure::new(BatchItemId("a".into()), error)),
+                &mut outcomes,
+                &mut retry,
+                &mut dedupe,
+                &std::sync::Mutex::new(crate::recovery::ThrottleBucket::default()),
+                &AccountId("test".into()),
+                &mut advice,
+            );
+            assert_eq!(outcomes[&ObjectId("a".into())], expected);
+            assert!(unresolved_readback_ids(&outcomes).is_empty());
+        }
+    }
 
     #[test]
     fn retry_limit_counts_resubmissions_only() {
@@ -1443,24 +1789,17 @@ mod campaign_tests {
 
     #[test]
     fn non_landing_observation_is_pending_not_terminal() {
-        use crate::mutation::readback::ObjectReadback;
-        let outcomes = HashMap::from([
-            (
-                ObjectId("landed".into()),
-                observation_bucket(ObjectReadback::Matched),
-            ),
-            (
-                ObjectId("not-landed".into()),
-                observation_bucket(ObjectReadback::Mismatched),
-            ),
-            (
-                ObjectId("unknown".into()),
-                observation_bucket(ObjectReadback::Unresolved),
-            ),
-        ]);
+        let outcomes = [
+            MutationBucket::Mismatched,
+            MutationBucket::ReadyReassert,
+            MutationBucket::Unresolved,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, b)| (bifrost_types::ObjectId(i.to_string()), b))
+        .collect();
         let counters = counters_from_outcomes(&outcomes);
-        assert_eq!(counters.skipped, 1);
-        assert_eq!(counters.pending_retry, 2);
+        assert_eq!(counters.pending_retry, 3);
         assert_eq!(counters.failed_terminal, 0);
     }
 

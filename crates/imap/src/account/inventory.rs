@@ -393,9 +393,73 @@ pub(crate) fn flags_set(flags: &[crate::types::Flag]) -> HashSet<String> {
         .collect()
 }
 
+/// The IMAP flag judge behind `ImapAccount::flag_target`. `\Recent` is
+/// server-owned: no STORE sets or clears it, so an operation naming it is
+/// undecidable, and a `Set` compares the observation with `\Recent` removed.
+/// Everything else is the generic case-insensitive judge, which is IMAP flag
+/// identity.
+pub(crate) fn imap_flag_target(
+    observed: &HashSet<String>,
+    op: &bifrost_types::FlagOp,
+) -> bifrost_types::FlagTargetState {
+    use bifrost_types::{FlagOp, FlagTargetState};
+    let recent = |flags: &HashSet<String>| flags.iter().any(|f| f.eq_ignore_ascii_case("\\recent"));
+    let names_recent = match op {
+        FlagOp::Add(s) | FlagOp::Remove(s) | FlagOp::Set(s) => recent(s),
+        FlagOp::Patch { add, remove } => recent(add) || recent(remove),
+        _ => return FlagTargetState::Indeterminate,
+    };
+    if names_recent {
+        return FlagTargetState::Indeterminate;
+    }
+    if matches!(op, FlagOp::Set(_)) {
+        let flags = observed
+            .iter()
+            .filter(|f| !f.eq_ignore_ascii_case("\\recent"))
+            .cloned()
+            .collect();
+        bifrost_types::flag_target_state(&flags, op)
+    } else {
+        bifrost_types::flag_target_state(observed, op)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imap_flag_target_ignores_recent_for_set() {
+        let observed = ["\\seen", "\\recent"]
+            .map(String::from)
+            .into_iter()
+            .collect();
+        let op = bifrost_types::FlagOp::Set(["\\Seen"].map(String::from).into_iter().collect());
+        assert_eq!(
+            super::imap_flag_target(&observed, &op),
+            bifrost_types::FlagTargetState::Satisfied
+        );
+    }
+
+    #[test]
+    fn imap_flag_target_refuses_ops_naming_recent() {
+        use bifrost_types::{FlagOp, FlagTargetState};
+        let recent = ["\\Recent"].map(String::from).into_iter().collect();
+        for op in [
+            FlagOp::Add(recent),
+            FlagOp::Remove(["\\recent".into()].into_iter().collect()),
+            FlagOp::Set(["\\RECENT".into()].into_iter().collect()),
+            FlagOp::Patch {
+                add: ["x".into()].into_iter().collect(),
+                remove: ["\\recent".into()].into_iter().collect(),
+            },
+        ] {
+            assert_eq!(
+                super::imap_flag_target(&Default::default(), &op),
+                FlagTargetState::Indeterminate
+            );
+        }
+    }
 
     #[test]
     fn inventory_attrs_request_modseq_only_when_available() {

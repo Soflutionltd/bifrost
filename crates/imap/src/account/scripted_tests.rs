@@ -3545,3 +3545,45 @@ async fn a_refused_push_dial_is_retried_not_latched_as_terminal() {
     drop(peer);
     account.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn flags_only_fetch_without_flags_is_a_missing_field_failure() {
+    use bifrost_types::{AccountErrorKind, ItemOutcome, Projection, ProtocolErrorKind, SyncEvent};
+    use futures::StreamExt;
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        respond(&mut server, &format!("* FLAGS (\\Seen)\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 3] ok\r\n{} OK [READ-ONLY] done\r\n", tag_of(&select))).await;
+        let fetch = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!(
+                "* 1 FETCH (UID 1)\r\n* 2 FETCH (UID 2 FLAGS (\\Seen))\r\n{} OK done\r\n",
+                tag_of(&fetch)
+            ),
+        )
+        .await;
+    });
+    let folder = crate::types::MailboxName::new("INBOX").unwrap();
+    let ids = (1..=2)
+        .map(|uid| super::encode_object_id(&folder, 5, uid))
+        .collect::<Vec<_>>();
+    let mut output = super::get::get_stream(
+        account,
+        Box::pin(futures::stream::iter(ids)),
+        Projection::FlagsOnly,
+    );
+    let mut items = Vec::new();
+    while let Some(event) = output.next().await {
+        if let SyncEvent::Batch(batch) = event {
+            items.extend(batch.items);
+        }
+    }
+    assert_eq!(items.len(), 2);
+    assert!(
+        matches!(&items[0],ItemOutcome::Failed(f) if matches!(f.error.kind(),AccountErrorKind::Protocol(ProtocolErrorKind::MissingField)))
+    );
+    assert!(matches!(&items[1], ItemOutcome::Succeeded(_)));
+    script.await.unwrap();
+}

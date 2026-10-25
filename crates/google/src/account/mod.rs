@@ -518,6 +518,17 @@ impl Account for GoogleAccount {
         ))
     }
 
+    fn flag_target(
+        &self,
+        _target: &ObjectId,
+        observed: &std::collections::HashSet<String>,
+        op: &bifrost_types::FlagOp,
+    ) -> bifrost_types::FlagTargetState {
+        // Clones the label vocabulary per observed id; accepted, see
+        // reference/google.md beside the judge rules.
+        flags::gmail_flag_target(&scopes::snapshot(&self.scope_cache), observed, op)
+    }
+
     fn get_stream(
         &self,
         ids: AccountStream<ObjectId>,

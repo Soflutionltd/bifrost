@@ -379,9 +379,21 @@ async fn run_folder_get(
             }
         }
     }
-    let hydrated_by_uid: HashMap<u32, HydratedObject> = fetched_by_uid
+    let hydrated_by_uid: HashMap<u32, Result<HydratedObject, AccountError>> = fetched_by_uid
         .into_iter()
         .filter_map(|(uid, fetch)| {
+            if matches!(projection, Projection::FlagsOnly) && fetch.flags.is_none() {
+                return Some((
+                    uid,
+                    Err(super::account_error_with(
+                        crate::Error::ProtocolMissing(format!(
+                            "FETCH response lacked FLAGS for UID {uid}"
+                        )),
+                        super::error::ImapErrorContext::operation(AccountOperation::Hydrate)
+                            .with_folder_scope(folder),
+                    )),
+                ));
+            }
             let object = fetch_to_hydrated(
                 folder,
                 uidvalidity,
@@ -389,14 +401,15 @@ async fn run_folder_get(
                 projection,
                 shared_owner.as_ref(),
             )?;
-            Some((uid, object))
+            Some((uid, Ok(object)))
         })
         .collect();
     for target in valid {
         // The permit stamps the id: a hydrated object can only ever be
         // published under the id that was requested for it.
         let verdict = match hydrated_by_uid.get(&target.uid()).cloned() {
-            Some(object) => Verdict::Succeeded(object),
+            Some(Ok(object)) => Verdict::Succeeded(object),
+            Some(Err(error)) => Verdict::Failed(error),
             None => Verdict::Failed(message_not_found_error(target.id())),
         };
         out.push(target.seal(verdict).into_outcome());

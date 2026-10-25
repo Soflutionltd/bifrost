@@ -288,7 +288,9 @@ its scope and action.
   quote or newline in a parameter survives a write/read round trip. For
   vCard 4 preference ordinals, the lowest valid ordinal within each
   EMAIL/TEL/ADR group maps to the shared primary flag.
-- `capabilities.rs` - contact-only `AccountCapabilities`.
+- `capabilities.rs` - contact-only `AccountCapabilities`. Mutation
+  reassertion is `MutationReassertion::NONE`: the account has no mail bulk
+  doors.
 
 ## Account behavior
 
