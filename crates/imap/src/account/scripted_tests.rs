@@ -3288,6 +3288,96 @@ async fn mutation_select_omits_qresync_baseline_and_keeps_cached_store_guard() {
     let _server = script.await.unwrap();
 }
 
+/// A MODSEQ group whose STORE times out abandons the checkout. The next
+/// group must settle at once as unsent rather than queue its own STORE
+/// behind the stalled exchange and spend a second full timeout withdrawing
+/// it. Both flag and destroy mutations group this way.
+#[tokio::test(start_paused = true)]
+async fn a_group_after_an_abandoning_timeout_settles_unsent_without_waiting() {
+    use bifrost_types::{
+        AccountErrorKind, Cause, FlagOp, ItemOutcome, SyncEvent, TransmissionState,
+        TransportErrorKind,
+    };
+    use futures::StreamExt;
+
+    for destroy in [false, true] {
+        let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 CONDSTORE")).await;
+        let account = scripted_sync_account(conn, 1, false, None, inbox_registry());
+        account
+            .folders
+            .get(&inbox())
+            .unwrap()
+            .record_modseq(5, 2, 900)
+            .unwrap();
+        let timeout = account.command_timeout();
+        let script = tokio::spawn(async move {
+            let select = read_line(&mut server).await;
+            respond(&mut server, &format!(
+                "{SELECT_PREAMBLE}* 2 EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 4] ok\r\n* OK [HIGHESTMODSEQ 900] ok\r\n{} OK [READ-WRITE] selected\r\n",
+                tag_of(&select))).await;
+            let store = read_line(&mut server).await;
+            assert!(
+                store.contains("UID STORE 2 (UNCHANGEDSINCE 900)"),
+                "{store}"
+            );
+            // Never answered: the caller times out with the driver inside it.
+            server
+        });
+        let kind = if destroy {
+            super::mutate::MutationKind::Destroy
+        } else {
+            super::mutate::MutationKind::Flags(FlagOp::Add(std::collections::HashSet::from([
+                "$flagged".to_owned(),
+            ])))
+        };
+        let started = tokio::time::Instant::now();
+        let events = super::mutate::mutation_stream(
+            account,
+            Box::pin(futures::stream::iter([
+                super::encode_object_id(&inbox(), 5, 2),
+                super::encode_object_id(&inbox(), 5, 3),
+            ])),
+            kind,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(
+            started.elapsed(),
+            timeout,
+            "one timeout for the stalled group, none for the next (destroy = {destroy})"
+        );
+        let third = super::encode_object_id(&inbox(), 5, 3);
+        let error = events
+            .iter()
+            .filter_map(|event| match event {
+                SyncEvent::Batch(batch) => Some(batch.items.iter()),
+                _ => None,
+            })
+            .flatten()
+            .find_map(|item| match item {
+                ItemOutcome::Failed(f) if f.item.0 == third.0 => Some(f.error.clone()),
+                ItemOutcome::Uncertain(u) if u.item.0 == third.0 => Some(u.error.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("uid 3 must fail: {events:?}"));
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Transport(TransportErrorKind::Network),
+            "{error:?}"
+        );
+        let attempts: Vec<TransmissionState> = error
+            .chain()
+            .iter()
+            .filter_map(|cause| match cause {
+                Cause::Attempt(a) => Some(a.transmission_state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attempts, vec![TransmissionState::Unsent], "{error:?}");
+        drop(script.await.unwrap());
+    }
+}
+
 /// A cache that has advanced beyond the consumer cannot replace its guard.
 #[tokio::test]
 async fn caller_modseq_rejects_stale_flags_while_absent_keeps_cached_guard() {

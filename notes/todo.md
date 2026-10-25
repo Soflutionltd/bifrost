@@ -125,16 +125,6 @@ PUBLISHED SURFACE fence apply.
   Withdrawal through that window needs retirement rules for bytes buffered by
   TLS even when the socket counter has not advanced.
 
-## IMAP abandoned checkout cascade
-
-- `run_flag_mutation_groups` and `run_destroy_mutation_groups` continue submitting
-  on the same checkout after an earlier command abandoned it. Later queued
-  commands withdraw truthfully as `Unsent`, but each still waits a full timeout.
-  Decide between failing fast on abandonment and obtaining another checkout.
-  Under the physical session cap, obtaining another checkout must discard the
-  abandoned one first: a nested checkout waits forever at pool_cap = 1 or
-  when data capacity is exhausted. Its permit returns only at driver exit.
-
 ## IMAP push: same-session NOTIFY extension is uncovered until registration
 
 - In the Reidle branch, a newly added folder is watched only after the

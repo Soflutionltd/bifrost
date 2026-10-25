@@ -584,6 +584,29 @@ async fn run_folder_mutation(
     Ok((results, bytes_in))
 }
 
+/// The error for a MODSEQ group whose checkout is no longer reusable: an
+/// earlier group's command abandoned it (its caller timed out with the driver
+/// still inside the exchange), or its driver is gone. The group's command
+/// would only queue behind that exchange and withdraw unsent at its own
+/// deadline, so the group settles at once with the same `Unsent` evidence
+/// instead of spending a full timeout per remaining group.
+///
+/// No replacement checkout is taken. Under the session cap it would wait for
+/// capacity the abandoned member holds until its driver exits, and at
+/// `pool_cap = 1` that never happens while this checkout is held.
+fn unusable_checkout_error(
+    conn: &super::PooledConn,
+    operation: AccountOperation,
+    folder: &MailboxName,
+) -> Option<AccountError> {
+    (!conn.connection().is_reusable()).then(|| {
+        super::account_error_with(
+            crate::Error::closed().with_attempt(bifrost_types::TransmissionState::Unsent),
+            super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
+        )
+    })
+}
+
 async fn run_destroy_mutation_groups(
     account: &ImapAccount,
     conn: &super::PooledConn,
@@ -599,6 +622,14 @@ async fn run_destroy_mutation_groups(
             results.extend(target_batch.settle_unsent(AccountOperation::BulkDestroy, folder));
             continue;
         };
+        if let Some(error) = unusable_checkout_error(conn, AccountOperation::BulkDestroy, folder) {
+            results.extend(
+                target_batch.settle(AccountOperation::BulkDestroy, folder, |target| {
+                    target.seal(mutation_error_verdict(&error))
+                }),
+            );
+            continue;
+        }
         let store = conn
             .connection()
             .uid_store(
@@ -699,6 +730,14 @@ async fn run_flag_mutation_groups(
             results.extend(target_batch.settle_unsent(AccountOperation::UpdateFlags, folder));
             continue;
         };
+        if let Some(error) = unusable_checkout_error(conn, AccountOperation::UpdateFlags, folder) {
+            results.extend(
+                target_batch.settle(AccountOperation::UpdateFlags, folder, |target| {
+                    target.seal(mutation_error_verdict(&error))
+                }),
+            );
+            continue;
+        }
         if let FlagOp::Patch { add, remove } = op
             && !add.is_empty()
             && !remove.is_empty()
