@@ -27,7 +27,9 @@ impl EwsClient {
         headers: &EwsHeaders,
     ) -> Result<Vec<EwsFolder>, EwsError> {
         let body = find_folder_body(parent_folder_id);
-        let xml = self.execute(&body, headers).await?;
+        let xml = self
+            .execute(&body, headers, bifrost_net::ReplayPolicy::Idempotent)
+            .await?;
         parse_find_folder_response(&xml)
     }
 
@@ -40,7 +42,9 @@ impl EwsClient {
         headers: &EwsHeaders,
     ) -> Result<EwsFolder, EwsError> {
         let body = get_folder_body(folder_id);
-        let xml = self.execute(&body, headers).await?;
+        let xml = self
+            .execute(&body, headers, bifrost_net::ReplayPolicy::Idempotent)
+            .await?;
         parse_get_folder_response(&xml)
     }
 
@@ -56,7 +60,9 @@ impl EwsClient {
         headers: &EwsHeaders,
     ) -> Result<FindItemsResult, EwsError> {
         let body = find_items_body(folder_id, since, offset, max_entries);
-        let xml = self.execute(&body, headers).await?;
+        let xml = self
+            .execute(&body, headers, bifrost_net::ReplayPolicy::Idempotent)
+            .await?;
         parse_find_items_response(&xml)
     }
 
@@ -79,7 +85,9 @@ impl EwsClient {
         headers: &EwsHeaders,
     ) -> Result<EwsItem, EwsError> {
         let body = get_item_body(item_id, shape);
-        let xml = self.execute(&body, headers).await?;
+        let xml = self
+            .execute(&body, headers, bifrost_net::ReplayPolicy::Idempotent)
+            .await?;
         parse_get_item_response(&xml)
     }
 
@@ -94,7 +102,9 @@ impl EwsClient {
         headers: &EwsHeaders,
     ) -> Result<EwsAttachmentContent, EwsError> {
         let body = get_attachment_body(attachment_id);
-        let xml = self.execute(&body, headers).await?;
+        let xml = self
+            .execute(&body, headers, bifrost_net::ReplayPolicy::Idempotent)
+            .await?;
         parse_get_attachment_response(&xml)
     }
 }

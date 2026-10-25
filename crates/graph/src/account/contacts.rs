@@ -139,6 +139,7 @@ pub(crate) async fn create(
             Resource::Outlook,
             &path,
             &graph_contact_from_create(&contact),
+            bifrost_net::ReplayPolicy::Never,
         )
         .await
         .map_err(|error| into_error(error, AccountOperation::ContactCreate))?;
@@ -206,10 +207,24 @@ pub(crate) async fn update(
     let result = if let Some(etag) = etag.as_deref() {
         account
             .client
-            .patch_if_match(Resource::Outlook, &path, etag, &body)
+            .patch_if_match(
+                Resource::Outlook,
+                &path,
+                etag,
+                &body,
+                bifrost_net::ReplayPolicy::IdempotentUnlessConditional,
+            )
             .await
     } else {
-        account.client.patch(Resource::Outlook, &path, &body).await
+        account
+            .client
+            .patch(
+                Resource::Outlook,
+                &path,
+                &body,
+                bifrost_net::ReplayPolicy::IdempotentUnlessConditional,
+            )
+            .await
     };
     result.map_err(|error| into_error(error, AccountOperation::ContactUpdate))
 }
@@ -247,10 +262,18 @@ pub(crate) async fn delete_if_version(
     let result = if let Some(etag) = etag.as_deref() {
         account
             .client
-            .delete_if_match(Resource::Outlook, &path, etag)
+            .delete_if_match(
+                Resource::Outlook,
+                &path,
+                etag,
+                bifrost_net::ReplayPolicy::Never,
+            )
             .await
     } else {
-        account.client.delete(Resource::Outlook, &path).await
+        account
+            .client
+            .delete(Resource::Outlook, &path, bifrost_net::ReplayPolicy::Never)
+            .await
     };
     result.map_err(|error| into_error(error, AccountOperation::ContactDelete))
 }

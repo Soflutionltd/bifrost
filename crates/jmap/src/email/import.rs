@@ -69,6 +69,7 @@ pub(crate) struct EmailImportResponse {
 }
 
 impl crate::core::method::JmapMethod for EmailImportRequest {
+    const REPLAY_SAFE: bool = false;
     const NAME: &'static str = "Email/import";
     type Cap = crate::core::capability::Mail;
     type Response = EmailImportResponse;

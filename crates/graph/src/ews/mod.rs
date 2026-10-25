@@ -304,6 +304,7 @@ pub(crate) trait EwsExecute: Send + Sync {
         &self,
         body_xml: &str,
         headers: &EwsHeaders,
+        replay: bifrost_net::ReplayPolicy,
     ) -> impl Future<Output = Result<String, EwsError>> + Send;
 
     /// Open an EWS streaming response. The default keeps existing scripted
@@ -315,7 +316,9 @@ pub(crate) trait EwsExecute: Send + Sync {
         headers: &EwsHeaders,
     ) -> impl Future<Output = Result<EwsBodyStream, EwsError>> + Send {
         async move {
-            let response = self.execute(body_xml, headers).await?;
+            let response = self
+                .execute(body_xml, headers, bifrost_net::ReplayPolicy::Idempotent)
+                .await?;
             Ok(Box::pin(futures::stream::once(
                 async move { Ok(Bytes::from(response)) },
             )) as EwsBodyStream)

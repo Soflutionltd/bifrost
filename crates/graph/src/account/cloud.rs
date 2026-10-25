@@ -228,6 +228,7 @@ async fn cancel_upload_session(
         &[],
         Bytes::new(),
         Some(SESSION_CANCEL_TIMEOUT),
+        bifrost_net::ReplayPolicy::IdempotentUnlessConditional,
     );
     let outcome = tokio::select! {
         biased;
@@ -328,7 +329,14 @@ async fn create_upload_session(
         conflict_behavior: "rename",
     };
 
-    client.post(Resource::Unmetered, &path, &body).await
+    client
+        .post(
+            Resource::Unmetered,
+            &path,
+            &body,
+            bifrost_net::ReplayPolicy::Never,
+        )
+        .await
 }
 
 /// Upload the payload in `chunk_size`-aligned chunks against the
@@ -432,6 +440,7 @@ async fn upload_chunks(
             &headers,
             chunk,
             Some(remaining),
+            bifrost_net::ReplayPolicy::Idempotent,
         );
         // Shutdown is watched HERE, at the one boundary where the stage is
         // known, rather than by racing the whole upload: a race around the
@@ -544,7 +553,14 @@ async fn create_sharing_link(
         "scope": onedrive_scope(scope),
     });
 
-    let response: CreateLinkResponse = client.post(Resource::Unmetered, &path, &body).await?;
+    let response: CreateLinkResponse = client
+        .post(
+            Resource::Unmetered,
+            &path,
+            &body,
+            bifrost_net::ReplayPolicy::Never,
+        )
+        .await?;
     Ok(response.link.web_url)
 }
 

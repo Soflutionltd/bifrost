@@ -508,20 +508,33 @@ mod tests {
         assert!(client.get::<serde_json::Value>("/labels").await.is_err());
         assert!(
             client
-                .post::<serde_json::Value, _>("/watch", &serde_json::json!({}))
+                .post::<serde_json::Value, _>(
+                    "/watch",
+                    &serde_json::json!({}),
+                    bifrost_net::ReplayPolicy::Never
+                )
                 .await
                 .is_err()
         );
         assert!(
             client
-                .post_no_content("/stop", &serde_json::json!({}))
+                .post_no_content(
+                    "/stop",
+                    &serde_json::json!({}),
+                    bifrost_net::ReplayPolicy::Never
+                )
                 .await
                 .is_err()
         );
         let raw = client
             .account_net()
             .post("https://gmail.test/messages/batchModify");
-        assert!(client.execute_builder(raw, "Gmail API").await.is_err());
+        assert!(
+            client
+                .execute_builder(raw, "Gmail API", bifrost_net::ReplayPolicy::Never)
+                .await
+                .is_err()
+        );
         assert_eq!(gate.current().unwrap().deadline, deadline);
         assert!(script.requests().is_empty());
     }

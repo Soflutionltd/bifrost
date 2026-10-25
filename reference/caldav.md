@@ -3,12 +3,10 @@
 DAV generic net translation explicitly passes account throttle scope, matching
 the DAV status ladder.
 
-Request replay safety is not inferred from the enclosing operation.
-`EventUpdate` includes relocation, whose MOVE and conditional create-PUT legs
-are explicitly unreplayable. The error overrides on those legs and on a
-partially completed sequence are required even if net is given an operation
-label. Create-PUT already explicitly disables net replay; the HTTP PUT default
-alone would be too permissive.
+Every request declares its `ReplayPolicy` at the call site. Creates and MOVE
+are Never. Conditional updates and versioned deletes require read-back after an
+ambiguous drop; unconditional deletes remain replayable with gone targets absorbed.
+Net narrows possible-commit failures; DAV also stamps its own minted failures.
 
 Current Stage 4 standalone CalDAV account implementation.
 
@@ -1168,24 +1166,20 @@ search capabilities; CardDAV sync boundaries retire affected original scopes
 through ScopeRevoked / DisableScope.
 CalDAV installs no guard and retains its existing origin and redirect policy.
 
-**Which requests are declared unreplayable, and why it is a request-level
-declaration.** `DavRequest::idempotent(false)` is set at two call sites: the
-create-PUT (`If-None-Match: *`) in both crates' `put_event` / `put_vcard` - which
-is also the copy leg of the MOVE fallback, one caller up, so the two lanes share
-one declaration - and the `MOVE` in `DavDispatch::move_resource`. Each is a
-request whose blind replay after a mid-flight drop misreports a mutation that
-SUCCEEDED: a replayed create answers 412 and the consumer re-creates under a
-fresh UUID, leaving two copies; a re-issued update after a committed MOVE
-answers 404 at a source the first attempt already emptied, which the status
-ladder reads as `NotFound` -> `ProviderRefused`. `If-Match` and unconditional
-PUTs are deliberately NOT declared: they address a known URL with absolute
-state, so a replay lands on the same end state, and a replay arriving after the
-first attempt committed answers 412 -> `ConcurrencyConflict` ->
-`Retry(AfterStateRefresh)`, which is already the right handling. Losing that
-resilience on the update lane is a cost the fix must not impose.
+**Which requests are declared unreplayable, and why.** Create-PUT and MOVE
+use Never: replay can turn their own successful commit into a 412 or 404.
+Every CalDAV event PUT and scheduling reply uses Never because replay can emit
+another scheduling message. CardDAV PUT uses Never for create and
+IdempotentUnlessConditional otherwise. Versioned DELETE uses Never; reads
+use Idempotent. A conditional update must not replay into a false caller-version
+conflict. This includes self-fetched validators: a dropped update now costs a
+read-back even when the first attempt did not commit. That resilience cost is
+accepted. Explicit Idempotent could recover it for self-fetched validators in a
+future policy, but is not selected here.
 
 **DELETE is replayable, and a gone target is a success (dav-D1, ruled
-2026-09-07).** The DELETE was briefly declared unreplayable too, because a
+2026-09-07).** Only unconditional DELETE is replayable. The DELETE was briefly
+declared unreplayable too, because a
 replayed DELETE that had landed answered 404 and the ladder reported a
 successful delete as `ProviderRefused`. That traded away delete resilience: every
 drop, whether the request landed or not, reached the consumer as
@@ -1203,20 +1197,17 @@ first attempt already removed is the move's end state rather than a failed leg.
 Pinned by `a_dropped_delete_replays_and_a_gone_target_is_a_success` in both
 crates and `a_delete_replays_and_reads_a_gone_target_as_success` in dav-core.
 
-The declaration does two things, and the second is the one that is easy to miss.
-On the wire it stops `bifrost-net` replaying the request. At CLASSIFICATION it
-also overrides the `AccountOperation` idempotency table, which is the default
-source of `derive`'s idempotency and is keyed on the LOGICAL operation rather
-than on the request: the copy leg and the MOVE both run under
-`EventUpdate` / `ContactUpdate`, which that table calls idempotent, so without
-the override a drop on either derives `Retry(SameRequest)`. `dispatch_once`
-therefore stamps `idempotency_override(false)` on every failure it returns FROM
-THE WIRE, not only the transport one - the oversized-response arm mints
-`Protocol(PartialResponse)`, which `derive_protocol` routes by the same flag.
-(The two invalid-header returns precede the stamp and do not carry it; harmless,
-since a malformed header derives `ClientBug` either way.)
-`MOVE` needs the declaration even though it is an extension method net never
-replays, precisely because the classification half is separate.
+The declaration gates wire replay on transport drops and ambiguous retryable
+statuses. Net also narrows classification on possible-commit failures.
+`dispatch_once` stamps all wire failures of an unreplayable request as well,
+because DAV itself mints oversized-body failures. The operation table alone
+cannot prove MOVE or a partly completed sequence safe.
+
+DAV only reads method refusals (405/501) as data after histories consisting of
+401/429/503/501. Other ambiguous histories reconcile. The all-401 exception is
+defensive and unreachable today: DAV refreshes outside net, with bearer injection
+disabled. A lone 501 remains data for MOVE fallback; a lone 503 reconciles and
+cannot consume a queued 405. A genuine first-attempt 412 stays a conflict.
 
 **And the declaration must survive a REBUILD.** That is the third place, and the
 easiest to miss. `partial_sequence_error` (caldav) and `partial_move_error`

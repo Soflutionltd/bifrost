@@ -1645,9 +1645,16 @@ pub(crate) fn get_id_unresolved_after_query(
 /// one answer per submitted id, but the omission says nothing about whether
 /// the write landed. The method response did arrive, so preserve
 /// acknowledged transmission evidence and let non-idempotent work reconcile.
+///
+/// `guarded` says the set carried `ifInState`. A same-request retry of a
+/// guarded set whose write landed answers `stateMismatch`, so a guarded
+/// omission is narrowed to non-idempotent and reconciles (CheckTarget only for
+/// an idempotent operation); an unguarded one keeps the operation default.
+/// `guarded` rather than "the caller supplied the state" is deliberate: a
+/// conditional request is not auto-replayed whoever minted its validator.
 #[must_use]
-pub(crate) fn set_id_unanswered(id: &str, ctx: JmapErrorContext) -> AccountError {
-    build(
+pub(crate) fn set_id_unanswered(id: &str, ctx: JmapErrorContext, guarded: bool) -> AccountError {
+    let builder = build(
         AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
         Cause::Wire(WireCause::MalformedResponse {
             protocol: Protocol::Jmap,
@@ -1659,9 +1666,15 @@ pub(crate) fn set_id_unanswered(id: &str, ctx: JmapErrorContext) -> AccountError
     )
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
-    )))
-    .try_build()
-    .expect("valid account error classification")
+    )));
+    let builder = if guarded {
+        builder.idempotency_override(false)
+    } else {
+        builder
+    };
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn convert_id_not_found(id: String, ctx: JmapErrorContext) -> AccountError {
@@ -3127,6 +3140,61 @@ mod unsupported_constructor_tests {
         assert_eq!(
             error.kind(),
             &bifrost_types::AccountErrorKind::Unsupported(operation)
+        );
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    #[test]
+    fn an_unanswered_id_from_a_guarded_set_reconciles() {
+        for guarded in [true, false] {
+            let error = set_id_unanswered(
+                "m1",
+                JmapErrorContext::new(AccountOperation::UpdateFlags),
+                guarded,
+            );
+            if guarded {
+                assert!(
+                    matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget])
+                );
+            } else {
+                assert!(matches!(
+                    error.recovery(),
+                    bifrost_types::RecoveryClass::Retry(_)
+                ));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn a_dropped_set_reconciles_under_an_idempotent_operation() {
+        use crate::core::transport::HttpTransport;
+        let script = bifrost_net::test_support::ScriptedDispatch::new([
+            bifrost_net::test_support::Canned::Error(bifrost_net::Error::Network {
+                message: "lost".into(),
+                transmission_state: bifrost_types::TransmissionState::InFlight,
+                source: None,
+            }),
+        ]);
+        let transport = crate::transport_reqwest::ReqwestTransport::scripted_with_retry(
+            &script,
+            bifrost_net::RetryPolicy::disabled(),
+        );
+        let error = transport
+            .api_request(
+                "https://jmap.test/api",
+                vec![],
+                bifrost_net::ReplayPolicy::Never,
+            )
+            .await
+            .unwrap_err();
+        let error = into_account_error(
+            crate::Error::from(error),
+            JmapErrorContext::new(AccountOperation::UpdateFlags),
+        );
+        assert!(
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget])
         );
     }
 }

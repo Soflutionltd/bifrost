@@ -314,9 +314,14 @@ nothing was transmitted. `Ok(BatchOutcome)` means every item is
 accounted for. `ItemOutcome::Uncertain` means the write may have landed
 and must be read back rather than replayed blindly.
 
-`AccountOperation::is_idempotent` is the authoritative retry input for
-the error model. Absolute-state writes are idempotent. Sends, creates,
-moves, destroys, uploads, and other side-effecting writers are not.
+`AccountOperation::is_idempotent` is the default retry input for the error
+model. Absolute-state writes are idempotent. Sends, creates, moves,
+destroys, uploads, and other side-effecting writers are not. A producer
+can narrow it per request with `idempotency_override(false)`: bifrost-net
+does so when a request whose replay policy forbids replay may have
+committed. The operation table alone, never the override, decides whether
+`PartialResponse` also carries `DedupeByClientId`
+(`reference/error-model.md`).
 
 ## Paginated results
 

@@ -101,6 +101,7 @@ impl GraphClient {
             Resource::Outlook,
             &format!("{prefix}/mailFolders/inbox/messageRules"),
             rule,
+            bifrost_net::ReplayPolicy::Never,
         )
         .await
     }
@@ -116,6 +117,7 @@ impl GraphClient {
             Resource::Outlook,
             &format!("{prefix}/mailFolders/inbox/messageRules/{encoded}"),
             patch,
+            bifrost_net::ReplayPolicy::Idempotent,
         )
         .await
     }
@@ -126,6 +128,7 @@ impl GraphClient {
         self.delete(
             Resource::Outlook,
             &format!("{prefix}/mailFolders/inbox/messageRules/{encoded}"),
+            bifrost_net::ReplayPolicy::Never,
         )
         .await
     }

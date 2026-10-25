@@ -61,7 +61,12 @@ pub(crate) async fn create_subscription(
     };
 
     let response: SubscriptionResponse = client
-        .post(Resource::Unmetered, "/subscriptions", &body)
+        .post(
+            Resource::Unmetered,
+            "/subscriptions",
+            &body,
+            bifrost_net::ReplayPolicy::Never,
+        )
         .await?;
     tracing::info!(
         "[Graph webhooks] Created subscription {} for resource '{}' (expires {})",
@@ -88,6 +93,7 @@ pub(crate) async fn renew_subscription(
             Resource::Unmetered,
             &format!("/subscriptions/{subscription_id}"),
             &body,
+            bifrost_net::ReplayPolicy::Idempotent,
         )
         .await?;
     tracing::info!(
@@ -120,6 +126,7 @@ pub(crate) async fn delete_subscription(
         .delete(
             Resource::Unmetered,
             &format!("/subscriptions/{subscription_id}"),
+            bifrost_net::ReplayPolicy::IdempotentUnlessConditional,
         )
         .await;
     if let Err(error) = server_result {

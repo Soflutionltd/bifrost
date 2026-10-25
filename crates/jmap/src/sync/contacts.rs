@@ -1056,6 +1056,7 @@ mod tests {
             &self,
             _url: &str,
             body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
         ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
             let request: Value = serde_json::from_slice(&body).expect("request json");
             let call = request["methodCalls"][0].clone();
@@ -1170,6 +1171,7 @@ mod tests {
             &self,
             _url: &str,
             body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
         ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
             let request: Value = serde_json::from_slice(&body).expect("request json");
             let call = request["methodCalls"][0].clone();
@@ -1575,6 +1577,7 @@ mod tests {
             &self,
             _url: &str,
             body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
         ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
             let request: Value = serde_json::from_slice(&body).expect("request json");
             let call_id = request["methodCalls"][0][2]

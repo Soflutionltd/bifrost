@@ -46,6 +46,7 @@ pub(crate) struct ResultReference {
 
 /// A type-erased method call stored in the request batch.
 pub(crate) struct RawMethodCall {
+    pub(crate) replay_safe: bool,
     pub(crate) name: &'static str,
     pub(crate) arguments: Box<serde_json::value::RawValue>,
     pub(crate) call_id: String,
@@ -161,6 +162,17 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         &self.session_state
     }
 
+    /// The wire replay policy of this batch: `Idempotent` when every call is
+    /// replay-safe (an empty request has no effect and qualifies), else
+    /// `Never`.
+    pub(crate) fn replay_policy(&self) -> bifrost_net::ReplayPolicy {
+        if self.method_calls.iter().all(|call| call.replay_safe) {
+            bifrost_net::ReplayPolicy::Idempotent
+        } else {
+            bifrost_net::ReplayPolicy::Never
+        }
+    }
+
     pub(crate) fn account_id(mut self, account_id: impl Into<AccountId>) -> Self {
         self.account_id = account_id.into();
         self
@@ -219,6 +231,7 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         }
 
         self.method_calls.push(RawMethodCall {
+            replay_safe: M::REPLAY_SAFE,
             name: M::NAME,
             arguments,
             call_id: call_id.clone(),

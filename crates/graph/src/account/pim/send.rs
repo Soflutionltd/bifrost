@@ -90,7 +90,12 @@ pub(crate) async fn send_raw_message(
     let base64_mime = base64::engine::general_purpose::STANDARD.encode(&raw);
     let path = format!("{}/messages", client.api_path_prefix());
     let created: Value = client
-        .post_mime(Resource::Outlook, &path, bytes::Bytes::from(base64_mime))
+        .post_mime(
+            Resource::Outlook,
+            &path,
+            bytes::Bytes::from(base64_mime),
+            bifrost_net::ReplayPolicy::Never,
+        )
         .await
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::Send)))?;
     let id = created.get("id").and_then(Value::as_str).ok_or_else(|| {
@@ -233,7 +238,12 @@ pub(super) async fn stamp_deferred_send_time(
     );
     let body = deferred_send_time_body(at);
     client
-        .patch(Resource::Outlook, &path, &body)
+        .patch(
+            Resource::Outlook,
+            &path,
+            &body,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
         .await
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))
 }
@@ -264,12 +274,15 @@ pub(crate) async fn cancel_scheduled_send(
         client.api_path_prefix(),
         bifrost_net::url::encode_path_component(draft_id)
     );
-    client.delete(Resource::Outlook, &path).await.map_err(|e| {
-        into_account_error(
-            e,
-            GraphErrorContext::graph(AccountOperation::CancelScheduledSend),
-        )
-    })
+    client
+        .delete(Resource::Outlook, &path, bifrost_net::ReplayPolicy::Never)
+        .await
+        .map_err(|e| {
+            into_account_error(
+                e,
+                GraphErrorContext::graph(AccountOperation::CancelScheduledSend),
+            )
+        })
 }
 
 pub(crate) async fn reschedule_send(

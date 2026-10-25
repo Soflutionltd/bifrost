@@ -551,14 +551,20 @@ impl DavDispatch {
         // EventUpdate/ContactUpdate also enclose MOVE and create-PUT legs.
         // Using operation.is_idempotent() here would replay those legs, while
         // removing the matching error override would authorize engine replay.
-        if let Some(idempotent) = request.idempotent {
-            builder = builder.idempotent(idempotent);
+        // Net resolves the forwarded declaration with the same
+        // `request_is_replayable` rule `DavRequest::replayable` uses, against
+        // the same headers plus the minted `Authorization`, which is not a
+        // precondition, so both sides agree by construction.
+        if let Some(replay) = request.replay {
+            builder = builder.replay(replay);
         }
         if let Some(body) = &request.body {
             builder = builder.body(body.clone());
         }
-        // A request that declared itself unreplayable on the wire must classify
-        // that way too, whichever failure it hits. The `AccountOperation` table
+        // A request that resolves unreplayable on the wire must classify
+        // that way too, whichever failure it hits. Net already narrows its own
+        // ambiguous outcomes; the stamp below also covers failures minted here,
+        // such as the oversized-response error. The `AccountOperation` table
         // is the default source of idempotency and it is keyed on the logical
         // operation, not on the request: the copy leg of the MOVE fallback is a
         // create-PUT (`If-None-Match: *`) issued under
@@ -592,7 +598,7 @@ impl DavDispatch {
                 } else {
                     error
                 };
-                if request.idempotent == Some(false) {
+                if !request.replayable() {
                     return error
                         .into_builder()
                         .idempotency_override(false)
@@ -614,27 +620,46 @@ impl DavDispatch {
     ) -> Result<DavResponse, AccountError> {
         match outcome {
             Err(error @ NetError::AttemptHistory { .. }) => {
-                // Status refusals do not make a MOVE or create ambiguous. In
-                // particular 429/503 -> 405/412 must retain DAV fallback/conflict
-                // semantics. A prior transport drop or other status can have
-                // committed a mutation and must keep the shared classifier.
+                // The terminal status of an unreplayable request is data only
+                // when its earlier attempts cannot have produced it. A replay
+                // after the request's own committed first attempt can answer
+                // 412 (conditional PUT/DELETE, create-PUT) or 404 (versioned
+                // DELETE, MOVE whose source already moved), so those go to the
+                // shared classifier, whose `may_have_committed` path
+                // reconciles. A 405/501 denies the method itself, which no
+                // earlier commit can cause, and is the one status DAV needs as
+                // data after a refusal (the MOVE fallback).
+                //
+                // The all-401 clause is defensive and cannot fire today: DAV
+                // builds every net request without bearer auth and refreshes in
+                // `send_raw_until` across separate dispatches, so net never
+                // walks a 401 refresh for DAV. It keeps the rule right if DAV
+                // ever routes auth through net. It needs at least one attempt:
+                // an empty-attempt envelope is net's own ambiguity record.
                 let refused_only = match &error {
-                    NetError::AttemptHistory { attempts, .. } => attempts.iter().all(|attempt| {
-                        matches!(attempt, NetError::Status { code, .. }
-                            if matches!(code.as_u16(), 401 | 429 | 503 | 501))
-                    }),
+                    NetError::AttemptHistory { attempts, .. } => {
+                        let status_is = |attempt: &NetError, codes: &[u16]| {
+                            matches!(attempt, NetError::Status { code, .. }
+                                if codes.contains(&code.as_u16()))
+                        };
+                        let all_auth = !attempts.is_empty()
+                            && attempts.iter().all(|attempt| status_is(attempt, &[401]));
+                        let method_refused = match error.terminal() {
+                            NetError::Status { code, .. } => matches!(code.as_u16(), 405 | 501),
+                            NetError::RetryBudgetExhausted {
+                                final_response: Some(r),
+                                ..
+                            } => matches!(r.status.as_u16(), 405 | 501),
+                            _ => false,
+                        };
+                        let earlier_refused = attempts
+                            .iter()
+                            .all(|attempt| status_is(attempt, &[401, 429, 503, 501]));
+                        all_auth || (method_refused && earlier_refused)
+                    }
                     _ => false,
                 };
-                // Terminal status is usable as data only when this wire leg
-                // can be replayed (or all earlier attempts were refusals).
-                // The logical update label alone does not prove that for MOVE
-                // or a create-PUT fallback, so honor the same request flag net
-                // used rather than substituting the operation table.
-                if request
-                    .idempotent
-                    .unwrap_or_else(|| request.method.is_idempotent())
-                    || refused_only
-                {
+                if request.replayable() || refused_only {
                     let response = match error.terminal() {
                         NetError::Status {
                             code,
@@ -744,9 +769,7 @@ impl DavDispatch {
         request: DavRequest,
         operation: AccountOperation,
     ) -> Result<DavResponse, AccountError> {
-        let unreplayable = !request
-            .idempotent
-            .unwrap_or_else(|| request.method.is_idempotent());
+        let unreplayable = !request.replayable();
         self.send_raw_until(request, operation, Instant::now() + DAV_CLIENT_TIMEOUT)
             .await
             .map_err(|error| {
@@ -791,9 +814,7 @@ impl DavDispatch {
                 self.protocol,
             ));
         }
-        let unreplayable = !request
-            .idempotent
-            .unwrap_or_else(|| request.method.is_idempotent());
+        let unreplayable = !request.replayable();
         let mut history = RedirectHistory::default();
         let mut request = request;
         let mut hops = 0usize;
@@ -1001,7 +1022,7 @@ impl DavDispatch {
                 url: next.to_string(),
                 headers,
                 body: request.body,
-                idempotent: request.idempotent,
+                replay: request.replay,
                 // Unreachable: the first dispatch already refused a request
                 // carrying one. Carried rather than reset so a future path that
                 // reaches here does not launder the rejection away.
@@ -1051,7 +1072,7 @@ impl DavDispatch {
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .header("Depth", depth)
             // A read: replaying after a dropped connection cannot change state.
-            .idempotent(true)
+            .replay(bifrost_net::ReplayPolicy::Idempotent)
             .body(body.to_string());
         self.send_body_request(request, operation).await
     }
@@ -1074,7 +1095,7 @@ impl DavDispatch {
         let request = DavRequest::new(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .header("Depth", depth)
-            .idempotent(true)
+            .replay(bifrost_net::ReplayPolicy::Idempotent)
             .body(body.to_string());
         self.send_raw_request(request, operation).await
     }
@@ -1111,7 +1132,8 @@ impl DavDispatch {
         url: &str,
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
-        let request = DavRequest::new(Method::DELETE, url);
+        let request = DavRequest::new(Method::DELETE, url)
+            .replay(bifrost_net::ReplayPolicy::IdempotentUnlessConditional);
         let response = self.send_raw_request(request, operation).await?;
         if response.status.is_success() || delete_target_already_gone(response.status) {
             Ok(())
@@ -1171,7 +1193,7 @@ impl DavDispatch {
             // 404 -> `NotFound` -> `ProviderRefused`, a move that succeeded
             // reported as a permanent refusal. Declaring it unreplayable
             // routes the drop to `Reconcile(CheckTarget)` instead.
-            .idempotent(false);
+            .replay(bifrost_net::ReplayPolicy::Never);
         let response = self.send_raw_request(request, operation).await?;
         if response.status.is_success() {
             return Ok(true);
@@ -1657,6 +1679,173 @@ mod tests {
         }
     }
 
+    fn replay_dav_response(status: StatusCode, body: &str) -> Canned {
+        Canned::Response {
+            status,
+            headers: HeaderMap::new(),
+            body: Bytes::copy_from_slice(body.as_bytes()),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_conditional_put_drop_reconciles() {
+        let script = dav_script([
+            dav_dropped_after_send(),
+            replay_dav_response(StatusCode::NO_CONTENT, ""),
+        ]);
+        let dispatch = scripted_dispatch(scripted_dav_net(&script));
+        let error = dispatch
+            .send_raw_request(
+                DavRequest::new(Method::PUT, format!("{BASE}/one.ics")).header("If-Match", "v1"),
+                AccountOperation::EventUpdate,
+            )
+            .await
+            .unwrap_err();
+        assert!(reconciles(&error));
+        assert_eq!(transcripts(&script).len(), 1);
+    }
+
+    #[test]
+    fn a_status_after_a_possible_commit_is_not_read_as_data() {
+        let dispatch = scripted_dispatch(scripted_dav_net(&dav_script_empty()));
+        for (method, code, operation) in [
+            (Method::PUT, 412, AccountOperation::EventUpdate),
+            (Method::DELETE, 404, AccountOperation::EventDelete),
+            (
+                Method::from_bytes(b"MOVE").unwrap(),
+                404,
+                AccountOperation::EventUpdate,
+            ),
+            (Method::PUT, 405, AccountOperation::EventUpdate),
+        ] {
+            let status = |code| NetError::Status {
+                code: StatusCode::from_u16(code).unwrap(),
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            };
+            let request =
+                DavRequest::new(method, format!("{BASE}/one.ics")).header("If-Match", "v1");
+            let result = dispatch.wire_outcome(
+                &request,
+                operation,
+                Err(NetError::AttemptHistory {
+                    source: Box::new(status(code)),
+                    attempts: vec![status(503)],
+                    may_have_committed: true,
+                }),
+            );
+            if code == 405 {
+                assert_eq!(result.unwrap().status, StatusCode::METHOD_NOT_ALLOWED);
+            } else {
+                assert!(reconciles(&result.unwrap_err()));
+            }
+        }
+        let request = DavRequest::new(
+            Method::from_bytes(b"MOVE").unwrap(),
+            format!("{BASE}/one.ics"),
+        );
+        let result = dispatch.wire_outcome(
+            &request,
+            AccountOperation::EventUpdate,
+            Err(NetError::AttemptHistory {
+                source: Box::new(NetError::RetryBudgetExhausted {
+                    final_response: Some(bifrost_net::error::FinalResponse {
+                        status: StatusCode::NOT_IMPLEMENTED,
+                        headers: HeaderMap::new(),
+                        body: Bytes::new(),
+                    }),
+                    retry_after_history: vec![],
+                }),
+                attempts: vec![],
+                may_have_committed: true,
+            }),
+        );
+        assert_eq!(result.unwrap().status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn an_unreplayable_dav_status_stops_before_the_next_reply() {
+        for (method, terminal) in [
+            (Method::PUT, StatusCode::PRECONDITION_FAILED),
+            (Method::DELETE, StatusCode::NOT_FOUND),
+            (
+                Method::from_bytes(b"MOVE").unwrap(),
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+        ] {
+            let script = dav_script([
+                replay_dav_response(StatusCode::SERVICE_UNAVAILABLE, "unknown"),
+                replay_dav_response(terminal, "unused"),
+            ]);
+            let dispatch = scripted_dispatch(scripted_dav_net(&script));
+            // PUT and DELETE are unreplayable because they are conditional;
+            // MOVE is unreplayable by its method default.
+            let mut request = DavRequest::new(method.clone(), format!("{BASE}/one.ics"));
+            if method != Method::from_bytes(b"MOVE").unwrap() {
+                request = request.header("If-Match", "v1");
+            }
+            let error = dispatch
+                .send_raw_request(request, AccountOperation::EventUpdate)
+                .await
+                .unwrap_err();
+            assert!(reconciles(&error));
+            assert_eq!(transcripts(&script).len(), 1);
+            assert_eq!(script.remaining(), 1);
+        }
+        for status in [StatusCode::METHOD_NOT_ALLOWED, StatusCode::NOT_IMPLEMENTED] {
+            let script = dav_script([replay_dav_response(status, "unsupported")]);
+            let dispatch = scripted_dispatch(scripted_dav_net(&script));
+            assert!(
+                !dispatch
+                    .move_resource(
+                        &format!("{BASE}/one.ics"),
+                        &format!("{BASE}/two.ics"),
+                        AccountOperation::EventUpdate
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+        let script = dav_script([replay_dav_response(
+            StatusCode::PRECONDITION_FAILED,
+            "conflict",
+        )]);
+        let dispatch = scripted_dispatch(scripted_dav_net(&script));
+        let error = dispatch
+            .send_status_request(
+                DavRequest::new(Method::PUT, format!("{BASE}/one.ics")).header("If-Match", "v1"),
+                AccountOperation::EventUpdate,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), &AccountErrorKind::ConcurrencyConflict);
+        let script = dav_script([
+            answer(StatusCode::UNAUTHORIZED),
+            answer(StatusCode::PRECONDITION_FAILED),
+        ]);
+        let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch = DavDispatch::with_account_net(
+            scripted_dav_net(&script),
+            BASE,
+            DavCredentials::Bearer {
+                token_source: Arc::new(RotatingTokenSource {
+                    refreshes: Arc::clone(&refreshes),
+                }),
+            },
+            DavProtocol::CalDav,
+        );
+        let error = dispatch
+            .send_status_request(
+                DavRequest::new(Method::PUT, format!("{BASE}/one.ics")).header("If-Match", "v1"),
+                AccountOperation::EventUpdate,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), &AccountErrorKind::ConcurrencyConflict);
+        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+        assert_eq!(transcripts(&script).len(), 2);
+    }
+
     /// An oversized response on an unreplayable request reconciles too.
     ///
     /// `response_read_error` mints `Protocol(PartialResponse)` with an
@@ -1907,7 +2096,7 @@ mod tests {
             let result = dispatch
                 .send_status_request(
                     DavRequest::new(Method::PUT, format!("{BASE}/one.ics"))
-                        .idempotent(false)
+                        .replay(bifrost_net::ReplayPolicy::Never)
                         .body("calendar bytes"),
                     AccountOperation::EventCreate,
                 )
@@ -1931,46 +2120,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_status_retry_preserves_move_fallback_and_create_conflicts() {
-        for refused in [
-            StatusCode::TOO_MANY_REQUESTS,
-            StatusCode::SERVICE_UNAVAILABLE,
-        ] {
-            let script = dav_script([answer(refused), answer(StatusCode::METHOD_NOT_ALLOWED)]);
-            let dispatch = scripted_dispatch(scripted_dav_net(&script));
-            assert!(
-                !dispatch
-                    .move_resource(
-                        &format!("{BASE}/a.ics"),
-                        &format!("{BASE}/b.ics"),
-                        AccountOperation::EventUpdate,
-                    )
-                    .await
-                    .expect("405 still signals copy/delete fallback")
-            );
-            assert_eq!(transcripts(&script).len(), 2);
-
-            let script = dav_script([answer(refused), answer(StatusCode::PRECONDITION_FAILED)]);
-            let dispatch = scripted_dispatch(scripted_dav_net(&script));
-            let error = dispatch
-                .send_status_request(
-                    DavRequest::new(Method::PUT, format!("{BASE}/new.ics"))
-                        .idempotent(false)
-                        .header("If-None-Match", "*")
-                        .body("calendar"),
-                    AccountOperation::EventCreate,
+    async fn a_429_refusal_preserves_move_fallback_but_create_ambiguity_reconciles() {
+        let script = dav_script([
+            answer(StatusCode::TOO_MANY_REQUESTS),
+            answer(StatusCode::METHOD_NOT_ALLOWED),
+        ]);
+        let dispatch = scripted_dispatch(scripted_dav_net(&script));
+        assert!(
+            !dispatch
+                .move_resource(
+                    &format!("{BASE}/a.ics"),
+                    &format!("{BASE}/b.ics"),
+                    AccountOperation::EventUpdate
                 )
                 .await
-                .expect_err("a refused create stays a conflict");
-            assert_eq!(error.kind(), &AccountErrorKind::ConcurrencyConflict);
-            assert_eq!(transcripts(&script).len(), 2);
-        }
+                .unwrap()
+        );
+        assert_eq!(transcripts(&script).len(), 2);
+        let script = dav_script([
+            answer(StatusCode::TOO_MANY_REQUESTS),
+            answer(StatusCode::PRECONDITION_FAILED),
+        ]);
+        let dispatch = scripted_dispatch(scripted_dav_net(&script));
+        let error = dispatch
+            .send_status_request(
+                DavRequest::new(Method::PUT, format!("{BASE}/new.ics"))
+                    .replay(bifrost_net::ReplayPolicy::Never)
+                    .header("If-None-Match", "*")
+                    .body("calendar"),
+                AccountOperation::EventCreate,
+            )
+            .await
+            .unwrap_err();
+        assert!(reconciles(&error));
+        assert_eq!(transcripts(&script).len(), 2);
     }
 
     #[test]
     fn an_ambiguous_prior_attempt_cannot_be_hidden_by_a_terminal_status() {
         let dispatch = scripted_dispatch(scripted_dav_net(&dav_script_empty()));
-        let request = DavRequest::new(Method::PUT, format!("{BASE}/new.ics")).idempotent(false);
+        let request = DavRequest::new(Method::PUT, format!("{BASE}/new.ics"))
+            .replay(bifrost_net::ReplayPolicy::Never);
         let error = dispatch
             .wire_outcome(
                 &request,
@@ -2015,7 +2205,8 @@ mod tests {
         let dispatch = dispatch_at(account_net, BASE);
         let error = dispatch
             .send_raw_request(
-                DavRequest::new(Method::PUT, format!("{BASE}/start")).idempotent(false),
+                DavRequest::new(Method::PUT, format!("{BASE}/start"))
+                    .replay(bifrost_net::ReplayPolicy::Never),
                 AccountOperation::EventUpdate,
             )
             .await
@@ -2103,7 +2294,8 @@ mod tests {
                 );
                 let error = dispatch
                     .send_raw_request(
-                        DavRequest::new(Method::PUT, format!("{BASE}/start")).idempotent(false),
+                        DavRequest::new(Method::PUT, format!("{BASE}/start"))
+                            .replay(bifrost_net::ReplayPolicy::Never),
                         AccountOperation::EventUpdate,
                     )
                     .await
@@ -2265,7 +2457,8 @@ mod tests {
         let waiting_request = tokio::spawn(async move {
             dispatch
                 .send_raw_request(
-                    DavRequest::new(Method::PUT, format!("{BASE}/waiting")).idempotent(false),
+                    DavRequest::new(Method::PUT, format!("{BASE}/waiting"))
+                        .replay(bifrost_net::ReplayPolicy::Never),
                     AccountOperation::EventUpdate,
                 )
                 .await

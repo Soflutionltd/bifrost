@@ -55,6 +55,7 @@ pub(crate) struct EmailParseResponse {
 }
 
 impl crate::core::method::JmapMethod for EmailParseRequest {
+    const REPLAY_SAFE: bool = true;
     const NAME: &'static str = "Email/parse";
     type Cap = crate::core::capability::Mail;
     type Response = EmailParseResponse;

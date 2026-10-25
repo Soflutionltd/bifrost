@@ -2260,6 +2260,9 @@ Unknown future success variants remain protected in the read-back lane.
   swallowing a later `DisableScope`).
 - terminal recovery -> `failed_terminal`.
 
+A narrowed absolute write (request unreplayable, operation idempotent) arrives
+with CheckTarget-only reconciliation and is reassertable.
+
 `ItemOutcome::Uncertain` always queues for read-back. Retry advice with a
 known disposition or CheckTarget-only reconcile advice permits bounded
 reassertion after observation; dedupe guidance, engine, terminal, or unknown

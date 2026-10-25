@@ -197,13 +197,16 @@ async fn run_worker<E: EwsExecute>(account: GraphAccount, ews: E) {
                 }
             }
             Err(error) => {
+                let back_off = subscribe_status_stopped_by_replay_policy(&error);
                 let account_error = ews_error_to_account_error(
                     error,
                     GraphErrorContext::ews(AccountOperation::PushSubscribe),
                 );
                 // Only Retry belongs to this reconnect loop. Engine and Reconcile
-                // must reach the sync reconciler through Terminated too.
-                if !account_error.recovery().is_retryable() {
+                // must reach the sync reconciler through Terminated too, with
+                // one exception: a retry-candidate status that net refused to
+                // replay (see `subscribe_status_stopped_by_replay_policy`).
+                if !account_error.recovery().is_retryable() && !back_off {
                     super::push_stream::publish_terminal(&account, account_error);
                     return;
                 }
@@ -284,7 +287,14 @@ fn reconnect_delay(failures: u32, jitter_seed: u64) -> Duration {
 /// request is expected to fail right along with it.
 async fn release_subscription<E: EwsExecute>(ews: &E, subscription_id: &str) {
     let body = build_unsubscribe_request(subscription_id);
-    if let Err(error) = ews.execute(&body, &EwsHeaders::default()).await {
+    if let Err(error) = ews
+        .execute(
+            &body,
+            &EwsHeaders::default(),
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
+        .await
+    {
         tracing::debug!(
             target: "bifrost_graph::ews",
             error = ?error,
@@ -484,7 +494,13 @@ async fn subscribe<E: EwsExecute>(
     scopes: &[EwsSubscriptionScope],
 ) -> Result<String, EwsError> {
     let body = build_subscribe_request(scopes);
-    let xml = ews.execute(&body, &EwsHeaders::default()).await?;
+    let xml = ews
+        .execute(
+            &body,
+            &EwsHeaders::default(),
+            bifrost_net::ReplayPolicy::Never,
+        )
+        .await?;
     let subscriptions = parse_subscribe_response(&xml)
         .map_err(|error| EwsError::MalformedXml(DiagnosticText::support_only(error)))?;
     subscriptions.into_iter().next().ok_or_else(|| {
@@ -492,6 +508,28 @@ async fn subscribe<E: EwsExecute>(
             "EWS Subscribe returned no StreamingSubscription".to_string(),
         ))
     })
+}
+
+/// Whether an EWS `Subscribe` failed on a retry-candidate status (a 5xx, or
+/// a status listed in the retry policy) that net stopped retrying, rather
+/// than on a definite refusal or a transport drop.
+///
+/// `subscribe` declares the request `ReplayPolicy::Never` because each call
+/// mints a new subscription, so net does not replay such a status and
+/// reports it as an ambiguity envelope that classifies as `Reconcile` under
+/// `PushSubscribe`. In this worker that advice is already satisfied by the
+/// backoff-and-resubscribe arm: a subscription the failed call may have
+/// created is never polled and lapses server-side on its own, and the next
+/// `Subscribe` is the read that settles what is live. Terminating instead
+/// would end the EWS lane on one gateway 503, which a bare budget-exhausted
+/// status (classified `Retry`) never did. A transport drop past `Unsent`
+/// still terminates, as it did before the request was declared `Never`.
+fn subscribe_status_stopped_by_replay_policy(error: &EwsError) -> bool {
+    matches!(
+        error,
+        EwsError::Transport(net)
+            if matches!(net.terminal(), bifrost_net::Error::RetryBudgetExhausted { .. })
+    )
 }
 
 async fn run_get_events_loop<E: EwsExecute>(
@@ -1689,7 +1727,12 @@ mod tests {
     }
 
     impl EwsExecute for ScriptedEws {
-        async fn execute(&self, body_xml: &str, _headers: &EwsHeaders) -> Result<String, EwsError> {
+        async fn execute(
+            &self,
+            body_xml: &str,
+            _headers: &EwsHeaders,
+            _replay: bifrost_net::ReplayPolicy,
+        ) -> Result<String, EwsError> {
             let step = self
                 .steps
                 .lock()
@@ -1736,6 +1779,78 @@ mod tests {
             WatchEvent::Terminated(error) => assert!(error.recovery().requires_reconciliation()),
             other => panic!("expected reconciliation termination, got {other:?}"),
         }
+    }
+
+    /// The envelope net builds when a `Never` request meets a 503: one
+    /// attempt, no replay, `may_have_committed`.
+    fn unreplayed_unavailable() -> EwsError {
+        EwsError::Transport(bifrost_net::Error::AttemptHistory {
+            source: Box::new(bifrost_net::Error::RetryBudgetExhausted {
+                final_response: Some(bifrost_net::FinalResponse {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    headers: reqwest::header::HeaderMap::new(),
+                    body: bytes::Bytes::new(),
+                }),
+                retry_after_history: Vec::new(),
+            }),
+            attempts: Vec::new(),
+            may_have_committed: true,
+        })
+    }
+
+    /// A 5xx on the `Never` Subscribe classifies as `Reconcile`, but the
+    /// worker's backoff-and-resubscribe is that reconciliation, so the lane
+    /// reports `Disconnected`, resubscribes and reports `Reconnected` instead
+    /// of terminating. The classification is asserted first: were the 503
+    /// already `Retry`, the worker half would pass without the exception.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreplayed_subscribe_status_backs_off_and_resubscribes() {
+        let classified = ews_error_to_account_error(
+            unreplayed_unavailable(),
+            GraphErrorContext::ews(AccountOperation::PushSubscribe),
+        );
+        assert!(
+            classified.recovery().requires_reconciliation(),
+            "{:?}",
+            classified.recovery()
+        );
+        assert!(subscribe_status_stopped_by_replay_policy(
+            &unreplayed_unavailable()
+        ));
+
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
+        let mut events = account.push_tx.subscribe();
+        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
+        let (scripted, mut requests) = scripted(vec![
+            ScriptStep::Fail(unreplayed_unavailable()),
+            ScriptStep::Respond(subscribe_response_xml("sub-1")),
+            ScriptStep::Hang,
+            ScriptStep::Respond(unsubscribe_response_xml()),
+        ]);
+        let worker = tokio::spawn(run_worker(account.clone(), scripted));
+
+        let failed = requests.recv().await.expect("first subscribe");
+        assert!(failed.contains("<m:Subscribe>"), "{failed}");
+        let retried = requests.recv().await.expect("resubscribe after backoff");
+        assert!(retried.contains("<m:Subscribe>"), "{retried}");
+        let poll = requests
+            .recv()
+            .await
+            .expect("long poll on the new subscription");
+        assert!(
+            poll.contains("<t:SubscriptionId>sub-1</t:SubscriptionId>"),
+            "{poll}"
+        );
+        assert!(matches!(events.try_recv(), Ok(WatchEvent::Disconnected)));
+        assert!(matches!(events.try_recv(), Ok(WatchEvent::Reconnected)));
+
+        account.shutdown.cancel();
+        worker.await.expect("worker joins");
+        assert!(
+            !matches!(events.try_recv(), Ok(WatchEvent::Terminated(_))),
+            "a backed-off Subscribe status must not end the lane"
+        );
     }
 
     /// The registration that starts the worker bumps the topology BEFORE
@@ -2064,5 +2179,56 @@ mod tests {
         super::super::push_stream::ensure_ews_worker(account.clone()).await;
         assert!(account.ews_worker.lock().await.is_some());
         account.shutdown.cancel();
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use bifrost_net::test_support::{Canned, ScriptedDispatch, canned};
+    fn fixture() -> (EwsClient, std::sync::Arc<ScriptedDispatch>) {
+        let script = ScriptedDispatch::new([
+            Canned::Error(bifrost_net::Error::Network {
+                message: "lost".into(),
+                transmission_state: bifrost_types::TransmissionState::InFlight,
+                source: None,
+            }),
+            canned(reqwest::StatusCode::OK, b"<root/>"),
+        ]);
+        let mut policy = bifrost_net::RetryPolicy::default();
+        policy.max_attempts = 2;
+        policy.initial_backoff = Duration::ZERO;
+        policy.max_backoff = Duration::ZERO;
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            bifrost_net::NetConfig::default(),
+            vec![],
+            std::sync::Arc::new(bifrost_net::StaticTokenSource::new("token", None)),
+            policy,
+        );
+        let client = crate::client::GraphClient::new("token");
+        (EwsClient::new(net, client.ews_url()), script)
+    }
+    #[tokio::test]
+    async fn ews_subscribe_is_not_replayed_and_reads_are() {
+        let (client, script) = fixture();
+        assert!(subscribe(&client, &[]).await.is_err());
+        assert_eq!(script.requests().len(), 1);
+        let (client, script) = fixture();
+        // The minimal XML can be rejected by the parser; the two wire attempts
+        // pin the policy before parsing the response.
+        let _ = client.find_folder("inbox", &EwsHeaders::default()).await;
+        assert_eq!(script.requests().len(), 2);
+    }
+    #[tokio::test]
+    async fn ews_streaming_request_is_not_replayed_by_net() {
+        let (client, script) = fixture();
+        assert!(
+            client
+                .execute_streaming("<GetStreamingEvents/>", &EwsHeaders::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(script.requests().len(), 1);
     }
 }

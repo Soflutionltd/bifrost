@@ -347,7 +347,12 @@ mod tests {
     }
 
     impl HttpTransport for ScriptedTransport {
-        async fn api_request(&self, _: &str, _: Vec<u8>) -> Result<Bytes, TransportError> {
+        async fn api_request(
+            &self,
+            _: &str,
+            _: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
+        ) -> Result<Bytes, TransportError> {
             unreachable!("the EventSource test does not make API requests")
         }
 

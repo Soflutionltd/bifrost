@@ -135,6 +135,10 @@ pub(crate) async fn message_reactions(
                 headers: None,
             })
             .collect();
+        let replayable: Vec<_> = requests
+            .iter()
+            .map(super::graph_error::subrequest_replayable)
+            .collect();
         match account
             .client
             .post_batch(
@@ -142,10 +146,17 @@ pub(crate) async fn message_reactions(
                     .batch_resource(&chunk)
                     .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?,
                 &BatchRequest { requests },
+                bifrost_net::ReplayPolicy::Idempotent,
             )
             .await
         {
-            Ok(response) => classify_chunk(&chunk, response.responses, operation, &mut builder),
+            Ok(response) => classify_chunk(
+                &chunk,
+                response.responses,
+                operation,
+                &mut builder,
+                &replayable,
+            ),
             Err(e) => {
                 // The whole chunk never returned: every item's fate is
                 // unknown. Uncertain, never an empty succeeded state.
@@ -206,6 +217,7 @@ fn classify_chunk(
     responses: Vec<BatchResponseItem>,
     operation: AccountOperation,
     builder: &mut BatchOutcomeBuilder<MessageReactionState>,
+    replayable: &[bool],
 ) {
     let mut answered: HashSet<usize> = HashSet::new();
     for item in responses {
@@ -265,6 +277,7 @@ fn classify_chunk(
                         "Graph $batch returned no response for reaction read {index} \
                          (item fate unknown)"
                     ),
+                    replayable.get(index).copied().unwrap_or(false),
                 ),
             );
         }
@@ -541,6 +554,7 @@ mod tests {
             ],
             AccountOperation::MessageReactionsRead,
             &mut builder,
+            &vec![true; chunk.len()],
         );
         let outcome = builder
             .finalize(&[
@@ -621,6 +635,7 @@ mod tests {
             vec![response_item("0", 503, None)],
             AccountOperation::MessageReactionsRead,
             &mut builder,
+            &vec![true; chunk.len()],
         );
         let outcome = builder
             .finalize(&[BatchItemId("m1".to_string())])
@@ -644,6 +659,7 @@ mod tests {
             ],
             AccountOperation::MessageReactionsRead,
             &mut builder,
+            &vec![true; chunk.len()],
         );
         let outcome = builder
             .finalize(&[BatchItemId("m1".to_string())])
@@ -665,6 +681,7 @@ mod tests {
             ],
             AccountOperation::MessageReactionsRead,
             &mut builder,
+            &vec![true; chunk.len()],
         );
         let outcome = builder
             .finalize(&[BatchItemId("a".to_string()), BatchItemId("b".to_string())])

@@ -93,6 +93,15 @@ impl GraphErrorContext {
     /// exists - has no target to reconcile against and is safe to repeat, so
     /// it says so here rather than borrowing an unrelated operation whose
     /// name would then lie in every telemetry export.
+    ///
+    /// Valid only where every request classified under this context is
+    /// declared `ReplayPolicy::Idempotent`. Such a request never carries net's
+    /// `may_have_committed`, so the widening can never undo a net narrowing.
+    /// The coupling is real: the override survives `into_builder`, and
+    /// `apply_idempotency_override` re-applies this `true` after net
+    /// translates, so on a request net narrowed it WOULD overwrite net's
+    /// `false`. `translate_exchange_ids_is_declared_idempotent` guards the one
+    /// caller.
     #[must_use]
     pub(crate) fn idempotent(mut self) -> Self {
         self.idempotency_override = Some(true);
@@ -300,12 +309,14 @@ fn graph_envelope_evidence(
 /// Re-apply the context's idempotency override onto an error `bifrost-net`
 /// built.
 ///
-/// `NetErrorContext` carries no override channel, and the override is a
-/// builder-only input that `into_builder` deliberately drops, so the
-/// transport arm re-derives the recovery class through the documented
-/// decoration path instead of teaching every net consumer a new field. The
-/// kind and cause chain are untouched; only `recovery` recomputes. A call
-/// site that declared nothing pays nothing - there is no rebuild.
+/// `NetErrorContext` carries no override channel, so the context's override
+/// is stamped after net translates. `into_builder` keeps every override,
+/// including a narrowing net stamped itself, and this re-application replaces
+/// it: a widening context (`GraphErrorContext::idempotent`) is therefore
+/// valid only where every request is declared `ReplayPolicy::Idempotent`, so
+/// net never narrowed in the first place. The kind and cause chain are
+/// untouched; only `recovery` recomputes. A call site that declared nothing
+/// pays nothing - there is no rebuild.
 #[must_use]
 fn apply_idempotency_override(error: AccountError, ctx: &GraphErrorContext) -> AccountError {
     let Some(idempotent) = ctx.idempotency_override else {
@@ -1584,11 +1595,17 @@ pub(crate) fn protocol_violation(
 /// contract's answer: it retries idempotent work (hydration, absolute-state
 /// flag writes) and routes non-idempotent work (move, destroy) to
 /// `Reconcile(PartialCompletionSignal)` so the caller probes the target.
+///
+/// `subrequest_replayable` (computed by `subrequest_replayable()` before the
+/// batch is sent) narrows that default: a subrequest that may not be replayed,
+/// such as a PATCH carrying `If-Match`, is stamped non-idempotent so its
+/// omission reconciles instead of retrying into a 412 against its own write.
 #[must_use]
 pub(crate) fn batch_response_missing(
     operation: AccountOperation,
     scope: Option<ErrorScope>,
     detail: impl Into<String>,
+    subrequest_replayable: bool,
 ) -> AccountError {
     let detail = DiagnosticText::support_only(detail.into());
     let mut builder = AccountErrorBuilder::new(
@@ -1602,6 +1619,9 @@ pub(crate) fn batch_response_missing(
     .provider(Provider::Microsoft)
     .protocol(Protocol::Graph)
     .text(detail);
+    if !subrequest_replayable {
+        builder = builder.idempotency_override(false);
+    }
     if let Some(scope) = scope {
         builder = builder.scope(scope);
     }
@@ -1611,6 +1631,33 @@ pub(crate) fn batch_response_missing(
     builder
         .try_build()
         .expect("valid account error classification")
+}
+
+/// Resolve a batch leg using the same declaration rule as top-level requests:
+/// a PATCH subrequest is an absolute write by id, declared
+/// `IdempotentUnlessConditional`; every other method takes its method
+/// default. Fails closed: an unparseable method or any header that does not
+/// convert answers `false`, because silently dropping an unconvertible
+/// `If-Match` would let a guarded leg read as replayable.
+pub(crate) fn subrequest_replayable(item: &crate::types::BatchRequestItem) -> bool {
+    let Ok(method) = reqwest::Method::from_bytes(item.method.as_bytes()) else {
+        return false;
+    };
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(entries) = &item.headers {
+        for (name, value) in entries {
+            let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) else {
+                return false;
+            };
+            headers.insert(name, value);
+        }
+    }
+    let declared = (method == reqwest::Method::PATCH)
+        .then_some(bifrost_net::ReplayPolicy::IdempotentUnlessConditional);
+    bifrost_net::request_is_replayable(declared, &method, &headers)
 }
 
 /// Translate a single `$batch` response item into an
@@ -1854,6 +1901,7 @@ mod tests {
                     id: ("m1".to_string()).into(),
                 }),
                 "Graph $batch returned no response for m1",
+                true,
             );
             assert!(matches!(
                 err.kind(),
@@ -2979,5 +3027,61 @@ mod unsupported_constructor_tests {
             error.kind(),
             &bifrost_types::AccountErrorKind::Unsupported(operation)
         );
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    #[test]
+    fn a_missing_conditional_subresponse_reconciles() {
+        for (op, safe) in [
+            (AccountOperation::SetCategory, false),
+            (AccountOperation::SetCategory, true),
+            (AccountOperation::BulkDestroy, false),
+        ] {
+            let error = batch_response_missing(op, None, "omitted", safe);
+            if safe {
+                assert!(matches!(
+                    error.recovery(),
+                    bifrost_types::RecoveryClass::Retry(_)
+                ));
+            } else {
+                let bifrost_types::RecoveryClass::Reconcile(a) = error.recovery() else {
+                    panic!("{error:?}")
+                };
+                let mut expected = vec![bifrost_types::ReconcileAction::CheckTarget];
+                if op == AccountOperation::BulkDestroy {
+                    expected.push(bifrost_types::ReconcileAction::DedupeByClientId);
+                }
+                assert_eq!(a.guidance.actions, expected);
+            }
+        }
+    }
+    #[test]
+    fn subrequest_replayable_follows_the_declaration_rule_and_fails_closed() {
+        for (method, header, expected) in [
+            ("GET", None, true),
+            ("PATCH", None, true),
+            ("PATCH", Some("v1"), false),
+            ("POST", None, false),
+            ("DELETE", None, true),
+            ("bad method", None, false),
+            ("PATCH", Some("bad\nvalue"), false),
+        ] {
+            let item = crate::types::BatchRequestItem {
+                id: "0".into(),
+                method: method.into(),
+                url: "/me/messages/m1".into(),
+                body: None,
+                headers: header
+                    .map(|value| [("If-Match".into(), value.into())].into_iter().collect()),
+            };
+            assert_eq!(
+                subrequest_replayable(&item),
+                expected,
+                "{method} {header:?}"
+            );
+        }
     }
 }

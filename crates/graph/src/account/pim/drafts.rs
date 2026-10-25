@@ -46,7 +46,12 @@ pub(crate) async fn draft_update(
     );
     account
         .client
-        .patch(Resource::Outlook, &path, &message)
+        .patch(
+            Resource::Outlook,
+            &path,
+            &message,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
         .await
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftUpdate)))
 }
@@ -62,7 +67,7 @@ pub(crate) async fn draft_discard(
     );
     account
         .client
-        .delete(Resource::Outlook, &path)
+        .delete(Resource::Outlook, &path, bifrost_net::ReplayPolicy::Never)
         .await
         .map_err(|e| {
             into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftDiscard))
@@ -259,7 +264,12 @@ pub(super) async fn create_draft_message(
 ) -> Result<DraftHandle, AccountError> {
     let path = format!("{}/messages", client.api_path_prefix());
     let created: Value = client
-        .post(Resource::Outlook, &path, &message)
+        .post(
+            Resource::Outlook,
+            &path,
+            &message,
+            bifrost_net::ReplayPolicy::Never,
+        )
         .await
         .map_err(|e| {
             into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftCreate))
@@ -284,7 +294,7 @@ pub(super) async fn send_draft_message(
         bifrost_net::url::encode_path_component(&draft.0)
     );
     client
-        .post_empty(Resource::Outlook, &path)
+        .post_empty(Resource::Outlook, &path, bifrost_net::ReplayPolicy::Never)
         .await
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::Send)))
 }

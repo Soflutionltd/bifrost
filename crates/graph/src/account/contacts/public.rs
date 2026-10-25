@@ -128,7 +128,11 @@ async fn page(
     let client = super::super::public_folder::ews_client(account)
         .map_err(|error| ews_error(error, operation))?;
     let xml = client
-        .execute(&ews::contacts::find_body(folder, offset, query), &headers)
+        .execute(
+            &ews::contacts::find_body(folder, offset, query),
+            &headers,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
         .await
         .map_err(|error| ews_error(error, operation))?;
     let page = ews::parse_find_items_response(&xml).map_err(|error| ews_error(error, operation))?;
@@ -220,7 +224,11 @@ pub(super) async fn get(
     let headers = routing(account, folder, operation).await?;
     let client = super::super::public_folder::ews_client(account).map_err(map_error)?;
     let xml = client
-        .execute(&ews::contacts::get_body(item), &headers)
+        .execute(
+            &ews::contacts::get_body(item),
+            &headers,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
         .await
         .map_err(map_error)?;
     let nodes = ews::contacts::contact_nodes(&xml).map_err(map_error)?;

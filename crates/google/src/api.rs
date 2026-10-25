@@ -35,7 +35,8 @@ impl GmailClient {
                 "backgroundColor": bg_color,
             });
         }
-        self.post("/labels", &body).await
+        self.post("/labels", &body, bifrost_net::ReplayPolicy::Never)
+            .await
     }
 
     pub(crate) async fn update_label(
@@ -55,12 +56,21 @@ impl GmailClient {
                 None => serde_json::Value::Null,
             };
         }
-        self.patch(&format!("/labels/{label_id}"), &body).await
+        self.patch(
+            &format!("/labels/{label_id}"),
+            &body,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
+        .await
     }
 
     pub(crate) async fn delete_label(&self, label_id: &str) -> Result<()> {
         let label_id = bifrost_net::url::encode_path_component(label_id);
-        self.delete(&format!("/labels/{label_id}")).await
+        self.delete(
+            &format!("/labels/{label_id}"),
+            bifrost_net::ReplayPolicy::Never,
+        )
+        .await
     }
 
     pub(crate) async fn list_filters(&self) -> Result<Vec<GmailFilter>> {
@@ -69,12 +79,21 @@ impl GmailClient {
     }
 
     pub(crate) async fn create_filter(&self, filter: &GmailFilter) -> Result<GmailFilter> {
-        self.post("/settings/filters", filter).await
+        self.post(
+            "/settings/filters",
+            filter,
+            bifrost_net::ReplayPolicy::Never,
+        )
+        .await
     }
 
     pub(crate) async fn delete_filter(&self, filter_id: &str) -> Result<()> {
         let encoded = bifrost_net::url::encode_path_component(filter_id);
-        self.delete(&format!("/settings/filters/{encoded}")).await
+        self.delete(
+            &format!("/settings/filters/{encoded}"),
+            bifrost_net::ReplayPolicy::Never,
+        )
+        .await
     }
 
     pub(crate) async fn list_threads(
@@ -128,13 +147,18 @@ impl GmailClient {
                 "addLabelIds": add_labels,
                 "removeLabelIds": remove_labels,
             }),
+            bifrost_net::ReplayPolicy::Idempotent,
         )
         .await
     }
 
     pub(crate) async fn delete_thread(&self, thread_id: &str) -> Result<()> {
         let thread_id = bifrost_net::url::encode_path_component(thread_id);
-        self.delete(&format!("/threads/{thread_id}")).await
+        self.delete(
+            &format!("/threads/{thread_id}"),
+            bifrost_net::ReplayPolicy::Never,
+        )
+        .await
     }
 
     pub(crate) async fn get_message(&self, message_id: &str, format: &str) -> Result<GmailMessage> {
@@ -152,7 +176,8 @@ impl GmailClient {
         if let Some(tid) = thread_id {
             body["threadId"] = json!(tid);
         }
-        self.post("/messages/send", &body).await
+        self.post("/messages/send", &body, bifrost_net::ReplayPolicy::Never)
+            .await
     }
 
     pub(crate) async fn modify_message(
@@ -168,6 +193,7 @@ impl GmailClient {
                 "addLabelIds": add_labels,
                 "removeLabelIds": remove_labels,
             }),
+            bifrost_net::ReplayPolicy::Idempotent,
         )
         .await
     }
@@ -195,7 +221,14 @@ impl GmailClient {
         let url = self.api_url(&format!(
             "/messages/{message_id}/attachments/{attachment_id}"
         ));
-        let response = self.execute(&url, "GET", None::<&()>).await?;
+        let response = self
+            .execute(
+                &url,
+                "GET",
+                None::<&()>,
+                bifrost_net::ReplayPolicy::Idempotent,
+            )
+            .await?;
         let transferred_size = u64::try_from(response.body.len()).unwrap_or(u64::MAX);
         let attachment = super::client::parse_json_response(response, "Gmail API").await?;
         Ok((attachment, transferred_size))
@@ -230,7 +263,12 @@ impl GmailClient {
         if let Some(tid) = thread_id {
             message["threadId"] = json!(tid);
         }
-        self.post("/drafts", &json!({ "message": message })).await
+        self.post(
+            "/drafts",
+            &json!({ "message": message }),
+            bifrost_net::ReplayPolicy::Never,
+        )
+        .await
     }
 
     pub(crate) async fn get_draft(&self, draft_id: &str, format: &str) -> Result<GmailDraft> {
@@ -253,17 +291,27 @@ impl GmailClient {
         self.put(
             &format!("/drafts/{draft_id}"),
             &json!({ "message": message }),
+            bifrost_net::ReplayPolicy::Idempotent,
         )
         .await
     }
 
     pub(crate) async fn delete_draft(&self, draft_id: &str) -> Result<()> {
         let draft_id = bifrost_net::url::encode_path_component(draft_id);
-        self.delete(&format!("/drafts/{draft_id}")).await
+        self.delete(
+            &format!("/drafts/{draft_id}"),
+            bifrost_net::ReplayPolicy::Never,
+        )
+        .await
     }
 
     pub(crate) async fn send_draft(&self, draft_id: &str) -> Result<GmailMessage> {
-        self.post("/drafts/send", &json!({ "id": draft_id })).await
+        self.post(
+            "/drafts/send",
+            &json!({ "id": draft_id }),
+            bifrost_net::ReplayPolicy::Never,
+        )
+        .await
     }
 
     pub(crate) async fn list_send_as(&self) -> Result<Vec<GmailSendAs>> {
@@ -277,8 +325,12 @@ impl GmailClient {
         body: &serde_json::Value,
     ) -> Result<GmailSendAs> {
         let encoded = bifrost_net::url::encode_path_component(send_as_email);
-        self.patch(&format!("/settings/sendAs/{encoded}"), body)
-            .await
+        self.patch(
+            &format!("/settings/sendAs/{encoded}"),
+            body,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
+        .await
     }
 
     pub(crate) async fn get_vacation(&self) -> Result<GmailVacationSettings> {
@@ -289,7 +341,12 @@ impl GmailClient {
         &self,
         settings: &GmailVacationSettings,
     ) -> Result<GmailVacationSettings> {
-        self.put("/settings/vacation", settings).await
+        self.put(
+            "/settings/vacation",
+            settings,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
+        .await
     }
 }
 

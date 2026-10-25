@@ -218,7 +218,12 @@ mod tests {
     struct UrlCapture(Arc<Mutex<Option<String>>>);
 
     impl HttpTransport for UrlCapture {
-        async fn api_request(&self, _url: &str, _body: Vec<u8>) -> Result<Bytes, TransportError> {
+        async fn api_request(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
+        ) -> Result<Bytes, TransportError> {
             Err(TransportError::new("stub transport does not call the API"))
         }
 

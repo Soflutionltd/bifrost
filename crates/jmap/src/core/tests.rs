@@ -548,11 +548,18 @@ mod envelope {
     /// connection failure looks like to the caller.
     struct StubTransport {
         sent: Arc<Mutex<Vec<Value>>>,
+        policies: Arc<Mutex<Vec<bifrost_net::ReplayPolicy>>>,
         replies: Arc<Mutex<VecDeque<String>>>,
     }
 
     impl HttpTransport for StubTransport {
-        async fn api_request(&self, _url: &str, body: Vec<u8>) -> Result<Bytes, TransportError> {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+            replay: bifrost_net::ReplayPolicy,
+        ) -> Result<Bytes, TransportError> {
+            self.policies.lock().unwrap().push(replay);
             let parsed: Value =
                 serde_json::from_slice(&body).expect("client emitted a non-JSON request body");
             self.sent.lock().expect("stub sent lock").push(parsed);
@@ -635,10 +642,73 @@ mod envelope {
         .expect("session fixture parses")
     }
 
+    crate::define_set_method!(
+        ReplayTestSet,
+        super::TestObj,
+        "Test/set",
+        crate::core::capability::Core
+    );
+
+    #[test]
+    fn request_replay_policy_is_idempotent_only_when_every_call_is_replay_safe() {
+        let stub = stub(mail_primary(), []);
+        let mut request = stub.client.build();
+        assert_eq!(
+            request.replay_policy(),
+            bifrost_net::ReplayPolicy::Idempotent
+        );
+        request.call(TestGet::new()).unwrap();
+        request.call(TestQuery::new()).unwrap();
+        assert_eq!(
+            request.replay_policy(),
+            bifrost_net::ReplayPolicy::Idempotent
+        );
+        request.call(ReplayTestSet::new()).unwrap();
+        assert_eq!(request.replay_policy(), bifrost_net::ReplayPolicy::Never);
+        #[cfg(feature = "mail")]
+        {
+            let mut request = stub.client.build();
+            request
+                .call(crate::email::import::EmailImportRequest::new())
+                .unwrap();
+            assert_eq!(request.replay_policy(), bifrost_net::ReplayPolicy::Never);
+        }
+    }
+    #[tokio::test]
+    async fn send_request_hands_the_typed_batch_policy_to_the_transport() {
+        let policies = Arc::new(Mutex::new(Vec::new()));
+        let client = Client::with_transport(
+            StubTransport {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                replies: Arc::new(Mutex::new(VecDeque::new())),
+                policies: Arc::clone(&policies),
+            },
+            session(mail_primary()),
+            "https://example.test/.well-known/jmap",
+        )
+        .unwrap();
+        let mut request = client.build();
+        request.call(TestGet::new()).unwrap();
+        assert!(client.send_request(&request).await.is_err());
+        let mut request = client.build();
+        request
+            .call(ReplayTestSet::new().if_in_state("caller-old"))
+            .unwrap();
+        assert!(client.send_request(&request).await.is_err());
+        assert_eq!(
+            *policies.lock().unwrap(),
+            [
+                bifrost_net::ReplayPolicy::Idempotent,
+                bifrost_net::ReplayPolicy::Never
+            ]
+        );
+    }
+
     fn stub(primary_accounts: Value, replies: impl IntoIterator<Item = String>) -> Stub {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let transport = StubTransport {
             sent: Arc::clone(&sent),
+            policies: Arc::new(Mutex::new(Vec::new())),
             replies: Arc::new(Mutex::new(replies.into_iter().collect())),
         };
         let client = Client::with_transport(
@@ -658,6 +728,7 @@ mod envelope {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let transport = StubTransport {
             sent: Arc::clone(&sent),
+            policies: Arc::new(Mutex::new(Vec::new())),
             replies: Arc::new(Mutex::new(replies.into_iter().collect())),
         };
         let client = Client::with_transport(

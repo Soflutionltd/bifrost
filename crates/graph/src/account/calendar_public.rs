@@ -216,6 +216,7 @@ pub(super) async fn range(
                     cap,
                 ),
                 &headers,
+                bifrost_net::ReplayPolicy::Idempotent,
             )
             .await
             .map_err(map)?;
@@ -299,7 +300,11 @@ pub(super) async fn get(
     let headers = routing(account, folder, op).await?;
     let client = super::super::public_folder::ews_client(account).map_err(map)?;
     let xml = client
-        .execute(&ews::calendar::get_body(item), &headers)
+        .execute(
+            &ews::calendar::get_body(item),
+            &headers,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
         .await
         .map_err(map)?;
     let nodes = ews::contacts::contact_nodes(&xml).map_err(map)?;
@@ -460,6 +465,7 @@ pub(super) async fn search(
                 .execute(
                     &ews::calendar::search_body(folder, offset, &request.query),
                     &headers,
+                    bifrost_net::ReplayPolicy::Idempotent,
                 )
                 .await
                 .map_err(map)?;

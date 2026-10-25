@@ -544,7 +544,7 @@ mod tests {
             b"prefix ... (body read timed out)"
         );
     }
-    async fn review_r1_committed_attempt(status: StatusCode) {
+    async fn review_r1_committed_attempt(status: StatusCode, operation: AccountOperation) {
         struct CommitDispatch {
             script: Arc<ScriptedDispatch>,
             gate: Arc<Mutex<Option<SharedHold>>>,
@@ -597,14 +597,23 @@ mod tests {
             .send()
             .await
             .err()
-            .expect("replacement attempt is held");
-        assert!(
-            matches!(&error, Error::LocalHold { attempts, .. } if matches!(attempts.as_slice(), [Error::Status { code, body, .. }] if *code == status && body.as_ref() == b"mutation outcome"))
-        );
+            .expect("the committed mutation must not succeed through a replacement attempt");
+        if status == StatusCode::FORBIDDEN {
+            assert!(
+                matches!(&error, Error::AttemptHistory { attempts, may_have_committed: true, .. } if attempts.is_empty())
+            );
+            assert!(matches!(
+                error.terminal(),
+                Error::RetryBudgetExhausted { .. }
+            ));
+            assert!(net.shared_hold("committed").current().is_some());
+        } else {
+            assert!(matches!(&error, Error::LocalHold { attempts, .. } if attempts.len() == 1));
+        }
         let error = crate::into_account_error_with_throttle_scope(
             error,
             crate::NetErrorContext {
-                operation: AccountOperation::Send,
+                operation,
                 provider: Some(Provider::Gmail),
                 protocol: Protocol::Gmail,
                 scope: None,
@@ -612,10 +621,17 @@ mod tests {
             Some(bifrost_types::ThrottleScope::Account),
         );
         assert!(
-            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(advice) if advice.reason == bifrost_types::ReconcileReason::ThrottledMidFlight),
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(advice) if advice.reason == if status == StatusCode::FORBIDDEN { bifrost_types::ReconcileReason::PartialCompletionSignal } else { bifrost_types::ReconcileReason::ThrottledMidFlight }),
             "must reconcile the original mutation: {:?}",
             error.recovery()
         );
+        if status == StatusCode::FORBIDDEN {
+            assert!(
+                matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(advice) if advice.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget, bifrost_types::ReconcileAction::DedupeByClientId]),
+                "{:?}",
+                error.recovery()
+            );
+        }
         assert!(
             matches!(error.chain().iter().find(|cause| matches!(cause, Cause::Attempt(_))), Some(Cause::Attempt(attempt)) if attempt.transmission_state == TransmissionState::InFlight)
         );
@@ -624,15 +640,20 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn review_r1_post_303_then_hold_reconciles() {
-        review_r1_committed_attempt(StatusCode::SEE_OTHER).await;
+        review_r1_committed_attempt(StatusCode::SEE_OTHER, AccountOperation::Send).await;
     }
     #[tokio::test(start_paused = true)]
     async fn review_r1_post_307_then_hold_reconciles() {
-        review_r1_committed_attempt(StatusCode::TEMPORARY_REDIRECT).await;
+        review_r1_committed_attempt(StatusCode::TEMPORARY_REDIRECT, AccountOperation::Send).await;
     }
     #[tokio::test(start_paused = true)]
-    async fn review_r1_post_retry_then_hold_reconciles() {
-        review_r1_committed_attempt(StatusCode::FORBIDDEN).await;
+    async fn review_r1_nonreplayable_post_stops_before_a_retry_hold() {
+        review_r1_committed_attempt(StatusCode::FORBIDDEN, AccountOperation::Send).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hold_after_a_possible_commit_reconciles_under_an_idempotent_operation() {
+        review_r1_committed_attempt(StatusCode::SEE_OTHER, AccountOperation::SetIsRead).await;
     }
 
     async fn review_r1_streaming(status: StatusCode, disable_redirects: bool) {

@@ -884,7 +884,10 @@ async fn directory_review_redirected_writes_check_every_source_and_rebased_desti
                     .map(|_| ()),
             }
             .expect_err("refuse before the gateway hop");
-            let unreplayable = matches!(door, "create-put" | "move-source" | "move-destination");
+            let unreplayable = matches!(
+                door,
+                "create-put" | "update-put" | "move-source" | "move-destination"
+            );
             if unreplayable {
                 assert!(
                     matches!(
@@ -1196,7 +1199,8 @@ async fn directory_round_two_late_markers_reach_the_redirect_guard() {
                 .map(|_| ()),
         };
         let error = result.expect_err("later marker is shared with every redirect guard");
-        if door.starts_with("move") {
+        // "put" is an If-Match update: conditional, so unreplayable like MOVE.
+        if door.starts_with("move") || door == "put" {
             assert!(matches!(
                 error.kind(),
                 AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::PartialResponse)

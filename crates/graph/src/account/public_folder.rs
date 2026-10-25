@@ -1797,9 +1797,13 @@ mod tests {
         let ews = ews_client(&account).expect("metered account has an EWS client");
 
         assert_eq!(
-            ews.execute("<m:GetFolder/>", &crate::ews::EwsHeaders::default())
-                .await
-                .expect("scripted EWS response"),
+            ews.execute(
+                "<m:GetFolder/>",
+                &crate::ews::EwsHeaders::default(),
+                bifrost_net::ReplayPolicy::Idempotent
+            )
+            .await
+            .expect("scripted EWS response"),
             response
         );
         assert_eq!(tally.take(), u64::try_from(response.len()).unwrap());
@@ -1847,7 +1851,11 @@ mod tests {
         let ews = ews_client(&account).expect("metered account has an EWS client");
 
         let result = ews
-            .execute("<m:GetItem/>", &crate::ews::EwsHeaders::default())
+            .execute(
+                "<m:GetItem/>",
+                &crate::ews::EwsHeaders::default(),
+                bifrost_net::ReplayPolicy::Idempotent,
+            )
             .await;
         assert!(result.is_err(), "a 403 must surface as an EWS error");
         assert_eq!(

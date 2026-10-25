@@ -18,6 +18,7 @@ pub(crate) struct SieveScriptValidateResponse {
 }
 
 impl crate::core::method::JmapMethod for SieveScriptValidateRequest {
+    const REPLAY_SAFE: bool = true;
     const NAME: &'static str = "SieveScript/validate";
     type Cap = crate::core::capability::Sieve;
     type Response = SieveScriptValidateResponse;

@@ -878,7 +878,12 @@ mod session_state_tests {
     }
 
     impl HttpTransport for RefreshingTransport {
-        async fn api_request(&self, url: &str, _body: Vec<u8>) -> Result<Bytes, TransportError> {
+        async fn api_request(
+            &self,
+            url: &str,
+            _body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
+        ) -> Result<Bytes, TransportError> {
             self.api_urls
                 .lock()
                 .expect("api url lock")
@@ -910,7 +915,12 @@ mod session_state_tests {
     }
 
     impl HttpTransport for RequestSnapshotTransport {
-        async fn api_request(&self, url: &str, body: Vec<u8>) -> Result<Bytes, TransportError> {
+        async fn api_request(
+            &self,
+            url: &str,
+            body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
+        ) -> Result<Bytes, TransportError> {
             let request = serde_json::from_slice(&body).expect("request body is JSON");
             self.requests
                 .lock()
@@ -946,7 +956,12 @@ mod session_state_tests {
     }
 
     impl HttpTransport for GatedRefreshTransport {
-        async fn api_request(&self, _url: &str, _body: Vec<u8>) -> Result<Bytes, TransportError> {
+        async fn api_request(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
+        ) -> Result<Bytes, TransportError> {
             Err(TransportError::new(
                 "refresh test does not send API requests",
             ))
@@ -1111,7 +1126,12 @@ mod session_state_tests {
     }
 
     impl HttpTransport for LimitRecordingTransport {
-        async fn api_request(&self, _url: &str, _body: Vec<u8>) -> Result<Bytes, TransportError> {
+        async fn api_request(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
+        ) -> Result<Bytes, TransportError> {
             Err(TransportError::new("stub transport returns no response"))
         }
 
@@ -1310,7 +1330,12 @@ mod session_state_tests {
     }
 
     impl HttpTransport for DiscoveryTransport {
-        async fn api_request(&self, _: &str, _: Vec<u8>) -> Result<Bytes, TransportError> {
+        async fn api_request(
+            &self,
+            _: &str,
+            _: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
+        ) -> Result<Bytes, TransportError> {
             unreachable!("session discovery does not make API requests")
         }
 
@@ -1499,7 +1524,11 @@ impl<T: HttpTransport> Client<T> {
         let (bytes, bytes_in) = self
             .inner
             .transport
-            .api_request_measured(request.session_state().api_url(), body)
+            .api_request_measured(
+                request.session_state().api_url(),
+                body,
+                request.replay_policy(),
+            )
             .await
             .map_err(crate::Error::from)?;
         self.record_bytes_in(bytes_in);

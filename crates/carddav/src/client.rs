@@ -598,7 +598,10 @@ impl CardDavClient {
         url: &str,
         operation: AccountOperation,
     ) -> Result<CardDavFetchedVCard, AccountError> {
-        let request = self.dav.request(Method::GET, url);
+        let request = self
+            .dav
+            .request(Method::GET, url)
+            .replay(bifrost_net::ReplayPolicy::Idempotent);
         let response = self.dav.send_raw_request(request, operation).await?;
         let status = response.status;
         let etag = response
@@ -633,13 +636,24 @@ impl CardDavClient {
         let mut request = self
             .dav
             .request(Method::PUT, url)
+            .replay(bifrost_net::ReplayPolicy::IdempotentUnlessConditional)
             .header(CONTENT_TYPE, "text/vcard; charset=utf-8")
             .body(body);
+        // A create-PUT replayed after its first attempt committed answers 412,
+        // which reads as a conflict and invites re-creating the card under a
+        // new UUID, so it is `Never`. An `If-Match` update replayed the same way
+        // answers 412 against the caller's own write; the
+        // `IdempotentUnlessConditional` declaration makes it unreplayable
+        // through its precondition, so a drop reconciles (read-back) even when
+        // the validator was fetched by the account itself. An unconditional
+        // PUT is an absolute write to a known URL and stays replayable.
+        // Unlike `bifrost-caldav`'s `put_event`, no scheduling side effect
+        // applies to a vCard.
         match condition {
-            // Twin of `bifrost-caldav`'s `put_vcard` conditional; see there for
-            // why a create-PUT must not be replayed after a mid-flight drop.
             PutCondition::IfNoneMatch => {
-                request = request.header("If-None-Match", "*").idempotent(false);
+                request = request
+                    .header("If-None-Match", "*")
+                    .replay(bifrost_net::ReplayPolicy::Never);
             }
             PutCondition::IfMatch(etag) => {
                 if let Some(etag) = prepare_if_match(etag) {
@@ -681,6 +695,7 @@ impl CardDavClient {
         let request = self
             .dav
             .request(Method::DELETE, url)
+            .replay(bifrost_net::ReplayPolicy::Never)
             .header("If-Match", etag);
         self.dav.send_status_request(request, operation).await
     }
@@ -697,7 +712,10 @@ impl CardDavClient {
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
         self.refuse_directory_access(url, operation)?;
-        let request = self.dav.request(Method::DELETE, url);
+        let request = self
+            .dav
+            .request(Method::DELETE, url)
+            .replay(bifrost_net::ReplayPolicy::IdempotentUnlessConditional);
         let response = self.dav.send_raw_request(request, operation).await?;
         if bifrost_dav_core::delete_target_already_gone(response.status) {
             return Ok(None);
@@ -1319,12 +1337,13 @@ mod tests {
 
     /// A create-PUT must not be replayed after a mid-flight drop.
     ///
-    /// `bifrost-net` derives replay safety from the METHOD, and HTTP calls PUT
-    /// idempotent. That is true of an absolute-state write to a known URL and
-    /// false of a create. A replayed create whose first attempt committed
-    /// answers 412 -> `ConcurrencyConflict` -> `Retry(AfterStateRefresh)`, and
-    /// the consumer re-creates the contact under a fresh UUID, leaving two
-    /// copies.
+    /// HTTP calls PUT idempotent. That is true of an absolute-state write to a
+    /// known URL and false of a create, which is why the create-PUT is declared
+    /// `ReplayPolicy::Never` (net's PUT default also refuses replay once
+    /// `If-None-Match` is present). A replayed create whose first attempt
+    /// committed answers 412 -> `ConcurrencyConflict` ->
+    /// `Retry(AfterStateRefresh)`, and the consumer re-creates the contact
+    /// under a fresh UUID, leaving two copies.
     ///
     /// One drop is scripted, so a request that IS replayed exhausts the script
     /// and panics rather than passing quietly.
@@ -1497,14 +1516,63 @@ mod tests {
         );
     }
 
-    /// The `If-Match` update PUT stays replayable.
-    ///
-    /// It addresses a known URL with absolute state, and a replay landing after
-    /// the first attempt committed answers 412 - refresh-and-retry, which is
-    /// already the right handling. Losing that resilience is the cost the
-    /// no-replay fix above must NOT impose on the update lane.
+    /// Versioned mutations read back after ambiguity rather than replaying.
     #[tokio::test]
-    async fn an_if_match_update_put_still_replays_after_a_mid_flight_drop() {
+    async fn a_versioned_delete_reconciles_after_a_mid_flight_drop() {
+        let script = dav_script([
+            dav_dropped_after_send(),
+            DavResponse {
+                status: StatusCode::NO_CONTENT,
+                headers: HeaderMap::new(),
+                body: String::new(),
+                url: String::new(),
+            }
+            .into(),
+        ]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let error = client
+            .delete_vcard_if_match(
+                "https://dav.example.test/book/one.vcf",
+                "v1",
+                AccountOperation::ContactDelete,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(transcripts(&script).len(), 1);
+        assert!(
+            matches!(error.recovery(), RecoveryClass::Reconcile(a) if a.guidance.actions.contains(&ReconcileAction::CheckTarget))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unconditional_vcard_put_replays_after_a_mid_flight_drop() {
+        let script = dav_script([
+            dav_dropped_after_send(),
+            DavResponse {
+                status: StatusCode::NO_CONTENT,
+                headers: HeaderMap::new(),
+                body: String::new(),
+                url: String::new(),
+            }
+            .into(),
+        ]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let result = client
+            .put_vcard(
+                "https://dav.example.test/book/one.vcf",
+                String::new(),
+                PutCondition::None,
+                AccountOperation::ContactUpdate,
+            )
+            .await;
+        assert_eq!(transcripts(&script).len(), 2);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_if_match_update_put_reconciles_after_a_mid_flight_drop() {
         let mut headers = HeaderMap::new();
         headers.insert(ETAG, HeaderValue::from_static("\"v2\""));
         let script = dav_script([
@@ -1519,7 +1587,7 @@ mod tests {
         let client =
             CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
-        let etag = client
+        let error = client
             .put_vcard(
                 "https://dav.example.test/book/one.vcf",
                 "BEGIN:VCARD\r\nEND:VCARD\r\n".to_string(),
@@ -1527,10 +1595,16 @@ mod tests {
                 AccountOperation::ContactUpdate,
             )
             .await
-            .expect("the replay succeeds");
+            .expect_err("conditional write must reconcile");
 
-        assert_eq!(transcripts(&script).len(), 2, "the update PUT must replay");
-        assert_eq!(etag.as_deref(), Some("v2"));
+        assert_eq!(
+            transcripts(&script).len(),
+            1,
+            "the conditional PUT must not replay"
+        );
+        assert!(
+            matches!(error.recovery(), RecoveryClass::Reconcile(a) if a.guidance.actions == [ReconcileAction::CheckTarget])
+        );
     }
 
     #[tokio::test]

@@ -4,11 +4,12 @@ Generic net translation receives the context throttle scope, falling back to
 account scope, just like the provider status ladder. Response excerpts use
 net's shared byte cap and truncation marker.
 
-The shared HTTP funnel does not receive `AccountOperation`. Net uses its
-method default, conservatively refusing in-flight replay of PATCH and POST.
-Logical error recovery can still permit retry of an idempotent update. A
-verb-to-operation mapping cannot supply request safety: the funnel serves
-Gmail, People and Calendar, including action POSTs and compound operations.
+Every request declares its `ReplayPolicy`; the table lives at the call sites.
+Label modify and absolute replacements use Idempotent. People updateContact
+uses Never for its body etag; Calendar updates and RSVPs use Never for scheduling
+side effects. Unabsorbed DELETEs are Never. Non-replayable requests stop at the
+first ambiguous retryable status or in-flight drop; 401/429 refusals keep their
+existing retries.
 
 Current architecture of the Google Account-layer code under
 `crates/google/src/account/`. Public surface is
@@ -1207,7 +1208,13 @@ There is no renewer handle for another task to clear or restart. Its renewal arm
 - On failure, the actor classifies through
   `error::into_account_error(_, GmailErrorContext::push_subscribe())`. The
   context scopes the error to `CursorScope::Account` because the watch covers
-  that cursor. The actor retries locally only for `RecoveryClass::Retry`. Every other class,
+  that cursor. The actor retries locally only for `RecoveryClass::Retry`, plus
+  one exception: a retry-candidate status (5xx or a policy-listed status) that
+  net declined to replay because `/watch` is declared `ReplayPolicy::Never`.
+  That error classifies as `Reconcile`, but the damped re-watch is its
+  reconciliation (`users.watch` replaces whatever watch the mailbox has, and
+  the old watch stays live until expiry), so it takes the retry path
+  (`renewal_status_stopped_by_replay_policy`). Every other class,
   including engine directives and reconciliation, emits
   `WatchEvent::Terminated(AccountError)` and returns to `Unwatched`, so a later
   subscribe command starts a fresh watch and renewal schedule. Retry classes

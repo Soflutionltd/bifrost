@@ -6,6 +6,14 @@ use super::id::AccountId;
 /// A self-describing JMAP method call.
 pub(crate) trait JmapMethod: Serialize + Send {
     const NAME: &'static str;
+    /// Whether the transport may replay a batch made only of calls like this
+    /// one: `true` exactly for reads. Every write is `false`, including an
+    /// update-only `*/set` without `ifInState`: updates can carry side
+    /// effects (`EmailSubmission/set` success actions, one-way `undoStatus`,
+    /// `CalendarEvent/set` scheduling messages), and individually safe
+    /// patches do not compose within one batch. No default, so every
+    /// implementation states it.
+    const REPLAY_SAFE: bool;
     type Cap: Capability;
     type Response: DeserializeOwned + Send;
 
@@ -23,6 +31,7 @@ macro_rules! define_get_method {
 
         impl $crate::core::method::JmapMethod for $name {
             const NAME: &'static str = $method_name;
+            const REPLAY_SAFE: bool = true;
             type Cap = $cap;
             type Response = $crate::core::get::GetResponse<$obj>;
 
@@ -108,6 +117,7 @@ macro_rules! define_set_method {
 
         impl $crate::core::method::JmapMethod for $name {
             const NAME: &'static str = $method_name;
+            const REPLAY_SAFE: bool = false;
             type Cap = $cap;
             type Response = $crate::core::set::SetResponse<$obj>;
 
@@ -181,6 +191,7 @@ macro_rules! define_changes_method {
 
         impl $crate::core::method::JmapMethod for $name {
             const NAME: &'static str = $method_name;
+            const REPLAY_SAFE: bool = true;
             type Cap = $cap;
             type Response = $crate::core::changes::ChangesResponse<$obj>;
 
@@ -235,6 +246,7 @@ macro_rules! define_query_method {
 
         impl $crate::core::method::JmapMethod for $name {
             const NAME: &'static str = $method_name;
+            const REPLAY_SAFE: bool = true;
             type Cap = $cap;
             type Response = $crate::core::query::QueryResponse<$obj>;
 
@@ -337,6 +349,7 @@ macro_rules! define_query_changes_method {
 
         impl $crate::core::method::JmapMethod for $name {
             const NAME: &'static str = $method_name;
+            const REPLAY_SAFE: bool = true;
             type Cap = $cap;
             type Response = $crate::core::query_changes::QueryChangesResponse<$obj>;
 
@@ -428,6 +441,7 @@ macro_rules! define_copy_method {
 
         impl $crate::core::method::JmapMethod for $name {
             const NAME: &'static str = $method_name;
+            const REPLAY_SAFE: bool = false;
             type Cap = $cap;
             type Response = $crate::core::copy::CopyResponse<$obj>;
 
@@ -571,6 +585,7 @@ macro_rules! define_parse_method {
 
         impl $crate::core::method::JmapMethod for $name {
             const NAME: &'static str = $method_name;
+            const REPLAY_SAFE: bool = true;
             type Cap = $cap;
             type Response = $response;
 

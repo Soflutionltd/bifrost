@@ -515,7 +515,12 @@ mod tests {
     }
 
     impl HttpTransport for HydrationTransport {
-        async fn api_request(&self, _url: &str, body: Vec<u8>) -> Result<Bytes, TransportError> {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
+        ) -> Result<Bytes, TransportError> {
             let request: Value = serde_json::from_slice(&body)
                 .map_err(|error| TransportError::with_source("request is not JSON", error))?;
             self.requests

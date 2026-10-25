@@ -631,12 +631,15 @@ async fn watch_actor(
                         }
                     }
                     Err(err) => {
+                        let damp = renewal_status_stopped_by_replay_policy(&err);
                         let account_error = error::into_account_error(
                             err, error::GmailErrorContext::push_subscribe(),
                         );
                         // Only Retry belongs to this reconnect loop. Engine and Reconcile
-                        // must reach the sync reconciler through Terminated too.
-                        if !account_error.recovery().is_retryable() {
+                        // must reach the sync reconciler through Terminated too, with
+                        // one exception: a retry-candidate status that net refused to
+                        // replay (see `renewal_status_stopped_by_replay_policy`).
+                        if !account_error.recovery().is_retryable() && !damp {
                             // Publish the latch before waking receivers. It survives ring
                             // overflow and subscriptions made after this actor retires.
                             *terminal.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -898,11 +901,43 @@ async fn watch_once(
     if !config.label_ids.is_empty() {
         body["labelIds"] = json!(config.label_ids);
     }
-    client.post("/watch", &body).await
+    client
+        .post("/watch", &body, bifrost_net::ReplayPolicy::Never)
+        .await
+}
+
+/// Whether a renewal `users.watch` failed on a retry-candidate status (a
+/// 5xx, or a status listed in the retry policy) that net stopped retrying,
+/// rather than on a definite refusal or a transport drop.
+///
+/// `watch_once` declares `/watch` `ReplayPolicy::Never`, so net does not
+/// replay such a status and reports it as an ambiguity envelope
+/// (`AttemptHistory` with `may_have_committed`) that classifies as
+/// `Reconcile` under `PushSubscribe`. For a renewal that advice is already
+/// satisfied by the renewer's own damped retry: `users.watch` replaces
+/// whatever watch the mailbox has, so re-calling it five minutes later
+/// converges whether or not the failed call committed, and the previous
+/// watch stays live meanwhile because renewal fires a day before expiry.
+/// Terminating instead would end the push lane on one gateway 503, which a
+/// bare budget-exhausted status (classified `Retry`) never did. Only the
+/// renewer reads this; the first `users.watch` in `actor_subscribe` returns
+/// its `Reconcile` to the caller unchanged.
+fn renewal_status_stopped_by_replay_policy(error: &crate::Error) -> bool {
+    let net = match error {
+        crate::Error::Net(net) => net,
+        crate::Error::ObservedNet(observed) => &observed.error,
+        _ => return false,
+    };
+    matches!(
+        net.terminal(),
+        bifrost_net::Error::RetryBudgetExhausted { .. }
+    )
 }
 
 async fn stop_watch(client: &GmailClient) -> crate::Result<()> {
-    client.post_no_content("/stop", &json!({})).await
+    client
+        .post_no_content("/stop", &json!({}), bifrost_net::ReplayPolicy::Never)
+        .await
 }
 
 fn parse_expiration(value: &str) -> Option<SystemTime> {
@@ -1601,7 +1636,10 @@ mod tests {
                 headers: reqwest::header::HeaderMap::new(),
                 body: Bytes::from_static(br#"{"historyId":"1"}"#),
             },
-            // First renewal: transient failure, arming the damper.
+            // First renewal: transient failure, arming the damper. A 503 on
+            // the `Never` `/watch` arrives as a non-replayed ambiguity
+            // envelope classified `Reconcile`; the renewer must still damp
+            // it rather than terminate.
             canned(StatusCode::SERVICE_UNAVAILABLE),
             // The damped retry, five minutes later.
             Canned::Response {
@@ -1643,6 +1681,36 @@ mod tests {
         );
     }
 
+    /// The renewer's damping exception covers exactly the status net declined
+    /// to replay. The 503 must classify as non-retryable on its own (or the
+    /// renewer tests above would pass without the exception), and a definite
+    /// refusal must stay outside it.
+    #[tokio::test]
+    async fn only_a_non_replayed_retry_candidate_status_is_damped() {
+        let config = PubSubConfig::new("projects/p/topics/t");
+        let (client, _script) = scripted_client([
+            canned(StatusCode::SERVICE_UNAVAILABLE),
+            canned(StatusCode::BAD_REQUEST),
+        ]);
+
+        let unavailable = watch_once(&client, &config)
+            .await
+            .expect_err("a 503 fails the watch");
+        assert!(renewal_status_stopped_by_replay_policy(&unavailable));
+        let classified =
+            error::into_account_error(unavailable, error::GmailErrorContext::push_subscribe());
+        assert!(
+            classified.recovery().requires_reconciliation(),
+            "a non-replayed 503 on `/watch` reconciles, so only the exception keeps it local: {:?}",
+            classified.recovery(),
+        );
+
+        let refused = watch_once(&client, &config)
+            .await
+            .expect_err("a 400 fails the watch");
+        assert!(!renewal_status_stopped_by_replay_policy(&refused));
+    }
+
     /// Two health-lane properties that used to be wrong in opposite
     /// directions.
     ///
@@ -1665,8 +1733,10 @@ mod tests {
                 headers: reqwest::header::HeaderMap::new(),
                 body: Bytes::from_static(br#"{"historyId":"1"}"#),
             },
+            // One 503 (a non-replayed `Reconcile` the renewer damps) and one
+            // 429 (a refusal classified `Retry`): both shapes count.
             canned(StatusCode::SERVICE_UNAVAILABLE),
-            canned(StatusCode::SERVICE_UNAVAILABLE),
+            canned(StatusCode::TOO_MANY_REQUESTS),
         ]);
         let shutdown = CancellationToken::new();
         let pubsub = Arc::new(PubSubControl::new(

@@ -21,29 +21,6 @@ filed in that provider's document. What remains here spans crates or roots in a
 shared crate. Entries needing a specification or set aside as low value are in
 `notes/bugs-deferred.md`.
 
-## SHARED-007 - Replay safety needs request-level operation context
-
-**Needs a technical implementation specification** (owner, 2026-10-21).
-Direction agreed: every request declares its replay policy on net's request
-builder (`Idempotent`, `Never`, `IdempotentUnlessConditional`), set by each
-provider funnel where the operation and leg are known; the HTTP-method rule
-becomes only the default; conditional requests (`If-Match`, `ifInState`) are not
-auto-replayed, and an ambiguous loss surfaces as `Reconcile` for read-back.
-
-The two idempotency authorities (the
-`AccountOperation` rule that `derive` consults and the HTTP-method rule that net
-replay and dav-core `wire_outcome` use) were checked and the universal
-replacement was refused: the DAV overrides are needed because `EventUpdate` and
-`ContactUpdate` also cover MOVE, the create-PUT fallback and partly completed
-sequences; Graph and Google wire funnels carry no operation context; and a JMAP
-POST can be a mixed batch. Reasoning is at the code sites and in the references.
-Removing the second authority needs request-level context handed to net per
-request (operation, plus whether this request is a replayable leg). Related
-lateral: replaying a DAV conditional `If-Match` PUT whose first response was lost
-can turn a committed write into a 412 conflict. Caller-versioned deletes now
-share the shape: a versioned DAV delete retried after a dropped response sees
-404 or 412 where the unversioned delete reports success.
-
 ## SHARED-019 - A proxy 407 maps to `AuthLost`, implying the wrong remedy
 
 Residue: JMAP now classifies net's typed `TunnelError` (407 ->

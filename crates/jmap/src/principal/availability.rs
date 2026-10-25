@@ -54,6 +54,7 @@ pub(crate) struct AvailabilityEntry {
 }
 
 impl crate::core::method::JmapMethod for PrincipalGetAvailabilityRequest {
+    const REPLAY_SAFE: bool = true;
     const NAME: &'static str = "Principal/getAvailability";
     type Cap = crate::core::capability::Principals;
     type Response = PrincipalGetAvailabilityResponse;

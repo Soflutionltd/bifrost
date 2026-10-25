@@ -105,6 +105,9 @@ pub enum Error {
     /// A later stage failed after earlier wire attempts. The terminal error
     /// describes that stage; earlier outcomes remain ordered and must be
     /// considered before deciding whether the logical operation is replayable.
+    /// `may_have_committed` is also set when a request that was not replayable
+    /// ended in a transport failure past `Unsent` or a retryable status that
+    /// may follow a commit; `attempts` may then be empty.
     #[error("logical request failed after earlier attempts: {source}")]
     AttemptHistory {
         #[source]
@@ -147,10 +150,8 @@ pub enum Error {
         transmission_state: TransmissionState,
     },
 
-    /// Server returned a non-success status code outside the retry
-    /// set, or returned a status code inside the set but the retry
-    /// budget was exhausted before the call escalated to
-    /// `RetryBudgetExhausted`.
+    /// Terminal status outside the retry-candidate set. A selected status stopped
+    /// by budget or replay policy uses RetryBudgetExhausted (429 uses RateLimited).
     #[error("HTTP {code}")]
     Status {
         /// HTTP status code.
@@ -170,10 +171,9 @@ pub enum Error {
         response: FinalResponse,
     },
 
-    /// Retry budget exhausted. The final response is preserved when
-    /// one was received so protocol crates keep status, headers, and
-    /// capped body evidence after the retry loop gives up.
-    #[error("retry budget exhausted")]
+    /// Retrying stopped because the attempt budget was spent or the request's
+    /// replay policy forbids another attempt. The final response is preserved.
+    #[error("request retries stopped by attempt budget or replay policy")]
     RetryBudgetExhausted {
         /// Preserved final response when one was received.
         final_response: Option<FinalResponse>,

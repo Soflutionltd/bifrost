@@ -628,7 +628,7 @@ async fn apply_batch_with_version<T: HttpTransport>(
                 response.updated(&email_id).map(|_| ())
             }
         };
-        results.push(classify_set_response(raw, id, operation));
+        results.push(classify_set_response(raw, id, operation, guarded));
     }
 
     Ok(Some(Batch {
@@ -647,6 +647,7 @@ fn classify_set_response(
     raw: crate::Result<()>,
     id: ObjectId,
     operation: AccountOperation,
+    guarded: bool,
 ) -> ItemOutcome<MutationSuccess> {
     match raw {
         Ok(()) => ItemOutcome::Succeeded(BatchSuccess::new(
@@ -667,6 +668,7 @@ fn classify_set_response(
                 super::error::JmapErrorContext::new(operation).with_scope(ErrorScope::Message {
                     id: (id.0.clone()).into(),
                 }),
+                guarded,
             ),
         )),
         Err(err) => ItemOutcome::Failed(BatchFailure::new(
@@ -912,6 +914,7 @@ mod tests {
             &self,
             _url: &str,
             body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
         ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
             let request: serde_json::Value =
                 serde_json::from_slice(&body).expect("request is JSON");
@@ -968,6 +971,7 @@ mod tests {
             &self,
             _url: &str,
             body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
         ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
             let request: serde_json::Value =
                 serde_json::from_slice(&body).expect("request is JSON");
@@ -1111,6 +1115,7 @@ mod tests {
             &self,
             _url: &str,
             body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
         ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
             let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
             self.requests.lock().unwrap().push(request.clone());
@@ -1716,6 +1721,7 @@ mod tests {
             Err(crate::Error::IdNotFound("m1".to_string())),
             ObjectId("m1".to_string()),
             AccountOperation::BulkDestroy,
+            false,
         );
 
         let ItemOutcome::Failed(failure) = outcome else {
@@ -1731,5 +1737,98 @@ mod tests {
             failure.error.telemetry_fields().transmission_state,
             Some(bifrost_types::TransmissionState::Acknowledged)
         );
+    }
+    fn replay_transport(
+        replies: Vec<bifrost_net::test_support::Canned>,
+    ) -> (
+        crate::transport_reqwest::ReqwestTransport,
+        Arc<bifrost_net::test_support::ScriptedDispatch>,
+    ) {
+        let script = bifrost_net::test_support::ScriptedDispatch::new(replies);
+        let mut policy = bifrost_net::RetryPolicy::default();
+        policy.max_attempts = 2;
+        policy.initial_backoff = std::time::Duration::ZERO;
+        policy.max_backoff = std::time::Duration::ZERO;
+        (
+            crate::transport_reqwest::ReqwestTransport::scripted_with_retry(&script, policy),
+            script,
+        )
+    }
+    #[tokio::test]
+    async fn a_503_before_state_mismatch_reconciles_without_replay() {
+        use bifrost_net::test_support::canned;
+        for ambiguous in [true, false] {
+            let mut replies = Vec::new();
+            if ambiguous {
+                replies.push(canned(
+                    reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    b"ambiguous",
+                ));
+            }
+            replies.push(canned(reqwest::StatusCode::OK, br#"{"sessionState":"session-1","methodResponses":[["error",{"type":"stateMismatch"},"s0"]]}"#));
+            let (transport, script) = replay_transport(replies);
+            let (mail, _) = mutation_accounts(transport);
+            let states = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let result = apply_batch_with_version(
+                &mail,
+                &states,
+                "primary",
+                false,
+                &MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
+                &mut vec![ObjectId("m1".into())],
+                Some("caller-old"),
+            )
+            .await;
+            if ambiguous {
+                let error = super::super::error::into_account_error(
+                    result.err().unwrap(),
+                    super::super::error::JmapErrorContext::new(AccountOperation::UpdateFlags),
+                );
+                assert_eq!(
+                    error.kind(),
+                    &AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::PartialResponse)
+                );
+                assert!(
+                    matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget])
+                );
+                assert_eq!(script.remaining(), 1);
+            } else {
+                let batch = result.unwrap().unwrap();
+                assert!(
+                    matches!(&batch.items[0], ItemOutcome::Failed(f) if f.error.kind() == &AccountErrorKind::ConcurrencyConflict)
+                );
+            }
+            assert_eq!(script.requests().len(), 1);
+            let requests = script.requests();
+            let body: serde_json::Value =
+                serde_json::from_slice(requests[0].body.as_ref().unwrap()).unwrap();
+            assert_eq!(body["methodCalls"][0][0], "Email/set");
+            assert_eq!(body["methodCalls"][0][1]["ifInState"], "caller-old");
+        }
+    }
+    #[tokio::test]
+    async fn a_guarded_flag_write_with_an_omitted_id_reconciles() {
+        let (transport, script) = replay_transport(vec![bifrost_net::test_support::canned(reqwest::StatusCode::OK, br#"{"sessionState":"session-1","methodResponses":[["Email/set",{"accountId":"primary","oldState":"caller-old","newState":"new"},"s0"]]}"#)]);
+        let (mail, _) = mutation_accounts(transport);
+        let states = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let batch = apply_batch_with_version(
+            &mail,
+            &states,
+            "primary",
+            false,
+            &MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
+            &mut vec![ObjectId("m1".into())],
+            Some("caller-old"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(&batch.items[0], ItemOutcome::Failed(f) if matches!(f.error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget]))
+        );
+        let requests = script.requests();
+        let body: serde_json::Value =
+            serde_json::from_slice(requests[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(body["methodCalls"][0][1]["ifInState"], "caller-old");
     }
 }

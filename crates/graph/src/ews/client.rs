@@ -5,10 +5,15 @@ use super::{
 use futures::TryStreamExt;
 
 impl EwsExecute for EwsClient {
-    async fn execute(&self, body_xml: &str, headers: &EwsHeaders) -> Result<String, EwsError> {
+    async fn execute(
+        &self,
+        body_xml: &str,
+        headers: &EwsHeaders,
+        replay: bifrost_net::ReplayPolicy,
+    ) -> Result<String, EwsError> {
         // Inherent methods outrank trait methods in resolution, so this
         // delegates rather than recursing.
-        EwsClient::execute(self, body_xml, headers).await
+        EwsClient::execute(self, body_xml, headers, replay).await
     }
 
     async fn execute_streaming(
@@ -19,10 +24,24 @@ impl EwsExecute for EwsClient {
         // EWS throttling is per calling user under its own policy; streaming
         // notifications have a separate subscription budget. The REST
         // per-mailbox four does not apply, so this path stays ungated.
+        //
+        // `Idempotent` because `GetStreamingEvents` is a read and `PushStream`
+        // is idempotent in the operation table; `Never` would newly narrow a
+        // drop to `Reconcile`. Network retries are off so the declaration does
+        // not widen wire behavior: a pre-header drop of the stream must reach
+        // `ews_stream.rs`'s own reconnect, backoff and health accounting rather
+        // than be replayed inside net, which could double the hang on a dead
+        // path. (This also hands an `Unsent` connect failure to that reconnect
+        // loop instead of net's retry; the loop already handles it.) Status
+        // retries are unchanged.
+        let mut policy = self.net.default_retry().clone();
+        policy.network_errors = false;
         let envelope = build_soap_envelope(body_xml);
         let mut req = self
             .net
             .post(self.endpoint()?)
+            .replay(bifrost_net::ReplayPolicy::Idempotent)
+            .retry(policy)
             .header("Content-Type", "text/xml; charset=utf-8");
         for (name, value) in headers.pairs() {
             req = req.header(name, &value);
@@ -83,9 +102,10 @@ impl EwsClient {
         &self,
         body_xml: &str,
         headers: &EwsHeaders,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<String, EwsError> {
         let xml = self
-            .execute_envelope(build_soap_envelope(body_xml), headers)
+            .execute_envelope(build_soap_envelope(body_xml), headers, replay)
             .await?;
         check_response_error(&xml)?;
         Ok(xml)
@@ -100,7 +120,11 @@ impl EwsClient {
     ) -> Result<Vec<Result<super::contacts::Node, EwsError>>, EwsError> {
         let body = super::calendar::get_many_body(ids);
         let xml = self
-            .execute_envelope(super::xml_helpers::get_items_envelope(&body), headers)
+            .execute_envelope(
+                super::xml_helpers::get_items_envelope(&body),
+                headers,
+                bifrost_net::ReplayPolicy::Idempotent,
+            )
             .await?;
         super::calendar::parse_get_items(&xml, ids.len())
     }
@@ -109,10 +133,12 @@ impl EwsClient {
         &self,
         envelope: String,
         headers: &EwsHeaders,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<String, EwsError> {
         let mut req = self
             .net
             .post(self.endpoint()?)
+            .replay(replay)
             .header("Content-Type", "text/xml; charset=utf-8");
         for (name, value) in headers.pairs() {
             req = req.header(name, &value);

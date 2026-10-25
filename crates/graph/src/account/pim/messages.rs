@@ -620,12 +620,25 @@ async fn submit_write_batch_resource(
     // from a `HashSet` made the message an operator saw for a reproducible
     // failure differ between runs. Submission order is the only stable
     // choice, and a linear scan over at most 20 ids is free.
+    let replayable: std::collections::HashMap<_, _> = requests
+        .iter()
+        .map(|r| {
+            (
+                r.id.clone(),
+                super::super::graph_error::subrequest_replayable(r),
+            )
+        })
+        .collect();
     let expected_ids: Vec<String> = requests.iter().map(|r| r.id.clone()).collect();
     let mut seen_ids: HashSet<String> = HashSet::new();
     let mut first_error: Option<AccountError> = None;
     let response: BatchResponse = account
         .client
-        .post_batch(resource, &BatchRequest { requests })
+        .post_batch(
+            resource,
+            &BatchRequest { requests },
+            bifrost_net::ReplayPolicy::Never,
+        )
         .await
         .map_err(|e| into_account_error(e, ctx.clone()))?;
     for item in response.responses {
@@ -737,6 +750,7 @@ async fn submit_write_batch_resource(
             format!(
                 "Graph $batch returned no response for request {missing}; the item's fate is unknown"
             ),
+            replayable.get(missing).copied().unwrap_or(false),
         ));
     }
     Ok(())
@@ -797,6 +811,77 @@ mod tests {
         assert!(
             client.take_rest_requests().is_empty(),
             "the refusal must come before the etag GET"
+        );
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use bifrost_net::test_support::canned;
+    use bifrost_types::{AccountErrorKind, ProtocolErrorKind, ReconcileAction, RecoveryClass};
+
+    async fn patch_with_replies(
+        replies: Vec<bifrost_net::test_support::Canned>,
+    ) -> (AccountError, GraphClient) {
+        let client = GraphClient::new("token");
+        let mut policy = bifrost_net::RetryPolicy::default();
+        policy.max_attempts = 2;
+        policy.initial_backoff = std::time::Duration::ZERO;
+        policy.max_backoff = std::time::Duration::ZERO;
+        client.script_wire(replies, policy);
+        let account = GraphAccount::new_for_tests_with_shared(
+            client.clone(),
+            crate::account::PushMode::GraphSubscriptions,
+            &[],
+        );
+        let error = patch_messages(
+            &account,
+            vec![MessagePatch {
+                id: ObjectId("m1".into()),
+                etag: "v1".into(),
+                body: json!({"categories":["blue"]}),
+            }],
+            AccountOperation::SetCategory,
+        )
+        .await
+        .unwrap_err();
+        let requests = client.rest_requests();
+        let body: Value = serde_json::from_slice(requests[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(body["requests"][0]["headers"]["If-Match"], "v1");
+        (error, client)
+    }
+    #[tokio::test]
+    async fn a_503_before_a_batch_412_reconciles_without_replay() {
+        let conflict = || {
+            canned(reqwest::StatusCode::OK, br#"{"responses":[{"id":"0","status":412,"body":{"error":{"code":"ErrorIrresolvableConflict","message":"stale etag"}}}]}"#)
+        };
+        let (error, client) = patch_with_replies(vec![
+            canned(reqwest::StatusCode::SERVICE_UNAVAILABLE, b"ambiguous"),
+            conflict(),
+        ])
+        .await;
+        assert_eq!(client.rest_requests().len(), 1);
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
+        );
+        assert!(
+            matches!(error.recovery(), RecoveryClass::Reconcile(a) if a.guidance.actions == [ReconcileAction::CheckTarget])
+        );
+        let (error, client) = patch_with_replies(vec![conflict()]).await;
+        assert_eq!(client.rest_requests().len(), 1);
+        assert_eq!(error.kind(), &AccountErrorKind::ConcurrencyConflict);
+    }
+    #[tokio::test]
+    async fn a_missing_conditional_subresponse_reconciles() {
+        let (error, _) = patch_with_replies(vec![canned(
+            reqwest::StatusCode::OK,
+            br#"{"responses":[]}"#,
+        )])
+        .await;
+        assert!(
+            matches!(error.recovery(), RecoveryClass::Reconcile(a) if a.guidance.actions == [ReconcileAction::CheckTarget])
         );
     }
 }

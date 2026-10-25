@@ -17,7 +17,7 @@ use reqwest::StatusCode;
 #[non_exhaustive]
 pub struct RetryPolicy {
     /// Maximum number of attempts including the initial one. A value
-    /// of 1 disables retry.
+    /// of 1 disables retry. Replay policy may stop before this upper bound.
     pub max_attempts: u32,
     /// Initial backoff before the second attempt. Subsequent attempts
     /// use decorrelated jitter capped by `max_backoff`.
@@ -28,14 +28,9 @@ pub struct RetryPolicy {
     /// occasionally return absurd values during partial outage; the
     /// cap prevents multi-hour stalls.
     pub honor_retry_after_cap: Duration,
-    /// Additional HTTP status codes the policy retries on, on top of
-    /// the always-on 5xx family. The retry loop treats `statuses` as
-    /// the *additive* set and applies `StatusCode::is_server_error()`
-    /// unconditionally: 5xx responses are retried whether or not the
-    /// caller listed them here, so callers should populate `statuses`
-    /// only with 4xx codes they want retried (typically just 429).
-    /// Listing a 5xx code here is harmless (the membership test
-    /// short-circuits before `is_server_error()`) but redundant.
+    /// Additional retry candidates on top of the 5xx family. The resolved
+    /// request replay policy still gates retries, except for explicit 401 and
+    /// 429 refusals. Listing a status does not make replay safe.
     pub statuses: Vec<StatusCode>,
     /// Whether to retry transport-level failures (connect, reset,
     /// idle timeout, TLS handshake).

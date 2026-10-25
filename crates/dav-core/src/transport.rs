@@ -60,13 +60,10 @@ pub struct DavRequest {
     pub(crate) url: String,
     pub(crate) headers: HeaderMap,
     pub(crate) body: Option<Bytes>,
-    /// Whether replaying this request cannot change server state.
-    ///
-    /// `bifrost-net` derives replay safety from the method and treats every
-    /// extension method as unsafe, which is right for `MOVE` and wrong for
-    /// `PROPFIND` and `REPORT` - both are reads, and refusing to retry them
-    /// after a dropped connection loses resilience for nothing.
-    pub(crate) idempotent: Option<bool>,
+    /// Declared replay policy for this wire leg. `None` uses the method
+    /// default; either way it is resolved against `headers` by
+    /// `bifrost_net::request_is_replayable`, the rule net applies too.
+    pub(crate) replay: Option<bifrost_net::ReplayPolicy>,
     /// The first header this record could not carry, if any.
     ///
     /// `header` is a fluent builder and cannot return a `Result` without
@@ -86,7 +83,7 @@ impl DavRequest {
             url: url.into(),
             headers: HeaderMap::new(),
             body: None,
-            idempotent: None,
+            replay: None,
             invalid_header: None,
         }
     }
@@ -145,11 +142,31 @@ impl DavRequest {
         self
     }
 
-    /// Override the method-derived replay-safety default.
+    /// Declare replay safety for this wire leg.
     #[must_use]
-    pub fn idempotent(mut self, idempotent: bool) -> Self {
-        self.idempotent = Some(idempotent);
+    pub fn replay(mut self, policy: bifrost_net::ReplayPolicy) -> Self {
+        self.replay = Some(policy);
         self
+    }
+
+    /// Compatibility spelling for [`Self::replay`]: `true` declares
+    /// `ReplayPolicy::Idempotent`, `false` declares `ReplayPolicy::Never`.
+    #[must_use]
+    pub fn idempotent(self, idempotent: bool) -> Self {
+        self.replay(if idempotent {
+            bifrost_net::ReplayPolicy::Idempotent
+        } else {
+            bifrost_net::ReplayPolicy::Never
+        })
+    }
+
+    /// Whether this request may be replayed, by the one rule net's retry loop
+    /// also applies (`bifrost_net::request_is_replayable`). Net sees these
+    /// headers plus the minted `Authorization`, which is not a precondition,
+    /// so both sides resolve identically.
+    #[must_use]
+    pub fn replayable(&self) -> bool {
+        bifrost_net::request_is_replayable(self.replay, &self.method, &self.headers)
     }
 
     #[must_use]
@@ -263,5 +280,35 @@ mod tests {
         assert_eq!(replayed.body, request.body);
         assert_eq!(replayed.headers, request.headers);
         assert_eq!(replayed.method, Method::PUT);
+    }
+    #[test]
+    fn dav_requests_resolve_replay_through_the_net_rule() {
+        use bifrost_net::ReplayPolicy;
+        assert!(
+            DavRequest::new(Method::from_bytes(b"PROPFIND").unwrap(), "https://dav.test")
+                .replay(ReplayPolicy::Idempotent)
+                .replayable()
+        );
+        assert!(
+            !DavRequest::new(Method::from_bytes(b"MOVE").unwrap(), "https://dav.test")
+                .replay(ReplayPolicy::Never)
+                .replayable()
+        );
+        assert!(
+            !DavRequest::new(Method::PUT, "https://dav.test")
+                .replay(ReplayPolicy::IdempotentUnlessConditional)
+                .header("If-Match", "v1")
+                .replayable()
+        );
+        for method in [Method::PUT, Method::DELETE] {
+            assert!(DavRequest::new(method.clone(), "https://dav.test").replayable());
+            for name in ["If-Match", "If-None-Match"] {
+                assert!(
+                    !DavRequest::new(method.clone(), "https://dav.test")
+                        .header(name, "v1")
+                        .replayable()
+                );
+            }
+        }
     }
 }

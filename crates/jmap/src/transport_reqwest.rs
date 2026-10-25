@@ -127,9 +127,10 @@ impl ReqwestTransport {
         body: Option<Bytes>,
         content_type: Option<&str>,
         total_timeout: Option<Duration>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<Bytes, TransportError> {
         Ok(self
-            .send_measured(method, url, body, content_type, total_timeout, None)
+            .send_measured(method, url, body, content_type, total_timeout, None, replay)
             .await?
             .0)
     }
@@ -138,6 +139,7 @@ impl ReqwestTransport {
     /// count. That count is the real inbound total for the whole
     /// request - retry drains, 401 recovery bodies and followed
     /// redirects included - which the decoded body length cannot see.
+    #[allow(clippy::too_many_arguments)]
     async fn send_measured(
         &self,
         method: &str,
@@ -146,9 +148,18 @@ impl ReqwestTransport {
         content_type: Option<&str>,
         total_timeout: Option<Duration>,
         limit: Option<ConcurrencyLimit>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<(Bytes, u64), TransportError> {
         let response = self
-            .send_once(method, url, body, content_type, total_timeout, limit)
+            .send_once(
+                method,
+                url,
+                body,
+                content_type,
+                total_timeout,
+                limit,
+                replay,
+            )
             .await?;
         let bytes_in = response.bytes_in();
         Ok((
@@ -157,6 +168,7 @@ impl ReqwestTransport {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build_request(
         &self,
         method: &str,
@@ -165,11 +177,12 @@ impl ReqwestTransport {
         content_type: Option<&str>,
         total_timeout: Option<Duration>,
         limit: Option<ConcurrencyLimit>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<bifrost_net::RequestBuilder, TransportError> {
-        // A JMAP POST can batch reads with creates, sends and updates. This
-        // transport receives bytes, not an AccountOperation or typed calls;
-        // one enclosing operation cannot establish safety for the whole batch.
-        // Keep POST conservative until payload-aware callers supply that proof.
+        // The bytes are opaque here, so the caller supplies the replay policy:
+        // `Client::send_request` derives it from the typed batch before
+        // serialization (`Idempotent` only when every call is a read), uploads
+        // pass `Never`, and GETs pass `Idempotent`.
         let mut request = match method {
             "GET" => self.net.get(url),
             "POST" => self.net.post(url),
@@ -221,9 +234,10 @@ impl ReqwestTransport {
         if let Some(limit) = limit {
             request = request.concurrency_limit(limit);
         }
-        Ok(request)
+        Ok(request.replay(replay))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_once(
         &self,
         method: &str,
@@ -232,12 +246,21 @@ impl ReqwestTransport {
         content_type: Option<&str>,
         total_timeout: Option<Duration>,
         limit: Option<ConcurrencyLimit>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<bifrost_net::Response, TransportError> {
-        self.build_request(method, url, body, content_type, total_timeout, limit)
-            .await?
-            .send()
-            .await
-            .map_err(transport_error_from_net)
+        self.build_request(
+            method,
+            url,
+            body,
+            content_type,
+            total_timeout,
+            limit,
+            replay,
+        )
+        .await?
+        .send()
+        .await
+        .map_err(transport_error_from_net)
     }
 
     fn handle_response(
@@ -261,14 +284,20 @@ impl ReqwestTransport {
 }
 
 impl HttpTransport for ReqwestTransport {
-    async fn api_request(&self, url: &str, body: Vec<u8>) -> Result<bytes::Bytes, TransportError> {
-        Ok(self.api_request_measured(url, body).await?.0)
+    async fn api_request(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+        replay: bifrost_net::ReplayPolicy,
+    ) -> Result<bytes::Bytes, TransportError> {
+        Ok(self.api_request_measured(url, body, replay).await?.0)
     }
 
     async fn api_request_measured(
         &self,
         url: &str,
         body: Vec<u8>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<(bytes::Bytes, u64), TransportError> {
         self.send_measured(
             "POST",
@@ -277,6 +306,7 @@ impl HttpTransport for ReqwestTransport {
             Some("application/json"),
             Some(self.timeout),
             self.api_limit(),
+            replay,
         )
         .await
     }
@@ -321,6 +351,7 @@ impl HttpTransport for ReqwestTransport {
                 content_type,
                 None,
                 self.upload_limit(),
+                bifrost_net::ReplayPolicy::Never,
             )
             .await?
             .0)
@@ -345,7 +376,15 @@ impl HttpTransport for ReqwestTransport {
     }
 
     async fn get_session(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
-        self.send("GET", url, None, None, Some(self.timeout)).await
+        self.send(
+            "GET",
+            url,
+            None,
+            None,
+            Some(self.timeout),
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
+        .await
     }
 }
 
@@ -359,7 +398,15 @@ impl crate::blob::download::BlobTransport for ReqwestTransport {
         // blobs need the JMAP default headers, Basic auth support, and no total
         // deadline. Both doors use net's retry, metering and inactivity bounds.
         let response = self
-            .build_request("GET", url, None, None, None, None)
+            .build_request(
+                "GET",
+                url,
+                None,
+                None,
+                None,
+                None,
+                bifrost_net::ReplayPolicy::Idempotent,
+            )
             .await?
             .send_streaming()
             .await
@@ -423,6 +470,7 @@ impl SseTransport for ReqwestTransport {
         let mut request = self
             .net
             .get(url)
+            .replay(bifrost_net::ReplayPolicy::Idempotent)
             .header(header::ACCEPT.as_str(), "text/event-stream")
             .without_timeout();
         for (name, value) in &self.headers {
@@ -653,20 +701,7 @@ mod tests {
     }
 
     fn scripted_transport(script: &Arc<ScriptedDispatch>) -> ReqwestTransport {
-        let mut spec = AccountSpec::new(Some(Arc::new(StaticTokenSource::new("token", None))));
-        spec.request_timeout = Some(Duration::from_secs(45));
-        let account = scripted_net(script, bifrost_net::NetConfig::default())
-            .attach_account(AccountId("api-limit".to_owned()), spec);
-        ReqwestTransport {
-            net: account,
-            headers: header::HeaderMap::new(),
-            authorization: Authorization::from_credentials_for_test(Credentials::basic(
-                "user", "secret",
-            )),
-            timeout: Duration::from_secs(30),
-            api_limit: std::sync::Mutex::new(None),
-            upload_limit: std::sync::Mutex::new(None),
-        }
+        ReqwestTransport::scripted_with_retry(script, bifrost_net::RetryPolicy::default())
     }
 
     /// The session's `maxConcurrentRequests` bounds API requests across
@@ -680,7 +715,13 @@ mod tests {
         let api_script = ScriptedDispatch::yielding((0..4).map(|_| ok()));
         let api = scripted_transport(&api_script);
         api.set_api_concurrency(2);
-        let calls = (0..4).map(|_| api.api_request("https://jmap.test/api", b"{}".to_vec()));
+        let calls = (0..4).map(|_| {
+            api.api_request(
+                "https://jmap.test/api",
+                b"{}".to_vec(),
+                bifrost_net::ReplayPolicy::Never,
+            )
+        });
         for result in futures::future::join_all(calls).await {
             result.expect("api request");
         }
@@ -728,7 +769,11 @@ mod tests {
         let transport = scripted_transport(&script);
 
         transport
-            .api_request("https://jmap.test/api", b"{}".to_vec())
+            .api_request(
+                "https://jmap.test/api",
+                b"{}".to_vec(),
+                bifrost_net::ReplayPolicy::Never,
+            )
             .await
             .expect("API request");
         transport
@@ -890,5 +935,76 @@ mod tests {
         let mut expected = exact.to_vec();
         expected.extend_from_slice(b" ... (body read failed)");
         assert_eq!(passthrough_excerpt(failed).await, Bytes::from(expected));
+    }
+}
+
+#[cfg(test)]
+impl ReqwestTransport {
+    /// A Basic-auth transport over a scripted net whose account default retry
+    /// policy is `policy`. Fetches no session.
+    pub(crate) fn scripted_with_retry(
+        script: &Arc<bifrost_net::test_support::ScriptedDispatch>,
+        policy: bifrost_net::RetryPolicy,
+    ) -> Self {
+        let mut spec = bifrost_net::AccountSpec::new(Some(Arc::new(
+            bifrost_net::StaticTokenSource::new("token", None),
+        )));
+        spec.default_retry = policy;
+        spec.request_timeout = Some(Duration::from_secs(45));
+        let account =
+            bifrost_net::test_support::scripted_net(script, bifrost_net::NetConfig::default())
+                .attach_account(AccountId("api-limit".to_owned()), spec);
+        ReqwestTransport {
+            net: account,
+            headers: header::HeaderMap::new(),
+            authorization: Authorization::from_credentials_for_test(
+                crate::client::Credentials::basic("user", "secret"),
+            ),
+            timeout: Duration::from_secs(30),
+            api_limit: std::sync::Mutex::new(None),
+            upload_limit: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use bifrost_net::test_support::{Canned, ScriptedDispatch, canned};
+    #[tokio::test]
+    async fn a_read_only_api_post_replays_after_a_drop() {
+        for replay in [
+            bifrost_net::ReplayPolicy::Idempotent,
+            bifrost_net::ReplayPolicy::Never,
+        ] {
+            let script = ScriptedDispatch::new([
+                Canned::Error(bifrost_net::Error::Network {
+                    message: "lost".into(),
+                    transmission_state: bifrost_net::TransmissionState::InFlight,
+                    source: None,
+                }),
+                canned(reqwest::StatusCode::OK, b"{}"),
+            ]);
+            let mut policy = bifrost_net::RetryPolicy::default();
+            policy.max_attempts = 2;
+            policy.initial_backoff = Duration::ZERO;
+            policy.max_backoff = Duration::ZERO;
+            let transport = ReqwestTransport::scripted_with_retry(&script, policy);
+            let result = transport
+                .api_request("https://jmap.test/api", vec![], replay)
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                replay == bifrost_net::ReplayPolicy::Idempotent
+            );
+            assert_eq!(
+                script.requests().len(),
+                if replay == bifrost_net::ReplayPolicy::Idempotent {
+                    2
+                } else {
+                    1
+                }
+            );
+        }
     }
 }

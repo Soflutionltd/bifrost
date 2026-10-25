@@ -75,6 +75,9 @@ pub use rate::{RateGeneration, RateLimit, RateLimitGovernor, RequestCost};
 pub use redirect::{
     DEFAULT_MAX_HOPS, FollowRedirects, RedirectAction, RedirectPolicy, RedirectStep,
 };
-pub use request::{ByteStream, RequestBuilder, RequestByteCounter, Response, StreamingResponse};
+pub use request::{
+    ByteStream, ReplayPolicy, RequestBuilder, RequestByteCounter, Response, StreamingResponse,
+    request_is_replayable,
+};
 pub use retry::RetryPolicy;
 pub use status_line::{status_line_code, status_line_is_success};

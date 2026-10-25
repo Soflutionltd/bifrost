@@ -346,49 +346,63 @@ impl GmailClient {
 
     pub(crate) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = self.api_url(path);
-        self.request::<T, ()>(&url, "GET", None).await
+        self.request::<T, ()>(&url, "GET", None, bifrost_net::ReplayPolicy::Idempotent)
+            .await
     }
 
     pub(crate) async fn post<T: DeserializeOwned, B: Serialize>(
         &self,
         path: &str,
         body: &B,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<T> {
         let url = self.api_url(path);
-        self.request(&url, "POST", Some(body)).await
+        self.request(&url, "POST", Some(body), replay).await
     }
 
     pub(crate) async fn put<T: DeserializeOwned, B: Serialize>(
         &self,
         path: &str,
         body: &B,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<T> {
         let url = self.api_url(path);
-        self.request(&url, "PUT", Some(body)).await
+        self.request(&url, "PUT", Some(body), replay).await
     }
 
     pub(crate) async fn patch<T: DeserializeOwned, B: Serialize>(
         &self,
         path: &str,
         body: &B,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<T> {
         let url = self.api_url(path);
-        self.request(&url, "PATCH", Some(body)).await
+        self.request(&url, "PATCH", Some(body), replay).await
     }
 
-    pub(crate) async fn delete(&self, path: &str) -> Result<()> {
+    pub(crate) async fn delete(&self, path: &str, replay: bifrost_net::ReplayPolicy) -> Result<()> {
         let url = self.api_url(path);
-        self.delete_absolute(&url, "Gmail API").await
+        self.delete_absolute(&url, "Gmail API", replay).await
     }
 
-    async fn delete_absolute(&self, url: &str, service: &str) -> Result<()> {
-        let response = self.execute(url, "DELETE", None::<&()>).await?;
+    async fn delete_absolute(
+        &self,
+        url: &str,
+        service: &str,
+        replay: bifrost_net::ReplayPolicy,
+    ) -> Result<()> {
+        let response = self.execute(url, "DELETE", None::<&()>, replay).await?;
         check_response_status(response, service).await
     }
 
-    pub(crate) async fn post_no_content<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+    pub(crate) async fn post_no_content<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        replay: bifrost_net::ReplayPolicy,
+    ) -> Result<()> {
         let url = self.api_url(path);
-        let response = self.execute(&url, "POST", Some(body)).await?;
+        let response = self.execute(&url, "POST", Some(body), replay).await?;
         check_response_status(response, "Gmail API").await
     }
 
@@ -407,8 +421,9 @@ impl GmailClient {
         url: &str,
         method: &str,
         body: Option<&B>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<T> {
-        let response = self.execute(url, method, body).await?;
+        let response = self.execute(url, method, body, replay).await?;
         parse_json_response(response, "Gmail API").await
     }
 
@@ -417,8 +432,9 @@ impl GmailClient {
         url: &str,
         method: &str,
         body: Option<&B>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<Response> {
-        self.execute_if_match(url, method, body, None).await
+        self.execute_if_match(url, method, body, None, replay).await
     }
 
     pub(crate) async fn execute_if_match<B: Serialize>(
@@ -427,11 +443,12 @@ impl GmailClient {
         method: &str,
         body: Option<&B>,
         expected: Option<&str>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<Response> {
-        // This shared Gmail/People/Calendar funnel has no AccountOperation.
-        // POST covers both reads/actions and creates; operation labels cannot
-        // be recovered from the HTTP verb. Keep the conservative wire default
-        // until callers can carry replay safety for the actual request legs.
+        // This shared Gmail/People/Calendar funnel has no AccountOperation, and
+        // needs none: the caller knows the request and its payload and
+        // declares its replay policy (applied below). POST covers reads,
+        // actions and creates alike, so no verb-level default would do.
         let mut builder = match method {
             "GET" => self.account_net().get(url),
             "POST" => self.account_net().post(url),
@@ -469,7 +486,8 @@ impl GmailClient {
         if let Some(expected) = expected {
             builder = builder.header("If-Match", expected);
         }
-        self.send_recorded(builder, self.surface_for_url(url)).await
+        self.send_recorded(builder.replay(replay), self.surface_for_url(url))
+            .await
     }
 
     fn gmail_data_limit(&self) -> bifrost_net::ConcurrencyLimit {
@@ -505,6 +523,7 @@ impl GmailClient {
         &self,
         builder: RequestBuilder,
         service: &str,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<Response> {
         // Net errors retain their original shape alongside observation metadata so
         // the account-side translation boundary can inspect transmission
@@ -521,7 +540,7 @@ impl GmailClient {
             "Calendar API" => crate::quota::ApiSurface::Calendar,
             _ => crate::quota::ApiSurface::Drive,
         };
-        self.send_recorded(builder, surface).await
+        self.send_recorded(builder.replay(replay), surface).await
     }
 
     fn surface_for_url(&self, url: &str) -> crate::quota::ApiSurface {
@@ -842,7 +861,12 @@ mod tests {
             let mut request: futures::future::BoxFuture<'static, Result<Response>> =
                 Box::pin(async move {
                     client
-                        .execute("https://gmail.test/messages/m", "GET", None::<&()>)
+                        .execute(
+                            "https://gmail.test/messages/m",
+                            "GET",
+                            None::<&()>,
+                            bifrost_net::ReplayPolicy::Idempotent,
+                        )
                         .await
                 });
             drive_pending(std::pin::Pin::new(&mut request)).await;
@@ -857,7 +881,12 @@ mod tests {
         let client = concurrency_client(&script);
         let mut held = saturate_gmail(&client).await;
         assert_eq!(script.requests().len(), 32);
-        let mut typed = Box::pin(client.execute("https://gmail.test/profile", "GET", None::<&()>));
+        let mut typed = Box::pin(client.execute(
+            "https://gmail.test/profile",
+            "GET",
+            None::<&()>,
+            bifrost_net::ReplayPolicy::Idempotent,
+        ));
         drive_pending(std::pin::Pin::new(&mut typed)).await;
         let mut raw = Box::pin(
             client.execute_builder(
@@ -865,6 +894,7 @@ mod tests {
                     .account_net()
                     .post("https://gmail.test/messages/batchModify"),
                 "Gmail API",
+                bifrost_net::ReplayPolicy::Never,
             ),
         );
         drive_pending(std::pin::Pin::new(&mut raw)).await;
@@ -922,8 +952,13 @@ mod tests {
             "Gmail must actually be saturated"
         );
         let body = serde_json::json!({"topicName": "projects/test/topics/mail"});
-        let mut watch = Box::pin(client.post::<serde_json::Value, _>("/watch", &body));
-        let mut stop = Box::pin(client.post_no_content("/stop", &()));
+        let mut watch = Box::pin(client.post::<serde_json::Value, _>(
+            "/watch",
+            &body,
+            bifrost_net::ReplayPolicy::Never,
+        ));
+        let mut stop =
+            Box::pin(client.post_no_content("/stop", &(), bifrost_net::ReplayPolicy::Never));
         drive_pending(std::pin::Pin::new(&mut watch)).await;
         drive_pending(std::pin::Pin::new(&mut stop)).await;
         assert_eq!(
@@ -1008,13 +1043,19 @@ mod tests {
                 "https://gmail.test/messages/send",
                 "POST",
                 Some(&serde_json::json!({})),
+                bifrost_net::ReplayPolicy::Never,
             )
             .await
             .expect("send dispatches");
         let second_client = client.clone();
         let second = tokio::spawn(async move {
             second_client
-                .execute("https://gmail.test/profile", "GET", None::<&()>)
+                .execute(
+                    "https://gmail.test/profile",
+                    "GET",
+                    None::<&()>,
+                    bifrost_net::ReplayPolicy::Idempotent,
+                )
                 .await
         });
         tokio::task::yield_now().await;
@@ -1061,6 +1102,7 @@ mod tests {
                 "https://gmail.test/messages/batchModify",
                 "POST",
                 Some(&serde_json::json!({})),
+                bifrost_net::ReplayPolicy::Never,
             )
             .await;
         assert!(result.is_err(), "a 403 must surface as an error");

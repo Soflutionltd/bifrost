@@ -145,8 +145,8 @@ impl ImapErrorContext {
 
     /// Unused by design: IMAP lets `derive` recompute idempotency from the
     /// operation via the central `AccountOperation::is_idempotent` table
-    /// rather than overriding per error. The consequence, and the one case
-    /// where it would bite, is worked through at `pim::restamp`.
+    /// rather than overriding per error. Builder round-trips preserve any
+    /// explicit override, including through submission restamping.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn with_idempotency_override(mut self, idempotent: bool) -> Self {

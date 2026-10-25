@@ -1095,12 +1095,19 @@ mod tests {
         ///   5xx family, read off the policy rather than restated: the
         ///   retry budget is spent and the loop surfaces `RateLimited`
         ///   for 429 and `RetryBudgetExhausted` for the rest, each with
-        ///   the final response preserved.
+        ///   the final response preserved. When the batch's replay policy
+        ///   forbids replay (any write), a retryable status other than 429
+        ///   stops at once and arrives wrapped in an empty-attempt
+        ///   `AttemptHistory` with `may_have_committed: true`, as net's
+        ///   status gate produces it.
         /// - Any other 4xx: terminal `Error::Status`.
         ///
         /// So a `Status` fixture for a retryable code is not something a
         /// test author can write by accident.
-        fn into_transport_result(self) -> Result<Bytes, TransportError> {
+        fn into_transport_result(
+            self,
+            replay: bifrost_net::ReplayPolicy,
+        ) -> Result<Bytes, TransportError> {
             let (status, body, headers) = match self.kind {
                 ScriptedReplyKind::Error(error) => return Err(error),
                 ScriptedReplyKind::Response {
@@ -1141,12 +1148,25 @@ mod tests {
                         final_response,
                     }));
                 }
-                return Err(TransportError::from_net(
-                    bifrost_net::Error::RetryBudgetExhausted {
-                        final_response: Some(final_response),
-                        retry_after_history: retry_after.into_iter().collect(),
-                    },
-                ));
+                let exhausted = bifrost_net::Error::RetryBudgetExhausted {
+                    final_response: Some(final_response),
+                    retry_after_history: retry_after.into_iter().collect(),
+                };
+                let replayable = bifrost_net::request_is_replayable(
+                    Some(replay),
+                    &reqwest::Method::POST,
+                    &reqwest::header::HeaderMap::new(),
+                );
+                if !replayable {
+                    return Err(TransportError::from_net(
+                        bifrost_net::Error::AttemptHistory {
+                            source: Box::new(exhausted),
+                            attempts: Vec::new(),
+                            may_have_committed: true,
+                        },
+                    ));
+                }
+                return Err(TransportError::from_net(exhausted));
             }
             Err(TransportError::from_net(bifrost_net::Error::Status {
                 code: status,
@@ -1168,7 +1188,11 @@ mod tests {
             self.requests.lock().expect("script requests lock").clone()
         }
 
-        fn api_reply(&self, body: Vec<u8>) -> Result<Bytes, TransportError> {
+        fn api_reply(
+            &self,
+            body: Vec<u8>,
+            replay: bifrost_net::ReplayPolicy,
+        ) -> Result<Bytes, TransportError> {
             let request = serde_json::from_slice(&body).map_err(|error| {
                 TransportError::with_source("JMAP client emitted a non-JSON API request", error)
             })?;
@@ -1212,13 +1236,18 @@ mod tests {
                     );
                 }
             }
-            reply.into_transport_result()
+            reply.into_transport_result(replay)
         }
     }
 
     impl HttpTransport for ScriptedTransport {
-        async fn api_request(&self, _url: &str, body: Vec<u8>) -> Result<Bytes, TransportError> {
-            self.api_reply(body)
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+            replay: bifrost_net::ReplayPolicy,
+        ) -> Result<Bytes, TransportError> {
+            self.api_reply(body, replay)
         }
 
         async fn upload(

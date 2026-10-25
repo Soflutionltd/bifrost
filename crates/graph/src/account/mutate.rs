@@ -337,11 +337,19 @@ async fn submit_batch_with_version(
 
     if !requests.is_empty() {
         assign_batch_ids(&mut requests);
+        let replayable: Vec<_> = requests
+            .iter()
+            .map(super::graph_error::subrequest_replayable)
+            .collect();
         let response = match account.batch_resource(&request_ids) {
             Ok(resource) => {
                 account
                     .client
-                    .post_batch(resource, &BatchRequest { requests })
+                    .post_batch(
+                        resource,
+                        &BatchRequest { requests },
+                        bifrost_net::ReplayPolicy::Never,
+                    )
                     .await
             }
             Err(error) => Err(error),
@@ -357,6 +365,7 @@ async fn submit_batch_with_version(
                     kind,
                     &mut item_outcomes,
                     &|id| account.budget_for_object(id),
+                    &replayable,
                 );
             }
             Err(error) => append_batch_failure(&request_ids, kind, error, &mut item_outcomes),
@@ -521,6 +530,7 @@ fn reconcile_mutation_responses(
     // The mailbox budget each id's sub-request was charged to
     // (`GraphAccount::budget_for_object`), stamped on a throttled item.
     budget_for: &dyn Fn(&ObjectId) -> Option<bifrost_types::ThrottleBudget>,
+    replayable: &[bool],
 ) {
     let mut seen_indices: HashSet<usize> = HashSet::new();
     for (index, item) in responses {
@@ -576,6 +586,7 @@ fn reconcile_mutation_responses(
                     "Graph $batch returned no response for {}; the item's fate is unknown",
                     id.0
                 ),
+                replayable.get(index).copied().unwrap_or(false),
             ),
         )));
     }
@@ -1387,6 +1398,7 @@ mod tests {
             &MutationKind::Move(MembershipScope::Folder(FolderId("archive".to_string()))),
             &mut outcomes,
             &|_| None,
+            &[],
         );
 
         assert_eq!(outcomes.len(), 2);
@@ -1405,12 +1417,12 @@ mod tests {
         assert!(!uncertain.error.recovery().is_terminal());
     }
 
-    /// An absolute-state flag write is idempotent, so the same ambiguity
-    /// classifies retryable - but it still rides the uncertain lane,
+    /// A guarded absolute flag write must read back before reassertion.
+    /// Its missing response still rides the uncertain lane,
     /// because the engine's read-back guard is what turns "may have
     /// landed" into a fact for either shape.
     #[test]
-    fn an_unanswered_flag_write_is_uncertain_and_retryable() {
+    fn an_unanswered_conditional_flag_write_is_uncertain_and_reconcilable() {
         let request_ids = vec![ObjectId("m0".to_string())];
         let mut outcomes = Vec::new();
         reconcile_mutation_responses(
@@ -1419,12 +1431,15 @@ mod tests {
             &MutationKind::SetFlags(FlagOp::Add(HashSet::from(["\\seen".to_string()]))),
             &mut outcomes,
             &|_| None,
+            &[false],
         );
 
         let ItemOutcome::Uncertain(uncertain) = &outcomes[0] else {
             panic!("expected uncertain, got {:?}", outcomes[0]);
         };
-        assert!(uncertain.error.recovery().is_retryable());
+        assert!(
+            matches!(uncertain.error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget])
+        );
     }
 
     /// A response id outside the submitted range, unparsable, or repeated
@@ -1449,6 +1464,7 @@ mod tests {
             &MutationKind::Destroy,
             &mut outcomes,
             &|_| None,
+            &[],
         );
 
         assert_eq!(outcomes.len(), 1);
@@ -1561,7 +1577,14 @@ mod tests {
         let kind = MutationKind::SetFlags(FlagOp::Set(HashSet::new()));
         update_etag_cache_from_responses(&account, &ids, &resolved, &kind).await;
         let mut outcomes = Vec::new();
-        reconcile_mutation_responses(&ids, resolved, &kind, &mut outcomes, &|_| None);
+        reconcile_mutation_responses(
+            &ids,
+            resolved,
+            &kind,
+            &mut outcomes,
+            &|_| None,
+            &vec![true; ids.len()],
+        );
 
         assert_eq!(
             account.etag_index.write().await.get("m0"),

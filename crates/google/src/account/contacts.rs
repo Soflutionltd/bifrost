@@ -229,7 +229,7 @@ pub(crate) fn create(
             bifrost_net::url::encode_query_value(PERSON_FIELDS)
         );
         let person: Person = client
-            .post(&url, &person)
+            .post(&url, &person, bifrost_net::ReplayPolicy::Never)
             .await
             .map_err(|error| collection_error(error, AccountOperation::ContactCreate))?;
         let resource_name = person.resource_name.ok_or_else(|| {
@@ -337,9 +337,12 @@ pub(crate) fn update(
                 bifrost_net::url::encode_query_value(&update_fields),
                 bifrost_net::url::encode_query_value(PERSON_FIELDS)
             );
-            let _: Person = client.patch(&url, &person).await.map_err(|error| {
-                contact_error(error, AccountOperation::ContactUpdate, contact.0.clone())
-            })?;
+            let _: Person = client
+                .patch(&url, &person, bifrost_net::ReplayPolicy::Never)
+                .await
+                .map_err(|error| {
+                    contact_error(error, AccountOperation::ContactUpdate, contact.0.clone())
+                })?;
         }
         if let Some(photo) = patch.photo
             && let Err(error) = update_contact_photo(&client, &contact, photo).await
@@ -369,7 +372,11 @@ async fn update_contact_photo(
         // People documents PATCH for this action, despite the colon verb path:
         // https://developers.google.com/people/api/rest/v1/people/updateContactPhoto
         let _: serde_json::Value = client
-            .patch(&url, &update_contact_photo_request(photo))
+            .patch(
+                &url,
+                &update_contact_photo_request(photo),
+                bifrost_net::ReplayPolicy::Idempotent,
+            )
             .await
             .map_err(|error| {
                 contact_error(error, AccountOperation::ContactUpdate, contact.0.clone())
@@ -377,7 +384,7 @@ async fn update_contact_photo(
     } else {
         let url = delete_contact_photo_url(client.people_base(), &encoded);
         let _: Person = client
-            .delete(&url)
+            .delete(&url, bifrost_net::ReplayPolicy::Never)
             .await
             .map(|_| Person::default())
             .map_err(|error| {
@@ -467,7 +474,7 @@ pub(crate) fn delete(
         let encoded = encode_resource_name_path(&contact.0);
         let url = format!("{}/{encoded}:deleteContact", client.people_base());
         client
-            .delete(&url)
+            .delete(&url, bifrost_net::ReplayPolicy::Never)
             .await
             .map_err(|error| contact_error(error, AccountOperation::ContactDelete, contact.0))
     })

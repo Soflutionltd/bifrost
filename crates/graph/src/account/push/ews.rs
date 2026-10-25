@@ -263,6 +263,7 @@ pub(super) async fn translate_ews_scopes(
                 Resource::Outlook,
                 "/me/translateExchangeIds",
                 &request,
+                bifrost_net::ReplayPolicy::Idempotent,
             )
             .await
         {
@@ -438,4 +439,50 @@ pub(super) async fn unsubscribe_ews(
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    #[tokio::test]
+    async fn translate_exchange_ids_is_declared_idempotent() {
+        let client = crate::client::GraphClient::new("token");
+        let mut policy = bifrost_net::RetryPolicy::default();
+        policy.max_attempts = 2;
+        policy.initial_backoff = std::time::Duration::ZERO;
+        policy.max_backoff = std::time::Duration::ZERO;
+        client.script_wire(
+            [
+                bifrost_net::test_support::Canned::Error(bifrost_net::Error::Network {
+                    message: "lost".into(),
+                    transmission_state: bifrost_types::TransmissionState::InFlight,
+                    source: None,
+                }),
+                bifrost_net::test_support::canned(
+                    reqwest::StatusCode::OK,
+                    br#"{"value":[{"sourceId":"f1","targetId":"ews-f1"}]}"#,
+                ),
+            ],
+            policy,
+        );
+        let account = GraphAccount::new_for_tests_with_shared(
+            client.clone(),
+            crate::account::PushMode::GraphSubscriptions,
+            &[],
+        );
+        let mut outcomes = bifrost_types::BatchOutcomeBuilder::new();
+        let translated = translate_ews_scopes(
+            &account,
+            vec![(
+                bifrost_types::BatchItemId("f1".into()),
+                CursorScope::Folder(bifrost_types::FolderId("f1".into())),
+                "f1".into(),
+            )],
+            &mut outcomes,
+        )
+        .await
+        .unwrap();
+        assert_eq!(translated.len(), 1);
+        assert_eq!(client.rest_requests().len(), 2);
+    }
 }

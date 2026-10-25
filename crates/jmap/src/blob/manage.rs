@@ -105,6 +105,7 @@ pub(crate) struct BlobUploadCreated {
 }
 
 impl crate::core::method::JmapMethod for BlobUploadRequest {
+    const REPLAY_SAFE: bool = false;
     const NAME: &'static str = "Blob/upload";
     type Cap = crate::core::capability::Blob;
     type Response = BlobUploadResponse;
@@ -115,6 +116,7 @@ impl crate::core::method::JmapMethod for BlobUploadRequest {
 }
 
 impl crate::core::method::JmapMethod for BlobGetRequest {
+    const REPLAY_SAFE: bool = true;
     const NAME: &'static str = "Blob/get";
     type Cap = crate::core::capability::Blob;
     type Response = BlobGetResponse;
@@ -125,6 +127,7 @@ impl crate::core::method::JmapMethod for BlobGetRequest {
 }
 
 impl crate::core::method::JmapMethod for BlobLookupRequest {
+    const REPLAY_SAFE: bool = true;
     const NAME: &'static str = "Blob/lookup";
     type Cap = crate::core::capability::Blob;
     type Response = BlobLookupResponse;

@@ -166,7 +166,7 @@ pub(crate) fn create(
         let encoded = bifrost_net::url::encode_path_component(&calendar_id);
         let url = format!("{}/calendars/{encoded}/events", client.calendar_base());
         let created: GoogleEvent = client
-            .post(&url, &body)
+            .post(&url, &body, bifrost_net::ReplayPolicy::Never)
             .await
             .map_err(|error| collection_error(error, AccountOperation::EventCreate))?;
         let id = created.id.ok_or_else(|| {
@@ -255,6 +255,7 @@ pub(crate) fn update(
                         &target_calendar.0,
                     ),
                     &json!({}),
+                    bifrost_net::ReplayPolicy::Never,
                 )
                 .await
                 .map_err(|error| {
@@ -275,7 +276,13 @@ pub(crate) fn update(
         let target_event_id = join_event_id(&calendar_id, &native_event_id);
         let google_patch = google_patch.expect("a field patch was prepared before the move");
         let response = client
-            .execute_if_match(&url, "PATCH", Some(&google_patch), expected.as_deref())
+            .execute_if_match(
+                &url,
+                "PATCH",
+                Some(&google_patch),
+                expected.as_deref(),
+                bifrost_net::ReplayPolicy::Never,
+            )
             .await;
         let result = match response {
             Ok(response) => {
@@ -321,7 +328,13 @@ pub(crate) fn delete_if_version(
         let (calendar_id, native_id) = split_event_id(&event.0, AccountOperation::EventDelete)?;
         let url = event_url(client.calendar_base(), &calendar_id, &native_id);
         let response = client
-            .execute_if_match(&url, "DELETE", None::<&()>, expected)
+            .execute_if_match(
+                &url,
+                "DELETE",
+                None::<&()>,
+                expected,
+                bifrost_net::ReplayPolicy::Never,
+            )
             .await
             .map_err(|error| event_error(error, AccountOperation::EventDelete, event.0.clone()))?;
         crate::client::check_response_status(response, "Calendar API")
@@ -376,6 +389,7 @@ pub(crate) fn rsvp_if_version(
                 "PATCH",
                 Some(&patch),
                 expected,
+                bifrost_net::ReplayPolicy::Never,
             )
             .await
             .map_err(|error| event_error(error, AccountOperation::EventRsvp, event.0.clone()))?;

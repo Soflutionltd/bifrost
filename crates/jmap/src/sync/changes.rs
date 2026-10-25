@@ -516,6 +516,7 @@ mod tests {
             &self,
             _url: &str,
             body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
         ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
             self.reply(body)
         }

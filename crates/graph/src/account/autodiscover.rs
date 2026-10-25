@@ -625,6 +625,7 @@ impl GraphAccount {
                 &headers,
                 bytes::Bytes::from(body),
                 None,
+                bifrost_net::ReplayPolicy::Idempotent,
             )
             .await
             .map_err(|error| into_account_error(error, ctx.clone()))?;

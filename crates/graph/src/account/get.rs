@@ -328,7 +328,7 @@ async fn fetch_batch(
     // The subrequest index is assigned AFTER the routing split, so it
     // indexes `rest_ids` and `reconcile_hydration_responses` can project
     // responses back onto exactly the ids that were sent.
-    let requests = urls
+    let requests: Vec<BatchRequestItem> = urls
         .into_iter()
         .enumerate()
         .map(|(index, url)| BatchRequestItem {
@@ -339,10 +339,18 @@ async fn fetch_batch(
             headers: None,
         })
         .collect();
+    let replayable: Vec<_> = requests
+        .iter()
+        .map(super::graph_error::subrequest_replayable)
+        .collect();
     let request = BatchRequest { requests };
     let response: BatchResponse = account
         .client
-        .post_batch(account.batch_resource(&rest_ids)?, &request)
+        .post_batch(
+            account.batch_resource(&rest_ids)?,
+            &request,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
         .await?;
     let etags = reconcile_hydration_responses(
         &rest_ids,
@@ -350,6 +358,7 @@ async fn fetch_batch(
         projection,
         &mut outcomes,
         &|id| account.budget_for_object(id),
+        &replayable,
     );
 
     if !etags.is_empty() {
@@ -410,6 +419,7 @@ fn reconcile_hydration_responses(
     // (`GraphAccount::budget_for_object`), stamped on a throttled item. The
     // outer `$batch` mixes mailboxes; each sub-request does not.
     budget_for: &dyn Fn(&ObjectId) -> Option<bifrost_types::ThrottleBudget>,
+    replayable: &[bool],
 ) -> Vec<(String, String)> {
     let mut etags = Vec::new();
     let mut seen_indices = HashSet::new();
@@ -517,6 +527,7 @@ fn reconcile_hydration_responses(
                     id: (id.0.clone()).into(),
                 }),
                 format!("Graph $batch returned no response for {}", id.0),
+                replayable.get(index).copied().unwrap_or(false),
             ),
         )));
     }
@@ -774,6 +785,7 @@ mod tests {
                 Projection::FlagsOnly,
                 &mut outcomes,
                 &|_| None,
+                &[true; 1],
             );
             assert!(etags.is_empty());
             assert_eq!(outcomes.len(), 1);
@@ -792,6 +804,7 @@ mod tests {
             Projection::FlagsOnly,
             &mut outcomes,
             &|_| None,
+            &[true; 1],
         );
         assert_eq!(etags.len(), 1);
         assert!(matches!(&outcomes[0], ItemOutcome::Succeeded(_)));
@@ -834,6 +847,7 @@ mod tests {
             Projection::Metadata,
             &mut outcomes,
             &|_| None,
+            &vec![true; ids.len()],
         );
 
         assert!(etags.is_empty());
@@ -876,6 +890,7 @@ mod tests {
             Projection::Metadata,
             &mut outcomes,
             &|_| None,
+            &vec![true; ids.len()],
         );
 
         assert_eq!(outcomes.len(), 1);
@@ -896,6 +911,7 @@ mod tests {
             Projection::Metadata,
             &mut outcomes,
             &|_| None,
+            &vec![true; ids.len()],
         );
 
         assert_eq!(outcomes.len(), 1);

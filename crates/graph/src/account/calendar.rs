@@ -179,7 +179,12 @@ pub(crate) async fn create(
     let body = graph_event_from_create(&event)?;
     let created = account
         .client
-        .post::<GraphEvent, _>(Resource::Outlook, &path, &body)
+        .post::<GraphEvent, _>(
+            Resource::Outlook,
+            &path,
+            &body,
+            bifrost_net::ReplayPolicy::Never,
+        )
         .await
         .map_err(|error| into_error(error, AccountOperation::EventCreate))?;
     Ok(EventId(join_event_id(&calendar_id, &created.id)))
@@ -333,10 +338,24 @@ pub(crate) async fn update(
     let result = if let Some(etag) = etag {
         account
             .client
-            .patch_if_match(Resource::Outlook, &path, etag, &body)
+            .patch_if_match(
+                Resource::Outlook,
+                &path,
+                etag,
+                &body,
+                bifrost_net::ReplayPolicy::Never,
+            )
             .await
     } else {
-        account.client.patch(Resource::Outlook, &path, &body).await
+        account
+            .client
+            .patch(
+                Resource::Outlook,
+                &path,
+                &body,
+                bifrost_net::ReplayPolicy::Never,
+            )
+            .await
     };
     result.map_err(|error| into_error(error, operation))
 }
@@ -384,10 +403,18 @@ pub(crate) async fn delete_if_version(
     let result = if let Some(etag) = etag.as_deref() {
         account
             .client
-            .delete_if_match(Resource::Outlook, &path, etag)
+            .delete_if_match(
+                Resource::Outlook,
+                &path,
+                etag,
+                bifrost_net::ReplayPolicy::Never,
+            )
             .await
     } else {
-        account.client.delete(Resource::Outlook, &path).await
+        account
+            .client
+            .delete(Resource::Outlook, &path, bifrost_net::ReplayPolicy::Never)
+            .await
     };
     result.map_err(|error| into_error(error, AccountOperation::EventDelete))
 }
@@ -410,6 +437,7 @@ pub(crate) async fn rsvp(
                 comment: None,
                 send_response: false,
             },
+            bifrost_net::ReplayPolicy::Never,
         )
         .await
         .map_err(|error| into_error(error, AccountOperation::EventRsvp))
@@ -576,7 +604,12 @@ async fn search_with_graph_api(
     };
     let response = account
         .client
-        .post::<GraphSearchResponse, _>(Resource::Outlook, "/search/query", &body)
+        .post::<GraphSearchResponse, _>(
+            Resource::Outlook,
+            "/search/query",
+            &body,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
         .await
         .map_err(|error| into_error(error, AccountOperation::EventSearch))?;
     // Graph Search pages by `from`/`size`; `moreResultsAvailable` on the

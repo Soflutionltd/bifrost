@@ -1,15 +1,8 @@
 # bifrost-net reference
 
-HTTP request replay and logical-operation recovery have different inputs.
-`AccountOperation::is_idempotent()` defaults the latter, with an explicit
-error override taking precedence; it does not describe each wire leg of a
-compound operation. Net's method default remains conservative for PATCH and
-POST and can be narrowed or widened through `idempotent(bool)`. DAV narrows
-create-PUT and MOVE legs and preserves that declaration in error recovery.
-Replacing those declarations with the enclosing update's operation default
-would permit unsafe replay. Graph, Google and JMAP transport funnels do not
-receive an account operation; propagating request safety would require typed
-caller context, including all calls in a JMAP or Graph batch.
+HTTP wire replay is declared per request with `ReplayPolicy`; logical recovery
+uses the operation table unless net narrows it after a possible commit. Provider
+funnels require the caller's declaration, where the payload and leg are known.
 
 Current architecture of the shared HTTP transport crate.
 
@@ -179,7 +172,8 @@ A response whose diagnostic drain fails still contributes its status and
 headers. `Error::terminal()` exposes the failing stage for diagnostics without
 removing the history; classification must consume the complete error.
 
-If a non-idempotent attempt may have committed, generic translation uses
+When history carries a possible commit on a non-replayable request, translation
+narrows idempotency and uses
 `Protocol(PartialResponse)` with an effective `Attempt(InFlight)` ahead of the
 physical attempt evidence. This is the existing reconcile-required lane for
 an incomplete logical exchange, including when the later failure is auth or
@@ -268,11 +262,12 @@ already-buffered slice past the absolute deadline.
 Expiry before dispatch of the replacement attempt is `Timeout { Unsent }` and
 replay-safe for any method; a `response_headers_timeout` expiry while awaiting
 headers is `Timeout { InFlight }` - bytes may have gone out, so a
-non-idempotent operation reconciles instead of replaying. Expiry *after* headers
+non-replayable request reconciles instead of replaying even under an idempotent
+operation. Expiry *after* headers
 arrived is `Timeout { Acknowledged }`, which converts to
 `Protocol(PartialResponse)` - the same class an inactivity `read_timeout`
-mid-body produces, deriving to `Retry(SameRequest)` for an idempotent operation
-and `Reconcile(PartialCompletionSignal)` otherwise. The distinction is
+mid-body produces. Replayable requests use the operation default; a
+non-replayable possible commit narrows to `Reconcile(PartialCompletionSignal)`. The distinction is
 load-bearing: a body cut short by the deadline must reach the caller as an
 error, never as a clean end-of-stream, or `send()` would hand back a prefix of
 the payload as though it were the whole response.
@@ -385,7 +380,7 @@ concurrency; ablating the bound reads 10 against a bound of 4.
 same `RequestBuilder`; the generic method does not expose reqwest.
 Builder setters of note beyond the example: `body(Bytes)` for raw
 payloads (used when `json()` is not the right encoding),
-`idempotent(bool)` to override the method-derived replay-safety
+`replay(ReplayPolicy)` (or its `idempotent(bool)` spelling) to override replay-safety
 default (see "Replay safety" below), and
 `without_bearer_auth()` for the pre-authenticated-URL and
 Basic-auth flows (Gmail upload URLs, JMAP Basic), which still want
@@ -420,7 +415,8 @@ feeds the per-account meter and the bandwidth-cap throttle.
   evidence. The 401-recovery budget is **separate** from the network
   retry budget: a 401 retry no longer burns one of the `max_attempts`
   network attempts.
-- 5xx or in `policy.statuses` -> retry with backoff. Honor
+- 5xx or in `policy.statuses` -> retry candidate, subject to resolved replay
+  policy (401/429 refusals excepted). Allowed retries use backoff. Honor
   `Retry-After` (delta-seconds + RFC 9110 HTTP-date via
   `httpdate`), capped by `policy.honor_retry_after_cap` (single
   source of truth). Without `Retry-After`: exponential backoff
@@ -432,7 +428,7 @@ feeds the per-account meter and the bandwidth-cap throttle.
 - Network / timeout / decode errors -> retry if
   `policy.network_errors && attempt < max_attempts` **and the failure
   is replayable**. See "Replay safety" below.
-- Past `max_attempts` -> `Error::RetryBudgetExhausted` (or
+- Past `max_attempts`, or stopped by replay policy -> `Error::RetryBudgetExhausted` (or
   `Error::RateLimited` on 429). The exhausted-attempt branch parses
   the *final* response's `Retry-After` and pushes it onto
   `retry_after_history` before surfacing, so consumers see the
@@ -452,47 +448,63 @@ rewrite server evidence.
 
 ### Replay safety
 
-The transport-failure retry branch consults idempotency;
-`transport_error_is_replayable` allows a retry when EITHER nothing was
-transmitted (`TransmissionState::Unsent`) OR replaying cannot change
-server state. Past `Unsent` on a non-idempotent request the side effect
-may already have landed. A remote HTTP/2 `REFUSED_STREAM` reset guarantees
-the stream was not processed (RFC 9113 section 8.7), so `send_error_to_error` classifies it
-as `Network { Unsent }`. The retry loop rebuilds a fresh upload body through
-admission on each attempt; reqwest cannot clone the wrapped body for its own
-protocol retries. Other non-connect, non-timeout reqwest failures are
-`Network { InFlight }`, preserving that uncertainty. Retrying regardless is how one Gmail
-`/messages/send` becomes two delivered messages and one JMAP
-`Email/set` create becomes two drafts, and it happened three times
-before `into_account_error_with_throttle_scope` ever ran, so the
-`Reconcile` classification only ever described the final attempt.
+Every provider request declares `ReplayPolicy` at its call site:
 
-Idempotency defaults to `reqwest::Method::is_idempotent()`: safe
-methods plus PUT and DELETE are replayable, POST / PATCH / extension
-methods are not. `RequestBuilder::idempotent(bool)` overrides it. The
-override exists for two real shapes: a read carried over POST (JMAP's
-single `/jmap/api` endpoint, when the payload's method calls are all
-`*/get` or `*/query`) opts back in, and a GET a provider treats as an
-action opts out. The JMAP transport does not set it today - its `send`
-sees only method, URL, and opaque body bytes - so JMAP POSTs are
-conservatively non-replayable at this layer.
+- `Idempotent`: reads, including POST reads, absolute writes by stable id whose
+  replay preserves both state and answer, and protocol-defined resumable uploads.
+- `IdempotentUnlessConditional`: absolute writes with optional header guards,
+  and DELETEs whose call site absorbs 404/410 as the intended end state.
+- `Never`: creates, sends, moves, actions, unabsorbed DELETEs, body-level guards
+  (`ifInState`, People etags, Graph batch subrequest guards), calendar event
+  writes and RSVPs that can emit scheduling messages, and undocumented safety.
 
-This is not a net loss of resilience. The refused replay surfaces to
-`into_account_error_with_throttle_scope`, which holds the caller's real
-`AccountOperation` and routes `InFlight` + idempotent to `Retry(SameRequest)` and
-`InFlight` + non-idempotent to
-`Reconcile(TransportDropAfterSend, [CheckTarget])`. The retry decision
-moves up to the layer that knows what the request meant, instead of
-being taken three times by the layer that only knows it is holding
-bytes.
+`RequestBuilder::replay` selects the policy; `idempotent(bool)` is its retained
+compatibility spelling (`true` is `Idempotent`, `false` is `Never`). Undeclared
+safe methods default to `Idempotent`, PUT/DELETE to
+`IdempotentUnlessConditional`, and other methods to `Never`.
+`request_is_replayable` is the shared resolver used by net and DAV.
 
-Status-driven retry (5xx, 429, `policy.statuses`) is deliberately NOT
-gated on idempotency. A complete response is `Acknowledged` evidence
-that the server is reporting it did not do the work, and
-`recovery::derive`'s `transient_retry_or_reconcile` already treats
-`Acknowledged` as replayable for any operation. Gating it here would
-contradict the shared error model and turn every 503 on a POST into an
-immediate failure.
+A precondition is any If-Match, If-None-Match, If-Unmodified-Since, WebDAV If,
+or If-Schedule-Tag-Match header. If-Modified-Since and If-Range are excluded
+because their defined methods are safe; Overwrite: F is excluded because its
+MOVE/COPY methods already default to `Never`. Safe methods remain replayable
+under `IdempotentUnlessConditional`. Explicit `Idempotent` wins over guards.
+A method-rewriting redirect clears the declaration so the new GET receives its
+method default; earlier possible-commit evidence stays sticky.
+
+Transport retries require either `Unsent` evidence or a replayable request.
+Past `Unsent` on an unreplayable request the side effect may already have
+landed. A remote HTTP/2 `REFUSED_STREAM` reset guarantees the stream was not
+processed (RFC 9113 section 8.7), so `send_error_to_error` classifies it as
+`Network { Unsent }`; other non-connect, non-timeout reqwest failures are
+`Network { InFlight }`, preserving that uncertainty. The retry loop rebuilds a
+fresh upload body through admission on each attempt; reqwest cannot clone the
+wrapped body for its own protocol retries.
+All 5xx and configured `RetryPolicy::statuses` are retry candidates, gated by
+that same resolved request policy. Only 401 and 429 refusals may retry an
+unreplayable request. Authentication refresh keeps its separate budget; 429
+must still be selected by the retry policy. A 5xx acknowledges a response, but
+does not prove refusal: it can follow a committed write. The response is drained
+and observed before the gate, preserving diagnostics, holds and Retry-After.
+An allowed retry refunds its quota slot; a policy-stopped attempt neither waits
+nor refunds for a retry that never happens.
+
+An unreplayable terminal transport failure past Unsent, or an ambiguous
+retryable status, carries `AttemptHistory` with `may_have_committed: true`,
+even with no earlier attempts. A lone RateLimited or terminal Status is not
+newly wrapped. Net narrows classification with `idempotency_override(false)`.
+An empty transport history preserves the terminal transport kind; an ambiguous
+status becomes `Protocol(PartialResponse)` with InFlight evidence. Local holds
+after a possible commit also narrow. The operation table remains the default
+otherwise, and widening is a producer decision on declared replayable requests.
+
+The accepted cost is a read-back after the first ambiguous status on a Never
+request, even with attempt budget left. Conditional and scheduling updates may
+also require read-back after a drop before any commit. Narrowed absolute writes
+receive CheckTarget-only and enter reassertable engine read-back; creates,
+sends, moves and destroys keep their protected lane. A body-level conflict
+cannot follow automatic replay of a Never write: [503, 200 conflict] stops at
+503 and reconciles. A genuine first-response conflict remains a conflict.
 
 Token-source failures returned from `current()` are passed through
 to the caller unchanged: `Error::AuthLost` for true auth failures,
@@ -504,7 +516,8 @@ for retry-vs-give-up decisions).
 5xx; explicitly documented to avoid double-counting.
 
 The rate-limit slot is **refunded on every retried failure**, not
-just 429-with-Retry-After, so 5xx retries don't burn quota for work
+just 429-with-Retry-After. A policy-stopped attempt is not refunded.
+Allowed 5xx retries do not burn quota for work
 the server didn't perform.
 
 Each acquired slot is held by an armed guard until a response arrives. The debit
@@ -1305,6 +1318,10 @@ variants:
 - `AttemptHistory { source, attempts, may_have_committed }` - terminal
   stage failure together with earlier wire outcomes. The complete error feeds
   classification; `terminal()` is a diagnostic view of the failing stage.
+  `attempts` may be empty: an unreplayable request whose only attempt ended in
+  a transport failure past `Unsent` or an ambiguous retryable status is
+  wrapped with `may_have_committed: true`, which translation turns into an
+  `idempotency_override(false)` narrowing.
 - `LocalHold { key, held, attempts, may_have_committed }` - registry gate
   refusal with the same accumulated transmission evidence.
 - `Network { message, transmission_state, source }` - transport-level
@@ -1322,8 +1339,10 @@ variants:
   status. `body` is capped at 4 KB via `cap_status_body` with a
   truncation marker.
 - `RetryBudgetExhausted { final_response, retry_after_history }` -
-  retry budget exhausted. `final_response` preserves the last status,
-  headers, and capped body when a response was received.
+  retrying stopped because the attempt budget was spent or the request's
+  replay policy forbids another attempt (the latter can happen with budget
+  left). `final_response` preserves the last status, headers, and capped body
+  when a response was received.
 - `RateLimited { retry_after, final_response }` - 429 past the retry
   budget with preserved response evidence.
 - `AuthLost { transmission_state, final_response }` - irrecoverable

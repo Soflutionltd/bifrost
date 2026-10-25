@@ -324,8 +324,9 @@ operation is treated idempotent). The rules at altitude (read
 - **Unsupported** -> `Unsupported(op)`.
 - **Protocol** -> parse / missing-field / contract-violation ->
   `ProviderContractViolation`; `PartialResponse` -> `Retry(SameRequest)`
-  if idempotent else `Reconcile(PartialCompletionSignal, [CheckTarget,
-  DedupeByClientId])`; `Unknown` -> `UnknownPermanent`.
+  if idempotent else `Reconcile(PartialCompletionSignal, [CheckTarget])`,
+  plus `DedupeByClientId` only for a table-non-idempotent operation;
+  `Unknown` -> `UnknownPermanent`.
 - **Internal** -> never retried: an implementation failure is deterministic
   or has left its resource dead, and retrying one in a loop is worse than
   stopping visibly. `InternalFailure` (terminal), except `InFlight` on a
@@ -347,6 +348,12 @@ a fresh name snapshot and resumes polling when change history expires.
 Missing client recovery context does not establish provider misconduct; the
 JMAP converter treats unhandled state expiry without a cursor scope as an
 `Internal(InvariantViolated)` client error.
+
+For a non-idempotent PartialResponse input, reconciliation always includes
+CheckTarget. DedupeByClientId is added only when the operation table itself
+calls the operation non-idempotent, independent of an override. Creates and
+sends need duplicate detection; moves and destroys retain protected read-back
+routing. Narrowed absolute writes and an absent operation get CheckTarget only.
 
 ### Local refusals
 
@@ -592,16 +599,17 @@ default idempotency source `derive` consults when no explicit
 policy, not proof that every HTTP leg of that operation is replayable.
 An event/contact update can contain a MOVE or conditional create-PUT; its
 request and partial-sequence failures must narrow the default to reconciliation.
-Net independently uses request-level replay safety and otherwise its HTTP-method
-default. Those defaults are not equivalent. Absolute-state writes
-against a known id, including the `*Update` family (except `FilterUpdate`,
-which is delete+create on Gmail and name-keyed on ManageSieve, so it sits with
-the non-idempotent writes) and the singleton settings
-writers, are idempotent; sends, creates, deletes, moves, renames, uploads, and
-other potentially double-applied side effects are not. Rename is with the moves
-deliberately: IMAP `RENAME` keys on the old name rather than an id, so a replay
-of a rename that landed names a mailbox that no longer exists. `Provider` and
-`Protocol` are the small stable provenance enums.
+The request's `ReplayPolicy` decides wire replay. When a non-replayable
+request may have committed, net stamps `idempotency_override(false)` during
+translation. The operation table is the default otherwise and for every
+non-HTTP protocol. Widening is an operation-level producer decision on requests
+declared replayable only.
+
+An HTTP acknowledgement does not prove refusal: net preserves 401/429 refusal
+retries, but stops at a 5xx or other configured ambiguous status on an
+unreplayable request. It translates that ambiguity to PartialResponse with
+InFlight evidence and a false override before invoking the generic server
+mapper, whose acknowledged retry rule remains unchanged.
 
 ## Warning is outside the error model
 

@@ -564,6 +564,7 @@ mod tests {
             &self,
             _url: &str,
             body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
         ) -> Result<bytes::Bytes, TransportError> {
             let request: serde_json::Value =
                 serde_json::from_slice(&body).expect("client emits JSON");

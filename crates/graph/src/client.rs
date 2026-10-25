@@ -855,7 +855,14 @@ impl GraphClient {
         resource: Resource,
         url: &AdmittedUrl,
     ) -> Result<T, GraphError> {
-        self.request::<T, ()>(resource, url, "GET", None).await
+        self.request::<T, ()>(
+            resource,
+            url,
+            "GET",
+            None,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
+        .await
     }
 
     pub(crate) async fn get_eventual<T: DeserializeOwned>(
@@ -865,7 +872,15 @@ impl GraphClient {
         eventual: bool,
     ) -> Result<T, GraphError> {
         let response = self
-            .execute_wire(resource, url, "GET", None, (None, eventual), None)
+            .execute_wire(
+                resource,
+                url,
+                "GET",
+                None,
+                (None, eventual),
+                None,
+                bifrost_net::ReplayPolicy::Idempotent,
+            )
             .await?;
         parse_json_response(response)
     }
@@ -876,8 +891,15 @@ impl GraphClient {
         url: &AdmittedUrl,
         prefer: &str,
     ) -> Result<T, GraphError> {
-        self.request_prefer::<T, ()>(resource, url, "GET", prefer, None)
-            .await
+        self.request_prefer::<T, ()>(
+            resource,
+            url,
+            "GET",
+            prefer,
+            None,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
+        .await
     }
 
     pub(crate) async fn post<T: DeserializeOwned, B: Serialize>(
@@ -885,18 +907,23 @@ impl GraphClient {
         resource: Resource,
         path: &str,
         body: &B,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<T, GraphError> {
         let url = self.api_url(path)?;
-        self.request(resource, &url, "POST", Some(body)).await
+        self.request(resource, &url, "POST", Some(body), replay)
+            .await
     }
 
     pub(crate) async fn post_empty(
         &self,
         resource: Resource,
         path: &str,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
-        let response = self.execute(resource, &url, "POST", None::<&()>).await?;
+        let response = self
+            .execute(resource, &url, "POST", None::<&()>, replay)
+            .await?;
         check_response_status(response)
     }
 
@@ -905,9 +932,12 @@ impl GraphClient {
         resource: Resource,
         path: &str,
         body: &B,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
-        let response = self.execute(resource, &url, "POST", Some(body)).await?;
+        let response = self
+            .execute(resource, &url, "POST", Some(body), replay)
+            .await?;
         check_response_status(response)
     }
 
@@ -921,6 +951,7 @@ impl GraphClient {
         resource: Resource,
         path: &str,
         base64_mime: Bytes,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<T, GraphError> {
         let url = self.api_url(path)?;
         let response = self
@@ -931,6 +962,7 @@ impl GraphClient {
                 None,
                 (None, false),
                 Some(WireBody::mime(base64_mime)),
+                replay,
             )
             .await?;
         parse_json_response(response)
@@ -941,9 +973,12 @@ impl GraphClient {
         resource: Resource,
         path: &str,
         body: &B,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
-        let response = self.execute(resource, &url, "PATCH", Some(body)).await?;
+        let response = self
+            .execute(resource, &url, "PATCH", Some(body), replay)
+            .await?;
         check_response_status(response)
     }
 
@@ -953,10 +988,11 @@ impl GraphClient {
         path: &str,
         etag: &str,
         body: &B,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
         let response = self
-            .execute_if_match(resource, &url, "PATCH", etag, Some(body))
+            .execute_if_match(resource, &url, "PATCH", etag, Some(body), replay)
             .await?;
         check_response_status(response)
     }
@@ -966,14 +1002,23 @@ impl GraphClient {
         resource: Resource,
         path: &str,
         body: &B,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<T, GraphError> {
         let url = self.api_url(path)?;
-        self.request(resource, &url, "PATCH", Some(body)).await
+        self.request(resource, &url, "PATCH", Some(body), replay)
+            .await
     }
 
-    pub(crate) async fn delete(&self, resource: Resource, path: &str) -> Result<(), GraphError> {
+    pub(crate) async fn delete(
+        &self,
+        resource: Resource,
+        path: &str,
+        replay: bifrost_net::ReplayPolicy,
+    ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
-        let response = self.execute(resource, &url, "DELETE", None::<&()>).await?;
+        let response = self
+            .execute(resource, &url, "DELETE", None::<&()>, replay)
+            .await?;
         check_response_status(response)
     }
 
@@ -982,10 +1027,11 @@ impl GraphClient {
         resource: Resource,
         path: &str,
         etag: &str,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
         let response = self
-            .execute_if_match(resource, &url, "DELETE", etag, None::<&()>)
+            .execute_if_match(resource, &url, "DELETE", etag, None::<&()>, replay)
             .await?;
         check_response_status(response)
     }
@@ -994,8 +1040,9 @@ impl GraphClient {
         &self,
         resource: Resource,
         batch: &crate::types::BatchRequest,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<crate::types::BatchResponse, GraphError> {
-        self.post(resource, "/$batch", batch).await
+        self.post(resource, "/$batch", batch, replay).await
     }
 
     async fn request<T: DeserializeOwned, B: Serialize>(
@@ -1004,8 +1051,9 @@ impl GraphClient {
         url: &AdmittedUrl,
         method: &str,
         body: Option<&B>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<T, GraphError> {
-        let response = self.execute(resource, url, method, body).await?;
+        let response = self.execute(resource, url, method, body, replay).await?;
         parse_json_response(response)
     }
 
@@ -1016,9 +1064,10 @@ impl GraphClient {
         method: &str,
         prefer: &str,
         body: Option<&B>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<T, GraphError> {
         let response = self
-            .execute_request(resource, url, method, None, Some(prefer), body)
+            .execute_request(resource, url, method, None, Some(prefer), body, replay)
             .await?;
         parse_json_response(response)
     }
@@ -1029,8 +1078,9 @@ impl GraphClient {
         url: &AdmittedUrl,
         method: &str,
         body: Option<&B>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<RestResponse, GraphError> {
-        self.execute_request(resource, url, method, None, None, body)
+        self.execute_request(resource, url, method, None, None, body, replay)
             .await
     }
 
@@ -1041,11 +1091,13 @@ impl GraphClient {
         method: &str,
         etag: &str,
         body: Option<&B>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<RestResponse, GraphError> {
-        self.execute_request(resource, url, method, Some(etag), None, body)
+        self.execute_request(resource, url, method, Some(etag), None, body, replay)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_request<B: Serialize>(
         &self,
         resource: Resource,
@@ -1054,13 +1106,22 @@ impl GraphClient {
         if_match: Option<&str>,
         prefer: Option<&str>,
         body: Option<&B>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<RestResponse, GraphError> {
         let body = match body {
             Some(body) => Some(WireBody::json(body)?),
             None => None,
         };
-        self.execute_wire(resource, url, method, if_match, (prefer, false), body)
-            .await
+        self.execute_wire(
+            resource,
+            url,
+            method,
+            if_match,
+            (prefer, false),
+            body,
+            replay,
+        )
+        .await
     }
 
     /// The one place a Graph REST request leaves this crate. Every helper
@@ -1070,6 +1131,7 @@ impl GraphClient {
     /// The URL must be an `AdmittedUrl`: bifrost-net attaches the
     /// bearer to the first request whatever its host, so the origin decision
     /// has to be made before this point, and the type proves it was.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_wire(
         &self,
         resource: Resource,
@@ -1078,6 +1140,7 @@ impl GraphClient {
         if_match: Option<&str>,
         options: (Option<&str>, bool),
         body: Option<WireBody>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<RestResponse, GraphError> {
         let (prefer, eventual) = options;
         let url = url.as_str();
@@ -1088,10 +1151,10 @@ impl GraphClient {
         self.record_wire(method, url, if_match, prefer, body.as_ref());
         let account_net = self.attached_net()?;
 
-        // This funnel has no AccountOperation: callers include batch POSTs
-        // and conditional PATCHes as well as absolute-state updates. A PATCH
-        // may commit and then reject its replay's stale If-Match. Widening
-        // replay needs request-specific evidence, not a verb-to-operation map.
+        // This funnel has no AccountOperation, and needs none: the caller
+        // knows the request and its payload, and declares its replay policy
+        // (applied below). Batch POSTs, conditional PATCHes and absolute
+        // updates all pass through here, so no verb-level default would do.
         let mut builder = match method {
             "GET" => account_net.get(url),
             "POST" => account_net.post(url),
@@ -1127,6 +1190,7 @@ impl GraphClient {
                 .body(body.bytes);
         }
 
+        builder = builder.replay(replay);
         let counter = bifrost_net::RequestByteCounter::new();
         let sent = builder.count_bytes_into(counter.clone()).send().await;
         self.record_bytes(&counter);
@@ -1147,6 +1211,7 @@ impl GraphClient {
     /// caller spending one budget across several requests passes what is
     /// left of it and bifrost-net classifies an expiry by the stage it hit.
     /// `None` keeps the account default.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_aux(
         &self,
         resource: Resource,
@@ -1155,6 +1220,7 @@ impl GraphClient {
         headers: &[(&str, &str)],
         body: Bytes,
         timeout: Option<std::time::Duration>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> Result<RestResponse, GraphError> {
         debug_assert!(matches!(resource, Resource::Unmetered));
         // Autodiscover is ungated: EWS throttling is per calling user under
@@ -1193,6 +1259,7 @@ impl GraphClient {
         for (name, value) in headers {
             builder = builder.header(name, value);
         }
+        builder = builder.replay(replay);
         let counter = bifrost_net::RequestByteCounter::new();
         let sent = builder
             .body(body)
@@ -1772,7 +1839,8 @@ mod tests {
                     AuxTarget::Bearer(&url),
                     &[],
                     Bytes::new(),
-                    None
+                    None,
+                    bifrost_net::ReplayPolicy::Idempotent
                 )
                 .await
                 .err()
@@ -1914,7 +1982,15 @@ mod tests {
             .api_url(&format!("{}/messages", shared.api_path_prefix()))
             .expect("api url");
         match shared
-            .execute_wire(Resource::Outlook, &url, "GET", None, (None, false), None)
+            .execute_wire(
+                Resource::Outlook,
+                &url,
+                "GET",
+                None,
+                (None, false),
+                None,
+                bifrost_net::ReplayPolicy::Idempotent,
+            )
             .await
         {
             Err(GraphError::MailboxThrottled { budget, .. }) => {
@@ -1950,7 +2026,15 @@ mod tests {
             .expect("api url");
         assert!(matches!(
             shouted
-                .execute_wire(Resource::Outlook, &url, "GET", None, (None, false), None)
+                .execute_wire(
+                    Resource::Outlook,
+                    &url,
+                    "GET",
+                    None,
+                    (None, false),
+                    None,
+                    bifrost_net::ReplayPolicy::Idempotent
+                )
                 .await,
             Err(GraphError::MailboxThrottled { .. })
         ));
@@ -1961,7 +2045,15 @@ mod tests {
             assert!(
                 matches!(
                     primary
-                        .execute_wire(Resource::Unmetered, &url, "GET", None, (None, false), None)
+                        .execute_wire(
+                            Resource::Unmetered,
+                            &url,
+                            "GET",
+                            None,
+                            (None, false),
+                            None,
+                            bifrost_net::ReplayPolicy::Idempotent
+                        )
                         .await,
                     Err(GraphError::Net(_))
                 ),
@@ -2297,7 +2389,11 @@ mod tests {
                     })
                     .collect(),
             };
-            let mut request = Box::pin(primary.post_batch(Resource::Batch(clients), &batch));
+            let mut request = Box::pin(primary.post_batch(
+                Resource::Batch(clients),
+                &batch,
+                bifrost_net::ReplayPolicy::Never,
+            ));
             drive_pending(request.as_mut()).await;
             assert_eq!((limit.in_flight(), other.in_flight()), expected);
             let recorded = primary.take_rest_requests();
@@ -2490,11 +2586,19 @@ mod tests {
             .await
             .expect("GET");
         client
-            .delete(Resource::Outlook, "/me/messages/m1")
+            .delete(
+                Resource::Outlook,
+                "/me/messages/m1",
+                bifrost_net::ReplayPolicy::Never,
+            )
             .await
             .expect("DELETE");
         client
-            .post_empty(Resource::Outlook, "/me/messages/m1/accept")
+            .post_empty(
+                Resource::Outlook,
+                "/me/messages/m1/accept",
+                bifrost_net::ReplayPolicy::Never,
+            )
             .await
             .expect("bodyless POST");
         let _: serde_json::Value = client
@@ -2502,6 +2606,7 @@ mod tests {
                 Resource::Outlook,
                 "/me/messages",
                 &serde_json::json!({"subject":"created"}),
+                bifrost_net::ReplayPolicy::Never,
             )
             .await
             .expect("JSON POST");
@@ -2531,7 +2636,15 @@ mod tests {
         client.script_rest(responses);
         let url = client.api_url("/me/messages").expect("api url");
         client
-            .execute_wire(Resource::Outlook, &url, "GET", None, (None, false), None)
+            .execute_wire(
+                Resource::Outlook,
+                &url,
+                "GET",
+                None,
+                (None, false),
+                None,
+                bifrost_net::ReplayPolicy::Idempotent,
+            )
             .await
     }
 
@@ -2655,7 +2768,15 @@ mod tests {
 
         let url = client.api_url("/me").expect("api url");
         let response = client
-            .execute_wire(Resource::Outlook, &url, "GET", None, (None, false), None)
+            .execute_wire(
+                Resource::Outlook,
+                &url,
+                "GET",
+                None,
+                (None, false),
+                None,
+                bifrost_net::ReplayPolicy::Idempotent,
+            )
             .await
             .expect("the retried 503 succeeds on the second attempt");
 

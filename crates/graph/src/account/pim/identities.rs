@@ -81,7 +81,12 @@ pub(crate) async fn vacation_set(
     let path = format!("{}/mailboxSettings", account.client.api_path_prefix());
     account
         .client
-        .patch(Resource::Outlook, &path, &setting)
+        .patch(
+            Resource::Outlook,
+            &path,
+            &setting,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
         .await
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::VacationSet)))
 }

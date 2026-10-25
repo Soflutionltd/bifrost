@@ -544,7 +544,10 @@ impl CalDavClient {
         url: &str,
         operation: AccountOperation,
     ) -> Result<CalDavFetchedEvent, AccountError> {
-        let request = self.dav.request(Method::GET, url);
+        let request = self
+            .dav
+            .request(Method::GET, url)
+            .replay(bifrost_net::ReplayPolicy::Idempotent);
         let response = self.dav.send_raw_request(request, operation).await?;
         let status = response.status;
         let etag = response_etag(&response.headers);
@@ -567,23 +570,24 @@ impl CalDavClient {
         condition: PutCondition<'_>,
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
+        // Every event PUT is `Never`, whatever its condition. A create-PUT
+        // replayed after its first attempt committed answers 412, which reads as
+        // a conflict and invites re-creating the event under a new UUID. An
+        // `If-Match` update replayed the same way answers 412 against the
+        // caller's own write. And an unconditional PUT is still a calendar
+        // write that RFC 6638 implicit scheduling can turn into an iTIP
+        // message; nothing documents that a replay cannot send a second one.
+        // A drop therefore reconciles (read-back) instead of replaying, even
+        // when the validator was fetched by the account itself.
         let mut request = self
             .dav
             .request(Method::PUT, url)
+            .replay(bifrost_net::ReplayPolicy::Never)
             .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
             .body(body);
         match condition {
-            // A create-PUT is the one PUT a replay cannot repair. HTTP calls
-            // PUT idempotent, so `bifrost-net` replays one whose connection
-            // dropped after the bytes went out; if the first attempt committed,
-            // the replay answers 412, the ladder reads `ConcurrencyConflict` ->
-            // `Retry(AfterStateRefresh)`, and the consumer re-creates the event
-            // under a freshly minted UUID - two copies of one event. Declaring
-            // it unreplayable routes the drop to `Reconcile(CheckTarget)`.
-            // `IfMatch` and `None` address a known URL with absolute state, so
-            // they stay replayable.
             PutCondition::IfNoneMatch => {
-                request = request.header("If-None-Match", "*").idempotent(false);
+                request = request.header("If-None-Match", "*");
             }
             PutCondition::IfMatch(etag) => {
                 if let Some(etag) = prepare_if_match(etag) {
@@ -616,6 +620,7 @@ impl CalDavClient {
         let request = self
             .dav
             .request(Method::DELETE, url)
+            .replay(bifrost_net::ReplayPolicy::Never)
             .header("If-Match", etag);
         self.dav.send_status_request(request, operation).await
     }
@@ -657,6 +662,7 @@ impl CalDavClient {
         let request = self
             .dav
             .request(Method::POST, outbox_url)
+            .replay(bifrost_net::ReplayPolicy::Never)
             .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
             .header("Originator", schedule_address(originator).as_str())
             .header("Recipient", schedule_address(recipient).as_str())
@@ -1234,9 +1240,11 @@ mod tests {
     ///
     /// Twin of `bifrost-carddav`'s
     /// `a_create_put_is_not_replayed_after_a_mid_flight_drop`; keep them in
-    /// step. `bifrost-net` derives replay safety from the METHOD, and HTTP calls
-    /// PUT idempotent - true of an absolute-state write to a known URL, false of
-    /// a create. A replayed create whose first attempt committed answers 412 ->
+    /// step. HTTP calls PUT idempotent - true of an absolute-state write to a
+    /// known URL, false of a create, which is why the create-PUT is declared
+    /// `ReplayPolicy::Never` (and why net's PUT default refuses replay once
+    /// `If-None-Match` is present). A replayed create whose first attempt
+    /// committed answers 412 ->
     /// `ConcurrencyConflict` -> `Retry(AfterStateRefresh)`, and `event_create`
     /// mints a fresh UUID on the retry, so the calendar ends up holding two
     /// copies of one event.
@@ -1418,14 +1426,63 @@ mod tests {
         );
     }
 
-    /// The `If-Match` update PUT stays replayable.
-    ///
-    /// It addresses a known URL with absolute state, and a replay landing after
-    /// the first attempt committed answers 412 - refresh-and-retry, which is
-    /// already the right handling. Losing that resilience is the cost the
-    /// no-replay fix above must NOT impose on the update lane.
+    /// Versioned mutations read back after ambiguity rather than replaying.
     #[tokio::test]
-    async fn an_if_match_update_put_still_replays_after_a_mid_flight_drop() {
+    async fn a_versioned_delete_reconciles_after_a_mid_flight_drop() {
+        let script = dav_script([
+            dav_dropped_after_send(),
+            DavResponse {
+                status: StatusCode::NO_CONTENT,
+                headers: HeaderMap::new(),
+                body: String::new(),
+                url: String::new(),
+            }
+            .into(),
+        ]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let error = client
+            .delete_event_if_match(
+                "https://dav.example.test/book/one.ics",
+                "v1",
+                AccountOperation::EventDelete,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(transcripts(&script).len(), 1);
+        assert!(
+            matches!(error.recovery(), RecoveryClass::Reconcile(a) if a.guidance.actions.contains(&ReconcileAction::CheckTarget))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unconditional_event_put_is_not_replayed_after_a_mid_flight_drop() {
+        let script = dav_script([
+            dav_dropped_after_send(),
+            DavResponse {
+                status: StatusCode::NO_CONTENT,
+                headers: HeaderMap::new(),
+                body: String::new(),
+                url: String::new(),
+            }
+            .into(),
+        ]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let result = client
+            .put_event(
+                "https://dav.example.test/book/one.ics",
+                String::new(),
+                PutCondition::None,
+                AccountOperation::EventUpdate,
+            )
+            .await;
+        assert_eq!(transcripts(&script).len(), 1);
+        assert!(result.unwrap_err().recovery().requires_reconciliation());
+    }
+
+    #[tokio::test]
+    async fn an_if_match_update_put_reconciles_after_a_mid_flight_drop() {
         let mut headers = HeaderMap::new();
         headers.insert(
             reqwest::header::ETAG,
@@ -1443,7 +1500,7 @@ mod tests {
         let client =
             CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
-        let etag = client
+        let error = client
             .put_event(
                 "https://dav.example.test/cal/one.ics",
                 "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".to_string(),
@@ -1451,10 +1508,16 @@ mod tests {
                 AccountOperation::EventUpdate,
             )
             .await
-            .expect("the replay succeeds");
+            .expect_err("conditional write must reconcile");
 
-        assert_eq!(transcripts(&script).len(), 2, "the update PUT must replay");
-        assert_eq!(etag.as_deref(), Some("v2"));
+        assert_eq!(
+            transcripts(&script).len(),
+            1,
+            "the conditional PUT must not replay"
+        );
+        assert!(
+            matches!(error.recovery(), RecoveryClass::Reconcile(a) if a.guidance.actions == [ReconcileAction::CheckTarget])
+        );
     }
 
     /// A recurrence-instance `EventId` is refused before anything is sent by the

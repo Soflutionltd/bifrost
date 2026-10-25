@@ -844,7 +844,15 @@ async fn apply_label_patch_body(
             .lock()
             .expect("mutation progress lock poisoned")
             .begin(&part);
-        match post_empty_json(client, "/messages/batchModify", &body, key).await {
+        match post_empty_json(
+            client,
+            "/messages/batchModify",
+            &body,
+            key,
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
+        .await
+        {
             Ok(()) => {
                 progress
                     .lock()
@@ -975,7 +983,15 @@ async fn apply_destroy(
         .lock()
         .expect("mutation progress lock poisoned")
         .begin(ids);
-    match post_empty_json(client, "/messages/batchDelete", &body, key).await {
+    match post_empty_json(
+        client,
+        "/messages/batchDelete",
+        &body,
+        key,
+        bifrost_net::ReplayPolicy::Never,
+    )
+    .await
+    {
         Ok(()) => {
             progress
                 .lock()
@@ -1140,6 +1156,7 @@ async fn post_empty_json<B: Serialize>(
     path: &str,
     body: &B,
     _key: &IdempotencyKey,
+    replay: bifrost_net::ReplayPolicy,
 ) -> crate::Result<()> {
     // Gmail messages endpoints accept no documented client-mintable
     // replay token, so the Account idempotency key stays engine-side.
@@ -1156,7 +1173,7 @@ async fn post_empty_json<B: Serialize>(
     if let Some(cost) = client.gmail_quota_cost(&url, "POST") {
         request = request.cost(cost);
     }
-    let response = client.execute_builder(request, "Gmail API").await?;
+    let response = client.execute_builder(request, "Gmail API", replay).await?;
     let status = response.status();
     if status.is_success() {
         return Ok(());

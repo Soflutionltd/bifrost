@@ -49,8 +49,28 @@ pub fn into_account_error_with_throttle_scope(
             attempts,
             may_have_committed,
         } => {
+            // An unreplayable request's only attempt dropped past Unsent. No
+            // earlier attempt exists whose outcome the drop could obscure, so
+            // the terminal's own kind and transmission state are the whole
+            // truth; only the idempotency narrowing is added. Every other
+            // envelope, including the empty-attempt RetryBudgetExhausted one,
+            // must reach the reclassification below: its terminal translates
+            // to an acknowledged Server error, which retries whatever the
+            // idempotency input says.
+            let lone_transport = attempts.is_empty()
+                && matches!(
+                    source.as_ref(),
+                    Error::Network { .. } | Error::Timeout { .. } | Error::Tls { .. }
+                );
             let terminal =
                 into_account_error_with_throttle_scope(*source, ctx.clone(), throttle_scope);
+            if lone_transport {
+                let mut builder = terminal.into_builder();
+                if may_have_committed {
+                    builder = builder.idempotency_override(false);
+                }
+                return finish(builder, &ctx);
+            }
             let rejected_unauthorized: Vec<_> = attempts
                 .iter()
                 .map(|attempt| {
@@ -132,9 +152,35 @@ pub fn into_account_error_with_throttle_scope(
                 }
             }
             if reclassified {
+                // Reclassification changes recovery, not the terminal response's
+                // diagnostic evidence. Preserve its consent tiers and tokens.
+                let diagnostics = terminal.support_consented();
+                builder = builder.status(diagnostics.telemetry.status);
+                if let Some(id) = diagnostics.telemetry.request_id {
+                    builder = builder.request_id(id);
+                }
+                if let Some(id) = diagnostics.telemetry.trace_id {
+                    builder = builder.trace_id(id);
+                }
+                if let Some(code) = diagnostics.telemetry.native_code {
+                    builder = builder.native_code(code);
+                }
+                for text in diagnostics.user_safe_text {
+                    builder = builder.text(DiagnosticText::user_safe(text));
+                }
+                for text in diagnostics.support_text {
+                    builder = builder.text(DiagnosticText::support_only(text));
+                }
                 for cause in terminal.chain().iter() {
                     builder = builder.push_cause(cause.clone());
                 }
+            }
+            // A request that was not replayable may have reached the server.
+            // A blind same-request retry of the logical operation would replay
+            // it, so derive must see it as non-idempotent whatever the
+            // operation table says. The override only ever narrows.
+            if may_have_committed {
+                builder = builder.idempotency_override(false);
             }
             finish(builder, &ctx)
         }
@@ -185,6 +231,9 @@ pub fn into_account_error_with_throttle_scope(
                 for cause in error.chain().iter() {
                     builder = builder.push_cause(cause.clone());
                 }
+            }
+            if may_have_committed {
+                builder = builder.idempotency_override(false);
             }
             builder = builder.text(DiagnosticText::support_only(diagnostics));
             if let Some(scope) = throttle_scope {

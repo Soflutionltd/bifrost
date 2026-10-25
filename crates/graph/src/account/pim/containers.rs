@@ -253,7 +253,12 @@ pub(crate) async fn container_create(
     };
     let folder: GraphMailFolder = account
         .client
-        .post(Resource::Outlook, &path, &json!({ "displayName": name }))
+        .post(
+            Resource::Outlook,
+            &path,
+            &json!({ "displayName": name }),
+            bifrost_net::ReplayPolicy::Never,
+        )
         .await
         .map_err(|e| {
             into_account_error(
@@ -278,7 +283,12 @@ pub(crate) async fn container_rename(
     );
     account
         .client
-        .patch(Resource::Outlook, &path, &json!({ "displayName": name }))
+        .patch(
+            Resource::Outlook,
+            &path,
+            &json!({ "displayName": name }),
+            bifrost_net::ReplayPolicy::Idempotent,
+        )
         .await
         .map_err(|e| {
             into_account_error(
@@ -305,6 +315,7 @@ pub(crate) async fn container_move(
             Resource::Outlook,
             &path,
             &json!({ "destinationId": destination_id }),
+            bifrost_net::ReplayPolicy::Never,
         )
         .await
         .map_err(|e| {
@@ -324,7 +335,7 @@ pub(crate) async fn container_delete(
     );
     account
         .client
-        .delete(Resource::Outlook, &path)
+        .delete(Resource::Outlook, &path, bifrost_net::ReplayPolicy::Never)
         .await
         .map_err(|e| {
             into_account_error(

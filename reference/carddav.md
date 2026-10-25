@@ -3,12 +3,10 @@
 DAV generic net translation explicitly passes account throttle scope, matching
 the DAV status ladder.
 
-Request replay safety is not inferred from the enclosing operation.
-`ContactUpdate` includes relocation, whose MOVE and conditional create-PUT legs
-are explicitly unreplayable. The error overrides on those legs and on a
-partially completed sequence are required even if net is given an operation
-label. Create-PUT already explicitly disables net replay; the HTTP PUT default
-alone would be too permissive.
+Every request declares its `ReplayPolicy` at the call site. Creates and MOVE
+are Never. Conditional updates and versioned deletes require read-back after an
+ambiguous drop; unconditional deletes remain replayable with gone targets absorbed.
+Net narrows possible-commit failures; DAV also stamps its own minted failures.
 
 Current Stage 3 W2 standalone CardDAV account implementation.
 
@@ -789,27 +787,19 @@ the trailing-slash reason it depends on.
 `CardDavCredentials` stays published and unchanged; `to_shared` projects it onto
 the dispatcher's `DavCredentials`.
 
-Replay policy is shared and lives with the dispatcher: `reference/caldav.md`,
-"Which requests are declared unreplayable", is the description. It names the same
-call sites on this side - the create-PUT in `put_vcard` (which is also the copy
-leg of the MOVE fallback) and `DavDispatch::move_resource` - states that
-`If-Match` and unconditional PUTs stay replayable and that DELETE is replayable
-with a gone target absorbed as success (`delete_vcard`, dav-D1), and explains that
-the declaration overrides the `AccountOperation` idempotency table at
-classification as well as suppressing the wire replay, which is what a
-`ContactUpdate`-scoped copy leg or MOVE needs. The third leg of that rule lands
-in this crate's own `account.rs`: `partial_move_error` rebuilds the error through
-a fresh `AccountErrorBuilder`, which carries no override forward, so it re-states
-`.idempotency_override(false)` itself - without it a half-applied move derived
-`Retry(SameRequest)` and the replay create-PUT the destination it had already
-occupied. Pinned here by
-`a_create_put_is_not_replayed_after_a_mid_flight_drop`,
-`a_dropped_delete_replays_and_a_gone_target_is_a_success`,
-`a_dropped_relocate_move_reconciles_rather_than_replaying`,
-`an_if_match_update_put_still_replays_after_a_mid_flight_drop` and the
-`recovery()` assertion in
-`a_contact_move_without_server_move_support_copies_then_deletes`, each the twin
-of a CalDAV test of the same name.
+Replay policy uses the shared net resolver through DAV. Reads use Idempotent,
+create-PUT and MOVE use Never, and other vCard PUTs use
+IdempotentUnlessConditional. Versioned DELETE is Never; unconditional DELETE
+uses IdempotentUnlessConditional and absorbs gone targets. Conditional updates
+must read back after ambiguity rather than replay into a false caller-version
+conflict. Self-fetched validators pay the same accepted read-back cost.
+Net narrows possible-commit failures and `dispatch_once` also stamps DAV-minted
+failures. Ambiguous retryable statuses stop before another write, with 401/429
+refusal handling preserved. DAV's all-401 history exception is defensive and
+unreachable with today's outer credential-refresh walk. Partial-move wrappers
+still declare the whole sequence unreplayable when rebuilding a fresh error.
+Pinned by the create, conditional update, unconditional update, versioned delete,
+gone-target delete and relocate transcript tests in `client.rs`.
 
 The 207 parser and the polling cursor were both collapsed into that shared crate
 too; `reference/caldav.md`, "The 207 parser, collapsed" and "The polling cursor,

@@ -284,3 +284,11 @@ PUBLISHED SURFACE fence apply.
 - A dedupe-bearing stream termination leaves same-round per-item
   SameRequest/AfterAuthRefresh blind retry candidates eligible, as before.
   Whether whole-submission dedupe should suppress these retries needs a ruling.
+
+## JMAP direct PIM set omissions need partial-response classification
+
+Direct calendar/contact update and RSVP paths read `SetResponse::updated`.
+An omitted id becomes `Error::IdNotFound` and then Protocol(MissingField), a
+terminal result without read-back. The bulk path's `set_id_unanswered` is the
+precedent: provider omission does not prove the write failed. This concerns
+first-response omission classification, independently of wire replay policy.

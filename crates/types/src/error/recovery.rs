@@ -450,7 +450,11 @@ pub(crate) fn derive(
         ) => RecoveryClass::ClientBug,
         AccountErrorKind::NotFound(_) => RecoveryClass::ProviderRefused,
         AccountErrorKind::Unsupported(op) => RecoveryClass::Unsupported(*op),
-        AccountErrorKind::Protocol(kind) => derive_protocol(*kind, idempotent),
+        AccountErrorKind::Protocol(kind) => derive_protocol(
+            *kind,
+            idempotent,
+            operation.is_some_and(|op| !op.is_idempotent()),
+        ),
         AccountErrorKind::Internal(_) => derive_internal(tx_state, idempotent),
     }
 }
@@ -859,7 +863,11 @@ fn operator_reason(chain: &CauseChain) -> Option<&str> {
     })
 }
 
-fn derive_protocol(kind: ProtocolErrorKind, idempotent: bool) -> RecoveryClass {
+fn derive_protocol(
+    kind: ProtocolErrorKind,
+    idempotent: bool,
+    may_duplicate: bool,
+) -> RecoveryClass {
     match kind {
         ProtocolErrorKind::ParseFailed
         | ProtocolErrorKind::MissingField
@@ -877,10 +885,14 @@ fn derive_protocol(kind: ProtocolErrorKind, idempotent: bool) -> RecoveryClass {
         ProtocolErrorKind::PartialResponse => RecoveryClass::Reconcile(ReconcileAdvice {
             reason: ReconcileReason::PartialCompletionSignal,
             guidance: ReconcileGuidance {
-                actions: vec![
-                    ReconcileAction::CheckTarget,
-                    ReconcileAction::DedupeByClientId,
-                ],
+                actions: if may_duplicate {
+                    vec![
+                        ReconcileAction::CheckTarget,
+                        ReconcileAction::DedupeByClientId,
+                    ]
+                } else {
+                    vec![ReconcileAction::CheckTarget]
+                },
             },
             retry_hint: None,
             throttle_scope: None,
@@ -897,15 +909,10 @@ fn transient_retry_or_reconcile(
     throttle_scope: Option<ThrottleScope>,
 ) -> RecoveryClass {
     match tx_state {
-        // Only `InFlight` (transport dropped after the request went out, no
-        // response) on a non-idempotent op reconciles: the side effect may
-        // have landed but we have no acknowledgement, so a blind same-request
-        // retry could double-apply. `Acknowledged` is different: the server
-        // returned a complete response, so an ack-then-transient-fail is a
-        // commit-rejection (nothing committed), safe to retry the same
-        // request. This matches reference/error-model.md: `Unsent`/
-        // `Acknowledged`, or `InFlight`+idempotent -> `Retry(SameRequest)`;
-        // `InFlight`+non-idempotent -> `Reconcile`.
+        // Generic acknowledged server failures retry. HTTP responses alone do
+        // not prove refusal: net represents an ambiguous non-replayable status
+        // as PartialResponse with InFlight evidence before reaching this mapper.
+        // Its 401/429 refusal exceptions retain their existing retry behavior.
         TransmissionState::InFlight if !idempotent => RecoveryClass::Reconcile(ReconcileAdvice {
             reason: match reason {
                 RetryReason::RateLimited | RetryReason::QuotaExhausted => {
@@ -1053,9 +1060,8 @@ mod tests {
 
     #[test]
     fn idempotent_inflight_transport_retries() {
-        // SyncChanges is a read; an in-flight transport drop is safely
-        // re-driven. (UpdateFlags used to stand in for "idempotent" here,
-        // but flag writes are now correctly in the non-idempotent set.)
+        // SyncChanges and UpdateFlags are idempotent in the operation table.
+        // This case pins the read default for an in-flight transport drop.
         let recovery = derive(
             &AccountErrorKind::Transport(super::super::kind::TransportErrorKind::Network),
             None,
@@ -1925,5 +1931,60 @@ mod tests {
             .scope(scope)
             .try_build()
             .expect("valid account error classification")
+    }
+    #[test]
+    fn partial_response_dedupe_follows_the_operation_table() {
+        for (op, override_, actions) in [
+            (
+                Some(AccountOperation::UpdateFlags),
+                Some(false),
+                vec![ReconcileAction::CheckTarget],
+            ),
+            (
+                Some(AccountOperation::Send),
+                None,
+                vec![
+                    ReconcileAction::CheckTarget,
+                    ReconcileAction::DedupeByClientId,
+                ],
+            ),
+            (
+                Some(AccountOperation::BulkDestroy),
+                None,
+                vec![
+                    ReconcileAction::CheckTarget,
+                    ReconcileAction::DedupeByClientId,
+                ],
+            ),
+            (None, Some(false), vec![ReconcileAction::CheckTarget]),
+        ] {
+            let recovery = derive(
+                &AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+                None,
+                op,
+                &chain(Cause::Attempt(crate::error::AttemptCause::new(
+                    TransmissionState::InFlight,
+                ))),
+                None,
+                override_,
+            );
+            let RecoveryClass::Reconcile(advice) = recovery else {
+                panic!("{recovery:?}")
+            };
+            assert_eq!(advice.guidance.actions, actions);
+        }
+        assert!(matches!(
+            derive(
+                &AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+                None,
+                Some(AccountOperation::UpdateFlags),
+                &chain(Cause::Attempt(crate::error::AttemptCause::new(
+                    TransmissionState::InFlight
+                ))),
+                None,
+                None
+            ),
+            RecoveryClass::Retry(_)
+        ));
     }
 }

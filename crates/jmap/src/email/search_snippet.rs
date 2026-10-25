@@ -42,6 +42,7 @@ pub(crate) struct SearchSnippetGetResponse {
 }
 
 impl crate::core::method::JmapMethod for SearchSnippetGetRequest {
+    const REPLAY_SAFE: bool = true;
     const NAME: &'static str = "SearchSnippet/get";
     type Cap = crate::core::capability::Mail;
     type Response = SearchSnippetGetResponse;

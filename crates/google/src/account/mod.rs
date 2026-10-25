@@ -1810,3 +1810,137 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod replay_policy_tests {
+    use crate::client::GmailClient;
+    use bifrost_net::StaticTokenSource;
+    use bifrost_net::test_support::{Canned, ScriptedDispatch, canned};
+    use bifrost_types::{AccountOperation, EventId, EventPatch};
+    use std::sync::Arc;
+    fn dropped() -> Canned {
+        Canned::Error(bifrost_net::Error::Network {
+            message: "lost".into(),
+            transmission_state: bifrost_types::TransmissionState::InFlight,
+            source: None,
+        })
+    }
+    fn fixture(replies: Vec<Canned>) -> (Arc<GmailClient>, Arc<ScriptedDispatch>) {
+        let script = ScriptedDispatch::new(replies);
+        let mut policy = bifrost_net::RetryPolicy::default();
+        policy.max_attempts = 2;
+        policy.initial_backoff = std::time::Duration::ZERO;
+        policy.max_backoff = std::time::Duration::ZERO;
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            bifrost_net::NetConfig::default(),
+            vec![],
+            Arc::new(StaticTokenSource::new("token", None)),
+            policy,
+        );
+        (
+            Arc::new(GmailClient::with_account_net("https://gmail.test", net)),
+            script,
+        )
+    }
+    #[tokio::test]
+    async fn gmail_label_modify_replays_after_a_drop() {
+        let (client, script) = fixture(vec![
+            dropped(),
+            canned(reqwest::StatusCode::OK, br#"{"id":"m1","threadId":"t1"}"#),
+        ]);
+        client
+            .modify_message("m1", &["STARRED".into()], &[])
+            .await
+            .unwrap();
+        assert_eq!(script.requests().len(), 2);
+    }
+    #[tokio::test]
+    async fn people_update_reconciles_after_a_drop() {
+        let (client, script) = fixture(vec![canned(reqwest::StatusCode::OK, br#"{"resourceName":"people/c1","metadata":{"sources":[{"type":"CONTACT","id":"c1","etag":"v1"}]}}"#), dropped(), canned(reqwest::StatusCode::OK, b"{}")]);
+        let patch = bifrost_types::ContactPatch {
+            display_name: Some(Some("New".into())),
+            ..Default::default()
+        };
+        let error = crate::account::contacts::update(
+            client,
+            bifrost_types::ContactId("people/c1".into()),
+            patch,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.recovery().requires_reconciliation(), "{error:?}");
+        assert_eq!(
+            script
+                .requests()
+                .iter()
+                .filter(|r| r.method == reqwest::Method::PATCH)
+                .count(),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn calendar_delete_is_not_replayed_after_a_drop() {
+        let (client, script) = fixture(vec![
+            dropped(),
+            canned(reqwest::StatusCode::NO_CONTENT, b""),
+        ]);
+        let error = crate::account::calendar::delete_if_version(
+            client,
+            EventId("primary::e1".into()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.recovery().requires_reconciliation());
+        assert_eq!(script.requests().len(), 1);
+    }
+    #[tokio::test]
+    async fn calendar_event_writes_are_not_replayed_after_a_drop() {
+        for rsvp in [false, true] {
+            let mut replies = Vec::new();
+            if rsvp {
+                replies.push(canned(reqwest::StatusCode::OK, br#"{"id":"e1","attendees":[{"email":"me@example.test","self":true,"responseStatus":"needsAction"}]}"#));
+            }
+            replies.extend([dropped(), canned(reqwest::StatusCode::OK, b"{}")]);
+            let (client, script) = fixture(replies);
+            let result = if rsvp {
+                crate::account::calendar::rsvp(
+                    client,
+                    "me@example.test".into(),
+                    EventId("primary::e1".into()),
+                    bifrost_types::RsvpStatus::Accepted,
+                )
+                .await
+            } else {
+                crate::account::calendar::update(
+                    client,
+                    EventId("primary::e1".into()),
+                    EventPatch {
+                        title: Some(Some("new".into())),
+                        ..Default::default()
+                    },
+                )
+                .await
+            };
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.operation(),
+                Some(if rsvp {
+                    AccountOperation::EventRsvp
+                } else {
+                    AccountOperation::EventUpdate
+                })
+            );
+            assert!(error.recovery().requires_reconciliation());
+            assert_eq!(
+                script
+                    .requests()
+                    .iter()
+                    .filter(|r| r.method == reqwest::Method::PATCH)
+                    .count(),
+                1
+            );
+        }
+    }
+}

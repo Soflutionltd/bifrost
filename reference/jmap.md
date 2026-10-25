@@ -6,12 +6,14 @@ absolute dates remain in response headers for error recovery. SSE redirect
 excerpts probe beyond the shared cap to identify truncation; read failures
 retain a separate marker, including when the prefix exactly fills the cap.
 
-The reqwest transport receives serialized bytes, not `AccountOperation`.
-Net conservatively refuses in-flight replay of API POSTs. A POST may batch
-reads with creates, sends and updates, so one enclosing operation label
-cannot prove the batch replayable. Logical recovery may still retry an
-idempotent operation; widening transport replay requires payload-aware
-caller context for every method call.
+Every request declares its `ReplayPolicy`; the table lives at the call sites.
+Typed batches are Idempotent iff all methods declare REPLAY_SAFE. All writes,
+including unguarded update-only sets, are Never because side effects and
+sequential patches do not compose safely on replay. An unanswered guarded
+Email/set id reconciles, including internally probed ifInState; unguarded ids
+retain retry advice. Non-replayable requests stop on the first ambiguous status
+or in-flight drop. 401/429 refusal retries remain. [503, 200 stateMismatch]
+stops at 503 and reconciles; a genuine first-response conflict stays a conflict.
 
 Current architecture of the JMAP implementation crate. The only external surface is `bifrost_jmap::sync` (account factory + config types). The protocol client, typed wire objects, transport, method macros, error type, and helper facade are crate-internal.
 
@@ -815,7 +817,7 @@ short batch cannot be held to end-of-input by a busy one; the wait is capped
 at the same input volume a full batch already accepts. A route holding only
 locally-rejected targets emits them without probing Email state.
 
-`IdempotencyKey` is a wire no-op, so replay safety stays `None` (read-back observes current state; eligible targets may reassert within bounds). Per-id outcomes flow from `SetResponse::updated`/`destroyed`; an id the server names in neither the success nor error collection becomes `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so idempotent flag work retries and possibly-applied moves/destroys reconcile rather than being fabricated as `NotFound`. A `stateMismatch` surviving retry emits `Failed(ConcurrencyConflict)`; real per-id set errors map through `classify_set_item`. Empty additive/subtractive flag operations, wholly empty patches, and patches naming the same flag in both sets are rejected up front as `Terminated(Request(Malformed))` rather than transmitting empty patches. `bulk_move` accepts only `MembershipScope::Mailbox`.
+`IdempotencyKey` is a wire no-op, so replay safety stays `None` (read-back observes current state; eligible targets may reassert within bounds). Per-id outcomes flow from `SetResponse::updated`/`destroyed`; an id the server names in neither the success nor error collection becomes `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so unguarded idempotent flag work retries, guarded flag work reconciles with CheckTarget only, and possibly-applied moves/destroys reconcile rather than being fabricated as `NotFound`. A `stateMismatch` surviving retry emits `Failed(ConcurrencyConflict)`; real per-id set errors map through `classify_set_item`. Empty additive/subtractive flag operations, wholly empty patches, and patches naming the same flag in both sets are rejected up front as `Terminated(Request(Malformed))` rather than transmitting empty patches. `bulk_move` accepts only `MembershipScope::Mailbox`.
 
 ### PIM primitives and conveniences
 

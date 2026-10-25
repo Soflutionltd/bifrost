@@ -315,7 +315,13 @@ async fn cancel_upload_session(client: &GmailClient, upload_url: &str) -> Sessio
         .follow_redirects(bifrost_net::FollowRedirects::Disabled)
         .retry(bifrost_net::RetryPolicy::disabled())
         .timeout(GDRIVE_CANCEL_TIMEOUT);
-    let outcome = client.execute_builder(request, "Drive API").await;
+    let outcome = client
+        .execute_builder(
+            request,
+            "Drive API",
+            bifrost_net::ReplayPolicy::IdempotentUnlessConditional,
+        )
+        .await;
 
     match outcome {
         // An unfollowed 3xx is not Drive accepting the cancel.
@@ -352,7 +358,9 @@ async fn create_upload_session(
         .header("X-Upload-Content-Type", meta.mime.as_str())
         .header("X-Upload-Content-Length", &meta.size.to_string())
         .json(&metadata);
-    let response = client.execute_builder(request, "Drive API").await?;
+    let response = client
+        .execute_builder(request, "Drive API", bifrost_net::ReplayPolicy::Never)
+        .await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -480,7 +488,9 @@ async fn upload_file_chunked(
             .follow_redirects(bifrost_net::FollowRedirects::Disabled)
             .header("Content-Range", &content_range)
             .body(chunk);
-        let response = client.execute_builder(request, "Drive API").await?;
+        let response = client
+            .execute_builder(request, "Drive API", bifrost_net::ReplayPolicy::Idempotent)
+            .await?;
 
         let status = response.status().as_u16();
         if response.status().is_redirection() && response.headers.contains_key("location") {
@@ -604,7 +614,9 @@ async fn create_sharing_permission(
 ) -> Result<String, Error> {
     let file_id = bifrost_net::url::encode_path_component(file_id);
     let path = format!("https://www.googleapis.com/drive/v3/files/{file_id}/permissions?fields=id");
-    let _perm: serde::de::IgnoredAny = client.post(&path, body).await?;
+    let _perm: serde::de::IgnoredAny = client
+        .post(&path, body, bifrost_net::ReplayPolicy::Never)
+        .await?;
 
     let link_path =
         format!("https://www.googleapis.com/drive/v3/files/{file_id}?fields=webViewLink");

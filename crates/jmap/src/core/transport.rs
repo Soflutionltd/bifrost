@@ -191,6 +191,7 @@ pub(crate) trait HttpTransport: Send + Sync + 'static {
         &self,
         url: &str,
         body: Vec<u8>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> impl Future<Output = Result<Bytes, TransportError>> + Send;
 
     /// Send a JMAP API request, also reporting the inbound payload
@@ -207,9 +208,10 @@ pub(crate) trait HttpTransport: Send + Sync + 'static {
         &self,
         url: &str,
         body: Vec<u8>,
+        replay: bifrost_net::ReplayPolicy,
     ) -> impl Future<Output = Result<(Bytes, u64), TransportError>> + Send {
         async move {
-            let bytes = self.api_request(url, body).await?;
+            let bytes = self.api_request(url, body, replay).await?;
             let measured = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             Ok((bytes, measured))
         }

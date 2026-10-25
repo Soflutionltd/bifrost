@@ -31,6 +31,81 @@ use crate::rate::{RateGeneration, RateLimitGovernor};
 use crate::redirect::{FollowRedirects, RedirectAction, RedirectPolicy, classify_redirect};
 use crate::retry::RetryPolicy;
 
+/// Whether the transport may send a request again after bytes of an earlier
+/// attempt may have reached the server.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ReplayPolicy {
+    /// A replay can neither change server state nor change the answer the
+    /// caller reads. Holds whatever headers the request carries: an explicit
+    /// `Idempotent` wins over a precondition.
+    Idempotent,
+    /// Never replay once an attempt may have left the process.
+    Never,
+    /// `Idempotent`, unless the request carries a precondition on a non-safe
+    /// method, in which case `Never`.
+    IdempotentUnlessConditional,
+}
+
+impl ReplayPolicy {
+    /// The default for a request that declares nothing: safe methods (GET,
+    /// HEAD, OPTIONS, TRACE) are `Idempotent`, PUT and DELETE are
+    /// `IdempotentUnlessConditional`, everything else is `Never`.
+    #[must_use]
+    pub fn for_method(method: &reqwest::Method) -> Self {
+        if method.is_safe() {
+            Self::Idempotent
+        } else if matches!(*method, reqwest::Method::PUT | reqwest::Method::DELETE) {
+            Self::IdempotentUnlessConditional
+        } else {
+            Self::Never
+        }
+    }
+
+    /// Resolve the policy against the request as it will be sent.
+    #[must_use]
+    pub fn permits_replay(self, method: &reqwest::Method, headers: &HeaderMap) -> bool {
+        match self {
+            Self::Idempotent => true,
+            Self::Never => false,
+            Self::IdempotentUnlessConditional => method.is_safe() || !carries_precondition(headers),
+        }
+    }
+}
+
+/// Whether the request carries a precondition that a replay after its own
+/// committed first attempt would answer as a failure (412).
+///
+/// Deliberately excluded, so nobody adds them by analogy: `If-Modified-Since`
+/// and `If-Range` (defined only for GET/HEAD and range requests, which are
+/// safe), and WebDAV `Overwrite: F` (applies only to MOVE and COPY, which
+/// default to `Never` anyway). `HeaderMap` lookups are case-insensitive.
+fn carries_precondition(headers: &HeaderMap) -> bool {
+    [
+        "if-match",
+        "if-none-match",
+        "if-unmodified-since",
+        "if",
+        "if-schedule-tag-match",
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name))
+}
+
+/// The one replay rule, shared by net's retry loop and callers that walk
+/// their own hops (dav-core): the declared policy, else
+/// [`ReplayPolicy::for_method`], resolved against `method` and `headers`.
+#[must_use]
+pub fn request_is_replayable(
+    declared: Option<ReplayPolicy>,
+    method: &reqwest::Method,
+    headers: &HeaderMap,
+) -> bool {
+    declared
+        .unwrap_or_else(|| ReplayPolicy::for_method(method))
+        .permits_replay(method, headers)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RequestDeadline(Option<tokio::time::Instant>);
 
@@ -305,9 +380,10 @@ struct RequestBuilderInner {
     /// Optional per-request redirect policy override. `None` uses the
     /// account's `AccountSpec::follow_redirects`.
     follow_redirects: Option<FollowRedirects>,
-    /// Caller's override of whether replaying this request can change
-    /// server state. `None` derives it from the HTTP method.
-    idempotent: Option<bool>,
+    /// Caller's declared replay policy. `None` uses
+    /// `ReplayPolicy::for_method`. Reset to `None` when a redirect rewrites
+    /// the method, because the declaration describes the request as written.
+    replay: Option<ReplayPolicy>,
     /// Whether the transport should inject `Authorization: Bearer`.
     /// Some protocol flows use a pre-authenticated upload URL or an
     /// explicit Basic authorization header, but still need the shared
@@ -382,7 +458,7 @@ impl RequestBuilder {
                 retry: None,
                 timeout: None,
                 follow_redirects: None,
-                idempotent: None,
+                replay: None,
                 bearer_auth: true,
                 pending_error: None,
                 bytes_in: None,
@@ -573,37 +649,35 @@ impl RequestBuilder {
         self
     }
 
-    /// Declare whether replaying this request can change server state,
-    /// overriding the method-derived default.
+    /// Declare this request's replay policy, overriding
+    /// [`ReplayPolicy::for_method`]. It describes one wire request, not the
+    /// enclosing account operation.
     ///
-    /// This describes one wire request, not the enclosing account operation.
-    /// An account update can include a MOVE or a conditional create followed
-    /// by deletion; the operation's default cannot prove those legs replayable.
-    /// Conversely a batch POST can mix reads and writes. Callers must establish
-    /// safety for the actual payload before widening the method default.
+    /// The resolved policy gates transport failures and retryable HTTP statuses.
+    /// A 401 or 429 refusal may be retried even when the policy forbids replay.
+    /// An ambiguous terminal outcome retains commit evidence for read-back
+    /// instead of authorizing another write: a non-replayable request that
+    /// received any non-401 answer, or dropped past `Unsent`, carries
+    /// `may_have_committed`, and `into_account_error` then narrows its
+    /// classification to non-idempotent whatever the operation table says.
     ///
-    /// The default is `reqwest::Method::is_idempotent()`, so POST,
-    /// PATCH, and extension methods are treated as unsafe to replay and
-    /// the transport will not retry them once bytes have gone out. Two
-    /// shapes want the override:
-    ///
-    /// - `idempotent(true)` for a read carried over POST. JMAP's single
-    ///   `/jmap/api` endpoint is the standing example: a request whose
-    ///   method calls are all `*/get` or `*/query` is safe to replay,
-    ///   and saying so restores transport-level retry for it.
-    /// - `idempotent(false)` for a GET or PUT the caller knows the
-    ///   provider treats as an action rather than a read or an
-    ///   absolute-state write.
-    ///
-    /// This does not affect retries driven by a status RESPONSE (5xx,
-    /// 429). A complete response is `Acknowledged` evidence that the
-    /// server is reporting it did not do the work, which the shared
-    /// error model already treats as replayable regardless of
-    /// idempotency. Only the transport-failure path consults this.
+    /// The declaration is dropped when a redirect rewrites the method (a
+    /// 301/302/303 POST becoming a GET); the new method's default applies.
     #[must_use]
-    pub fn idempotent(mut self, idempotent: bool) -> Self {
-        self.inner.idempotent = Some(idempotent);
+    pub fn replay(mut self, policy: ReplayPolicy) -> Self {
+        self.inner.replay = Some(policy);
         self
+    }
+
+    /// Compatibility spelling for [`Self::replay`]: `true` declares
+    /// [`ReplayPolicy::Idempotent`], `false` declares [`ReplayPolicy::Never`].
+    #[must_use]
+    pub fn idempotent(self, idempotent: bool) -> Self {
+        self.replay(if idempotent {
+            ReplayPolicy::Idempotent
+        } else {
+            ReplayPolicy::Never
+        })
     }
 
     /// Disable automatic bearer-token injection for this request.
@@ -803,17 +877,18 @@ impl StreamingResponse {
 pub(crate) struct AttemptEvidence {
     attempts: Vec<Error>,
     may_have_committed: bool,
+    unreplayable_terminal: bool,
 }
 
 impl AttemptEvidence {
     pub(crate) fn finish(self, source: Error) -> Error {
-        if self.attempts.is_empty() {
+        if self.attempts.is_empty() && !self.unreplayable_terminal {
             return source;
         }
         Error::AttemptHistory {
             source: Box::new(source),
             attempts: self.attempts,
-            may_have_committed: self.may_have_committed,
+            may_have_committed: self.may_have_committed || self.unreplayable_terminal,
         }
     }
 
@@ -948,7 +1023,7 @@ pub(crate) async fn send_streaming_inner(
         retry,
         timeout,
         follow_redirects: redirect_override,
-        idempotent,
+        mut replay,
         bearer_auth,
         pending_error,
         bytes_in: caller_bytes_in,
@@ -1046,6 +1121,7 @@ pub(crate) async fn send_streaming_inner(
     // across method rewrites so a held replacement GET cannot authorize
     // replaying the original operation.
     let mut may_have_committed = false;
+    let mut unreplayable_terminal = false;
     let mut pending_response = None;
     let outcome = async {
         'outer: loop {
@@ -1055,7 +1131,7 @@ pub(crate) async fn send_streaming_inner(
             // can rewrite the method: RFC 7231 section 6.4 turns a 301/302/303 on a
             // POST into a GET, and the GET that results is replayable even
             // though the request the caller wrote was not.
-            let replayable = idempotent.unwrap_or_else(|| method.is_idempotent());
+            let replayable = request_is_replayable(replay, &method, &headers);
             // Acquire a rate-limit slot. No-op if no host is configured.
             // Surfaces `Error::CostExceedsBurst` if the caller asked for
             // more units than the host's bucket can ever hold; that is a
@@ -1188,6 +1264,9 @@ pub(crate) async fn send_streaming_inner(
                         deadline.sleep(delay).await?;
                         continue;
                     }
+                    if !replayable && left_the_process(&e) {
+                        unreplayable_terminal = true;
+                    }
                     return Err(e);
                 }
             };
@@ -1249,13 +1328,18 @@ pub(crate) async fn send_streaming_inner(
                     if let Some(ra) = retry_after {
                         retry_after_history.push(ra);
                     }
-                    if attempt >= policy.max_attempts {
+                    if attempt >= policy.max_attempts
+                        || !status_error_is_replayable(status, replayable)
+                    {
                         pending_response = None;
                         if status == StatusCode::TOO_MANY_REQUESTS {
                             return Err(Error::RateLimited {
                                 retry_after: retry_after_history.last().copied(),
                                 final_response: evidence,
                             });
+                        }
+                        if !replayable && status != StatusCode::UNAUTHORIZED {
+                            unreplayable_terminal = true;
                         }
                         return Err(Error::RetryBudgetExhausted {
                             final_response: Some(evidence),
@@ -1395,6 +1479,9 @@ pub(crate) async fn send_streaming_inner(
                                 if let Some(debit) = rate_debit.as_ref() {
                                     debit.refund_acknowledged();
                                 }
+                                if step.next_method != method {
+                                    replay = None;
+                                }
                                 method = step.next_method;
                                 url = step.next_url;
                                 if !step.preserve_body {
@@ -1489,6 +1576,7 @@ pub(crate) async fn send_streaming_inner(
     let evidence = AttemptEvidence {
         attempts: prior_attempts,
         may_have_committed,
+        unreplayable_terminal,
     };
     match outcome {
         Ok(mut response) => {
@@ -1545,25 +1633,43 @@ fn build_reqwest(
     req
 }
 
+/// Whether a retry-candidate status may be followed by another attempt.
+///
+/// A selected status is only a retry candidate. Authentication and rate-limit
+/// refusals establish that the attempted work was refused; a generic 5xx does not,
+/// because a gateway 502/503/504 can follow a commit.
+fn status_error_is_replayable(status: StatusCode, replayable: bool) -> bool {
+    replayable
+        || matches!(
+            status,
+            StatusCode::UNAUTHORIZED | StatusCode::TOO_MANY_REQUESTS
+        )
+}
+
+/// Whether a transport failure happened after bytes of the attempt may have
+/// left the process: the complement of the `Unsent` half of
+/// [`transport_error_is_replayable`].
+fn left_the_process(error: &Error) -> bool {
+    match error {
+        Error::Network {
+            transmission_state, ..
+        }
+        | Error::Tls {
+            transmission_state, ..
+        }
+        | Error::Timeout { transmission_state } => *transmission_state != TransmissionState::Unsent,
+        _ => false,
+    }
+}
+
 /// Whether a transport failure may be replayed on the wire.
 ///
 /// Two conditions make a replay safe, and either suffices: nothing was
-/// transmitted, or transmitting it again cannot change server state.
-/// Past `Unsent` on a non-idempotent request the side effect may
-/// already have landed - `send_error_to_error` classifies other
-/// non-connect, non-timeout reqwest failures as
-/// `Network { InFlight }`, which is precisely the "may have landed"
-/// evidence - and a blind replay is how one Gmail `messages/send`
-/// becomes two delivered messages, or one JMAP `Email/set` create
-/// becomes two drafts.
-///
-/// Refusing the replay is not the end of the retry story. The error
-/// surfaces to `into_account_error_with_throttle_scope`, which has the
-/// caller's real `AccountOperation` and routes `InFlight` + non-idempotent to
-/// `Reconcile(TransportDropAfterSend)` and `InFlight` + idempotent to
-/// `Retry(SameRequest)`. The decision moves up to the layer that knows
-/// what the request meant, instead of being taken three times by a
-/// layer that only knows it is holding bytes.
+/// transmitted, or the resolved replay policy says transmitting it again
+/// cannot change server state or the answer. A terminal unreplayable drop
+/// past `Unsent` retains commit evidence (`AttemptHistory` with
+/// `may_have_committed`), so classification requires read-back even under
+/// an idempotent logical operation.
 ///
 /// A variant carrying no transmission evidence is not replayable here:
 /// `InvalidRequest` and the rest are local failures a retry cannot fix.
@@ -1964,6 +2070,7 @@ mod tests {
 
         let response = account
             .post("https://retry.test/resource")
+            .replay(ReplayPolicy::Idempotent)
             .body(Bytes::from_static(b"payload"))
             .send()
             .await
@@ -2051,7 +2158,7 @@ mod tests {
         };
 
         assert!(matches!(
-            error,
+            error.terminal(),
             Error::Network {
                 transmission_state: TransmissionState::InFlight,
                 ..
@@ -2062,6 +2169,7 @@ mod tests {
             1,
             "exactly one wire attempt; the reconcile decision belongs to the caller"
         );
+        assert_commit_envelope(&error);
     }
 
     /// `Unsent` is the other half of the rule: nothing reached the
@@ -2193,17 +2301,16 @@ mod tests {
             panic!("the override wins over the method default");
         };
 
-        assert!(matches!(error, Error::Network { .. }));
+        assert!(matches!(error.terminal(), Error::Network { .. }));
         assert_eq!(script.requests().len(), 1);
+        assert_commit_envelope(&error);
     }
 
-    /// A status RESPONSE is `Acknowledged` evidence that the server is
-    /// reporting it did not do the work, which the shared error model
-    /// treats as replayable regardless of idempotency. Idempotency must
-    /// not leak into that branch and turn every 503 on a POST into an
-    /// immediate failure.
+    /// A 503 can follow a commit, so it is only a retry candidate: the
+    /// resolved replay policy decides. A POST the caller declared
+    /// `Idempotent` (a read carried over POST) keeps its status retry.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn a_503_on_a_post_still_retries() {
+    async fn a_503_on_an_explicitly_idempotent_post_still_retries() {
         let script = ScriptedDispatch::new([
             canned(StatusCode::SERVICE_UNAVAILABLE, b"try again"),
             canned(StatusCode::OK, b"recovered"),
@@ -2212,10 +2319,11 @@ mod tests {
 
         let response = account
             .post("https://send.test/messages/send")
+            .replay(ReplayPolicy::Idempotent)
             .body(Bytes::from_static(b"payload"))
             .send()
             .await
-            .expect("status-driven retry is unchanged by the idempotency rule");
+            .expect("an explicitly replayable POST can retry an ambiguous status");
 
         assert_eq!(response.body, Bytes::from_static(b"recovered"));
         assert_eq!(script.requests().len(), 2);
@@ -3783,5 +3891,460 @@ mod tests {
             .expect("throttle is not body inactivity");
         assert_eq!(response.body.len(), 20);
         assert_eq!(started.elapsed(), Duration::from_secs(1));
+    }
+    #[test]
+    fn replay_policy_resolves_methods_preconditions_and_explicit_declarations() {
+        use reqwest::Method;
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::TRACE,
+            Method::PUT,
+            Method::DELETE,
+            Method::POST,
+            Method::PATCH,
+            Method::from_bytes(b"MOVE").unwrap(),
+        ] {
+            for header in [
+                None,
+                Some("If-Match"),
+                Some("If-None-Match"),
+                Some("If-Unmodified-Since"),
+                Some("If"),
+                Some("If-Schedule-Tag-Match"),
+                Some("If-Modified-Since"),
+                Some("If-Range"),
+                Some("Overwrite"),
+            ] {
+                let mut headers = HeaderMap::new();
+                if let Some(header) = header {
+                    headers.insert(
+                        HeaderName::from_bytes(header.as_bytes()).unwrap(),
+                        HeaderValue::from_static("value"),
+                    );
+                }
+                let conditional = matches!(
+                    header,
+                    Some(
+                        "If-Match"
+                            | "If-None-Match"
+                            | "If-Unmodified-Since"
+                            | "If"
+                            | "If-Schedule-Tag-Match"
+                    )
+                );
+                assert_eq!(
+                    request_is_replayable(None, &method, &headers),
+                    method.is_safe()
+                        || ((method == Method::PUT || method == Method::DELETE) && !conditional)
+                );
+                assert!(request_is_replayable(
+                    Some(ReplayPolicy::Idempotent),
+                    &method,
+                    &headers
+                ));
+                assert!(!request_is_replayable(
+                    Some(ReplayPolicy::Never),
+                    &method,
+                    &headers
+                ));
+                assert_eq!(
+                    request_is_replayable(
+                        Some(ReplayPolicy::IdempotentUnlessConditional),
+                        &method,
+                        &headers
+                    ),
+                    method.is_safe() || !conditional
+                );
+            }
+        }
+    }
+
+    fn assert_commit_envelope(error: &Error) {
+        assert!(
+            matches!(error, Error::AttemptHistory { attempts, may_have_committed: true, .. } if attempts.is_empty()),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_conditional_put_is_not_replayed_after_an_in_flight_drop() {
+        for conditional in [false, true] {
+            let script = ScriptedDispatch::new([in_flight_reset(), canned(StatusCode::OK, b"ok")]);
+            let account =
+                scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+            let mut request = account.put("https://replay.test/resource");
+            if conditional {
+                request = request.header("If-Match", "v1");
+            }
+            let result = request.send().await;
+            assert_eq!(script.requests().len(), if conditional { 1 } else { 2 });
+            if conditional {
+                let error = result.err().unwrap();
+                assert_commit_envelope(&error);
+                assert!(matches!(
+                    error.terminal(),
+                    Error::Network {
+                        transmission_state: TransmissionState::InFlight,
+                        ..
+                    }
+                ));
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_method_rewriting_redirect_restores_the_method_default() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::LOCATION,
+            HeaderValue::from_static("/result"),
+        );
+        let script = ScriptedDispatch::new([
+            Canned::Response {
+                status: StatusCode::SEE_OTHER,
+                headers,
+                body: Bytes::new(),
+            },
+            in_flight_reset(),
+            canned(StatusCode::OK, b"ok"),
+        ]);
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+        account
+            .post("https://replay.test/action")
+            .replay(ReplayPolicy::Never)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(script.requests().len(), 3);
+        assert_eq!(script.requests()[1].method, reqwest::Method::GET);
+    }
+
+    #[test]
+    fn status_replay_obeys_policy_except_proven_refusals() {
+        for code in [401, 429, 409, 500, 502, 503, 504, 599] {
+            let status = StatusCode::from_u16(code).unwrap();
+            assert!(status_error_is_replayable(status, true));
+            assert_eq!(
+                status_error_is_replayable(status, false),
+                matches!(code, 401 | 429)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_single_exhausted_status_on_an_unreplayable_request_is_wrapped() {
+        for (status, replay) in [
+            (StatusCode::SERVICE_UNAVAILABLE, None),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(ReplayPolicy::Idempotent),
+            ),
+            (StatusCode::TOO_MANY_REQUESTS, None),
+        ] {
+            let script = ScriptedDispatch::new([canned(status, b"refused")]);
+            let account = scripted_account(
+                &script,
+                NetConfig::default(),
+                Vec::new(),
+                RetryPolicy::disabled(),
+            );
+            let mut request = account.post("https://replay.test/action");
+            if let Some(policy) = replay {
+                request = request.replay(policy);
+            }
+            let error = request.send().await.err().unwrap();
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                assert!(matches!(error, Error::RateLimited { .. }));
+            } else if replay.is_some() {
+                assert!(matches!(error, Error::RetryBudgetExhausted { .. }));
+            } else {
+                assert_commit_envelope(&error);
+                assert!(
+                    matches!(error.terminal(), Error::RetryBudgetExhausted { final_response: Some(r), .. } if r.status == status),
+                    "{error:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ambiguous_status_retries_obey_the_resolved_request_policy() {
+        for code in [500, 502, 503, 504, 599, 409] {
+            for (method, declared, conditional) in [
+                (reqwest::Method::POST, Some(ReplayPolicy::Never), false),
+                (reqwest::Method::POST, None, false),
+                (reqwest::Method::PUT, None, true),
+                (reqwest::Method::DELETE, None, true),
+                (
+                    reqwest::Method::PUT,
+                    Some(ReplayPolicy::IdempotentUnlessConditional),
+                    true,
+                ),
+                (
+                    reqwest::Method::DELETE,
+                    Some(ReplayPolicy::IdempotentUnlessConditional),
+                    true,
+                ),
+                (reqwest::Method::GET, Some(ReplayPolicy::Never), false),
+            ] {
+                for control in [false, true] {
+                    let status = StatusCode::from_u16(code).unwrap();
+                    let mut headers = HeaderMap::new();
+                    headers.insert("request-id", HeaderValue::from_static("replay-test"));
+                    headers.insert(
+                        RETRY_AFTER,
+                        HeaderValue::from_static(if control { "0" } else { "60" }),
+                    );
+                    let script = ScriptedDispatch::new([
+                        Canned::Response {
+                            status,
+                            headers,
+                            body: Bytes::from_static(b"ambiguous"),
+                        },
+                        canned(StatusCode::OK, b"ok"),
+                    ]);
+                    let mut policy = two_attempts();
+                    policy.statuses.push(status);
+                    let account =
+                        scripted_account(&script, NetConfig::default(), Vec::new(), policy);
+                    let mut request = account
+                        .request(method.clone(), "https://replay.test/resource")
+                        .timeout(Duration::from_secs(1));
+                    if let Some(policy) = declared {
+                        request = request.replay(policy);
+                    }
+                    if conditional {
+                        request = request.header("If-Match", "v1");
+                    }
+                    if control {
+                        request = request.replay(ReplayPolicy::Idempotent);
+                    }
+                    let started = tokio::time::Instant::now();
+                    let result = request.send().await;
+                    if control {
+                        assert!(result.is_ok());
+                        assert_eq!(script.requests().len(), 2);
+                    } else {
+                        assert_eq!(started.elapsed(), Duration::ZERO);
+                        let error = result.err().unwrap();
+                        assert_commit_envelope(&error);
+                        assert!(
+                            matches!(error.terminal(), Error::RetryBudgetExhausted { final_response: Some(r), retry_after_history } if r.status == status && r.body.as_ref() == b"ambiguous" && r.headers["request-id"] == "replay-test" && retry_after_history == &[Duration::from_secs(60)])
+                        );
+                        assert_eq!(script.requests().len(), 1);
+                        assert_eq!(script.remaining(), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_never_request_still_retries_a_429_refusal() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("0"));
+        let script = ScriptedDispatch::new([
+            Canned::Response {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                headers,
+                body: Bytes::new(),
+            },
+            canned(StatusCode::OK, b"ok"),
+        ]);
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+        account
+            .post("https://replay.test/action")
+            .replay(ReplayPolicy::Never)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(script.requests().len(), 2);
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("60"));
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            headers,
+            body: Bytes::from_static(b"rate refusal"),
+        }]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+        let error = account
+            .post("https://replay.test/action")
+            .replay(ReplayPolicy::Never)
+            .send()
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, Error::RateLimited { retry_after: Some(delay), final_response } if delay == Duration::from_secs(60) && final_response.body.as_ref() == b"rate refusal")
+        );
+    }
+
+    fn classify_replay_error(
+        error: Error,
+        operation: bifrost_types::AccountOperation,
+    ) -> bifrost_types::AccountError {
+        crate::into_account_error_with_throttle_scope(
+            error,
+            crate::NetErrorContext {
+                provider: None,
+                protocol: bifrost_types::error::Protocol::Graph,
+                operation,
+                scope: None,
+            },
+            None,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unreplayable_drop_reconciles_under_an_idempotent_operation() {
+        for control in [false, true] {
+            let script = ScriptedDispatch::new([in_flight_reset(), in_flight_reset()]);
+            let account =
+                scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+            let mut request = account
+                .put("https://replay.test/resource")
+                .header("If-Match", "v1");
+            if control {
+                request = request.replay(ReplayPolicy::Idempotent);
+            }
+            let error = classify_replay_error(
+                request.send().await.err().unwrap(),
+                bifrost_types::AccountOperation::EventUpdate,
+            );
+            if control {
+                assert!(matches!(
+                    error.recovery(),
+                    bifrost_types::RecoveryClass::Retry(_)
+                ));
+            } else {
+                assert!(matches!(
+                    error.kind(),
+                    bifrost_types::AccountErrorKind::Transport(_)
+                ));
+                assert!(
+                    matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.reason == bifrost_types::ReconcileReason::TransportDropAfterSend && a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget])
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_single_exhausted_status_reconciles_under_an_idempotent_operation() {
+        let script = ScriptedDispatch::new([canned(StatusCode::SERVICE_UNAVAILABLE, b"ambiguous")]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+        let error = classify_replay_error(
+            account
+                .post("https://replay.test/action")
+                .send()
+                .await
+                .err()
+                .unwrap(),
+            bifrost_types::AccountOperation::SetIsRead,
+        );
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::PartialResponse
+            )
+        ));
+        assert!(
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget])
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_policy_stopped_status_reconciles_before_a_duplicate_effect() {
+        for operation in [
+            bifrost_types::AccountOperation::EventCreate,
+            bifrost_types::AccountOperation::Send,
+            bifrost_types::AccountOperation::SetIsRead,
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("request-id", HeaderValue::from_static("commit"));
+            let script = ScriptedDispatch::new([
+                Canned::Response {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    headers,
+                    body: Bytes::from_static(b"commit unknown"),
+                },
+                canned(StatusCode::OK, b"duplicate"),
+            ]);
+            let account =
+                scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+            let error = classify_replay_error(
+                account
+                    .post("https://replay.test/action")
+                    .replay(ReplayPolicy::Never)
+                    .send()
+                    .await
+                    .err()
+                    .unwrap(),
+                operation,
+            );
+            let bifrost_types::RecoveryClass::Reconcile(a) = error.recovery() else {
+                panic!("{error:?}")
+            };
+            let expected = if operation == bifrost_types::AccountOperation::SetIsRead {
+                vec![bifrost_types::ReconcileAction::CheckTarget]
+            } else {
+                vec![
+                    bifrost_types::ReconcileAction::CheckTarget,
+                    bifrost_types::ReconcileAction::DedupeByClientId,
+                ]
+            };
+            assert_eq!(a.guidance.actions, expected);
+            assert_eq!(script.requests().len(), 1);
+            assert_eq!(script.remaining(), 1);
+            assert!(
+                error
+                    .support_consented()
+                    .support_text
+                    .iter()
+                    .any(|text| text.contains("commit unknown"))
+            );
+            assert_eq!(error.telemetry_fields().request_id, Some("commit"));
+            assert_eq!(error.telemetry_fields().status, Some(503));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_post_that_may_have_committed_reconciles_under_an_idempotent_operation() {
+        let script = ScriptedDispatch::new([
+            canned(StatusCode::UNAUTHORIZED, b"refresh"),
+            canned(StatusCode::SERVICE_UNAVAILABLE, b"ambiguous"),
+        ]);
+        let account = scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+        let error = account
+            .post("https://replay.test/action")
+            .replay(ReplayPolicy::Never)
+            .send()
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&error, Error::AttemptHistory { attempts, may_have_committed: true, .. } if matches!(attempts.as_slice(), [Error::Status { code: StatusCode::UNAUTHORIZED, .. }]))
+        );
+        assert!(
+            matches!(error.terminal(), Error::RetryBudgetExhausted { final_response: Some(r), .. } if r.status == StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(script.requests().len(), 2);
+        let error = classify_replay_error(error, bifrost_types::AccountOperation::SetIsRead);
+        assert!(
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.reason == bifrost_types::ReconcileReason::PartialCompletionSignal && a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget])
+        );
     }
 }

@@ -32,6 +32,7 @@ pub(crate) struct CopyBlobResponse {
 }
 
 impl crate::core::method::JmapMethod for CopyBlobRequest {
+    const REPLAY_SAFE: bool = false;
     const NAME: &'static str = "Blob/copy";
     type Cap = crate::core::capability::Core;
     type Response = CopyBlobResponse;

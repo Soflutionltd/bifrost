@@ -728,20 +728,8 @@ fn header_name_is_bcc(line: &[u8]) -> bool {
 /// Re-stamp an `AccountError` from the submission boundary with the IMAP
 /// operation that drove it, so recovery/telemetry attribute it correctly.
 ///
-/// Coupling caveat: `into_builder` does NOT preserve builder-only
-/// overrides (`idempotency_override`, `throttle_scope`) per
-/// `reference/error-model.md`. After the round-trip, `derive` recomputes
-/// idempotency from the *operation* via `AccountOperation::is_idempotent`.
-/// This is correct today only because both operations `restamp` is called
-/// with - `Send` and `DraftSend` - are non-idempotent in the central
-/// table, matching what an SMTP `idempotency_override(false)` would have
-/// said. If a future caller passes an idempotent operation here, or if
-/// SMTP ever stamps an `idempotency_override` that disagrees with the
-/// operation's default, this re-stamp would silently drop it. The fix
-/// would be to reapply the override after `into_builder` (it is readable
-/// from the original error's recovery only indirectly), which requires
-/// either an accessor in `bifrost-types` or threading the override
-/// through - out of this crate's scope.
+/// `into_builder` preserves idempotency and throttle overrides. Restamping
+/// changes the operation without discarding the submission boundary's evidence.
 fn restamp(err: AccountError, op: AccountOperation) -> AccountError {
     err.into_builder()
         .operation(op)

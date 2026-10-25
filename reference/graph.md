@@ -3,12 +3,18 @@
 Generic net translation receives `throttle_scope_for` explicitly for REST and EWS.
 Body diagnostics use net's shared byte cap and truncation marker.
 
-The HTTP wire funnel does not receive `AccountOperation`. Net uses its
-method default: PATCH and POST do not replay after an in-flight drop, even
-when logical recovery later permits retry of an idempotent update. Conditional
-PATCH and mixed batch POST need request-specific replay analysis; widening
-all updates from their operation label is insufficient. An If-Match write
-that committed can reject its replay with a stale etag.
+Every request declares its `ReplayPolicy`; the table lives at the call sites.
+Unabsorbed DELETEs and calendar updates are Never; read batches are Idempotent.
+Absolute by-id renames, filter updates and deferred-send timestamps deliberately
+use Idempotent despite the enclosing operation table's conservative default.
+EWS reads are Idempotent; streaming reads disable net network retries so the
+stream worker retains reconnect accounting. Subscribe is Never.
+A non-replayable request stops at its first ambiguous retryable status, with
+401/429 refusal handling preserved. [503, 200 with subrequest 412] stops at 503
+and reconciles; a first-response 200/412 remains a conflict. Missing conditional
+batch answers narrow to CheckTarget-only reconciliation. Context `.idempotent()`
+widening is valid only when every request is declared Idempotent, so it cannot
+undo net's narrowing.
 
 Current architecture of the Graph Account-layer code under
 `crates/graph/src/account/`. Public surface:
@@ -2682,6 +2688,8 @@ exhausted" without them.
 ### Push failure routing
 
 The EWS streaming worker retries locally only for `RecoveryClass::Retry`, at Subscribe, HTTP stream, and classified frame failures. Every other classification is forwarded as `WatchEvent::Terminated` so the sync reconciler can act on engine directives and reconciliation.
+
+One exception, at Subscribe only: a retry-candidate status (5xx or a policy-listed status) that net declined to replay because Subscribe is declared `ReplayPolicy::Never`. It classifies as `Reconcile`, but backing off and resubscribing is its reconciliation (a subscription the failed call may have minted is never polled and lapses server-side), so it takes the `Disconnected` and backoff path (`subscribe_status_stopped_by_replay_policy`). A transport drop past `Unsent` on Subscribe still terminates.
 
 ## Unsupported error construction
 
