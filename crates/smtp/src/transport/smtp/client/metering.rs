@@ -5,9 +5,33 @@ use bifrost_net::{BandwidthBudget, BandwidthDirection, MeterSinkHandle};
 /// Legacy atomic encoding for unlimited bandwidth. Budgets use `None` instead.
 pub const UNLIMITED_BANDWIDTH: u64 = u64::MAX;
 
-// The blocking transport shares this adapter with the Tokio transport.
-// MeteredStream implements Tokio I/O only, so replacing this type would leave
-// blocking admission without its runtime-independent wait and epoch checks.
+// Keep SMTP/LMTP's adapter private to the two network stream implementations.
+// BandwidthBudget and its Reservation own scheduling, grant sizes, epoch
+// validation, conservative offered cancellation and tail-only refunds. This
+// adapter shares those rules and the optional plaintext sink between the
+// published blocking and Tokio transports; it does not own another schedule.
+//
+// The blocking half implements std::io without a Tokio runtime. It uses
+// reserve/offer and sleeps the calling thread in at most one-second slices,
+// rechecking cap and epoch so even an unlimited-then-recapped transition between
+// checks discards the stale slot. Reservation::offer performs the final epoch
+// and readiness validation under the shared budget lock. The polling loop
+// repeats waiter orchestration, not grant pricing or installation policy;
+// blocking_admission_readmits_after_an_unobserved_unlimited_epoch pins it.
+// MeteredStream implements Tokio I/O only and cannot replace this wait path.
+//
+// The Tokio half explicitly admits each read-buffer fill and write before the
+// connection arms its peer timer. Cumulative reply peer time excludes admission,
+// while an absolute setup deadline includes it. A timeout around MeteredStream
+// would include both waits; replacing this adapter must preserve the separate
+// admission phase or move peer timing inside the wrapped stream. AsyncNetworkStream
+// also retains the offered grant and original retry_len across Pending native-tls
+// writes and cap retunes, then finishes and observes only successful plaintext
+// I/O. Both directions allow only one outstanding admission on each stream.
+//
+// A shared blocking admission API could replace the wait loop independently;
+// it would not remove these stream and deadline responsibilities. Reuse alone
+// does not justify moving SMTP's I/O state into the shared Tokio stream wrapper.
 /// Clones share the caller's budget across connections and transport pools.
 #[derive(Clone)]
 pub(crate) struct WireMetering {

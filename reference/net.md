@@ -952,6 +952,54 @@ adapts an attached account's counters for this path. It installs no peer timeout
 polling inner I/O, so a timer implemented inside S starts after admission;
 a caller's timeout around the entire adapter includes admission waiting.
 
+IMAP and SMTP/LMTP deliberately keep their private `WireMetering` adapters in
+`crates/imap/src/connection/wire.rs` and
+`crates/smtp/src/transport/smtp/client/metering.rs`. They already use
+`BandwidthBudget` and `Reservation` for the shared scheduling, bounded offers,
+epoch validation, conservative cancellation and tail-only refunds, and report
+successful plaintext I/O through `MeterSinkHandle`. Sharing that contract does
+not require sharing the byte-stream wrapper.
+
+IMAP admission sits at `WireReader`, above TLS and COMPRESS decoding. At the
+COMPRESS transition its read-ahead can contain a plaintext tagged OK followed
+by compressed bytes. The last read's reservation completion and observation
+wait until parsing identifies the suffix; only the plaintext prefix is finished
+and counted, and the suffix is charged after inflation. `MeteredStream` would
+finish and count the entire successful read before that parser decision, then
+charge the inflated plaintext again. The hermetic
+`bandwidth_compress_coalesced_suffix_is_charged_only_as_plaintext` test pins the
+budget and both observations. IMAP's cloned state also keeps one cumulative
+peer allowance across reader rebuilds and the STARTTLS handshake, spending time
+only after admission and also on cancelled I/O. Its connection-local inbound
+counter survives upgrades and supplies `DriverTask::bytes_in` for account batch
+deltas independently of the optional account sink. An account-wide counter
+cannot replace that observation.
+
+SMTP/LMTP share their adapter between the published blocking and Tokio
+transports. Blocking `std::io` admission uses `reserve`/`offer` and
+`std::thread::sleep`, without requiring a Tokio runtime. Waits are sliced to at
+most one second with cap and epoch checks, including unlimited-then-recapped
+transitions between checks. The final offer still validates readiness and epoch
+under the shared budget lock; the private loop neither prices grants nor
+implements refunds. Its transition handling is pinned by
+`blocking_admission_readmits_after_an_unobserved_unlimited_epoch`. This is
+blocking waiter orchestration that a separate blocking budget API could own;
+it is not a reason to replace the stream adapters. The Tokio stream exposes
+admission separately so connection code can exclude it from cumulative reply
+peer time and per-write timers while including it in absolute setup deadlines.
+It retains an offered grant and the original native-tls write length across
+Pending and cap retunes. These stream and deadline responsibilities remain
+even if the blocking wait loop moves.
+
+Peer timing alone is composable: ManageSieve already wraps `PeerReadTimeout`
+inside `MeteredStream`, excluding admission from its cumulative line or literal
+peer allowance. JMAP WebSocket and ManageSieve both install the account sink
+on `MeteredStream`; their successful traffic is observed as well as admitted.
+Replacing the private IMAP or SMTP adapters therefore addresses no missing
+metering guarantee. Such a redesign must preserve the parser, upgrade,
+connection-counter, deadline, TLS retry and blocking-I/O boundaries above;
+deduplicating wrapper code alone is not its correctness goal.
+
 `BandwidthRegistry` is an injected Arc-shared AccountId-to-Weak map. Lookup and
 insert share one lock. Final budget teardown
 removes its own entry only if the pointer still matches, preserving any

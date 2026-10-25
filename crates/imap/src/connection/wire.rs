@@ -504,9 +504,30 @@ pub(in crate::connection) async fn peer_io<T>(
         .map_err(Error::from)
 }
 
-// This adapter also owns the cumulative peer timeout and defers completion
-// across the COMPRESS boundary until the plaintext prefix length is known.
-// MeteredStream completes at each poll and cannot express that deferred charge.
+// Keep IMAP's metering state private to WireReader. BandwidthBudget and
+// Reservation already own the shared admission, epoch, cancellation and refund
+// rules; this type adds protocol boundary state, not another bandwidth policy.
+//
+// WireReader reads ahead across the COMPRESS tagged OK. Its last reservation
+// and byte observation must remain unfinished until parsing identifies the
+// plaintext prefix: the compressed suffix is passed to the inflater and charged
+// only when its decoded plaintext is read. MeteredStream finishes and observes
+// every successful inner read immediately, below that parser decision, so a
+// direct substitution would charge the raw suffix as well as its plaintext.
+// bandwidth_compress_coalesced_suffix_is_charged_only_as_plaintext pins both
+// the budget charge and the counters at this boundary.
+//
+// Clones also preserve one cumulative PeerBudget across STARTTLS and COMPRESS,
+// including the TLS handshake. peer_io runs after admission and spends elapsed
+// peer time even on cancellation; rebuilding a reader cannot reset it. The
+// separate connection-local inbound counter survives those same upgrades and
+// feeds DriverTask::bytes_in for account batch deltas even without a meter sink.
+// An account-wide sink alone cannot provide that per-connection observation.
+//
+// Peer timing alone does not require a private meter: ManageSieve puts its
+// PeerReadTimeout inside MeteredStream. IMAP additionally needs parser-controlled
+// completion and upgrade-stable state. Replacing this adapter would require a
+// redesign preserving all three, not simply wrapping the underlying stream.
 #[derive(Clone)]
 pub(super) struct WireMetering {
     sink: Option<MeterSinkHandle>,

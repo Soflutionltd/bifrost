@@ -44,17 +44,6 @@ can turn a committed write into a 412 conflict. Caller-versioned deletes now
 share the shape: a versioned DAV delete retried after a dropped response sees
 404 or 412 where the unversioned delete reports success.
 
-## SHARED-009 - The IMAP and SMTP wire meters stay private
-
-**Needs a technical implementation specification** (owner, 2026-10-21): too
-consequential to resolve by ruling.
-
-Residue: JMAP WebSocket and ManageSieve now record into the account meter
-through `MeteredStream`. IMAP's `WireMetering` defers accounting across COMPRESS
-and carries peer-timeout state, and SMTP's also serves blocking I/O with
-runtime-independent admission, so they were kept with comments; collapsing them
-onto the shared stream needs those two behaviours to move into it.
-
 ## SHARED-019 - A proxy 407 maps to `AuthLost`, implying the wrong remedy
 
 Residue: JMAP now classifies net's typed `TunnelError` (407 ->
