@@ -51,14 +51,18 @@ pub struct ImapAccountConfig {
     pub imap: ImapConfig,
     pub credentials: Credentials,
     pub auth_policy: AuthPolicy,
-    /// Data-session sizing input: data checkouts share `max(pool_cap - 1, 1)`
-    /// slots. Dedicated IDLE sessions have a separate budget below; this is
-    /// not a cap on the account's total physical connections.
+    /// Maximum physical IMAP sessions this account holds at once, clamped to
+    /// at least one: pooled data sessions, push (IDLE) sessions, replacement
+    /// dials, and sessions still finishing their LOGOUT. Push capacity is
+    /// carved out of it and never takes the last session, so `pool_cap = 1`
+    /// disables push. SMTP submission, CardDAV/CalDAV and ManageSieve are
+    /// separate protocols and are not counted.
     pub pool_cap: usize,
-    /// Maximum dedicated IDLE sessions used when the server lacks NOTIFY,
-    /// clamped to at least one. Added to the data budget, not drawn from it:
-    /// defaults allow three data plus four IDLE sessions (seven total).
-    /// NOTIFY uses one dedicated IDLE session instead.
+    /// Ceiling on push sessions on a server without NOTIFY, clamped to at
+    /// least one, and further capped at `pool_cap - 1`. Drawn from
+    /// `pool_cap`, not added to it. Defaults to two, which leaves a fully
+    /// pushed default account two data sessions. A NOTIFY server uses one
+    /// push session.
     pub idle_connection_budget: usize,
     pub idle_timeout: Duration,
     pub enable_qresync: bool,
@@ -80,7 +84,7 @@ impl ImapAccountConfig {
             credentials,
             auth_policy,
             pool_cap: 4,
-            idle_connection_budget: 4,
+            idle_connection_budget: 2,
             idle_timeout: Duration::from_secs(29 * 60),
             enable_qresync: false,
             flag_sync_interval: Duration::from_secs(300),
@@ -95,8 +99,22 @@ impl ImapAccountConfig {
         }
     }
 
-    fn data_connection_budget(&self) -> usize {
-        self.pool_cap.saturating_sub(1).max(1)
+    /// The physical session cap the pool enforces: `pool_cap`, at least one.
+    pub(crate) fn session_cap(&self) -> usize {
+        self.pool_cap.max(1)
+    }
+
+    /// Push sessions carved out of `session_cap()`, never its last session:
+    /// at most one with NOTIFY, at most `idle_connection_budget` (at least
+    /// one) without, and zero at a single-session cap. Fixed at open from
+    /// the factory profile's NOTIFY support.
+    pub(crate) fn push_session_capacity(&self, supports_notify: bool) -> usize {
+        let headroom = self.session_cap() - 1;
+        if supports_notify {
+            headroom.min(1)
+        } else {
+            headroom.min(self.idle_connection_budget.max(1))
+        }
     }
 
     pub fn with_bandwidth_meter(mut self, meter: Arc<bifrost_net::BandwidthMeter>) -> Self {
@@ -230,6 +248,7 @@ impl ImapAccountFactory {
                 calendars.as_ref().map(|c| c.capabilities()),
                 submission.is_some(),
                 foreign_namespaces_advertised,
+                cfg.push_session_capacity(profile.supports_notify()),
             );
             let registry = Arc::new(FolderRegistry::from_lists(folders, shared));
             // Built AFTER the registry so the index can be made disjoint from
@@ -246,11 +265,10 @@ impl ImapAccountFactory {
                 &imap_mailboxes,
             );
             dav_degraded.extend(dav_scope_warnings);
-            let data_cap = cfg.data_connection_budget();
             let pool = Arc::new(Pool::new(
                 Arc::clone(&cfg),
                 conn,
-                data_cap,
+                super::pool::production_connector(),
                 meter,
                 bandwidth_budget.clone(),
             ));
@@ -823,23 +841,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn data_and_idle_connection_budgets_are_separate() {
+    fn push_capacity_is_carved_out_of_pool_cap() {
         let mut cfg = ImapAccountConfig::new(
             ImapConfig::plaintext("imap.invalid"),
             Credentials::password("user", "pass"),
             AuthPolicy::default(),
         );
-        assert_eq!(cfg.data_connection_budget(), 3);
-        assert_eq!(
-            cfg.data_connection_budget() + cfg.idle_connection_budget.max(1),
-            7
-        );
-        cfg.pool_cap = 0;
-        assert_eq!(cfg.data_connection_budget(), 1);
-        cfg.pool_cap = 1;
-        assert_eq!(cfg.data_connection_budget(), 1);
-        cfg.pool_cap = 8;
-        assert_eq!(cfg.data_connection_budget(), 7);
+        assert_eq!((cfg.pool_cap, cfg.idle_connection_budget), (4, 2));
+        for (cap, budget, plain, notify) in [
+            (4, 2, 2, 1),
+            (4, 4, 3, 1),
+            (8, 4, 4, 1),
+            (2, 0, 1, 1),
+            (1, 4, 0, 0),
+            (0, 4, 0, 0),
+        ] {
+            cfg.pool_cap = cap;
+            cfg.idle_connection_budget = budget;
+            assert_eq!(cfg.session_cap(), cap.max(1));
+            assert_eq!(cfg.push_session_capacity(false), plain);
+            assert_eq!(cfg.push_session_capacity(true), notify);
+        }
     }
 
     fn bandwidth_config(calendar: bool) -> ImapAccountConfig {

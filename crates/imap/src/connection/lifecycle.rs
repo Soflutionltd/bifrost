@@ -47,10 +47,12 @@ impl ImapConnection {
             timeout,
             None,
             None,
+            &super::LeaseHandoff::none(),
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn connect_with_tls_connector_metered(
         host: &str,
         port: u16,
@@ -59,6 +61,7 @@ impl ImapConnection {
         timeout: Duration,
         meter_sink: Option<bifrost_net::MeterSinkHandle>,
         bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
+        leases: &super::LeaseHandoff,
     ) -> Result<Self, Error> {
         use super::dispatch::CapabilityConsumer;
         use super::driver;
@@ -215,23 +218,24 @@ impl ImapConnection {
         let (state_tx, state_rx) = tokio::sync::watch::channel(proto_state.snapshot());
         let inbound_bytes = wire_reader.metering().inbound_counter();
 
-        let handle = tokio::spawn(driver::driver_task(
-            wire_reader,
-            proto_state,
-            tag_gen,
-            cmd_rx,
-            state_tx,
-            event_sink,
-        ));
+        let driver_task = super::DriverTask::spawn(
+            driver::driver_task(
+                wire_reader,
+                proto_state,
+                tag_gen,
+                cmd_rx,
+                state_tx,
+                event_sink,
+            ),
+            inbound_bytes,
+            leases.take(),
+        );
 
         Ok(Self {
             cmd_tx,
             state_rx,
             events_rx: tokio::sync::Mutex::new(events_rx),
-            driver_handle: std::sync::Arc::new(super::DriverTask::with_inbound_counter(
-                Some(handle),
-                inbound_bytes,
-            )),
+            driver_handle: std::sync::Arc::new(driver_task),
             host: host.to_owned(),
             tls_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 tls_mode.uses_implicit_tls() || tls_mode.uses_starttls(),

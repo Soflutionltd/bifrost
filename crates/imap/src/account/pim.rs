@@ -2067,9 +2067,9 @@ fn leaf_name(account: &ImapAccount, folder: &MailboxName) -> String {
 /// Re-LIST the personal namespace over a connection the caller already holds.
 ///
 /// The connection is a parameter rather than a fresh checkout on purpose: every
-/// caller is mid-mutation and still owns a pooled permit, so acquiring a second
-/// one here would deadlock whenever the in-flight mutations exhaust the pool
-/// cap. LIST is not mailbox-relative, so reusing the mutation's own connection
+/// caller is mid-mutation and still holds a pooled checkout, so acquiring a
+/// second one here would deadlock whenever the in-flight mutations exhaust the
+/// pool cap. LIST is not mailbox-relative, so reusing the mutation's own connection
 /// is safe regardless of what it has selected.
 async fn refresh_folders(
     account: &ImapAccount,

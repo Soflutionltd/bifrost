@@ -16,17 +16,6 @@
 Filed from the October 2026 defect hunt: the imap protocol and imap account
 scopes.
 
-## IMAP-018 - IDLE sessions are still uncounted against `pool_cap`
-
-**Needs a technical implementation specification** (owner, 2026-10-21): too
-consequential to resolve by ruling.
-
-Scope: imap account. Residue: the config docs and reference now state the real
-total (`pool_cap - 1 + idle_connection_budget`). Whether IDLE workers should
-instead draw from a shared session budget, so the footprint stays inside
-`pool_cap` on providers with a low per-user connection limit, is a product
-decision.
-
 ## IMAP-004 - Literals are not emitted incrementally
 
 Residue: FETCH body and binary literals are now `Bytes` slices of the framed

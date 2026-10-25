@@ -324,27 +324,170 @@ pub(crate) struct ImapConnection {
     abandoned: std::sync::atomic::AtomicBool,
 }
 
+/// Values whose lifetime is tied to a driver task's transport (the pool's
+/// session permit, a push slot): released only once the driver future, and
+/// with it the socket, has been destroyed. `retain` and `mark_exited` are
+/// linearized by `state`, and taken values are dropped outside the lock.
+pub(crate) struct DriverExit {
+    state: std::sync::Mutex<ExitState>,
+}
+
+enum ExitState {
+    Running(Vec<Box<dyn Send>>),
+    Exited,
+}
+
+impl DriverExit {
+    fn running(values: Vec<Box<dyn Send>>) -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new(ExitState::Running(values)),
+        })
+    }
+
+    fn exited() -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new(ExitState::Exited),
+        })
+    }
+
+    fn retain(&self, value: Box<dyn Send>) {
+        let mut state = self.state.lock().expect("driver exit lock poisoned");
+        if let ExitState::Running(values) = &mut *state {
+            values.push(value);
+            return;
+        }
+        drop(state);
+        drop(value);
+    }
+
+    fn mark_exited(&self) {
+        let previous = {
+            let mut state = self.state.lock().expect("driver exit lock poisoned");
+            std::mem::replace(&mut *state, ExitState::Exited)
+        };
+        drop(previous);
+    }
+
+    #[cfg(test)]
+    fn has_exited(&self) -> bool {
+        matches!(
+            *self.state.lock().expect("driver exit lock poisoned"),
+            ExitState::Exited
+        )
+    }
+}
+
+/// The future actually spawned for a driver. `inner` is destroyed BEFORE the
+/// exit is published, on completion (inside `poll`) and in `Drop` (abort,
+/// panic unwinding through tokio, runtime teardown). Built outside any async
+/// block, so an abort before the first poll still runs the `Drop` path.
+struct DriverScope<F> {
+    inner: Option<std::pin::Pin<Box<F>>>,
+    exit: Arc<DriverExit>,
+}
+
+impl<F: std::future::Future<Output = ()>> std::future::Future for DriverScope<F> {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let this = self.get_mut();
+        let result = this
+            .inner
+            .as_mut()
+            .expect("driver present")
+            .as_mut()
+            .poll(cx);
+        if result.is_ready() {
+            this.inner = None;
+            this.exit.mark_exited();
+        }
+        result
+    }
+}
+
+impl<F> Drop for DriverScope<F> {
+    fn drop(&mut self) {
+        self.inner = None;
+        self.exit.mark_exited();
+    }
+}
+
+/// Hand-off cell for values that must be owned by a driver from the instant
+/// it is spawned. The pool's dial task keeps one clone until its connector
+/// future has been destroyed; the connector takes the values at spawn time
+/// with no await in between.
+#[derive(Clone)]
+pub(crate) struct LeaseHandoff(Arc<std::sync::Mutex<Vec<Box<dyn Send>>>>);
+
+impl LeaseHandoff {
+    pub(crate) fn new(values: Vec<Box<dyn Send>>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(values)))
+    }
+
+    pub(crate) fn none() -> Self {
+        Self::new(Vec::new())
+    }
+
+    pub(crate) fn take(&self) -> Vec<Box<dyn Send>> {
+        std::mem::take(&mut *self.0.lock().expect("lease handoff lock poisoned"))
+    }
+}
+
 pub(crate) struct DriverTask {
+    exit: Arc<DriverExit>,
     pub(crate) handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     abort_handle: Option<tokio::task::AbortHandle>,
     inbound_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DriverTask {
-    pub(crate) fn new(handle: Option<tokio::task::JoinHandle<()>>) -> Self {
-        Self::with_inbound_counter(handle, Arc::new(std::sync::atomic::AtomicU64::new(0)))
+    /// Spawn `driver` under a `DriverScope` that owns `retained` until the
+    /// driver future has been destroyed. The join handle is still kept:
+    /// close joins the task, and the exit slot proves transport destruction
+    /// without replacing that join.
+    pub(crate) fn spawn<F>(
+        driver: F,
+        inbound_bytes: Arc<std::sync::atomic::AtomicU64>,
+        retained: Vec<Box<dyn Send>>,
+    ) -> Self
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let exit = DriverExit::running(retained);
+        let scope = DriverScope {
+            inner: Some(Box::pin(driver)),
+            exit: Arc::clone(&exit),
+        };
+        let handle = tokio::spawn(scope);
+        Self {
+            abort_handle: Some(handle.abort_handle()),
+            handle: tokio::sync::Mutex::new(Some(handle)),
+            inbound_bytes,
+            exit,
+        }
     }
 
-    pub(crate) fn with_inbound_counter(
-        handle: Option<tokio::task::JoinHandle<()>>,
-        inbound_bytes: Arc<std::sync::atomic::AtomicU64>,
-    ) -> Self {
-        let abort_handle = handle.as_ref().map(tokio::task::JoinHandle::abort_handle);
+    /// For fakes with no driver: starts exited, so retained values drop at once.
+    pub(crate) fn absent() -> Self {
         Self {
-            handle: tokio::sync::Mutex::new(handle),
-            abort_handle,
-            inbound_bytes,
+            handle: tokio::sync::Mutex::new(None),
+            abort_handle: None,
+            inbound_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            exit: DriverExit::exited(),
         }
+    }
+
+    /// Keep `value` until the driver has exited, or drop it now if it has.
+    pub(crate) fn retain_until_exit(&self, value: Box<dyn Send>) {
+        self.exit.retain(value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_exited(&self) -> bool {
+        self.exit.has_exited()
     }
 
     fn bytes_in(&self) -> u64 {

@@ -281,10 +281,11 @@ async fn run_qresync(
                 "QRESYNC SELECT failed during response parsing; continuing with CONDSTORE",
             )
             .await?;
-            // Release the checkout (and its pool permit) before the retry:
+            // Release the checkout before the retry:
             // run_condstore_with_baseline re-enters checkout_for_folder, and
-            // holding the permit across that call deadlocks at data_cap == 1
-            // and needlessly dials a second connection above it.
+            // holding this member across that call deadlocks once no other
+            // session is free (always at pool_cap == 1) and needlessly dials
+            // a second connection otherwise.
             drop(conn);
             return run_condstore_with_baseline(
                 account,

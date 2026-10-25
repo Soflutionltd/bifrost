@@ -123,7 +123,7 @@ impl DetachedPipeline {
             cmd_tx,
             state_rx,
             events_rx: tokio::sync::Mutex::new(events_rx),
-            driver_handle: std::sync::Arc::new(crate::connection::DriverTask::new(None)),
+            driver_handle: std::sync::Arc::new(crate::connection::DriverTask::absent()),
             tls_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             abandoned: std::sync::atomic::AtomicBool::new(false),
             host: String::new(),

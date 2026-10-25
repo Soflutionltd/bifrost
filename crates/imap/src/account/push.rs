@@ -24,7 +24,14 @@ pub(crate) struct PushState {
     scopes: Mutex<HashMap<String, HashSet<CursorScope>>>,
     pub(super) task_cancel: Mutex<Vec<CancellationToken>>,
     supports_notify: bool,
-    idle_budget: usize,
+    /// Push sessions carved out of `pool_cap`
+    /// (`ImapAccountConfig::push_session_capacity`), fixed at open. Zero
+    /// refuses every push scope.
+    push_capacity: usize,
+    /// One slot per push session, held from reservation through the
+    /// session's driver exit, not worker exit: worker count alone does not
+    /// bound push sessions once retired sessions tail their LOGOUT.
+    push_slots: std::sync::Arc<tokio::sync::Semaphore>,
     /// Monotonic generation of the subscribed scope set. Every worker holds
     /// a receiver and re-evaluates `choose_idle_folder` when it moves, so a
     /// scope added after the workers parked is picked up without waiting for
@@ -42,7 +49,7 @@ pub(crate) struct PushState {
 }
 
 impl PushState {
-    pub(crate) fn new(supports_notify: bool, idle_budget: usize) -> Self {
+    pub(crate) fn new(supports_notify: bool, push_capacity: usize) -> Self {
         let (tx, _rx) = broadcast::channel(PUSH_EVENT_CAPACITY);
         Self {
             tx,
@@ -50,11 +57,23 @@ impl PushState {
             scopes: Mutex::new(HashMap::new()),
             task_cancel: Mutex::new(Vec::new()),
             supports_notify,
-            idle_budget: idle_budget.max(1),
+            push_capacity,
+            push_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(push_capacity)),
             resubscribe: tokio::sync::watch::Sender::new(0),
             terminal: tokio::sync::watch::Sender::new(None),
             next_id: AtomicU64::new(1),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_push_slots(&self) -> usize {
+        self.push_slots.available_permits()
+    }
+
+    /// Whether a worker has latched a terminal (non-retryable) push error.
+    #[cfg(test)]
+    pub(crate) fn has_terminal_error(&self) -> bool {
+        self.terminal.borrow().is_some()
     }
 
     /// Publish that the subscribed scope set changed.
@@ -156,13 +175,15 @@ pub(crate) fn push_subscribe(
                     outcomes.push_failed(item, invalid_folder_name_error());
                     continue;
                 }
-                // NOTIFY folds every folder onto one session, so the budget
-                // does not apply there. A folder already covered costs no
-                // new session either; only a new distinct folder consumes a
-                // slot. A refusal is per scope and never fails a sibling.
-                let admitted = account.push.supports_notify
-                    || covered.contains(&folder.0)
-                    || covered.len() < account.push.idle_budget;
+                // Zero push capacity (`pool_cap = 1`) refuses everything.
+                // Otherwise NOTIFY folds every folder onto one session, and
+                // a folder already covered costs no new session either; only
+                // a new distinct folder consumes a slot. A refusal is per
+                // scope and never fails a sibling.
+                let admitted = account.push.push_capacity > 0
+                    && (account.push.supports_notify
+                        || covered.contains(&folder.0)
+                        || covered.len() < account.push.push_capacity);
                 // Accepted residual, not an open defect: on a NOTIFY server
                 // this `Succeeded` is settled here, before the first dial,
                 // and the whole scope list rides on a `NOTIFY SET` that the
@@ -258,12 +279,14 @@ fn unsupported_push_scope_error() -> AccountError {
     rejected_scope_error("IMAP push covers folder scopes only")
 }
 
-/// The account is at `idle_connection_budget` distinct pushed folders and the
+/// The account has filled its push capacity with distinct folders, and the
 /// server has no NOTIFY to fold another one onto an existing session. The
 /// scope is refused rather than silently dropped, so bifrost-sync keeps it in
 /// the polling lane instead of believing it is pushed.
 fn idle_budget_error() -> AccountError {
-    rejected_scope_error("IMAP IDLE connection budget exhausted; folder remains poll-only")
+    rejected_scope_error(
+        "IMAP push session budget exhausted within pool_cap; folder remains poll-only",
+    )
 }
 
 /// The scope names a folder that is not a sendable IMAP mailbox name
@@ -398,10 +421,12 @@ fn ensure_idle_tasks(account: ImapAccount) -> Result<(), crate::Error> {
     if !guard.is_empty() {
         return Ok(());
     }
+    // Reached only after admission accepted a scope, so push capacity is at
+    // least one here.
     let workers = if account.push.supports_notify {
         1
     } else {
-        account.push.idle_budget
+        account.push.push_capacity
     };
     for slot in 0..workers {
         let cancel = CancellationToken::new();
@@ -437,6 +462,58 @@ async fn sleep_backoff(
     }
 }
 
+/// The capacity phase of a worker's session: a push slot, then a fresh pool
+/// session. The slot is handed to the pool as an extra, so it lives in the
+/// new driver's exit slot and comes back only when that transport is gone -
+/// a retired session's LOGOUT tail keeps holding it. `waited()` covers a
+/// wait in either step.
+async fn reserve_push_session(
+    account: &ImapAccount,
+) -> Result<super::pool::FreshReservation, crate::Error> {
+    let slots = std::sync::Arc::clone(&account.push.push_slots);
+    let (slot, waited) = match std::sync::Arc::clone(&slots).try_acquire_owned() {
+        Ok(slot) => (slot, false),
+        Err(tokio::sync::TryAcquireError::Closed) => return Err(crate::Error::closed()),
+        Err(tokio::sync::TryAcquireError::NoPermits) => (
+            slots
+                .acquire_owned()
+                .await
+                .map_err(|_| crate::Error::closed())?,
+            true,
+        ),
+    };
+    Ok(account
+        .pool
+        .reserve_fresh(vec![Box::new(slot)])
+        .await?
+        .with_prior_wait(waited))
+}
+
+/// Invalidate what a fresh push session starts covering, called only when
+/// its reservation waited for capacity. Changes landing between subscribe
+/// and the first IDLE are not reported by IDLE; polling covers that window,
+/// which normally lasts one dial but a wait can stretch arbitrarily. The
+/// selected folder always, and every other watched folder when a NOTIFY
+/// registration took. Per folder, never account-wide, so the reason for
+/// not emitting `Reconnected` on a first connect still holds.
+fn signal_coverage_established(
+    push: &PushState,
+    selected: &crate::types::MailboxName,
+    watched: &[crate::types::MailboxName],
+    registered: bool,
+) {
+    push.publish_event(invalidated(HintPayload::SpecificCursorScope(folder_scope(
+        selected,
+    ))));
+    if registered {
+        for folder in watched.iter().filter(|folder| *folder != selected) {
+            push.publish_event(invalidated(HintPayload::SpecificCursorScope(folder_scope(
+                folder,
+            ))));
+        }
+    }
+}
+
 async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize) {
     // These transport health edges remain per worker: a sibling's recovery
     // does not prove that every IDLE session is healthy. Aggregating them
@@ -458,7 +535,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
         // wakes this worker instead of being lost.
         resubscribe.mark_unchanged();
         let folder = choose_idle_folder(&account, slot);
-        let Some(folder) = folder else {
+        let Some(mut folder) = folder else {
             // Do not tear down the task merely because the last subscription
             // left. `ensure_idle_task` has one account-lifetime owner; a
             // subsequent subscription wakes this parked loop directly.
@@ -473,7 +550,44 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
             }
             continue;
         };
-        let conn = match account.pool.dial_idle().await {
+        // Capacity phase. No session exists yet, so nothing is folder
+        // specific: a subscription change re-chooses and keeps polling the
+        // same reservation, or drops it (slot and permit back at once) when
+        // this slot has nothing left to watch.
+        let reservation = reserve_push_session(&account);
+        tokio::pin!(reservation);
+        let reserved = loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => break 'worker,
+                () = account.shutdown.cancelled() => break 'worker,
+                changed = resubscribe.changed() => {
+                    if changed.is_err() { break 'worker; }
+                    resubscribe.mark_unchanged();
+                    match choose_idle_folder(&account, slot) {
+                        Some(current) => folder = current,
+                        None => continue 'worker,
+                    }
+                }
+                result = &mut reservation => break result,
+            }
+        };
+        let waited = reserved
+            .as_ref()
+            .is_ok_and(super::pool::FreshReservation::waited);
+        let dialed = match reserved {
+            // Never raced with `resubscribe`: a cancelled dial would cost the
+            // provider a connect plus authentication while the worker dials
+            // again at once, outside the failure backoff.
+            Ok(reserved) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => break 'worker,
+                () = account.shutdown.cancelled() => break 'worker,
+                result = reserved.dial() => result,
+            },
+            Err(error) => Err(error),
+        };
+        let conn = match dialed {
             Ok(conn) => conn,
             Err(error) => {
                 if report_idle_failure(&account.push, error, &folder) {
@@ -490,6 +604,14 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                 continue;
             }
         };
+        // A generation bump during authentication changes the selection,
+        // never the in-flight dial. Later bumps latch for the first IDLE.
+        resubscribe.mark_unchanged();
+        let Some(current) = choose_idle_folder(&account, slot) else {
+            drop(conn);
+            continue 'worker;
+        };
+        folder = current;
         let selected = match conn.select(&folder, account.command_timeout()).await {
             Ok(selected) => selected,
             Err(error) => {
@@ -530,6 +652,9 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                 }
             };
         signal_notify_coverage_loss(&account.push, registered);
+        if waited {
+            signal_coverage_established(&account.push, &folder, &watched, registered);
+        }
         if was_disconnected {
             account.push.publish_event(WatchEvent::Reconnected);
             was_disconnected = false;
@@ -553,10 +678,9 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
             // waiting for this connection to break.
             let round_cancel = cancel.child_token();
             let notify_cancel = round_cancel.clone();
-            // The receiver was marked seen once, before `choose_idle_folder`
-            // read the scope set this round is built on. It must NOT be
-            // re-marked here: the dial, SELECT, and `NOTIFY SET` between the
-            // choice and this point all await the network, and a generation
+            // The receiver was last marked seen before the post-dial folder
+            // choice this round is built on. It must NOT be re-marked here:
+            // SELECT and NOTIFY SET await the network, and a generation
             // bump landing in that window is exactly what the latch exists
             // to preserve. Clearing it would leave this worker on a stale
             // assignment for a full `idle_timeout`. The clone keeps the
@@ -768,22 +892,9 @@ enum ResubscribeAction {
 /// and it forces a coarse `Unknown` invalidation for a window a same-folder
 /// re-IDLE on the same connection never loses.
 ///
-/// Pure so the decision is pinnable without a live server. Only the
-/// decision is pinned: the loop around it takes its connection from
-/// `pool.dial_idle()`, a real dial, so the re-IDLE wiring above is not
-/// hermetically testable and rests on review.
-///
-/// The same blind spot covers the NOTIFY-collapse degradation. Both
-/// `signal_notify_coverage_loss` and the `register_notify` that feeds it are
-/// individually tested, but that the two are WIRED - `register_notify`'s
-/// answer reaching `signal_notify_coverage_loss` on both call sites, the
-/// outer dial-and-SELECT path and the re-IDLE path in the interrupted-round
-/// arm - is verified by reading the loop, not by a test. Accepted limit:
-/// pinning either would need a dial seam in the pool so the IDLE worker
-/// could be driven against a scripted connection, which was ruled heavier
-/// machinery than the risk it retires (see also the hermetic-STARTTLS
-/// ruling at `ImapStream::into_tcp`). If that seam is ever built for another
-/// reason, both of these become cheap and should be pinned together.
+/// The pure decision is pinned. The pool connector seam also makes the
+/// re-IDLE and NOTIFY-collapse wiring hermetically drivable; those additional
+/// wiring tests remain a separate work item.
 fn resubscribe_action(
     current: &crate::types::MailboxName,
     chosen: Option<&crate::types::MailboxName>,
@@ -809,8 +920,8 @@ fn choose_idle_folder(account: &ImapAccount, slot: usize) -> Option<crate::types
     drop(scopes);
 
     // The INBOX fallback belongs to one worker only. Every slot taking it
-    // would point the whole budget at the same mailbox and burn
-    // `idle_connection_budget` sessions to watch it once.
+    // would point the whole budget at the same mailbox and burn every
+    // push session to watch it once.
     //
     // Reachability note: with today's admission (`push_subscribe` inserts
     // only non-empty sets of `CursorScope::Folder` whose names pass
@@ -845,7 +956,7 @@ fn first_inbox_folder(
 /// order from deciding which mailbox a slot watches. Worker `n` takes the
 /// nth entry; on a NOTIFY server only slot 0 runs and the rest of the list
 /// rides on `NOTIFY SET` from that one session. Admission caps the list at
-/// `idle_connection_budget` on a non-NOTIFY server, so every accepted folder
+/// carved-out push capacity on a non-NOTIFY server, so every accepted folder
 /// always has a slot - the assignment of folder to slot index shifts when
 /// the set changes, the coverage of the set does not.
 fn subscribed_idle_folders(
@@ -866,29 +977,6 @@ fn subscribed_idle_folders(
     folders
 }
 
-/// Extend this IDLE session's coverage from the one SELECTed mailbox to
-/// every subscribed folder, via `NOTIFY SET` (RFC 5465 Section 3).
-///
-/// IDLE alone reports only the selected mailbox, so an account subscribing
-/// ten folder scopes would get push for one of them and silence for the
-/// other nine. NOTIFY fixes that on one connection: message events on the
-/// selected mailbox keep arriving as EXISTS/EXPUNGE/FETCH, and the same
-/// events on the other watched mailboxes arrive as STATUS responses
-/// (RFC 5465 Section 4), which `map_idle_event` already turns into a
-/// per-folder invalidation.
-///
-/// `status` is left off deliberately: the initial STATUS snapshot would
-/// invalidate every watched scope immediately after subscribe, right when
-/// discovery and inventory have just run.
-///
-/// Returns whether every watched folder is covered. A server without
-/// NOTIFY leaves the loop watching only the selected mailbox. A rejected
-/// registration returns the error so the caller can forward non-Retry
-/// recovery; a retryable failure retains selected-only coverage and feeds
-/// that answer to `signal_notify_coverage_loss`, which turns a collapse on
-/// a NOTIFY-advertising account into a coarse invalidation rather than
-/// silence, because the subscribe outcome already reported those folders
-/// pushed and cannot be retracted.
 /// The `NOTIFY SET` registration for one IDLE round: message events on the
 /// selected mailbox, the same events on the other watched mailboxes.
 ///
@@ -919,6 +1007,32 @@ fn notify_params(others: Vec<crate::types::MailboxArgument>) -> crate::types::No
     )
 }
 
+/// Extend this IDLE session's coverage from the one SELECTed mailbox to
+/// every subscribed folder, via `NOTIFY SET` (RFC 5465 Section 3).
+///
+/// IDLE alone reports only the selected mailbox, so an account subscribing
+/// ten folder scopes would get push for one of them and silence for the
+/// other nine. NOTIFY fixes that on one connection: message events on the
+/// selected mailbox keep arriving as EXISTS/EXPUNGE/FETCH, and the same
+/// events on the other watched mailboxes arrive as STATUS responses
+/// (RFC 5465 Section 4), which `map_idle_event` already turns into a
+/// per-folder invalidation.
+///
+/// `status` is left off deliberately: the initial STATUS snapshot would
+/// invalidate every watched scope immediately after subscribe, right when
+/// discovery and inventory have just run. A push session that waited for
+/// capacity publishes per-folder invalidations itself
+/// (`signal_coverage_established`), which this decision does not forbid
+/// because it fires only after a wait.
+///
+/// Returns whether every watched folder is covered. A server without
+/// NOTIFY leaves the loop watching only the selected mailbox. A rejected
+/// registration returns the error so the caller can forward non-Retry
+/// recovery; a retryable failure retains selected-only coverage and feeds
+/// that answer to `signal_notify_coverage_loss`, which turns a collapse on
+/// a NOTIFY-advertising account into a coarse invalidation rather than
+/// silence, because the subscribe outcome already reported those folders
+/// pushed and cannot be retracted.
 async fn register_notify(
     conn: &crate::connection::ImapConnection,
     selected: &crate::types::MailboxName,
@@ -990,7 +1104,7 @@ fn signal_idle_interrupt_loss(push: &PushState) {
 /// coarse invalidation at the IDLE cadence instead of nothing at all.
 ///
 /// Gated on the account-level NOTIFY capability on purpose. Without it the
-/// account runs `idle_connection_budget` workers and admission caps the
+/// account runs one worker per available push session and admission caps the
 /// subscribed set at that many folders, so every folder has its own SELECTed
 /// session and a `false` here means only "this worker has no others to fold
 /// in" - not a coverage gap. Firing there would invalidate the whole account
@@ -1433,6 +1547,36 @@ mod tests {
                 )),
                 "fetch attributes are only legal on the selected filter, and we want none",
             );
+        }
+    }
+
+    /// Per-folder hints only, never `Unknown`: the selected folder always,
+    /// the other watched folders only when the registration took.
+    #[test]
+    fn coverage_establishment_names_each_covered_folder() {
+        let push = PushState::new(true, 1);
+        let selected = crate::types::MailboxName::new("INBOX").unwrap();
+        let watched = vec![
+            selected.clone(),
+            crate::types::MailboxName::new("A").unwrap(),
+            crate::types::MailboxName::new("B").unwrap(),
+        ];
+        for registered in [false, true] {
+            let (mut events, _) = push.subscribe_events();
+            signal_coverage_established(&push, &selected, &watched, registered);
+            let expected = if registered {
+                &watched[..]
+            } else {
+                &watched[..1]
+            };
+            for folder in expected {
+                assert!(
+                    matches!(events.try_recv().unwrap(), WatchEvent::Invalidated {
+                    hint: InvalidationHint { payload: HintPayload::SpecificCursorScope(scope), .. }
+                } if scope == folder_scope(folder))
+                );
+            }
+            assert!(events.try_recv().is_err());
         }
     }
 }

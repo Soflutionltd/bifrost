@@ -18,11 +18,10 @@ use super::folder_registry::FolderRegistry;
 use super::test_support::scripted_account_parts;
 use super::{ImapAccount, ImapAccountParts};
 
-/// Build an account whose pool holds exactly `pool_cap` permits and is
-/// primed with the scripted connection. Every checkout therefore reuses
-/// that one connection; a second concurrent checkout would have to dial,
-/// which the duplex transport cannot do, so any nested acquire shows up
-/// as a hang rather than silently passing.
+/// Build an account whose pool allows `pool_cap` physical sessions,
+/// the primed scripted connection included. Fresh dials are refused locally.
+/// At a single-session cap a nested checkout waits for the held member,
+/// exposing accidental nested acquisition.
 fn scripted_account(conn: crate::ImapConnection, pool_cap: usize) -> ImapAccount {
     scripted_sync_account(conn, pool_cap, false, None, FolderRegistry::default())
 }
@@ -679,27 +678,28 @@ async fn undecodable_ids_ride_one_batch_per_window() {
     assert_batched_exactly_once(&batches, &expected, 2);
 }
 
-/// A non-NOTIFY server gets one dedicated IDLE session per pushed folder, so
-/// the fifth folder of a four-session budget cannot be pushed. It must be
-/// refused in the failed lane rather than silently accepted: bifrost-sync
-/// records only the succeeded scopes as pushed and keeps the rest polling, so
-/// a silent acceptance would make that folder invisible - neither pushed nor
-/// polled.
+/// A non-NOTIFY server gets one dedicated IDLE session per pushed folder,
+/// carved out of `pool_cap`, so the third folder at the default budget of
+/// two cannot be pushed. It must be refused in the failed lane rather than
+/// silently accepted: bifrost-sync records only the succeeded scopes as
+/// pushed and keeps the rest polling, so a silent acceptance would make that
+/// folder invisible - neither pushed nor polled.
 ///
-/// Pinned at the exact boundary in both directions. The fourth folder (item
-/// "3") must succeed and the fifth (item "4") must fail; an off-by-one in
-/// either direction moves one of those two.
+/// Pinned at the exact boundary in both directions. The second folder (item
+/// "1") must succeed and the third (item "2") must fail; an off-by-one in
+/// either direction moves one of those two. `pool_cap = 4` leaves headroom
+/// above the budget, so the budget, not the headroom clamp, is what binds.
 #[tokio::test]
 async fn non_notify_push_reports_the_folder_beyond_its_budget_as_poll_only() {
     use bifrost_types::{Account, CursorScope, FolderId};
 
     let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
-    let account = scripted_account(conn, 1);
+    let account = scripted_account(conn, 4);
     assert_eq!(
-        account.config.idle_connection_budget, 4,
+        account.config.idle_connection_budget, 2,
         "this transcript is written against the default budget",
     );
-    let scopes: Vec<_> = ["A", "B", "C", "D", "E"]
+    let scopes: Vec<_> = ["A", "B", "C"]
         .into_iter()
         .map(|name| CursorScope::Folder(FolderId(name.to_owned())))
         .collect();
@@ -715,13 +715,13 @@ async fn non_notify_push_reports_the_folder_beyond_its_budget_as_poll_only() {
         .collect();
     assert_eq!(
         succeeded,
-        vec!["0", "1", "2", "3"],
+        vec!["0", "1"],
         "every folder up to and including the budget is pushed",
     );
     assert_eq!(result.outcomes.failed().len(), 1);
     assert_eq!(
         result.outcomes.failed()[0].item.0,
-        "4",
+        "2",
         "the first folder past the budget, and only it, is rejected",
     );
     assert!(
@@ -735,14 +735,14 @@ async fn non_notify_push_reports_the_folder_beyond_its_budget_as_poll_only() {
         result.handle.is_some(),
         "accepted scopes retain one subscription handle"
     );
-    // Workers are budget-many, not folder-many: the pool is started once and
-    // idle slots park until a folder is admitted to them. The point of the
-    // assertion is that a non-NOTIFY account runs the whole budget rather
-    // than the single worker a NOTIFY account needs.
+    // Workers are capacity-many, not folder-many: the pool is started once
+    // and idle slots park until a folder is admitted to them. The point of
+    // the assertion is that a non-NOTIFY account runs its whole push
+    // capacity rather than the single worker a NOTIFY account needs.
     assert_eq!(
         account.push.task_cancel.lock().unwrap().len(),
-        account.config.idle_connection_budget,
-        "a non-NOTIFY account runs one IDLE worker per budgeted session"
+        2,
+        "a non-NOTIFY account runs one IDLE worker per push session"
     );
     drop(server);
     account.close().await.unwrap();
@@ -759,7 +759,7 @@ async fn a_folder_scope_with_an_unsendable_name_is_refused_not_misreported() {
     use bifrost_types::{Account, CursorScope, FolderId};
 
     let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
-    let account = scripted_account(conn, 1);
+    let account = scripted_account(conn, 2);
     let scopes = vec![
         CursorScope::Folder(FolderId("bad\r\nname".to_owned())),
         CursorScope::Folder(FolderId("Valid".to_owned())),
@@ -810,7 +810,7 @@ async fn a_composed_dav_collection_scope_is_refused_by_push_admission() {
     );
     assert!(warnings.is_empty());
     let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
-    let account = scripted_dav_account(conn, 1, false, None, FolderRegistry::default(), dav_scopes);
+    let account = scripted_dav_account(conn, 2, false, None, FolderRegistry::default(), dav_scopes);
     let scopes = vec![
         CursorScope::Folder(FolderId(collection.to_owned())),
         CursorScope::Folder(FolderId("INBOX".to_owned())),
@@ -1044,67 +1044,57 @@ async fn a_refused_select_clears_the_mailbox_affinity() {
 /// exactly the fallback these old servers need. It also leaves the target
 /// mailbox SELECTed on a live session while DELETE goes out (RFC 2683 2.2.2).
 ///
-/// The pool is closed before the fallback runs, so the redial is refused
-/// locally and cannot reach for a socket. What the transcript then proves is
-/// the ordering: LOGOUT for the old member is on the wire even though the
-/// replacement never happened.
-#[tokio::test]
+/// The pool stays open and dials through a scripted connector, so the
+/// LOGOUT the script reads is the fallback's own (not close's drain) and
+/// the connector has not been called when it arrives. The replacement
+/// queues for capacity before retiring, so a checkout that arrives while
+/// that LOGOUT is in flight does not take the room the old member frees.
+/// A checkout queued BEFORE the fallback started would take it by design,
+/// which is why the second checkout is created only after the LOGOUT.
+#[tokio::test(start_paused = true)]
 async fn deselect_fallback_releases_the_old_connection_before_redialing() {
-    // IMAP4rev1 with no UNSELECT capability: `unselect` fails the gate
-    // without touching the wire, so the fallback is what runs.
-    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
-    let account = scripted_account(conn, 1);
+    let (account, mut peer, mut dials) = session_account(1, 1, false).await;
     let folder = crate::types::MailboxName::new("Archive").unwrap();
-
-    let script = tokio::spawn(async move {
-        let select = read_line(&mut server).await;
-        assert!(select.contains("SELECT"), "expected SELECT, got {select}");
-        respond(
-            &mut server,
-            &format!(
-                "* FLAGS (\\Deleted \\Seen)\r\n\
-                 * 0 EXISTS\r\n\
-                 * 0 RECENT\r\n\
-                 * OK [UIDVALIDITY 1] selected\r\n\
-                 {} OK [READ-WRITE] SELECT done\r\n",
-                tag_of(&select)
-            ),
-        )
-        .await;
-
-        let logout = read_line(&mut server).await;
-        assert!(
-            logout.contains("LOGOUT"),
-            "the superseded selected connection must be closed first, got {logout}"
-        );
-        respond(
-            &mut server,
-            &format!("* BYE closing\r\n{} OK LOGOUT done\r\n", tag_of(&logout)),
-        )
-        .await;
-        server
-    });
-
-    let mut pooled = account.pool.checkout_any().await.unwrap();
-    account
-        .select_folder(&mut pooled, &folder, None, false)
-        .await
-        .unwrap();
-
-    // Refuse the redial locally rather than letting it look for a socket.
-    account.pool.close().await;
-
-    let result = pooled
-        .deselect_target(&folder, Duration::from_secs(5))
-        .await;
-    assert!(
-        result.is_err(),
-        "a refused redial must surface, not silently leave the target selected"
+    let mut held = account.pool.checkout_any().await.unwrap();
+    let script = async {
+        session_select(&mut peer, "Archive").await;
+    };
+    let (result, ()) = tokio::join!(
+        account.select_folder(&mut held, &folder, None, false),
+        script
     );
-    let _server = tokio::time::timeout(Duration::from_secs(5), script)
-        .await
-        .expect("LOGOUT must precede the replacement dial")
-        .unwrap();
+    result.unwrap();
+    let mut replace = Box::pin(held.deselect_target(&folder, Duration::from_secs(5)));
+    assert!(futures::poll!(&mut replace).is_pending());
+    let logout = read_line(&mut peer).await;
+    assert!(logout.contains("LOGOUT"));
+    assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let mut second = Box::pin(account.pool.checkout_any());
+    assert!(futures::poll!(&mut second).is_pending());
+    respond(
+        &mut peer,
+        &format!("* BYE closing\r\n{} OK done\r\n", tag_of(&logout)),
+    )
+    .await;
+    let script = async {
+        let mut peer = dials.servers.recv().await.unwrap();
+        let auth = read_line(&mut peer).await;
+        session_auth(&mut peer, &auth).await;
+        peer
+    };
+    let (result, _dial_peer) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(5), replace),
+        script
+    );
+    result.unwrap().unwrap();
+    assert!(
+        held.connection()
+            .server_profile()
+            .supports(crate::types::Capability::Binary)
+    );
+    assert_eq!(held.selected_affinity(), None);
+    assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(futures::poll!(&mut second).is_pending());
 }
 
 // ---------------------------------------------------------------------------
@@ -3295,4 +3285,263 @@ async fn caller_modseq_rejects_stale_flags_while_absent_keeps_cached_guard() {
         }
         let _server = script.await.unwrap();
     }
+}
+
+const SESSION_GREETING: &[u8] = b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR] ready\r\n";
+
+async fn session_account(
+    cap: usize,
+    count: usize,
+    notify: bool,
+) -> (
+    ImapAccount,
+    tokio::io::DuplexStream,
+    super::test_support::ScriptedDials,
+) {
+    let (conn, peer) = driver_pair(&preauth_greeting("IMAP4rev1 ACL")).await;
+    let (connector, dials) =
+        super::test_support::scripted_connector(vec![SESSION_GREETING.to_vec(); count]);
+    let config = super::factory::ImapAccountConfig {
+        idle_connection_budget: 1,
+        ..super::test_support::scripted_account_config(cap)
+    };
+    let mut parts = super::test_support::scripted_account_parts_from(conn, config, connector);
+    parts.supports_notify = notify;
+    (ImapAccount::new(parts), peer, dials)
+}
+
+async fn session_auth(peer: &mut tokio::io::DuplexStream, auth: &str) {
+    assert!(auth.contains("AUTHENTICATE PLAIN"), "{auth}");
+    respond(
+        peer,
+        &format!(
+            "{} OK [CAPABILITY IMAP4rev1 IDLE UNSELECT BINARY] done\r\n",
+            tag_of(auth)
+        ),
+    )
+    .await;
+}
+
+async fn session_select(peer: &mut tokio::io::DuplexStream, folder: &str) {
+    let select = read_line(peer).await;
+    assert!(
+        select.contains("SELECT") && select.contains(folder),
+        "{select}"
+    );
+    respond(peer, &format!("* FLAGS (\\Seen)\r\n* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] valid\r\n{} OK [READ-WRITE] selected\r\n", tag_of(&select))).await;
+}
+
+async fn session_idle(peer: &mut tokio::io::DuplexStream) {
+    let idle = read_line(peer).await;
+    assert!(idle.contains("IDLE"), "{idle}");
+    respond(peer, "+ idling\r\n").await;
+}
+
+fn push_folder(name: &str) -> bifrost_types::CursorScope {
+    bifrost_types::CursorScope::Folder(bifrost_types::FolderId(name.into()))
+}
+
+/// Push never takes the last session, so at `pool_cap = 1` every scope lands
+/// in the failed lane, with or without NOTIFY, and no worker starts.
+#[tokio::test]
+async fn push_is_refused_entirely_when_pool_cap_leaves_no_room() {
+    use bifrost_types::Account as _;
+    for notify in [false, true] {
+        let (account, peer, dials) = session_account(1, 0, notify).await;
+        let result = account
+            .push_subscribe(&[push_folder("INBOX"), push_folder("Archive")])
+            .await
+            .unwrap();
+        assert_eq!(result.outcomes.failed().len(), 2);
+        assert!(result.outcomes.succeeded().is_empty());
+        assert!(result.handle.is_none());
+        assert!(account.push.task_cancel.lock().unwrap().is_empty());
+        assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(peer);
+        account.close().await.unwrap();
+    }
+}
+
+/// NOTIFY folds every folder onto one session, so the smallest cap with
+/// push room admits any number of folders on a single worker.
+#[tokio::test]
+async fn a_notify_account_admits_every_folder_on_one_worker() {
+    use bifrost_types::Account as _;
+    let (account, peer, _) = session_account(2, 0, true).await;
+    let scopes: Vec<_> = ["A", "B", "C", "D", "E"]
+        .into_iter()
+        .map(push_folder)
+        .collect();
+    let result = account.push_subscribe(&scopes).await.unwrap();
+    assert_eq!(result.outcomes.succeeded().len(), 5);
+    assert!(result.outcomes.failed().is_empty());
+    assert_eq!(account.push.task_cancel.lock().unwrap().len(), 1);
+    drop(peer);
+    account.close().await.unwrap();
+}
+
+/// A live IDLE session holds a session permit and a push slot: with the
+/// primed session checked out, a second data checkout waits instead of
+/// dialing a third session.
+#[tokio::test(start_paused = true)]
+async fn an_idle_worker_session_counts_against_pool_cap() {
+    use bifrost_types::Account as _;
+    let (account, peer, mut dials) = session_account(2, 1, false).await;
+    account
+        .push_subscribe(&[push_folder("INBOX")])
+        .await
+        .unwrap();
+    let mut push_peer = dials.servers.recv().await.unwrap();
+    let auth = read_line(&mut push_peer).await;
+    session_auth(&mut push_peer, &auth).await;
+    session_select(&mut push_peer, "INBOX").await;
+    session_idle(&mut push_peer).await;
+    assert_eq!(account.pool.available_sessions(), 0);
+    assert_eq!(account.push.available_push_slots(), 0);
+    let _held = account.pool.checkout_any().await.unwrap();
+    let mut second = Box::pin(account.pool.checkout_any());
+    assert!(futures::poll!(&mut second).is_pending());
+    assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(second);
+    drop(push_peer);
+    drop(peer);
+    account.close().await.unwrap();
+}
+
+/// A generation bump while the worker authenticates must not cancel the
+/// dial: the one-greeting connector refuses a second call. Leg 1 bumps with
+/// an accepted same-folder subscribe; leg 2 moves the assignment, which the
+/// post-dial re-choice picks up before SELECT.
+#[tokio::test(start_paused = true)]
+async fn a_subscription_change_mid_dial_keeps_the_pending_session() {
+    use bifrost_types::Account as _;
+    for reassign in [false, true] {
+        let (account, peer, mut dials) = session_account(2, 1, false).await;
+        let first = account
+            .push_subscribe(&[push_folder("INBOX")])
+            .await
+            .unwrap()
+            .handle
+            .unwrap();
+        let mut push_peer = dials.servers.recv().await.unwrap();
+        let auth = read_line(&mut push_peer).await;
+        if reassign {
+            account.push_unsubscribe(first).await.unwrap();
+        }
+        let selected = if reassign { "Archive" } else { "INBOX" };
+        account
+            .push_subscribe(&[push_folder(selected)])
+            .await
+            .unwrap();
+        session_auth(&mut push_peer, &auth).await;
+        session_select(&mut push_peer, selected).await;
+        session_idle(&mut push_peer).await;
+        assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(push_peer);
+        drop(peer);
+        account.close().await.unwrap();
+    }
+}
+
+/// Both sessions are held by data checkouts when the worker asks, so it
+/// waits; once covering, it invalidates the folder for the stretched window.
+#[tokio::test(start_paused = true)]
+async fn a_push_session_that_waited_for_capacity_invalidates_the_folder_it_starts_covering() {
+    use bifrost_types::Account as _;
+    use futures::StreamExt as _;
+    let (account, peer, mut dials) = session_account(2, 2, false).await;
+    let mut events = account.push_stream();
+    let _held = account.pool.checkout_any().await.unwrap();
+    let script = async {
+        let mut peer = dials.servers.recv().await.unwrap();
+        let auth = read_line(&mut peer).await;
+        session_auth(&mut peer, &auth).await;
+        peer
+    };
+    let (second, mut data_peer) = tokio::join!(account.pool.checkout_any(), script);
+    let second = second.unwrap();
+    account
+        .push_subscribe(&[push_folder("INBOX")])
+        .await
+        .unwrap();
+    drop(second);
+    let script = async {
+        let logout = read_line(&mut data_peer).await;
+        assert!(logout.contains("LOGOUT"));
+        respond(
+            &mut data_peer,
+            &format!("* BYE closing\r\n{} OK done\r\n", tag_of(&logout)),
+        )
+        .await;
+        let mut push_peer = dials.servers.recv().await.unwrap();
+        let auth = read_line(&mut push_peer).await;
+        session_auth(&mut push_peer, &auth).await;
+        session_select(&mut push_peer, "INBOX").await;
+        session_idle(&mut push_peer).await;
+        push_peer
+    };
+    let (event, push_peer) = tokio::join!(events.next(), script);
+    assert!(
+        matches!(event, Some(bifrost_types::WatchEvent::Invalidated {
+        hint: bifrost_types::InvalidationHint { payload: bifrost_types::HintPayload::SpecificCursorScope(scope), .. }
+    }) if scope == push_folder("INBOX"))
+    );
+    drop(push_peer);
+    drop(peer);
+    account.close().await.unwrap();
+}
+
+/// Capacity available at once: no coverage invalidation, which keeps the
+/// `register_notify` no-snapshot decision for the common case.
+#[tokio::test(start_paused = true)]
+async fn a_push_session_dialed_at_once_publishes_no_coverage_invalidation() {
+    use bifrost_types::Account as _;
+    use futures::StreamExt as _;
+    let (account, peer, mut dials) = session_account(2, 1, false).await;
+    let mut events = account.push_stream();
+    account
+        .push_subscribe(&[push_folder("INBOX")])
+        .await
+        .unwrap();
+    let mut push_peer = dials.servers.recv().await.unwrap();
+    let auth = read_line(&mut push_peer).await;
+    session_auth(&mut push_peer, &auth).await;
+    session_select(&mut push_peer, "INBOX").await;
+    session_idle(&mut push_peer).await;
+    drop(push_peer);
+    assert!(matches!(
+        events.next().await,
+        Some(bifrost_types::WatchEvent::Disconnected)
+    ));
+    drop(peer);
+    account.close().await.unwrap();
+}
+
+/// The refusing connector stands in for an unreachable host, so a push
+/// worker whose dial it refuses must take the retryable arm (Disconnected,
+/// backoff, redial) and latch no terminal push error. Every push admission
+/// test built on `scripted_account_parts` relies on this.
+#[tokio::test(start_paused = true)]
+async fn a_refused_push_dial_is_retried_not_latched_as_terminal() {
+    use bifrost_types::Account as _;
+    use futures::StreamExt as _;
+    let (account, peer, dials) = session_account(2, 0, false).await;
+    let mut events = account.push_stream();
+    account
+        .push_subscribe(&[push_folder("INBOX")])
+        .await
+        .unwrap();
+    assert!(matches!(
+        events.next().await,
+        Some(bifrost_types::WatchEvent::Disconnected)
+    ));
+    assert!(!account.push.has_terminal_error());
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(
+        dials.calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "the worker redials after its backoff"
+    );
+    assert!(!account.push.has_terminal_error());
+    drop(peer);
+    account.close().await.unwrap();
 }

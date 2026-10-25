@@ -60,7 +60,7 @@ async fn account() -> ImapAccount {
 
     let profile = ServerProfile::new(Vec::new(), Vec::new());
     ImapAccount::new(ImapAccountParts {
-        capabilities: build_capabilities(&profile, &[], false, None, None, false, false),
+        capabilities: build_capabilities(&profile, &[], false, None, None, false, false, 1),
         ..scripted_account_parts(conn, 1)
     })
 }
@@ -100,7 +100,7 @@ async fn account_with_submission() -> ImapAccount {
     );
     let profile = ServerProfile::new(Vec::new(), Vec::new());
     ImapAccount::new(ImapAccountParts {
-        capabilities: build_capabilities(&profile, &[], false, None, None, true, false),
+        capabilities: build_capabilities(&profile, &[], false, None, None, true, false, 1),
         submission: Some(submission),
         ..parts
     })
@@ -734,6 +734,7 @@ fn the_bare_imap_snapshot_advertises_both_answers() {
         None,
         false,
         false,
+        1,
     );
     assert!(caps.pim_methods.set_keyword, "some flag is true");
     assert!(!caps.pim_methods.search, "some flag is false");

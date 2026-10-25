@@ -61,20 +61,25 @@ async fn make_driver_test_pair() -> (ImapConnection, tokio::io::DuplexStream) {
     // Spawn the driver task.
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
     let (state_tx, state_rx) = tokio::sync::watch::channel(proto_state.snapshot());
-    let handle = tokio::spawn(driver::driver_task(
-        wire_reader,
-        proto_state,
-        tag_gen,
-        cmd_rx,
-        state_tx,
-        event_sink,
-    ));
+    let inbound_bytes = wire_reader.metering().inbound_counter();
+    let driver_task = super::DriverTask::spawn(
+        driver::driver_task(
+            wire_reader,
+            proto_state,
+            tag_gen,
+            cmd_rx,
+            state_tx,
+            event_sink,
+        ),
+        inbound_bytes,
+        Vec::new(),
+    );
 
     let conn = ImapConnection {
         cmd_tx,
         state_rx,
         events_rx: tokio::sync::Mutex::new(events_rx),
-        driver_handle: std::sync::Arc::new(super::DriverTask::new(Some(handle))),
+        driver_handle: std::sync::Arc::new(driver_task),
         tls_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         abandoned: std::sync::atomic::AtomicBool::new(false),
         host: "test".into(),
@@ -2901,5 +2906,93 @@ mod withdrawal {
         assert_eq!(b.await.unwrap().unwrap_err().attempt(), Some(Unsent));
         assert!(conn.is_reusable());
         next_capability(&conn, &mut server, a, &tag).await;
+    }
+}
+
+struct ExitFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for ExitFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn a_value_retained_by_a_running_driver_is_released_only_at_driver_exit() {
+    let (conn, peer) =
+        test_support::driver_pair(&test_support::preauth_greeting("IMAP4rev1")).await;
+    let driver = conn.driver_task();
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    driver.retain_until_exit(Box::new(ExitFlag(Arc::clone(&flag))));
+    assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+    drop(peer);
+    driver.finish_or_abort(LOGOUT_DRAIN_TIMEOUT).await;
+    assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(driver.has_exited());
+}
+
+#[test]
+fn a_value_retained_after_driver_exit_is_released_at_once() {
+    let driver = DriverTask::absent();
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    driver.retain_until_exit(Box::new(ExitFlag(Arc::clone(&flag))));
+    assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(driver.has_exited());
+}
+
+#[tokio::test]
+async fn aborting_a_driver_before_its_first_poll_releases_its_retained_values() {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let driver = DriverTask::spawn(
+        std::future::pending(),
+        Arc::default(),
+        vec![Box::new(ExitFlag(Arc::clone(&flag)))],
+    );
+    driver.abort();
+    driver.abort_and_join().await;
+    assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(driver.has_exited());
+}
+
+struct ExitOrder(Arc<std::sync::Mutex<Vec<&'static str>>>, &'static str);
+impl Drop for ExitOrder {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().push(self.1);
+    }
+}
+
+struct ExitOrderFuture {
+    _guard: ExitOrder,
+    pending: bool,
+}
+impl std::future::Future for ExitOrderFuture {
+    type Output = ();
+    fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if self.pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_driver_future_is_destroyed_before_its_retained_values() {
+    for abort in [false, true] {
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let guard = ExitOrder(Arc::clone(&order), "driver");
+        let driver = DriverTask::spawn(
+            ExitOrderFuture {
+                _guard: guard,
+                pending: abort,
+            },
+            Arc::default(),
+            vec![Box::new(ExitOrder(Arc::clone(&order), "lease"))],
+        );
+        if abort {
+            driver.abort_and_join().await;
+        } else {
+            driver.finish_or_abort(LOGOUT_DRAIN_TIMEOUT).await;
+        }
+        assert_eq!(*order.lock().unwrap(), ["driver", "lease"]);
     }
 }

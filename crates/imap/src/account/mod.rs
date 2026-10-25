@@ -133,7 +133,10 @@ pub(crate) struct ImapAccountParts {
 
 impl ImapAccount {
     pub(crate) fn new(parts: ImapAccountParts) -> Self {
-        let push = push::PushState::new(parts.supports_notify, parts.config.idle_connection_budget);
+        let push = push::PushState::new(
+            parts.supports_notify,
+            parts.config.push_session_capacity(parts.supports_notify),
+        );
         // The QRESYNC policy lives on the pool, which reads it at every dial
         // to bring a new member to the account's QRESYNC state. The pool
         // dials nothing before the account exists, so seeding it here is
@@ -1748,9 +1751,9 @@ mod guarded_stream_tests {
     use crate::connection::test_support::{driver_pair, preauth_greeting};
     use crate::types::{AuthPolicy, Credentials};
 
-    fn pool_with(primed: crate::ImapConnection, data_cap: usize) -> Arc<Pool> {
+    fn pool_with(primed: crate::ImapConnection, pool_cap: usize) -> Arc<Pool> {
         let config = Arc::new(ImapAccountConfig {
-            pool_cap: data_cap,
+            pool_cap,
             ..ImapAccountConfig::new(
                 crate::ImapConfig::plaintext("test.invalid"),
                 Credentials::password("user", "pass"),
@@ -1760,7 +1763,7 @@ mod guarded_stream_tests {
         Arc::new(Pool::new(
             config,
             primed,
-            data_cap,
+            crate::account::test_support::refusing_connector(),
             None,
             bifrost_net::BandwidthBudget::default(),
         ))
@@ -1770,11 +1773,10 @@ mod guarded_stream_tests {
     /// the pooled connection back, not leave a detached driver running
     /// against the account while the engine starts its successor.
     ///
-    /// The pool holds exactly one permit and cannot dial (the duplex
-    /// transport has no peer to dial), so the second checkout succeeds
-    /// only if the aborted task actually released both its permit and its
-    /// connection. Without the abort the task parks forever holding both
-    /// and this checkout never returns.
+    /// The pool allows one physical session and refuses fresh dials, so
+    /// the second checkout succeeds only if the aborted task returns its
+    /// connection. Without the abort the task holds it forever and this
+    /// checkout never returns.
     #[tokio::test]
     async fn dropping_a_guarded_stream_aborts_its_task_and_returns_the_connection() {
         let (conn, _server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;

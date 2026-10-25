@@ -137,16 +137,52 @@ PUBLISHED SURFACE fence apply.
   on the same checkout after an earlier command abandoned it. Later queued
   commands withdraw truthfully as `Unsent`, but each still waits a full timeout.
   Decide between failing fast on abandonment and obtaining another checkout.
+  Under the physical session cap, obtaining another checkout must discard the
+  abandoned one first: a nested checkout waits forever at pool_cap = 1 or
+  when data capacity is exhausted. Its permit returns only at driver exit.
 
 ## IMAP unbounded LOGOUT outside pool drain
 
-- `PooledConn::replace_selected_member` awaits `old.conn.logout()` without a
-  deadline inside a live operation, retaining its permit against a silent peer.
-  The push cancellation path likewise awaits unbounded LOGOUT. Only the pool
-  drain currently provides an external timeout.
+- The push cancellation path awaits unbounded LOGOUT. The pool drain
+  provides an external timeout; until driver exit the push slot remains held.
 
 ## IMAP peer certificate lookup outside authentication deadline
 
 - `resolve_scram_binding` awaits `peer_certificate_der` before SCRAM-PLUS.
   That non-wire request uses unbounded channel admission and reply waits, so
   it can wait behind a stalled head command beyond the authentication deadline.
+
+## IMAP push: same-session NOTIFY extension is uncovered until registration
+
+- In the Reidle branch, a newly added folder is watched only after the
+  re-issued NOTIFY SET. Changes before registration are not invalidated.
+  Pre-existing; the shared session budget does not widen this window.
+
+## IMAP push: pin the re-IDLE and NOTIFY-collapse wiring through the pool connector seam
+
+- The connector seam now supports hermetic worker transcripts. Pin both the
+  same-session re-IDLE path and register_notify's result reaching
+  signal_notify_coverage_loss on fresh and interrupted rounds.
+
+## Session cap does not span account incarnations
+
+- A failed or cancelled factory open, or a closing incarnation during reopen,
+  can leave a transport tail that the next incarnation's cap does not count.
+
+## IMAP push: false NOTIFY warning on non-NOTIFY accounts
+
+- register_notify warns that other subscribed folders will not be pushed on
+  every fresh session and Reidle round of a multi-folder non-NOTIFY account,
+  although each other folder has its own worker. signal_notify_coverage_loss
+  already treats false as no coverage gap in that topology.
+
+## IMAP push: push_subscribe bumps the generation when it accepted nothing
+
+- The unconditional bump wakes every worker without a scope-set change.
+  Gate it on a non-empty accepted set.
+
+## IMAP DELETE / RENAME while a parked member has the target selected
+
+- deselect_target handles only its own checkout. Another parked member may
+  remain SELECTed on the target while DELETE or RENAME goes out, contrary to
+  RFC 2683 Section 2.2.2. Pre-existing.

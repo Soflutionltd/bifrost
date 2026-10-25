@@ -693,33 +693,65 @@ pub(crate) fn stub_arc(account: StubAccount) -> Arc<dyn Account> {
     Arc::new(account)
 }
 
-/// The parts of a real `ImapAccount` whose pool holds exactly `pool_cap`
-/// permits and is primed with `conn`, usually one half of
+/// The parts of a real `ImapAccount` whose pool allows `pool_cap` physical
+/// sessions, including the primed `conn`, usually one half of
 /// `connection::test_support::driver_pair`.
 ///
 /// Every field a test might care about is at its quietest default: stub
 /// capabilities, an empty folder registry, no QRESYNC, no submission, no
 /// composed DAV. Override what the test needs, then `ImapAccount::new`.
-/// The duplex transport cannot dial, so once the primed connection is
-/// checked out a second concurrent checkout hangs rather than silently
-/// opening another connection.
+/// The connector refuses every fresh dial, so below the cap a checkout that
+/// needs a new session fails fast, and at the cap a nested checkout waits
+/// for a returned member (a hang the caller's timeout turns into a failure)
+/// rather than silently opening another connection.
 pub(crate) fn scripted_account_parts(
     conn: crate::ImapConnection,
     pool_cap: usize,
 ) -> super::ImapAccountParts {
-    let config = Arc::new(super::factory::ImapAccountConfig {
+    scripted_account_parts_with(conn, pool_cap, refusing_connector())
+}
+
+/// [`scripted_account_parts`] dialing through `connector`, usually a
+/// [`scripted_connector`]. The config allows cleartext PLAIN and disables
+/// keepalive, so a scripted dial is exactly AUTHENTICATE on the wire.
+pub(crate) fn scripted_account_parts_with(
+    conn: crate::connection::ImapConnection,
+    pool_cap: usize,
+    connector: super::pool::Connector,
+) -> super::ImapAccountParts {
+    scripted_account_parts_from(conn, scripted_account_config(pool_cap), connector)
+}
+
+/// The config [`scripted_account_parts_with`] uses: `pool_cap` sessions,
+/// cleartext PLAIN allowed, keepalive off, every other field at its
+/// default. Adjust it, then hand it to [`scripted_account_parts_from`].
+pub(crate) fn scripted_account_config(pool_cap: usize) -> super::factory::ImapAccountConfig {
+    let mut imap = crate::ImapConfig::plaintext("test.invalid");
+    imap.keepalive = None;
+    super::factory::ImapAccountConfig {
         pool_cap,
         ..super::factory::ImapAccountConfig::new(
-            crate::ImapConfig::plaintext("test.invalid"),
+            imap,
             crate::types::Credentials::password("user", "pass"),
-            crate::types::AuthPolicy::default(),
+            crate::types::AuthPolicy::default().allow_cleartext_without_tls(),
         )
-    });
+    }
+}
+
+/// [`scripted_account_parts_with`] built on a caller-adjusted `config`. The
+/// account and its pool share this one `Arc`, so a field changed before the
+/// call is seen by both; changing it afterwards would fork a private copy.
+pub(crate) fn scripted_account_parts_from(
+    conn: crate::connection::ImapConnection,
+    config: super::factory::ImapAccountConfig,
+    connector: super::pool::Connector,
+) -> super::ImapAccountParts {
+    let config = Arc::new(config);
     let bandwidth_budget = bifrost_net::BandwidthBudget::default();
     let pool = Arc::new(super::Pool::new(
         Arc::clone(&config),
         conn,
-        pool_cap,
+        connector,
         None,
         bandwidth_budget.clone(),
     ));
@@ -810,4 +842,58 @@ mod unsupported_default_tests {
         );
         assert!(stream.next().await.is_none());
     }
+}
+
+/// The test's side of a [`scripted_connector`]: how many times the pool
+/// called it, and the server end of every session it dialed, in order.
+pub(crate) struct ScriptedDials {
+    pub(crate) calls: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) servers: tokio::sync::mpsc::UnboundedReceiver<tokio::io::DuplexStream>,
+}
+
+/// A pool connector that serves one in-memory session per greeting, in
+/// order, with the dial's leases handed to the driver at spawn. Every call
+/// is counted. A call with no greeting left fails the way a refused TCP
+/// connect does (`Error::Io`, unsent), which is retryable: a push worker
+/// whose dial is refused backs off and redials, as it would against a real
+/// unreachable host, instead of latching a terminal push error the way an
+/// `Error::Internal` (an invariant violation, `InternalFailure`) would.
+pub(crate) fn scripted_connector(
+    greetings: Vec<Vec<u8>>,
+) -> (super::pool::Connector, ScriptedDials) {
+    use futures::FutureExt as _;
+    let greetings = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+        greetings,
+    )));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let (tx, servers) = tokio::sync::mpsc::unbounded_channel();
+    let connector: super::pool::Connector = Arc::new(move |req| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        let greeting = greetings.lock().unwrap().pop_front();
+        let tx = tx.clone();
+        async move {
+            let greeting = greeting.ok_or_else(|| crate::Error::Io {
+                source: Arc::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "scripted connector has no session to dial",
+                )),
+                attempt: Some(crate::error::ImapAttempt::new(
+                    bifrost_types::TransmissionState::Unsent,
+                )),
+            })?;
+            let (conn, server) =
+                crate::connection::test_support::driver_pair_leased(&greeting, &req.leases).await;
+            let _ = tx.send(server);
+            Ok(conn)
+        }
+        .boxed()
+    });
+    (connector, ScriptedDials { calls, servers })
+}
+
+/// A connector that refuses every dial locally, never touching a socket,
+/// with the retryable error a refused TCP connect produces.
+pub(crate) fn refusing_connector() -> super::pool::Connector {
+    scripted_connector(Vec::new()).0
 }

@@ -54,7 +54,7 @@ pub(crate) fn detached(
         cmd_tx,
         state_rx,
         events_rx: tokio::sync::Mutex::new(events_rx),
-        driver_handle: std::sync::Arc::new(crate::connection::DriverTask::new(None)),
+        driver_handle: std::sync::Arc::new(crate::connection::DriverTask::absent()),
         host: "test.invalid".to_owned(),
         tls_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         abandoned: std::sync::atomic::AtomicBool::new(false),
@@ -76,7 +76,8 @@ pub(crate) async fn driver_pair_metered(
     greeting: &[u8],
     budget: bifrost_net::BandwidthBudget,
 ) -> (ImapConnection, tokio::io::DuplexStream) {
-    driver_pair_with_capacity_and_budget(greeting, 1 << 16, budget).await
+    driver_pair_with_capacity_and_budget(greeting, 1 << 16, budget, &super::LeaseHandoff::none())
+        .await
 }
 
 /// [`driver_pair`] over a duplex that buffers at most `capacity` octets in
@@ -89,6 +90,7 @@ pub(crate) async fn driver_pair_with_capacity(
         greeting,
         capacity,
         bifrost_net::BandwidthBudget::default(),
+        &super::LeaseHandoff::none(),
     )
     .await
 }
@@ -97,6 +99,7 @@ async fn driver_pair_with_capacity_and_budget(
     greeting: &[u8],
     capacity: usize,
     budget: bifrost_net::BandwidthBudget,
+    leases: &super::LeaseHandoff,
 ) -> (ImapConnection, tokio::io::DuplexStream) {
     let (client, mut server) = tokio::io::duplex(capacity);
 
@@ -122,23 +125,24 @@ async fn driver_pair_with_capacity_and_budget(
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
     let (state_tx, state_rx) = tokio::sync::watch::channel(proto_state.snapshot());
     let inbound_bytes = wire_reader.metering().inbound_counter();
-    let handle = tokio::spawn(driver::driver_task(
-        wire_reader,
-        proto_state,
-        tag_gen,
-        cmd_rx,
-        state_tx,
-        event_sink,
-    ));
+    let driver_task = super::DriverTask::spawn(
+        driver::driver_task(
+            wire_reader,
+            proto_state,
+            tag_gen,
+            cmd_rx,
+            state_tx,
+            event_sink,
+        ),
+        inbound_bytes,
+        leases.take(),
+    );
 
     let conn = ImapConnection {
         cmd_tx,
         state_rx,
         events_rx: tokio::sync::Mutex::new(events_rx),
-        driver_handle: std::sync::Arc::new(crate::connection::DriverTask::with_inbound_counter(
-            Some(handle),
-            inbound_bytes,
-        )),
+        driver_handle: std::sync::Arc::new(driver_task),
         host: "test.invalid".to_owned(),
         tls_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         abandoned: std::sync::atomic::AtomicBool::new(false),
@@ -208,4 +212,19 @@ pub(crate) fn tag_of(line: &str) -> &str {
 pub(crate) async fn respond(server: &mut tokio::io::DuplexStream, bytes: &str) {
     server.write_all(bytes.as_bytes()).await.unwrap();
     server.flush().await.unwrap();
+}
+
+/// [`driver_pair`] whose driver takes `leases` at spawn, the way the pool's
+/// connector contract requires, so they are released only at driver exit.
+pub(crate) async fn driver_pair_leased(
+    greeting: &[u8],
+    leases: &super::LeaseHandoff,
+) -> (ImapConnection, tokio::io::DuplexStream) {
+    driver_pair_with_capacity_and_budget(
+        greeting,
+        1 << 16,
+        bifrost_net::BandwidthBudget::default(),
+        leases,
+    )
+    .await
 }

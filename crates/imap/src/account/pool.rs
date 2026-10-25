@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use futures::FutureExt;
@@ -9,6 +10,51 @@ use crate::types::MailboxName;
 
 use super::factory::ImapAccountConfig;
 
+/// Everything a [`Connector`] needs for one dial.
+pub(crate) struct ConnectRequest {
+    /// The account's IMAP config with keepalive disabled: `dial_admitted`
+    /// sets keepalive only after the connection is registered.
+    pub(crate) config: crate::ImapConfig,
+    pub(crate) meter: Option<bifrost_net::MeterSinkHandle>,
+    pub(crate) bandwidth_budget: bifrost_net::BandwidthBudget,
+    pub(crate) leases: crate::connection::LeaseHandoff,
+}
+
+/// The pool's way of opening a transport (the factory passes
+/// `production_connector`, tests a scripted one).
+///
+/// Contract: spawn the connection's driver as the final step, with
+/// `req.leases.take()` handed to the spawn and no await between the take and
+/// the spawn, and return immediately after the spawn. `dial_admitted`
+/// registers the connection only once the connector has returned, so a
+/// connector that awaited after spawning would, on cancellation, drop an
+/// unregistered live connection: close would never join it, and it would run
+/// a graceful LOGOUT after `Account::close()` returned.
+pub(crate) type Connector = Arc<
+    dyn Fn(ConnectRequest) -> futures::future::BoxFuture<'static, Result<ImapConnection, Error>>
+        + Send
+        + Sync,
+>;
+
+/// The real network connector: `connect_config_metered` with the request's
+/// leases. It meets the contract only because the request's keepalive is
+/// disabled: with keepalive set, `connect_config_metered` awaits keepalive
+/// setup after the spawn.
+pub(crate) fn production_connector() -> Connector {
+    Arc::new(|req| {
+        async move {
+            ImapConnection::connect_config_metered(
+                &req.config,
+                req.meter,
+                Some(req.bandwidth_budget),
+                &req.leases,
+            )
+            .await
+        }
+        .boxed()
+    })
+}
+
 struct PoolMember {
     conn: Arc<ImapConnection>,
     selected: Option<MailboxName>,
@@ -19,13 +65,93 @@ struct SessionRegistration {
     driver: Arc<DriverTask>,
 }
 
+/// Under this lock `parked` and `waiters` are never both non-empty: a member
+/// is parked only when nobody waits, and an acquisition registers as a
+/// waiter only when nothing is parked or someone already waits.
+struct IdleState {
+    /// Each parked member still owns its session permit through its driver
+    /// exit slot; parking releases no capacity.
+    parked: Vec<PoolMember>,
+    /// Acquisitions waiting for a returned member, oldest first.
+    waiters: VecDeque<Waiter>,
+    next_waiter: u64,
+}
+
+struct Waiter {
+    id: u64,
+    tx: tokio::sync::oneshot::Sender<PoolMember>,
+}
+
+/// Built under the idle lock in the same synchronous section that pushes its
+/// `Waiter`, never inside a later await, so a future dropped before its next
+/// poll still runs this guard. Drop removes the entry if it is still queued,
+/// then takes any member already handed here and sends it back through
+/// `return_member` (next waiter, or parked) instead of losing it.
+struct WaiterGuard {
+    pool: Arc<PoolInner>,
+    id: u64,
+    rx: tokio::sync::oneshot::Receiver<PoolMember>,
+}
+
+impl WaiterGuard {
+    fn take_handoff(&mut self) -> Option<PoolMember> {
+        let mut idle = self.pool.idle.lock().expect("pool lock poisoned");
+        idle.waiters.retain(|w| w.id != self.id);
+        self.rx.try_recv().ok()
+    }
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        if let Some(member) = self.take_handoff() {
+            self.pool.return_member(member);
+        }
+    }
+}
+
+/// Capacity granted for one fresh session, not yet dialed. Dropping it
+/// releases the permit and the extra values at once: no session exists yet.
+pub(crate) struct FreshReservation {
+    pool: Arc<PoolInner>,
+    permit: OwnedSemaphorePermit,
+    extra: Vec<Box<dyn Send>>,
+    waited: bool,
+}
+
+impl FreshReservation {
+    /// Whether capacity was not available on the first attempt.
+    pub(crate) fn waited(&self) -> bool {
+        self.waited
+    }
+
+    /// Fold in a wait that happened before the pool was asked (the push slot).
+    pub(crate) fn with_prior_wait(mut self, waited: bool) -> Self {
+        self.waited |= waited;
+        self
+    }
+
+    /// Dial the session. The permit and extras move into the dial task
+    /// synchronously and from there into the new driver's exit slot.
+    pub(crate) async fn dial(self) -> Result<Arc<ImapConnection>, Error> {
+        self.pool.dial(self.permit, self.extra).await
+    }
+}
+
 pub(crate) struct Pool {
     inner: Arc<PoolInner>,
 }
 
 struct PoolInner {
-    permits: Arc<Semaphore>,
-    idle: Mutex<Vec<PoolMember>>,
+    /// One permit per physical session, `config.session_cap()` in total.
+    /// Invariant: every connecting, live or tailing session owns exactly one
+    /// permit, from before its connector starts until its driver has exited
+    /// (the permit lives in the driver's exit slot), and every push session
+    /// additionally owns one push slot over the same interval. The physical
+    /// cap is enforced by this semaphore alone; parked adoption only avoids
+    /// dials.
+    sessions: Arc<Semaphore>,
+    connector: Connector,
+    idle: Mutex<IdleState>,
     config: Arc<ImapAccountConfig>,
     meter: Option<bifrost_net::MeterSinkHandle>,
     bandwidth_budget: bifrost_net::BandwidthBudget,
@@ -45,7 +171,7 @@ struct PoolInner {
     /// therefore seen by the drain; one that reaches it after the drain
     /// observes the flag and terminates itself. Nothing can land a live
     /// session on the far side of a completed close.
-    sessions: Mutex<Vec<SessionRegistration>>,
+    registry: Mutex<Vec<SessionRegistration>>,
     // A read guard spans connect, authentication and initialization. Close takes
     // the write guard before draining, so no admitted dial outlives completion.
     dials: tokio::sync::RwLock<()>,
@@ -62,26 +188,36 @@ impl Pool {
     pub(crate) fn new(
         config: Arc<ImapAccountConfig>,
         primed: ImapConnection,
-        data_cap: usize,
+        connector: Connector,
         meter: Option<bifrost_net::MeterSinkHandle>,
         bandwidth_budget: bifrost_net::BandwidthBudget,
     ) -> Self {
+        let sessions = Arc::new(Semaphore::new(config.session_cap()));
+        let permit = Arc::clone(&sessions)
+            .try_acquire_owned()
+            .expect("fresh session budget");
+        primed.driver_task().retain_until_exit(Box::new(permit));
         let primed = Arc::new(primed);
         let primed_weak = Arc::downgrade(&primed);
         let primed_driver = primed.driver_task();
         Self {
             inner: Arc::new(PoolInner {
-                permits: Arc::new(Semaphore::new(data_cap.max(1))),
-                idle: Mutex::new(vec![PoolMember {
-                    conn: primed,
-                    selected: None,
-                }]),
+                sessions,
+                idle: Mutex::new(IdleState {
+                    parked: vec![PoolMember {
+                        conn: primed,
+                        selected: None,
+                    }],
+                    waiters: VecDeque::new(),
+                    next_waiter: 0,
+                }),
+                connector,
                 config,
                 meter,
                 bandwidth_budget,
                 closed: std::sync::atomic::AtomicBool::new(false),
                 qresync_policy: std::sync::atomic::AtomicBool::new(false),
-                sessions: Mutex::new(vec![SessionRegistration {
+                registry: Mutex::new(vec![SessionRegistration {
                     connection: primed_weak,
                     driver: primed_driver,
                 }]),
@@ -109,61 +245,40 @@ impl Pool {
         &self,
         folder: &MailboxName,
     ) -> Result<PooledConn, Error> {
-        let permit = self.inner.permit().await?;
-        let member = {
-            let mut idle = self.inner.idle.lock().expect("pool lock poisoned");
-            idle.retain(|member| member.conn.is_alive());
-            let idx = idle
-                .iter()
-                .position(|member| member.selected.as_ref() == Some(folder));
-            idx.map(|idx| idle.swap_remove(idx)).or_else(|| idle.pop())
-        };
-        let member = match member {
-            Some(member) => member,
-            None => PoolMember {
-                conn: self.inner.dial(Some(Arc::clone(&permit))).await?,
-                selected: None,
-            },
-        };
-        Ok(PooledConn {
-            member: Some(member),
-            pool: Arc::clone(&self.inner),
-            _permit: permit,
-        })
+        self.checkout(Some(folder)).await
     }
 
-    /// Check out a pooled connection without imposing a selected-mailbox
-    /// affinity. Callers that do not issue mailbox-relative commands can
-    /// safely reuse any parked connection, including one left selected by a
-    /// folder-scoped operation.
     pub(crate) async fn checkout_any(&self) -> Result<PooledConn, Error> {
-        let permit = self.inner.permit().await?;
-        let member = {
-            let mut idle = self.inner.idle.lock().expect("pool lock poisoned");
-            idle.retain(|member| member.conn.is_alive());
-            idle.pop()
-        };
-        let member = match member {
-            Some(member) => member,
-            None => PoolMember {
-                conn: self.inner.dial(Some(Arc::clone(&permit))).await?,
-                selected: None,
-            },
-        };
+        self.checkout(None).await
+    }
+
+    async fn checkout(&self, affinity: Option<&MailboxName>) -> Result<PooledConn, Error> {
         Ok(PooledConn {
-            member: Some(member),
+            member: Some(self.inner.acquire_member(affinity).await?),
             pool: Arc::clone(&self.inner),
-            _permit: permit,
         })
     }
 
-    /// Dial the dedicated connection used exclusively by the long-lived IDLE
-    /// loop. Ordinary account operations must use a checkout method instead.
-    /// This does not acquire a data permit: push admission bounds its own
-    /// sessions separately. Holding data permits for permanent IDLE workers
-    /// would starve checkouts; `pool_cap` is not a shared physical-session cap.
-    pub(crate) async fn dial_idle(&self) -> Result<Arc<ImapConnection>, Error> {
-        self.inner.dial(None).await
+    /// Capacity for a fresh session that never comes from the parked list
+    /// (push). `extra` values live as long as the session's transport.
+    pub(crate) async fn reserve_fresh(
+        &self,
+        extra: Vec<Box<dyn Send>>,
+    ) -> Result<FreshReservation, Error> {
+        self.inner.reserve_fresh(extra, None).await
+    }
+
+    /// `reserve_fresh(extra)`, then dial.
+    pub(crate) async fn acquire_fresh(
+        &self,
+        extra: Vec<Box<dyn Send>>,
+    ) -> Result<Arc<ImapConnection>, Error> {
+        self.reserve_fresh(extra).await?.dial().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_sessions(&self) -> usize {
+        self.inner.sessions.available_permits()
     }
 
     pub(crate) async fn close(&self) {
@@ -174,7 +289,13 @@ impl Pool {
                 self.inner
                     .closed
                     .store(true, std::sync::atomic::Ordering::Release);
-                self.inner.permits.close();
+                self.inner.sessions.close();
+                self.inner
+                    .idle
+                    .lock()
+                    .expect("pool lock poisoned")
+                    .waiters
+                    .clear();
                 self.inner.cancel_dials.cancel();
                 let inner = Arc::clone(&self.inner);
                 let task = tokio::spawn(async move { inner.drain().await });
@@ -192,13 +313,13 @@ impl PoolInner {
         let _dials = self.dials.write().await;
         let members = {
             let mut idle = self.idle.lock().expect("pool lock poisoned");
-            std::mem::take(&mut *idle)
+            std::mem::take(&mut idle.parked)
         };
         // Drain under the same mutex registration re-checks `closed` under.
         // Exclusive dial admission means every admitted connect/authenticate
         // task has finished or terminated its unclaimed session before here.
         let sessions: Vec<_> = self
-            .sessions
+            .registry
             .lock()
             .expect("pool sessions lock poisoned")
             .drain(..)
@@ -236,90 +357,237 @@ impl PoolInner {
         self.closed.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Acquire one data-lane permit, refusing a closed pool on both sides of
-    /// the await. The pre-check is the cheap path; the post-check is the
-    /// load-bearing one, because `close` can land while this task is parked
-    /// on the semaphore and the permit it then receives must not become a
-    /// live session after the drain has already run.
-    async fn permit(&self) -> Result<Arc<OwnedSemaphorePermit>, Error> {
-        if self.is_closed() {
-            return Err(Error::closed());
+    /// A data checkout: adopt a parked member (affinity first), else wait for
+    /// a returned member or a session permit, whichever comes first.
+    ///
+    /// Fairness: both queues are FIFO - the waiter queue for returned
+    /// members, tokio's semaphore for released sessions. A new acquisition
+    /// never adopts while anyone waits, so a re-checkout loop cannot overtake
+    /// a queued waiter, and each acquisition holds one semaphore position for
+    /// its whole call. The remaining non-FIFO edge is between the two queues:
+    /// a waiter granted a permit and a member at once keeps the member and
+    /// releases the permit to the next semaphore waiter. No physical-cap
+    /// property depends on fairness; latency at the cap does.
+    async fn acquire_member(
+        self: &Arc<Self>,
+        affinity: Option<&MailboxName>,
+    ) -> Result<PoolMember, Error> {
+        let acquire = Arc::clone(&self.sessions).acquire_owned();
+        tokio::pin!(acquire);
+        loop {
+            let mut guard = {
+                let mut idle = self.idle.lock().expect("pool lock poisoned");
+                if self.is_closed() {
+                    return Err(Error::closed());
+                }
+                idle.parked.retain(|m| m.conn.is_alive());
+                if idle.waiters.is_empty() {
+                    let idx = idle
+                        .parked
+                        .iter()
+                        .position(|m| m.selected.as_ref() == affinity);
+                    if let Some(member) = idx
+                        .map(|i| idle.parked.swap_remove(i))
+                        .or_else(|| idle.parked.pop())
+                    {
+                        return Ok(member);
+                    }
+                }
+                self.waiter(&mut idle)
+            };
+            tokio::select! {
+                biased;
+                member = &mut guard.rx => match member {
+                    Ok(m) if m.conn.is_alive() => return Ok(m),
+                    Ok(_) => continue,
+                    Err(_) => return Err(Error::closed()),
+                },
+                permit = &mut acquire => {
+                    let permit = permit.map_err(|_| Error::closed())?;
+                    if self.is_closed() { return Err(Error::closed()); }
+                    // A dead member's permit follows its own driver; the
+                    // grant this acquisition already holds dials instead.
+                    if let Some(member) = guard.take_handoff()
+                        && member.conn.is_alive()
+                    {
+                        drop(permit);
+                        return Ok(member);
+                    }
+                    return Ok(PoolMember { conn: self.dial(permit, Vec::new()).await?, selected: None });
+                }
+            }
         }
-        let permit = Arc::clone(&self.permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::closed())?;
-        if self.is_closed() {
-            return Err(Error::closed());
-        }
-        Ok(Arc::new(permit))
     }
 
-    /// Dial and authenticate one fresh connection under the pool's meter and
-    /// bandwidth cap, then bring it to the account's QRESYNC state. The
-    /// single place a pool connection is minted, so a future change to how
-    /// connections are metered, capped or initialized lands once.
+    fn waiter(self: &Arc<Self>, idle: &mut IdleState) -> WaiterGuard {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let id = idle.next_waiter;
+        idle.next_waiter = idle.next_waiter.wrapping_add(1);
+        idle.waiters.push_back(Waiter { id, tx });
+        WaiterGuard {
+            pool: Arc::clone(self),
+            id,
+            rx,
+        }
+    }
+
+    /// Hand a reusable member to the oldest waiter still listening, or park
+    /// it when nobody waits. A closed pool drops it. No await.
+    fn return_member(&self, mut member: PoolMember) {
+        let mut idle = self.idle.lock().expect("pool lock poisoned");
+        if self.is_closed() {
+            return;
+        }
+        while let Some(waiter) = idle.waiters.pop_front() {
+            match waiter.tx.send(member) {
+                Ok(()) => return,
+                Err(m) => member = m,
+            }
+        }
+        idle.parked.push(member);
+    }
+
+    /// Bounded LOGOUT, then abort and join: once this returns the member's
+    /// driver has exited and its permit is back. The member is still
+    /// registered, so a concurrent close may terminate it too; the second
+    /// terminate waits on the driver handle mutex for the first join.
+    async fn retire(&self, member: PoolMember) {
+        let _ = tokio::time::timeout(self.config.imap.command_timeout, member.conn.logout()).await;
+        member.conn.terminate().await;
+    }
+
+    /// Capacity for a fresh session that never comes from the parked list.
+    /// `retiring` is the caller's own member (member replacement), retired
+    /// after this acquisition has queued on the semaphore.
     ///
-    /// A dial that started before `close` and completed after it is torn
-    /// down here rather than handed out: `Account::close()` promises no
-    /// session of this account is still connected when it returns. The
-    /// connection is registered BEFORE authentication and initialization.
-    /// An owned dial task retains admission until it hands out the session
-    /// or terminates it when its consumer has gone away.
+    /// The semaphore acquisition is created once and polled BEFORE any
+    /// retire, so this call is already queued when a retired driver exits.
+    /// Tokio's semaphore assigns a released permit to the oldest queued
+    /// acquisition even while it is not being polled, so the room a retire
+    /// makes comes back here ahead of anyone who queued during the retire -
+    /// but not ahead of an acquisition that was already queued before this
+    /// call started, which is older and takes it by design.
+    async fn reserve_fresh(
+        self: &Arc<Self>,
+        extra: Vec<Box<dyn Send>>,
+        retiring: Option<PoolMember>,
+    ) -> Result<FreshReservation, Error> {
+        if self.is_closed() {
+            return Err(Error::closed());
+        }
+        let acquire = Arc::clone(&self.sessions).acquire_owned();
+        tokio::pin!(acquire);
+        let immediate = futures::poll!(&mut acquire);
+        // Replacement retires its own selected member even when a spare
+        // permit was granted at once: the old session must be gone before
+        // the replacement dials and the caller's DELETE / RENAME goes out
+        // (RFC 2683 2.2.2), rather than tailing its LOGOUT concurrently.
+        if let Some(own) = retiring {
+            self.retire(own).await;
+        }
+        if let std::task::Poll::Ready(permit) = immediate {
+            return self.reservation(permit.map_err(|_| Error::closed())?, extra, false);
+        }
+        loop {
+            if let std::task::Poll::Ready(permit) = futures::poll!(&mut acquire) {
+                return self.reservation(permit.map_err(|_| Error::closed())?, extra, true);
+            }
+            let (taken, mut guard) = {
+                let mut idle = self.idle.lock().expect("pool lock poisoned");
+                if self.is_closed() {
+                    return Err(Error::closed());
+                }
+                idle.parked.retain(|m| m.conn.is_alive());
+                if idle.waiters.is_empty() && !idle.parked.is_empty() {
+                    (idle.parked.pop(), None)
+                } else {
+                    (None, Some(self.waiter(&mut idle)))
+                }
+            };
+            if let Some(member) = taken {
+                self.retire(member).await;
+                continue;
+            }
+            let guard = guard.as_mut().expect("fresh waiter present");
+            tokio::select! {
+                biased;
+                permit = &mut acquire => {
+                    let permit = permit.map_err(|_| Error::closed())?;
+                    if let Some(member) = guard.take_handoff() { self.return_member(member); }
+                    return self.reservation(permit, extra, true);
+                }
+                member = &mut guard.rx => match member {
+                    Ok(m) => self.retire(m).await,
+                    Err(_) => return Err(Error::closed()),
+                },
+            }
+        }
+    }
+
+    fn reservation(
+        self: &Arc<Self>,
+        permit: OwnedSemaphorePermit,
+        extra: Vec<Box<dyn Send>>,
+        waited: bool,
+    ) -> Result<FreshReservation, Error> {
+        if self.is_closed() {
+            return Err(Error::closed());
+        }
+        Ok(FreshReservation {
+            pool: Arc::clone(self),
+            permit,
+            extra,
+            waited,
+        })
+    }
+
     async fn dial(
         self: &Arc<Self>,
-        permit: Option<Arc<OwnedSemaphorePermit>>,
+        permit: OwnedSemaphorePermit,
+        extra: Vec<Box<dyn Send>>,
     ) -> Result<Arc<ImapConnection>, Error> {
-        let inner = Arc::clone(self);
-        self.dial_with_permit(
-            async move {
-                // Keep the post-spawn keepalive await inside dial_admitted, where
-                // cancellation retains a handle it can terminate and join.
-                let mut config = inner.config.imap.clone();
-                config.keepalive = None;
-                ImapConnection::connect_config_metered(
-                    &config,
-                    inner.meter.clone(),
-                    Some(inner.bandwidth_budget.clone()),
-                )
-                .await
-            },
-            permit,
-        )
+        let mut config = self.config.imap.clone();
+        config.keepalive = None;
+        let connector = Arc::clone(&self.connector);
+        let meter = self.meter.clone();
+        let bandwidth_budget = self.bandwidth_budget.clone();
+        self.dial_with(permit, extra, move |leases| {
+            connector(ConnectRequest {
+                config,
+                meter,
+                bandwidth_budget,
+                leases,
+            })
+        })
         .await
     }
 
-    #[cfg(test)]
-    async fn dial_with<F>(self: &Arc<Self>, connect: F) -> Result<Arc<ImapConnection>, Error>
-    where
-        F: std::future::Future<Output = Result<ImapConnection, Error>> + Send + 'static,
-    {
-        self.dial_with_permit(connect, None).await
-    }
-
-    async fn dial_with_permit<F>(
+    async fn dial_with<C, F>(
         self: &Arc<Self>,
-        connect: F,
-        permit: Option<Arc<OwnedSemaphorePermit>>,
+        permit: OwnedSemaphorePermit,
+        mut extra: Vec<Box<dyn Send>>,
+        connect: C,
     ) -> Result<Arc<ImapConnection>, Error>
     where
+        C: FnOnce(crate::connection::LeaseHandoff) -> F + Send + 'static,
         F: std::future::Future<Output = Result<ImapConnection, Error>> + Send + 'static,
     {
+        extra.push(Box::new(permit));
+        let handoff = crate::connection::LeaseHandoff::new(extra);
         let (mut tx, rx) = tokio::sync::oneshot::channel();
         let inner = Arc::clone(self);
         tokio::spawn(async move {
-            // Keep capacity charged until cancellation has terminated the driver.
-            let _permit = permit;
             let _dial = inner.dials.read().await;
             let mut connected = None;
             let result = tokio::select! {
                 biased;
                 _ = inner.cancel_dials.cancelled() => Err(Error::closed()),
                 _ = tx.closed() => Err(Error::closed()),
-                result = inner.dial_admitted(connect, &mut connected) => result,
+                result = inner.dial_admitted(connect(handoff.clone()), &mut connected) => result,
             };
-            // This handle lives outside the cancellable future: dropping an
-            // authentication future alone does not join its driver task.
+            // Drop the connector future (and any pre-spawn transport) before
+            // releasing leases. After spawn, the exit slot owns the leases.
+            drop(handoff);
             match result {
                 Ok(conn) => {
                     if let Err(Ok(conn)) = tx.send(Ok(conn)) {
@@ -380,7 +648,7 @@ impl PoolInner {
     /// registered, meaning the caller owns tearing it down (the drain in
     /// `close` has already run and will not see it).
     fn register(&self, conn: &Arc<ImapConnection>) -> bool {
-        let mut sessions = self.sessions.lock().expect("pool sessions lock poisoned");
+        let mut sessions = self.registry.lock().expect("pool sessions lock poisoned");
         if self.is_closed() {
             return false;
         }
@@ -428,7 +696,6 @@ pub(crate) async fn enable_qresync(
 pub(crate) struct PooledConn {
     member: Option<PoolMember>,
     pool: Arc<PoolInner>,
-    _permit: Arc<OwnedSemaphorePermit>,
 }
 
 impl PooledConn {
@@ -504,20 +771,26 @@ impl PooledConn {
 
     /// Replace this checkout's connection with a freshly dialed one.
     ///
-    /// The old member is logged out and released BEFORE the replacement is
-    /// dialed. Dialing first would hold cap+1 physical connections for the
-    /// duration of the handshake, and a server that enforces its per-user
-    /// connection limit rejects exactly the fallback that a pre-UNSELECT
-    /// server needs. It also keeps the old session SELECTed on the target
-    /// while the DELETE that follows is issued, which RFC 2683 2.2.2 warns
-    /// against. Ordering the teardown first costs one round trip and makes
-    /// the fallback work on the servers that require it.
+    /// The old member is retired (bounded LOGOUT, then terminate) after the
+    /// replacement's capacity request has queued and BEFORE the replacement
+    /// is dialed. Dialing first would hold cap+1 physical connections for
+    /// the duration of the handshake, and a server that enforces its
+    /// per-user connection limit rejects exactly the fallback that a
+    /// pre-UNSELECT server needs. It would also keep the old session
+    /// SELECTed on the target while the DELETE that follows is issued, which
+    /// RFC 2683 2.2.2 warns against. The replacement is always a fresh dial,
+    /// never a parked member, so it is unselected by construction. At the
+    /// cap it can wait: the room its own member frees goes to an
+    /// acquisition that was already queued before it, if there is one.
     async fn replace_selected_member(&mut self) -> Result<(), Error> {
-        if let Some(old) = self.member.take() {
-            let _ = old.conn.logout().await;
-        }
+        let old = self.member.take();
         self.member = Some(PoolMember {
-            conn: self.pool.dial(Some(Arc::clone(&self._permit))).await?,
+            conn: self
+                .pool
+                .reserve_fresh(Vec::new(), old)
+                .await?
+                .dial()
+                .await?,
             selected: None,
         });
         Ok(())
@@ -540,21 +813,7 @@ impl Drop for PooledConn {
         {
             return;
         }
-        // The `closed` re-check happens UNDER the idle lock, together with
-        // the push. Reading the flag before taking the lock is a race:
-        // `close` stores the flag and only then drains `idle`, so a drop
-        // that read `closed == false` and was preempted before its push
-        // could park a member on the far side of a completed close - and
-        // that member has already been LOGOUT'd and terminated by the
-        // drain. Holding the lock across both makes the two orders the only
-        // possible ones: this push lands before the drain and is drained,
-        // or it observes the flag the drain's own lock acquisition
-        // published and parks nothing.
-        let mut idle = self.pool.idle.lock().expect("pool lock poisoned");
-        if self.pool.is_closed() {
-            return;
-        }
-        idle.push(member);
+        self.pool.return_member(member);
     }
 }
 
@@ -573,15 +832,18 @@ mod tests {
     use crate::error::Error;
     use crate::types::{AuthPolicy, Capability, Credentials, MailboxName};
 
-    /// A config whose dial target is unroutable on purpose: every test
-    /// below must be served from parked members, so any code path that
-    /// decides to dial shows up as a failure instead of silently passing.
+    /// A config whose dial target is unroutable. Pools built on it dial only
+    /// through an injected connector (`pool_of` passes one that refuses), so
+    /// a test that must be served from parked members fails instead of
+    /// silently dialing.
     fn config() -> Arc<ImapAccountConfig> {
-        Arc::new(ImapAccountConfig::new(
+        let mut cfg = ImapAccountConfig::new(
             crate::ImapConfig::plaintext("test.invalid"),
             Credentials::password("user", "pass"),
-            AuthPolicy::default(),
-        ))
+            AuthPolicy::default().allow_cleartext_without_tls(),
+        );
+        cfg.imap.keepalive = None;
+        Arc::new(cfg)
     }
 
     #[tokio::test(start_paused = true)]
@@ -593,8 +855,22 @@ mod tests {
             driver_pair_metered(&preauth_greeting("IMAP4rev1"), budget.clone()).await;
         let (b, mut peer_b) =
             driver_pair_metered(&preauth_greeting("IMAP4rev1"), budget.clone()).await;
-        let pool = Pool::new(config(), a, 2, None, budget.clone());
-        pool.inner.idle.lock().unwrap().push(PoolMember {
+        let pool = Pool::new(
+            Arc::new(ImapAccountConfig {
+                pool_cap: 2,
+                ..(*config()).clone()
+            }),
+            a,
+            crate::account::test_support::refusing_connector(),
+            None,
+            budget.clone(),
+        );
+        b.driver_task().retain_until_exit(Box::new(
+            Arc::clone(&pool.inner.sessions)
+                .try_acquire_owned()
+                .unwrap(),
+        ));
+        pool.inner.idle.lock().unwrap().parked.push(PoolMember {
             conn: Arc::new(b),
             selected: None,
         });
@@ -639,14 +915,14 @@ mod tests {
         .await;
         pool.close().await;
         assert!(!held.connection().is_alive());
-        assert!(pool.inner.sessions.lock().unwrap().is_empty());
+        assert!(pool.inner.registry.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn close_joins_a_detached_healthy_drivers_graceful_logout() {
         let (primed, mut peer) = marked("ACL").await;
         let pool = pool_of(primed, 1);
-        let member = pool.inner.idle.lock().unwrap().pop().unwrap();
+        let member = pool.inner.idle.lock().unwrap().parked.pop().unwrap();
         let PoolMember { conn: detached, .. } = member;
         drop(detached);
 
@@ -665,48 +941,74 @@ mod tests {
         )
         .await;
         closing.await;
-        assert!(pool.inner.sessions.lock().unwrap().is_empty());
+        assert!(pool.inner.registry.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn close_cancels_a_dial_before_registration() {
         let (primed, primed_peer) = marked("ACL").await;
-        let pool = pool_of(primed, 1);
+        let pool = pool_of(primed, 2);
         drop(primed_peer);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let mut dial = Box::pin(pool.inner.dial_with(async move {
-            started_tx.send(()).unwrap();
-            std::future::pending().await
-        }));
+        let mut dial = Box::pin(
+            pool.inner.dial_with(
+                Arc::clone(&pool.inner.sessions)
+                    .try_acquire_owned()
+                    .unwrap(),
+                Vec::new(),
+                move |_handoff| async move {
+                    started_tx.send(()).unwrap();
+                    std::future::pending().await
+                },
+            ),
+        );
         assert!(futures::poll!(dial.as_mut()).is_pending());
         started_rx.await.unwrap();
         pool.close().await;
         assert!(matches!(dial.await, Err(Error::Closed { .. })));
-        assert!(pool.inner.sessions.lock().unwrap().is_empty());
+        assert!(pool.inner.registry.lock().unwrap().is_empty());
+        assert_eq!(pool.available_sessions(), 2);
     }
 
     #[tokio::test(start_paused = true)]
     async fn close_cancels_authentication_already_on_the_wire() {
         let (primed, primed_peer) = marked("ACL").await;
         drop(primed_peer);
-        let (late, mut peer) =
-            driver_pair(b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR] ready\r\n").await;
+        let (peer_tx, peer_rx) = tokio::sync::oneshot::channel();
         let mut cfg = (*config()).clone();
+        cfg.pool_cap = 2;
         cfg.imap.keepalive = None;
         cfg.auth_policy = AuthPolicy::default().allow_cleartext_without_tls();
         let pool = Pool::new(
             Arc::new(cfg),
             primed,
-            1,
+            crate::account::test_support::refusing_connector(),
             None,
             bifrost_net::BandwidthBudget::default(),
         );
-        let mut dial = Box::pin(pool.inner.dial_with(async move { Ok(late) }));
+        let mut dial = Box::pin(
+            pool.inner.dial_with(
+                Arc::clone(&pool.inner.sessions)
+                    .try_acquire_owned()
+                    .unwrap(),
+                Vec::new(),
+                move |handoff| async move {
+                    let (late, peer) = crate::connection::test_support::driver_pair_leased(
+                        b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR] ready\r\n",
+                        &handoff,
+                    )
+                    .await;
+                    peer_tx.send(peer).unwrap();
+                    Ok(late)
+                },
+            ),
+        );
         assert!(futures::poll!(dial.as_mut()).is_pending());
+        let mut peer = peer_rx.await.unwrap();
         assert!(read_line(&mut peer).await.contains("AUTHENTICATE PLAIN"));
         let conn = pool
             .inner
-            .sessions
+            .registry
             .lock()
             .unwrap()
             .last()
@@ -719,6 +1021,7 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::ZERO);
         assert!(!conn.is_alive());
         assert!(matches!(dial.await, Err(Error::Closed { .. })));
+        assert_eq!(pool.available_sessions(), 2);
     }
 
     struct StalledTokenSource {
@@ -749,10 +1052,10 @@ mod tests {
     async fn close_cancels_stalled_token_lookup_and_joins_its_driver() {
         let (primed, primed_peer) = marked("ACL").await;
         drop(primed_peer);
-        let (late, _peer) =
-            driver_pair(b"* OK [CAPABILITY IMAP4rev1 AUTH=XOAUTH2 SASL-IR] ready\r\n").await;
+        let (peer_tx, peer_rx) = tokio::sync::oneshot::channel();
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
         let mut cfg = (*config()).clone();
+        cfg.pool_cap = 2;
         cfg.imap.keepalive = None;
         cfg.credentials = Credentials::oauth2_source(
             "user",
@@ -764,16 +1067,33 @@ mod tests {
         let pool = Pool::new(
             Arc::new(cfg),
             primed,
-            1,
+            crate::account::test_support::refusing_connector(),
             None,
             bifrost_net::BandwidthBudget::default(),
         );
-        let mut dial = Box::pin(pool.inner.dial_with(async move { Ok(late) }));
+        let mut dial = Box::pin(
+            pool.inner.dial_with(
+                Arc::clone(&pool.inner.sessions)
+                    .try_acquire_owned()
+                    .unwrap(),
+                Vec::new(),
+                move |handoff| async move {
+                    let (late, peer) = crate::connection::test_support::driver_pair_leased(
+                        b"* OK [CAPABILITY IMAP4rev1 AUTH=XOAUTH2 SASL-IR] ready\r\n",
+                        &handoff,
+                    )
+                    .await;
+                    peer_tx.send(peer).unwrap();
+                    Ok(late)
+                },
+            ),
+        );
         assert!(futures::poll!(dial.as_mut()).is_pending());
+        let _peer = peer_rx.await.unwrap();
         entered.acquire().await.unwrap().forget();
         let conn = pool
             .inner
-            .sessions
+            .registry
             .lock()
             .unwrap()
             .last()
@@ -829,7 +1149,7 @@ mod tests {
         }
 
         let (primed, _peer) = marked("ACL").await;
-        let pool = pool_of(primed, 1);
+        let pool = pool_of(primed, 2);
         let active = Arc::new(AtomicUsize::new(0));
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
         for _ in 0..16 {
@@ -837,25 +1157,28 @@ mod tests {
             let dial_active = Arc::clone(&active);
             let dial_entered = Arc::clone(&entered);
             let mut checkout = Box::pin(async move {
-                let permit = inner.permit().await?;
+                let permit = Arc::clone(&inner.sessions)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::closed())?;
                 inner
-                    .dial_with_permit(
-                        async move {
-                            assert_eq!(dial_active.fetch_add(1, Ordering::SeqCst), 0);
-                            let _active = Active(dial_active);
-                            dial_entered.add_permits(1);
-                            std::future::pending().await
-                        },
-                        Some(permit),
-                    )
+                    .dial_with(permit, Vec::new(), |_| async move {
+                        assert_eq!(dial_active.fetch_add(1, Ordering::SeqCst), 0);
+                        let _active = Active(dial_active);
+                        dial_entered.add_permits(1);
+                        std::future::pending().await
+                    })
                     .await
             });
             assert!(futures::poll!(checkout.as_mut()).is_pending());
             entered.acquire().await.unwrap().forget();
             drop(checkout);
             // No executor yield: cancellation has not reached the detached task.
-            assert_eq!(pool.inner.permits.available_permits(), 0);
-            let permit = pool.inner.permit().await.unwrap();
+            assert_eq!(pool.available_sessions(), 0);
+            let permit = Arc::clone(&pool.inner.sessions)
+                .acquire_owned()
+                .await
+                .unwrap();
             assert_eq!(active.load(Ordering::SeqCst), 0);
             drop(permit);
         }
@@ -875,23 +1198,30 @@ mod tests {
         driver_pair(&preauth_greeting(&format!("IMAP4rev1 {mark}"))).await
     }
 
-    fn pool_of(primed: crate::ImapConnection, data_cap: usize) -> Pool {
+    fn pool_of(primed: crate::ImapConnection, pool_cap: usize) -> Pool {
         Pool::new(
-            config(),
+            Arc::new(ImapAccountConfig {
+                pool_cap,
+                ..(*config()).clone()
+            }),
             primed,
-            data_cap,
+            crate::account::test_support::refusing_connector(),
             None,
             bifrost_net::BandwidthBudget::default(),
         )
     }
 
     /// Park an extra member directly. `Pool::new` accepts only one primed
-    /// connection and the only other way in is a real dial, which no
-    /// hermetic test may perform.
+    /// connection. Injected members must retain their own session lease.
     fn park(pool: &Pool, conn: crate::ImapConnection, selected: Option<MailboxName>) {
+        conn.driver_task().retain_until_exit(Box::new(
+            Arc::clone(&pool.inner.sessions)
+                .try_acquire_owned()
+                .unwrap(),
+        ));
         let conn = Arc::new(conn);
         pool.inner
-            .sessions
+            .registry
             .lock()
             .unwrap()
             .push(SessionRegistration {
@@ -902,15 +1232,16 @@ mod tests {
             .idle
             .lock()
             .unwrap()
+            .parked
             .push(PoolMember { conn, selected });
     }
 
     fn set_primed_affinity(pool: &Pool, selected: MailboxName) {
-        pool.inner.idle.lock().unwrap()[0].selected = Some(selected);
+        pool.inner.idle.lock().unwrap().parked[0].selected = Some(selected);
     }
 
     fn idle_len(pool: &Pool) -> usize {
-        pool.inner.idle.lock().unwrap().len()
+        pool.inner.idle.lock().unwrap().parked.len()
     }
 
     fn idle_selection(pool: &Pool) -> Vec<Option<MailboxName>> {
@@ -918,6 +1249,7 @@ mod tests {
             .idle
             .lock()
             .unwrap()
+            .parked
             .iter()
             .map(|member| member.selected.clone())
             .collect()
@@ -999,11 +1331,11 @@ mod tests {
         assert_eq!(idle_len(&pool), 0, "a discarded member must not be parked");
     }
 
-    /// Dropping a checkout releases its permit. A leaked permit is
-    /// invisible until the pool is saturated, and at `data_cap == 1` it is
+    /// Dropping a checkout returns its member. A lost member is
+    /// invisible until the pool is saturated, and at `pool_cap == 1` it is
     /// a permanent deadlock, so pin it at the smallest cap.
     #[tokio::test]
-    async fn dropping_a_checkout_releases_its_permit() {
+    async fn a_returned_checkout_is_available_to_the_next_checkout() {
         let (primed, _primed_server) = marked("ACL").await;
         let pool = pool_of(primed, 1);
 
@@ -1014,15 +1346,13 @@ mod tests {
             pool.checkout_for_folder(&folder("INBOX")),
         )
         .await
-        .expect("the released permit must be reacquirable");
+        .expect("the returned member must be available");
         assert!(second.is_ok());
     }
 
-    /// `Semaphore::new(0)` never hands out a permit, so a misconfigured
-    /// `pool_cap` of zero would hang the first checkout forever rather than
-    /// erroring. `Pool::new` clamps to one; pin the clamp.
+    /// session_cap() clamps zero to one physical session, including primed.
     #[tokio::test]
-    async fn a_zero_data_cap_is_clamped_to_one_permit() {
+    async fn a_zero_pool_cap_is_clamped_to_one_session() {
         let (primed, _primed_server) = marked("ACL").await;
         let pool = pool_of(primed, 0);
 
@@ -1031,7 +1361,7 @@ mod tests {
             pool.checkout_for_folder(&folder("INBOX")),
         )
         .await
-        .expect("a zero cap must still yield one permit");
+        .expect("a zero cap must still allow one session");
         assert!(conn.is_ok());
     }
 
@@ -1058,7 +1388,10 @@ mod tests {
             pool.checkout_any().await,
             Err(Error::Closed { .. })
         ));
-        assert!(matches!(pool.dial_idle().await, Err(Error::Closed { .. })));
+        assert!(matches!(
+            pool.acquire_fresh(Vec::new()).await,
+            Err(Error::Closed { .. })
+        ));
         assert_eq!(idle_len(&pool), 0, "close drains the parked members");
     }
 
@@ -1144,7 +1477,7 @@ mod tests {
         let pool = pool_of(primed, 1);
         let conn = pool.checkout_any().await.unwrap();
 
-        let idle = pool.inner.idle.lock().unwrap();
+        let mut guard = pool.inner.idle.lock().unwrap();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let dropper = std::thread::spawn(move || {
             ready_tx.send(()).expect("the test is still waiting");
@@ -1159,12 +1492,11 @@ mod tests {
         }
 
         // Close's linearization, under the lock the drop must respect.
-        let mut idle = idle;
         pool.inner
             .closed
             .store(true, std::sync::atomic::Ordering::Release);
-        idle.clear();
-        drop(idle);
+        guard.parked.clear();
+        drop(guard);
 
         dropper.join().expect("the dropper thread finished");
         assert_eq!(
@@ -1174,12 +1506,13 @@ mod tests {
         );
     }
 
-    /// A checkout parked on the semaphore when `close` runs must not be
-    /// handed the permit and go on to dial. `close` drains `sessions` once;
-    /// a session minted after that drain is a live connection the consumer
-    /// has already been told is gone, which is exactly the guarantee this
-    /// pool now makes. The single permit is held for the whole test, so the
-    /// waiter can only ever be released by `close` itself.
+    /// A checkout waiting at the cap when `close` runs must refuse rather
+    /// than dial. `close` drains `registry` once; a session minted after
+    /// that drain is a live connection the consumer has already been told is
+    /// gone, which is exactly the guarantee this pool makes. The only
+    /// session is held for the whole test, so the waiter can only ever be
+    /// released by `close` itself (the closed semaphore, the cleared waiter
+    /// queue, or the post-grant re-check).
     #[tokio::test]
     async fn a_checkout_blocked_on_a_permit_at_close_refuses_instead_of_dialing() {
         let (primed, primed_server) = marked("ACL").await;
@@ -1193,9 +1526,9 @@ mod tests {
             let pool = Arc::clone(&pool);
             async move { pool.checkout_any().await.map(|_| ()) }
         });
-        // Let the spawned checkout reach the semaphore before closing, so
-        // the post-acquire re-check is the thing under test rather than the
-        // cheap pre-check.
+        // Let the spawned checkout register as a waiter before closing, so
+        // close's release of blocked acquisitions is the thing under test
+        // rather than the cheap pre-check.
         tokio::task::yield_now().await;
         tokio::time::timeout(Duration::from_secs(5), pool.close())
             .await
@@ -1234,7 +1567,7 @@ mod tests {
             "a session that finished after the drain must not be filed as live",
         );
         assert!(
-            pool.inner.sessions.lock().unwrap().is_empty(),
+            pool.inner.registry.lock().unwrap().is_empty(),
             "close leaves the registry drained",
         );
     }
@@ -1263,13 +1596,412 @@ mod tests {
                 .await;
         }
 
-        let registered = pool.inner.sessions.lock().unwrap().len();
+        let registered = pool.inner.registry.lock().unwrap().len();
         assert!(
             registered <= 2,
             "completed detached sessions left {registered} registry entries",
         );
         drop(primed_server);
         pool.close().await;
-        assert!(pool.inner.sessions.lock().unwrap().is_empty());
+        assert!(pool.inner.registry.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_checkout_dials_through_the_injected_connector() {
+        use super::super::test_support::{scripted_account_parts_with, scripted_connector};
+        let (primed, _peer) = marked("ACL").await;
+        let (connector, mut dials) = scripted_connector(vec![
+            b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR] ready\r\n".to_vec(),
+        ]);
+        let parts = scripted_account_parts_with(primed, 2, connector);
+        let _held = parts.pool.checkout_any().await.unwrap();
+        let script = async {
+            let mut peer = dials.servers.recv().await.unwrap();
+            let auth = read_line(&mut peer).await;
+            assert!(auth.contains("AUTHENTICATE PLAIN"));
+            respond(
+                &mut peer,
+                &format!(
+                    "{} OK [CAPABILITY IMAP4rev1 IDLE UNSELECT BINARY] done\r\n",
+                    tag_of(&auth)
+                ),
+            )
+            .await;
+            peer
+        };
+        let (checkout, _peer) = tokio::join!(parts.pool.checkout_any(), script);
+        let checkout = checkout.unwrap();
+        assert!(
+            checkout
+                .connection()
+                .server_profile()
+                .supports(Capability::Binary)
+        );
+        assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    const DIAL_GREETING: &[u8] = b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR] ready\r\n";
+
+    async fn budget_pool(
+        cap: usize,
+        count: usize,
+    ) -> (
+        Arc<Pool>,
+        tokio::io::DuplexStream,
+        super::super::test_support::ScriptedDials,
+    ) {
+        let (primed, peer) = marked("ACL").await;
+        let (connector, dials) =
+            super::super::test_support::scripted_connector(vec![DIAL_GREETING.to_vec(); count]);
+        let parts = super::super::test_support::scripted_account_parts_with(primed, cap, connector);
+        (parts.pool, peer, dials)
+    }
+
+    async fn answer_dial(
+        dials: &mut super::super::test_support::ScriptedDials,
+    ) -> tokio::io::DuplexStream {
+        let mut peer = dials.servers.recv().await.unwrap();
+        let auth = read_line(&mut peer).await;
+        assert!(auth.contains("AUTHENTICATE PLAIN"), "{auth}");
+        respond(
+            &mut peer,
+            &format!(
+                "{} OK [CAPABILITY IMAP4rev1 IDLE UNSELECT BINARY] done\r\n",
+                tag_of(&auth)
+            ),
+        )
+        .await;
+        peer
+    }
+
+    async fn answer_logout(peer: &mut tokio::io::DuplexStream) {
+        let logout = read_line(peer).await;
+        assert!(logout.contains("LOGOUT"), "{logout}");
+        respond(
+            peer,
+            &format!("* BYE closing\r\n{} OK done\r\n", tag_of(&logout)),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_primed_session_owns_a_permit() {
+        let (pool, _peer, _) = budget_pool(1, 0).await;
+        assert_eq!(pool.available_sessions(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_discarded_session_keeps_its_permit_until_its_driver_exits() {
+        let (pool, _peer, mut dials) = budget_pool(2, 1).await;
+        let _held = pool.checkout_any().await.unwrap();
+        let (second, mut peer) = tokio::join!(pool.checkout_any(), answer_dial(&mut dials));
+        let mut second = second.unwrap();
+        let driver = second.connection().driver_task();
+        assert_eq!(pool.available_sessions(), 0);
+        second.discard();
+        assert_eq!(pool.available_sessions(), 0);
+        answer_logout(&mut peer).await;
+        driver
+            .finish_or_abort(crate::connection::LOGOUT_DRAIN_TIMEOUT)
+            .await;
+        assert_eq!(pool.available_sessions(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_checkout_at_the_cap_waits_for_a_member_parked_later() {
+        let (pool, _peer, dials) = budget_pool(1, 0).await;
+        let held = pool.checkout_any().await.unwrap();
+        let mut second = Box::pin(pool.checkout_any());
+        assert!(futures::poll!(&mut second).is_pending());
+        drop(held);
+        let second = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            second
+                .connection()
+                .server_profile()
+                .supports(Capability::Acl)
+        );
+        assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_returned_member_goes_to_the_oldest_waiter_not_a_barging_checkout() {
+        let (pool, _peer, _) = budget_pool(1, 0).await;
+        let held = pool.checkout_any().await.unwrap();
+        let mut waiter = Box::pin(pool.checkout_any());
+        assert!(futures::poll!(&mut waiter).is_pending());
+        drop(held);
+        let mut barger = Box::pin(pool.checkout_any());
+        assert!(futures::poll!(&mut barger).is_pending());
+        let std::task::Poll::Ready(Ok(held)) = futures::poll!(&mut waiter) else {
+            panic!("oldest waiter was not handed the member")
+        };
+        assert!(held.connection().server_profile().supports(Capability::Acl));
+    }
+
+    #[tokio::test]
+    async fn a_checkout_at_the_cap_dials_once_a_session_exits() {
+        let (pool, peer, mut dials) = budget_pool(1, 1).await;
+        let mut held = pool.checkout_any().await.unwrap();
+        let mut second = Box::pin(pool.checkout_any());
+        assert!(futures::poll!(&mut second).is_pending());
+        assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        held.discard();
+        drop(peer);
+        let (second, _peer) = tokio::join!(second, answer_dial(&mut dials));
+        assert!(
+            second
+                .unwrap()
+                .connection()
+                .server_profile()
+                .supports(Capability::Binary)
+        );
+        assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_acquisition_retires_a_parked_member_to_make_room() {
+        let (pool, mut peer, mut dials) = budget_pool(1, 1).await;
+        let old = Arc::clone(&pool.inner.idle.lock().unwrap().parked[0].conn);
+        let script = async {
+            answer_logout(&mut peer).await;
+            answer_dial(&mut dials).await
+        };
+        let (fresh, _peer) = tokio::join!(pool.acquire_fresh(Vec::new()), script);
+        assert!(fresh.unwrap().server_profile().supports(Capability::Binary));
+        assert!(!old.is_alive());
+        assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_acquisition_takes_a_member_returned_while_it_waits() {
+        let (pool, mut peer, mut dials) = budget_pool(1, 1).await;
+        let held = pool.checkout_any().await.unwrap();
+        let mut fresh = Box::pin(pool.acquire_fresh(Vec::new()));
+        assert!(futures::poll!(&mut fresh).is_pending());
+        drop(held);
+        let mut data = Box::pin(pool.checkout_any());
+        assert!(futures::poll!(&mut data).is_pending());
+        let script = async {
+            answer_logout(&mut peer).await;
+            answer_dial(&mut dials).await
+        };
+        let (fresh, _peer) = tokio::join!(fresh, script);
+        let fresh = fresh.unwrap();
+        assert!(fresh.server_profile().supports(Capability::Binary));
+        assert!(futures::poll!(&mut data).is_pending());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_room_a_retire_makes_returns_to_the_retiring_acquisition() {
+        let (pool, mut peer, mut dials) = budget_pool(1, 1).await;
+        let mut fresh = Box::pin(pool.acquire_fresh(Vec::new()));
+        assert!(futures::poll!(&mut fresh).is_pending());
+        let logout = read_line(&mut peer).await;
+        assert!(logout.contains("LOGOUT"));
+        let mut data = Box::pin(pool.checkout_any());
+        assert!(futures::poll!(&mut data).is_pending());
+        respond(
+            &mut peer,
+            &format!("* BYE closing\r\n{} OK done\r\n", tag_of(&logout)),
+        )
+        .await;
+        let (fresh, _peer) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), fresh),
+            answer_dial(&mut dials)
+        );
+        let fresh = fresh.unwrap().unwrap();
+        assert!(fresh.server_profile().supports(Capability::Binary));
+        assert!(futures::poll!(&mut data).is_pending());
+    }
+
+    #[tokio::test]
+    async fn fresh_acquisition_never_adopts_a_parked_member() {
+        let (pool, _peer, mut dials) = budget_pool(2, 1).await;
+        let (fresh, _peer) = tokio::join!(pool.acquire_fresh(Vec::new()), answer_dial(&mut dials));
+        assert!(fresh.unwrap().server_profile().supports(Capability::Binary));
+        assert_eq!(idle_len(&pool), 1);
+        assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    struct Flag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn extra_values_are_released_only_at_the_fresh_session_driver_exit() {
+        let (pool, _peer, mut dials) = budget_pool(2, 1).await;
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (fresh, peer) = tokio::join!(
+            pool.acquire_fresh(vec![Box::new(Flag(Arc::clone(&flag)))]),
+            answer_dial(&mut dials)
+        );
+        let fresh = fresh.unwrap();
+        let driver = fresh.driver_task();
+        drop(fresh);
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(pool.available_sessions(), 0);
+        drop(peer);
+        driver
+            .finish_or_abort(crate::connection::LOGOUT_DRAIN_TIMEOUT)
+            .await;
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(pool.available_sessions(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_fresh_dial_returns_its_permit_and_extras_at_once() {
+        let (pool, _peer, _) = budget_pool(2, 0).await;
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(
+            pool.acquire_fresh(vec![Box::new(Flag(Arc::clone(&flag)))])
+                .await
+                .is_err()
+        );
+        assert_eq!(pool.available_sessions(), 1);
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    struct Order(Arc<std::sync::Mutex<Vec<&'static str>>>, &'static str);
+    impl Drop for Order {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push(self.1);
+        }
+    }
+
+    struct PendingConnector {
+        _handoff: crate::connection::LeaseHandoff,
+        _transport: Order,
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+    impl std::future::Future for PendingConnector {
+        type Output = Result<crate::ImapConnection, Error>;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            if let Some(tx) = self.entered.take() {
+                tx.send(()).unwrap();
+            }
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_connector_is_destroyed_before_its_leases() {
+        let (pool, peer, _) = budget_pool(2, 0).await;
+        drop(peer);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = Order(Arc::clone(&order), "transport");
+        let lease = Order(Arc::clone(&order), "lease");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let permit = Arc::clone(&pool.inner.sessions)
+            .try_acquire_owned()
+            .unwrap();
+        let mut dial = Box::pin(pool.inner.dial_with(
+            permit,
+            vec![Box::new(lease)],
+            move |handoff| PendingConnector {
+                _handoff: handoff,
+                _transport: transport,
+                entered: Some(tx),
+            },
+        ));
+        assert!(futures::poll!(&mut dial).is_pending());
+        rx.await.unwrap();
+        pool.close().await;
+        assert!(matches!(dial.await, Err(Error::Closed { .. })));
+        assert_eq!(*order.lock().unwrap(), ["transport", "lease"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_dials_fresh_instead_of_adopting_a_parked_member() {
+        let (pool, mut peer, mut dials) = budget_pool(2, 1).await;
+        let mut held = pool.checkout_any().await.unwrap();
+        let target = folder("Archive");
+        let select_script = async {
+            let select = read_line(&mut peer).await;
+            assert!(select.contains("SELECT"));
+            respond(&mut peer, &format!("* FLAGS (\\Seen)\r\n* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] valid\r\n{} OK [READ-WRITE] selected\r\n", tag_of(&select))).await;
+        };
+        let (result, ()) = tokio::join!(
+            held.connection().select(&target, Duration::from_secs(5)),
+            select_script
+        );
+        result.unwrap();
+        held.set_selected(folder("Archive"));
+        let (other, _other_peer) = marked("UNSELECT").await;
+        park(&pool, other, Some(folder("Archive")));
+        let script = async {
+            answer_logout(&mut peer).await;
+            answer_dial(&mut dials).await
+        };
+        let target = folder("Archive");
+        let (result, _peer) = tokio::join!(
+            held.deselect_target(&target, Duration::from_secs(5)),
+            script
+        );
+        result.unwrap();
+        assert!(
+            held.connection()
+                .server_profile()
+                .supports(Capability::Binary)
+        );
+        assert_eq!(held.selected_affinity(), None);
+        assert_eq!(idle_selection(&pool), vec![Some(folder("Archive"))]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_releases_waiters_with_closed() {
+        let (pool, peer, dials) = budget_pool(1, 0).await;
+        let _held = pool.checkout_any().await.unwrap();
+        let mut data = Box::pin(pool.checkout_any());
+        let mut fresh = Box::pin(pool.acquire_fresh(Vec::new()));
+        assert!(futures::poll!(&mut data).is_pending());
+        assert!(futures::poll!(&mut fresh).is_pending());
+        drop(peer);
+        pool.close().await;
+        assert!(matches!(data.await, Err(Error::Closed { .. })));
+        assert!(matches!(fresh.await, Err(Error::Closed { .. })));
+        assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A waiter cancelled after a member was already handed to it must pass
+    /// that member on, or the session is stranded at the cap forever.
+    #[tokio::test]
+    async fn a_cancelled_waiter_returns_its_handoff_to_the_next_waiter() {
+        let (pool, _peer, _) = budget_pool(1, 0).await;
+        let held = pool.checkout_any().await.unwrap();
+        let mut first = Box::pin(pool.checkout_any());
+        let mut next = Box::pin(pool.checkout_any());
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut next).is_pending());
+        drop(held);
+        drop(first);
+        let std::task::Poll::Ready(Ok(held)) = futures::poll!(&mut next) else {
+            panic!("a cancelled receiver stranded its handed member");
+        };
+        assert!(held.connection().server_profile().supports(Capability::Acl));
+    }
+
+    /// A cancelled waiter leaves the queue synchronously in its drop. A
+    /// stale entry would stop every later checkout from adopting a parked
+    /// member (nobody adopts while someone waits).
+    #[tokio::test]
+    async fn a_cancelled_waiter_is_removed_before_any_member_returns() {
+        let (pool, _peer, _) = budget_pool(1, 0).await;
+        let held = pool.checkout_any().await.unwrap();
+        let mut first = Box::pin(pool.checkout_any());
+        assert!(futures::poll!(&mut first).is_pending());
+        drop(first);
+        assert!(pool.inner.idle.lock().unwrap().waiters.is_empty());
+        drop(held);
+        assert_eq!(idle_len(&pool), 1);
     }
 }

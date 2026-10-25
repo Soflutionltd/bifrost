@@ -8,6 +8,7 @@ use bifrost_types::{
 
 use crate::types::{Capability, MailboxAttribute, MailboxInfo, ServerProfile};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_capabilities(
     profile: &ServerProfile,
     folders: &[MailboxInfo],
@@ -16,6 +17,7 @@ pub(crate) fn build_capabilities(
     calendars: Option<&AccountCapabilities>,
     submission_configured: bool,
     foreign_namespaces_advertised: bool,
+    push_capacity: usize,
 ) -> AccountCapabilities {
     // Copy only the contact / calendar field subsets from the
     // sub-accounts' real capability snapshots; an absent sub-account
@@ -83,7 +85,11 @@ pub(crate) fn build_capabilities(
         // handle is dishonest.
         blob_range: BlobRangeSupport::No,
         blob_digest_pre_download: false,
-        push: if profile.supports(Capability::Idle) {
+        // Push capacity is carved out of `pool_cap` and is zero at a
+        // single-session cap. Advertising push the account will refuse for
+        // every scope would keep bifrost-sync's push forwarder open with
+        // every subscribe refused.
+        push: if profile.supports(Capability::Idle) && push_capacity > 0 {
             PushCapability::InProcess
         } else {
             PushCapability::None
@@ -256,6 +262,7 @@ mod tests {
                 Some(&calendars),
                 false,
                 false,
+                1,
             );
             let expected = if contact_delete || event_delete {
                 MutationConcurrency::ExpectedVersion {
@@ -309,6 +316,7 @@ mod tests {
                 Some(&calendars),
                 false,
                 false,
+                1,
             );
             assert_eq!(
                 caps.mutation.concurrency,
@@ -332,7 +340,7 @@ mod tests {
             vec![Capability::Idle, Capability::Condstore, Capability::Quota],
             Vec::new(),
         );
-        let caps = build_capabilities(&profile, &[], false, None, None, false, false);
+        let caps = build_capabilities(&profile, &[], false, None, None, false, false, 1);
         assert_eq!(caps.cursor_freshness, CursorFreshness::Hybrid);
         assert_eq!(caps.blob_range, BlobRangeSupport::No);
         assert_eq!(caps.push, PushCapability::InProcess);
@@ -369,14 +377,14 @@ mod tests {
     #[test]
     fn capability_builder_leaves_mutation_concurrency_none_without_condstore() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let caps = build_capabilities(&profile, &[], false, None, None, false, false);
+        let caps = build_capabilities(&profile, &[], false, None, None, false, false, 1);
         assert_eq!(caps.mutation.concurrency, MutationConcurrency::None);
     }
 
     #[test]
     fn capability_builder_advertises_sieve_when_configured() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let caps = build_capabilities(&profile, &[], true, None, None, false, false);
+        let caps = build_capabilities(&profile, &[], true, None, None, false, false, 1);
         assert_eq!(caps.filter_rule_shape, FilterRuleShape::Scripts);
         assert!(caps.pim_methods.filters_list);
         assert!(caps.pim_methods.filter_create);
@@ -392,11 +400,11 @@ mod tests {
             let mut sub = crate::account::test_support::stub_capabilities();
             sub.pim_methods.directory_search = search;
             sub.pim_methods.directory_enumerate = enumerate;
-            let caps = build_capabilities(&profile, &[], false, Some(&sub), None, false, false);
+            let caps = build_capabilities(&profile, &[], false, Some(&sub), None, false, false, 1);
             assert_eq!(caps.pim_methods.directory_search, search);
             assert_eq!(caps.pim_methods.directory_enumerate, enumerate);
             let calendar_only =
-                build_capabilities(&profile, &[], false, None, Some(&sub), false, false);
+                build_capabilities(&profile, &[], false, None, Some(&sub), false, false, 1);
             assert!(!calendar_only.pim_methods.directory_search);
             assert!(!calendar_only.pim_methods.directory_enumerate);
         }
@@ -421,7 +429,7 @@ mod tests {
     fn capability_builder_advertises_contacts_when_carddav_configured() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
         let sub = contacts_snapshot();
-        let caps = build_capabilities(&profile, &[], false, Some(&sub), None, false, false);
+        let caps = build_capabilities(&profile, &[], false, Some(&sub), None, false, false, 1);
         assert!(caps.pim_methods.address_books_list);
         assert!(caps.pim_methods.contacts_list);
         assert!(caps.pim_methods.contact_get);
@@ -447,7 +455,16 @@ mod tests {
         calendars.pim_methods.event_get = true;
         calendars.pim_methods.event_rsvp = false; // unsupported by this provider
 
-        let caps = build_capabilities(&profile, &[], false, None, Some(&calendars), false, false);
+        let caps = build_capabilities(
+            &profile,
+            &[],
+            false,
+            None,
+            Some(&calendars),
+            false,
+            false,
+            1,
+        );
         assert!(caps.pim_methods.calendars_list);
         assert!(caps.pim_methods.event_get);
         assert!(
@@ -463,11 +480,11 @@ mod tests {
     fn capabilities_send_flag_tracks_submission() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
 
-        let without = build_capabilities(&profile, &[], false, None, None, false, false);
+        let without = build_capabilities(&profile, &[], false, None, None, false, false, 1);
         assert!(!without.pim_methods.send_message);
         assert!(!without.pim_methods.draft_send);
 
-        let with = build_capabilities(&profile, &[], false, None, None, true, false);
+        let with = build_capabilities(&profile, &[], false, None, None, true, false, 1);
         assert!(with.pim_methods.send_message);
         assert!(with.pim_methods.draft_send);
         // Submission does not turn on uploaded-attachment support (A6).
@@ -477,9 +494,9 @@ mod tests {
     #[test]
     fn foreign_namespace_flag_flows_through_verbatim() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let without = build_capabilities(&profile, &[], false, None, None, false, false);
+        let without = build_capabilities(&profile, &[], false, None, None, false, false, 1);
         assert!(!without.discovers_foreign_namespaces_on_rediscovery);
-        let with = build_capabilities(&profile, &[], false, None, None, false, true);
+        let with = build_capabilities(&profile, &[], false, None, None, false, true, 1);
         assert!(with.discovers_foreign_namespaces_on_rediscovery);
     }
 
@@ -502,19 +519,37 @@ mod tests {
         let drafts = [mailbox("Drafts", Vec::new())];
         let special_use = [mailbox("Brouillons", vec![MailboxAttribute::Drafts])];
 
-        let caps = build_capabilities(&with_uidplus, &drafts, false, None, None, false, false);
+        let caps = build_capabilities(&with_uidplus, &drafts, false, None, None, false, false, 1);
         assert!(caps.pim_methods.draft_create, "name match plus UIDPLUS");
 
-        let caps = build_capabilities(&with_uidplus, &special_use, false, None, None, false, false);
+        let caps = build_capabilities(
+            &with_uidplus,
+            &special_use,
+            false,
+            None,
+            None,
+            false,
+            false,
+            1,
+        );
         assert!(
             caps.pim_methods.draft_create,
             "a localized Drafts folder is found by its SPECIAL-USE attribute",
         );
 
-        let caps = build_capabilities(&without_uidplus, &drafts, false, None, None, false, false);
+        let caps = build_capabilities(
+            &without_uidplus,
+            &drafts,
+            false,
+            None,
+            None,
+            false,
+            false,
+            1,
+        );
         assert!(!caps.pim_methods.draft_create, "no UIDPLUS, no APPENDUID");
 
-        let caps = build_capabilities(&with_uidplus, &[], false, None, None, false, false);
+        let caps = build_capabilities(&with_uidplus, &[], false, None, None, false, false, 1);
         assert!(!caps.pim_methods.draft_create, "nowhere to APPEND a draft");
     }
 
@@ -523,7 +558,7 @@ mod tests {
         let profile = ServerProfile::new(vec![Capability::UidPlus], Vec::new());
         let mut drafts = mailbox("INBOX.Drafts", Vec::new());
         drafts.delimiter = Some('.');
-        let caps = build_capabilities(&profile, &[drafts], false, None, None, false, false);
+        let caps = build_capabilities(&profile, &[drafts], false, None, None, false, false, 1);
         assert!(caps.pim_methods.draft_create);
     }
 
@@ -536,7 +571,7 @@ mod tests {
             vec![Capability::Thread("REFERENCES".to_owned())],
             Vec::new(),
         );
-        let caps = build_capabilities(&references, &[], false, None, None, false, false);
+        let caps = build_capabilities(&references, &[], false, None, None, false, false, 1);
         assert!(caps.pim_methods.search);
         assert!(caps.pim_methods.thread_hydrate);
 
@@ -545,14 +580,14 @@ mod tests {
             vec![Capability::Thread("references".to_owned())],
             Vec::new(),
         );
-        let caps = build_capabilities(&lowercase, &[], false, None, None, false, false);
+        let caps = build_capabilities(&lowercase, &[], false, None, None, false, false, 1);
         assert!(caps.pim_methods.search);
 
         let ordered_subject = ServerProfile::new(
             vec![Capability::Thread("ORDEREDSUBJECT".to_owned())],
             Vec::new(),
         );
-        let caps = build_capabilities(&ordered_subject, &[], false, None, None, false, false);
+        let caps = build_capabilities(&ordered_subject, &[], false, None, None, false, false, 1);
         assert!(!caps.pim_methods.search);
         assert!(!caps.pim_methods.thread_hydrate);
         // Per-message search does not need THREAD at all.
@@ -562,13 +597,13 @@ mod tests {
     #[test]
     fn push_and_quota_track_their_server_capabilities() {
         let bare = ServerProfile::new(Vec::new(), Vec::new());
-        let caps = build_capabilities(&bare, &[], false, None, None, false, false);
+        let caps = build_capabilities(&bare, &[], false, None, None, false, false, 1);
         assert_eq!(caps.push, PushCapability::None, "IDLE is what drives push");
         assert_eq!(caps.quota_signal, QuotaSignal::None);
         assert!(!caps.pim_methods.quota_get);
 
         let quota = ServerProfile::new(vec![Capability::Quota], Vec::new());
-        let caps = build_capabilities(&quota, &[], false, None, None, false, false);
+        let caps = build_capabilities(&quota, &[], false, None, None, false, false, 1);
         assert_eq!(caps.quota_signal, QuotaSignal::Implicit);
         assert!(caps.pim_methods.quota_get);
     }
@@ -576,19 +611,19 @@ mod tests {
     #[test]
     fn expunge_backed_methods_require_uidplus_or_rev2() {
         let bare = ServerProfile::new(Vec::new(), Vec::new());
-        let caps = build_capabilities(&bare, &[], false, None, None, false, false);
+        let caps = build_capabilities(&bare, &[], false, None, None, false, false, 1);
         assert!(!caps.pim_methods.remove_from_container);
         assert!(!caps.pim_methods.draft_discard);
         assert!(!caps.pim_methods.draft_create);
 
         let uidplus = ServerProfile::new(vec![Capability::UidPlus], Vec::new());
-        let caps = build_capabilities(&uidplus, &[], false, None, None, false, false);
+        let caps = build_capabilities(&uidplus, &[], false, None, None, false, false, 1);
         assert!(caps.pim_methods.remove_from_container);
         assert!(caps.pim_methods.draft_discard);
 
         let rev2 = ServerProfile::new(vec![Capability::Imap4Rev2], vec!["IMAP4REV2".to_owned()]);
         let drafts = [mailbox("Drafts", Vec::new())];
-        let caps = build_capabilities(&rev2, &drafts, false, None, None, false, false);
+        let caps = build_capabilities(&rev2, &drafts, false, None, None, false, false, 1);
         assert!(caps.pim_methods.remove_from_container);
         assert!(caps.pim_methods.draft_discard);
         assert!(caps.pim_methods.draft_create);
@@ -601,7 +636,29 @@ mod tests {
         // `false` even when submission is configured; support is decided
         // at send time by the smtp boundary.
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let with_submission = build_capabilities(&profile, &[], false, None, None, true, false);
+        let with_submission = build_capabilities(&profile, &[], false, None, None, true, false, 1);
         assert!(!with_submission.pim_methods.scheduled_send);
+    }
+
+    #[test]
+    fn push_is_not_advertised_without_push_capacity() {
+        for (idle, capacity, expected) in [
+            (true, 0, PushCapability::None),
+            (true, 1, PushCapability::InProcess),
+            (false, 1, PushCapability::None),
+        ] {
+            let profile = ServerProfile::new(
+                if idle {
+                    vec![Capability::Idle]
+                } else {
+                    Vec::new()
+                },
+                Vec::new(),
+            );
+            assert_eq!(
+                build_capabilities(&profile, &[], false, None, None, false, false, capacity).push,
+                expected
+            );
+        }
     }
 }

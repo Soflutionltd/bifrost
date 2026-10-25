@@ -93,8 +93,13 @@ impl ImapConfig {
         meter_sink: Option<bifrost_net::MeterSinkHandle>,
         bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
     ) -> Result<(ImapConnection, crate::types::AuthOutcome), Error> {
-        let conn =
-            ImapConnection::connect_config_metered(self, meter_sink, bandwidth_budget).await?;
+        let conn = ImapConnection::connect_config_metered(
+            self,
+            meter_sink,
+            bandwidth_budget,
+            &super::LeaseHandoff::none(),
+        )
+        .await?;
         let outcome = conn
             .authenticate_best(credentials, policy, self.command_timeout)
             .await?;
@@ -124,6 +129,7 @@ impl ImapConnection {
         config: &ImapConfig,
         meter_sink: Option<bifrost_net::MeterSinkHandle>,
         bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
+        leases: &super::LeaseHandoff,
     ) -> Result<Self, Error> {
         let conn = if let Some(connector) = &config.tls_connector {
             Self::connect_with_tls_connector_metered(
@@ -134,6 +140,7 @@ impl ImapConnection {
                 config.connect_timeout,
                 meter_sink,
                 bandwidth_budget,
+                leases,
             )
             .await?
         } else {
@@ -145,6 +152,7 @@ impl ImapConnection {
                 config.connect_timeout,
                 meter_sink,
                 bandwidth_budget,
+                leases,
             )
             .await?
         };
