@@ -231,6 +231,7 @@ pub(crate) fn update<T: HttpTransport>(
         let jmap_patch =
             jmap_patch_from_event_patch(&patch, &context, AccountOperation::EventUpdate)?;
         let mut set = CalendarEventSet::new();
+        let guarded = expected.is_some();
         if let Some(state) = expected {
             set = set.if_in_state(state);
         }
@@ -241,7 +242,11 @@ pub(crate) fn update<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::EventUpdate))?;
         response
             .updated(&id)
-            .map_err(to_acct_err(AccountOperation::EventUpdate))?;
+            .map_err(super::error::set_answer_error(
+                AccountOperation::EventUpdate,
+                "CalendarEvent/set",
+                guarded,
+            ))?;
         Ok(())
     })
 }
@@ -266,6 +271,7 @@ pub(crate) fn delete_if_version<T: HttpTransport>(
         let calendars = require_calendars(calendars, AccountOperation::EventDelete)?;
         let id = CalendarEventId::new(event.0);
         let mut set = CalendarEventSet::new().destroy([id.clone()]);
+        let guarded = expected.is_some();
         if let Some(state) = expected {
             set = set.if_in_state(state);
         }
@@ -275,7 +281,11 @@ pub(crate) fn delete_if_version<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::EventDelete))?;
         response
             .destroyed(&id)
-            .map_err(to_acct_err(AccountOperation::EventDelete))
+            .map_err(super::error::set_answer_error(
+                AccountOperation::EventDelete,
+                "CalendarEvent/set",
+                guarded,
+            ))
     })
 }
 
@@ -304,6 +314,7 @@ pub(crate) fn rsvp_if_version<T: HttpTransport>(
         let patch = jmap_rsvp_patch_from_participants(current.participants(), &self_emails, status)
             .map_err(|message| unsupported(AccountOperation::EventRsvp, message))?;
         let mut set = CalendarEventSet::new();
+        let guarded = expected.is_some();
         if let Some(state) = expected {
             set = set.if_in_state(state);
         }
@@ -314,7 +325,11 @@ pub(crate) fn rsvp_if_version<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::EventRsvp))?;
         response
             .updated(&id)
-            .map_err(to_acct_err(AccountOperation::EventRsvp))?;
+            .map_err(super::error::set_answer_error(
+                AccountOperation::EventRsvp,
+                "CalendarEvent/set",
+                guarded,
+            ))?;
         Ok(())
     })
 }
@@ -2337,6 +2352,53 @@ mod tests {
                     .count(),
                 3
             );
+        }
+    }
+
+    /// The scripted server answers `CalendarEvent/set` for "one" only, so a
+    /// write to "two" comes back omitted from every map. The omission does
+    /// not prove the write failed: update, RSVP and delete must report the
+    /// partial response (which reconciles or retries), never the terminal
+    /// `MissingField` a bare `IdNotFound` classified as.
+    #[tokio::test]
+    async fn an_omitted_event_set_answer_is_a_partial_response() {
+        let partial = bifrost_types::AccountErrorKind::Protocol(
+            bifrost_types::ProtocolErrorKind::PartialResponse,
+        );
+        for expected in [
+            None,
+            Some(bifrost_types::ServerVersion::StateAt("s1".into())),
+        ] {
+            let transport = ScriptedQueryTransport::new(Vec::new());
+            let update = update(
+                Some(transport.account()),
+                EventId("two".into()),
+                EventPatch {
+                    expected_version: expected.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(update.kind(), &partial, "{update:?}");
+            let rsvp = rsvp_if_version(
+                Some(transport.account()),
+                Vec::new(),
+                EventId("two".into()),
+                RsvpStatus::Accepted,
+                expected.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(rsvp.kind(), &partial, "{rsvp:?}");
+            let delete = delete_if_version(
+                Some(transport.account()),
+                EventId("two".into()),
+                expected.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(delete.kind(), &partial, "{delete:?}");
         }
     }
 

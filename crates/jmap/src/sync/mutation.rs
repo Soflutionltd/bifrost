@@ -664,6 +664,7 @@ fn classify_set_response(
         Err(crate::Error::IdNotFound(_)) => ItemOutcome::Failed(BatchFailure::new(
             BatchItemId(id.0.clone()),
             super::error::set_id_unanswered(
+                "Email/set",
                 &id.0,
                 super::error::JmapErrorContext::new(operation).with_scope(ErrorScope::Message {
                     id: (id.0.clone()).into(),

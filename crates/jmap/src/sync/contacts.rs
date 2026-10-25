@@ -194,6 +194,7 @@ pub(crate) fn update<T: HttpTransport>(
             None
         };
         let mut set = ContactCardSet::new();
+        let guarded = expected.is_some();
         if let Some(state) = expected {
             set = set.if_in_state(state);
         }
@@ -207,7 +208,11 @@ pub(crate) fn update<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::ContactUpdate))?;
         response
             .updated(&id)
-            .map_err(to_acct_err(AccountOperation::ContactUpdate))?;
+            .map_err(super::error::set_answer_error(
+                AccountOperation::ContactUpdate,
+                "ContactCard/set",
+                guarded,
+            ))?;
         Ok(())
     })
 }
@@ -232,6 +237,7 @@ pub(crate) fn delete_if_version<T: HttpTransport>(
         let contacts = require_contacts(contacts, AccountOperation::ContactDelete)?;
         let id = ContactCardId::new(contact.0);
         let mut set = ContactCardSet::new().destroy([id.clone()]);
+        let guarded = expected.is_some();
         if let Some(state) = expected {
             set = set.if_in_state(state);
         }
@@ -241,7 +247,11 @@ pub(crate) fn delete_if_version<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::ContactDelete))?;
         response
             .destroyed(&id)
-            .map_err(to_acct_err(AccountOperation::ContactDelete))
+            .map_err(super::error::set_answer_error(
+                AccountOperation::ContactDelete,
+                "ContactCard/set",
+                guarded,
+            ))
     })
 }
 
@@ -1305,6 +1315,42 @@ mod tests {
             "state": "session-1"
         }))
         .expect("session parses")
+    }
+
+    /// The scripted server answers `ContactCard/set` for "one" only, so a
+    /// write to "two" comes back omitted from every map. That omission is a
+    /// partial response, never the terminal `MissingField` a bare
+    /// `IdNotFound` classified as: it does not prove the write failed.
+    #[tokio::test]
+    async fn an_omitted_contact_set_answer_is_a_partial_response() {
+        let partial = bifrost_types::AccountErrorKind::Protocol(
+            bifrost_types::ProtocolErrorKind::PartialResponse,
+        );
+        for expected in [
+            None,
+            Some(bifrost_types::ServerVersion::StateAt("s1".into())),
+        ] {
+            let transport = ScriptedQueryTransport::new(Vec::new());
+            let update = update(
+                Some(transport.account()),
+                ContactId("two".into()),
+                ContactPatch {
+                    expected_version: expected.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(update.kind(), &partial, "{update:?}");
+            let delete = delete_if_version(
+                Some(transport.account()),
+                ContactId("two".into()),
+                expected.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(delete.kind(), &partial, "{delete:?}");
+        }
     }
 
     #[tokio::test]
