@@ -1021,15 +1021,18 @@ async fn run_backfill_partition_at_boundary(
         // RE-CHECK THE WALK'S FENCE, with admission in hand and before a single
         // page has been read. Every step above this line can park indefinitely -
         // a pause, a throttle deadline, the scheduler's admission queue - and a
-        // scope reset can close inside any of them. `run_partition`'s own
-        // revalidation cannot see that: its reading is taken once a page is in
-        // hand, which is AFTER the reset, so it compares the replacement
-        // incarnation's fence with itself and lets the page through. The pages
-        // this walk would go on to publish are minted above the fence, a
-        // consumer acknowledges them in good faith, and the durable rows a
-        // `delete_backfill: true` reset deleted come back - for a folder the
-        // provider has deleted, that resurrects the completion marker that makes
-        // a folder recreated under the same id skip its cold-start walk.
+        // scope reset can close inside any of them. `run_partition` is handed
+        // this same `fence_at_walk_start` and registers every page only if the
+        // fence still equals it, so a stale page can no longer be minted; this
+        // check is the cheap early exit that spares the provider a pass whose
+        // every page would be refused, and the incarnation half catches a
+        // registry replacement the fence does not describe. Were a pass to
+        // adopt a fence read after the reset, its pages would be minted above
+        // the fence, a consumer would acknowledge them in good faith, and the
+        // durable rows a `delete_backfill: true` reset deleted would come back -
+        // for a folder the provider has deleted, that resurrects the completion
+        // marker that makes a folder recreated under the same id skip its
+        // cold-start walk.
         //
         // Failing the partition is the right shape: the driver ends the walk,
         // withholds the completion marker, and leaves the scope Pending. If the
@@ -1066,6 +1069,7 @@ async fn run_backfill_partition_at_boundary(
             Some(writer_tx),
             generation,
             Some(lane),
+            fence_at_walk_start,
             delivery,
         )
         .await;
@@ -1247,7 +1251,25 @@ pub(super) async fn emit_backfill_complete(
     // afterwards - the sweep retires that page while a replacement, which had
     // the marker in its ring all along, acknowledges it. The writer compares
     // this reading against the scope's watermark again before it writes.
-    let publication = control.publish_walk_marker(expected.clone(), undelivered_before);
+    let publication = match control.publish_walk_marker_if_fence(
+        expected.clone(),
+        undelivered_before,
+        fence_at_walk_start,
+    ) {
+        Ok(id) => id,
+        // The fence moved after the last point-in-time check above: the
+        // comparison under the coverage lock is the one that cannot race. The
+        // marker's claim is empty, so there is no debt to route.
+        Err(_) => {
+            tracing::warn!(
+                target: "bifrost.sync.backfill",
+                scope = ?scope,
+                "scope was reset or deleted before its completion marker could be \
+                 registered; withholding the marker"
+            );
+            return MarkerOutcome::Withheld;
+        }
+    };
     let event = MultiplexerEvent {
         scope: scope.clone(),
         event: Arc::new(SyncEvent::Batch(batch)),

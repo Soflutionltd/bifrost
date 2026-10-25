@@ -9,8 +9,8 @@
 //! would fail identically. The account would be permanently stranded by
 //! one unreadable row.
 //!
-//! These tests pin the attach path healing the row itself: delete the
-//! scope's cursor, re-establish from the live account, keep going.
+//! Attach heals by clearing every checkpoint of the account with its ledger
+//! preserved, then establishes every scope fresh.
 //!
 //! On the local `HealAccount` double below: the reusable `StubAccount` seam
 //! now lives in `tests/common/mod.rs` and is the model for NEW tests. This
@@ -21,10 +21,13 @@
 //! pins the stranding bug. Write new tests against `common::StubAccount`;
 //! leave this one alone unless it needs to change for its own reasons.
 
+mod common;
+
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bifrost_sync::{
     CheckpointStore, CheckpointTransition, DebtLedger, Error, InMemoryCheckpointStore, SyncEngine,
@@ -105,15 +108,17 @@ fn cursor_for(scope: &CursorScope, state: &[u8]) -> ChangeCursor {
 
 /// A store whose `get_change_cursor` reports the row as undecodable -
 /// what a consumer store returns when `decode_envelope` hits a schema
-/// it cannot read - until the engine deletes it.
+/// it cannot read - until the engine deletes the row or clears the account.
 #[derive(Default)]
 struct PoisonedStore {
     inner: InMemoryCheckpointStore,
     /// Scopes still reporting `SchemaIncompatible`.
     poisoned: Mutex<Vec<CursorScope>>,
-    /// Scopes the engine asked to delete, in call order.
+    /// Scopes the engine asked to delete one by one, in call order.
     deleted: Mutex<Vec<CursorScope>>,
     fail_reads: bool,
+    /// Account-wide clears the engine ran.
+    clears: std::sync::atomic::AtomicUsize,
 }
 
 impl PoisonedStore {
@@ -137,6 +142,22 @@ impl PoisonedStore {
 }
 
 impl CheckpointStore for PoisonedStore {
+    fn clear_account_checkpoints<'a>(
+        &'a self,
+        account: &'a AccountId,
+        ledger: DebtLedger,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async move {
+            self.inner
+                .clear_account_checkpoints(account, ledger)
+                .await?;
+            self.clears
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.poisoned.lock().expect("poisoned").clear();
+            Ok(())
+        })
+    }
+
     fn apply_transition<'a>(
         &'a self,
         account: &'a AccountId,
@@ -1173,8 +1194,8 @@ async fn attach_heals_an_undecodable_cursor_instead_of_failing() {
         .expect("an undecodable cursor must not fail the attach");
 
     assert_eq!(
-        store.deleted(),
-        vec![scope.clone()],
+        store.clears.load(Ordering::SeqCst),
+        1,
         "the unreadable row must be cleared, otherwise the next attach hits it again"
     );
     assert_eq!(
@@ -1196,8 +1217,17 @@ async fn attach_heals_an_undecodable_cursor_instead_of_failing() {
     assert_eq!(closed.load(Ordering::SeqCst), 1);
 }
 
+/// One unreadable row clears every durable row of the account at attach: the
+/// readable sibling's cursor and completion marker, and the rows of a scope
+/// discovery never names. The ledger survives byte for byte, old object id
+/// included; `HealFactory`'s idle changes stream means no accepted coverage can
+/// discharge it during the assertion.
+///
+/// Ablations: restore the per-scope `delete_change_cursor` heal (no clear, the
+/// sibling resumes its stored cursor and is not established); pass
+/// `DebtLedger::default()` from attach to the clear (the ledger bytes differ).
 #[tokio::test]
-async fn one_undecodable_scope_does_not_disturb_its_siblings() {
+async fn one_undecodable_scope_clears_every_row_of_the_account_at_attach() {
     let account_id = AccountId("schema-heal-sibling".to_owned());
     let poisoned = CursorScope::Type(bifrost_types::ObjectType::Email);
     let healthy = CursorScope::Type(bifrost_types::ObjectType::Mailbox);
@@ -1205,6 +1235,42 @@ async fn one_undecodable_scope_does_not_disturb_its_siblings() {
     let established = Arc::new(Mutex::new(Vec::new()));
     let closed = Arc::new(AtomicUsize::new(0));
 
+    let absent = CursorScope::Type(bifrost_types::ObjectType::Contact);
+    for scope in [&healthy, &absent] {
+        store
+            .put_change_cursor(&account_id, cursor_for(scope, b"old"))
+            .await
+            .expect("seed");
+        store
+            .put_backfill(
+                &account_id,
+                BackfillCheckpoint {
+                    scope: scope.clone(),
+                    partition: bifrost_sync::backfill::partitioner::completion_partition(),
+                    progress_marker: None,
+                    progress: Default::default(),
+                    envelope_version: 1,
+                },
+            )
+            .await
+            .expect("seed marker");
+    }
+    let mut ledger = DebtLedger::default();
+    let report = bifrost_types::InventoryCoverageReport::degraded(
+        bifrost_types::CoverageDomain::full(healthy.clone()),
+        vec![bifrost_types::InventoryObligation::Object {
+            key: bifrost_types::ObligationKey(b"old-id".to_vec()),
+            id: ObjectId("old-encoding-id".into()),
+            error: unsupported(bifrost_types::AccountOperation::SyncInventory),
+            repair: Vec::new(),
+        }],
+    );
+    ledger.ingest_debt_only(&report, 1, 1);
+    let ledger_bytes = bifrost_sync::cursor::encode_ledger(&ledger);
+    store
+        .put_ledger(&account_id, ledger)
+        .await
+        .expect("seed ledger");
     let engine = SyncEngine::builder()
         .checkpoints(Arc::clone(&store) as Arc<dyn CheckpointStore>)
         .build()
@@ -1221,12 +1287,35 @@ async fn one_undecodable_scope_does_not_disturb_its_siblings() {
         .expect("attach succeeds");
 
     assert_eq!(
-        store.deleted(),
-        vec![poisoned.clone()],
-        "only the unreadable scope's row is cleared"
+        store.clears.load(Ordering::SeqCst),
+        1,
+        "an unreadable scope clears the account"
     );
-    // Both scopes still establish: the healthy one because it had no
-    // stored cursor, the poisoned one because its row was dropped.
+    assert!(
+        store.deleted().is_empty(),
+        "attach must not heal an unreadable row per scope"
+    );
+    for scope in [&healthy, &absent] {
+        assert!(
+            store
+                .get_backfill(&account_id, scope)
+                .await
+                .expect("read")
+                .is_none()
+        );
+    }
+    assert!(
+        store
+            .get_change_cursor(&account_id, &absent)
+            .await
+            .expect("read")
+            .is_none()
+    );
+    assert_eq!(
+        bifrost_sync::cursor::encode_ledger(&store.get_ledger(&account_id).await.expect("ledger")),
+        ledger_bytes
+    );
+    // Both scopes establish fresh, including the formerly readable sibling.
     assert_eq!(
         *established.lock().expect("established lock"),
         vec![poisoned, healthy]
@@ -1982,6 +2071,14 @@ struct FlakyGetStore {
 }
 
 impl CheckpointStore for FlakyGetStore {
+    fn clear_account_checkpoints<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        ledger: bifrost_sync::cursor::DebtLedger,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.clear_account_checkpoints(account, ledger)
+    }
+
     fn apply_transition<'a>(
         &'a self,
         account: &'a AccountId,
@@ -2134,6 +2231,14 @@ struct AckRacingStore {
 }
 
 impl CheckpointStore for AckRacingStore {
+    fn clear_account_checkpoints<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        ledger: bifrost_sync::cursor::DebtLedger,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.clear_account_checkpoints(account, ledger)
+    }
+
     fn apply_transition<'a>(
         &'a self,
         account: &'a AccountId,
@@ -2251,7 +2356,7 @@ async fn aborted_reattach_cannot_clobber_concurrently_acked_vanished_cursor() {
     let store = Arc::new(AckRacingStore {
         inner: Arc::clone(&inner),
         mutated_scopes: Mutex::new(Vec::new()),
-        side_write: Mutex::new(Some((account_id.clone(), newer_ack.clone()))),
+        side_write: Mutex::new(None),
     });
     let engine = SyncEngine::builder()
         .checkpoints(Arc::clone(&store) as Arc<dyn CheckpointStore>)
@@ -2267,6 +2372,7 @@ async fn aborted_reattach_cannot_clobber_concurrently_acked_vanished_cursor() {
         .subscribe_push(&account_id, std::slice::from_ref(&live_scope))
         .await
         .expect("subscribe");
+    *store.side_write.lock().expect("side write") = Some((account_id.clone(), newer_ack.clone()));
     // Attach persisted both live scopes; only the reopen's mutations are
     // under scrutiny. The scripted side write fires on the reopen's first
     // put, so it lands mid-reattach by construction.
@@ -2934,4 +3040,88 @@ async fn a_committed_reattach_is_not_rolled_back_by_the_next_aborted_one() {
     );
 
     engine.detach(&account_id).await.expect("detach");
+}
+
+/// A deferred inventory walk (attach-time, so its scope is not registered)
+/// that terminates with a schema error triggers the account reset through
+/// `ctx.recover(Some(scope), ..)`. The reset must re-establish that scope even
+/// though the registry never held it, and the queued sibling item must not
+/// walk a second time.
+///
+/// Ablations: pass an empty `extra` from the directive arm (A is walked once
+/// and never registered); drop both of the worker's pre-walk fence checks, the
+/// one before the throttle waits and the one after admission (B walks twice:
+/// its queued walk runs after the reset, is refused at its first publication,
+/// and is re-run through `EstablishIfAbsent`).
+#[tokio::test(start_paused = true)]
+async fn a_deferred_inventory_that_raises_schema_incompatible_is_established_after_the_reset() {
+    let a = CursorScope::Type(bifrost_types::ObjectType::Email);
+    let b = CursorScope::Type(bifrost_types::ObjectType::Mailbox);
+    let walks = Arc::new(Mutex::new(
+        std::collections::HashMap::<CursorScope, usize>::new(),
+    ));
+    let observed = Arc::clone(&walks);
+    let mut account = common::StubAccount::new(vec![a.clone(), b.clone()]);
+    account.establishment = |_| bifrost_types::CursorEstablishment::EstablishViaInventory;
+    let trigger = a.clone();
+    account.inventory_hook = Some(Arc::new(move |scope| {
+        let mut walks = observed.lock().expect("walks");
+        let count = walks.entry(scope.clone()).or_default();
+        *count += 1;
+        if *scope == trigger && *count == 1 {
+            vec![bifrost_types::InventoryEvent::Terminated(
+                bifrost_types::AccountErrorBuilder::new(
+                    bifrost_types::AccountErrorKind::SyncState(
+                        bifrost_types::SyncStateErrorKind::SchemaIncompatible,
+                    ),
+                    bifrost_types::Cause::State(bifrost_types::StateCause::SchemaIncompatible),
+                )
+                .try_build()
+                .expect("schema error"),
+            )]
+        } else {
+            vec![bifrost_types::InventoryEvent::Done(
+                bifrost_types::InventoryCompletion::complete(
+                    bifrost_types::CoverageDomain::full(scope.clone()),
+                    Some(Checkpoint::Change(cursor_for(scope, b"fresh"))),
+                    bifrost_types::PartitionEnd::Exhausted,
+                ),
+            )]
+        }
+    }));
+    let id = AccountId("deferred-schema".into());
+    let engine = SyncEngine::builder().build().expect("engine");
+    engine
+        .attach(
+            id.clone(),
+            Arc::new(common::StubFactory::queue(vec![Arc::new(account)])),
+        )
+        .await
+        .expect("attach");
+    let mut receiver = engine.account_changes_stream(&id).expect("subscribe");
+    let mut done = std::collections::HashSet::new();
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while done.len() < 2 {
+            let event = receiver.recv().await.expect("event");
+            if let Some(checkpoint) = event.checkpoint.clone() {
+                engine
+                    .ack_checkpoint(
+                        &id,
+                        event.scope.clone(),
+                        checkpoint,
+                        event.publication.clone(),
+                    )
+                    .await
+                    .expect("ack");
+            }
+            if matches!(event.event.as_ref(), SyncEvent::Done(_)) {
+                done.insert(event.scope);
+            }
+        }
+    })
+    .await
+    .expect("both inventories");
+    assert_eq!(walks.lock().expect("walks").get(&a), Some(&2));
+    assert_eq!(walks.lock().expect("walks").get(&b), Some(&1));
+    engine.detach(&id).await.expect("detach");
 }

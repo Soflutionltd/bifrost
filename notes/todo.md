@@ -194,3 +194,62 @@ PUBLISHED SURFACE fence apply.
   it. A caller re-polling with a shorter buffer would panic. Looks unreachable
   today: a dropped write leaves the connection Broken and the pool discards
   it.
+
+## Account schema reset follow-ups
+
+- "`BackfillCheckpointWriter::persist` bypasses completion refusal and every
+  reset fence" - the attached route accepts any consumer-supplied
+  `BackfillCheckpoint`, completion partition included, with no publication;
+  the direct route has no engine at all. The account reset excludes this
+  consumer assertion path.
+- "Ledger-only writer requests from pre-reset producers" - `RecordBarrier`
+  and `CrossWaivedBarriers` sent by a walk that predates a scope or account
+  reset are accepted; a stale barrier fails closed (it blocks the
+  replacement walk and asks an operator) and needs its own policy.
+  `RecordDebt` acceptance is the safe direction and stays.
+- "Schema-incompatibility evidence discarded before classification" - a
+  lifecycle `Created` restart deletes a preexisting row unread;
+  `run_establish` types an unreadable row as `Engine(SchemaIncompatible)`
+  without routing it to the account reset, and the per-scope retry loop
+  treats it as retryable. Reachable for a preexisting row of a scope absent
+  from discovery at attach that returns mid-session before any sibling door
+  failure.
+- "Per-scope fences do not refuse foreign publications" - the account fence
+  refuses ids minted by earlier attachments; per-scope resets still accept
+  a prior attachment's change receipt through the fallback.
+- "Duplicate SchemaIncompatible directives run duplicate account resets" -
+  every scope whose door fails sends its own directive, and each runs a full
+  clear and re-establishment. (The parked-reset double and the queued
+  deferred `Resume` items are closed by the account reset; the remaining cost is
+  directives already queued by distinct live drives.)
+- "`ack_checkpoint` with no publication bypasses every fence" - a change
+  cursor or backfill page acknowledged with `publication: None` skips the
+  claim lookup and every reset fence in `persist_ack_request`; after an
+  account reset such a backfill page becomes a resume position past windows
+  the replacement walk never re-mints. Nothing in the engine sends one. Two
+  answers to rule on: name it as a consumer assertion path (as the account
+  reset does), or refuse a `None`-publication backfill acknowledgement (always, by
+  the reasoning `completion_refusal` already records, or once an account
+  fence is raised).
+- "Conditional registration ignores `fenced_backfill`" - `register_if_fence`
+  compares `scope_fence`, which reads `fenced` (and `fenced_account`), not
+  `fenced_backfill`, so a backfill discard still revokes an in-flight
+  backfill producer only at acknowledgement, not at registration.
+  Pre-existing and probably harmless (the discard runs before the retry
+  mints), but the same point-in-time question the walk and establishment fences close for `fenced`.
+- "Backfill discard requests survive an account reset" - detach drains
+  `take_backfill_discards()` and sends `DiscardBackfillProgress` per scope; a
+  discard recorded before an account reset deletes the post-reset walk's rows
+  at detach. Safe direction (costs a re-walk) and pre-existing for per-scope
+  resets.
+- "Capture the lifecycle epoch where `Created` is raised" - routing the
+  lifecycle `Created` as `EstablishIfAbsent { scope, epoch }` read at the
+  multiplexer, instead of a synthesized `RestartScope` whose park reads the
+  epoch at decline time, would let the epoch alone distinguish "deleted
+  before the repair was raised" from "recreated". Changes the routing an
+  existing multiplexer test pins.
+- "Engine-internal requests on the published `ReopenRequest`" -
+  `ScopeDeleted`, and now `EstablishIfAbsent` and `SchemaReset`, are
+  engine plumbing whose epochs and generations mean nothing to a consumer,
+  on a `pub` enum re-exported from `lib.rs`. Moving them to a crate-private
+  request enum removes published variants, so it needs the owner's ruling.

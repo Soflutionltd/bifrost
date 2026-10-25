@@ -114,6 +114,7 @@ impl Harness {
             }
         });
         let ctx = SlotContext {
+            deferred_schema_reset: Arc::new(crate::engine::DeferredSchemaReset::default()),
             bandwidth_budget: None,
             factory,
             current: Arc::new(ArcSwap::from_pointee(account)),

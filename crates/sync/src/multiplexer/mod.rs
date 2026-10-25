@@ -670,6 +670,23 @@ pub enum ReopenRequest {
     /// new incarnation's entire cold-start walk: data invisibility, not
     /// just a leaked row.
     ScopeDeleted { scope: CursorScope },
+    /// Engine plumbing: establish `scope` unless it is already registered or
+    /// a provider deletion moved its lifecycle epoch past `epoch` since the
+    /// obligation was recorded. Raised by parked scope repairs and by the
+    /// deferred inventory worker for a walk a reset or deletion superseded.
+    /// The epoch is an engine-internal counter and means nothing to a
+    /// consumer.
+    EstablishIfAbsent { scope: CursorScope, epoch: u64 },
+    /// Engine plumbing: re-run an account-wide schema reset that was declined
+    /// under a pause or exhausted its retry budget, owing re-establishment to
+    /// `reestablish` (scope -> lifecycle epoch). `parked_at` is the count of
+    /// completed account resets as of the newest decline; a reset that has
+    /// committed since already cleared every row, so the listener then only
+    /// establishes the owed scopes.
+    SchemaReset {
+        reestablish: HashMap<CursorScope, u64>,
+        parked_at: u64,
+    },
 }
 
 /// Upper bound on the lifecycle reader's wait for a replacement connection.
@@ -921,6 +938,7 @@ impl Multiplexer {
         let lifecycle_account = Arc::clone(&account);
         let lifecycle_shutdown = shutdown.clone();
         let lifecycle_cursors = Arc::clone(&cursors);
+        let lifecycle_control = control.clone();
         let lifecycle_tokens = Arc::clone(&scope_tokens);
         let lifecycle_reopen = reopen_tx.clone();
         let lifecycle_changes = delivery.sender().clone();
@@ -1042,6 +1060,7 @@ impl Multiplexer {
                             };
                             apply_lifecycle_transition(
                                 &lifecycle_cursors,
+                                &lifecycle_control,
                                 &lifecycle_tokens,
                                 &lifecycle_reopen,
                                 lifecycle,
@@ -1814,6 +1833,25 @@ async fn handle_drive_outcome(
     }
 }
 
+/// Take a provider-deleted scope out of service in memory: revoke its
+/// obligations (lifecycle epoch), revoke its fence-guarded producers (scope
+/// fence), and only THEN drop its registry entry, if any. The order is the
+/// point: a fusion finalizing before the fence raise put a cursor the delete
+/// below removes; one finalizing after it fails `put_if`. The epoch moves before
+/// the fence so a caller that reads the fence and then checks the epoch either
+/// sees the deletion in the epoch or holds a fence the deletion has since moved.
+/// Both deletion front ends (the multiplexer and the reopen listener) call this,
+/// so the sequence is written in exactly one place.
+pub(crate) fn retire_deleted_scope(
+    cursors: &CursorRegistry,
+    control: &SyncControl,
+    scope: &CursorScope,
+) {
+    cursors.bump_lifecycle_epoch(scope);
+    control.raise_scope_fence(scope);
+    cursors.delete(scope);
+}
+
 /// Apply one `ScopeLifecycle` transition to the live registry, the poll
 /// tokens, and the engine's reopen channel.
 ///
@@ -1827,12 +1865,14 @@ async fn handle_drive_outcome(
 /// the create half on the new id.
 async fn apply_lifecycle_transition(
     cursors: &CursorRegistry,
+    control: &SyncControl,
     tokens: &ScopeTokens,
     reopen_tx: &mpsc::Sender<ReopenRequest>,
     lifecycle: ScopeLifecycle,
 ) {
     async fn delete_scopes(
         cursors: &CursorRegistry,
+        control: &SyncControl,
         tokens: &ScopeTokens,
         reopen_tx: &mpsc::Sender<ReopenRequest>,
         membership: &bifrost_types::MembershipScope,
@@ -1862,11 +1902,12 @@ async fn apply_lifecycle_transition(
             // window: the poll token was gone while the cursor was still
             // live, and a reconciler entering it started a drive on a scope
             // about to be deleted.
-            cursors.delete(&scope);
+            retire_deleted_scope(cursors, control, &scope);
             cancel_scope_token(tokens, &scope);
             let _ = reopen_tx.send(ReopenRequest::ScopeDeleted { scope }).await;
         }
         for scope in unindexed {
+            retire_deleted_scope(cursors, control, &scope);
             let _ = reopen_tx.send(ReopenRequest::ScopeDeleted { scope }).await;
         }
     }
@@ -1900,10 +1941,10 @@ async fn apply_lifecycle_transition(
             establish_scopes(cursors, reopen_tx, &membership).await;
         }
         ScopeLifecycle::Deleted(membership) => {
-            delete_scopes(cursors, tokens, reopen_tx, &membership).await;
+            delete_scopes(cursors, control, tokens, reopen_tx, &membership).await;
         }
         ScopeLifecycle::Renamed { old, new, .. } => {
-            delete_scopes(cursors, tokens, reopen_tx, &old).await;
+            delete_scopes(cursors, control, tokens, reopen_tx, &old).await;
             establish_scopes(cursors, reopen_tx, &new).await;
         }
         _ => {}
@@ -2059,6 +2100,51 @@ mod tests {
             &*rx.try_recv().expect("termination published").event,
             SyncEvent::Terminated(_)
         ));
+    }
+
+    #[test]
+    fn retiring_a_deleted_scope_revokes_its_producers_before_its_cursor() {
+        let coverage = Arc::new(crate::cursor::PendingCoverage::new());
+        let control = lag_test_control_over(Arc::clone(&coverage));
+        let cursors = CursorRegistry::new();
+        let Checkpoint::Change(cursor) = account_change_checkpoint(b"live") else {
+            panic!("cursor")
+        };
+        cursors.put(cursor.clone());
+        let old = coverage.scope_fence(&cursor.scope);
+        let epoch = cursors.lifecycle_epoch(&cursor.scope);
+        retire_deleted_scope(&cursors, &control, &cursor.scope);
+        assert!(
+            !cursors.put_if(cursor.clone(), || coverage.scope_fence(&cursor.scope)
+                == old)
+        );
+        assert!(cursors.snapshot(&cursor.scope).is_none());
+        assert!(cursors.lifecycle_epoch(&cursor.scope) > epoch);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_scope_leaves_no_registry_entry_and_a_moved_fence() {
+        let coverage = Arc::new(crate::cursor::PendingCoverage::new());
+        let control = lag_test_control_over(Arc::clone(&coverage));
+        let cursors = CursorRegistry::new();
+        let scope = CursorScope::Folder(bifrost_types::FolderId("deleted".into()));
+        cursors.put(crate::test_common::cursor_for(&scope, b"live"));
+        let old = coverage.scope_fence(&scope);
+        let epoch = cursors.lifecycle_epoch(&scope);
+        let (tx, _rx) = mpsc::channel(4);
+        apply_lifecycle_transition(
+            &cursors,
+            &control,
+            &Arc::default(),
+            &tx,
+            ScopeLifecycle::Deleted(bifrost_types::MembershipScope::Folder(
+                bifrost_types::FolderId("deleted".into()),
+            )),
+        )
+        .await;
+        assert!(cursors.snapshot(&scope).is_none());
+        assert!(coverage.scope_fence(&scope) > old);
+        assert!(cursors.lifecycle_epoch(&scope) > epoch);
     }
 
     fn warning_event(message: &str) -> MultiplexerEvent {
@@ -2227,6 +2313,7 @@ mod tests {
 
         apply_lifecycle_transition(
             &cursors,
+            &lag_test_control(),
             &tokens,
             &reopen_tx,
             ScopeLifecycle::Deleted(membership),

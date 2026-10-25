@@ -182,10 +182,27 @@ pub(super) async fn ack_writer(
     // obligations retained by earlier attachments. Retry on the next request;
     // do not consume claims or alter publication bookkeeping on a failed read.
     let mut loaded_ledger = None;
+    // Debt offered by `RecordDebt` while the ledger is unloaded. Answered
+    // `Err`, but RETAINED: the producer has nowhere else to put it (a refused
+    // publication's debt, a terminal walk summary), so dropping it here would
+    // be a silent loss. Ingested the moment a later load succeeds, before that
+    // request is dispatched, so its write carries the debt. Unbounded while the
+    // ledger never loads, deliberately: every entry is one report a producer
+    // already held in memory, and dropping one is the loss this exists to close.
+    let mut pending_debt: Vec<(bifrost_types::InventoryCoverageReport, u64)> = Vec::new();
     while let Some(req) = rx.recv().await {
         if loaded_ledger.is_none() {
             match store.get_ledger(&account_id).await {
-                Ok(ledger) => loaded_ledger = Some(ledger),
+                Ok(mut ledger) => {
+                    for (report, generation) in pending_debt.drain(..) {
+                        ledger.ingest_debt_only(
+                            &report,
+                            generation,
+                            jiff::Timestamp::now().as_second(),
+                        );
+                    }
+                    loaded_ledger = Some(ledger);
+                }
                 Err(error) => {
                     tracing::error!(
                         target: "bifrost.sync.changes",
@@ -193,7 +210,8 @@ pub(super) async fn ack_writer(
                         error = %error,
                         "failed to load debt ledger; refusing ledger-dependent requests"
                     );
-                    reject_unloaded_request(req, error, &account_id, &store).await;
+                    reject_unloaded_request(req, error, &account_id, &store, &mut pending_debt)
+                        .await;
                     continue;
                 }
             }
@@ -484,6 +502,57 @@ pub(super) async fn ack_writer(
                 let _ = done.send(discarded);
                 continue;
             }
+            WriterRequest::ResetAccountForSchemaRecovery { done } => {
+                // The account-wide form of the `ResetScope` arm below, with the
+                // same two-pass shape. Pass 1 retires every scoped publication,
+                // takes the whole carry-forward slot and raises the account
+                // fence BEFORE the first await, so nothing registered so far
+                // can be acknowledged after the clear. Its debt rides the
+                // clear's own atomic ledger write rather than a separate one.
+                let debt = coverage.invalidate_account();
+                let now = jiff::Timestamp::now().as_second();
+                for report in &debt.reports {
+                    ledger.ingest_debt_only(report, debt.generation, now);
+                }
+                let cleared = store
+                    .clear_account_checkpoints(&account_id, ledger.clone())
+                    .await;
+                // Only a committed clear removed the provisional rows. A failed
+                // clear left them in place, and a delayed `ReattachAbort` must
+                // still find its ownership to delete them.
+                if cleared.is_ok() {
+                    provisional.clear();
+                }
+                // Pass 2 closes the window the clear's await opened: anything
+                // registered meanwhile is retired, fenced and its debt carried.
+                let debt = coverage.invalidate_account();
+                let carried = !debt.reports.is_empty();
+                let now = jiff::Timestamp::now().as_second();
+                for report in &debt.reports {
+                    ledger.ingest_debt_only(report, debt.generation, now);
+                }
+                // Written after a FAILED clear too: pass 1 already removed its
+                // debt from the coverage ledger, so without this write it would
+                // live only in writer memory and be lost if the reset exhausts
+                // and the slot detaches. That write cannot change the answer
+                // (`cleared` is already `Err`); a pass-2 failure after a
+                // committed clear does, so the caller retries.
+                let second = if cleared.is_err() || carried {
+                    persist_ledger_only(&account_id, &store, ledger).await
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = &second {
+                    tracing::warn!(
+                        target: "bifrost.sync.changes",
+                        account = ?account_id,
+                        error = %error,
+                        "account reset could not persist the debt of the publications it retired"
+                    );
+                }
+                let _ = done.send(cleared.and(second));
+                continue;
+            }
             WriterRequest::ResetScope {
                 scope,
                 delete_backfill,
@@ -714,14 +783,22 @@ impl WriterHandle {
         self.reset_scope(scope, true).await
     }
 
-    /// Schema recovery: drop the backfill rows too, completion marker included.
-    /// The re-walk is the point - it re-mints ids under the new encoding, and
-    /// the marker would make the next attach skip it.
-    pub(super) async fn reset_scope_for_schema_recovery(
-        &self,
-        scope: CursorScope,
-    ) -> Result<(), Error> {
-        self.reset_scope(scope, true).await
+    /// Schema recovery: drop every change cursor and backfill row of the
+    /// account, completion markers included, keeping the debt ledger.
+    ///
+    /// Account-wide rather than per registered scope because the rows a schema
+    /// bump must clear include scopes the registry does not name - a scope whose
+    /// restart budget was exhausted, a disabled scope, one absent from this
+    /// session's discovery, one whose deferred inventory has not finalized - and
+    /// any surviving completion marker makes that scope's next establishment
+    /// skip the inventory walk that re-mints its ids under the new encoding.
+    pub(super) async fn reset_account_for_schema_recovery(&self) -> Result<(), Error> {
+        let (done, recv) = oneshot::channel();
+        self.tx
+            .send(WriterRequest::ResetAccountForSchemaRecovery { done })
+            .await
+            .map_err(|_| Error::ShuttingDown)?;
+        recv.await.map_err(|_| Error::ShuttingDown)?
     }
 
     async fn reset_scope(&self, scope: CursorScope, delete_backfill: bool) -> Result<(), Error> {
@@ -874,6 +951,7 @@ async fn reject_unloaded_request(
     error: Error,
     account: &AccountId,
     store: &Arc<DynCheckpointStore>,
+    pending_debt: &mut Vec<(bifrost_types::InventoryCoverageReport, u64)>,
 ) {
     match req {
         WriterRequest::Ack(req) => {
@@ -887,9 +965,17 @@ async fn reject_unloaded_request(
         | WriterRequest::DiscardBackfillProgress { done, .. }
         | WriterRequest::ResetScope { done, .. }
         | WriterRequest::RecordBarrier { done, .. }
-        | WriterRequest::RecordDebt { done, .. }
+        | WriterRequest::ResetAccountForSchemaRecovery { done }
         | WriterRequest::ApplyRepair { done, .. }
         | WriterRequest::AcknowledgePublication { done, .. } => {
+            let _ = done.send(Err(error));
+        }
+        WriterRequest::RecordDebt {
+            report,
+            generation,
+            done,
+        } => {
+            pending_debt.push((report, generation));
             let _ = done.send(Err(error));
         }
         WriterRequest::CrossWaivedBarriers { done, .. }
@@ -1516,6 +1602,15 @@ mod tests {
     }
 
     impl CheckpointStore for FlakyLedgerStore {
+        fn clear_account_checkpoints<'a>(
+            &'a self,
+            account: &'a bifrost_types::AccountId,
+            ledger: crate::cursor::DebtLedger,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>>
+        {
+            self.inner.clear_account_checkpoints(account, ledger)
+        }
+
         fn apply_transition<'a>(
             &'a self,
             account: &'a bifrost_types::AccountId,
@@ -1654,6 +1749,50 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let task = tokio::spawn(ack_writer(account, store, control, coverage, rx));
         (tx, task)
+    }
+
+    async fn refused_debt_failure_case(fail_load: bool) {
+        let store = seeded_store().await;
+        store
+            .fail_reads
+            .store(fail_load, std::sync::atomic::Ordering::SeqCst);
+        store
+            .fail_writes
+            .store(!fail_load, std::sync::atomic::Ordering::SeqCst);
+        let (tx, task) = start_flaky_writer(Arc::clone(&store));
+        let claim = crate::cursor::CoverageClaim::new(
+            bifrost_types::InventoryCoverageReport::degraded(
+                bifrost_types::CoverageDomain::full(email_scope()),
+                vec![unrepresentable("refused")],
+            ),
+            7,
+        );
+        crate::inventory_walk::record_refused_debt(Some(&tx), claim)
+            .await
+            .expect("writer retains failed debt");
+        store
+            .fail_reads
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        store
+            .fail_writes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        persist_test_cursor(&tx).await.expect("flush ledger");
+        let ledger = store
+            .inner
+            .get_ledger(&AccountId("acct".into()))
+            .await
+            .expect("ledger");
+        assert_eq!(ledger.open_debt().count(), 2);
+        drop(tx);
+        task.await.expect("writer");
+    }
+    #[tokio::test]
+    async fn debt_offered_before_the_ledger_loads_is_kept() {
+        refused_debt_failure_case(true).await;
+    }
+    #[tokio::test]
+    async fn refused_debt_survives_a_failed_ledger_write() {
+        refused_debt_failure_case(false).await;
     }
 
     async fn persist_test_cursor(tx: &mpsc::Sender<WriterRequest>) -> Result<(), Error> {

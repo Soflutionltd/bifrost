@@ -56,6 +56,11 @@ pub enum Error {
     /// Account is paused.
     #[error("account is paused")]
     Paused,
+    /// The work was invalidated by a reset or deletion of its scope that
+    /// closed while it ran; whoever closed it owns the follow-up. Not an
+    /// `AccountError`, and never routed through recovery dispatch.
+    #[error("work superseded by a reset or deletion")]
+    Superseded,
     /// Account operation surfaced through an engine path that is not
     /// `attach`. The carried error has its derived `RecoveryClass`
     /// intact; consumers route through it the same way they route any

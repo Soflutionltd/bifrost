@@ -294,6 +294,49 @@ impl SyncControl {
         self.inner.publications.register(checkpoint, claim)
     }
 
+    /// Register a checkpoint publication only if its scope's fence still equals
+    /// `expected_fence`, compared atomically with the mint. A refusal mints
+    /// nothing and hands the claim back; the producer must not broadcast, and
+    /// owes the writer the claim's debt (`inventory_walk::record_refused_debt`).
+    pub(crate) fn publish_checkpoint_if_fence(
+        &self,
+        checkpoint: Checkpoint,
+        claim: crate::cursor::CoverageClaim,
+        expected_fence: u64,
+    ) -> Result<crate::cursor::PublicationId, crate::cursor::CoverageClaim> {
+        self.inner
+            .publications
+            .register_if_fence(checkpoint, claim, expected_fence, None)
+    }
+
+    /// The completion-marker flavour of [`Self::publish_checkpoint_if_fence`]:
+    /// the walk's undelivered watermark is stamped into the receipt so the ack
+    /// writer can ask again, at acknowledgement time, whether the walk this
+    /// marker concludes is still whole. The marker's claim is empty, so a
+    /// refusal carries no debt.
+    pub(crate) fn publish_walk_marker_if_fence(
+        &self,
+        checkpoint: Checkpoint,
+        walk_watermark: u64,
+        expected_fence: u64,
+    ) -> Result<crate::cursor::PublicationId, crate::cursor::CoverageClaim> {
+        self.inner.publications.register_if_fence(
+            checkpoint,
+            crate::cursor::CoverageClaim {
+                reports: Vec::new(),
+                generation: 0,
+            },
+            expected_fence,
+            Some(walk_watermark),
+        )
+    }
+
+    /// Revoke every fence-guarded producer of `scope`, now. See
+    /// `multiplexer::retire_deleted_scope`.
+    pub(crate) fn raise_scope_fence(&self, scope: &bifrost_types::CursorScope) {
+        self.inner.publications.raise_scope_fence(scope);
+    }
+
     pub(crate) fn publish_checkpoint_without_report(
         &self,
         checkpoint: Checkpoint,
@@ -305,25 +348,6 @@ impl SyncControl {
                 reports: Vec::new(),
                 generation,
             },
-        )
-    }
-
-    /// The completion-marker flavour: the same publication, with the walk's
-    /// undelivered watermark stamped into its receipt so the ack writer can ask
-    /// again - at acknowledgement time, and after any retirement - whether the
-    /// walk this marker concludes is still whole.
-    pub(crate) fn publish_walk_marker(
-        &self,
-        checkpoint: Checkpoint,
-        walk_watermark: u64,
-    ) -> crate::cursor::PublicationId {
-        self.inner.publications.register_walk_marker(
-            checkpoint,
-            crate::cursor::CoverageClaim {
-                reports: Vec::new(),
-                generation: 0,
-            },
-            walk_watermark,
         )
     }
 

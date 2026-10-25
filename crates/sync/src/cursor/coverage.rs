@@ -518,13 +518,24 @@ struct Ledger {
     /// Per-scope acknowledgement fence installed by a durable scope reset.
     ///
     /// Holds the mint counter as of the moment the reset closed. Every
-    /// publication id at or below it names a batch published against durable
+    /// publication id below it names a batch published against durable
     /// rows the reset has since deleted, so acknowledging one would re-create
     /// the very cursor the reset dropped to force re-establishment. Ids minted
     /// after the reset closed - i.e. by the re-establish that follows - are
-    /// above the fence and unaffected, so no unfencing step exists to be
+    /// at or above the fence and unaffected, so no unfencing step exists to be
     /// forgotten. One entry per scope, so it stays bounded.
     fenced: HashMap<CursorScope, u64>,
+    /// Account-wide acknowledgement fence, raised by an account reset.
+    /// Exclusive bound over this ledger's ids, like `fenced`; once nonzero it
+    /// also refuses every scoped id this ledger did not mint. Segments come
+    /// from a process-global counter, so a foreign id from an earlier
+    /// attachment in THIS process carries a lower segment and is already below
+    /// the bound; the `minted_here` clause is for a foreign id with a HIGHER
+    /// segment - a receipt persisted by a previous process (segments restart
+    /// at 0) - which the bound alone would admit. Any foreign id was minted by
+    /// an attachment that ended before this reset, so none may land after it.
+    /// Repair receipts carry no scope and stay acknowledgeable.
+    fenced_account: u64,
     /// Highest BACKFILL publication id this ledger has ever minted, per scope.
     ///
     /// Survives the publication itself: the entry is removed on acknowledgement,
@@ -660,7 +671,10 @@ impl PendingCoverage {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn mint(&self, receipt: PublicationReceipt) -> PublicationId {
+    /// Mint and register under ONE ledger guard. Minting under one guard and
+    /// registering under another lets an id minted before invalidation escape
+    /// both retirement passes, stranding the debt in a fenced registration.
+    fn mint(&self, _held: &mut Ledger, receipt: PublicationReceipt) -> PublicationId {
         PublicationId(
             self.next.fetch_add(1, Ordering::Relaxed),
             std::sync::Arc::new(receipt),
@@ -689,12 +703,14 @@ impl PendingCoverage {
     /// what keeps the two halves of a checkpoint publication - the claim and
     /// the boundary registration - from ever existing separately.
     pub fn publish(&self, claim: CoverageClaim) -> PublicationId {
-        let id = self.mint(PublicationReceipt {
+        let receipt = PublicationReceipt {
             checkpoint: None,
             claim: claim.clone(),
             walk_watermark: None,
-        });
-        self.guard().claims.insert(
+        };
+        let mut ledger = self.guard();
+        let id = self.mint(&mut ledger, receipt);
+        ledger.claims.insert(
             id.clone(),
             Publication {
                 lane: Lane::Repair,
@@ -713,7 +729,8 @@ impl PendingCoverage {
     /// design, and any gap here lets both leave a live entry for the same lane,
     /// after which one acknowledgement discharges only one of them.
     pub fn register(&self, checkpoint: Checkpoint, claim: CoverageClaim) -> PublicationId {
-        self.register_in(checkpoint, claim, None)
+        self.register_in(checkpoint, claim, None, None)
+            .expect("unconditional registration")
     }
 
     /// Register a backfill COMPLETION marker, stamping the walk's undelivered
@@ -725,7 +742,8 @@ impl PendingCoverage {
         claim: CoverageClaim,
         walk_watermark: u64,
     ) -> PublicationId {
-        self.register_in(checkpoint, claim, Some(walk_watermark))
+        self.register_in(checkpoint, claim, Some(walk_watermark), None)
+            .expect("unconditional registration")
     }
 
     fn register_in(
@@ -733,15 +751,28 @@ impl PendingCoverage {
         checkpoint: Checkpoint,
         claim: CoverageClaim,
         walk_watermark: Option<u64>,
-    ) -> PublicationId {
+        expected_fence: Option<u64>,
+    ) -> Result<PublicationId, CoverageClaim> {
         let lane = Lane::of(&checkpoint);
-        let id = self.mint(PublicationReceipt {
+        let receipt = PublicationReceipt {
             checkpoint: Some(checkpoint.clone()),
             claim: claim.clone(),
             walk_watermark,
-        });
-        let mut claim = claim;
+        };
         let mut ledger = self.guard();
+        // The fence comparison is the first step under the SAME guard as the
+        // mint and the registration, so no reset can close between a producer
+        // passing it and its publication becoming visible to the invalidation.
+        if let Some(expected) = expected_fence {
+            let scope = lane
+                .scope()
+                .expect("conditional registration of a checkpoint with no scope");
+            if Self::scope_fence_in(&ledger, scope) != expected {
+                return Err(claim);
+            }
+        }
+        let id = self.mint(&mut ledger, receipt);
+        let mut claim = claim;
         if let Lane::Backfill(scope, _) = &lane {
             let mint = ledger
                 .last_backfill_mint
@@ -875,7 +906,95 @@ impl PendingCoverage {
         if freed_capacity {
             self.wake_capacity();
         }
-        id
+        Ok(id)
+    }
+
+    /// Mint and register only if `scope_fence(scope) == expected_fence`,
+    /// compared under the same lock. A refusal registers nothing, mints
+    /// nothing, and hands the claim back so its debt can be preserved.
+    ///
+    /// The scope comes from the checkpoint's lane; every caller passes a change
+    /// or backfill checkpoint, so a scope-less lane is a caller bug and panics.
+    pub(crate) fn register_if_fence(
+        &self,
+        checkpoint: Checkpoint,
+        claim: CoverageClaim,
+        expected_fence: u64,
+        walk_watermark: Option<u64>,
+    ) -> Result<PublicationId, CoverageClaim> {
+        self.register_in(checkpoint, claim, walk_watermark, Some(expected_fence))
+    }
+
+    /// Consume one id so the returned exclusive bound is strictly greater than
+    /// every id minted before it and every fence burnt before it. A fence read
+    /// from the counter instead would not move across two resets with nothing
+    /// minted between them, and a walk that snapshotted the first would not see
+    /// the second. Called only under the ledger lock.
+    fn burn_fence(&self, _held: &mut Ledger) -> u64 {
+        self.next.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn scope_fence_in(ledger: &Ledger, scope: &CursorScope) -> u64 {
+        ledger
+            .fenced
+            .get(scope)
+            .copied()
+            .unwrap_or(0)
+            .max(ledger.fenced_account)
+    }
+
+    /// Revoke every fence-guarded producer of one scope, now. Retires nothing:
+    /// the writer's reset that follows does the retirement and carries the
+    /// debt. Used by provider deletion, ahead of its registry delete.
+    pub(crate) fn raise_scope_fence(&self, scope: &CursorScope) {
+        let mut ledger = self.guard();
+        let fence = self.burn_fence(&mut ledger);
+        Self::fence_in(&mut ledger, scope, fence);
+        drop(ledger);
+        self.wake_capacity();
+    }
+
+    /// Revoke every fence-guarded producer of every scope, now. Retires
+    /// nothing. The schema reset raises it before it touches the registry or
+    /// the store.
+    pub(crate) fn raise_account_fence(&self) {
+        let mut ledger = self.guard();
+        ledger.fenced_account = self.burn_fence(&mut ledger);
+        drop(ledger);
+        self.wake_capacity();
+    }
+
+    /// The account-wide form of [`PendingCoverage::invalidate_scope`]: retire
+    /// every boundary entry and claim whose lane has a scope (every lane, every
+    /// scope; the scope-less repair lane is untouched, since obligations survive
+    /// resets and stay acknowledgeable), take the debt of their claims and the
+    /// WHOLE carry-forward slot, and raise the account fence with a burnt id.
+    /// One critical section. Retiring the entries frees their backfill
+    /// capacity, so parked producers are woken.
+    pub(crate) fn invalidate_account(&self) -> CoverageClaim {
+        let mut ledger = self.guard();
+        ledger
+            .boundaries
+            .retain(|entry| entry.lane.scope().is_none());
+        let mut debt = ledger.carried.take().unwrap_or(CoverageClaim {
+            reports: Vec::new(),
+            generation: 0,
+        });
+        let ids: Vec<_> = ledger
+            .claims
+            .iter()
+            .filter(|(_, publication)| publication.lane.scope().is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            if let Some(publication) = ledger.claims.remove(&id) {
+                debt.absorb(publication.claim.debt_only());
+            }
+        }
+        ledger.fenced_account = self.burn_fence(&mut ledger);
+        drop(ledger);
+        self.wake_capacity();
+        debt.debt_only()
     }
 
     /// The watermark the walk that published this marker was running under, if
@@ -1403,11 +1522,11 @@ impl PendingCoverage {
     ///
     /// A producer that parks - on the bound, or waiting for a subscriber - and
     /// then resumes has to be able to ask whether the incarnation it read its
-    /// page from is still the live one. The fence moves exactly when a reset
-    /// closes for the scope, which is exactly the question.
+    /// page from is still the live one. Scope resets, provider deletion and
+    /// account resets all move it when they revoke the producer's ownership.
     #[must_use]
     pub fn scope_fence(&self, scope: &CursorScope) -> u64 {
-        self.guard().fenced.get(scope).copied().unwrap_or(0)
+        Self::scope_fence_in(&self.guard(), scope)
     }
 
     /// Best-effort boundary release for a caller that holds only a checkpoint
@@ -1636,7 +1755,7 @@ impl PendingCoverage {
         // past the ceiling: everything the old attempt minted, and nothing the
         // retry will.
         let watermark = through.map_or_else(
-            || self.next.load(Ordering::Relaxed),
+            || self.burn_fence(&mut ledger),
             |ceiling| ceiling.0.saturating_add(1),
         );
         match lane_kind {
@@ -1741,7 +1860,9 @@ impl PendingCoverage {
                     .fenced_backfill
                     .get(scope)
                     .is_some_and(|watermark| *watermark > id.0);
-            scope_wide || lane_wide
+            let account_wide = ledger.fenced_account > id.0
+                || (ledger.fenced_account != 0 && !self.minted_here(&id));
+            account_wide || scope_wide || lane_wide
         });
         if fenced_out {
             // Nothing is dropped here: `invalidate_scope` runs twice around the
@@ -1939,6 +2060,119 @@ mod tests {
 
     fn scope() -> CursorScope {
         CursorScope::Type(ObjectType::Email)
+    }
+
+    #[test]
+    fn a_scope_fence_moves_even_when_nothing_was_minted() {
+        let p = PendingCoverage::new();
+        let old = p.scope_fence(&scope());
+        p.raise_scope_fence(&scope());
+        let first = p.scope_fence(&scope());
+        p.raise_scope_fence(&scope());
+        assert!(old < first && first < p.scope_fence(&scope()));
+    }
+
+    #[test]
+    fn register_if_fence_refuses_a_stale_fence_and_registers_nothing() {
+        let p = PendingCoverage::new();
+        let claim = CoverageClaim::new(degraded("owed"), 42);
+        let old = p.scope_fence(&scope());
+        p.raise_scope_fence(&scope());
+        let refused = p
+            .register_if_fence(checkpoint(b"old"), claim.clone(), old, None)
+            .expect_err("stale");
+        assert_eq!(refused.generation, claim.generation);
+        let encoded = |reports: &[InventoryCoverageReport]| {
+            let mut ledger = crate::cursor::DebtLedger::default();
+            for report in reports {
+                ledger.ingest(report, claim.generation, 1);
+            }
+            crate::cursor::encode_ledger(&ledger)
+        };
+        assert_eq!(encoded(&refused.reports), encoded(&claim.reports));
+        assert_eq!(p.pending_checkpoints(), 0);
+        assert!(
+            p.register_if_fence(checkpoint(b"new"), claim, p.scope_fence(&scope()), None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_account_fence_moves_every_scope_fence_even_when_nothing_was_minted() {
+        let p = PendingCoverage::new();
+        let old = p.scope_fence(&scope());
+        p.raise_account_fence();
+        let first = p.scope_fence(&scope());
+        p.raise_account_fence();
+        assert!(old < first && first < p.scope_fence(&scope()));
+    }
+
+    #[test]
+    fn an_account_fence_refuses_every_scope_minted_before_it() {
+        let p = PendingCoverage::new();
+        let a = checkpoint(b"a");
+        let mut b = a.clone();
+        if let Checkpoint::Change(cursor) = &mut b {
+            cursor.scope = CursorScope::Account;
+        }
+        let ai = p.register(a.clone(), CoverageClaim::new(degraded("a"), 1));
+        let bi = p.register(b.clone(), CoverageClaim::new(degraded("b"), 1));
+        p.raise_account_fence();
+        assert!(matches!(p.claim_checkpoint(ai, &a), ClaimLookup::Unknown));
+        assert!(matches!(p.claim_checkpoint(bi, &b), ClaimLookup::Unknown));
+        let fresh = p.register(a.clone(), CoverageClaim::new(degraded("fresh"), 2));
+        assert!(matches!(
+            p.claim_checkpoint(fresh, &a),
+            ClaimLookup::Apply(_)
+        ));
+    }
+
+    /// Construct the foreign ledger second so its segment exceeds this fence,
+    /// as a persisted receipt can after process-local segments restart at zero.
+    #[test]
+    fn an_account_fence_refuses_a_publication_from_another_process() {
+        let current = PendingCoverage::new();
+        let foreign = PendingCoverage::new();
+        let cp = checkpoint(b"foreign");
+        let id = foreign.register(cp.clone(), CoverageClaim::new(degraded("owed"), 1));
+        assert!(matches!(
+            current.claim_checkpoint(id.clone(), &cp),
+            ClaimLookup::Apply(_)
+        ));
+        current.raise_account_fence();
+        assert!(matches!(
+            current.claim_checkpoint(id, &cp),
+            ClaimLookup::Unknown
+        ));
+    }
+
+    #[test]
+    fn invalidate_account_carries_every_scoped_debt_and_spares_repair_claims() {
+        let p = PendingCoverage::new();
+        let on = |scope: CursorScope, key: &str| {
+            let mut cp = checkpoint(key.as_bytes());
+            if let Checkpoint::Change(cursor) = &mut cp {
+                cursor.scope = scope.clone();
+            }
+            let mut report = degraded(key);
+            report.domain.scope = scope;
+            (cp, CoverageClaim::new(report, 1))
+        };
+        let (cp, claim) = on(CursorScope::Account, "carried");
+        p.register(cp, claim);
+        p.abandon_checkpoints();
+        for (scope, key) in [
+            (scope(), "a"),
+            (CursorScope::Type(ObjectType::Contact), "b"),
+        ] {
+            let (cp, claim) = on(scope, key);
+            p.register(cp, claim);
+        }
+        let repair = p.publish_without_report(1);
+        let debt = p.invalidate_account();
+        assert_eq!(debt.reports.len(), 3);
+        assert_eq!(p.pending_checkpoints(), 0);
+        assert!(matches!(p.claim_repair(repair), ClaimLookup::Apply(_)));
     }
 
     fn degraded(key: &str) -> InventoryCoverageReport {

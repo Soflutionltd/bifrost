@@ -597,7 +597,7 @@ async fn a_replayed_marker_does_not_create_a_completion_the_new_attachment_never
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_discard_leaves_the_request_for_the_next_attempt() {
     let store: Arc<DynCheckpointStore> = Arc::new(FailingDeleteStore {
-        inner: crate::cursor::InMemoryCheckpointStore::new(),
+        inner: Arc::new(crate::cursor::InMemoryCheckpointStore::new()),
     });
     let (_account, coverage, tx, writer) = writer_harness_over(Arc::clone(&store));
     let scope = email_scope();
@@ -1206,6 +1206,14 @@ async fn a_failed_store_write_still_frees_the_bound() {
 struct FailingTransitionStore;
 
 impl crate::cursor::store::CheckpointStore for FailingTransitionStore {
+    fn clear_account_checkpoints<'a>(
+        &'a self,
+        _account: &'a bifrost_types::AccountId,
+        _ledger: crate::cursor::DebtLedger,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn put_change_cursor<'a>(
         &'a self,
         _account: &'a bifrost_types::AccountId,
@@ -1297,10 +1305,19 @@ impl crate::cursor::store::CheckpointStore for FailingTransitionStore {
 /// a test can act inside the writer's await window rather than around it.
 /// An in-memory store whose `delete_backfill` always FAILS.
 struct FailingDeleteStore {
-    inner: crate::cursor::InMemoryCheckpointStore,
+    inner: Arc<crate::cursor::InMemoryCheckpointStore>,
 }
 
 impl CheckpointStore for FailingDeleteStore {
+    fn clear_account_checkpoints<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        ledger: crate::cursor::DebtLedger,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        let _ = (account, ledger);
+        Box::pin(async { Err(Error::CheckpointStore("delete refused".into())) })
+    }
+
     fn apply_transition<'a>(
         &'a self,
         account: &'a bifrost_types::AccountId,
@@ -1378,6 +1395,14 @@ struct FailingOnceStore {
 }
 
 impl CheckpointStore for FailingOnceStore {
+    fn clear_account_checkpoints<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        ledger: crate::cursor::DebtLedger,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        self.inner.clear_account_checkpoints(account, ledger)
+    }
+
     fn apply_transition<'a>(
         &'a self,
         account: &'a bifrost_types::AccountId,
@@ -1459,6 +1484,7 @@ impl CheckpointStore for FailingOnceStore {
 }
 
 struct GatedDeleteStore {
+    fail_ledger: std::sync::atomic::AtomicBool,
     inner: Arc<crate::cursor::InMemoryCheckpointStore>,
     entered: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
@@ -1467,6 +1493,7 @@ struct GatedDeleteStore {
 impl GatedDeleteStore {
     fn new(inner: Arc<crate::cursor::InMemoryCheckpointStore>) -> Self {
         Self {
+            fail_ledger: std::sync::atomic::AtomicBool::new(false),
             inner,
             entered: tokio::sync::Semaphore::new(0),
             release: tokio::sync::Semaphore::new(0),
@@ -1475,6 +1502,18 @@ impl GatedDeleteStore {
 }
 
 impl CheckpointStore for GatedDeleteStore {
+    fn clear_account_checkpoints<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        ledger: crate::cursor::DebtLedger,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async move {
+            self.entered.add_permits(1);
+            self.release.acquire().await.expect("gate").forget();
+            self.inner.clear_account_checkpoints(account, ledger).await
+        })
+    }
+
     fn apply_transition<'a>(
         &'a self,
         account: &'a bifrost_types::AccountId,
@@ -1513,6 +1552,9 @@ impl CheckpointStore for GatedDeleteStore {
         account: &'a bifrost_types::AccountId,
         ledger: crate::cursor::DebtLedger,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+        if self.fail_ledger.load(std::sync::atomic::Ordering::SeqCst) {
+            return Box::pin(async { Err(Error::CheckpointStore("ledger refused".into())) });
+        }
         self.inner.put_ledger(account, ledger)
     }
 
@@ -1737,7 +1779,7 @@ async fn a_restart_reset_preserves_completed_backfill() {
             .await
             .expect("backfill read")
             .is_some(),
-        "a restart must PRESERVE backfill completion; only schema recovery deletes it"
+        "a restart must PRESERVE backfill completion; only deletion and schema recovery drop it"
     );
 
     drop(tx);
@@ -1747,38 +1789,85 @@ async fn a_restart_reset_preserves_completed_backfill() {
 /// The other half of the same contract: schema recovery really does delete
 /// backfill, because the re-walk is what re-mints ids under the new
 /// encoding and the completion marker would make the next attach skip it.
+///
+/// Account-wide: the contact scope is never registered by anything in the
+/// harness, and its marker must go too. The ledger, seeded BEFORE the harness
+/// loads it, must survive byte for byte - old target ids, unresolved proof,
+/// operator decisions and attempt history alike: a reset proves no coverage.
+///
+/// Ablations: clear only the email scope's backfill in the writer arm (the
+/// contact rows survive); pass `DebtLedger::default()` to the clear (the
+/// ledger bytes differ).
 #[tokio::test]
-async fn a_schema_recovery_reset_deletes_backfill() {
+async fn an_account_schema_reset_deletes_every_scope_and_its_completion_markers() {
     let inner = Arc::new(crate::cursor::InMemoryCheckpointStore::new());
-    let store: Arc<DynCheckpointStore> = Arc::clone(&inner) as Arc<DynCheckpointStore>;
-    let (account, _coverage, tx, writer) = writer_harness_over(store);
-
-    let bifrost_types::Checkpoint::Backfill(marker) =
-        backfill_checkpoint_at(bifrost_types::Partition(b"done".to_vec()), 99)
-    else {
-        panic!("backfill checkpoint");
-    };
-    inner
-        .put_backfill(&account, marker)
-        .await
-        .expect("backfill row seeded");
-
-    WriterHandle::new(tx.clone())
-        .reset_scope_for_schema_recovery(email_scope())
-        .await
-        .expect("schema reset");
-
-    assert!(
-        inner
-            .get_backfill(&account, &email_scope())
-            .await
-            .expect("backfill read")
-            .is_none(),
-        "schema recovery must drop the completion marker so the re-walk happens"
+    let account = bifrost_types::AccountId("acct".into());
+    let mut ledger = crate::cursor::DebtLedger::default();
+    for key in ["old-retrying", "old-waived", "old-blocked"] {
+        let claim = degraded_claim(key);
+        ledger.ingest_debt_only(&claim.reports[0], 1, 1);
+    }
+    ledger.record_attempt(&bifrost_types::ObligationKey(b"old-retrying".to_vec()), 3);
+    ledger.waive(
+        &bifrost_types::ObligationKey(b"old-waived".to_vec()),
+        "operator".into(),
+        2,
     );
-
+    ledger.block(&bifrost_types::ObligationKey(b"old-blocked".to_vec()));
+    let bytes = crate::cursor::encode_ledger(&ledger);
+    inner
+        .put_ledger(&account, ledger)
+        .await
+        .expect("seed ledger");
+    let scopes = [
+        email_scope(),
+        CursorScope::Type(bifrost_types::ObjectType::Contact),
+    ];
+    for scope in &scopes {
+        let mut cursor = change_cursor(b"old");
+        cursor.scope = scope.clone();
+        inner
+            .put_change_cursor(&account, cursor)
+            .await
+            .expect("seed cursor");
+        let bifrost_types::Checkpoint::Backfill(mut marker) =
+            backfill_checkpoint_at(crate::backfill::partitioner::completion_partition(), 99)
+        else {
+            panic!("marker")
+        };
+        marker.scope = scope.clone();
+        inner
+            .put_backfill(&account, marker)
+            .await
+            .expect("seed marker");
+    }
+    let (_, _, tx, writer) = writer_harness_over(Arc::clone(&inner) as Arc<DynCheckpointStore>);
+    WriterHandle::new(tx.clone())
+        .reset_account_for_schema_recovery()
+        .await
+        .expect("reset");
+    for scope in &scopes {
+        assert!(
+            inner
+                .get_change_cursor(&account, scope)
+                .await
+                .expect("read")
+                .is_none()
+        );
+        assert!(
+            inner
+                .get_backfill(&account, scope)
+                .await
+                .expect("read")
+                .is_none()
+        );
+    }
+    assert_eq!(
+        crate::cursor::encode_ledger(&inner.get_ledger(&account).await.expect("ledger")),
+        bytes
+    );
     drop(tx);
-    writer.await.expect("writer exits");
+    writer.await.expect("writer");
 }
 
 /// A scope that is still running while its reset is in flight registers a
@@ -3557,4 +3646,112 @@ fn a_failed_resume_read_walks_from_scratch_on_both_plan_shapes() {
         Some(bifrost_types::InventoryPartition::Page { from: 0, to: 250 }),
         "a failed read restarts at page 0, never at a guessed offset"
     );
+}
+
+/// A degraded publication registered on a scope while the writer is parked
+/// inside the account clear: pass 2 must retire it and persist its debt
+/// (ablation: delete pass 2), and a failure of that pass-2 ledger write must
+/// fail the reset (ablation: answer `cleared` instead of `cleared.and(second)`).
+async fn account_reset_during_clear(fail_second: bool) {
+    let inner = Arc::new(crate::cursor::InMemoryCheckpointStore::new());
+    let gate = Arc::new(GatedDeleteStore::new(Arc::clone(&inner)));
+    let (account, coverage, tx, writer) =
+        writer_harness_over(Arc::clone(&gate) as Arc<DynCheckpointStore>);
+    let handle = WriterHandle::new(tx.clone());
+    let reset = tokio::spawn(async move { handle.reset_account_for_schema_recovery().await });
+    gate.entered.acquire().await.expect("entered").forget();
+    let mut cursor = change_cursor(b"during");
+    cursor.scope = CursorScope::Type(bifrost_types::ObjectType::Contact);
+    coverage.register(
+        bifrost_types::Checkpoint::Change(cursor),
+        degraded_claim("during-account-reset"),
+    );
+    gate.fail_ledger
+        .store(fail_second, std::sync::atomic::Ordering::SeqCst);
+    gate.release.add_permits(1);
+    let result = reset.await.expect("task");
+    assert_eq!(result.is_err(), fail_second);
+    if !fail_second {
+        assert_eq!(
+            inner
+                .get_ledger(&account)
+                .await
+                .expect("ledger")
+                .open_debt()
+                .count(),
+            1
+        );
+    }
+    drop(tx);
+    writer.await.expect("writer");
+}
+#[tokio::test]
+async fn debt_published_during_an_account_reset_survives_it() {
+    account_reset_during_clear(false).await;
+}
+#[tokio::test]
+async fn a_failed_second_pass_ledger_write_fails_the_account_reset() {
+    account_reset_during_clear(true).await;
+}
+
+/// Pass 1's debt rides the clear's own atomic ledger write, so a failed clear
+/// must write the ledger separately or that debt lives only in writer memory.
+/// Ablation: write the ledger only when pass 2 carried debt.
+#[tokio::test]
+async fn a_failed_account_clear_still_persists_its_first_pass_debt() {
+    let inner = Arc::new(crate::cursor::InMemoryCheckpointStore::new());
+    let store = Arc::new(FailingDeleteStore {
+        inner: Arc::clone(&inner),
+    });
+    let (account, coverage, tx, writer) = writer_harness_over(store);
+    coverage.register(
+        bifrost_types::Checkpoint::Change(change_cursor(b"old")),
+        degraded_claim("owed"),
+    );
+    assert!(
+        WriterHandle::new(tx.clone())
+            .reset_account_for_schema_recovery()
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        inner
+            .get_ledger(&account)
+            .await
+            .expect("ledger")
+            .open_debt()
+            .count(),
+        1
+    );
+    drop(tx);
+    writer.await.expect("writer");
+}
+
+/// A failed clear left the provisional row in place, so a delayed
+/// `ReattachAbort` must still own it and delete it. Ablation: clear
+/// `provisional` before the store call.
+#[tokio::test]
+async fn a_failed_account_clear_keeps_reattach_ownership() {
+    let inner = Arc::new(crate::cursor::InMemoryCheckpointStore::new());
+    let store = Arc::new(FailingDeleteStore {
+        inner: Arc::clone(&inner),
+    });
+    let (account, _, tx, writer) = writer_harness_over(store);
+    let handle = WriterHandle::new(tx.clone());
+    handle
+        .reattach_insert(7, change_cursor(b"provisional"))
+        .await
+        .expect("insert");
+    assert!(handle.reset_account_for_schema_recovery().await.is_err());
+    handle.reattach_abort(7).await;
+    assert!(
+        inner
+            .get_change_cursor(&account, &email_scope())
+            .await
+            .expect("read")
+            .is_none()
+    );
+    drop(handle);
+    drop(tx);
+    writer.await.expect("writer");
 }

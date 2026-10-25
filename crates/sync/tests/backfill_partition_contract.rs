@@ -76,6 +76,7 @@ async fn run(
         None,
         0,
         None,
+        0,
         &delivery,
     )
     .await
@@ -115,6 +116,7 @@ async fn run_observed(
         None,
         0,
         None,
+        0,
         &delivery,
     )
     .await

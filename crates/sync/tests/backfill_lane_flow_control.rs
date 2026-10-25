@@ -224,6 +224,16 @@ impl RecordingDeleteStore {
 }
 
 impl CheckpointStore for RecordingDeleteStore {
+    fn clear_account_checkpoints<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        ledger: bifrost_sync::cursor::DebtLedger,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), bifrost_sync::Error>> + Send + 'a>,
+    > {
+        self.inner.clear_account_checkpoints(account, ledger)
+    }
+
     fn apply_transition<'a>(
         &'a self,
         account: &'a AccountId,
@@ -329,6 +339,21 @@ impl FailingDeleteStore {
 }
 
 impl CheckpointStore for FailingDeleteStore {
+    fn clear_account_checkpoints<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        ledger: bifrost_sync::cursor::DebtLedger,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), bifrost_sync::Error>> + Send + 'a>,
+    > {
+        let _ = (account, ledger);
+        Box::pin(async {
+            Err(bifrost_sync::Error::CheckpointStore(
+                "delete refused".into(),
+            ))
+        })
+    }
+
     fn apply_transition<'a>(
         &'a self,
         account: &'a AccountId,

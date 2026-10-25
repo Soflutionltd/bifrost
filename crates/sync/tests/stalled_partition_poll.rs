@@ -85,6 +85,7 @@ async fn a_cancelled_partition_walk_fails_rather_than_reporting_completion() {
             None,
             0,
             Some(&gate),
+            0,
             &delivery,
         )
         .await

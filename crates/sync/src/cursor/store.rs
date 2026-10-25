@@ -25,9 +25,12 @@
 //!   objects are permanently invisible;
 //! - ledger first records debt for progress that never committed.
 //!
-//! That is why [`CheckpointStore::apply_transition`] is the only mutating
-//! operation. A backend may spread the state across several tables - the
-//! representation is backend-owned, the atomicity is not.
+//! That is why [`CheckpointStore::apply_transition`] is the only operation that
+//! advances a checkpoint, and it takes the ledger with it. The account-wide
+//! reset, [`CheckpointStore::clear_account_checkpoints`], is atomic in the same
+//! way: the rows go and the ledger is written in one operation. A backend may
+//! spread the state across several tables - the representation is
+//! backend-owned, the atomicity is not.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -67,6 +70,34 @@ pub trait CheckpointStore: Send + Sync {
         &'a self,
         account: &'a AccountId,
         transition: CheckpointTransition,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+
+    /// Drop every change cursor and every backfill checkpoint stored for
+    /// `account` - every scope, completion markers included - and persist
+    /// `ledger` as the account's debt ledger, as ONE atomic operation.
+    ///
+    /// Used by the engine's `SchemaIncompatible` recovery and by attach when it
+    /// meets a row it cannot read. A schema bump means the ids the consumer
+    /// holds were minted under an encoding the protocol has disowned, and any
+    /// surviving completion marker - including one of a scope the engine does
+    /// not currently track - makes the next establishment of that scope skip
+    /// the inventory walk that re-mints them. There is deliberately no default
+    /// body: the trait has no enumeration, so any default would leave exactly
+    /// those rows behind.
+    ///
+    /// Atomic, like `apply_transition`: either every row is gone and the
+    /// ledger is written, or nothing changed. Rows of other accounts are
+    /// untouched. The ledger passed in is the account's existing ledger with
+    /// retired debt folded in, never an empty one: a reset proves no coverage.
+    ///
+    /// What an implementation needs: one transaction spanning the account's
+    /// change cursors, its backfill rows and its ledger, plus a way to address
+    /// every row of one account (a key prefix or an account column) without the
+    /// engine naming the scopes.
+    fn clear_account_checkpoints<'a>(
+        &'a self,
+        account: &'a AccountId,
+        ledger: DebtLedger,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
 
     /// Read the latest change cursor for `(account, scope)` if any.
@@ -184,14 +215,14 @@ pub trait CheckpointStore: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
 
     /// Drop every backfill checkpoint for `(account, scope)`, the durable
-    /// completion marker included. Used ONLY by the engine's
-    /// `SchemaIncompatible` recovery: a schema bump means the ids the consumer
-    /// holds were minted under an encoding the protocol has disowned, and the
-    /// completion marker is what makes the next attach skip the inventory
-    /// re-walk that re-mints them - so a no-op here silently pins the consumer
-    /// to the old ids forever. Routine `RestartScope` recovery deliberately
-    /// does NOT call this: re-walking a completed backfill after every cursor
-    /// invalidation would re-hydrate the whole scope for no schema reason.
+    /// completion marker included. Used by the engine's scope-deletion reset (a
+    /// marker surviving into a folder recreated under the same id would skip
+    /// its cold-start walk) and by the discard that follows a walk which lost
+    /// pages, so a no-op here silently keeps rows the engine relies on being
+    /// gone. Routine `RestartScope` and `DisableScope` recovery deliberately do
+    /// NOT call this: re-walking a completed backfill after every cursor
+    /// invalidation would re-hydrate the whole scope for no reason. Schema
+    /// recovery uses [`CheckpointStore::clear_account_checkpoints`] instead.
     fn delete_backfill<'a>(
         &'a self,
         account: &'a AccountId,
@@ -233,6 +264,20 @@ impl InMemoryCheckpointStore {
 }
 
 impl CheckpointStore for InMemoryCheckpointStore {
+    fn clear_account_checkpoints<'a>(
+        &'a self,
+        account: &'a AccountId,
+        ledger: DebtLedger,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut guard = self.inner.lock().expect("poisoned");
+            guard.change.retain(|(aid, _), _| aid != account);
+            guard.backfill.retain(|(aid, _, _), _| aid != account);
+            guard.ledgers.insert(account.clone(), ledger);
+            Ok(())
+        })
+    }
+
     fn apply_transition<'a>(
         &'a self,
         account: &'a AccountId,

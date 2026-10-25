@@ -59,26 +59,55 @@ pub(super) struct SlotContext {
     pub reopen_tx: mpsc::Sender<ReopenRequest>,
     /// Scope repairs declined under a pause that nothing else will raise again.
     pub deferred_repairs: Arc<DeferredScopeRepairs>,
+    /// An account-wide schema reset declined under a pause or exhausted, with
+    /// the scopes it owes re-establishment, plus the count of resets that have
+    /// committed during this attachment. See [`DeferredSchemaReset`].
+    pub deferred_schema_reset: Arc<DeferredSchemaReset>,
     /// The multiplexer's per-scope poll tokens, for retiring a scope the
     /// reopen listener learns was deleted after it established it.
     pub scope_tokens: crate::multiplexer::ScopeTokens,
 }
 
 impl SlotContext {
-    /// Dispatch a classified error through recovery, and park a scope repair the
-    /// dispatch declined because the account was paused, when nothing else would
-    /// raise it again. See [`DeferredScopeRepairs`].
+    /// Dispatch a classified error through recovery, and park whatever the
+    /// dispatch declined because the account was paused (or, for an account
+    /// reset, could not complete), when nothing else would raise it again. See
+    /// [`DeferredScopeRepairs`] and [`DeferredSchemaReset`].
     pub(super) async fn recover(&self, scope: Option<CursorScope>, error: AccountError) {
         let writer = self.writer();
         let recovery = self.recovery(&writer);
-        if let Some(declined) = handle_account_error(&recovery, scope, error).await {
-            self.deferred_repairs.park(
-                declined,
+        let followup = handle_account_error(&recovery, scope, error).await;
+        self.park_followup(followup);
+    }
+
+    /// Hand a recovery follow-up to the parked state that owns it.
+    pub(super) fn park_followup(&self, followup: RecoveryFollowUp) {
+        match followup {
+            RecoveryFollowUp::None => {}
+            RecoveryFollowUp::ParkScope { scope, epoch } => self.deferred_repairs.park(
+                scope,
+                epoch,
                 self.control.clone(),
-                Arc::clone(&self.cursors),
                 self.shutdown.clone(),
                 self.reopen_tx.clone(),
-            );
+            ),
+            RecoveryFollowUp::ParkScopes(scopes) => {
+                for (scope, epoch) in scopes {
+                    self.deferred_repairs.park(
+                        scope,
+                        epoch,
+                        self.control.clone(),
+                        self.shutdown.clone(),
+                        self.reopen_tx.clone(),
+                    );
+                }
+            }
+            RecoveryFollowUp::ParkSchemaReset(scopes) => self.deferred_schema_reset.park(
+                scopes,
+                self.control.clone(),
+                self.shutdown.clone(),
+                self.reopen_tx.clone(),
+            ),
         }
     }
 
@@ -117,6 +146,7 @@ impl SlotContext {
     /// it, so it has to outlive the dispatch on the caller's stack.
     pub(super) fn recovery<'a>(&'a self, writer: &'a WriterHandle) -> RecoveryContext<'a> {
         RecoveryContext {
+            deferred_schema_reset: &self.deferred_schema_reset,
             bandwidth_budget: self.bandwidth_budget.as_ref(),
             factory: &self.factory,
             current: &self.current,

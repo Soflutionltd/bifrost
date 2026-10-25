@@ -546,6 +546,48 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_partition_pass_judges_pages_against_the_walk_fence_it_was_given() {
+        let h = marker_harness(4);
+        let scope = scope_a();
+        let mut account = crate::test_common::StubAccount::new(vec![]);
+        account.partition_hook = Some(Arc::new(|scope, _| {
+            vec![bifrost_types::InventoryEvent::Batch(
+                bifrost_types::InventoryBatch::try_new(
+                    Vec::new(),
+                    bifrost_types::PageBoundary::Page,
+                    std::time::Duration::ZERO,
+                    0,
+                    None,
+                    bifrost_types::InventoryCoverageReport::complete(
+                        bifrost_types::CoverageDomain::full(scope.clone()),
+                    ),
+                )
+                .expect("page"),
+            )]
+        }));
+        let old = h.lane.coverage.scope_fence(&scope);
+        h.lane.coverage.raise_scope_fence(&scope);
+        let result = crate::backfill::runner::BackfillRunner::run_partition(
+            &account,
+            scope,
+            bifrost_types::InventoryPartition::Full,
+            &crate::backfill::runner::LiveSupersedes::default(),
+            Some(h.tx.clone()),
+            1,
+            Some(&h.control),
+            Some(&h.lane.coverage),
+            None,
+            1,
+            Some(&h.lane.gate),
+            old,
+            &h.delivery,
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Superseded)));
+        assert_eq!(h.received(), 0);
+    }
+
     impl MarkerHarness {
         /// The production emission, exactly as the orchestrator calls it.
         fn emit_marker<'a>(

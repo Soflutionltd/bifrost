@@ -683,30 +683,79 @@ never in the snapshot the writer persisted, and the coverage obligation is lost
 silently. The reset therefore runs the same operation a SECOND time once its
 deletes have landed, folding in whatever was published during them.
 
-Each pass also raises a per-scope acknowledgement fence to the current
-publication mint counter. Any publication at or below the fence names a batch
-published against rows the reset has since deleted, so acknowledging it would
-recreate the very cursor the reset dropped to force re-establishment; the claim
-lookup refuses it before it can reach a live claim. The fence is an exclusive
-bound against a monotonic counter, so ids minted after the reset closed - which
-is to say by the re-establish that follows it - are above it and acknowledge
-normally. There is no unfencing step to forget.
+Each reset pass burns a publication id under the coverage ledger lock, raising
+an exclusive acknowledgement fence strictly beyond every earlier fence even
+when nothing was minted. Minting and registration share ONE critical section:
+an invalidation cannot miss a minted but not yet registered claim and strand
+its debt. `register_if_fence` compares the producer's expected scope fence under
+that same lock and returns a refused claim without minting or registering.
+Refused claims send debt only through `record_refused_debt`; the writer ingests
+before persisting and retains reports offered while its initial ledger load
+fails, flushing them when a later request loads the ledger successfully.
 
-`RestartScope` and `DisableScope` preserve backfill state; only schema recovery
-deletes it. The `WriterHandle` names that choice per caller
-(`reset_scope_for_restart`, `reset_scope_for_disable`,
-`reset_scope_for_schema_recovery`) rather than passing a bare boolean, because
-getting it wrong is silent: deleting the completion marker on ordinary cursor
-invalidation turns every recovery into a full historical inventory and
-hydration walk.
+The backfill runner receives the walk's fence rather than adopting a new one
+at partition entry. Completion markers register conditionally too. Inventory
+fusion carries `expected_fence` through pages, `Done`, and `put_if` finalization;
+checkpoint-less batches check before forwarding, as does every batch and the
+`Done` of a fusion built without a control handle, which has no conditional
+registration to judge them. A superseded fusion emits a
+scoped warning and returns `Invalidated`; establishment returns
+`Error::Superseded`, which stops scoped retries and skips that scope during
+reattach. `run_establish` receives its caller's fence, captured before awaited
+store reads and pacing, and conditionally installs stored and fresh cursors.
+Retries retain the same fence. Restart reads after its own reset; schema
+recovery reads after the account clear, before re-checking each owed scope's
+lifecycle epoch; establish-if-absent reads after its restart reset, before
+re-checking the epoch; reattach reads before each scope. Reading the fence
+BEFORE the epoch check is what makes it trustworthy: deletion bumps the epoch
+before it raises the fence, so a deletion that passes the epoch check raised
+its fence after the read and the establishment's installs refuse. The window a
+caller cannot close - a deletion between its own reset and its fence read - is
+retired by the deletion's queued `ScopeDeleted`.
 
-Schema recovery currently enumerates only registered cursors. A scope still
-establishing, or absent after exhausting its establishment budget, can retain
-durable rows and completion markers. The store contract has no account-wide
-row reset or durable scope enumeration; resetting registered scopes therefore
-does not guarantee an account-wide schema migration. Closing this gap requires
-an account-wide store operation routed through the checkpoint writer, including
-its publication retirement and acknowledgement fences.
+Provider deletion uses `retire_deleted_scope`: bump the lifecycle epoch, raise
+the scope fence, then delete the registry entry. Multiplexer and listener both
+call it deliberately, so queued repairs' late cursors are retired too; every
+deletion therefore bumps the epoch twice, and no reader may assume a park that
+follows a deletion sees "the deletion's epoch plus one". Lifecycle epochs are
+not the registry's `scope_generations` and must not be unified with them:
+`CursorRegistry::delete` bumps a drive generation on EVERY registry delete -
+restart, disable, account reset - so an obligation keyed to it would be voided
+by the very repair that owes it. Only provider deletion moves an epoch. The
+epoch map holds one entry per scope deleted during this attachment.
+
+`reset_scope_for_restart` and `reset_scope_for_disable` preserve backfill;
+`reset_scope_for_deletion` deletes it. `reset_account_for_schema_recovery`
+clears every change cursor and backfill row of the account, including completion
+markers for undiscovered or unregistered scopes. Surviving markers would
+suppress the inventory walk that migrates object ids.
+
+Schema recovery registers activity before revocation. It raises the account
+fence, snapshots registered scopes and their lifecycle epochs into an owed map,
+seeds that map with a cursorless triggering scope when present, then deletes
+registered cursors to revoke live drives. The writer invalidates all scoped
+publications and folds their debt into its existing ledger, atomically clears
+account checkpoints with that ledger, then invalidates again and persists any
+second-pass debt. A failed clear still attempts a ledger write so first-pass
+debt survives; a failed second-pass write fails the reset. Provisional reattach
+ownership clears only when the transaction commits. Account fences refuse all
+pre-reset scoped publications, including foreign receipts; repair claims remain
+acknowledgeable. The account reset retries with the bounded reopen backoff.
+After success it increments the completed-reset generation and re-establishes
+owed scopes whose epochs still match and which remain absent. Exhaustion warns,
+pauses with `RetryBudgetExhausted`, and parks the owed map for resume. The
+reopen lock serializes this bounded operation.
+
+Deferred inventory items capture fence zero and their lifecycle epoch at attach
+(the coverage ledger does not exist yet, so zero is every scope's fence at that
+instant). The worker compares that fence when it pops an item and again once
+admission is in hand, immediately before opening the stream, since a reset can
+commit inside any pause, throttle or admission wait; stale items and
+invalidated fusions request `EstablishIfAbsent` with no admission held. This
+keeps a queued stale resume cursor, whose first provider call is the likeliest
+thing to fail with the same schema error, from triggering another account
+clear. The worker's own `ctx.recover` runs inline, so a reset one item
+triggers has committed before the next item is popped.
 
 `CheckpointStore` remains a published consumer-implemented trait; ownership is
 enforced by which internal engine type can reach its `Arc`, not by hiding the
@@ -1473,30 +1522,19 @@ sender alive itself. The acknowledgeability question cannot be answered by the
 ledger alone, because `claim_checkpoint` falls back to the publication receipt
 by design so acknowledgements can replay after a writer restart.
 
-**A producer revalidates its scope before publishing, at every seam it can park
-on.** A reset fences every id minted before it, but a page still waiting has no
-id yet, so it would come back above the fence and rebuild the durable state the
-reset deleted. `run_partition`, `run_backfill_partition_at_boundary` and
-`emit_backfill_complete` all snapshot `PendingCoverage::scope_fence` and refuse
-to publish if it moved, and each snapshot is taken at the start of the span it
-protects rather than at the moment of publishing - a reading taken after the
-reset compares the replacement incarnation's fence with itself:
+**A producer registers under the fence its walk began with.** A parked page
+has no publication id yet, so acknowledgement fences alone cannot revoke it.
+The orchestrator snapshots `PendingCoverage::scope_fence` at walk entry and
+passes it through every partition into `run_partition`; the runner never
+adopts a newer fence. After waiting for capacity, pages use conditional
+registration under the coverage lock. A refusal preserves the claim's debt
+through the writer and returns `Error::Superseded`, failing the partition and
+withholding completion. The partition admission check and the marker's two
+early comparisons avoid starting work or parking capacity for a dead walk;
+the marker still registers conditionally to close the comparison-to-mint gap.
 
-- the PAGE check compares against the fence the PASS started under, since a
-  reset can close between page k's publish and page k+1's read as easily as
-  inside a capacity park;
-- the PARTITION check runs once admission is in hand and before a single page is
-  read, comparing against the fence the WALK started under, because everything
-  between two partitions can park indefinitely (a pause, a throttle deadline,
-  the scheduler's admission queue) and the pages that follow would otherwise be
-  published against rows a `delete_backfill: true` reset had just removed. It
-  fails the partition, which ends the walk and withholds the marker;
-- the MARKER check compares against the walk's starting fence too, because a
-  reset can close between the last page and the provider stream's terminal
-  `Done`.
-
-Only a full `invalidate_scope` (the writer's `ResetScope`) moves this fence; the
-backfill-lane discard fences `fenced_backfill`, which `scope_fence` does not
+Scope resets, provider deletion and account resets all move this fence.
+The backfill-lane discard fences `fenced_backfill`, which `scope_fence` does not
 read, so a walk that lost pages is still re-walked rather than aborted.
 `MarkerOutcome` names
 `Published`, `Withheld` and `ShuttingDown`, so a withheld marker records an
@@ -1998,30 +2036,48 @@ checkpoints through it. Pinned by
 and `a_pause_landing_mid_repair_waits_for_it_instead_of_stranding_the_scope`.
 
 Schema recovery follows the same discipline for the whole account: it registers
-activity before deleting any cursor, declines outright on a paused account (every
-cursor stays registered, so the poll raises the directive again after resume),
-and holds the registration through the last re-establishment, run on
+activity before touching anything, declines outright on a paused account, and
+holds the registration through the last re-establishment, run on
 `admitted_by`. It deletes every scope before re-establishing any, so a pause
-landing inside it used to strand all of them. Pinned by
-`schema_recovery_reaching_a_paused_account_deletes_nothing_and_runs_after_resume`
-and `a_pause_landing_mid_schema_recovery_waits_for_it_instead_of_stranding_scopes`.
+landing inside it used to strand all of them. A paused decline (and an
+exhausted clear, which also pauses with `RetryBudgetExhausted`) parks an
+explicit `DeferredSchemaReset` obligation with the scopes it owes, cursorless
+triggers included; it does not rely on still-registered cursors re-raising the
+directive. Parked maps merge by maximum lifecycle epoch. Each decline records
+the completed-reset generation; at listener execution a newer committed reset
+turns the obligation into establish-if-absent work rather than clearing freshly
+rebuilt state again. Provider deletion removes parked scope entries and
+execution rechecks epochs. If another pause declines only the establishments of
+an already completed reset, those entries park as scope repairs; resuming does
+not repeat the clear. Pinned by
+`schema_recovery_reaching_a_paused_account_deletes_nothing_and_runs_after_resume`,
+`a_pause_landing_mid_schema_recovery_waits_for_it_instead_of_stranding_scopes`,
+`a_schema_reset_whose_clear_keeps_failing_pauses_and_owes_its_scopes` and
+`a_parked_schema_reset_after_a_completed_one_only_establishes`.
 
-A `Created` lifecycle scope has no cursor, so a repair declined under a pause has
-nothing for the poll to re-raise the directive from. `handle_account_error`
-returns the scope of a declined `RestartScope` that has no registered cursor, and
+A `Created` lifecycle scope, or a deferred inventory scope, has no cursor, so a
+repair declined under a pause has nothing for the poll to re-raise the
+directive from. `handle_account_error` returns it as a follow-up, and
 `SlotContext::recover` (the reopen listener and the deferred-inventory worker
-both dispatch through it) parks it in the slot's `DeferredScopeRepairs`. Each
-parked scope is a small task that waits for the boundary to read `Run`, then
-sends the same synthesized restart directive back through the slot's reopen
-channel, so the repair re-runs through the ordinary dispatch, including the
-decline check should the account be paused again. It is a task, not a wait in
-the listener, because the listener serializes real directives and an unbounded
-pause would hold `RestartAccount` behind it. A scope parks at most once, the task
-skips a scope some other path established meanwhile (restarting a live cursor
-would reset healthy state), and it leaves through the shutdown token, so detach
-never waits on one. Pinned by
-`a_created_scope_declined_under_a_pause_is_established_after_resume` and
-`a_parked_scope_is_dropped_by_detach`.
+both dispatch through it) parks it in the slot's `DeferredScopeRepairs` with
+the scope's lifecycle epoch. Each parked scope is a small task that waits for
+the boundary to read `Run`, claims only the map entry matching its captured
+epoch, and sends `EstablishIfAbsent` back through the slot's reopen channel. It
+is a task, not a wait in the listener, because the listener serializes real
+directives and an unbounded pause would hold `RestartAccount` behind it. Under
+the reopen lock the request skips a registered scope (restarting a live cursor
+would reset healthy state; the check is made there, not in the task, so a
+replacement established while the request was queued is safe) and a stale
+epoch, then RESTARTS the scope - its durable row reset, not resumed, since the
+obligation can be a declined `RestartScope` whose row is what must go - with
+the decline check again should the account be paused once more. FIFO plus
+deletion's `unpark` protect deletions preceding the park; the epoch
+additionally protects a deletion after the task has claimed and queued its
+request. Tasks leave through the shutdown token, so detach never waits on one.
+Pinned by `a_created_scope_declined_under_a_pause_is_established_after_resume`,
+`a_parked_scope_is_dropped_by_detach`,
+`establish_if_absent_skips_a_registered_or_deleted_scope` and
+`a_park_claim_under_a_stale_epoch_takes_nothing`.
 
 Two entry points sit one layer apart and their names read as near
 anagrams of each other, so it is worth naming the difference:
@@ -3102,10 +3158,14 @@ Every encoded length is checked against `u32::MAX`. An impossible
 larger in-memory field panics at the encoding boundary instead of
 writing a false truncated prefix and silently corrupting the envelope.
 
-An unreadable row is classified where it is found. `establish_one` -
-the attach path - deletes the row and re-establishes that one scope
-inline, because the reopen listener is spawned later in `attach_inner`
-and does not exist yet. `run_establish` also translates an unreadable
+An unreadable row is classified where it is found. Attach pre-reads every
+discovered scope before establishing any. An unreadable envelope or failed
+outer validation clears every checkpoint row of that account with the existing
+ledger, including undiscovered scopes, then establishes every scope fresh.
+Corruption and downgrade conservatively take the same path because this signal
+cannot prove the provenance of retained ids. A failed ledger load or clear fails
+attach and closes the opened account; ordinary store errors propagate.
+`run_establish` also translates an unreadable
 row into a typed `AccountError` whose derived `RecoveryClass` is
 `Engine(SchemaIncompatible)`, but its callers do not feed that result
 back through `RecoveryContext::recover` and `handle_account_error`, which
@@ -3254,34 +3314,77 @@ this engine wrote, never by asserting one.
 
 ```rust
 pub trait CheckpointStore: Send + Sync {
-    fn put_change_cursor<'a>(&'a self, account: &'a AccountId, cursor: ChangeCursor)
-        -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
-    fn get_change_cursor<'a>(&'a self, account: &'a AccountId, scope: &'a CursorScope)
-        -> Pin<Box<dyn Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>>;
-    fn put_backfill<'a>(&'a self, account: &'a AccountId, checkpoint: BackfillCheckpoint)
-        -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
-    fn get_backfill<'a>(&'a self, account: &'a AccountId, scope: &'a CursorScope)
-        -> Pin<Box<dyn Future<Output = Result<Option<BackfillCheckpoint>, Error>> + Send + 'a>>;
-    fn delete_change_cursor<'a>(&'a self, account: &'a AccountId, scope: &'a CursorScope)
-        -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
-    fn delete_backfill<'a>(&'a self, account: &'a AccountId, scope: &'a CursorScope)
-        -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+    fn apply_transition<'a>(
+        &'a self,
+        account: &'a AccountId,
+        transition: CheckpointTransition,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+    fn clear_account_checkpoints<'a>(
+        &'a self,
+        account: &'a AccountId,
+        ledger: DebtLedger,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+    fn get_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>>;
+    fn get_backfill<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<BackfillCheckpoint>, Error>> + Send + 'a>>;
+    fn put_ledger<'a>(
+        &'a self,
+        account: &'a AccountId,
+        ledger: DebtLedger,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+    fn get_ledger<'a>(
+        &'a self,
+        account: &'a AccountId,
+    ) -> Pin<Box<dyn Future<Output = Result<DebtLedger, Error>> + Send + 'a>>;
+    fn put_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        cursor: ChangeCursor,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+    fn put_backfill<'a>(
+        &'a self,
+        account: &'a AccountId,
+        checkpoint: BackfillCheckpoint,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+    fn delete_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+    fn delete_backfill<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
 }
 ```
 
-`put_*` take owned `ChangeCursor` / `BackfillCheckpoint`; `get_*`
-take a borrowed `&CursorScope`. `delete_change_cursor` is required
-because `RecoveryClass::Engine(EngineDirective::RestartScope)` must
-drop the durable cursor so the next establish re-runs via inventory;
-a no-op delete would silently preserve the stale cursor. It is also
-what attach calls to clear an undecodable envelope, so a store that
-no-ops here strands the account on a row it cannot read.
-`delete_backfill` drops every backfill row for the scope, completion
-marker included; only `SchemaIncompatible` recovery calls it (the
-marker is what would make the next attach skip the inventory re-walk
-that re-mints ids under the new encoding), and routine `RestartScope`
-deliberately does not - re-walking a completed backfill after every
-cursor invalidation would re-hydrate the scope for no schema reason.
+`put_change_cursor` and `put_backfill` are provided convenience methods and
+must not be overridden. `apply_transition` atomically advances a checkpoint
+with its ledger. Required `clear_account_checkpoints` atomically deletes all
+change and backfill rows for one account and persists the supplied ledger;
+backends need a transaction over all three row families and account-wide row
+addressing. Other accounts remain untouched. A reset proves no coverage: old
+repair target ids, operator decisions, retry history and audits survive. Later
+coverage discharges debt only when generation and domain comparison allow it;
+an incomparable re-walk can leave debt open and completion blocked. An unreadable
+ledger, including nested barrier checkpoints, fails rather than becoming empty.
+`delete_change_cursor` is required because
+`RecoveryClass::Engine(EngineDirective::RestartScope)` must drop the durable
+cursor so the next establish re-runs; a no-op delete would silently preserve
+the stale cursor. `delete_backfill` serves provider deletion and backfill
+discard, while ordinary restart and disable deliberately preserve backfill
+state - re-walking a completed backfill after every cursor invalidation would
+re-hydrate the scope for no reason. A store that no-ops
+`clear_account_checkpoints` strands the account on rows it cannot read and
+pins the consumer to ids the protocol has disowned.
 
 A store that decodes durable bytes must surface a schema it cannot
 read as `Error::SchemaIncompatible` from `get_change_cursor`; that is
@@ -3606,7 +3709,8 @@ Cursor envelope schema mismatches at `get_change_cursor` are
 translated through `crate::recovery::cursor_decode_failure` into an
 `AccountError` whose derived recovery is
 `Engine(SchemaIncompatible)`; the reopen listener then clears every
-in-memory and durable cursor and re-establishes each scope under
+in-memory cursor and every durable checkpoint row of the account, including
+untracked scopes and completion markers, and re-establishes each scope under
 the same backoff/budget contract above. Per-scope failures
 escalate per-scope (account continues for sibling scopes);
 `RestartAccount` failure escalates per-account (every scope pauses).
@@ -3740,7 +3844,7 @@ crates/sync/src/
     ledger.rs             // DebtLedger: entries, barriers, retained proofs,
                           // compacted discharge audit, folded parent links
     ledger_envelope.rs    // encode_ledger / decode_ledger + error digest
-    store.rs              // CheckpointStore trait (6 methods) +
+    store.rs              // CheckpointStore trait +
                           // InMemoryCheckpointStore
   scheduler/
     mod.rs                // four-lane Scheduler + admission dispatcher

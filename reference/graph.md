@@ -1040,7 +1040,8 @@ detect them. A v1 account would resume its delta link, never re-run
 inventory, and keep routing thread hydration and thread-targeted writes at
 `/me`. `decode_cursor` therefore refuses a v1 cursor as
 `SchemaIncompatible`, which derives `Engine(SchemaIncompatible)`: the engine
-drops every durable cursor and re-establishes each scope through a full
+drops every durable checkpoint row of the account, including untracked scopes
+and backfill completion markers, and re-establishes each scope through a full
 `inventory_stream` pass, which re-mints the ids. The ids are server-issued
 and not reconstructable from the stored bytes, so reseeding is the migration.
 v3 added the calendarView window end to the payload. Graph retains that window

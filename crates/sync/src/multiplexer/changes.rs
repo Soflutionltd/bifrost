@@ -567,6 +567,13 @@ pub enum WriterRequest {
         scope: CursorScope,
         done: oneshot::Sender<Result<(), Error>>,
     },
+    /// Clear every durable row of the account, completion markers included,
+    /// retiring and fencing every scoped publication around the clear. The
+    /// account's debt ledger survives, with the debt of every retired
+    /// publication folded in.
+    ResetAccountForSchemaRecovery {
+        done: oneshot::Sender<Result<(), Error>>,
+    },
     /// Invalidate durable state for a scope as one writer-ordered operation.
     /// Pending publications for the affected lanes are retired before the
     /// rows are deleted, so a late acknowledgement cannot revive them.
@@ -697,6 +704,9 @@ impl std::fmt::Debug for WriterRequest {
                 .debug_struct("DiscardBackfillProgress")
                 .field("scope", scope)
                 .finish(),
+            Self::ResetAccountForSchemaRecovery { .. } => {
+                f.write_str("ResetAccountForSchemaRecovery")
+            }
             Self::ResetScope {
                 scope,
                 delete_backfill,

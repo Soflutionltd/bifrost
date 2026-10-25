@@ -77,6 +77,7 @@ pub mod lane;
 mod orphan_teardown;
 mod passthrough;
 mod reattach;
+pub(crate) use reattach::DeferredSchemaReset;
 #[cfg(test)]
 mod tests;
 
@@ -89,7 +90,7 @@ use backfill::{BackfillWiring, run_backfill_orchestrator};
 use context::SlotContext;
 use lane::LaneGate;
 use reattach::{
-    DeferredScopeRepairs, RecoveryContext, ReplacementOpen, accepted_push_scopes,
+    DeferredScopeRepairs, RecoveryContext, RecoveryFollowUp, ReplacementOpen, accepted_push_scopes,
     handle_account_error, log_open_skips, open_replacement, reattach_account,
 };
 
@@ -242,16 +243,22 @@ enum InitialScope {
     DeferredInventory(DeferredInventory),
 }
 
-enum DeferredInventory {
+struct DeferredInventory {
+    kind: DeferredKind,
+    fence: u64,
+    epoch: u64,
+}
+
+enum DeferredKind {
     Start(CursorScope),
     Resume(ChangeCursor),
 }
 
 impl DeferredInventory {
     fn scope(&self) -> &CursorScope {
-        match self {
-            Self::Start(scope) => scope,
-            Self::Resume(cursor) => &cursor.scope,
+        match &self.kind {
+            DeferredKind::Start(scope) => scope,
+            DeferredKind::Resume(cursor) => &cursor.scope,
         }
     }
 }
@@ -1002,6 +1009,7 @@ impl SyncEngine {
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         let writer = WriterHandle::new(writer_tx);
         let ctx = RecoveryContext {
+            deferred_schema_reset: &slot.deferred_schema_reset,
             bandwidth_budget: slot.bandwidth_budget.as_ref(),
             factory: &slot.factory,
             current: &slot.current,

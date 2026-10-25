@@ -364,6 +364,7 @@ impl BackfillRunner {
         writer_tx: Option<&tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>>,
         generation: u64,
         lane: Option<&crate::engine::lane::LaneGate>,
+        walk_fence: u64,
         delivery: &crate::multiplexer::ChangeDelivery,
     ) -> Result<BackfillPartitionOutcome, Error> {
         let _activity = match control {
@@ -378,15 +379,14 @@ impl BackfillRunner {
         let mut scope_walk = ScopeWalkStep::RequestNextPartition;
         let mut end = None;
         let mut walk = InventoryWalk::default();
-        // The incarnation this PASS belongs to, snapshotted before its first
-        // page. Read once and not per page: a reset that closes between page k's
-        // publish and page k+1's read is invisible to a per-page reading, which
-        // is taken after the reset and therefore compares the replacement
-        // incarnation's fence with itself. Every page of this pass is judged
-        // against the incarnation the pass started under, exactly as the
-        // completion marker is judged against the incarnation its WALK started
-        // under.
-        let fence_at_pass_start = lane.map_or(0, |gate| gate.coverage().scope_fence(&scope));
+        // Every page of this pass is judged against `walk_fence`, the scope
+        // fence the WALK started under, never against a reading taken here. A
+        // reset that closes between the orchestrator's own fence check and this
+        // pass's first page would otherwise be adopted as the pass's own
+        // incarnation, and its pages would publish against rows the reset
+        // deleted. The comparison is made under the coverage lock, atomically
+        // with the mint (`publish_checkpoint_if_fence`), so a reset closing
+        // inside a capacity wait or between two pages is refused alike.
         loop {
             // Cancellation is armed around the POLL and nowhere else.
             //
@@ -394,8 +394,8 @@ impl BackfillRunner {
             // are one indivisible step, and stopping between them would mint a
             // publication no acknowledgement can ever retire. Everything the
             // previous page did - `walk.accept`, the publish pair, the
-            // undelivered note and its retirement, the capacity wait and its
-            // scope-fence revalidation, barrier and debt recording - has
+            // undelivered note and its retirement, the capacity wait, the
+            // fence-guarded registration, barrier and debt recording - has
             // therefore completed before control returns here.
             //
             // The outcome is an ERROR rather than a partial
@@ -534,12 +534,6 @@ impl BackfillRunner {
                         // The wait also hands the account's scheduler admission
                         // back for its duration, so a parked cold start is not
                         // sitting on the permit polling needs.
-                        // The incarnation this PASS was started under - see
-                        // `fence_at_pass_start`. A capacity wait is indefinite
-                        // and a scope reset can close inside it, but it can just
-                        // as well close between two pages, so the comparison is
-                        // against the pass, not against this page.
-                        let fence_before = fence_at_pass_start;
                         if let Some(gate) = lane {
                             match gate.wait_for_capacity_holding_admission().await {
                                 Ok(()) => {}
@@ -557,29 +551,6 @@ impl BackfillRunner {
                                 Err(crate::engine::lane::WaitFailed::Refused(error)) => {
                                     return Err(error);
                                 }
-                            }
-                            // REVALIDATE the incarnation before publishing. A
-                            // reset that closed anywhere in this pass - while
-                            // this page was parked on the bound, or between two
-                            // of the pass's pages - deleted the scope's rows and
-                            // fenced every publication minted before it, but this
-                            // page has not been minted yet, so it would come back
-                            // with a FRESH id above the fence, acknowledge
-                            // normally, and recreate exactly the durable state the
-                            // reset dropped. A stale completion marker arriving
-                            // that way is worse than a stale page: it suppresses
-                            // the replacement incarnation's whole inventory walk.
-                            if gate.coverage().scope_fence(&scope) != fence_before {
-                                tracing::warn!(
-                                    target: "bifrost.sync.backfill",
-                                    scope = ?scope,
-                                    "scope was reset while this backfill pass was in \
-                                     flight; abandoning the page rather than publishing \
-                                     it against rows the reset deleted"
-                                );
-                                return Err(Error::Other(
-                                    "scope reset while the backfill pass was in flight".into(),
-                                ));
                             }
                         }
                         let bf = BackfillCheckpoint {
@@ -623,15 +594,36 @@ impl BackfillRunner {
                         // persisted under partition A's acknowledgement.
                         let expected = Checkpoint::Backfill(bf);
                         walk.accept(Some(expected.clone()));
-                        let publication = control.map(|control| {
-                            control.publish_checkpoint(
-                                expected.clone(),
-                                crate::cursor::CoverageClaim::new(
-                                    batch.coverage.clone(),
-                                    generation,
-                                ),
-                            )
-                        });
+                        let publication = if let Some(control) = control {
+                            let claim = crate::cursor::CoverageClaim::new(
+                                batch.coverage.clone(),
+                                generation,
+                            );
+                            if lane.is_some() {
+                                match control.publish_checkpoint_if_fence(
+                                    expected.clone(),
+                                    claim,
+                                    walk_fence,
+                                ) {
+                                    Ok(id) => Some(id),
+                                    Err(claim) => {
+                                        if let Err(error) =
+                                            crate::inventory_walk::record_refused_debt(
+                                                writer_tx, claim,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(%error, "could not record refused page debt");
+                                        }
+                                        return Err(Error::Superseded);
+                                    }
+                                }
+                            } else {
+                                Some(control.publish_checkpoint(expected.clone(), claim))
+                            }
+                        } else {
+                            None
+                        };
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
                             event: Arc::new(SyncEvent::Batch(synthetic)),

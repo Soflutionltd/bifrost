@@ -36,6 +36,12 @@ use super::{ChangeDelivery, MultiplexerEvent};
 pub enum FusionOutcome {
     /// Inventory completed and the in-memory cursor was established.
     Established,
+    /// A reset or deletion of the scope closed while the walk ran; no
+    /// checkpoint was published, no batch was forwarded and no cursor was
+    /// installed after the walk observed it. (A checkpoint-less batch forwarded
+    /// between the fence raise and the walk's next comparison did go out; it
+    /// makes nothing durable.) The engine broadcasts a scoped warning.
+    Invalidated,
     /// Inventory completed without yielding a cursor; the engine emits
     /// a Warning.
     NoCursor,
@@ -45,7 +51,23 @@ pub enum FusionOutcome {
     Terminated(AccountError),
 }
 
+/// What `forward_inventory_batch` did with one batch.
+enum Forwarded {
+    /// Sent on the delivery (with its publication, if it carried a checkpoint).
+    Published,
+    /// The scope fence had moved: nothing was sent, and the claim comes back
+    /// so its debt can be routed to the writer.
+    Refused(crate::cursor::CoverageClaim),
+}
+
 pub struct InventoryFusion {
+    /// The scope fence this walk's ownership began under, read by the caller
+    /// before any await that a deletion or reset could land in. Every
+    /// checkpoint publication registers only if the fence still equals it,
+    /// checkpoint-less batches (and, with no `control`, every batch and the
+    /// terminal `Done`) are withheld once it has moved, and the terminal cursor
+    /// is installed only under it. Ignored when `coverage` is `None`.
+    pub expected_fence: u64,
     pub account_id: bifrost_types::AccountId,
     pub cursors: Arc<CursorRegistry>,
     pub control: Option<SyncControl>,
@@ -249,15 +271,38 @@ impl InventoryFusion {
                         // can acknowledge between the send and a later
                         // registration, and the writer would then find no claim
                         // for a checkpoint that carried one.
-                        let publication = self.control.as_ref().map(|control| {
-                            control.publish_checkpoint(
+                        let publication = if let Some(control) = &self.control {
+                            match control.publish_checkpoint_if_fence(
                                 cp.clone(),
                                 crate::cursor::CoverageClaim::new(
                                     completion.coverage.clone(),
                                     self.generation,
                                 ),
-                            )
-                        });
+                                self.expected_fence,
+                            ) {
+                                Ok(id) => Some(id),
+                                Err(claim) => {
+                                    return self.refused(&scope, &changes_tx, claim).await;
+                                }
+                            }
+                        } else if self.fence_moved(&scope) {
+                            // No control means no conditional registration, so
+                            // the fence is read here instead: a `Done` whose
+                            // scope was reset or deleted under it is neither
+                            // broadcast nor finalized.
+                            return self
+                                .refused(
+                                    &scope,
+                                    &changes_tx,
+                                    crate::cursor::CoverageClaim::new(
+                                        completion.coverage.clone(),
+                                        self.generation,
+                                    ),
+                                )
+                                .await;
+                        } else {
+                            None
+                        };
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
                             event: Arc::new(SyncEvent::Done(Some(cp.clone()))),
@@ -274,7 +319,11 @@ impl InventoryFusion {
                             self.retire_claim(publication);
                         }
                     }
-                    return self.finalize(scope, checkpoint).await;
+                    let outcome = self.finalize(scope.clone(), checkpoint).await?;
+                    if matches!(outcome, FusionOutcome::Invalidated) {
+                        Self::warn_invalidated(&scope, &changes_tx);
+                    }
+                    return Ok(outcome);
                 }
                 bifrost_types::InventoryEvent::Terminated(err) => {
                     if let Some(tx) = &changes_tx {
@@ -336,10 +385,12 @@ impl InventoryFusion {
                         self.record_barriers(&scope, &batch.coverage, resume_from)
                             .await?;
                         if let Some(tx) = &changes_tx {
-                            if let Err(error) =
-                                self.forward_inventory_batch(tx, &scope, &batch, None)
-                            {
-                                return Ok(FusionOutcome::Terminated(error));
+                            match self.forward_inventory_batch(tx, &scope, &batch, None) {
+                                Ok(Forwarded::Published) => {}
+                                Ok(Forwarded::Refused(claim)) => {
+                                    return self.refused(&scope, &changes_tx, claim).await;
+                                }
+                                Err(error) => return Ok(FusionOutcome::Terminated(error)),
                             }
                             Self::warn_degraded(&changes_tx, &scope, &batch.coverage);
                         }
@@ -348,11 +399,14 @@ impl InventoryFusion {
                     let checkpoint = batch.checkpoint.accepted(crossed).cloned();
                     validate_checkpoint_envelope(checkpoint.as_ref())?;
                     walk.accept(checkpoint.clone());
-                    if let Some(tx) = &changes_tx
-                        && let Err(error) =
-                            self.forward_inventory_batch(tx, &scope, &batch, checkpoint)
-                    {
-                        return Ok(FusionOutcome::Terminated(error));
+                    if let Some(tx) = &changes_tx {
+                        match self.forward_inventory_batch(tx, &scope, &batch, checkpoint) {
+                            Ok(Forwarded::Published) => {}
+                            Ok(Forwarded::Refused(claim)) => {
+                                return self.refused(&scope, &changes_tx, claim).await;
+                            }
+                            Err(error) => return Ok(FusionOutcome::Terminated(error)),
+                        }
                     }
                 }
                 // A producer-emitted warning is forwarded, not absorbed. Graph
@@ -393,6 +447,44 @@ impl InventoryFusion {
             });
         }
         Ok(FusionOutcome::NoCursor)
+    }
+
+    fn warn_invalidated(scope: &CursorScope, delivery: &Option<Arc<ChangeDelivery>>) {
+        if let Some(tx) = delivery {
+            let _ = tx.sender().send(MultiplexerEvent {
+                scope: scope.clone(),
+                event: Arc::new(SyncEvent::Warning(bifrost_types::Warning::user_safe(
+                    bifrost_types::WarningKind::Other,
+                    "inventory walk superseded by a reset or deletion of its scope",
+                ))),
+                checkpoint: None,
+                publication: None,
+            });
+        }
+    }
+
+    /// Whether the scope fence has moved off `expected_fence`. A point-in-time
+    /// read, for publications the conditional registration does not judge;
+    /// `false` when there is no coverage ledger to read.
+    fn fence_moved(&self, scope: &CursorScope) -> bool {
+        self.coverage
+            .as_ref()
+            .is_some_and(|coverage| coverage.scope_fence(scope) != self.expected_fence)
+    }
+
+    async fn refused(
+        &self,
+        scope: &CursorScope,
+        delivery: &Option<Arc<ChangeDelivery>>,
+        claim: crate::cursor::CoverageClaim,
+    ) -> Result<FusionOutcome, Error> {
+        if let Err(error) =
+            crate::inventory_walk::record_refused_debt(self.writer_tx.as_ref(), claim).await
+        {
+            tracing::warn!(%error, "could not record refused inventory debt");
+        }
+        Self::warn_invalidated(scope, delivery);
+        Ok(FusionOutcome::Invalidated)
     }
 
     /// Release both halves of a publication nothing can ever acknowledge.
@@ -503,7 +595,24 @@ impl InventoryFusion {
         scope: &CursorScope,
         batch: &bifrost_types::InventoryBatch,
         checkpoint: Option<Checkpoint>,
-    ) -> Result<(), AccountError> {
+    ) -> Result<Forwarded, AccountError> {
+        // Only a checkpoint published through `control` is judged by the
+        // conditional registration, under the coverage lock. Everything else - a
+        // checkpoint-less batch, or any batch of a fusion with no control - mints
+        // nothing, so it is judged here, point-in-time, before anything is sent.
+        // A checkpoint-bearing batch refused here hands back its coverage, as the
+        // conditional registration would, so its debt still reaches the writer.
+        let registers = checkpoint.is_some() && self.control.is_some();
+        if !registers && self.fence_moved(scope) {
+            return Ok(Forwarded::Refused(if checkpoint.is_some() {
+                crate::cursor::CoverageClaim::new(batch.coverage.clone(), self.generation)
+            } else {
+                crate::cursor::CoverageClaim {
+                    reports: Vec::new(),
+                    generation: self.generation,
+                }
+            }));
+        }
         let removals = match crate::inventory_walk::removals(scope, batch.removed.iter()) {
             Ok(removals) => removals,
             Err(error) => {
@@ -542,10 +651,14 @@ impl InventoryFusion {
         // waiting for `Done` would let a page checkpoint become durable across
         // a gap it never declared.
         let publication = match (&self.control, &checkpoint) {
-            (Some(control), Some(checkpoint)) => Some(control.publish_checkpoint(
+            (Some(control), Some(checkpoint)) => match control.publish_checkpoint_if_fence(
                 checkpoint.clone(),
                 crate::cursor::CoverageClaim::new(batch.coverage.clone(), self.generation),
-            )),
+                self.expected_fence,
+            ) {
+                Ok(id) => Some(id),
+                Err(claim) => return Ok(Forwarded::Refused(claim)),
+            },
             _ => None,
         };
         let me = MultiplexerEvent {
@@ -557,7 +670,7 @@ impl InventoryFusion {
         if !tx.publish_acknowledgeable(me) {
             self.retire_claim(publication);
         }
-        Ok(())
+        Ok(Forwarded::Published)
     }
 
     async fn finalize(
@@ -574,7 +687,13 @@ impl InventoryFusion {
                 expected_scope, cursor.scope,
             )));
         }
-        self.cursors.put(cursor);
+        if !self.cursors.put_if(cursor, || {
+            self.coverage
+                .as_ref()
+                .is_none_or(|coverage| coverage.scope_fence(&expected_scope) == self.expected_fence)
+        }) {
+            return Ok(FusionOutcome::Invalidated);
+        }
         Ok(FusionOutcome::Established)
     }
 }
@@ -652,6 +771,300 @@ fn inventory_resume_stream_checked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The receiving halves of the control's channels. The caller holds them
+    /// for the life of the test, so nothing the control sends goes to a closed
+    /// channel, and they are dropped with the test rather than leaked.
+    type ControlViews = (
+        crate::cancel::BoundaryView,
+        tokio::sync::watch::Receiver<bifrost_types::Priority>,
+        tokio::sync::watch::Receiver<Option<u64>>,
+    );
+
+    fn guarded_fusion() -> (
+        InventoryFusion,
+        Arc<ChangeDelivery>,
+        tokio::sync::broadcast::Receiver<MultiplexerEvent>,
+        ControlViews,
+    ) {
+        let coverage = Arc::new(crate::cursor::PendingCoverage::new());
+        let (boundary, view) = crate::cancel::Boundary::new();
+        let (priority, p) = tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+        let (bandwidth, b) = tokio::sync::watch::channel(None);
+        let control = SyncControl::new_with_publications(
+            bifrost_types::AccountId("guarded".into()),
+            boundary,
+            priority,
+            bandwidth,
+            Arc::clone(&coverage),
+        );
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        (
+            InventoryFusion {
+                expected_fence: 0,
+                account_id: bifrost_types::AccountId("guarded".into()),
+                cursors: Arc::new(CursorRegistry::new()),
+                control: Some(control),
+                coverage: Some(coverage),
+                writer_tx: None,
+                generation: 1,
+                shutdown: None,
+            },
+            Arc::new(ChangeDelivery::new(tx)),
+            rx,
+            (view, p, b),
+        )
+    }
+    fn clean_done() -> bifrost_types::InventoryEvent {
+        bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(
+            bifrost_types::CoverageDomain::full(CursorScope::Account),
+            Some(Checkpoint::Change(crate::test_common::cursor_for(
+                &CursorScope::Account,
+                b"done",
+            ))),
+            bifrost_types::PartitionEnd::Exhausted,
+        ))
+    }
+    fn page(checkpoint: bool, degraded: bool) -> bifrost_types::InventoryEvent {
+        bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
+            items: vec![bifrost_types::InventoryEntry {
+                id: bifrost_types::ObjectId("observed".into()),
+                memberships: Vec::new(),
+                size: None,
+                blob_id: None,
+                fingerprint: bifrost_types::Fingerprint {
+                    server_version: bifrost_types::ServerVersion::Unavailable,
+                    size: None,
+                    flags_hash: 0,
+                },
+                thread_id: None,
+                message_id: None,
+                references: Vec::new(),
+                in_reply_to: None,
+            }],
+            removed: Vec::new(),
+            page_boundary: bifrost_types::PageBoundary::Page,
+            server_latency: std::time::Duration::ZERO,
+            bytes_in: 0,
+            checkpoint: if checkpoint {
+                bifrost_types::PageCheckpoint::Advance(Checkpoint::Change(
+                    crate::test_common::cursor_for(&CursorScope::Account, b"page"),
+                ))
+            } else {
+                bifrost_types::PageCheckpoint::None
+            },
+            coverage: if degraded {
+                bifrost_types::InventoryCoverageReport::degraded(
+                    bifrost_types::CoverageDomain::full(CursorScope::Account),
+                    vec![bifrost_types::InventoryObligation::Object {
+                        key: bifrost_types::ObligationKey(b"owed".to_vec()),
+                        id: bifrost_types::ObjectId("owed".into()),
+                        error: inventory_cursor_contract_error(CursorScope::Account),
+                        repair: Vec::new(),
+                    }],
+                )
+            } else {
+                bifrost_types::InventoryCoverageReport::complete(
+                    bifrost_types::CoverageDomain::full(CursorScope::Account),
+                )
+            },
+        })
+    }
+    #[tokio::test]
+    async fn a_fusion_page_under_a_moved_fence_is_refused_and_its_debt_recorded() {
+        let (mut fusion, delivery, mut rx, _views) = guarded_fusion();
+        let (tx, mut requests) = tokio::sync::mpsc::channel(4);
+        fusion.writer_tx = Some(tx);
+        let writer = tokio::spawn(async move {
+            let mut count = 0;
+            while let Some(request) = requests.recv().await {
+                let crate::multiplexer::WriterRequest::RecordDebt { report, done, .. } = request
+                else {
+                    panic!("debt request")
+                };
+                assert_eq!(report.obligations()[0].key().0, b"owed");
+                count += 1;
+                let _ = done.send(Ok(()));
+            }
+            count
+        });
+        fusion
+            .coverage
+            .as_ref()
+            .expect("coverage")
+            .raise_scope_fence(&CursorScope::Account);
+        let outcome = fusion
+            .run_stream(
+                CursorScope::Account,
+                Box::pin(futures::stream::iter([page(true, true), clean_done()])),
+                Some(delivery),
+            )
+            .await
+            .expect("walk");
+        assert!(matches!(outcome, FusionOutcome::Invalidated));
+        assert!(fusion.cursors.snapshot(&CursorScope::Account).is_none());
+        assert_eq!(
+            fusion
+                .coverage
+                .as_ref()
+                .expect("coverage")
+                .pending_checkpoints(),
+            0
+        );
+        while let Ok(event) = rx.try_recv() {
+            assert!(matches!(event.event.as_ref(), SyncEvent::Warning(_)));
+        }
+        drop(fusion);
+        assert_eq!(writer.await.expect("writer"), 1);
+    }
+    #[tokio::test]
+    async fn a_fusion_done_under_a_moved_fence_is_neither_published_nor_installed() {
+        let (fusion, delivery, mut rx, _views) = guarded_fusion();
+        let coverage = fusion.coverage.clone().expect("coverage");
+        let stream = futures::stream::unfold(0, move |n| {
+            let coverage = Arc::clone(&coverage);
+            async move {
+                match n {
+                    0 => Some((page(false, false), 1)),
+                    1 => {
+                        coverage.raise_scope_fence(&CursorScope::Account);
+                        Some((clean_done(), 2))
+                    }
+                    _ => None,
+                }
+            }
+        });
+        assert!(matches!(
+            fusion
+                .run_stream(CursorScope::Account, Box::pin(stream), Some(delivery))
+                .await
+                .expect("walk"),
+            FusionOutcome::Invalidated
+        ));
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event.event.as_ref(), SyncEvent::Done(_)));
+        }
+        assert!(fusion.cursors.snapshot(&CursorScope::Account).is_none());
+    }
+    #[tokio::test]
+    async fn a_fusion_finalize_under_a_moved_fence_installs_nothing() {
+        let (fusion, _, _, _views) = guarded_fusion();
+        fusion
+            .coverage
+            .as_ref()
+            .expect("coverage")
+            .raise_scope_fence(&CursorScope::Account);
+        assert!(matches!(
+            fusion
+                .finalize(
+                    CursorScope::Account,
+                    Some(Checkpoint::Change(crate::test_common::cursor_for(
+                        &CursorScope::Account,
+                        b"done"
+                    )))
+                )
+                .await
+                .expect("finalize"),
+            FusionOutcome::Invalidated
+        ));
+        assert!(fusion.cursors.snapshot(&CursorScope::Account).is_none());
+    }
+    #[tokio::test]
+    async fn a_fusion_forwards_no_batch_once_its_fence_has_moved() {
+        let (fusion, delivery, mut rx, _views) = guarded_fusion();
+        fusion
+            .coverage
+            .as_ref()
+            .expect("coverage")
+            .raise_scope_fence(&CursorScope::Account);
+        assert!(matches!(
+            fusion
+                .run_stream(
+                    CursorScope::Account,
+                    Box::pin(futures::stream::iter([page(false, false), clean_done()])),
+                    Some(delivery)
+                )
+                .await
+                .expect("walk"),
+            FusionOutcome::Invalidated
+        ));
+        let event = rx.try_recv().expect("warning");
+        assert_eq!(event.scope, CursorScope::Account);
+        assert!(matches!(event.event.as_ref(), SyncEvent::Warning(_)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// With no `control` there is no conditional registration to refuse a
+    /// checkpoint-bearing page, so the fence is read before it is sent: a
+    /// moved fence withholds the page and still routes its debt.
+    #[tokio::test]
+    async fn a_controlless_fusion_withholds_a_checkpoint_page_once_its_fence_has_moved() {
+        let (mut fusion, delivery, mut rx, _views) = guarded_fusion();
+        fusion.control = None;
+        let (tx, mut requests) = tokio::sync::mpsc::channel(4);
+        fusion.writer_tx = Some(tx);
+        let writer = tokio::spawn(async move {
+            let mut count = 0;
+            while let Some(request) = requests.recv().await {
+                let crate::multiplexer::WriterRequest::RecordDebt { report, done, .. } = request
+                else {
+                    panic!("debt request")
+                };
+                assert_eq!(report.obligations()[0].key().0, b"owed");
+                count += 1;
+                let _ = done.send(Ok(()));
+            }
+            count
+        });
+        fusion
+            .coverage
+            .as_ref()
+            .expect("coverage")
+            .raise_scope_fence(&CursorScope::Account);
+        let outcome = fusion
+            .run_stream(
+                CursorScope::Account,
+                Box::pin(futures::stream::iter([page(true, true), clean_done()])),
+                Some(delivery),
+            )
+            .await
+            .expect("walk");
+        assert!(matches!(outcome, FusionOutcome::Invalidated));
+        assert!(fusion.cursors.snapshot(&CursorScope::Account).is_none());
+        while let Ok(event) = rx.try_recv() {
+            assert!(matches!(event.event.as_ref(), SyncEvent::Warning(_)));
+        }
+        drop(fusion);
+        assert_eq!(writer.await.expect("writer"), 1);
+    }
+
+    /// The `Done` arm's counterpart: with no `control`, a terminal checkpoint
+    /// under a moved fence is not broadcast, and nothing is installed.
+    #[tokio::test]
+    async fn a_controlless_fusion_withholds_its_done_once_its_fence_has_moved() {
+        let (mut fusion, delivery, mut rx, _views) = guarded_fusion();
+        fusion.control = None;
+        fusion
+            .coverage
+            .as_ref()
+            .expect("coverage")
+            .raise_scope_fence(&CursorScope::Account);
+        assert!(matches!(
+            fusion
+                .run_stream(
+                    CursorScope::Account,
+                    Box::pin(futures::stream::iter([clean_done()])),
+                    Some(delivery)
+                )
+                .await
+                .expect("walk"),
+            FusionOutcome::Invalidated
+        ));
+        let event = rx.try_recv().expect("warning");
+        assert!(matches!(event.event.as_ref(), SyncEvent::Warning(_)));
+        assert!(rx.try_recv().is_err());
+        assert!(fusion.cursors.snapshot(&CursorScope::Account).is_none());
+    }
 
     fn empty_inventory_stream() -> bifrost_types::AccountStream<bifrost_types::InventoryEvent> {
         Box::pin(futures::stream::empty())
@@ -805,6 +1218,7 @@ mod tests {
         writer_tx: tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>,
     ) -> InventoryFusion {
         InventoryFusion {
+            expected_fence: 0,
             account_id: bifrost_types::AccountId("fusion-unit".into()),
             cursors: Arc::new(CursorRegistry::new()),
             control: None,

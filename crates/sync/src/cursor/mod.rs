@@ -77,6 +77,9 @@ struct RegistryState {
 #[derive(Debug, Default)]
 pub struct CursorRegistry {
     state: RwLock<RegistryState>,
+    /// Only provider deletion moves this epoch. Drive generations also move on
+    /// restart and reset, which must not revoke the repair obligation itself.
+    lifecycle_epochs: std::sync::Mutex<HashMap<CursorScope, u64>>,
     drive_leases: RwLock<HashMap<CursorScope, Arc<AsyncMutex<()>>>>,
     next_incarnation: AtomicU64,
     registry_generation: AtomicU64,
@@ -128,6 +131,36 @@ impl CursorRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Insert only while `admit` holds, evaluated under the registry write lock.
+    /// Lock order is registry then coverage, as for live drive publication.
+    pub(crate) fn put_if(&self, cursor: ChangeCursor, admit: impl FnOnce() -> bool) -> bool {
+        let mut guard = self.state.write().expect("poisoned");
+        if !admit() {
+            return false;
+        }
+        self.put_locked(&mut guard, cursor);
+        true
+    }
+
+    /// Provider-deletion epoch, independent of ordinary drive resets.
+    pub(crate) fn lifecycle_epoch(&self, scope: &CursorScope) -> u64 {
+        self.lifecycle_epochs
+            .lock()
+            .expect("poisoned")
+            .get(scope)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn bump_lifecycle_epoch(&self, scope: &CursorScope) {
+        *self
+            .lifecycle_epochs
+            .lock()
+            .expect("poisoned")
+            .entry(scope.clone())
+            .or_default() += 1;
     }
 
     /// Store the latest cursor for a scope.

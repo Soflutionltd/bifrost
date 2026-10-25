@@ -143,6 +143,45 @@ impl SyncEngine {
         // consumers observe cold-start data the same way they observe
         // live changes.
         let scopes = self.discover_scopes(opened.as_ref()).await?;
+        // Read every discovered scope's stored cursor BEFORE establishing any.
+        //
+        // An unreadable row (an envelope outside the migration window, or one
+        // failing validation) has unknowable provenance, and a release that
+        // moves the envelope makes EVERY row unreadable at once. Healing each
+        // row per scope, as attach once did, deleted the only evidence before
+        // any protocol door could fail, so the account-wide schema reset never
+        // ran and every completion marker survived to suppress the inventory
+        // walk that re-mints ids under the new encoding. One unreadable row
+        // therefore clears every change cursor and backfill row of the account,
+        // undiscovered scopes included; the debt ledger survives. Corruption and
+        // downgrade take the same path, conservatively: those signals cannot be
+        // told apart from an encoding change. A failed clear fails the attach -
+        // establishing fresh over surviving markers would recreate the defect.
+        let mut stored = HashMap::new();
+        let mut unreadable = false;
+        for scope in &scopes {
+            match self.checkpoints.get_change_cursor(&account_id, scope).await {
+                Ok(Some(cursor)) if cursor.validate_envelope().is_ok() => {
+                    stored.insert(scope.clone(), cursor);
+                }
+                Ok(None) => {}
+                Ok(Some(_)) | Err(Error::SchemaIncompatible) => unreadable = true,
+                Err(error) => return Err(error),
+            }
+        }
+        if unreadable {
+            tracing::warn!(
+                target: "bifrost.sync.attach",
+                account = ?account_id,
+                "an unreadable durable cursor; clearing every durable row of the account \
+                 and establishing every scope fresh"
+            );
+            let ledger = self.checkpoints.get_ledger(&account_id).await?;
+            self.checkpoints
+                .clear_account_checkpoints(&account_id, ledger)
+                .await?;
+            stored.clear();
+        }
         let mut deferred_inventory_scopes = Vec::new();
         for scope in scopes.clone() {
             let established = self
@@ -150,6 +189,7 @@ impl SyncEngine {
                     &account_id,
                     opened.as_ref(),
                     scope.clone(),
+                    stored.remove(&scope),
                     Arc::clone(&cursors),
                 )
                 .await;
@@ -529,6 +569,7 @@ impl SyncEngine {
             backfill_capacity: self.config.backfill.lane_capacity,
             reopen_tx: reopen_tx.clone(),
             deferred_repairs: Arc::new(DeferredScopeRepairs::new()),
+            deferred_schema_reset: Arc::new(DeferredSchemaReset::default()),
             scope_tokens: Arc::clone(&scope_tokens),
         };
 
@@ -580,23 +621,61 @@ impl SyncEngine {
                                 ReopenRequest::Recovery { scope, error } => {
                                     reopen_ctx.recover(scope, error).await;
                                 }
+                                // Both run under the reopen lock, like every
+                                // other scope repair.
+                                ReopenRequest::EstablishIfAbsent { scope, epoch } => {
+                                    let writer = reopen_ctx.writer();
+                                    let recovery = reopen_ctx.recovery(&writer);
+                                    let _guard = reopen_ctx.reopen_lock.lock().await;
+                                    let followup = super::reattach::establish_if_absent(
+                                        &recovery, scope, epoch,
+                                    )
+                                    .await;
+                                    reopen_ctx.park_followup(followup);
+                                }
+                                ReopenRequest::SchemaReset {
+                                    reestablish,
+                                    parked_at,
+                                } => {
+                                    let writer = reopen_ctx.writer();
+                                    let recovery = reopen_ctx.recovery(&writer);
+                                    let _guard = reopen_ctx.reopen_lock.lock().await;
+                                    let followup = super::reattach::run_parked_schema_reset(
+                                        &recovery,
+                                        reestablish,
+                                        parked_at,
+                                    )
+                                    .await;
+                                    reopen_ctx.park_followup(followup);
+                                }
                                 ReopenRequest::ScopeDeleted { scope } => {
-                                    // A repair parked for this scope under a
-                                    // pause must not establish it after resume:
-                                    // the folder it was for is gone.
+                                    // A repair or schema reset parked for this
+                                    // scope under a pause must not establish it
+                                    // after resume: the folder it was for is
+                                    // gone.
                                     reopen_ctx.deferred_repairs.unpark(&scope);
+                                    reopen_ctx.deferred_schema_reset.unpark_scope(&scope);
                                     // A cursor here was established after the
                                     // deletion was raised: a `Created` whose
                                     // repair was still queued ahead of this
                                     // request on this same channel. Retire it
                                     // exactly as the multiplexer retires a
-                                    // registered scope - registry first, then
-                                    // the poll token - before purging its rows,
-                                    // or the rows would be deleted out from
-                                    // under a live cursor for a folder that no
-                                    // longer exists.
-                                    if reopen_ctx.cursors.snapshot(&scope).is_some() {
-                                        reopen_ctx.cursors.delete(&scope);
+                                    // registered scope - epoch, fence, then
+                                    // registry, then the poll token - before
+                                    // purging its rows, or the rows would be
+                                    // deleted out from under a live cursor for
+                                    // a folder that no longer exists. The
+                                    // retirement runs unconditionally: this
+                                    // second epoch bump and fence raise is what
+                                    // revokes an establishment still in flight
+                                    // for the scope.
+                                    let registered = reopen_ctx.cursors.snapshot(&scope).is_some();
+                                    crate::multiplexer::retire_deleted_scope(
+                                        &reopen_ctx.cursors,
+                                        &reopen_ctx.control,
+                                        &scope,
+                                    );
+                                    if registered {
                                         crate::multiplexer::cancel_scope_token(
                                             &reopen_ctx.scope_tokens,
                                             &scope,
@@ -669,6 +748,7 @@ impl SyncEngine {
             changes_tx: changes_tx.clone(),
         };
         let slot = Arc::new(AccountSlot {
+            deferred_schema_reset: Arc::clone(&ctx.deferred_schema_reset),
             bandwidth_budget,
             scheduler: self.scheduler.clone(),
             factory,
@@ -704,67 +784,36 @@ impl SyncEngine {
         discover_scopes_from(account).await
     }
 
+    /// Establish one discovered scope at attach. `stored` is the scope's
+    /// readable durable cursor, pre-read by `attach_inner`; this function never
+    /// reads the store itself, so an unreadable row is never healed per scope
+    /// (see the account-wide clear in `attach_inner`).
     async fn establish_one(
         &self,
         account_id: &AccountId,
         account: &dyn Account,
         scope: CursorScope,
+        stored: Option<ChangeCursor>,
         cursors: Arc<CursorRegistry>,
     ) -> Result<InitialScope, Error> {
-        // Check the store first - resume path.
-        //
-        // A schema-incompatible envelope is healed HERE rather than
-        // returned to recovery dispatch. `run_establish` does return a
-        // typed `AccountError`, but its callers handle that result as a
-        // scoped retry or a failed replacement; they do not send it
-        // through the reopen listener's schema-clear arm. Attach has no
-        // listener yet and no retry path, so returning the error would
-        // leave the same unreadable row to fail every subsequent start.
-        // Delete this row and re-establish its scope inline.
-        match self.checkpoints.get_change_cursor(account_id, &scope).await {
-            Ok(Some(existing)) if existing.validate_envelope().is_ok() => {
-                // The classifier and the stream hook are required to agree.
-                // Defer either positive answer so InventoryFusion's guard can
-                // route a disagreement through scoped recovery. In
-                // particular, putting a cursor into the registry when only
-                // the stream hook accepts it would send an inventory page
-                // cursor to changes_stream.
-                let classified_as_inventory = account.is_inventory_cursor(&existing);
-                let has_resume_stream = account.inventory_resume_stream(existing.clone()).is_some();
-                if classified_as_inventory || has_resume_stream {
-                    return Ok(InitialScope::DeferredInventory(DeferredInventory::Resume(
-                        existing,
-                    )));
-                }
-                cursors.put(existing);
-                return Ok(InitialScope::Ready);
+        if let Some(existing) = stored {
+            // The classifier and the stream hook are required to agree.
+            // Defer either positive answer so InventoryFusion's guard can
+            // route a disagreement through scoped recovery. In
+            // particular, putting a cursor into the registry when only
+            // the stream hook accepts it would send an inventory page
+            // cursor to changes_stream.
+            let classified_as_inventory = account.is_inventory_cursor(&existing);
+            let has_resume_stream = account.inventory_resume_stream(existing.clone()).is_some();
+            if classified_as_inventory || has_resume_stream {
+                return Ok(InitialScope::DeferredInventory(DeferredInventory {
+                    epoch: cursors.lifecycle_epoch(&scope),
+                    fence: 0,
+                    kind: DeferredKind::Resume(existing),
+                }));
             }
-            Ok(None) => {}
-            Ok(Some(_)) | Err(Error::SchemaIncompatible) => {
-                tracing::warn!(
-                    target: "bifrost.sync.attach",
-                    account = ?account_id,
-                    scope = ?scope,
-                    "schema-incompatible cursor envelope; clearing the row and re-establishing the scope"
-                );
-                if let Err(err) = self
-                    .checkpoints
-                    .delete_change_cursor(account_id, &scope)
-                    .await
-                {
-                    // Non-fatal: re-establishment overwrites the row on
-                    // success anyway. Log and keep going rather than
-                    // failing the attach on a store hiccup.
-                    tracing::warn!(
-                        target: "bifrost.sync.attach",
-                        account = ?account_id,
-                        scope = ?scope,
-                        error = %err,
-                        "delete_change_cursor failed while clearing an unreadable envelope"
-                    );
-                }
-            }
-            Err(other) => return Err(other),
+            cursors.put(existing);
+            return Ok(InitialScope::Ready);
         }
         match account
             .establish_initial_cursor(scope.clone())
@@ -775,9 +824,13 @@ impl SyncEngine {
                 self.persist_cursor(account_id, cursor, cursors).await?;
                 Ok(InitialScope::Ready)
             }
-            CursorEstablishment::EstablishViaInventory => Ok(InitialScope::DeferredInventory(
-                DeferredInventory::Start(scope),
-            )),
+            CursorEstablishment::EstablishViaInventory => {
+                Ok(InitialScope::DeferredInventory(DeferredInventory {
+                    epoch: cursors.lifecycle_epoch(&scope),
+                    fence: 0,
+                    kind: DeferredKind::Start(scope),
+                }))
+            }
             // `CursorEstablishment` is `#[non_exhaustive]`; treat any
             // future variant as "cannot establish" so the engine fails
             // closed rather than silently continuing.
@@ -909,6 +962,23 @@ pub(super) async fn run_deferred_inventory_establishment(
         if shutdown.is_cancelled() {
             return;
         }
+        // Superseded before it was popped: a reset or deletion of this scope
+        // closed since attach recorded the item. Skip the walk and hand the
+        // scope to the listener, which establishes it only if it is still
+        // absent and was not deleted since (`epoch`). A reset this worker's own
+        // `ctx.recover` triggered has committed before the next item is
+        // popped, so this sees it. Re-checked after admission below.
+        if coverage.scope_fence(&scope) != inventory.fence {
+            let request = ReopenRequest::EstablishIfAbsent {
+                scope,
+                epoch: inventory.epoch,
+            };
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                _ = ctx.reopen_tx.send(request) => {},
+            }
+            continue;
+        }
         // The account-wide hold is slept out FIRST and the scope-local decision
         // taken after it, so a short account hold overlapping a long mailbox
         // hold cannot leave this scope in the inline wait below with every
@@ -1027,7 +1097,22 @@ pub(super) async fn run_deferred_inventory_establishment(
                 drop(admission);
                 continue;
             }
+            // The pre-walk fence check again, now that every wait above - a
+            // pause, a throttle, admission - is behind us. A reset can commit
+            // inside any of them (a schema reset parked under a pause runs the
+            // moment the account resumes), and a queued `Resume` holds a cursor
+            // of the encoding that reset disowned: opening its stream is the
+            // likeliest thing to fail with the same schema error and run a
+            // second complete account reset. The in-fusion guard would refuse
+            // the walk's first publication, but only after that provider call.
+            // Admission is released first: the follow-up `EstablishIfAbsent`
+            // must not be sent while holding it.
+            if coverage.scope_fence(&scope) != inventory.fence {
+                drop(admission);
+                break Ok(crate::multiplexer::FusionOutcome::Invalidated);
+            }
             let fusion = crate::multiplexer::InventoryFusion {
+                expected_fence: inventory.fence,
                 account_id: account_id.clone(),
                 cursors: Arc::clone(&cursors),
                 control: Some(control.clone()),
@@ -1036,13 +1121,13 @@ pub(super) async fn run_deferred_inventory_establishment(
                 generation: coverage.next_generation(),
                 shutdown: Some(shutdown.clone()),
             };
-            let result = match &inventory {
-                DeferredInventory::Start(_) => {
+            let result = match &inventory.kind {
+                DeferredKind::Start(_) => {
                     fusion
                         .run_with_broadcast(acc, scope.clone(), Some(Arc::clone(&ctx.delivery)))
                         .await
                 }
-                DeferredInventory::Resume(cursor) => {
+                DeferredKind::Resume(cursor) => {
                     fusion
                         .run_resume_with_broadcast(
                             acc,
@@ -1062,6 +1147,21 @@ pub(super) async fn run_deferred_inventory_establishment(
             break result;
         };
         match outcome {
+            // A reset or deletion of the scope closed while the item waited or
+            // walked. Whoever closed it owns nothing for an unregistered scope,
+            // so hand it to the listener, which establishes it only if it is
+            // still absent and its lifecycle epoch has not moved since attach.
+            // Sent with no admission or activity held.
+            Ok(crate::multiplexer::FusionOutcome::Invalidated) => {
+                let request = ReopenRequest::EstablishIfAbsent {
+                    scope,
+                    epoch: inventory.epoch,
+                };
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    _ = ctx.reopen_tx.send(request) => {},
+                }
+            }
             Ok(crate::multiplexer::FusionOutcome::Established) => {
                 let current = account.load_full();
                 // No shutdown arm on this provider poll, unlike the walk above:
@@ -1220,11 +1320,20 @@ mod tests {
         let cursors = Arc::new(CursorRegistry::new());
 
         let established = engine
-            .establish_one(&account_id, &account, scope.clone(), Arc::clone(&cursors))
+            .establish_one(
+                &account_id,
+                &account,
+                scope.clone(),
+                Some(cursor.clone()),
+                Arc::clone(&cursors),
+            )
             .await
             .expect("stored cursor is deferred for the resume guard");
 
-        let InitialScope::DeferredInventory(DeferredInventory::Resume(resumed)) = established
+        let InitialScope::DeferredInventory(DeferredInventory {
+            kind: DeferredKind::Resume(resumed),
+            ..
+        }) = established
         else {
             panic!("a supplied resume stream must stay out of the changes registry")
         };

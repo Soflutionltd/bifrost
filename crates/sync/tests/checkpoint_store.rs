@@ -273,7 +273,7 @@ async fn put_backfill_replaces_the_same_partition_row() {
     assert_eq!(got.progress.items_done, 400);
 }
 
-/// `delete_backfill` is the schema-clear half of the reseed contract:
+/// Provider deletion and backfill discard delete every partition of one scope:
 /// it must drop EVERY partition row for the named `(account, scope)` -
 /// the completion marker included, since that marker is what makes the
 /// next attach skip the inventory re-walk that re-mints ids - while
@@ -332,5 +332,76 @@ async fn delete_backfill_drops_every_partition_for_the_scope_only() {
             .progress
             .items_done,
         7
+    );
+}
+
+#[tokio::test]
+async fn clear_account_checkpoints_drops_every_row_of_the_account_and_only_that_account() {
+    let store = InMemoryCheckpointStore::new();
+    let a = account("a");
+    let b = account("b");
+    let scopes = [CursorScope::Account, CursorScope::Type(ObjectType::Contact)];
+    for account in [&a, &b] {
+        for scope in &scopes {
+            store
+                .put_change_cursor(account, change_cursor(scope, b"old"))
+                .await
+                .expect("seed");
+            store
+                .put_backfill(
+                    account,
+                    backfill(
+                        scope,
+                        &bifrost_sync::backfill::partitioner::completion_partition().0,
+                        10,
+                    ),
+                )
+                .await
+                .expect("seed");
+            store
+                .put_backfill(account, backfill(scope, b"page:0:10", 1))
+                .await
+                .expect("seed");
+        }
+    }
+    let mut ledger = bifrost_sync::cursor::DebtLedger::default();
+    ledger.record_barrier(bifrost_sync::cursor::BarrierIncident {
+        key: bifrost_types::ObligationKey(b"barrier".to_vec()),
+        domain: bifrost_types::CoverageDomain::full(scopes[0].clone()),
+        generation: 1,
+        failure_label: "blocked".into(),
+        evidence: bifrost_types::AccountError::unsupported(
+            bifrost_types::AccountOperation::SyncInventory,
+            bifrost_types::Protocol::Unknown,
+        ),
+        policy: bifrost_sync::cursor::PolicyStatus::Retrying { attempts: 0 },
+        resume_from: None,
+    });
+    let bytes = bifrost_sync::cursor::encode_ledger(&ledger);
+    store
+        .clear_account_checkpoints(&a, ledger)
+        .await
+        .expect("clear");
+    for scope in &scopes {
+        assert!(
+            store
+                .get_change_cursor(&a, scope)
+                .await
+                .expect("get")
+                .is_none()
+        );
+        assert!(store.get_backfill(&a, scope).await.expect("get").is_none());
+        assert!(
+            store
+                .get_change_cursor(&b, scope)
+                .await
+                .expect("get")
+                .is_some()
+        );
+        assert!(store.get_backfill(&b, scope).await.expect("get").is_some());
+    }
+    assert_eq!(
+        bifrost_sync::cursor::encode_ledger(&store.get_ledger(&a).await.expect("ledger")),
+        bytes
     );
 }

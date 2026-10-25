@@ -223,6 +223,50 @@ pub(crate) async fn cross_waived_barriers(
     }
 }
 
+/// Persist the debt of a claim whose publication was refused by a fence.
+/// Debt only: never proof, never a checkpoint.
+///
+/// One `RecordDebt` per degraded report, each awaited before the next. A
+/// writer that answers `Err` has RETAINED the report - ingested into its
+/// in-memory ledger before a failed persist, or queued while its ledger is
+/// unloaded - so that is logged and the next report sent. A closed channel or
+/// a dropped reply means the writer is gone and the slot is detaching: the
+/// debt is dropped exactly as every outstanding publication's is at detach
+/// (the next attach re-walks), and `Err` is returned.
+///
+/// Awaited by the producer inside its walk, like `record_barriers`: the writer
+/// takes no admission, activity or reopen lock, so this cannot deadlock against
+/// whatever the producer holds.
+pub(crate) async fn record_refused_debt(
+    writer_tx: Option<&tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>>,
+    claim: crate::cursor::CoverageClaim,
+) -> Result<(), Error> {
+    let claim = claim.debt_only();
+    for report in claim.reports {
+        let tx = writer_tx.ok_or(Error::ShuttingDown)?;
+        let (done, reply) = tokio::sync::oneshot::channel();
+        tx.send(crate::multiplexer::WriterRequest::RecordDebt {
+            report,
+            generation: claim.generation,
+            done,
+        })
+        .await
+        .map_err(|_| Error::ShuttingDown)?;
+        match reply.await.map_err(|_| Error::ShuttingDown)? {
+            Ok(()) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "bifrost.sync.changes",
+                    %error,
+                    "the writer could not persist a refused publication's debt yet; \
+                     it retains the debt for its next ledger write"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

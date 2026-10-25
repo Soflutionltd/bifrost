@@ -8,6 +8,7 @@ use super::*;
 /// `handle_account_error`, the engine-directive arm, and the reopen
 /// loop don't carry seven-positional argument lists.
 pub(crate) struct RecoveryContext<'a> {
+    pub deferred_schema_reset: &'a Arc<DeferredSchemaReset>,
     pub bandwidth_budget: Option<&'a bifrost_net::BandwidthBudget>,
     pub factory: &'a Arc<dyn AccountFactory>,
     pub current: &'a Arc<ArcSwap<Arc<dyn Account>>>,
@@ -52,21 +53,23 @@ pub(crate) struct RecoveryContext<'a> {
 /// directive's own scope when present; account-wide directives ignore
 /// it.
 ///
-/// Returns the scope of a repair that was declined because the account is
-/// paused AND that nothing will raise again: a scope with no cursor registered
-/// (a lifecycle `Created` scope, which has no failing cursor for the poll to
-/// re-raise the directive from). The caller owes that scope a re-offer after
-/// resume, see [`DeferredScopeRepairs`]. Every other outcome is `None`.
+/// Returns the obligation the caller must park because nothing else will raise
+/// it again: a repair of a cursorless scope declined under a pause (a lifecycle
+/// `Created` scope, or a deferred inventory scope, has no failing cursor for the
+/// poll to re-raise the directive from - see [`DeferredScopeRepairs`]), or an
+/// account schema reset that was declined under a pause or exhausted its retry
+/// budget, with the scopes it owes re-establishment (see
+/// [`DeferredSchemaReset`]). Every other outcome is [`RecoveryFollowUp::None`].
 pub(crate) async fn handle_account_error(
     ctx: &RecoveryContext<'_>,
     scope: Option<CursorScope>,
     error: AccountError,
-) -> Option<CursorScope> {
+) -> RecoveryFollowUp {
     use crate::recovery::{RecoveryPlan, plan_recovery};
     // Clone so we can log structured fields after dispatch consumes
     // the value.
     let plan = plan_recovery(error.clone());
-    let mut deferred = None;
+    let mut deferred = RecoveryFollowUp::None;
     match plan {
         RecoveryPlan::Retry(advice) => {
             // The reopen listener is a serialization point for real
@@ -200,10 +203,10 @@ async fn handle_engine_directive(
     fallback_scope: Option<CursorScope>,
     directive: EngineDirective,
     error: AccountError,
-) -> Option<CursorScope> {
+) -> RecoveryFollowUp {
     // The scope of a declined repair that nothing will raise again; see
     // `handle_account_error`.
-    let mut deferred = None;
+    let mut deferred = RecoveryFollowUp::None;
     // Every current directive has an explicit dispatch arm. The required
     // non-exhaustive fallback makes a future variant visible in logs until a
     // human gives it an intentional engine action.
@@ -221,14 +224,19 @@ async fn handle_engine_directive(
             if !restart_scope(ctx, directive_scope.clone()).await
                 && ctx.cursors.snapshot(&directive_scope).is_none()
             {
-                deferred = Some(directive_scope);
+                deferred = RecoveryFollowUp::ParkScope {
+                    epoch: ctx.cursors.lifecycle_epoch(&directive_scope),
+                    scope: directive_scope,
+                };
             }
         }
         EngineDirective::DowngradeCapabilityForScope(directive_scope) => {
             // Registered before the warning, so a deferred repair does not
             // announce a downgrade that will be announced again when the poll
             // re-raises the directive after resume.
-            let activity = begin_scope_repair(ctx, &directive_scope)?;
+            let Some(activity) = begin_scope_repair(ctx, &directive_scope) else {
+                return RecoveryFollowUp::None;
+            };
             broadcast_warning(
                 ctx.changes_tx,
                 Some(directive_scope.clone()),
@@ -267,7 +275,7 @@ async fn handle_engine_directive(
             // paused, the establishment is refused, and the deleted scope
             // would stay gone after resume.
             if !restart_account(ctx).await {
-                return None;
+                return RecoveryFollowUp::None;
             }
             // If the originating error was scoped to a cursor, also
             // re-establish that scope so the downgrade takes effect
@@ -285,7 +293,11 @@ async fn handle_engine_directive(
             }
         }
         EngineDirective::SchemaIncompatible => {
-            handle_schema_incompatible(ctx).await;
+            let mut extra = HashMap::new();
+            if let Some(scope) = fallback_scope {
+                extra.insert(scope.clone(), ctx.cursors.lifecycle_epoch(&scope));
+            }
+            deferred = handle_schema_incompatible(ctx, extra).await;
         }
         EngineDirective::OperatorOverrideRequired { reason } => {
             // Auto-pause the account: the engine no longer drives work
@@ -325,84 +337,112 @@ async fn handle_engine_directive(
     deferred
 }
 
+/// Recovery work a dispatch could not finish and that nothing else will raise
+/// again, handed back for the caller to park.
+pub(crate) enum RecoveryFollowUp {
+    /// Nothing is owed.
+    None,
+    /// A cursorless scope repair declined under a pause, with the scope's
+    /// lifecycle epoch read at decline time.
+    ParkScope { scope: CursorScope, epoch: u64 },
+    /// An account reset declined or exhausted; scopes it owes re-establishment
+    /// (scope -> lifecycle epoch).
+    ParkSchemaReset(HashMap<CursorScope, u64>),
+    /// Several cursorless establishments declined under a pause: what a parked
+    /// schema reset, finding a reset already committed since its decline, owes
+    /// when a second pause refuses the establishments it runs instead. Each is
+    /// parked as its own [`RecoveryFollowUp::ParkScope`]; this is only the
+    /// batched form, since one dispatch can decline many.
+    ParkScopes(HashMap<CursorScope, u64>),
+}
+
 /// Scope repairs declined under a pause that nothing else will raise again,
 /// re-offered to the reopen listener once the account runs.
 ///
 /// A repair of a scope that HAS a cursor needs no help: it declines without
 /// touching the cursor, and the poll raises the directive again after resume. A
 /// scope that has none - the directive a lifecycle `Created` synthesizes, before
-/// any cursor exists - is invisible to the multiplexer, which only polls
-/// registered scopes, so a declined repair of it was simply lost.
+/// any cursor exists, or a deferred inventory scope - is invisible to the
+/// multiplexer, which only polls registered scopes, so a declined repair of it
+/// would simply be lost.
 ///
 /// One instance per slot, owned by the reopen listener. Each parked scope is one
-/// small task that waits for the boundary to read `Run` and then sends the same
-/// synthesized directive back through the listener's own channel, so the repair
-/// runs through the ordinary dispatch (reopen lock, activity registration, the
-/// decline-under-pause check again). It is a task rather than a wait in the
-/// listener because the listener is the serialization point for real directives:
-/// blocking it across an unbounded pause would hold `RestartAccount` behind it.
-/// A scope is parked at most once, so repeated `Created` events during a long
-/// pause do not stack tasks; the task leaves through the shutdown token, so a
-/// detach never waits on one.
+/// small task that waits for the boundary to read `Run` and then sends
+/// [`ReopenRequest::EstablishIfAbsent`] back through the listener's own channel,
+/// so the repair runs under the reopen lock with the decline-under-pause check
+/// again, and re-checks absence THERE: a check made here, outside the lock,
+/// could restart a healthy replacement established between it and the dispatch.
+/// It is a task rather than a wait in the listener because the listener is the
+/// serialization point for real directives: blocking it across an unbounded
+/// pause would hold `RestartAccount` behind it. The task leaves through the
+/// shutdown token, so a detach never waits on one.
+///
+/// Each entry maps a scope to the lifecycle epoch its obligation was recorded
+/// under, and only the task that captured that epoch may consume it (`claim`):
+/// a folder deleted and recreated during one pause is parked under a newer
+/// epoch, the older task finds the entry overwritten and exits silently, and
+/// the newer task owns the obligation. Parking the same `(scope, epoch)` again
+/// is a no-op, so repeated `Created` events during a long pause do not stack
+/// tasks.
+#[derive(Clone)]
 pub(crate) struct DeferredScopeRepairs {
-    parked: Arc<std::sync::Mutex<HashSet<CursorScope>>>,
+    parked: Arc<std::sync::Mutex<HashMap<CursorScope, u64>>>,
 }
 
 impl DeferredScopeRepairs {
     pub(crate) fn new() -> Self {
         Self {
-            parked: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            parked: Arc::default(),
         }
     }
 
-    /// Park `scope` until the account runs, then re-raise its restart directive
-    /// on `reopen_tx`. A no-op if it is already parked.
+    fn guard(&self) -> std::sync::MutexGuard<'_, HashMap<CursorScope, u64>> {
+        self.parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Remove the entry for `scope` only if it still maps to `epoch`, and
+    /// report whether it did. A task whose entry was unparked (its folder was
+    /// deleted) or overwritten by a newer epoch takes nothing.
+    pub(crate) fn claim(&self, scope: &CursorScope, epoch: u64) -> bool {
+        let mut parked = self.guard();
+        if parked.get(scope) != Some(&epoch) {
+            return false;
+        }
+        parked.remove(scope);
+        true
+    }
+
+    /// Park `scope` under `epoch` until the account runs, then re-offer it as
+    /// [`ReopenRequest::EstablishIfAbsent`]. A no-op if exactly this obligation
+    /// is already parked; a different epoch overwrites the entry and spawns the
+    /// task that owns it.
     pub(crate) fn park(
         &self,
         scope: CursorScope,
+        epoch: u64,
         control: SyncControl,
-        cursors: Arc<CursorRegistry>,
         shutdown: CancellationToken,
         reopen_tx: mpsc::Sender<ReopenRequest>,
     ) {
-        let inserted = self
-            .parked
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(scope.clone());
-        if !inserted {
-            return;
-        }
-        let parked = Arc::clone(&self.parked);
-        tokio::spawn(async move {
-            let runs = control.wait_until_running(&shutdown).await;
-            // Unparked BEFORE the send, so a repair the listener declines again
-            // (a second pause) can park the scope afresh. The removal is also
-            // the check: a scope `unpark` already removed - its folder was
-            // deleted during the pause - is not re-raised, or it would be
-            // established after resume for a folder that no longer exists and
-            // end in the retry-budget terminal event. Deleted and then created
-            // again during one pause, it is parked afresh and exactly one of
-            // the two tasks finds it.
-            let still_parked = parked
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&scope);
-            // Something else established it while it waited (a second `Created`,
-            // a reattach): restarting a live cursor would reset healthy state.
-            if !runs || !still_parked || cursors.snapshot(&scope).is_some() {
+        {
+            let mut parked = self.guard();
+            if parked.get(&scope) == Some(&epoch) {
                 return;
             }
-            let error = crate::recovery::restart_scope_error(
-                scope.clone(),
-                bifrost_types::AccountOperation::SyncChanges,
-            );
+            parked.insert(scope.clone(), epoch);
+        }
+        let parked = self.clone();
+        tokio::spawn(async move {
+            // Claimed BEFORE the send, so a repair the listener declines again
+            // (a second pause) can park the scope afresh.
+            if !control.wait_until_running(&shutdown).await || !parked.claim(&scope, epoch) {
+                return;
+            }
             tokio::select! {
-                () = shutdown.cancelled() => {}
-                _ = reopen_tx.send(ReopenRequest::Recovery {
-                    scope: Some(scope),
-                    error,
-                }) => {}
+                () = shutdown.cancelled() => {},
+                _ = reopen_tx.send(ReopenRequest::EstablishIfAbsent { scope, epoch }) => {},
             }
         });
     }
@@ -410,63 +450,299 @@ impl DeferredScopeRepairs {
     /// Forget a parked scope whose folder was deleted, so its task re-raises
     /// nothing when the account runs again. A no-op if it is not parked.
     pub(crate) fn unpark(&self, scope: &CursorScope) {
-        self.parked
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(scope);
+        self.guard().remove(scope);
     }
 }
 
-async fn handle_schema_incompatible(ctx: &RecoveryContext<'_>) {
-    // Stop trusting durable cursor envelopes. Clear every in-memory
-    // cursor, delete every durable change cursor we know about, AND
-    // delete every backfill checkpoint - the completion marker
-    // included. The ids the consumer holds were minted under an
-    // encoding the protocol has disowned (that is what a schema bump
-    // asserts), and re-minting them requires the inventory re-walk
-    // the completion marker would otherwise skip at the next attach.
-    // For protocols whose establishment returns a `Ready` cursor from
-    // live state (JMAP), that next-attach re-walk IS the migration;
-    // this session's re-established cursor only covers changes from
-    // now on. Then re-establish each scope from the current account
-    // handle. Failure to re-establish a single scope escalates
-    // per-scope (sync-D7): the account keeps running for the scopes
-    // that succeed.
-    //
-    // The recovery deletes EVERY scope's cursor before it re-establishes any, so
-    // a pause landing inside it would strand all of them for the reason a scope
-    // repair must not (see `begin_scope_repair`): the establishment is
-    // refused on a paused account and nothing raises the directive again. It
-    // therefore registers activity before touching anything, declines outright
-    // on a paused account (the failing cursors stay registered and re-raise it
-    // after resume), and holds the registration through the last
-    // re-establishment, which runs on a control that registration admits.
+/// An account-wide schema reset owed after a decline, plus the reset
+/// generation that keeps a parked reset from repeating one that already ran.
+///
+/// A reset declined under a pause, or one whose clear exhausted its retry
+/// budget, cannot rely on a registered failing cursor to raise the directive
+/// again: a deferred inventory trigger has none, and the reset already removed
+/// the registered ones from the registry before an exhausted clear. The owed
+/// scopes are kept here instead, merged across declines (per scope, the greater
+/// epoch), and one task re-raises them as [`ReopenRequest::SchemaReset`] once
+/// the account runs.
+///
+/// The generation: on a paused decline the still-registered failing cursors
+/// re-raise the directive after resume as well, and without a check one decline
+/// would cost two complete resets, the second wiping the cursors and in-flight
+/// backfill the first just established. `completed` counts resets whose clear
+/// committed during this attachment and `parked_at` records it at the newest
+/// decline; the listener compares them at EXECUTION (not when the task takes
+/// the map), so a parked request queued behind a poll's directive still sees
+/// the reset that directive ran, and only establishes the owed scopes.
+#[derive(Default, Clone)]
+pub(crate) struct DeferredSchemaReset {
+    state: Arc<std::sync::Mutex<ParkedReset>>,
+}
+
+#[derive(Default)]
+struct ParkedReset {
+    /// Scopes owed re-establishment, `None` when no reset is owed. `Some` of
+    /// an empty map is still an owed reset: its scopes are the registered ones
+    /// the reset snapshots when it runs.
+    owed: Option<HashMap<CursorScope, u64>>,
+    /// Whether a task is parked waiting to send `owed`.
+    task: bool,
+    /// Account resets whose clear committed during this attachment.
+    completed: u64,
+    /// `completed` as of the most recent `park`.
+    parked_at: u64,
+}
+
+impl DeferredSchemaReset {
+    fn guard(&self) -> std::sync::MutexGuard<'_, ParkedReset> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn merge(state: &mut ParkedReset, scopes: HashMap<CursorScope, u64>) {
+        let owed = state.owed.get_or_insert_with(HashMap::new);
+        for (scope, epoch) in scopes {
+            let entry = owed.entry(scope).or_insert(epoch);
+            *entry = (*entry).max(epoch);
+        }
+    }
+
+    /// How many account resets have committed during this attachment.
+    pub(crate) fn completed(&self) -> u64 {
+        self.guard().completed
+    }
+
+    /// Record that an account reset's clear committed.
+    pub(crate) fn reset_completed(&self) {
+        self.guard().completed += 1;
+    }
+
+    /// Drop one deleted scope from the owed set. An optimisation only: the
+    /// execution re-checks every owed scope's lifecycle epoch.
+    pub(crate) fn unpark_scope(&self, scope: &CursorScope) {
+        if let Some(owed) = &mut self.guard().owed {
+            owed.remove(scope);
+        }
+    }
+
+    /// Merge `scopes` into the owed reset, stamp the newest decline's
+    /// generation, and spawn the re-raising task unless one is already parked.
+    pub(crate) fn park(
+        &self,
+        scopes: HashMap<CursorScope, u64>,
+        control: SyncControl,
+        shutdown: CancellationToken,
+        reopen_tx: mpsc::Sender<ReopenRequest>,
+    ) {
+        {
+            let mut state = self.guard();
+            Self::merge(&mut state, scopes);
+            state.parked_at = state.completed;
+            if state.task {
+                return;
+            }
+            state.task = true;
+        }
+        let reset = self.clone();
+        tokio::spawn(async move {
+            let runs = control.wait_until_running(&shutdown).await;
+            let (owed, parked_at) = {
+                let mut state = reset.guard();
+                state.task = false;
+                (state.owed.take(), state.parked_at)
+            };
+            if runs && let Some(reestablish) = owed {
+                tokio::select! {
+                    () = shutdown.cancelled() => {},
+                    _ = reopen_tx.send(ReopenRequest::SchemaReset { reestablish, parked_at }) => {},
+                }
+            }
+        });
+    }
+}
+
+/// The `EstablishIfAbsent` arm, called under the reopen lock: establish
+/// `scope` unless it is registered or a provider deletion moved its lifecycle
+/// epoch past `epoch`.
+///
+/// It restarts rather than merely establishing. The obligation may come from a
+/// declined `RestartScope` of a cursorless scope - a deferred inventory whose
+/// stored resume cursor was rejected, say - whose durable row is exactly what
+/// must go; establishing over it would resume the row the directive condemned.
+/// After an account reset the row is already gone and the restart's reset is
+/// a no-op.
+///
+/// The epoch is checked twice. Before anything moves, so a deleted or
+/// registered scope is not reset at all; and again AFTER the walk fence is
+/// read, which is what makes the fence trustworthy: a deletion bumps the epoch
+/// before it raises the fence (`retire_deleted_scope`), so a deletion that
+/// passes the second check raised its fence after the read, and every install
+/// of the establishment then refuses.
+pub(crate) async fn establish_if_absent(
+    ctx: &RecoveryContext<'_>,
+    scope: CursorScope,
+    epoch: u64,
+) -> RecoveryFollowUp {
+    if ctx.cursors.lifecycle_epoch(&scope) != epoch || ctx.cursors.snapshot(&scope).is_some() {
+        return RecoveryFollowUp::None;
+    }
+    let Some(activity) = begin_scope_repair(ctx, &scope) else {
+        return RecoveryFollowUp::ParkScope { scope, epoch };
+    };
+    if let Err(err) = ctx.writer.reset_scope_for_restart(scope.clone()).await {
+        tracing::warn!(
+            target: "bifrost.sync.changes",
+            account = ?ctx.account_id,
+            scope = ?scope,
+            error = %err,
+            "EstablishIfAbsent: durable scope reset failed"
+        );
+    }
+    let walk_fence = ctx.coverage.scope_fence(&scope);
+    if ctx.cursors.lifecycle_epoch(&scope) != epoch {
+        return RecoveryFollowUp::None;
+    }
+    let admitted = ctx.control.admitted_by(&activity);
+    re_establish_scope_with_backoff(ctx, scope, &admitted, walk_fence).await;
+    RecoveryFollowUp::None
+}
+
+/// The `SchemaReset` arm, called under the reopen lock.
+///
+/// If a reset committed after the newest decline, its clear was account-wide,
+/// so every owed scope's rows are already gone: establish each owed scope that
+/// is still absent instead of running a second reset. Otherwise run the reset.
+pub(crate) async fn run_parked_schema_reset(
+    ctx: &RecoveryContext<'_>,
+    reestablish: HashMap<CursorScope, u64>,
+    parked_at: u64,
+) -> RecoveryFollowUp {
+    if ctx.deferred_schema_reset.completed() <= parked_at {
+        return handle_schema_incompatible(ctx, reestablish).await;
+    }
+    let mut declined = HashMap::new();
+    for (scope, epoch) in reestablish {
+        if let RecoveryFollowUp::ParkScope { scope, epoch } =
+            establish_if_absent(ctx, scope, epoch).await
+        {
+            declined.insert(scope, epoch);
+        }
+    }
+    if declined.is_empty() {
+        RecoveryFollowUp::None
+    } else {
+        RecoveryFollowUp::ParkScopes(declined)
+    }
+}
+
+/// Account-wide schema recovery: clear every durable row of the account and
+/// re-establish every scope it owes, revoking every pre-reset producer first.
+///
+/// A schema bump means the ids the consumer holds were minted under an
+/// encoding the protocol has disowned, and re-minting them requires the
+/// inventory re-walk a surviving completion marker would skip. For protocols
+/// whose establishment returns a `Ready` cursor from live state (JMAP), the
+/// next attach's re-walk IS the migration; this session's re-established
+/// cursor only covers changes from now on. The clear is account-wide, not per
+/// registered scope, because the registry does not name every scope with rows
+/// (see `WriterHandle::reset_account_for_schema_recovery`).
+///
+/// Order, and why:
+///
+/// 1. Register activity, or decline on a paused account and hand the owed
+///    scopes back for parking: the reset deletes every cursor before it
+///    re-establishes any, so a pause landing inside it would strand them.
+/// 2. Raise the account fence: every fence-guarded producer of every scope
+///    (backfill pages and markers, inventory fusions, establishments) is
+///    revoked before anything else moves.
+/// 3. Snapshot and delete every registered cursor, recording its lifecycle
+///    epoch as owed. The registry delete bumps drive generations, revoking
+///    live drives; it must precede the clear, or an old drive could mint an
+///    acceptable publication after it.
+/// 4. The writer's account clear, retried with backoff (the reopen lock is
+///    held throughout, as `RestartScope` does).
+/// 5. On success, re-establish every owed scope still absent and not deleted
+///    since, each against the fence read after the reset's own raises.
+/// 6. On exhaustion, warn, pause with `RetryBudgetExhausted`, and hand the
+///    owed scopes back: after resume the parked reset re-runs in full.
+///
+/// `extra` seeds the owed set with scopes the registry does not hold - the
+/// dispatch's fallback scope, which for a deferred inventory trigger is a
+/// scope that never finalized and that nobody would otherwise re-establish.
+async fn handle_schema_incompatible(
+    ctx: &RecoveryContext<'_>,
+    extra: HashMap<CursorScope, u64>,
+) -> RecoveryFollowUp {
     let Some(activity) = ctx.control.begin_activity() else {
         tracing::debug!(
             target: "bifrost.sync.changes",
             account = ?ctx.account_id,
-            "schema recovery deferred: the account is paused; every cursor stays registered \
-             so the poll raises the directive again after resume"
+            "schema recovery deferred: the account is paused; the reset is parked and \
+             re-runs after resume"
         );
-        return;
+        return RecoveryFollowUp::ParkSchemaReset(extra);
     };
     let admitted = ctx.control.admitted_by(&activity);
-    let scopes: Vec<CursorScope> = ctx.cursors.all_scopes();
-    for s in &scopes {
-        ctx.cursors.delete(s);
-        if let Err(err) = ctx.writer.reset_scope_for_schema_recovery(s.clone()).await {
-            tracing::warn!(
-                target: "bifrost.sync.changes",
-                account = ?ctx.account_id,
-                scope = ?s,
-                error = %err,
-                "SchemaIncompatible: durable scope reset failed"
-            );
+    ctx.coverage.raise_account_fence();
+    let mut owed = extra;
+    for scope in ctx.cursors.all_scopes() {
+        let epoch = ctx.cursors.lifecycle_epoch(&scope);
+        let entry = owed.entry(scope.clone()).or_insert(epoch);
+        *entry = (*entry).max(epoch);
+        ctx.cursors.delete(&scope);
+    }
+    let mut delay = REOPEN_BACKOFF_INITIAL;
+    let mut last = None;
+    for attempt in 0..REOPEN_RETRY_BUDGET {
+        if attempt > 0 {
+            if !sleep_unless_shutdown(jittered(delay), ctx.shutdown).await {
+                return RecoveryFollowUp::None;
+            }
+            delay = delay.saturating_mul(2).min(REOPEN_BACKOFF_CAP);
+        }
+        match ctx.writer.reset_account_for_schema_recovery().await {
+            Ok(()) => {
+                ctx.deferred_schema_reset.reset_completed();
+                for (scope, epoch) in owed {
+                    // Fence BEFORE the epoch, for the reason `establish_if_absent`
+                    // gives: a deletion bumps the epoch before it raises the
+                    // fence, so one passing the epoch check raised its fence
+                    // after this read and the establishment's installs refuse.
+                    let walk_fence = ctx.coverage.scope_fence(&scope);
+                    if ctx.cursors.lifecycle_epoch(&scope) != epoch
+                        || ctx.cursors.snapshot(&scope).is_some()
+                    {
+                        continue;
+                    }
+                    re_establish_scope_with_backoff(ctx, scope, &admitted, walk_fence).await;
+                }
+                return RecoveryFollowUp::None;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "bifrost.sync.changes",
+                    account = ?ctx.account_id,
+                    attempt,
+                    error = %error,
+                    "SchemaIncompatible: account-wide checkpoint clear failed"
+                );
+                last = Some(error);
+            }
         }
     }
-    for s in scopes {
-        re_establish_scope_with_backoff(ctx, s, &admitted).await;
-    }
+    let detail = last.map_or_else(String::new, |error| error.to_string());
+    broadcast_warning(
+        ctx.changes_tx,
+        None,
+        bifrost_types::Warning::user_safe(
+            bifrost_types::WarningKind::OperatorAttentionNeeded,
+            "schema recovery could not clear durable checkpoints",
+        )
+        .with_protocol_detail(DiagnosticText::support_only(detail)),
+    );
+    drop(activity);
+    engine_pause(ctx, PauseReason::RetryBudgetExhausted);
+    RecoveryFollowUp::ParkSchemaReset(owed)
 }
 
 /// Reopen-failure budget. The engine attempts three reopens; after the
@@ -641,8 +917,8 @@ fn begin_scope_repair(ctx: &RecoveryContext<'_>, scope: &CursorScope) -> Option<
             target: "bifrost.sync.changes",
             account = ?ctx.account_id,
             scope = ?scope,
-            "scope repair deferred: the account is paused; the failing cursor stays registered \
-             so the poll raises the directive again after resume"
+            "scope repair deferred: the account is paused; a registered failing cursor \
+             raises the directive again after resume, and a cursorless scope is parked"
         );
     }
     activity
@@ -663,8 +939,9 @@ async fn restart_scope_admitted(
             "RestartScope: durable scope reset failed"
         );
     }
+    let walk_fence = ctx.coverage.scope_fence(&scope);
     let admitted = ctx.control.admitted_by(activity);
-    re_establish_scope_with_backoff(ctx, scope, &admitted).await;
+    re_establish_scope_with_backoff(ctx, scope, &admitted, walk_fence).await;
 }
 
 /// Quarantine a single scope: delete its in-memory and durable cursor and
@@ -709,6 +986,7 @@ async fn re_establish_scope_with_backoff(
     ctx: &RecoveryContext<'_>,
     scope: CursorScope,
     control: &SyncControl,
+    walk_fence: u64,
 ) {
     let mut delay = REOPEN_BACKOFF_INITIAL;
     let mut last_account_error: Option<AccountError> = None;
@@ -737,6 +1015,7 @@ async fn re_establish_scope_with_backoff(
             None,
             ctx,
             &mut pacing,
+            walk_fence,
         )
         .await
         {
@@ -755,7 +1034,7 @@ async fn re_establish_scope_with_backoff(
                 }
                 return;
             }
-            Err(Error::Paused | Error::ShuttingDown) => return,
+            Err(Error::Paused | Error::ShuttingDown | Error::Superseded) => return,
             Err(Error::Account(err) | Error::EstablishCursorTerminated(err)) => {
                 tracing::warn!(
                     target: "bifrost.sync.changes",
@@ -1442,7 +1721,8 @@ async fn reattach_account_paced(
             // the row, or it would stay owned by an attempt that never
             // settles it. An abort with nothing owned is a no-op.
             guard.rollback_owed = true;
-            match run_establish(
+            let walk_fence = ctx.coverage.scope_fence(scope);
+            let result = run_establish(
                 ctx.account_id,
                 next.as_ref(),
                 scope.clone(),
@@ -1456,25 +1736,27 @@ async fn reattach_account_paced(
                 Some(guard.attempt),
                 ctx,
                 pacing,
+                walk_fence,
             )
-            .await
-            {
-                Ok(EstablishOrigin::ResumedStored) => {}
-                Ok(EstablishOrigin::CreatedFresh) => {
+            .await;
+            match (reattach_scope_step(&result), result) {
+                (_, Ok(EstablishOrigin::ResumedStored)) => {}
+                (_, Ok(EstablishOrigin::CreatedFresh)) => {
                     if let Some(cursor) = staged.snapshot(scope) {
                         newly_established.push(cursor);
                     }
                 }
-                Err(Error::Account(error)) if scope_local_establish_failure(&error) => {
+                (ReattachScopeStep::Skip, Err(error)) => {
                     tracing::warn!(
                         target: "bifrost.sync.reopen",
                         account = ?ctx.account_id,
                         scope = ?scope,
                         error = %error,
-                        "scope-local establishment failure during reopen; skipping scope"
+                        "scope-local establishment failure or superseded scope during reopen; \
+                         skipping scope"
                     );
                 }
-                Err(error) => return Err(error),
+                (_, Err(error)) => return Err(error),
             }
         }
 
@@ -2088,9 +2370,47 @@ enum EstablishOrigin {
     CreatedFresh,
 }
 
-/// Re-establish a single scope. Mirrors `SyncEngine::establish_one`
-/// but lives at file scope so the reopen listener task can call it
-/// without owning a reference to the engine.
+/// What a reattach does with one scope's establishment result.
+#[derive(Debug, PartialEq, Eq)]
+enum ReattachScopeStep {
+    /// Established; stage it.
+    Keep,
+    /// Leave the scope out of the staged registry and carry on.
+    Skip,
+    /// Fail the whole reattach attempt.
+    Fail,
+}
+
+/// Classify one scope's establishment during a reattach.
+///
+/// `Superseded` is a skip, not a failure: a reattach holds the reopen lock, so
+/// the only producer of a moved fence is a provider deletion, and its queued
+/// `ScopeDeleted` owns the follow-up. Failing the attempt instead would make a
+/// deletion racing a reattach cost a full reattach retry, and enough of them
+/// would exhaust the reopen budget and pause the account.
+fn reattach_scope_step(result: &Result<EstablishOrigin, Error>) -> ReattachScopeStep {
+    match result {
+        Ok(_) => ReattachScopeStep::Keep,
+        Err(Error::Superseded) => ReattachScopeStep::Skip,
+        Err(Error::Account(error)) if scope_local_establish_failure(error) => {
+            ReattachScopeStep::Skip
+        }
+        Err(_) => ReattachScopeStep::Fail,
+    }
+}
+
+/// Re-establish a single scope. Mirrors `SyncEngine::establish_one` but lives
+/// at file scope so the reopen listener task can call it without owning a
+/// reference to the engine.
+///
+/// `walk_fence` is the scope fence the CALLER's ownership of this
+/// establishment began under; this function never reads `scope_fence` itself.
+/// It awaits the writer's store read and `pacing.wait` before either fusion,
+/// and a deletion landing in those awaits raises the fence: a reading taken
+/// here would adopt that deletion as the walk's own, so a stale resume stream
+/// would publish and install past every conditional check. Every install is
+/// therefore `put_if` against `walk_fence`, both fusions take it as their
+/// `expected_fence`, and a moved fence ends the call with `Error::Superseded`.
 #[allow(clippy::too_many_arguments)]
 async fn run_establish(
     account_id: &AccountId,
@@ -2106,6 +2426,7 @@ async fn run_establish(
     reattach_attempt: Option<u64>,
     ctx: &RecoveryContext<'_>,
     pacing: &mut RepairPacing,
+    walk_fence: u64,
 ) -> Result<EstablishOrigin, Error> {
     pacing.wait(ctx, Some(account), Some(&scope)).await?;
     pacing.failed_keys = crate::recovery::declared_keys(
@@ -2137,6 +2458,7 @@ async fn run_establish(
                 if classified_as_inventory || resume_stream.is_some() {
                     pacing.wait(ctx, Some(account), Some(&scope)).await?;
                     let fusion = crate::multiplexer::InventoryFusion {
+                        expected_fence: walk_fence,
                         account_id: account_id.clone(),
                         cursors: Arc::clone(&cursors),
                         control: control.cloned(),
@@ -2158,16 +2480,20 @@ async fn run_establish(
                         | crate::multiplexer::FusionOutcome::NoCursor => {
                             Ok(EstablishOrigin::ResumedStored)
                         }
+                        crate::multiplexer::FusionOutcome::Invalidated => Err(Error::Superseded),
                         crate::multiplexer::FusionOutcome::Terminated(error) => {
                             Err(Error::EstablishCursorTerminated(error))
                         }
                     };
                 }
-                cursors.put(existing);
+                if !cursors.put_if(existing, || coverage.scope_fence(&scope) == walk_fence) {
+                    return Err(Error::Superseded);
+                }
                 return Ok(EstablishOrigin::ResumedStored);
             }
             Ok(None) => {}
-            // Unlike `establish_one`, this path runs while an installed
+            // Unlike attach, which clears the whole account when it meets an
+            // unreadable row before anything runs, this path runs while an installed
             // account may still be acknowledging checkpoints. Its callers do
             // not route this result back through `handle_account_error` or its
             // schema-clear arm: scoped re-establishment reports it at its own
@@ -2207,12 +2533,15 @@ async fn run_establish(
                     // asserting completeness a cursor establishment never proved.
                     writer.persist_established(cursor.clone()).await?;
                 }
-                cursors.put(cursor);
+                if !cursors.put_if(cursor, || coverage.scope_fence(&scope) == walk_fence) {
+                    return Err(Error::Superseded);
+                }
                 Ok(EstablishOrigin::CreatedFresh)
             }
             CursorEstablishment::EstablishViaInventory => {
                 pacing.wait(ctx, Some(account), Some(&scope)).await?;
                 let fusion = crate::multiplexer::InventoryFusion {
+                    expected_fence: walk_fence,
                     account_id: account_id.clone(),
                     cursors: Arc::clone(&cursors),
                     control: control.cloned(),
@@ -2229,6 +2558,7 @@ async fn run_establish(
                     | crate::multiplexer::FusionOutcome::NoCursor => {
                         Ok(EstablishOrigin::CreatedFresh)
                     }
+                    crate::multiplexer::FusionOutcome::Invalidated => Err(Error::Superseded),
                     crate::multiplexer::FusionOutcome::Terminated(error) => {
                         Err(Error::EstablishCursorTerminated(error))
                     }

@@ -107,12 +107,20 @@ fn engine_over(store: &Arc<InMemoryCheckpointStore>) -> Arc<SyncEngine> {
 /// `subscribe_push` holds it, so the directive the failing scope raises queues
 /// on the lock. The account is then paused and only then is the lock released.
 /// Recovery must decline without deleting ANY cursor, and after resume the
-/// still-registered failing cursor must raise the directive again, which then
-/// re-establishes both scopes.
+/// parked obligation re-runs the reset, which then re-establishes both scopes.
 ///
-/// Ablation: without the activity gate at the top of `handle_schema_incompatible`
-/// both scopes' durable cursors are deleted, the establishment is refused as
-/// `Paused`, and neither is established again.
+/// The stub's `fire` arms ONE failure, so it is not re-armed before resume:
+/// a production schema-stale cursor fails at every poll and would re-raise the
+/// directive too, and which of the poll and the parked reset reaches the
+/// listener first would then decide the outcome. That path is pinned
+/// deterministically by `a_parked_schema_reset_after_a_completed_one_only_establishes`.
+///
+/// Ablations: without the activity gate at the top of
+/// `handle_schema_incompatible` the reset runs on the paused account, the
+/// durable cursors are cleared while paused, and the re-establishment is
+/// refused as `Paused`; without the parked reset (the decline returning
+/// `RecoveryFollowUp::None`), nothing re-raises the directive and the count
+/// stays at 2.
 #[tokio::test(start_paused = true)]
 async fn schema_recovery_reaching_a_paused_account_deletes_nothing_and_runs_after_resume() {
     let id = AccountId("schema-pause-declined".to_owned());
@@ -183,14 +191,13 @@ async fn schema_recovery_reaching_a_paused_account_deletes_nothing_and_runs_afte
         "nothing may be re-established while the account is paused"
     );
 
-    // After resume a still-registered failing cursor re-raises the directive.
-    fire.store(1, Ordering::SeqCst);
+    // After resume the parked obligation re-runs the reset.
     control.resume();
     tokio::time::sleep(POLL_CADENCE_PASSED).await;
     assert_eq!(
         established(&account).len(),
         4,
-        "after resume the poll must raise the directive again and recover both scopes"
+        "after resume the parked reset must recover both scopes"
     );
     for scope in [EMAIL, EVENTS] {
         assert!(durable_cursor_exists(&store, &id, &scope).await);
@@ -387,8 +394,18 @@ async fn a_parked_scope_whose_folder_is_deleted_during_the_pause_is_not_establis
 }
 
 /// Deleted and created AGAIN during one pause, the folder exists after resume
-/// and is established exactly once: the second `Created` parks it afresh, and
-/// only one of the two parked tasks finds it still parked.
+/// and is established exactly once: the second `Created` parks it afresh under
+/// a later lifecycle epoch, and only the task that captured that epoch may
+/// claim the entry. The exact epochs depend on whether the listener handled the
+/// first `Created` before or after the multiplexer's bump (each deletion bumps
+/// twice, once per front end), so none is asserted.
+///
+/// Ablation, epoch ownership: make the park task remove its entry
+/// unconditionally and send its captured epoch - the older task can then
+/// consume the newer obligation, its stale request is discarded at execution,
+/// and the scope is never established. Which task wakes first is
+/// scheduler-dependent here, so `a_park_claim_under_a_stale_epoch_takes_nothing`
+/// pins the rule deterministically.
 #[tokio::test(start_paused = true)]
 async fn a_folder_deleted_and_recreated_during_a_pause_is_established_once() {
     let id = AccountId("created-deleted-created-pause".to_owned());
@@ -527,4 +544,236 @@ async fn a_parked_scope_is_dropped_by_detach() {
         0,
         "a detached account must not establish a parked scope"
     );
+}
+
+/// Schema recovery clears the rows of a scope the account never discovers, so
+/// the registry never names it: its surviving completion marker would make a
+/// later establishment skip the inventory walk that re-mints its ids.
+///
+/// Ablation: replace the writer's account clear with a per-registered-scope
+/// `ResetScope { delete_backfill: true }` loop (the contact rows survive).
+#[tokio::test(start_paused = true)]
+async fn schema_recovery_clears_the_completion_marker_of_an_unregistered_scope() {
+    let id = AccountId("schema-unregistered".into());
+    let store = Arc::new(InMemoryCheckpointStore::new());
+    let absent = CursorScope::Type(ObjectType::Contact);
+    store
+        .put_change_cursor(&id, common::cursor_for(&absent, b"old"))
+        .await
+        .expect("seed");
+    store
+        .put_backfill(
+            &id,
+            bifrost_types::BackfillCheckpoint {
+                scope: absent.clone(),
+                partition: bifrost_sync::backfill::partitioner::completion_partition(),
+                progress_marker: None,
+                progress: Default::default(),
+                envelope_version: 1,
+            },
+        )
+        .await
+        .expect("seed marker");
+    let (account, fire) = failing_on_demand();
+    let account = Arc::new(account);
+    let engine = engine_over(&store);
+    engine
+        .attach(
+            id.clone(),
+            Arc::new(StubFactory::queue(vec![Arc::clone(&account)])),
+        )
+        .await
+        .expect("attach");
+    fire.store(1, Ordering::SeqCst);
+    tokio::time::timeout(BOUND, async {
+        while established(&account).len() < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovery");
+    assert!(
+        store
+            .get_change_cursor(&id, &absent)
+            .await
+            .expect("read")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_backfill(&id, &absent)
+            .await
+            .expect("read")
+            .is_none()
+    );
+    engine.detach(&id).await.expect("detach");
+}
+
+struct FlakyClearStore {
+    inner: InMemoryCheckpointStore,
+    fail: std::sync::atomic::AtomicBool,
+}
+impl CheckpointStore for FlakyClearStore {
+    fn clear_account_checkpoints<'a>(
+        &'a self,
+        account: &'a bifrost_types::AccountId,
+        ledger: bifrost_sync::cursor::DebtLedger,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), bifrost_sync::Error>> + Send + 'a>,
+    > {
+        if self.fail.load(Ordering::SeqCst) {
+            return Box::pin(async {
+                Err(bifrost_sync::Error::CheckpointStore("clear refused".into()))
+            });
+        }
+        self.inner.clear_account_checkpoints(account, ledger)
+    }
+
+    fn apply_transition<'a>(
+        &'a self,
+        account: &'a AccountId,
+        transition: bifrost_sync::CheckpointTransition,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), bifrost_sync::Error>> + Send + 'a>,
+    > {
+        self.inner.apply_transition(account, transition)
+    }
+
+    fn put_ledger<'a>(
+        &'a self,
+        account: &'a AccountId,
+        ledger: bifrost_sync::cursor::DebtLedger,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), bifrost_sync::Error>> + Send + 'a>,
+    > {
+        self.inner.put_ledger(account, ledger)
+    }
+
+    fn get_ledger<'a>(
+        &'a self,
+        account: &'a AccountId,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<bifrost_sync::cursor::DebtLedger, bifrost_sync::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        self.inner.get_ledger(account)
+    }
+
+    fn get_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<ChangeCursor>, bifrost_sync::Error>>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.inner.get_change_cursor(account, scope)
+    }
+
+    fn get_backfill<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<bifrost_types::BackfillCheckpoint>, bifrost_sync::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        self.inner.get_backfill(account, scope)
+    }
+
+    fn delete_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), bifrost_sync::Error>> + Send + 'a>,
+    > {
+        self.inner.delete_change_cursor(account, scope)
+    }
+
+    fn delete_backfill<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), bifrost_sync::Error>> + Send + 'a>,
+    > {
+        self.inner.delete_backfill(account, scope)
+    }
+}
+/// An account clear that fails through the whole retry budget pauses the
+/// account with `RetryBudgetExhausted` and parks the reset with the scopes it
+/// owes; once the store recovers and the account resumes, the parked reset
+/// re-runs and re-establishes them. Paused time: the writer attempts back off
+/// 1s then 2s, which under real time would be wall-clock sleeps.
+///
+/// Ablation: return `RecoveryFollowUp::None` on exhaustion (nothing is
+/// established after resume).
+#[tokio::test(start_paused = true)]
+async fn a_schema_reset_whose_clear_keeps_failing_pauses_and_owes_its_scopes() {
+    let id = AccountId("schema-clear-failure".into());
+    let store = Arc::new(FlakyClearStore {
+        inner: InMemoryCheckpointStore::new(),
+        fail: std::sync::atomic::AtomicBool::new(true),
+    });
+    let (account, fire) = failing_on_demand();
+    let account = Arc::new(account);
+    let engine = SyncEngine::builder()
+        .checkpoints(Arc::clone(&store) as Arc<dyn CheckpointStore>)
+        .build()
+        .expect("engine");
+    let control = engine
+        .attach(
+            id.clone(),
+            Arc::new(StubFactory::queue(vec![Arc::clone(&account)])),
+        )
+        .await
+        .expect("attach");
+    let mut events = engine.account_control_stream(&id).expect("control stream");
+    fire.store(1, Ordering::SeqCst);
+    tokio::time::timeout(BOUND, async {
+        loop {
+            if matches!(
+                events.recv().await.expect("control"),
+                bifrost_types::AccountControl::Pause(
+                    bifrost_types::PauseReason::RetryBudgetExhausted
+                )
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("pause");
+    assert_eq!(established(&account).len(), 2);
+    store.fail.store(false, Ordering::SeqCst);
+    control.resume();
+    tokio::time::timeout(BOUND, async {
+        while established(&account).len() < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovery");
+    for scope in [EMAIL, EVENTS] {
+        assert!(
+            store
+                .get_change_cursor(&id, &scope)
+                .await
+                .expect("read")
+                .is_some()
+        );
+    }
+    engine.detach(&id).await.expect("detach");
 }

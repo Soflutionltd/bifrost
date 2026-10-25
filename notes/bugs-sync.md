@@ -54,15 +54,3 @@ flag keeps the invalidation intent but cannot carry warning payloads,
 termination classifications or their ordering, so a bounded lossless ingress
 needs a control-event overflow policy or an API change. Reasoning is at both
 code sites and a test shows the semantic loss.
-
-## SYNC-015 - `handle_schema_incompatible` still resets only registered scopes
-
-**Needs a technical implementation specification** (owner, 2026-10-21): too
-consequential to resolve by ruling; it changes the consumer-implemented
-checkpoint store contract.
-
-Durable completion markers for scopes not in the registry survive the reset. A
-complete fix needs writer or store support for an account-wide reset or durable
-enumeration; the limitation is documented in the reference.
-
-
