@@ -605,11 +605,19 @@ impl ImapConnection {
                 timeout,
             )
             .await
-            .map_err(after_acknowledged_side_effect)?;
+            .map_err(|source| Error::MoveFallbackIncomplete {
+                copy: Box::new(copy_result.clone()),
+                stored_deleted: false,
+                source: Box::new(source),
+            })?;
             let (expunged, expunge_code) = self
                 .uid_expunge_with_code(sequence_set, timeout)
                 .await
-                .map_err(after_acknowledged_side_effect)?;
+                .map_err(|source| Error::MoveFallbackIncomplete {
+                    copy: Box::new(copy_result.clone()),
+                    stored_deleted: true,
+                    source: Box::new(source),
+                })?;
             // `code` mirrors the native path, where it is the MOVE's tagged
             // code: here the final UID EXPUNGE's tagged OK is that
             // counterpart (under QRESYNC, the source mailbox's new
@@ -763,26 +771,6 @@ impl ImapConnection {
             Some(tokio::time::Instant::now() + timeout),
         )
         .await
-    }
-}
-
-/// A step of a composite that runs after a non-idempotent step was
-/// acknowledged must not report the composite as unsent: the earlier side
-/// effect happened. In the UID MOVE fallback the COPY is that step, and a
-/// MOVE settled as unsent is retried, repeating the COPY and duplicating
-/// messages. Restamp evidence that reads `Unsent` (explicit, or absent on a
-/// variant that can carry it) as `InFlight`, so the operation is read back
-/// rather than replayed. Acknowledged evidence is left alone, and variants
-/// that cannot carry evidence (`StateChangedBeforeSend`, local refusals such
-/// as `MissingCapability`) pass through unchanged: `with_attempt` is a no-op
-/// for them. Those remaining cases need an aggregate partial-completion
-/// contract, which leaf transmission evidence cannot express.
-fn after_acknowledged_side_effect(error: Error) -> Error {
-    match error.attempt() {
-        None | Some(bifrost_types::TransmissionState::Unsent) => {
-            error.with_attempt(bifrost_types::TransmissionState::InFlight)
-        }
-        Some(_) => error,
     }
 }
 

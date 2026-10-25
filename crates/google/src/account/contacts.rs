@@ -4,6 +4,10 @@
 //! module; it was skipped as already test-dense. A later auditor should read
 //! it fresh rather than assuming that sweep covered it.
 
+use bifrost_types::{
+    Application, ErrorScope, PartialCommitBuilder, PrimaryLeg, StepEffect, StepReplay, StepTargets,
+    TargetRef, TargetRole,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -12,7 +16,7 @@ use bifrost_types::{
     AccessErrorKind, AccountError, AccountErrorKind, AccountFuture, AccountOperation, AddressBook,
     AddressBookId, ContactCard, ContactCorpus, ContactCreate, ContactEmail, ContactId,
     ContactOrganization, ContactPatch, ContactPhone, ContactProvenance, ContactSearchRequest,
-    DiagnosticText, DirectoryCard, Page, ProtocolKind,
+    DirectoryCard, Page, ProtocolKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -348,7 +352,7 @@ pub(crate) fn update(
             && let Err(error) = update_contact_photo(&client, &contact, photo).await
         {
             return Err(if fields_updated {
-                contact_fields_photo_error(error)
+                fields_then_photo_error(error, &contact)
             } else {
                 error
             });
@@ -394,18 +398,30 @@ async fn update_contact_photo(
     Ok(())
 }
 
-// The earlier field write landed, but recovery must still follow the photo
-// failure. Record the partial effect as diagnostic context, leaving the photo
-// request's classification and transmission evidence intact (in particular,
-// an earlier successful request cannot acknowledge a failed transport).
-fn contact_fields_photo_error(error: AccountError) -> AccountError {
+/// The field write landed, then the photo write failed. Both are `Repeatable`:
+/// an unversioned replay re-fetches source metadata and re-applies the same
+/// values, and versioned photo patches are refused before any I/O. The photo
+/// leaf keeps its classification and transmission evidence, so `recovery()`
+/// equals the photo leg's recovery.
+fn fields_then_photo_error(error: AccountError, contact: &ContactId) -> AccountError {
+    let targets = StepTargets::complete(vec![TargetRef::new(
+        TargetRole::Subject,
+        ErrorScope::Contact {
+            id: contact.clone(),
+        },
+    )]);
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
+        StepEffect::Updated,
+        targets.clone(),
+        StepReplay::Repeatable,
+        Application::from_leaf(&error),
+    ));
+    record.committed(StepEffect::Updated, targets, StepReplay::Repeatable);
     error
         .into_builder()
-        .text(DiagnosticText::support_only(
-            "contact fields were updated but the contact photo update failed",
-        ))
+        .partial_commit(record)
         .try_build()
-        .expect("valid decorated contact photo error")
+        .expect("valid contact photo record")
 }
 
 fn update_contact_photo_url(people_base: &str, encoded_resource_name: &str) -> String {
@@ -1799,12 +1815,9 @@ mod tests {
                 .iter()
                 .any(|text| text.contains("photo denied"))
         );
-        assert!(
-            error
-                .support_consented()
-                .support_text
-                .iter()
-                .any(|text| text.contains("contact fields were updated"))
+        assert_eq!(
+            error.partial_commit().unwrap().steps()[0].effect(),
+            Some(StepEffect::Updated)
         );
 
         let requests = script.requests();

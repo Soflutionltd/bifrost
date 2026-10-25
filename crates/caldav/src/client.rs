@@ -2229,10 +2229,8 @@ mod tests {
     ///
     /// The order is the recoverable one: a failed copy leaves the event exactly
     /// where it was, while a failed delete leaves it readable in two places.
-    /// The second is the one that needs the `Protocol(PartialResponse)` +
-    /// acknowledged `Attempt` verdict, because replaying the whole update
-    /// against a source that may already be gone is not the consumer's best
-    /// move - reconciling is.
+    /// The second keeps the failed DELETE's classification and records the
+    /// committed copy, protecting the operation from blindly repeating it.
     #[tokio::test]
     async fn a_move_without_server_move_support_copies_then_deletes() {
         use bifrost_types::account::Account as _;
@@ -2284,19 +2282,13 @@ mod tests {
             .await
             .expect_err("a failed cleanup is not a success");
 
-        assert!(
-            matches!(
-                error.kind(),
-                AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
-            ),
-            "a copied-but-not-removed event is a partial response: {error:?}"
+        assert!(matches!(error.kind(), AccountErrorKind::Server(_)));
+        let record = error.partial_commit().expect("committed copy");
+        assert_eq!(
+            record.steps()[0].effect(),
+            Some(bifrost_types::StepEffect::Copied)
         );
-        // The classification, not just the kind. `EventUpdate` is idempotent in
-        // the `AccountOperation` table, so `derive_protocol` answers
-        // `Retry(SameRequest)` for a `PartialResponse` unless the rebuilt error
-        // re-states the unreplayable declaration. That retry is the loop this
-        // asserts against: the re-issued update finds no MOVE, create-PUTs the
-        // destination it already occupied, takes a 412, refreshes, and repeats.
+        assert_eq!(record.plan().replay, bifrost_types::ReplaySafety::Never);
         assert!(
             matches!(
                 error.recovery(),

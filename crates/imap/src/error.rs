@@ -42,6 +42,13 @@ impl ImapAttempt {
 #[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum Error {
+    #[error("MOVE fallback incomplete after COPY: {source}")]
+    MoveFallbackIncomplete {
+        copy: Box<crate::types::CopyResult>,
+        stored_deleted: bool,
+        #[source]
+        source: Box<Error>,
+    },
     /// Underlying I/O error, including TLS transport errors (RFC 3501 Section 2.1).
     #[error("I/O error: {source}")]
     Io {
@@ -313,6 +320,18 @@ impl PartialEq for Error {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
+                Self::MoveFallbackIncomplete {
+                    copy: a,
+                    stored_deleted: ad,
+                    source: asrc,
+                },
+                Self::MoveFallbackIncomplete {
+                    copy: b,
+                    stored_deleted: bd,
+                    source: bsrc,
+                },
+            ) => a == b && ad == bd && asrc == bsrc,
+            (
                 Self::Io {
                     source: a,
                     attempt: a_att,
@@ -473,7 +492,10 @@ impl Error {
     /// exchange and the next byte on the wire begins a fresh response - so
     /// the connection stays reusable. A producer that could raise it with
     /// the exchange unfinished must use `Protocol` instead.
-    pub(crate) const fn is_connection_fatal(&self) -> bool {
+    pub(crate) fn is_connection_fatal(&self) -> bool {
+        if let Self::MoveFallbackIncomplete { source, .. } = self {
+            return source.is_connection_fatal();
+        }
         matches!(
             self,
             Self::Io { .. }
@@ -560,6 +582,15 @@ impl Error {
     pub(crate) fn with_attempt(self, state: TransmissionState) -> Self {
         let attempt = Some(ImapAttempt::new(state));
         match self {
+            Self::MoveFallbackIncomplete {
+                copy,
+                stored_deleted,
+                source,
+            } => Self::MoveFallbackIncomplete {
+                copy,
+                stored_deleted,
+                source: Box::new(source.with_attempt(state)),
+            },
             Self::Auth {
                 text,
                 code,
@@ -602,6 +633,7 @@ impl Error {
     /// Read out attempt evidence, if any.
     pub(crate) fn attempt(&self) -> Option<TransmissionState> {
         match self {
+            Self::MoveFallbackIncomplete { source, .. } => source.attempt(),
             Self::Auth { attempt, .. }
             | Self::Io { attempt, .. }
             | Self::Timeout { attempt }
@@ -684,6 +716,7 @@ impl Error {
     /// Response code carried by a server status error, if any.
     pub(crate) fn response_code(&self) -> Option<&ResponseCode> {
         match self {
+            Self::MoveFallbackIncomplete { source, .. } => source.response_code(),
             Self::Auth { code, .. }
             | Self::No { code, .. }
             | Self::Bad { code, .. }

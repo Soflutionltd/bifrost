@@ -4,6 +4,10 @@ use bifrost_dav_core::{
     inventory_entry as inventory_entry_from_snapshot, object_change, preserve_unobserved_entries,
     same_dav_url, slice_after_watermark, sorted_candidate_hrefs, worse_recovery,
 };
+use bifrost_types::{
+    Application, PartialCommitBuilder, PrimaryLeg, StepEffect, StepReplay, StepTargets, TargetRef,
+    TargetRole,
+};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -209,11 +213,8 @@ impl CalDavAccount {
     /// WebDAV `MOVE` is the atomic form and is tried first. A server that does
     /// not implement it (405/501) falls back to PUT-to-new then
     /// DELETE-from-old, which is NOT atomic: a failure after the PUT leaves the
-    /// event in both collections. That second-leg failure is wrapped
-    /// `Protocol(PartialResponse)` with an acknowledged `Attempt`, the same
-    /// treatment `event_rsvp` gives its own non-atomic sequence, so a consumer
-    /// can tell "not moved" from "copied but not cleaned up" and reconciles
-    /// rather than blindly replaying a write that already landed.
+    /// event in both collections. Typed progress preserves that copy without
+    /// changing the failed leg's classification or transmission evidence.
     ///
     /// The destination keeps the resource's own file name, so a collection that
     /// already holds that name refuses the move (`Overwrite: F`) rather than
@@ -224,11 +225,12 @@ impl CalDavAccount {
         target_calendar: &str,
         body: String,
         content_changed: bool,
-    ) -> Result<(), AccountError> {
+    ) -> Result<(), RelocateFailure> {
         let destination = append_path(target_calendar, &resource_file_name(source_url));
         if client
             .move_resource(source_url, &destination, AccountOperation::EventUpdate)
-            .await?
+            .await
+            .map_err(RelocateFailure::Before)?
         {
             if !content_changed {
                 return Ok(());
@@ -244,9 +246,7 @@ impl CalDavAccount {
                 )
                 .await
                 .map(|_| ())
-                .map_err(|error| {
-                    partial_move_error(&error, "event moved but the field patch failed")
-                });
+                .map_err(|error| RelocateFailure::MovedThenPut { destination, error });
         }
         // No MOVE support: copy first, then remove the original. Ordered this
         // way round because a failed copy leaves the event exactly where it
@@ -259,15 +259,15 @@ impl CalDavAccount {
                 PutCondition::IfNoneMatch,
                 AccountOperation::EventUpdate,
             )
-            .await?;
+            .await
+            .map_err(RelocateFailure::Before)?;
         client
             .delete_event(source_url, AccountOperation::EventUpdate)
             .await
-            .map_err(|error| {
-                partial_move_error(
-                    &error,
-                    "event copied to the destination calendar but the original could not be removed",
-                )
+            .map_err(|error| RelocateFailure::CopiedThenDelete {
+                destination,
+                source: source_url.to_owned(),
+                error,
             })
     }
 
@@ -1172,7 +1172,9 @@ impl Account for CalDavAccount {
             // own; a move-only patch does not, and must not be charged a
             // partial-failure verdict for a leg it never needed.
             let content_changed = patch_changes_content(&patch);
-            Self::relocate_event(&client, &url, &target_calendar, body, content_changed).await
+            Self::relocate_event(&client, &url, &target_calendar, body, content_changed)
+                .await
+                .map_err(|failure| relocation_error(failure, &url))
         })
     }
 
@@ -1254,14 +1256,22 @@ impl Account for CalDavAccount {
                 .post_schedule_reply(&schedule_outbox_url, &rsvp_email, &organizer_email, reply)
                 .await?;
             // Everything from here on runs after the organizer has already
-            // been told. Local encoding failures are as much a second-leg
-            // failure as a refused PUT, so they take the same wrapping
-            // rather than reporting a bare `unsupported`.
+            // been told. Every failure from here on carries the committed
+            // reply: a local encoding failure as an effectless leg, a failed
+            // PUT as the update leg.
             let patch = rsvp_patch(&current, status, &rsvp_email).map_err(|_| {
-                rsvp_local_write_error(unsupported_error(AccountOperation::EventRsvp))
+                rsvp_error(
+                    unsupported_error(AccountOperation::EventRsvp),
+                    &event,
+                    false,
+                )
             })?;
             let body = patch_to_ical(&current, &patch).map_err(|error| {
-                rsvp_local_write_error(patch_error(AccountOperation::EventRsvp, error))
+                rsvp_error(
+                    patch_error(AccountOperation::EventRsvp, error),
+                    &event,
+                    false,
+                )
             })?;
             let url = client.resolve_url(&event.0);
             client
@@ -1272,7 +1282,7 @@ impl Account for CalDavAccount {
                     AccountOperation::EventRsvp,
                 )
                 .await
-                .map_err(rsvp_local_write_error)?;
+                .map_err(|error| rsvp_error(error, &event, true))?;
             Ok(())
         })
     }
@@ -1558,26 +1568,37 @@ fn write_error(operation: AccountOperation, error: WriteError) -> AccountError {
     crate::client::local_error(operation, format!("event {} {}", error.field, error.reason))
 }
 
-/// The scheduling POST completed before the local PUT began. Preserve that
-/// acknowledged first-leg evidence on any second-leg failure so callers know
-/// the organizer may already have acted on the reply.
+/// Attach the accepted scheduling reply to a failure after the outbox POST.
 ///
-/// Accepted, not a defect: RSVP is non-atomic BY NATURE - iTIP delivers the
-/// reply to the organizer through the scheduling outbox, and the attendee's own
-/// copy of the event is a separate resource that only a second write can
-/// update. There is no transaction spanning the two and no compensating action
-/// (un-sending an iTIP reply is not a thing). So EVERY failure path after the
-/// outbox POST is funnelled through here, including the purely local encoding
-/// steps between the POST and the PUT, and comes out
-/// `Protocol(PartialResponse)` with `TransmissionState::Acknowledged`. A
-/// local-looking failure is classified as a partial success on purpose:
-/// what matters to the consumer is that the organizer already saw the reply.
-fn rsvp_local_write_error(error: AccountError) -> AccountError {
-    partial_sequence_error(
-        &error,
-        AccountOperation::EventRsvp,
-        "schedule reply was accepted but the local event update failed",
-    )
+/// RSVP is non-atomic by nature: iTIP delivers the reply to the organizer
+/// through the scheduling outbox, and the attendee's own copy is a separate
+/// resource only a second write can update. Nothing un-sends a reply, so the
+/// committed `Submitted` step is `Blocking` (a replay re-sends it) and no
+/// compensation exists. `write` is true for the PUT leg (an `Updated` primary
+/// whose application comes from its leaf) and false for the local encoding
+/// failures between POST and PUT (an effectless primary).
+fn rsvp_error(error: AccountError, event: &EventId, write: bool) -> AccountError {
+    let targets = StepTargets::complete(vec![TargetRef::new(
+        TargetRole::Subject,
+        ErrorScope::Event { id: event.clone() },
+    )]);
+    let primary = if write {
+        PrimaryLeg::new(
+            StepEffect::Updated,
+            targets.clone(),
+            StepReplay::Repeatable,
+            Application::from_leaf(&error),
+        )
+    } else {
+        PrimaryLeg::effectless(targets.clone())
+    };
+    let mut record = PartialCommitBuilder::new(primary);
+    record.committed(StepEffect::Submitted, targets, StepReplay::Blocking);
+    error
+        .into_builder()
+        .partial_commit(record)
+        .try_build()
+        .expect("valid scheduling record")
 }
 
 /// Whether the patch changes anything other than which collection the event
@@ -1601,56 +1622,71 @@ fn patch_changes_content(patch: &EventPatch) -> bool {
     content != EventPatch::default()
 }
 
-/// Reclassify the failure of a later leg of a non-atomic sequence whose
-/// earlier leg already landed on the server.
-///
-/// `Protocol(PartialResponse)` plus an acknowledged `Attempt` is what tells a
-/// consumer the request was half-applied rather than refused, so it reconciles
-/// instead of replaying a write that already took effect. The original cause
-/// chain rides along as secondary evidence.
-///
-/// This override describes the whole sequence, not HTTP method semantics.
-/// Feeding `AccountOperation::EventUpdate` into net cannot replace it: the
-/// sequence has already changed the source identity before this failure.
-///
-/// The unreplayable declaration must be RE-STATED here. `dispatch_once` stamps
-/// `idempotency_override(false)` on the leg's own failure, but this is a FRESH
-/// `AccountErrorBuilder`, and an override is not part of the cause chain that
-/// gets copied across - so without the restatement `derive_protocol` falls back
-/// to the `AccountOperation` table, which calls `EventUpdate` idempotent, and
-/// answers `Retry(SameRequest)` for a sequence that is half applied. The
-/// declaration must survive the wire, the classification, and any rebuild.
-/// It holds for every caller regardless of what the table says: a sequence whose
-/// earlier leg landed cannot be replayed from the top, because the replay
-/// re-runs that leg against state it already changed.
-fn partial_sequence_error(
-    error: &AccountError,
-    operation: AccountOperation,
-    detail: &'static str,
-) -> AccountError {
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::CalDav,
-            detail: Some(DiagnosticText::support_only(detail)),
-        }),
-    )
-    .protocol(Protocol::CalDav)
-    .operation(operation)
-    .idempotency_override(false)
-    .push_cause(Cause::Attempt(AttemptCause::new(
-        TransmissionState::Acknowledged,
-    )));
-    for cause in error.chain().iter() {
-        builder = builder.push_cause(cause.clone());
-    }
-    builder
-        .try_build()
-        .expect("valid partial-response classification")
+enum RelocateFailure {
+    Before(AccountError),
+    MovedThenPut {
+        destination: String,
+        error: AccountError,
+    },
+    CopiedThenDelete {
+        destination: String,
+        source: String,
+        error: AccountError,
+    },
 }
-
-fn partial_move_error(error: &AccountError, detail: &'static str) -> AccountError {
-    partial_sequence_error(error, AccountOperation::EventUpdate, detail)
+fn relocation_error(failure: RelocateFailure, original: &str) -> AccountError {
+    let (error, source, destination, committed, effect, subject) = match failure {
+        RelocateFailure::Before(error) => return error,
+        RelocateFailure::MovedThenPut { destination, error } => {
+            let subject = destination.clone();
+            (
+                error,
+                original.to_owned(),
+                destination,
+                StepEffect::Moved,
+                StepEffect::Updated,
+                subject,
+            )
+        }
+        RelocateFailure::CopiedThenDelete {
+            destination,
+            source,
+            error,
+        } => {
+            let subject = source.clone();
+            (
+                error,
+                source,
+                destination,
+                StepEffect::Copied,
+                StepEffect::Deleted,
+                subject,
+            )
+        }
+    };
+    let scope = |id: &str| ErrorScope::Event {
+        id: EventId(id.to_owned()),
+    };
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
+        effect,
+        StepTargets::complete(vec![TargetRef::new(TargetRole::Subject, scope(&subject))]),
+        StepReplay::Repeatable,
+        Application::from_leaf(&error),
+    ));
+    record.committed(
+        committed,
+        StepTargets::complete(vec![
+            TargetRef::new(TargetRole::Source, scope(&source)),
+            TargetRef::new(TargetRole::Destination, scope(&destination)),
+        ]),
+        StepReplay::Blocking,
+    );
+    error
+        .into_builder()
+        .scope(scope(&subject))
+        .partial_commit(record)
+        .try_build()
+        .expect("valid relocation record")
 }
 
 /// The last path segment of a resource URL - the name the resource keeps when
@@ -3539,18 +3575,16 @@ mod tests {
     #[test]
     fn rsvp_second_leg_error_records_acknowledged_first_leg() {
         let error = crate::client::transport_error(AccountOperation::EventRsvp, "put failed");
-        let decorated = rsvp_local_write_error(error);
-
-        assert!(decorated.chain().iter().any(|cause| matches!(
-            cause,
-            Cause::Attempt(attempt)
-                if attempt.transmission_state == TransmissionState::Acknowledged
-        )));
-        assert!(matches!(
-            decorated.recovery(),
-            RecoveryClass::Reconcile(advice)
-                if advice.reason == ReconcileReason::PartialCompletionSignal
-        ));
+        let expected = error.leg_recovery().clone();
+        let decorated = rsvp_error(error, &EventId("event".into()), true);
+        assert_eq!(decorated.leg_recovery(), &expected);
+        assert_eq!(
+            decorated.partial_commit().unwrap().steps()[0].effect(),
+            Some(StepEffect::Submitted)
+        );
+        assert!(
+            matches!(decorated.recovery(), RecoveryClass::Reconcile(advice) if advice.reason == ReconcileReason::PartialCommit)
+        );
     }
 
     /// A patch that cannot be spliced is classified by cause. Every cause was
@@ -4604,6 +4638,108 @@ mod tests {
                 .map(|entry| entry.uri.as_str())
                 .collect::<Vec<_>>(),
             vec!["https://dav.example.test/cal/unlabelled.ics"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod partial_commit_tests {
+    use super::*;
+    use bifrost_types::{ReconcileAction, RecoveryClass, RetryHint, ServerCause, ServerErrorKind};
+    fn throttled() -> AccountError {
+        AccountErrorBuilder::new(
+            AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            Cause::Server(ServerCause::RateLimited {
+                retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(37))),
+            }),
+        )
+        .try_build()
+        .unwrap()
+    }
+    #[test]
+    fn partial_commit_moved_then_put_refused() {
+        let leaf = unsupported_error(AccountOperation::EventUpdate);
+        let error = relocation_error(
+            RelocateFailure::MovedThenPut {
+                destination: "destination".into(),
+                error: leaf.clone(),
+            },
+            "source",
+        );
+        assert_eq!(error.recovery(), leaf.recovery());
+        let record = error.partial_commit().unwrap();
+        assert_eq!(record.steps()[0].effect(), Some(StepEffect::Moved));
+        assert_eq!(
+            record.primary().targets.refs[0].scope,
+            ErrorScope::Event {
+                id: EventId("destination".into())
+            }
+        );
+    }
+    #[test]
+    fn partial_commit_copied_then_delete_throttled() {
+        let leaf = throttled();
+        let expected = leaf.recovery().clone();
+        let error = relocation_error(
+            RelocateFailure::CopiedThenDelete {
+                destination: "destination".into(),
+                source: "source".into(),
+                error: leaf,
+            },
+            "source",
+        );
+        assert_eq!(error.leg_recovery(), &expected);
+        let RecoveryClass::Reconcile(advice) = error.recovery() else {
+            panic!("protected copy")
+        };
+        assert_eq!(
+            advice.guidance.actions,
+            [ReconcileAction::CheckTarget, ReconcileAction::ObserveOnly]
+        );
+        assert_eq!(
+            advice.retry_hint,
+            Some(RetryHint::After(std::time::Duration::from_secs(37)))
+        );
+        assert_eq!(
+            error.partial_commit().unwrap().steps()[0].effect(),
+            Some(StepEffect::Copied)
+        );
+    }
+}
+
+#[cfg(test)]
+mod partial_commit_rsvp_tests {
+    use super::*;
+    #[test]
+    fn partial_commit_rsvp_local_refusal_after_post_is_terminal_with_record() {
+        let leaf = unsupported_error(AccountOperation::EventRsvp);
+        let error = rsvp_error(leaf.clone(), &EventId("event".into()), false);
+        assert_eq!(error.recovery(), leaf.recovery());
+        assert_eq!(
+            error.partial_commit().unwrap().primary().application,
+            Application::NotApplicable
+        );
+        assert_eq!(
+            error.partial_commit().unwrap().steps()[0].effect(),
+            Some(StepEffect::Submitted)
+        );
+    }
+    #[test]
+    fn partial_commit_rsvp_put_drop_reconciles() {
+        let leaf = crate::client::transport_error(AccountOperation::EventRsvp, "put failed");
+        let expected = leaf.leg_recovery().clone();
+        let error = rsvp_error(leaf, &EventId("event".into()), true);
+        assert_eq!(error.leg_recovery(), &expected);
+        let bifrost_types::RecoveryClass::Reconcile(advice) = error.recovery() else {
+            panic!("protected reply")
+        };
+        assert_eq!(
+            advice.guidance.actions,
+            [
+                bifrost_types::ReconcileAction::CheckTarget,
+                bifrost_types::ReconcileAction::DedupeByClientId,
+                bifrost_types::ReconcileAction::ObserveOnly
+            ]
         );
     }
 }

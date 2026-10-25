@@ -389,6 +389,7 @@ fn all_variants_are_distinguishable() {
 
     for err in &errors {
         let label = match err {
+            Error::MoveFallbackIncomplete { .. } => "movefallback",
             Error::Io { .. } => "io",
             Error::Auth { .. } => "auth",
             Error::No { .. } => "no",

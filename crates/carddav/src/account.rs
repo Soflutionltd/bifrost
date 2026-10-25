@@ -4,6 +4,10 @@ use bifrost_dav_core::{
     inventory_entry as inventory_entry_from_snapshot, preserve_unobserved_entries, same_dav_url,
     slice_after_watermark, sorted_candidate_hrefs, worse_recovery,
 };
+use bifrost_types::{
+    Application, PartialCommitBuilder, PrimaryLeg, StepEffect, StepReplay, StepTargets, TargetRef,
+    TargetRole,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -11,9 +15,9 @@ use std::time::Instant;
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountFuture, AccountId, AccountOperation, AccountStream, AddressBook, AddressBookId,
-    AttachmentHandle, AttemptCause, BlobHandle, ByteRange, Calendar, CalendarEvent, Cause, Change,
-    ChangeCursor, Checkpoint, CloudUploadMeta, ContactCard, ContactCorpus, ContactCreate,
-    ContactId, ContactPatch, ContactProvenance, ContactSearchRequest, ContainerId, ContainerKind,
+    AttachmentHandle, BlobHandle, ByteRange, Calendar, CalendarEvent, Cause, Change, ChangeCursor,
+    Checkpoint, CloudUploadMeta, ContactCard, ContactCorpus, ContactCreate, ContactId,
+    ContactPatch, ContactProvenance, ContactSearchRequest, ContainerId, ContainerKind,
     ContainerList, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DiagnosticText,
     DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
     ErrorScope, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
@@ -21,10 +25,10 @@ use bifrost_types::{
     IdentityId, IdentityPatch, Importance, InternalCause, InternalErrorKind, InventoryEvent,
     InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope, Message,
     MutationSuccess, MutationTarget, ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary,
-    Priority, Protocol, ProtocolErrorKind, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest,
-    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SkippedScope,
-    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, TransmissionState,
-    VacationConfig, WatchEvent, WireCause,
+    Priority, Protocol, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendRequest,
+    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SkippedScope,
+    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
+    WatchEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -288,19 +292,19 @@ impl CardDavAccount {
     /// Twin of `bifrost-caldav`'s `relocate_event`; keep them in step. WebDAV
     /// `MOVE` is the atomic form and is tried first; a server that does not
     /// implement it falls back to PUT-to-new then DELETE-from-old, which is not
-    /// atomic, so a failure of the delete leg is wrapped
-    /// `Protocol(PartialResponse)` with an acknowledged `Attempt`.
+    /// atomic. Typed progress preserves the committed copy and failing leg.
     async fn relocate_contact(
         client: &CardDavClient,
         source_url: &str,
         target_addressbook: &str,
         data: String,
         content_changed: bool,
-    ) -> Result<(), AccountError> {
+    ) -> Result<(), RelocateFailure> {
         let destination = append_path(target_addressbook, &resource_file_name(source_url));
         if client
             .move_resource(source_url, &destination, AccountOperation::ContactUpdate)
-            .await?
+            .await
+            .map_err(RelocateFailure::Before)?
         {
             if !content_changed {
                 return Ok(());
@@ -316,9 +320,7 @@ impl CardDavAccount {
                 )
                 .await
                 .map(|_| ())
-                .map_err(|error| {
-                    partial_move_error(&error, "contact moved but the field patch failed")
-                });
+                .map_err(|error| RelocateFailure::MovedThenPut { destination, error });
         }
         // No MOVE support: copy first, then remove the original. A failed copy
         // leaves the contact exactly where it was; a failed delete leaves it
@@ -331,16 +333,16 @@ impl CardDavAccount {
                 AccountOperation::ContactUpdate,
             )
             .await
-            .map(|_| ())?;
+            .map(|_| ())
+            .map_err(RelocateFailure::Before)?;
         client
             .delete_vcard(source_url, AccountOperation::ContactUpdate)
             .await
             .map(|_| ())
-            .map_err(|error| {
-                partial_move_error(
-                    &error,
-                    "contact copied to the destination address book but the original could not be removed",
-                )
+            .map_err(|error| RelocateFailure::CopiedThenDelete {
+                destination,
+                source: source_url.to_owned(),
+                error,
             })
     }
 
@@ -1275,7 +1277,9 @@ impl Account for CardDavAccount {
             // own; a move-only patch does not, and must not be charged a
             // partial-failure verdict for a leg it never needed.
             let content_changed = patch_changes_content(&patch);
-            Self::relocate_contact(&client, &url, &target_addressbook, data, content_changed).await
+            Self::relocate_contact(&client, &url, &target_addressbook, data, content_changed)
+                .await
+                .map_err(|failure| relocation_error(failure, &url))
         })
     }
 
@@ -1599,45 +1603,71 @@ fn patch_changes_content(patch: &ContactPatch) -> bool {
     content != ContactPatch::default()
 }
 
-/// Reclassify the failure of a later leg of a non-atomic sequence whose
-/// earlier leg already landed on the server.
-///
-/// `Protocol(PartialResponse)` plus an acknowledged `Attempt` is what tells a
-/// consumer the request was half-applied rather than refused, so it reconciles
-/// instead of replaying a write that already took effect. Twin of
-/// `bifrost-caldav`'s `partial_sequence_error`.
-///
-/// This override describes the whole sequence, not HTTP method semantics.
-/// Feeding `AccountOperation::ContactUpdate` into net cannot replace it: the
-/// sequence has already changed the source identity before this failure.
-///
-/// The unreplayable declaration must be RE-STATED here. `dispatch_once` stamps
-/// `idempotency_override(false)` on the leg's own failure, but this is a FRESH
-/// `AccountErrorBuilder`, and an override is not part of the cause chain that
-/// gets copied across - so without the restatement `derive_protocol` falls back
-/// to the `AccountOperation` table, which calls `ContactUpdate` idempotent, and
-/// answers `Retry(SameRequest)` for a move that is half applied. The declaration
-/// must survive the wire, the classification, and any rebuild.
-fn partial_move_error(error: &AccountError, detail: &'static str) -> AccountError {
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::CardDav,
-            detail: Some(DiagnosticText::support_only(detail)),
-        }),
-    )
-    .protocol(Protocol::CardDav)
-    .operation(AccountOperation::ContactUpdate)
-    .idempotency_override(false)
-    .push_cause(Cause::Attempt(AttemptCause::new(
-        TransmissionState::Acknowledged,
-    )));
-    for cause in error.chain().iter() {
-        builder = builder.push_cause(cause.clone());
-    }
-    builder
+enum RelocateFailure {
+    Before(AccountError),
+    MovedThenPut {
+        destination: String,
+        error: AccountError,
+    },
+    CopiedThenDelete {
+        destination: String,
+        source: String,
+        error: AccountError,
+    },
+}
+fn relocation_error(failure: RelocateFailure, original: &str) -> AccountError {
+    let (error, source, destination, committed, effect, subject) = match failure {
+        RelocateFailure::Before(error) => return error,
+        RelocateFailure::MovedThenPut { destination, error } => {
+            let subject = destination.clone();
+            (
+                error,
+                original.to_owned(),
+                destination,
+                StepEffect::Moved,
+                StepEffect::Updated,
+                subject,
+            )
+        }
+        RelocateFailure::CopiedThenDelete {
+            destination,
+            source,
+            error,
+        } => {
+            let subject = source.clone();
+            (
+                error,
+                source,
+                destination,
+                StepEffect::Copied,
+                StepEffect::Deleted,
+                subject,
+            )
+        }
+    };
+    let scope = |id: &str| ErrorScope::Contact {
+        id: ContactId(id.to_owned()),
+    };
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
+        effect,
+        StepTargets::complete(vec![TargetRef::new(TargetRole::Subject, scope(&subject))]),
+        StepReplay::Repeatable,
+        Application::from_leaf(&error),
+    ));
+    record.committed(
+        committed,
+        StepTargets::complete(vec![
+            TargetRef::new(TargetRole::Source, scope(&source)),
+            TargetRef::new(TargetRole::Destination, scope(&destination)),
+        ]),
+        StepReplay::Blocking,
+    );
+    error
+        .into_builder()
+        .scope(scope(&subject))
+        .partial_commit(record)
         .try_build()
-        .expect("valid partial-response classification")
+        .expect("valid relocation record")
 }
 
 /// The last path segment of a resource URL - the name the resource keeps when
@@ -3655,3 +3685,68 @@ mod tests {
 #[cfg(test)]
 #[path = "directory_tests.rs"]
 mod directory_tests;
+
+#[cfg(test)]
+mod partial_commit_tests {
+    use super::*;
+    use bifrost_types::{ReconcileAction, RecoveryClass, RetryHint, ServerCause, ServerErrorKind};
+    fn throttled() -> AccountError {
+        AccountErrorBuilder::new(
+            AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            Cause::Server(ServerCause::RateLimited {
+                retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(37))),
+            }),
+        )
+        .try_build()
+        .unwrap()
+    }
+    #[test]
+    fn partial_commit_moved_then_put_refused() {
+        let leaf = unsupported_error(AccountOperation::ContactUpdate);
+        let error = relocation_error(
+            RelocateFailure::MovedThenPut {
+                destination: "destination".into(),
+                error: leaf.clone(),
+            },
+            "source",
+        );
+        assert_eq!(error.recovery(), leaf.recovery());
+        let record = error.partial_commit().unwrap();
+        assert_eq!(record.steps()[0].effect(), Some(StepEffect::Moved));
+        assert_eq!(
+            record.primary().targets.refs[0].scope,
+            ErrorScope::Contact {
+                id: ContactId("destination".into())
+            }
+        );
+    }
+    #[test]
+    fn partial_commit_copied_then_delete_throttled() {
+        let leaf = throttled();
+        let expected = leaf.recovery().clone();
+        let error = relocation_error(
+            RelocateFailure::CopiedThenDelete {
+                destination: "destination".into(),
+                source: "source".into(),
+                error: leaf,
+            },
+            "source",
+        );
+        assert_eq!(error.leg_recovery(), &expected);
+        let RecoveryClass::Reconcile(advice) = error.recovery() else {
+            panic!("protected copy")
+        };
+        assert_eq!(
+            advice.guidance.actions,
+            [ReconcileAction::CheckTarget, ReconcileAction::ObserveOnly]
+        );
+        assert_eq!(
+            advice.retry_hint,
+            Some(RetryHint::After(std::time::Duration::from_secs(37)))
+        );
+        assert_eq!(
+            error.partial_commit().unwrap().steps()[0].effect(),
+            Some(StepEffect::Copied)
+        );
+    }
+}

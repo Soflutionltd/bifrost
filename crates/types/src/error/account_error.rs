@@ -8,6 +8,7 @@ use super::diagnostic::{
     SupportExportMinimal, TelemetryToken, TelemetryView, account_kind_discriminant,
 };
 use super::kind::AccountErrorKind;
+use super::partial::{CompensationOutcome, PartialCommit, StepOutcome};
 use super::recovery::{
     ReconcileAction, ReconcileReason, RecoveryClass, RemediationAction, RetryDisposition,
     RetryReason, ThrottleBudget, ThrottleScope,
@@ -22,6 +23,8 @@ pub struct AccountError {
 
 #[derive(Clone, Debug)]
 struct AccountErrorInner {
+    partial_commit: Option<Arc<PartialCommit>>,
+    leg_recovery: RecoveryClass,
     kind: AccountErrorKind,
     recovery: RecoveryClass,
     remediation: Option<RemediationAction>,
@@ -56,6 +59,8 @@ impl AccountError {
     pub(crate) fn from_parts(parts: AccountErrorParts) -> Self {
         Self {
             inner: Arc::new(AccountErrorInner {
+                partial_commit: parts.partial_commit,
+                leg_recovery: parts.leg_recovery,
                 kind: parts.kind,
                 recovery: parts.recovery,
                 remediation: parts.remediation,
@@ -82,6 +87,44 @@ impl AccountError {
     #[must_use]
     pub fn throttle_budgets(&self) -> &[ThrottleBudget] {
         &self.inner.throttle_budgets
+    }
+
+    /// Historical effects of this operation, when it crossed a partial commit.
+    pub fn partial_commit(&self) -> Option<&PartialCommit> {
+        self.inner.partial_commit.as_deref()
+    }
+    /// Full recovery of the primary failed leg, not permission to replay the operation.
+    pub fn leg_recovery(&self) -> &RecoveryClass {
+        &self.inner.leg_recovery
+    }
+    pub(crate) fn classification_attempt(&self) -> Option<super::TransmissionState> {
+        self.inner
+            .chain
+            .iter()
+            .take(self.inner.classification_cause_count)
+            .find_map(|c| match c {
+                super::Cause::Attempt(a) => Some(a.transmission_state),
+                _ => None,
+            })
+    }
+    /// Each failure with its own recovery, scope and budgets, including cleanup.
+    pub fn throttle_observations(&self) -> Vec<(&AccountError, &RecoveryClass)> {
+        let mut observations = vec![(self, self.leg_recovery())];
+        if let Some(record) = self.partial_commit() {
+            for step in record.steps() {
+                if let StepOutcome::Failed { error, .. } = step.outcome() {
+                    observations.push((error, error.recovery()));
+                }
+            }
+            for c in record.compensations() {
+                if let CompensationOutcome::Failed(error)
+                | CompensationOutcome::Unconfirmed(error) = c.outcome()
+                {
+                    observations.push((error, error.recovery()));
+                }
+            }
+        }
+        observations
     }
 
     #[must_use]
@@ -159,6 +202,7 @@ impl AccountError {
             user_safe_text,
             support_text,
             scope: self.inner.scope.as_ref(),
+            partial_commit: self.partial_commit().map(PartialCommit::export),
         }
     }
 
@@ -166,6 +210,10 @@ impl AccountError {
     pub fn support_internal(&self) -> SupportExportInternal<'_> {
         SupportExportInternal {
             consented: self.support_consented(),
+            partial_commit_chains: self
+                .partial_commit()
+                .map(PartialCommit::chains)
+                .unwrap_or_default(),
             chain: self
                 .inner
                 .chain
@@ -201,6 +249,7 @@ impl AccountError {
         let mut causes = inner.chain.into_vec();
         let primary_cause = causes.remove(0);
         super::builder::AccountErrorBuilder::from_rebuild(super::builder::RebuildParts {
+            partial_commit: inner.partial_commit,
             kind: inner.kind,
             primary_cause,
             chain_extras: causes,
@@ -230,6 +279,8 @@ impl StdError for AccountError {
 }
 
 pub(crate) struct AccountErrorParts {
+    pub partial_commit: Option<Arc<PartialCommit>>,
+    pub leg_recovery: RecoveryClass,
     pub kind: AccountErrorKind,
     pub recovery: RecoveryClass,
     pub remediation: Option<RemediationAction>,
@@ -291,6 +342,9 @@ impl<'a> TelemetryView<'a> {
                 }
             }),
             operation: error.operation(),
+            partial_commit: error
+                .partial_commit()
+                .map(|r| r.telemetry(error.leg_recovery())),
         }
     }
 }
@@ -333,7 +387,7 @@ fn recovery_fields(recovery: &RecoveryClass) -> RecoveryFields<'_> {
     }
 }
 
-fn recovery_discriminant(recovery: &RecoveryClass) -> &'static str {
+pub(crate) fn recovery_discriminant(recovery: &RecoveryClass) -> &'static str {
     match recovery {
         RecoveryClass::Retry(_) => "retry",
         RecoveryClass::Reconcile(_) => "reconcile",
@@ -401,6 +455,7 @@ mod tests {
                 "message_key",
                 "native_code",
                 "operation",
+                "partial_commit",
                 "protocol",
                 "provider",
                 "reconcile_actions",

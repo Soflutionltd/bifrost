@@ -3313,7 +3313,9 @@ have produced one. Version 5 adds the Event error resource and scope for typed
 public-calendar reads. Versions 3 and 4 still decode, but reject the new Event
 tags as corruption; existing tags and layouts are unchanged. Version 6 adds
 `DirectoryGateway { url }` scope (tag 10), preserving versions 3 through 5
-without that tag and rejecting the tag in older-version rows.
+without that tag and rejecting the tag in older-version rows. Version 7 adds
+Submission, CloudFile and UploadSession scopes (tags 11, 12 and 13), rejected
+by older readers.
 
 Decode VALIDATES, never heals: a duplicated entry, barrier or lineage key,
 trailing bytes, a lineage that is not flat (a parent naming itself or an entry
@@ -3343,7 +3345,9 @@ bytes without leaking. So `last_error` and `BarrierIncident::evidence` persist
 as a digest - the exact classification (`AccountErrorKind`, `ErrorScope`,
 operation, provider, protocol) plus the whole `DiagnosticInfo` - rebuilt through
 `AccountErrorBuilder` with the canonical `Cause` its kind demands. Secondary
-cause payloads, `idempotency_override` and `throttle_scope` do not survive.
+cause payloads, `idempotency_override`, `throttle_scope` and the partial-commit
+record do not survive. Ledger errors are coverage/repair evidence, never write
+replay inputs; synthesized causes cannot validate a historical write record.
 
 That is affordable because no ledger predicate reads these fields.
 `blocks_completion`, `completion_permitted`, `repairable`, `lineage_root`,
@@ -3992,3 +3996,18 @@ ordinary read-back path.
 Caller-guarded targets are never reasserted. An explicit conflict in this
 contract means refusal of the caller's expected version; provider-observed
 conflicts on unversioned targets may refresh through read-back and reassert.
+
+## Partial-write observations in campaigns
+
+ObserveOnly reconcile guidance protects read-back from reassertion, even when
+the requested state is unsatisfied. Campaigns retain every item error carrying
+a partial-commit record in `MutationCounters::partial_commit_observations`,
+with its target id; stream terminations carry no target. These are append-only
+observations, not unique effects. Requested-state satisfaction never discharges
+residual side effects, and a later plain failure never removes earlier records.
+Per-leg throttle observation records primary, sibling and cleanup holds under
+each source's scope and budgets even when the operation recovery is terminal.
+The primary Failed-item hold can be recorded by classification and again by
+the batch observer; deadlines take the maximum, so this is harmless.
+Direct PIM writes forward the error: recovery() describes the operation,
+leg_recovery() the failing leg, and partial_commit() the historical effects.

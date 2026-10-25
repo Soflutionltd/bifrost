@@ -260,6 +260,7 @@ impl SyncEngine {
         }
         let mut outcomes = HashMap::new();
         let mut effects = HashMap::new();
+        let mut partial_commit_observations = Vec::new();
         let mut dedupe_count = 0;
         let mut forwarded_directives = HashSet::new();
         let mut first_error = None;
@@ -702,6 +703,21 @@ impl SyncEngine {
                 match event {
                     bifrost_types::SyncEvent::Batch(batch) => {
                         for item in batch.items {
+                            let observed = match &item {
+                                ItemOutcome::Failed(f) => Some((&f.item, &f.error)),
+                                ItemOutcome::Uncertain(u) => Some((&u.item, &u.error)),
+                                _ => None,
+                            };
+                            if let Some((id, error)) = observed
+                                && error.partial_commit().is_some()
+                            {
+                                partial_commit_observations.push(
+                                    crate::mutation::PartialCommitObservation {
+                                        target: Some(bifrost_types::ObjectId(id.0.clone())),
+                                        error: error.clone(),
+                                    },
+                                );
+                            }
                             if let ItemOutcome::Failed(failure) = &item {
                                 let id = bifrost_types::ObjectId(failure.item.0.clone());
                                 if expected_versions.contains_key(&id)
@@ -763,6 +779,8 @@ impl SyncEngine {
                                 blocked_by_engine = true;
                             }
                             if let Some(error) = error {
+                                // Classification also records the primary hold; max deadlines make
+                                // that duplicate harmless. This call observes siblings and cleanup too.
                                 record_error_throttle(&slot.throttles, account_id, &error);
                                 let delay = if matches!(
                                     outcomes.get(&item_id),
@@ -802,6 +820,15 @@ impl SyncEngine {
                     }
                     bifrost_types::SyncEvent::Terminated(err) => {
                         let original = err.clone();
+                        if original.partial_commit().is_some() {
+                            partial_commit_observations.push(
+                                crate::mutation::PartialCommitObservation {
+                                    target: None,
+                                    error: original.clone(),
+                                },
+                            );
+                        }
+                        record_error_throttle(&slot.throttles, account_id, &original);
                         match plan_recovery(err) {
                             RecoveryPlan::Retry(advice) => {
                                 if matches!(
@@ -849,24 +876,10 @@ impl SyncEngine {
                                             ),
                                     );
                                 }
-                                // Share the throttle deadline before the
-                                // next attempt sleeps it off locally.
-                                crate::recovery::record_throttle(
-                                    &slot.throttles,
-                                    account_id,
-                                    &advice,
-                                    &original,
-                                );
                                 stream_termination_advice = Some(advice);
                                 break;
                             }
                             RecoveryPlan::Reconcile(advice) => {
-                                crate::recovery::record_reconcile_throttle(
-                                    &slot.throttles,
-                                    account_id,
-                                    &advice,
-                                    &original,
-                                );
                                 reconcile_at = reconcile_at.max(
                                     tokio::time::Instant::now()
                                         + crate::recovery::reconcile_delay(
@@ -1050,6 +1063,7 @@ impl SyncEngine {
         let mut totals = counters_from_outcomes(&outcomes);
         totals.error = first_error.or(caller_conflict).map(Arc::new);
         totals.effects = effects.into_iter().collect();
+        totals.partial_commit_observations = partial_commit_observations;
         totals.dedupe_by_client_id = dedupe_count;
         Ok(totals)
     }
@@ -1219,15 +1233,16 @@ fn record_error_throttle(
     account_id: &AccountId,
     error: &AccountError,
 ) {
-    match error.recovery() {
-        bifrost_types::RecoveryClass::Retry(advice) => {
-            crate::recovery::record_throttle(throttles, account_id, advice, error);
+    for (source, recovery) in error.throttle_observations() {
+        match recovery {
+            bifrost_types::RecoveryClass::Retry(advice) => {
+                crate::recovery::record_throttle(throttles, account_id, advice, source);
+            }
+            bifrost_types::RecoveryClass::Reconcile(advice) => {
+                crate::recovery::record_reconcile_throttle(throttles, account_id, advice, source);
+            }
+            _ => {}
         }
-        bifrost_types::RecoveryClass::Reconcile(advice) => {
-            crate::recovery::record_reconcile_throttle(throttles, account_id, advice, error);
-        }
-        // Engine directives and terminal classes carry no throttle hold.
-        _ => {}
     }
 }
 
@@ -1242,7 +1257,7 @@ pub(super) enum ReadbackOrigin {
 }
 
 /// Reassertable iff every reconcile action is `CheckTarget`: any other action
-/// (today `DedupeByClientId`) is consumer guidance that dominates the origin.
+/// (including `DedupeByClientId` and `ObserveOnly`) protects the origin.
 fn reconcile_origin(advice: &bifrost_types::ReconcileAdvice) -> ReadbackOrigin {
     if advice
         .guidance
@@ -1912,5 +1927,93 @@ mod campaign_tests {
             Some(Error::ShuttingDown)
         ));
         engine.detach(&id).await.expect("detach");
+    }
+}
+
+#[cfg(test)]
+mod partial_commit_throttle_tests {
+    use super::*;
+    use bifrost_types::{
+        AccountErrorBuilder, AccountErrorKind, Application, Cause, CompensationOutcome, ErrorScope,
+        MailboxId, PartialCommitBuilder, PrimaryLeg, RetryHint, ServerCause, ServerErrorKind,
+        StepEffect, StepReplay, StepTargets, ThrottleBudget, ThrottleKey, ThrottleScope,
+    };
+    fn throttle(mailbox: &str, seconds: u64, budget: Option<&str>) -> AccountError {
+        let mut builder = AccountErrorBuilder::new(
+            AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            Cause::Server(ServerCause::RateLimited {
+                retry_hint: Some(RetryHint::After(Duration::from_secs(seconds))),
+            }),
+        )
+        .scope(ErrorScope::Mailbox {
+            id: MailboxId(mailbox.into()),
+        })
+        .throttle_scope(ThrottleScope::Mailbox);
+        if let Some(budget) = budget {
+            builder = builder.throttle_budget(ThrottleBudget::new(budget));
+        }
+        builder.try_build().unwrap()
+    }
+    #[tokio::test(start_paused = true)]
+    async fn record_error_throttle_holds_each_leg_under_its_own_scope() {
+        let mut record = PartialCommitBuilder::new(PrimaryLeg::effectless(StepTargets::unknown()));
+        let id = record.committed(
+            StepEffect::Created,
+            StepTargets::unknown(),
+            StepReplay::Repeatable,
+        );
+        let sibling = throttle("A", 37, None);
+        record.failed_sibling(
+            Some(StepEffect::Updated),
+            StepTargets::unknown(),
+            StepReplay::Repeatable,
+            Application::from_leaf(&sibling),
+            sibling,
+        );
+        record.compensation(
+            StepEffect::Deleted,
+            StepTargets::unknown(),
+            vec![id],
+            CompensationOutcome::Unconfirmed(throttle("B", 53, Some("cleanup"))),
+        );
+        let error = AccountError::unsupported(
+            bifrost_types::AccountOperation::Send,
+            bifrost_types::Protocol::Graph,
+        )
+        .into_builder()
+        .partial_commit(record)
+        .try_build()
+        .unwrap();
+        assert!(error.recovery().is_terminal());
+        let bucket = std::sync::Mutex::new(crate::recovery::ThrottleBucket::default());
+        let account = AccountId("account".into());
+        record_error_throttle(&bucket, &account, &error);
+        let bucket = bucket.lock().unwrap();
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            bucket.wait_for(
+                &ThrottleKey::Mailbox {
+                    account: account.clone(),
+                    mailbox: MailboxId("A".into())
+                },
+                now
+            ),
+            Some(Duration::from_secs(37))
+        );
+        assert_eq!(
+            bucket.wait_for(&ThrottleKey::Budget(ThrottleBudget::new("cleanup")), now),
+            Some(Duration::from_secs(53))
+        );
+        assert_eq!(
+            bucket.wait_for(
+                &ThrottleKey::Mailbox {
+                    account: account.clone(),
+                    mailbox: MailboxId("B".into())
+                },
+                now
+            ),
+            None
+        );
+        assert_eq!(bucket.wait_for_account(&account, now), None);
     }
 }

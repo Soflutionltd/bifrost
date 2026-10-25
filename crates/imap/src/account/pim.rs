@@ -8,6 +8,10 @@
 //! absence of reading, not evidence of correctness. Noted so a later auditor
 //! knows where coverage stops.
 
+use bifrost_types::{
+    Application, ErrorScope, PartialCommitBuilder, PrimaryLeg, StepEffect, StepReplay, StepTargets,
+    TargetRef, TargetRole,
+};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -88,25 +92,133 @@ const DRAFT_FETCH_BUDGET: usize = 64 * 1024 * 1024;
 /// A preview fetch needs enough source to reach past MIME framing in ordinary mail.
 pub(crate) const PREVIEW_FETCH_BYTES: u64 = 64 * 1024;
 
+/// One per-folder effect a direct PIM write committed.
+struct FolderEffect {
+    folder: MailboxName,
+    uids: Vec<u32>,
+    uidvalidity: u32,
+    effect: StepEffect,
+    destination: Option<MailboxName>,
+}
+/// Typed progress of the per-folder helpers (`copy_messages`,
+/// `delete_messages`, `set_flag`) and the inner forms of the composed
+/// operations. Never a record: each public operation attaches exactly once,
+/// through `folder_progress_error`. `stage` is the write leg in flight when
+/// `error` happened (`None` for a preflight or local refusal, which is an
+/// effectless primary); folders never attempted appear nowhere.
+struct FolderProgress {
+    done: Vec<FolderEffect>,
+    error: AccountError,
+    stage: Option<StepEffect>,
+    targets: StepTargets,
+}
+impl From<AccountError> for FolderProgress {
+    fn from(error: AccountError) -> Self {
+        Self {
+            done: Vec::new(),
+            error,
+            stage: None,
+            targets: StepTargets::unknown(),
+        }
+    }
+}
+fn folder_effect_targets(effect: &FolderEffect) -> StepTargets {
+    let mut refs: Vec<_> = effect
+        .uids
+        .iter()
+        .map(|uid| {
+            TargetRef::new(
+                if effect.destination.is_some() {
+                    TargetRole::Source
+                } else {
+                    TargetRole::Subject
+                },
+                ErrorScope::Message {
+                    id: encode_object_id(&effect.folder, effect.uidvalidity, *uid),
+                },
+            )
+        })
+        .collect();
+    if let Some(destination) = &effect.destination {
+        refs.push(TargetRef::new(
+            TargetRole::Destination,
+            ErrorScope::Cursor(super::folder_scope(destination)),
+        ));
+        StepTargets::at_least(refs)
+    } else {
+        StepTargets::complete(refs)
+    }
+}
+fn folder_progress_error(progress: FolderProgress) -> AccountError {
+    let FolderProgress {
+        done,
+        error,
+        stage,
+        targets,
+    } = progress;
+    // Nothing committed: only an uncertain write leg is worth a record (it
+    // may have applied); a refusal or an effectless preflight failure is the
+    // plain leaf.
+    if done.is_empty()
+        && (stage.is_none() || Application::from_leaf(&error) != Application::Uncertain)
+    {
+        return error;
+    }
+    let primary = stage.map_or_else(
+        || PrimaryLeg::effectless(targets.clone()),
+        |effect| {
+            PrimaryLeg::new(
+                effect,
+                targets.clone(),
+                folder_replay(effect),
+                Application::from_leaf(&error),
+            )
+        },
+    );
+    let mut record = PartialCommitBuilder::new(primary);
+    for effect in done {
+        record.committed(
+            effect.effect,
+            folder_effect_targets(&effect),
+            folder_replay(effect.effect),
+        );
+    }
+    super::mutate::finish_partial(error, record)
+}
+/// Replay judgment for a direct PIM folder effect: a replayed COPY makes a
+/// second copy at the destination (`Blocking`); STORE on an expunged UID,
+/// UID EXPUNGE of absent UIDs and re-applied flags are no-ops (`Repeatable`).
+fn folder_replay(effect: StepEffect) -> StepReplay {
+    if effect == StepEffect::Copied {
+        StepReplay::Blocking
+    } else {
+        StepReplay::Repeatable
+    }
+}
+
 pub(crate) fn add_to_container(
     account: ImapAccount,
     target: MutationTarget,
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        if !account.capabilities.pim_methods.add_to_container {
-            return Err(super::error::unsupported(AccountOperation::AddToContainer));
-        }
-        let destination = folder_from_container(&container, AccountOperation::AddToContainer)?;
-        let ids = decoded_targets(&target, AccountOperation::AddToContainer)?;
-        copy_messages(
-            &account,
-            ids,
-            &destination,
-            AccountOperation::AddToContainer,
-        )
-        .await
+        add_to_container_inner(&account, target, container)
+            .await
+            .map(|_| ())
+            .map_err(folder_progress_error)
     })
+}
+async fn add_to_container_inner(
+    account: &ImapAccount,
+    target: MutationTarget,
+    container: ContainerId,
+) -> Result<Vec<FolderEffect>, FolderProgress> {
+    if !account.capabilities.pim_methods.add_to_container {
+        return Err(super::error::unsupported(AccountOperation::AddToContainer).into());
+    }
+    let destination = folder_from_container(&container, AccountOperation::AddToContainer)?;
+    let ids = decoded_targets(&target, AccountOperation::AddToContainer)?;
+    copy_messages(account, ids, &destination, AccountOperation::AddToContainer).await
 }
 
 pub(crate) fn remove_from_container(
@@ -115,23 +227,29 @@ pub(crate) fn remove_from_container(
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        if !account.capabilities.pim_methods.remove_from_container {
-            return Err(super::error::unsupported(
-                AccountOperation::RemoveFromContainer,
-            ));
-        }
-        let source = folder_from_container(&container, AccountOperation::RemoveFromContainer)?;
-        let ids = decoded_targets(&target, AccountOperation::RemoveFromContainer)?
-            .into_iter()
-            .filter(|id| id.folder == source)
-            .collect::<Vec<_>>();
-        if ids.is_empty() {
-            return Err(super::error::unsupported(
-                AccountOperation::RemoveFromContainer,
-            ));
-        }
-        delete_messages(&account, ids, AccountOperation::RemoveFromContainer).await
+        remove_from_container_inner(&account, target, container)
+            .await
+            .map(|_| ())
+            .map_err(folder_progress_error)
     })
+}
+async fn remove_from_container_inner(
+    account: &ImapAccount,
+    target: MutationTarget,
+    container: ContainerId,
+) -> Result<Vec<FolderEffect>, FolderProgress> {
+    if !account.capabilities.pim_methods.remove_from_container {
+        return Err(super::error::unsupported(AccountOperation::RemoveFromContainer).into());
+    }
+    let source = folder_from_container(&container, AccountOperation::RemoveFromContainer)?;
+    let ids = decoded_targets(&target, AccountOperation::RemoveFromContainer)?
+        .into_iter()
+        .filter(|id| id.folder == source)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Err(super::error::unsupported(AccountOperation::RemoveFromContainer).into());
+    }
+    delete_messages(account, ids, AccountOperation::RemoveFromContainer).await
 }
 
 pub(crate) fn set_keyword(
@@ -146,7 +264,10 @@ pub(crate) fn set_keyword(
         }
         let flag = imap_flag_for_keyword(&keyword);
         let ids = decoded_targets(&target, AccountOperation::SetKeyword)?;
-        set_flag(&account, ids, flag, value, AccountOperation::SetKeyword).await
+        set_flag(&account, ids, flag, value, AccountOperation::SetKeyword)
+            .await
+            .map(|_| ())
+            .map_err(folder_progress_error)
     })
 }
 
@@ -168,6 +289,8 @@ pub(crate) fn set_is_read(
             AccountOperation::SetIsRead,
         )
         .await
+        .map(|_| ())
+        .map_err(folder_progress_error)
     })
 }
 
@@ -193,6 +316,8 @@ pub(crate) fn set_importance(
             AccountOperation::SetImportance,
         )
         .await
+        .map(|_| ())
+        .map_err(folder_progress_error)
     })
 }
 
@@ -409,7 +534,7 @@ pub(crate) fn draft_send(
         {
             tracing::warn!(
                 target: "bifrost_imap::draft_send",
-                error = %err,
+                error = %err.error,
                 "draft sent but discard from Drafts failed; the draft may linger"
             );
         }
@@ -757,7 +882,10 @@ pub(crate) fn draft_discard(
             return Err(super::error::unsupported(AccountOperation::DraftDiscard));
         }
         let id = decode_object_id(&ObjectId(draft.0), AccountOperation::DraftDiscard)?;
-        delete_messages(&account, vec![id], AccountOperation::DraftDiscard).await
+        delete_messages(&account, vec![id], AccountOperation::DraftDiscard)
+            .await
+            .map(|_| ())
+            .map_err(folder_progress_error)
     })
 }
 
@@ -844,6 +972,32 @@ pub(crate) fn containers_list(
     Box::pin(async move { Ok(ContainerList::complete(containers_snapshot(&account))) })
 }
 
+fn container_refresh_error(
+    error: AccountError,
+    effect: StepEffect,
+    source: &MailboxName,
+    destination: Option<&MailboxName>,
+) -> AccountError {
+    let mut refs = vec![TargetRef::new(
+        if destination.is_some() {
+            TargetRole::Source
+        } else {
+            TargetRole::Subject
+        },
+        ErrorScope::Cursor(super::folder_scope(source)),
+    )];
+    if let Some(destination) = destination {
+        refs.push(TargetRef::new(
+            TargetRole::Destination,
+            ErrorScope::Cursor(super::folder_scope(destination)),
+        ));
+    }
+    let targets = StepTargets::complete(refs);
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::effectless(targets.clone()));
+    record.committed(effect, targets, StepReplay::Blocking);
+    super::mutate::finish_partial(error, record)
+}
+
 pub(crate) fn container_create(
     account: ImapAccount,
     kind: ContainerKind,
@@ -874,7 +1028,8 @@ pub(crate) fn container_create(
             conn.connection(),
             AccountOperation::ContainerCreate,
         )
-        .await?;
+        .await
+        .map_err(|error| container_refresh_error(error, StepEffect::Created, &full_name, None))?;
         Ok(ContainerId(full_name.account_id()))
     })
 }
@@ -905,6 +1060,9 @@ pub(crate) fn container_rename(
             AccountOperation::ContainerRename,
         )
         .await
+        .map_err(|error| {
+            container_refresh_error(error, StepEffect::Moved, &folder, Some(&new_name))
+        })
     })
 }
 
@@ -931,7 +1089,11 @@ pub(crate) fn container_move(
             .rename(&folder, &new_name, account.command_timeout())
             .await
             .map_err(err)?;
-        refresh_folders(&account, conn.connection(), AccountOperation::ContainerMove).await
+        refresh_folders(&account, conn.connection(), AccountOperation::ContainerMove)
+            .await
+            .map_err(|error| {
+                container_refresh_error(error, StepEffect::Moved, &folder, Some(&new_name))
+            })
     })
 }
 
@@ -971,6 +1133,7 @@ pub(crate) fn container_delete(
             AccountOperation::ContainerDelete,
         )
         .await
+        .map_err(|error| container_refresh_error(error, StepEffect::Deleted, &folder, None))
     })
 }
 
@@ -1091,17 +1254,31 @@ pub(crate) fn move_thread(
     source: Option<ContainerId>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        add_to_container(
-            account.clone(),
-            MutationTarget::Thread(thread.clone()),
-            target,
-        )
-        .await?;
-        if let Some(source) = source {
-            remove_from_container(account, MutationTarget::Thread(thread), source).await?;
-        }
-        Ok(())
+        move_thread_inner(&account, thread, target, source)
+            .await
+            .map(|_| ())
+            .map_err(folder_progress_error)
     })
+}
+async fn move_thread_inner(
+    account: &ImapAccount,
+    thread: ThreadId,
+    target: ContainerId,
+    source: Option<ContainerId>,
+) -> Result<Vec<FolderEffect>, FolderProgress> {
+    let mut done =
+        add_to_container_inner(account, MutationTarget::Thread(thread.clone()), target).await?;
+    if let Some(source) = source {
+        match remove_from_container_inner(account, MutationTarget::Thread(thread), source).await {
+            Ok(next) => done.extend(next),
+            Err(mut failure) => {
+                done.append(&mut failure.done);
+                failure.done = done;
+                return Err(failure);
+            }
+        }
+    }
+    Ok(done)
 }
 
 pub(crate) fn delete_thread(
@@ -1125,22 +1302,33 @@ pub(crate) fn delete_thread(
                     .and_then(super::folder_registry::FolderEntry::delimiter),
             ) == Some(FolderRole::Trash)
             {
-                return remove_from_container(account, MutationTarget::Thread(thread), current)
-                    .await;
+                return remove_from_container_inner(
+                    &account,
+                    MutationTarget::Thread(thread),
+                    current,
+                )
+                .await
+                .map(|_| ())
+                .map_err(folder_progress_error);
             }
             let trash = role_folder(&account, FolderRole::Trash)
                 .ok_or_else(|| super::error::unsupported(AccountOperation::BulkMove))?;
-            return move_thread(
-                account,
+            return move_thread_inner(
+                &account,
                 thread,
                 ContainerId(trash.account_id()),
                 Some(current),
             )
-            .await;
+            .await
+            .map(|_| ())
+            .map_err(folder_progress_error);
         }
         let trash = role_folder(&account, FolderRole::Trash)
             .ok_or_else(|| super::error::unsupported(AccountOperation::BulkMove))?;
-        move_thread(account, thread, ContainerId(trash.account_id()), None).await
+        move_thread_inner(&account, thread, ContainerId(trash.account_id()), None)
+            .await
+            .map(|_| ())
+            .map_err(folder_progress_error)
     })
 }
 
@@ -1149,79 +1337,131 @@ async fn copy_messages(
     ids: Vec<DecodedObjectId>,
     destination: &MailboxName,
     op: AccountOperation,
-) -> Result<(), AccountError> {
+) -> Result<Vec<FolderEffect>, FolderProgress> {
     let err = op_err(op);
     let preflight = preflight_err(op);
+    let mut done = Vec::new();
     for (folder, ids) in group_by_folder(ids) {
-        let mut conn = account
-            .checkout_for_folder(&folder)
-            .await
-            .map_err(preflight)?;
-        let selected = account
-            .select_folder(&mut conn, &folder, None, false)
-            .await
-            .map_err(preflight)?;
-        let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
-        let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
-        let Some(uid_set) = operand.uid_set() else {
-            continue;
-        };
-        conn.connection()
-            .uid_copy(
-                uid_set.as_sequence_set(),
-                &destination,
-                account.command_timeout(),
-            )
-            .await
-            .map_err(err)?;
+        let mut stage = None;
+        let result: Result<(), AccountError> = async {
+            let mut conn = account
+                .checkout_for_folder(&folder)
+                .await
+                .map_err(preflight)?;
+            let selected = account
+                .select_folder(&mut conn, &folder, None, false)
+                .await
+                .map_err(preflight)?;
+            let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
+            let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
+            let Some(uid_set) = operand.uid_set() else {
+                return Ok(());
+            };
+            stage = Some(StepEffect::Copied);
+            conn.connection()
+                .uid_copy(
+                    uid_set.as_sequence_set(),
+                    &destination,
+                    account.command_timeout(),
+                )
+                .await
+                .map_err(err)?;
+            done.push(FolderEffect {
+                folder: folder.clone(),
+                uids: operand.uids().to_vec(),
+                uidvalidity,
+                effect: StepEffect::Copied,
+                destination: Some(destination.clone()),
+            });
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            return Err(FolderProgress {
+                done,
+                error,
+                stage,
+                targets: super::mutate::folder_targets(&folder, TargetRole::Subject),
+            });
+        }
     }
-    Ok(())
+    Ok(done)
 }
 
 async fn delete_messages(
     account: &ImapAccount,
     ids: Vec<DecodedObjectId>,
     op: AccountOperation,
-) -> Result<(), AccountError> {
+) -> Result<Vec<FolderEffect>, FolderProgress> {
     let err = op_err(op);
     let preflight = preflight_err(op);
+    let mut done = Vec::new();
     for (folder, ids) in group_by_folder(ids) {
-        let mut conn = account
-            .checkout_for_folder(&folder)
-            .await
-            .map_err(preflight)?;
-        let selected = account
-            .select_folder(&mut conn, &folder, None, false)
-            .await
-            .map_err(preflight)?;
-        let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
-        let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
-        let Some(uid_set) = operand.uid_set() else {
-            continue;
-        };
-        conn.connection()
-            .uid_store(
+        let mut stage = None;
+        let result: Result<(), AccountError> = async {
+            let mut conn = account
+                .checkout_for_folder(&folder)
+                .await
+                .map_err(preflight)?;
+            let selected = account
+                .select_folder(&mut conn, &folder, None, false)
+                .await
+                .map_err(preflight)?;
+            let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
+            let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
+            let Some(uid_set) = operand.uid_set() else {
+                return Ok(());
+            };
+            stage = Some(StepEffect::MarkedDeleted);
+            conn.connection()
+                .uid_store(
+                    uid_set.as_sequence_set(),
+                    StoreOperation::AddSilent,
+                    &[Flag::Deleted],
+                    None,
+                    account.command_timeout(),
+                )
+                .await
+                .map_err(err)?;
+            done.push(FolderEffect {
+                folder: folder.clone(),
+                uids: operand.uids().to_vec(),
+                uidvalidity,
+                effect: StepEffect::MarkedDeleted,
+                destination: None,
+            });
+            stage = Some(StepEffect::Deleted);
+            super::mutate::expunge_uids_or_fall_back(
+                account,
+                &conn,
                 uid_set.as_sequence_set(),
-                StoreOperation::AddSilent,
-                &[Flag::Deleted],
-                None,
-                account.command_timeout(),
+                operand.uids(),
             )
             .await
             .map_err(err)?;
-        super::mutate::expunge_uids_or_fall_back(
-            account,
-            &conn,
-            uid_set.as_sequence_set(),
-            operand.uids(),
-        )
-        .await
-        .map_err(err)?;
-        account
-            .folders
-            .clear_modseqs(&folder, uidvalidity, operand.uids());
+            account
+                .folders
+                .clear_modseqs(&folder, uidvalidity, operand.uids());
+            done.push(FolderEffect {
+                folder: folder.clone(),
+                uids: operand.uids().to_vec(),
+                uidvalidity,
+                effect: StepEffect::Deleted,
+                destination: None,
+            });
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            return Err(FolderProgress {
+                done,
+                error,
+                stage,
+                targets: super::mutate::folder_targets(&folder, TargetRole::Subject),
+            });
+        }
     }
-    Ok(())
+    Ok(done)
 }
 
 async fn set_flag(
@@ -1230,7 +1470,7 @@ async fn set_flag(
     flag: Flag,
     value: bool,
     op: AccountOperation,
-) -> Result<(), AccountError> {
+) -> Result<Vec<FolderEffect>, FolderProgress> {
     let err = op_err(op);
     let preflight = preflight_err(op);
     let operation = if value {
@@ -1238,35 +1478,57 @@ async fn set_flag(
     } else {
         StoreOperation::RemoveSilent
     };
+    let mut done = Vec::new();
     for (folder, ids) in group_by_folder(ids) {
-        let mut conn = account
-            .checkout_for_folder(&folder)
-            .await
-            .map_err(preflight)?;
-        let selected = account
-            .select_folder(&mut conn, &folder, None, false)
-            .await
-            .map_err(preflight)?;
-        let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
-        let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
-        let Some(uid_set) = operand.uid_set() else {
-            continue;
-        };
-        conn.connection()
-            .uid_store(
-                uid_set.as_sequence_set(),
-                operation,
-                std::slice::from_ref(&flag),
-                None,
-                account.command_timeout(),
-            )
-            .await
-            .map_err(err)?;
-        account
-            .folders
-            .clear_modseqs(&folder, uidvalidity, operand.uids());
+        let mut stage = None;
+        let result: Result<(), AccountError> = async {
+            let mut conn = account
+                .checkout_for_folder(&folder)
+                .await
+                .map_err(preflight)?;
+            let selected = account
+                .select_folder(&mut conn, &folder, None, false)
+                .await
+                .map_err(preflight)?;
+            let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
+            let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
+            let Some(uid_set) = operand.uid_set() else {
+                return Ok(());
+            };
+            stage = Some(StepEffect::Updated);
+            conn.connection()
+                .uid_store(
+                    uid_set.as_sequence_set(),
+                    operation,
+                    std::slice::from_ref(&flag),
+                    None,
+                    account.command_timeout(),
+                )
+                .await
+                .map_err(err)?;
+            account
+                .folders
+                .clear_modseqs(&folder, uidvalidity, operand.uids());
+            done.push(FolderEffect {
+                folder: folder.clone(),
+                uids: operand.uids().to_vec(),
+                uidvalidity,
+                effect: StepEffect::Updated,
+                destination: None,
+            });
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            return Err(FolderProgress {
+                done,
+                error,
+                stage,
+                targets: super::mutate::folder_targets(&folder, TargetRole::Subject),
+            });
+        }
     }
-    Ok(())
+    Ok(done)
 }
 
 async fn hydrate_decoded(
@@ -3575,5 +3837,212 @@ body text\r\n";
         let addrs: Vec<&str> = parsed.iter().map(|a| a.address.as_str()).collect();
         assert_eq!(addrs, ["jane@to.test", "bob@to.test"]);
         assert_eq!(parsed[0].name.as_deref(), Some("Doe, Jane"));
+    }
+}
+
+#[cfg(test)]
+mod partial_commit_tests {
+    use super::super::test_support::scripted_account_parts;
+    use super::*;
+    use crate::connection::test_support::{
+        driver_pair, preauth_greeting, read_line, respond, tag_of,
+    };
+    #[tokio::test]
+    async fn partial_commit_copy_messages_second_folder_failure_keeps_first() {
+        let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 UIDPLUS")).await;
+        let account = ImapAccount::new(scripted_account_parts(conn, 1));
+        let script = tokio::spawn(async move {
+            let select = read_line(&mut server).await;
+            respond(&mut server,&format!("* 1 EXISTS\r\n* 0 RECENT\r\n* FLAGS (\\Seen)\r\n* OK [UIDVALIDITY 7] epoch\r\n{} OK selected\r\n",tag_of(&select))).await;
+            let copy = read_line(&mut server).await;
+            assert!(copy.contains("UID COPY"));
+            respond(&mut server, &format!("{} OK copied\r\n", tag_of(&copy))).await;
+            let select = read_line(&mut server).await;
+            assert!(select.contains("SELECT"));
+            respond(
+                &mut server,
+                &format!("{} NO [UNAVAILABLE] busy\r\n", tag_of(&select)),
+            )
+            .await;
+            server
+        });
+        let ids = ["A", "B"]
+            .into_iter()
+            .map(|name| DecodedObjectId {
+                folder: MailboxName::new(name).unwrap(),
+                uidvalidity: 7,
+                uid: 1,
+            })
+            .collect();
+        let failure = match copy_messages(
+            &account,
+            ids,
+            &MailboxName::new("Archive").unwrap(),
+            AccountOperation::AddToContainer,
+        )
+        .await
+        {
+            Err(f) => f,
+            Ok(_) => panic!("second folder refused"),
+        };
+        let error = folder_progress_error(failure);
+        assert_eq!(error.partial_commit().unwrap().steps().len(), 1);
+        assert_eq!(error.partial_commit().unwrap().primary().effect, None);
+        assert!(error.recovery().requires_reconciliation());
+        let _server = script.await.unwrap();
+    }
+    async fn composed_failure(delete: bool) -> AccountError {
+        let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 UIDPLUS")).await;
+        let mut parts = scripted_account_parts(conn, 1);
+        parts.capabilities.pim_methods.add_to_container = true;
+        parts.capabilities.pim_methods.remove_from_container = true;
+        parts.folders =
+            std::sync::Arc::new(super::super::folder_registry::FolderRegistry::from_lists(
+                ["INBOX", "Trash"]
+                    .into_iter()
+                    .map(|name| crate::types::MailboxInfo {
+                        name: MailboxName::new(name).unwrap(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                vec![],
+            ));
+        let account = ImapAccount::new(parts);
+        let script = tokio::spawn(async move {
+            loop {
+                let line = read_line(&mut server).await;
+                if line.contains("SELECT") {
+                    respond(&mut server,&format!("* 1 EXISTS\r\n* 0 RECENT\r\n* FLAGS (\\Seen)\r\n* OK [UIDVALIDITY 7] epoch\r\n{} OK selected\r\n",tag_of(&line))).await;
+                } else if line.contains("UID COPY") || line.contains("NOOP") {
+                    respond(&mut server, &format!("{} OK copied\r\n", tag_of(&line))).await;
+                } else {
+                    assert!(line.contains("UID STORE"), "{line}");
+                    respond(
+                        &mut server,
+                        &format!("{} NO [UNAVAILABLE] busy\r\n", tag_of(&line)),
+                    )
+                    .await;
+                    break;
+                }
+            }
+            server
+        });
+        let thread = encode_thread_id(&MailboxName::new("INBOX").unwrap(), 7, &[1]);
+        let result = if delete {
+            delete_thread(account, thread, Some(ContainerId("INBOX".into()))).await
+        } else {
+            move_thread(
+                account,
+                thread,
+                ContainerId("Archive".into()),
+                Some(ContainerId("INBOX".into())),
+            )
+            .await
+        };
+        let error = result.unwrap_err();
+        let _server = script.await.unwrap();
+        error
+    }
+    #[tokio::test]
+    async fn partial_commit_move_thread_attaches_once_across_legs() {
+        let error = composed_failure(false).await;
+        assert_eq!(
+            error.partial_commit().unwrap().steps()[0].effect(),
+            Some(StepEffect::Copied)
+        );
+    }
+    #[tokio::test]
+    async fn partial_commit_delete_thread_attaches_once() {
+        let error = composed_failure(true).await;
+        assert_eq!(error.partial_commit().unwrap().steps().len(), 1);
+    }
+    #[tokio::test]
+    async fn partial_commit_draft_discard_expunge_failure_marks_deleted() {
+        let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 UIDPLUS")).await;
+        let mut parts = scripted_account_parts(conn, 1);
+        parts.capabilities.pim_methods.draft_discard = true;
+        let account = ImapAccount::new(parts);
+        let script = tokio::spawn(async move {
+            let line = read_line(&mut server).await;
+            respond(&mut server,&format!("* 1 EXISTS\r\n* 0 RECENT\r\n* FLAGS (\\Deleted)\r\n* OK [UIDVALIDITY 7] epoch\r\n{} OK selected\r\n",tag_of(&line))).await;
+            let line = read_line(&mut server).await;
+            assert!(line.contains("UID STORE"));
+            respond(&mut server, &format!("{} OK stored\r\n", tag_of(&line))).await;
+            let line = read_line(&mut server).await;
+            assert!(line.contains("UID EXPUNGE"));
+            respond(
+                &mut server,
+                &format!("{} NO [UNAVAILABLE] busy\r\n", tag_of(&line)),
+            )
+            .await;
+            server
+        });
+        let id = encode_object_id(&MailboxName::new("Drafts").unwrap(), 7, 1);
+        let error = draft_discard(account, DraftHandle(id.0)).await.unwrap_err();
+        assert_eq!(
+            error.partial_commit().unwrap().steps()[0].effect(),
+            Some(StepEffect::MarkedDeleted)
+        );
+        let _server = script.await.unwrap();
+    }
+    /// With nothing committed, an uncertain COPY is recorded (it may have
+    /// made a copy); a refused COPY and a preparation failure stay plain.
+    #[test]
+    fn partial_commit_lone_uncertain_write_leg_is_recorded() {
+        let folder = MailboxName::new("INBOX").unwrap();
+        let progress = |error: AccountError, stage| FolderProgress {
+            done: Vec::new(),
+            error,
+            stage,
+            targets: super::super::mutate::folder_targets(&folder, TargetRole::Subject),
+        };
+        let leaf = |attempt| {
+            super::super::account_error_with(
+                crate::Error::timeout().with_attempt(attempt),
+                super::super::error::ImapErrorContext::operation(AccountOperation::AddToContainer)
+                    .with_folder_scope(&folder),
+            )
+        };
+        let dropped = leaf(bifrost_types::TransmissionState::InFlight);
+        assert_eq!(Application::from_leaf(&dropped), Application::Uncertain);
+        let error = folder_progress_error(progress(dropped.clone(), Some(StepEffect::Copied)));
+        let record = error
+            .partial_commit()
+            .expect("an uncertain copy is recorded");
+        assert_eq!(record.primary().application, Application::Uncertain);
+        assert_eq!(record.plan().gating.len(), 1);
+        assert!(
+            folder_progress_error(progress(dropped, None))
+                .partial_commit()
+                .is_none()
+        );
+        let unsent = leaf(bifrost_types::TransmissionState::Unsent);
+        assert!(
+            folder_progress_error(progress(unsent, Some(StepEffect::Copied)))
+                .partial_commit()
+                .is_none()
+        );
+    }
+    #[test]
+    fn partial_commit_container_create_refresh_failure_is_protected() {
+        let leaf = AccountErrorBuilder::new(
+            AccountErrorKind::Server(bifrost_types::ServerErrorKind::Unavailable),
+            Cause::Server(bifrost_types::ServerCause::Unavailable { retry_hint: None }),
+        )
+        .try_build()
+        .unwrap();
+        let error = container_refresh_error(
+            leaf,
+            StepEffect::Created,
+            &MailboxName::new("new").unwrap(),
+            None,
+        );
+        assert_eq!(
+            error.partial_commit().unwrap().primary().application,
+            Application::NotApplicable
+        );
+        assert!(
+            matches!(error.recovery(),bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions.contains(&bifrost_types::ReconcileAction::ObserveOnly))
+        );
     }
 }

@@ -1,4 +1,6 @@
+use super::partial::{PartialCommit, PartialCommitBuilder, StepId};
 use std::fmt;
+use std::sync::Arc;
 
 use super::account_error::{AccountError, AccountErrorParts};
 use super::cause::{Cause, CauseChain};
@@ -34,6 +36,16 @@ impl TelemetryField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AccountErrorBuildError {
+    /// A record can be attached only once, including across rebuilds.
+    PartialCommitAlreadyAttached,
+    /// No historical effect, sibling, compensation or uncertain primary exists.
+    PartialCommitEmpty,
+    /// The declared application contradicts the effect or leaf evidence.
+    PartialCommitApplication { step: StepId },
+    /// A compensation has invalid references or contradictory evidence.
+    PartialCommitCompensation { compensation: StepId },
+    /// A sibling or compensation already carries an operation-level record.
+    PartialCommitNested { step: StepId },
     /// The chain was empty. Every `AccountError` must carry at least
     /// one `Cause` (the primary). Unreachable through the current
     /// builder - `new` demands a primary and `try_build` always pushes
@@ -77,6 +89,11 @@ pub enum AccountErrorBuildError {
 impl fmt::Display for AccountErrorBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PartialCommitAlreadyAttached
+            | Self::PartialCommitEmpty
+            | Self::PartialCommitApplication { .. }
+            | Self::PartialCommitCompensation { .. }
+            | Self::PartialCommitNested { .. } => write!(f, "invalid partial commitment: {self:?}"),
             Self::EmptyChain => write!(f, "AccountError chain is empty"),
             Self::KindCauseMismatch {
                 kind,
@@ -112,6 +129,7 @@ impl fmt::Display for AccountErrorBuildError {
 impl std::error::Error for AccountErrorBuildError {}
 
 pub(crate) struct RebuildParts {
+    pub partial_commit: Option<Arc<PartialCommit>>,
     pub kind: AccountErrorKind,
     pub primary_cause: Cause,
     pub chain_extras: Vec<Cause>,
@@ -128,6 +146,8 @@ pub(crate) struct RebuildParts {
 
 #[derive(Clone, Debug)]
 pub struct AccountErrorBuilder {
+    partial_commit: Option<PartialCommitBuilder>,
+    partial_commit_duplicate: bool,
     kind: AccountErrorKind,
     primary_cause: Cause,
     chain_extras: Vec<Cause>,
@@ -146,6 +166,8 @@ impl AccountErrorBuilder {
     #[must_use]
     pub fn new(kind: AccountErrorKind, primary_cause: Cause) -> Self {
         Self {
+            partial_commit: None,
+            partial_commit_duplicate: false,
             kind,
             primary_cause,
             chain_extras: Vec::new(),
@@ -172,6 +194,8 @@ impl AccountErrorBuilder {
     #[must_use]
     pub(crate) fn from_rebuild(parts: RebuildParts) -> Self {
         Self {
+            partial_commit: parts.partial_commit.map(|r| r.builder()),
+            partial_commit_duplicate: false,
             kind: parts.kind,
             primary_cause: parts.primary_cause,
             chain_extras: parts.chain_extras,
@@ -185,6 +209,16 @@ impl AccountErrorBuilder {
             throttle_scope: parts.throttle_scope,
             throttle_budgets: parts.throttle_budgets,
         }
+    }
+
+    #[must_use]
+    pub fn partial_commit(mut self, record: PartialCommitBuilder) -> Self {
+        if self.partial_commit.is_some() {
+            self.partial_commit_duplicate = true;
+        } else {
+            self.partial_commit = Some(record);
+        }
+        self
     }
 
     #[must_use]
@@ -331,6 +365,9 @@ impl AccountErrorBuilder {
     /// classification")` because an invalid combination is a library
     /// bug, not recoverable runtime state.
     pub fn try_build(self) -> Result<AccountError, AccountErrorBuildError> {
+        if self.partial_commit_duplicate {
+            return Err(AccountErrorBuildError::PartialCommitAlreadyAttached);
+        }
         let throttled = matches!(
             &self.kind,
             AccountErrorKind::Server(
@@ -416,6 +453,17 @@ impl AccountErrorBuilder {
             self.throttle_scope,
             self.idempotency_override,
         );
+        let leg_recovery = recovery.clone();
+        let (partial_commit, recovery) = if let Some(record) = self.partial_commit {
+            let attempt = classification_chain.iter().find_map(|c| match c {
+                Cause::Attempt(a) => Some(a.transmission_state),
+                _ => None,
+            });
+            let (record, projected) = record.finish(&recovery, attempt, &self.kind)?;
+            (Some(Arc::new(record)), projected)
+        } else {
+            (None, recovery)
+        };
         let remediation = recovery::suggest(
             &self.kind,
             &recovery,
@@ -425,6 +473,8 @@ impl AccountErrorBuilder {
         let message_key = message_key::derive(&self.kind);
 
         Ok(AccountError::from_parts(AccountErrorParts {
+            partial_commit,
+            leg_recovery,
             kind: self.kind,
             recovery,
             remediation,

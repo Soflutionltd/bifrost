@@ -83,7 +83,20 @@ A MULTIAPPEND's APPENDUID uid-set is believed only when it names exactly as many
 
 `CopyConsumer` and `MoveConsumer` handle an untagged `* OK [COPYUID ...]` differently, because the tagged OK can carry a code of its own (under QRESYNC typically `HIGHESTMODSEQ`, RFC 7162) and a single slot let that code hide the COPYUID. `CopyResult` and `MoveResult` therefore carry two fields, filled by one shared `resolve_copyuid` on the success arm: `code` is the tagged code when it has one, else the retained untagged OK's code; `copy_uid` is the COPYUID wherever it came from (the tagged code when that is COPYUID, else the retained untagged OK), always a `ResponseCode::CopyUid` when present. The retained untagged OK is consumed exactly when it supplies `copy_uid`, i.e. whenever the tagged code is not itself COPYUID; when the tagged code is COPYUID the untagged one was not this command's answer and is surrendered at its wire position among the buffered responses. For MOVE an untagged COPYUID is the expected shape, not a quirk: RFC 6851 Section 4.3 asks a UIDPLUS server to send it in an untagged OK before the expunges, though some servers put it on the tagged OK instead. `MoveConsumer` retains only the first such OK, whole, with the length of its buffer at arrival; a second one is an ordinary untagged OK and is buffered. On a tagged NO the retained OK goes back into the buffer at its wire position (a COPYUID naming a move the server then failed is not this command's answer), and the EXPUNGE / VANISHED mutations are surrendered after the buffer, verbatim, as before.
 
-On the UID MOVE fallback (COPY, STORE, UID EXPUNGE, for servers without MOVE) `MoveResult::code` mirrors the native path's tagged code: it is the final UID EXPUNGE's tagged code (under QRESYNC the source mailbox's new `HIGHESTMODSEQ`), falling back to the COPY's `code` only when the EXPUNGE carried none, and `copy_uid` is the COPY's. The EXPUNGE runs through `ExpungeConsumer::with_tagged_code` so the plain consumer's discarded tagged code is available; the plain `uid_expunge` is unchanged. Once the COPY is acknowledged, the STORE and UID EXPUNGE errors pass through an evidence floor (`after_acknowledged_side_effect` in `connection/uid_ops.rs`): evidence that reads `Unsent` (explicit, or absent on a variant that can carry it) is restamped `InFlight`. The fallback reports a later step's leaf evidence as the outcome of the whole MOVE, and the account layer settles `Unsent` as `Failed` (retryable), so without the floor a STORE withdrawn while queued, dropped unclaimed by a dying driver, refused at admission with its deadline gone, or failing its first write with the socket counter unmoved would let the engine replay the MOVE, repeat the acknowledged COPY and duplicate messages. `InFlight` sends it to read-back instead. Acknowledged evidence is left alone, and variants that cannot carry evidence (`StateChangedBeforeSend`, local refusals such as `MissingCapability`) pass through unchanged; those cases, and composite partial completion generally, need an aggregate-progress representation that leaf transmission evidence cannot express.
+On the UID MOVE fallback (COPY, STORE, UID EXPUNGE, for servers without MOVE) `MoveResult::code` mirrors the native path's tagged code: it is the final UID EXPUNGE's tagged code (under QRESYNC the source mailbox's new `HIGHESTMODSEQ`), falling back to the COPY's `code` only when the EXPUNGE carried none, and `copy_uid` is the COPY's. The EXPUNGE runs through `ExpungeConsumer::with_tagged_code` so the plain consumer's discarded tagged code is available; the plain `uid_expunge` is unchanged. Once COPY is acknowledged, a later STORE or EXPUNGE failure returns
+`MoveFallbackIncomplete { copy, stored_deleted, source }`, with the CopyResult
+boxed to keep the error enum compact. attempt(), response_code(), source(),
+with_attempt() and connection fatality delegate to the failed source; equality
+compares the progress and source. is_connection_fatal is no longer const.
+The fallback no longer raises Unsent leaf evidence to InFlight. Account mapping
+unwraps the source classification, and the BulkMove owner records the committed
+Blocking Copied effect, incomplete source/destination folder identities and any
+COPYUID destination messages. Completed STORE adds MarkedDeleted Repeatable.
+The primary is the failed MarkedDeleted/Deleted leg with its own application.
+An acknowledged retryable refusal or local capability/state refusal after COPY
+requires protected PartialCommit reconciliation with CheckTarget and ObserveOnly,
+without dedupe. This changes the fallback error shape from the former bare leaf;
+no error classification or transmission evidence is invented.
 
 APPEND resolves APPENDLIMIT (RFC 7889) before writing anything: a numeric `APPENDLIMIT=<n>` capability is a global limit, a bare `APPENDLIMIT` sends a preflight `STATUS <mailbox> (APPENDLIMIT)`, and a server advertising both gets the most restrictive of the two. The STATUS reply is read from `items` *and* `ambiguous`, since NOTIFY STATUS makes the solicited reply wire-identical to a notification. Because that STATUS is a preflight, its failures are restamped `TransmissionState::Unsent` relative to the APPEND, as is a deadline that expires before submission: APPEND is non-idempotent, and leaking the helper's `InFlight` / `Acknowledged` evidence would send `DraftCreate` recovery down the reconcile path for a message no server ever saw.
 
@@ -710,7 +723,7 @@ message metadata and parses selected bytes through `bifrost-types::mime`.
 
 - Container membership: `add_to_container` via UID COPY, `remove_from_container` via `+FLAGS.SILENT \Deleted` plus UID EXPUNGE. `add_to_container` and `message_hydrate` check their own `pim_methods` flag first and answer `Unsupported` when it is false, like the other primitives.
 
-The per-folder PIM primitives (`copy_messages`, `delete_messages`, `set_flag`, `hydrate_decoded`) stamp failures in the folder's PREPARATION (checkout, SELECT/EXAMINE, UIDVALIDITY read) `Unsent` through `preflight_err`, relative to the operation: the SELECT's own evidence (a tagged NO is `Acknowledged`) is about the SELECT, not the COPY / STORE / FETCH that was never sent, and publishing it would make recovery reconcile a non-idempotent mutation that never reached the server. It speaks for the folder being prepared only; earlier folders of a multi-folder call may already have been mutated, which these `Result<(), _>` lanes cannot express.
+The per-folder PIM primitives (`copy_messages`, `delete_messages`, `set_flag`, `hydrate_decoded`) stamp failures in the folder's PREPARATION (checkout, SELECT/EXAMINE, UIDVALIDITY read) `Unsent` through `preflight_err`, relative to the operation: the SELECT's own evidence (a tagged NO is `Acknowledged`) is about the SELECT, not the COPY / STORE / FETCH that was never sent, and publishing it would make recovery reconcile a non-idempotent mutation that never reached the server. It speaks for the folder being prepared only; earlier folders of a multi-folder call may already have been mutated. The helpers return FolderProgress carrying those effects, and a preparation failure becomes an effectless primary.
 
 Every path that removes messages (sync-side `bulk_destroy`, PIM `delete_messages`) goes through `expunge_uids_or_fall_back`. It issues `UID EXPUNGE` (RFC 4315 Section 2), and on `MissingCapability` - a server with neither UIDPLUS nor IMAP4rev2 - falls back to plain `EXPUNGE` only when `UID SEARCH DELETED` shows the mailbox's `\Deleted` set is a subset of the UIDs this batch just marked. Plain EXPUNGE names no messages: running it with a foreign `\Deleted` present would silently destroy another client's mail, so that case keeps the `MissingCapability` failure with the batch left flagged.
 
@@ -1061,7 +1074,13 @@ A `Transport(_)` kind must never carry an `Acknowledged` attempt - `try_build` r
 
 `Error::No` and `Error::Bad` carry `attempt: Option<ImapAttempt>`; `no_with_code`/`bad_with_code` default it to `Some(Acknowledged)` because a tagged `NO`/`BAD` is a server-acknowledged terminal response. Without this, recovery rows keyed on `Acknowledged` (e.g. `Server(Error { status: None }) + Acknowledged -> ProviderRefused`) collapse to the `Unsent` arm and misclassify provider refusals as retryable drops.
 
-`ImapErrorContext::with_extra_text` appends support-only diagnostics the call site knows and the wire does not, WITHOUT touching the classification. The destroy path uses it: a UID EXPUNGE that fails after its `UID STORE +FLAGS.SILENT \Deleted` was acknowledged leaves a confirmed partial effect (those messages stay flagged `\Deleted`), but the failure itself keeps its own kind and cause chain. Collapsing it into `Protocol(PartialResponse)` would flatten an auth loss, an ACL denial, a quota throttle and a capability loss into one generic reconcile - the exact classification `reference/error-model.md` requires the producer to preserve.
+Partial writes attach typed records at their public owner rather than adding
+side-effect diagnostic text. Destroy records MarkedDeleted Repeatable before
+failed EXPUNGE. Two-sided patches record the add half: cache-guarded Flags are
+Repeatable because the cache is cleared; caller ConditionalFlags are Blocking
+because their unchanged-since precondition was made false. The remove primary
+is Repeatable and retains its leaf. Item lanes read the recorded primary's
+application, never the historical successful command's evidence.
 
 ### Push lifecycle
 
@@ -1140,7 +1159,11 @@ IMAP diverges from the `MutationSuccess::Skipped` lane other crates use for the 
 
 `StoreConsumer::new` takes the command's own `unchanged_since` and has no argument-less form, so how a tagged `NO` is treated is a property of the command rather than a per-call-site choice. Under `UNCHANGEDSINCE` the consumer preserves tagged `NO` as a `StoreResult` with its status and response code, making the legal `NO [MODIFIED ...]` CONDSTORE rejection available to the mutation layer instead of discarding its per-UID conflict evidence. Without `UNCHANGEDSINCE` a tagged `NO` is a plain refusal and stays `Error::No`: the unconditional STORE callers (`delete_messages` marks `\Deleted` and then EXPUNGEs) read `Ok` as acceptance, and a silent success there would expunge messages another client had marked. Tagged `BAD` is a command error on both paths. `StoreWireOutcome::from_store_result` takes the whole result rather than a `(code, tagged_ok)` pair, so the status cannot be dropped on the way to classification. `concurrency_conflict_error` / `store_failed_error` / `uidvalidity_changed_error` each take the caller's `AccountOperation` and produce `ErrorScope::Cursor(Folder(id))`, matching the folder-producer scope contract above. A STORE refusal without a more specific response code is `Server(Error)`, not the client-bug `Request(Malformed)` classification.
 
-Mutation error lanes follow transmission evidence. An `InFlight` attempt makes the affected items `Uncertain`; `Unsent` or `Acknowledged` evidence makes them `Failed`. This rule is shared by grouped STORE, MOVE, and EXPUNGE error paths, so the loop that observes an error does not decide whether the server may have applied it.
+Mutation error lanes follow the primary application: recorded errors read their
+PrimaryLeg; plain leaves use Application::from_leaf. Explicit InFlight or leaf
+Reconcile means Uncertain; otherwise the failed command is Failed. Earlier
+commits do not acknowledge a later transport failure or make a refusal uncertain.
+Grouped STORE, MOVE and EXPUNGE use the same rule.
 
 ### Strategy downgrade derivation
 
@@ -1272,3 +1295,24 @@ A server can re-add maintained keywords or accept but not retain a new
 keyword when PERMANENTFLAGS lacks the wildcard grant. After an uncertain
 write, an unsatisfiable target can spend its remaining attempt budget on
 writes that cannot stick. This bounded futility is accepted.
+
+## Partial commitment of PIM operations
+
+copy_messages, delete_messages and set_flag retain committed per-folder effects
+and the failing stage in crate-local FolderProgress. Preparation failures are
+effectless; effect-bearing failures use Application::from_leaf. Earlier copies
+are Blocking, deletes and flag updates Repeatable. Delete retains the acknowledged
+MarkedDeleted step if EXPUNGE fails. With nothing committed, only an uncertain
+write leg gets a record; a refusal or preparation failure is the plain leaf.
+Public add/remove/keyword/read/importance,
+draft_discard, move_thread and delete_thread attach once. The composed thread
+operations call add_to_container_inner, remove_from_container_inner and
+move_thread_inner, never the attaching public forms. draft_send still logs and
+absorbs its private discard failure after SMTP succeeds.
+
+Container CREATE/RENAME/move/DELETE followed by a failed refresh records a
+Blocking Created/Moved/Moved/Deleted effect and an effectless refresh primary.
+Replay protection does not change the existing failure-return contract.
+Sent APPEND and post-send draft discard failures remain logged successes,
+outside the applicable failure-path producer set. Single-request draft creates
+without APPENDUID are likewise outside this multi-step adoption.

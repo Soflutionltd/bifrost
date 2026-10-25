@@ -71,12 +71,6 @@ impl ImapErrorContext {
         }
     }
 
-    #[must_use]
-    pub(crate) fn with_extra_text(mut self, text: DiagnosticText) -> Self {
-        self.extra_text.push(text);
-        self
-    }
-
     /// Unused: every producer reaches for a scope-shaped helper below
     /// (`with_cursor_scope` / `with_folder_scope` / `with_message_id`)
     /// rather than naming an `ErrorScope` directly.
@@ -434,6 +428,7 @@ fn internal(kind: InternalErrorKind, detail: String) -> Translation {
 
 fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
     match error {
+        Error::MoveFallbackIncomplete { source, .. } => classify(source, ctx),
         Error::Io { source, .. } => Translation::new(
             AccountErrorKind::Transport(TransportErrorKind::Network),
             Cause::Transport(TransportCause::new(

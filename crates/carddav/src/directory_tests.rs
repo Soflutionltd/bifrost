@@ -4,7 +4,7 @@ use bifrost_dav_core::test_support::{
     dav_redirect, dav_script, dav_script_yielding, scripted_dav_net, transcripts,
 };
 use bifrost_net::test_support::Canned;
-use bifrost_types::{RecoveryClass, RequestErrorKind};
+use bifrost_types::{RecoveryClass, RequestErrorKind, TransmissionState};
 use reqwest::{StatusCode, header::HeaderMap};
 
 const BASE: &str = "https://dav.example.test";

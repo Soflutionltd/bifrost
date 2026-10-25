@@ -5,6 +5,7 @@ pub mod cause;
 pub mod diagnostic;
 pub mod kind;
 pub mod message_key;
+pub mod partial;
 pub mod recovery;
 pub mod scope;
 pub mod stream;
@@ -39,3 +40,10 @@ pub use recovery::{
 pub use scope::{AccountOperation, ErrorScope, Protocol, Provider};
 pub use stream::{ItemOutcome, MutationEffect, MutationSuccess};
 pub use warning::{Warning, WarningKind};
+
+pub use partial::{
+    Application, Compensation, CompensationExport, CompensationOutcome, OperationPlan,
+    PartialCommit, PartialCommitBuilder, PartialCommitExport, PartialCommitTelemetry,
+    PlannedDirective, Prerequisites, PrimaryLeg, ReplaySafety, Step, StepEffect, StepExport,
+    StepId, StepOutcome, StepReplay, StepTargets, TargetRef, TargetRole,
+};

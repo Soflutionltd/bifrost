@@ -238,8 +238,10 @@ impl SyncEngine {
     // stale snapshot the consumer cached) and forwards to the matching
     // `Account` method 1:1, inventing no new semantics.
     //
-    // These are DIRECT - one wire op each - and deliberately bypass the
-    // idempotency / read-back / recovery pipeline. That pipeline guards
+    // These forward direct Account calls and deliberately bypass the
+    // idempotency / read-back / recovery pipeline. The forwarded error's
+    // recovery() describes the operation; leg_recovery() and partial_commit()
+    // retain the failed leg and historical effects. That pipeline guards
     // the *volume* mutations (`bulk_set_flags`, `bulk_move`,
     // `bulk_destroy`), where a partial-apply replay across a retry would
     // corrupt state and the read-back guard earns its keep. A
@@ -692,10 +694,12 @@ impl SyncEngine {
     // forwarded `Account` future is `'static` and captures its own `Arc`
     // clones, so it outlives the short-lived handle resolved per call.
     // The address-book / contact reads are read-only, and the single
-    // contact mutations are direct one-wire-op conveniences, so - like the
+    // contact mutations are forwarded direct account operations, so - like the
     // container / compose clusters - they deliberately bypass the
     // idempotency / read-back / recovery pipeline that guards the volume
-    // mutations. Capability gating (`pim_methods.directory_search`, etc.)
+    // mutations. The forwarded error's recovery() describes the operation;
+    // leg_recovery() and partial_commit() retain its leaf and effects.
+    // Capability gating (`pim_methods.directory_search`, etc.)
     // stays in the protocol crate; a consumer reads `account_capabilities`
     // to decide whether to dispatch before paying the round trip.
 

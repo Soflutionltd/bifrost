@@ -171,6 +171,12 @@ failures preserve it. Earlier attempts are retained even without a hold gate.
 A response whose diagnostic drain fails still contributes its status and
 headers. `Error::terminal()` exposes the failing stage for diagnostics without
 removing the history; classification must consume the complete error.
+`Error::redact_request_text()` replaces every free-text field that can quote
+the request URL (`Network`, `Tls`, `InvalidRequest` and the redirect messages,
+recursively through attempt history and local holds) with fixed text and drops
+boxed foreign sources, keeping variants, transmission states and response
+evidence, so the error classifies unchanged. It exists for requests whose URL
+is a credential, such as an upload session cancel.
 
 When history carries a possible commit on a non-replayable request, translation
 narrows idempotency and uses

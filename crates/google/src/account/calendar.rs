@@ -8,6 +8,10 @@
 //! module; it was skipped as already test-dense. A later auditor should read
 //! it fresh rather than assuming that sweep covered it.
 
+use bifrost_types::{
+    Application, ErrorScope, PartialCommitBuilder, PrimaryLeg, StepEffect, StepReplay, StepTargets,
+    TargetRef, TargetRole,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -16,8 +20,8 @@ use bifrost_types::{
     AccountErrorKind, Cause, Protocol, ProtocolErrorKind, TransmissionState, WireCause,
 };
 use bifrost_types::{
-    AttendeeRole, Calendar, CalendarEvent, CalendarId, CalendarProvenance, DiagnosticText,
-    EventAttendee, EventAvailability, EventCreate, EventId, EventOrganizer, EventPatch, EventRange,
+    AttendeeRole, Calendar, CalendarEvent, CalendarId, CalendarProvenance, EventAttendee,
+    EventAvailability, EventCreate, EventId, EventOrganizer, EventPatch, EventRange,
     EventRecurrence, EventSearchRequest, EventStatus, EventTime, EventVisibility, Page,
     ProtocolKind, RsvpStatus,
 };
@@ -291,9 +295,13 @@ pub(crate) fn update(
             Err(error) => Err(error),
         };
         result.map_err(|error| {
-            let error = event_error(error, AccountOperation::EventUpdate, target_event_id);
+            let error = event_error(
+                error,
+                AccountOperation::EventUpdate,
+                target_event_id.clone(),
+            );
             if moved {
-                event_move_patch_error(error)
+                moved_event_patch_error(error, &event, EventId(target_event_id))
             } else {
                 error
             }
@@ -1175,28 +1183,38 @@ fn event_move_url(
     )
 }
 
-// Record the successful first leg as support context while preserving the
-// second leg's classification. Replacing it with PartialResponse would change
-// recovery, turning a permanent 403 into reconciliation and discarding a 429
-// retry deadline. `event_error` already scopes the PATCH failure to the event
-// in its destination calendar. The public diagnostic supplies the continuation:
-// retry recovery applies to that destination PATCH, not the original composite
-// operation. Passing the destination id with the original patch skips the move.
-// Keep identifiers in the typed scope rather than diagnostic text.
-fn event_move_patch_error(error: AccountError) -> AccountError {
+/// A PATCH failed after the move committed. The PATCH leaf keeps its own
+/// classification (`leg_recovery`), re-addressed at the destination event;
+/// the committed move is `Blocking` because replaying the public update
+/// would move again from a source id that no longer exists.
+fn moved_event_patch_error(
+    error: AccountError,
+    source: &EventId,
+    destination: EventId,
+) -> AccountError {
+    let destination = ErrorScope::Event { id: destination };
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
+        StepEffect::Updated,
+        StepTargets::complete(vec![TargetRef::new(
+            TargetRole::Subject,
+            destination.clone(),
+        )]),
+        StepReplay::Repeatable,
+        Application::from_leaf(&error),
+    ));
+    record.committed(
+        StepEffect::Moved,
+        StepTargets::complete(vec![
+            TargetRef::new(TargetRole::Source, ErrorScope::Event { id: source.clone() }),
+            TargetRef::new(TargetRole::Destination, destination),
+        ]),
+        StepReplay::Blocking,
+    );
     error
         .into_builder()
-        .text(DiagnosticText::user_safe(
-            "The calendar move is already committed, but the field update failed. \
-             If recovery permits retrying, call event_update with the destination event id \
-             in this error's Calendar scope and the original patch. Do not retry with the \
-             original source event id. Retry advice and timing apply to the destination patch.",
-        ))
-        .text(DiagnosticText::support_only(
-            "event move succeeded but the destination field patch failed",
-        ))
+        .partial_commit(record)
         .try_build()
-        .expect("valid decorated Calendar move error")
+        .expect("valid calendar move record")
 }
 
 fn event_patch_has_non_move_fields(patch: &EventPatch) -> bool {
@@ -2502,13 +2520,9 @@ mod tests {
                 .any(|text| text.contains("denied")),
             "the provider's own diagnostic text must survive decoration"
         );
-        assert!(
-            error
-                .support_consented()
-                .support_text
-                .iter()
-                .any(|text| text.contains("event move succeeded")),
-            "support diagnostics record the completed first leg"
+        assert_eq!(
+            error.partial_commit().unwrap().steps()[0].effect(),
+            Some(StepEffect::Moved)
         );
 
         assert!(
@@ -2569,30 +2583,23 @@ mod tests {
             error.kind(),
             AccountErrorKind::Server(bifrost_types::ServerErrorKind::RateLimited)
         ));
-        let RecoveryClass::Retry(advice) = error.recovery() else {
-            panic!("the failed second leg retains retry recovery");
+        let RecoveryClass::Reconcile(advice) = error.recovery() else {
+            panic!("the operation protects the committed move");
         };
+        assert_eq!(
+            advice.guidance.actions,
+            [
+                bifrost_types::ReconcileAction::CheckTarget,
+                bifrost_types::ReconcileAction::ObserveOnly
+            ]
+        );
         assert!(matches!(
             advice.retry_hint,
             Some(bifrost_types::RetryHint::At(_))
         ));
         assert!(
-            error
-                .support_consented()
-                .support_text
-                .iter()
-                .any(|text| text.contains("event move succeeded")),
-            "the move context is added without replacing the retry hint"
+            matches!(error.leg_recovery(), RecoveryClass::Retry(a) if a.disposition == bifrost_types::RetryDisposition::SameRequest)
         );
-        assert_eq!(
-            advice.disposition,
-            bifrost_types::RetryDisposition::SameRequest
-        );
-        assert!(error.user_safe_text().any(|text| {
-            text.contains("already committed")
-                && text.contains("destination event id")
-                && text.contains("Do not retry")
-        }));
         let Some(bifrost_types::ErrorScope::Calendar { id }) = error.scope() else {
             panic!("continuation must name the destination event");
         };
@@ -2639,9 +2646,7 @@ mod tests {
             error.kind(),
             error.chain()
         );
-        assert!(error.user_safe_text().any(|text| {
-            text.contains("already committed") && text.contains("destination event id")
-        }));
+        assert!(error.partial_commit().is_some());
         assert_eq!(script.requests().len(), 3);
     }
 

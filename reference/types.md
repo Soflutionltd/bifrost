@@ -493,3 +493,16 @@ refusal for a supplied token and delegates to ordinary RSVP for `None`.
 Google Calendar enforces the caller ETag on its attendee PATCH. CalDAV RSVP
 sends a scheduling reply before a local resource PUT, so it cannot promise
 one atomic caller precondition for the whole operation and refuses tokens.
+
+## Partial write effects
+
+`error/partial.rs` exports PartialCommit, PartialCommitBuilder, PrimaryLeg,
+Step, StepOutcome, Compensation, CompensationOutcome, StepId, StepEffect,
+StepReplay, Application, StepTargets, TargetRef, TargetRole, OperationPlan,
+Prerequisites, PlannedDirective and ReplaySafety, plus the export shapes
+PartialCommitTelemetry, PartialCommitExport, StepExport and CompensationExport,
+from the error module and crate root.
+AccountError exposes the record, failed-leg recovery and per-leg throttle
+observations. The builder validates application and compensation evidence before
+freezing the derived operation plan. Telemetry and support tiers export the
+record at their respective consent levels; see `reference/error-model.md`.

@@ -28,6 +28,10 @@ use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, CloudUploadMeta, HostedAttachment, ShareScope,
     TransmissionState,
 };
+use bifrost_types::{
+    Application, CompensationOutcome, ErrorScope, PartialCommitBuilder, PrimaryLeg, StepEffect,
+    StepReplay, StepTargets, TargetRef, TargetRole,
+};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -213,13 +217,23 @@ const SESSION_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// drive item is gone, and deleting a session never deletes a created file;
 /// one that had not yet completed is stopped, which leaves the reconciliation
 /// that `InFlight` asks for a clean answer.
+///
+/// `None` means no cancel was attempted (shutdown had already fired), so the
+/// record carries no compensation. A shutdown that interrupts the cancel is an
+/// `InFlight` failure, which becomes an `Unconfirmed` compensation. An
+/// unfollowed 3xx is a contract violation with `Acknowledged` evidence, so a
+/// `Failed` compensation, never `Succeeded`.
+///
+/// A failure comes back through [`without_session_url`]: it is kept as the
+/// record's compensation outcome, which reaches support exports, and the
+/// transport's error text names the session URL, which is the credential.
 async fn cancel_upload_session(
     client: &GraphClient,
     upload_url: &UploadUrl,
     shutdown: &tokio_util::sync::CancellationToken,
-) {
+) -> Option<Result<(), GraphError>> {
     if shutdown.is_cancelled() {
-        return;
+        return None;
     }
     let cancel = client.execute_aux(
         Resource::Unmetered,
@@ -233,12 +247,36 @@ async fn cancel_upload_session(
     let outcome = tokio::select! {
         biased;
         outcome = cancel => outcome,
-        () = shutdown.cancelled() => return,
+        () = shutdown.cancelled() => return Some(Err(shutdown_during_upload(TransmissionState::InFlight))),
     };
-    if outcome.is_err() {
-        // The error is not logged: a transport message can name the URL,
-        // which is the session credential.
-        tracing::debug!("OneDrive upload session cancel failed; the session will expire");
+    Some(match outcome {
+        // The DELETE is sent with redirects disabled (`AuxTarget::Anonymous`),
+        // so a 3xx is the answer itself: a real response that did not accept
+        // the cancel, not a cancelled session. Classified like the chunk PUT's
+        // redirect, naming the status only, since a `Location` kept in the
+        // compensation would reach support exports and may carry the session
+        // credential. bifrost-net resolves 4xx/5xx into an `Err` before a
+        // response surfaces, so a 2xx is the only acceptance.
+        Ok(response) if !response.status.is_success() => Err(contract_violation(format!(
+            "OneDrive answered the upload session cancel with {}, which does not \
+             cancel the session",
+            response.status
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) => Err(without_session_url(error)),
+    })
+}
+
+/// `error` with the transport text that can quote the request URL withheld
+/// (`bifrost_net::Error::redact_request_text`), classifying as before.
+fn without_session_url(error: GraphError) -> GraphError {
+    match error {
+        GraphError::Net(net) => GraphError::Net(net.redact_request_text()),
+        GraphError::MailboxThrottled { budget, source } => GraphError::MailboxThrottled {
+            budget,
+            source: Box::new(without_session_url(*source)),
+        },
+        other => other,
     }
 }
 
@@ -284,7 +322,7 @@ pub(crate) fn host_attachment(
         }
         upload_and_link(&account, bytes, meta)
             .await
-            .map_err(|e| into_account_error(e, ctx()))
+            .map_err(upload_failure_error)
     })
 }
 
@@ -292,24 +330,157 @@ fn ctx() -> GraphErrorContext {
     GraphErrorContext::graph(AccountOperation::HostAttachment)
 }
 
+/// What an upload had done when it failed, for the partial-commit record.
+/// Every effect is `Repeatable` relative to hosting an attachment: a replay
+/// leaves at most another expiring session or unlinked file.
+#[derive(Default)]
+struct UploadFacts {
+    session: bool,
+    chunks: usize,
+    final_chunk: bool,
+    file: Option<String>,
+    cancel: Option<Result<(), GraphError>>,
+}
+struct UploadFailure {
+    error: GraphError,
+    facts: UploadFacts,
+    effect: Option<StepEffect>,
+}
+fn session_targets() -> StepTargets {
+    StepTargets::at_least(vec![TargetRef::new(
+        TargetRole::Subject,
+        ErrorScope::UploadSession,
+    )])
+}
+fn file_targets(id: Option<&str>) -> StepTargets {
+    id.map_or_else(StepTargets::unknown, |id| {
+        StepTargets::complete(vec![TargetRef::new(
+            TargetRole::Subject,
+            ErrorScope::CloudFile { id: id.to_owned() },
+        )])
+    })
+}
+/// The plain leaf when no session could exist; otherwise the leaf with the
+/// session, accepted chunks, cancel compensation and any created file. An
+/// admission refusal is an effectless primary with no compensation (no
+/// cancel is sent to an untrusted URL); a final-chunk failure is a
+/// `Created(CloudFile)` primary the session cancel does not reverse.
+fn upload_failure_error(failure: UploadFailure) -> AccountError {
+    let UploadFailure {
+        error,
+        facts,
+        effect,
+    } = failure;
+    let error = into_account_error(error, ctx());
+    let application = Application::from_leaf(&error);
+    if !facts.session && application != Application::Uncertain {
+        return error;
+    }
+    let targets = if !facts.session || effect == Some(StepEffect::Updated) {
+        session_targets()
+    } else {
+        file_targets(facts.file.as_deref())
+    };
+    let primary = effect.map_or_else(
+        || PrimaryLeg::effectless(targets.clone()),
+        |effect| PrimaryLeg::new(effect, targets.clone(), StepReplay::Repeatable, application),
+    );
+    let mut record = PartialCommitBuilder::new(primary);
+    if facts.session {
+        let session = record.committed(
+            StepEffect::Created,
+            session_targets(),
+            StepReplay::Repeatable,
+        );
+        for _ in 0..facts.chunks {
+            record.committed(
+                StepEffect::Updated,
+                session_targets(),
+                StepReplay::Repeatable,
+            );
+        }
+        if let Some(cancel) = facts.cancel {
+            record.compensation(
+                StepEffect::Deleted,
+                session_targets(),
+                vec![session],
+                match cancel {
+                    Ok(()) => CompensationOutcome::Succeeded,
+                    Err(e) => CompensationOutcome::from_error(into_account_error(e, ctx())),
+                },
+            );
+        }
+    }
+    if let Some(file) = facts.file {
+        record.committed(
+            StepEffect::Created,
+            file_targets(Some(&file)),
+            StepReplay::Repeatable,
+        );
+    }
+    error
+        .into_builder()
+        .partial_commit(record)
+        .try_build()
+        .expect("valid OneDrive progress")
+}
 async fn upload_and_link(
     account: &GraphAccount,
     bytes: Bytes,
     meta: CloudUploadMeta,
-) -> Result<HostedAttachment, GraphError> {
+) -> Result<HostedAttachment, UploadFailure> {
     let client = &account.client;
-    let session = create_upload_session(client, &meta.file_name).await?;
-    let upload_url = admit_upload_url(client, &session.upload_url)?;
-    let item_id = upload_file_chunked(
+    let mut facts = UploadFacts::default();
+    let session = create_upload_session(client, &meta.file_name)
+        .await
+        .map_err(|error| UploadFailure {
+            error,
+            facts: UploadFacts::default(),
+            effect: Some(StepEffect::Created),
+        })?;
+    facts.session = true;
+    let upload_url = match admit_upload_url(client, &session.upload_url) {
+        Ok(url) => url,
+        Err(error) => {
+            return Err(UploadFailure {
+                error,
+                facts,
+                effect: None,
+            });
+        }
+    };
+    let uploaded = upload_file_chunked(
         client,
         &upload_url,
         bytes,
         DEFAULT_CHUNK_SIZE,
         &account.shutdown,
+        &mut facts,
     )
-    .await?;
-    let share_url = create_sharing_link(client, &item_id, meta.scope).await?;
-
+    .await;
+    let item_id = match uploaded {
+        Ok(id) => id,
+        Err(error) => {
+            let effect = Some(if facts.final_chunk {
+                StepEffect::Created
+            } else {
+                StepEffect::Updated
+            });
+            return Err(UploadFailure {
+                error,
+                facts,
+                effect,
+            });
+        }
+    };
+    facts.file = Some(item_id.clone());
+    let share_url = create_sharing_link(client, &item_id, meta.scope)
+        .await
+        .map_err(|error| UploadFailure {
+            error,
+            facts,
+            effect: Some(StepEffect::Created),
+        })?;
     Ok(HostedAttachment::new(share_url, item_id))
 }
 
@@ -362,13 +533,16 @@ async fn create_upload_session(
 /// report the expiry as a provider parse failure the provider never caused.
 ///
 /// A failed upload cancels its session (`cancel_upload_session`) before the
-/// failure is returned, unchanged.
+/// failure is returned, unchanged. Progress for the partial-commit record
+/// (accepted chunks, whether the final chunk was in flight, the cancel
+/// outcome) is written into `facts`.
 async fn upload_file_chunked(
     client: &GraphClient,
     upload_url: &UploadUrl,
     data: Bytes,
     chunk_size: usize,
     shutdown: &tokio_util::sync::CancellationToken,
+    facts: &mut UploadFacts,
 ) -> Result<String, GraphError> {
     // Defensive guard over the caller-supplied chunk size; the sole caller
     // passes the `DEFAULT_CHUNK_SIZE` constant, so this is a producer-bug
@@ -379,11 +553,14 @@ async fn upload_file_chunked(
     );
 
     let deadline = tokio::time::Instant::now() + UPLOAD_TOTAL_TIMEOUT;
-    upload_or_cancel(client, upload_url, data, chunk_size, shutdown, deadline).await
+    upload_or_cancel(
+        client, upload_url, data, chunk_size, shutdown, deadline, facts,
+    )
+    .await
 }
 
-/// [`upload_chunks`], then the session cancel if it failed. The failure is
-/// returned unchanged.
+/// [`upload_chunks`], then the session cancel if it failed, its outcome kept
+/// in `facts.cancel`. The failure is returned unchanged.
 async fn upload_or_cancel(
     client: &GraphClient,
     upload_url: &UploadUrl,
@@ -391,14 +568,21 @@ async fn upload_or_cancel(
     chunk_size: usize,
     shutdown: &tokio_util::sync::CancellationToken,
     deadline: tokio::time::Instant,
+    facts: &mut UploadFacts,
 ) -> Result<String, GraphError> {
-    let uploaded = upload_chunks(client, upload_url, data, chunk_size, shutdown, deadline).await;
+    let uploaded = upload_chunks(
+        client, upload_url, data, chunk_size, shutdown, deadline, facts,
+    )
+    .await;
     if uploaded.is_err() {
-        cancel_upload_session(client, upload_url, shutdown).await;
+        facts.cancel = cancel_upload_session(client, upload_url, shutdown).await;
     }
     uploaded
 }
 
+/// The chunk loop. `facts.chunks` counts non-final chunks the server
+/// acknowledged with 202; `facts.final_chunk` is true while the chunk that
+/// would create the drive item is in flight.
 async fn upload_chunks(
     client: &GraphClient,
     upload_url: &UploadUrl,
@@ -406,6 +590,7 @@ async fn upload_chunks(
     chunk_size: usize,
     shutdown: &tokio_util::sync::CancellationToken,
     deadline: tokio::time::Instant,
+    facts: &mut UploadFacts,
 ) -> Result<String, GraphError> {
     // Empty payloads are rejected up front in `host_attachment`, so by here the
     // data is non-empty and the loop always runs at least once.
@@ -427,6 +612,7 @@ async fn upload_chunks(
             }));
         }
         let end = (offset + chunk_size).min(total);
+        facts.final_chunk = end == total;
         let chunk = data.slice(offset..end);
         let content_range = format!("bytes {offset}-{}/{total}", end - 1);
 
@@ -485,7 +671,10 @@ async fn upload_chunks(
             // The server is allowed to accept fewer bytes than the chunk we
             // PUT, so there is no safe default: a 202 without a valid offset
             // inside `offset..=end` is refused, never resumed at `end`.
-            202 => offset = admitted_resume_offset(&response.body, offset, end, total)?,
+            202 => {
+                offset = admitted_resume_offset(&response.body, offset, end, total)?;
+                facts.chunks += 1;
+            }
             // A redirect. The chunk PUT is sent with redirects disabled (the
             // session URL was admitted under a rule no hop is checked
             // against), so every 3xx arrives here. Graph's resumable upload
@@ -601,6 +790,47 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     const SESSION_URL: &str = "https://upload.example/session/abc?token=preauth";
+
+    // The production upload path without its progress out-parameter, so the
+    // tests below exercise the same composition `upload_and_link` runs.
+    async fn upload_file_chunked(
+        client: &GraphClient,
+        upload_url: &UploadUrl,
+        data: Bytes,
+        chunk_size: usize,
+        shutdown: &CancellationToken,
+    ) -> Result<String, GraphError> {
+        let mut facts = UploadFacts::default();
+        super::upload_file_chunked(client, upload_url, data, chunk_size, shutdown, &mut facts).await
+    }
+    async fn upload_or_cancel(
+        client: &GraphClient,
+        upload_url: &UploadUrl,
+        data: Bytes,
+        chunk_size: usize,
+        shutdown: &CancellationToken,
+        deadline: tokio::time::Instant,
+    ) -> Result<String, GraphError> {
+        let mut facts = UploadFacts::default();
+        super::upload_or_cancel(
+            client, upload_url, data, chunk_size, shutdown, deadline, &mut facts,
+        )
+        .await
+    }
+    async fn upload_chunks(
+        client: &GraphClient,
+        upload_url: &UploadUrl,
+        data: Bytes,
+        chunk_size: usize,
+        shutdown: &CancellationToken,
+        deadline: tokio::time::Instant,
+    ) -> Result<String, GraphError> {
+        let mut facts = UploadFacts::default();
+        super::upload_chunks(
+            client, upload_url, data, chunk_size, shutdown, deadline, &mut facts,
+        )
+        .await
+    }
 
     /// `SESSION_URL`, through the same admission production applies.
     fn session(client: &GraphClient) -> UploadUrl {
@@ -976,7 +1206,7 @@ mod tests {
     /// chunk PUT went out to the plain-http URL, consuming the scripted
     /// response this test deliberately does not provide.
     #[tokio::test]
-    async fn an_unsafe_upload_url_is_refused_before_any_byte_is_sent() {
+    async fn partial_commit_upload_admission_refusal_keeps_the_session() {
         for upload_url in [
             "http://upload.example/session/abc?token=preauth",
             "https://user:secret@upload.example/session/abc",
@@ -1005,6 +1235,10 @@ mod tests {
             )
             .await
             .expect_err("the upload URL is refused");
+            let record = error.partial_commit().expect("session already created");
+            assert_eq!(record.primary().effect, None);
+            assert_eq!(record.steps()[0].effect(), Some(StepEffect::Created));
+            assert!(record.compensations().is_empty());
             assert_eq!(
                 error.kind(),
                 &bifrost_types::AccountErrorKind::Protocol(
@@ -1276,6 +1510,48 @@ mod tests {
         assert_cancelled_once(&client, 1);
     }
 
+    /// The cancel DELETE is sent with redirects disabled, so an unfollowed
+    /// 3xx comes back as the response itself. That is OneDrive answering
+    /// without accepting the cancel: a `Failed` compensation, as Google
+    /// records the same case, never a cancelled session. Its evidence names
+    /// the status only, so a `Location` (which may carry the session
+    /// credential) never reaches an export. Against the old code any `Ok`
+    /// response was recorded as `Succeeded`.
+    #[tokio::test]
+    async fn partial_commit_upload_session_cancel_redirect_is_a_failed_compensation() {
+        let (client, error) = host_with([
+            accepted(json!({ "nextExpectedRanges": ["20-"] })),
+            ScriptedRestResponse::text(reqwest::StatusCode::PERMANENT_REDIRECT, "moved")
+                .with_header(
+                    "Location",
+                    "https://elsewhere.example/landing?token=preauth",
+                ),
+        ])
+        .await;
+        assert_cancelled_once(&client, 1);
+
+        let record = error.partial_commit().expect("the session was created");
+        let [compensation] = record.compensations() else {
+            panic!("one cancel compensation: {record:?}");
+        };
+        let CompensationOutcome::Failed(cancel) = compensation.outcome() else {
+            panic!("a redirected cancel did not cancel the session: {compensation:?}");
+        };
+        assert_eq!(
+            cancel.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation
+            )
+        );
+        for export in [
+            format!("{error:?}"),
+            format!("{:?}", error.support_internal()),
+            format!("{:?}", cancel.support_internal()),
+        ] {
+            assert!(!export.contains("elsewhere.example"), "{export}");
+        }
+    }
+
     /// A chunk the server refuses with an error status cancels the session
     /// too, and a cancel that itself fails does not replace the upload's
     /// error.
@@ -1292,6 +1568,65 @@ mod tests {
             &bifrost_types::AccountErrorKind::ConcurrencyConflict
         );
         assert_cancelled_once(&client, 1);
+    }
+
+    /// The session URL is the upload credential, and the transport copies
+    /// the HTTP stack's error text, which names the URL, into a transport
+    /// failure. A failed cancel is kept as the record's compensation, so
+    /// that text would reach every export of the error; it is withheld,
+    /// while the compensation still classifies as a transport failure.
+    #[tokio::test]
+    async fn a_failed_cancel_compensation_does_not_carry_the_session_url() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "uploadUrl": SESSION_URL, "expirationDateTime": "2099-01-01T00:00:00Z" }),
+        )]);
+        client.script_aux([ScriptedRestResponse::empty(reqwest::StatusCode::CONFLICT)]);
+        client.script_wire(
+            [bifrost_net::test_support::Canned::Error(
+                bifrost_net::Error::Network {
+                    message: format!("error sending request for url ({SESSION_URL})"),
+                    transmission_state: TransmissionState::Unsent,
+                    source: None,
+                },
+            )],
+            bifrost_net::RetryPolicy::disabled(),
+        );
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let payload = Bytes::from_static(b"0123456789AB");
+        let error = host_attachment(
+            account,
+            payload.clone(),
+            CloudUploadMeta::new(
+                "a.txt",
+                "text/plain",
+                payload.len() as u64,
+                ShareScope::Organization,
+            ),
+        )
+        .await
+        .expect_err("the upload fails");
+        assert_cancelled_once(&client, 1);
+
+        let record = error.partial_commit().expect("the session was created");
+        let [compensation] = record.compensations() else {
+            panic!("one cancel compensation: {record:?}");
+        };
+        let CompensationOutcome::Failed(cancel) = compensation.outcome() else {
+            panic!("an unsent cancel failed: {compensation:?}");
+        };
+        assert_eq!(
+            cancel.kind(),
+            &bifrost_types::AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network)
+        );
+        for export in [
+            format!("{error:?}"),
+            format!("{:?}", error.support_internal()),
+            format!("{:?}", cancel.support_internal()),
+        ] {
+            assert!(!export.contains("upload.example"), "{export}");
+        }
     }
 
     /// The upload budget running out is exactly when a cancel matters, and

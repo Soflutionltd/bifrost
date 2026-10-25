@@ -180,6 +180,7 @@ fn log_reconcile_advice(
         .map(|a| match a {
             ReconcileAction::CheckTarget => "check-target",
             ReconcileAction::DedupeByClientId => "dedupe-by-client-id",
+            ReconcileAction::ObserveOnly => "observe-only",
             // `ReconcileAction` is `#[non_exhaustive]`; new variants
             // are surfaced as a stable tag so dashboards don't lose
             // signal silently.

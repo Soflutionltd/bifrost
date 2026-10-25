@@ -8,6 +8,8 @@
 //! - per-id accumulation through `ItemOutcome<MutationSuccess>` lanes
 //!   (applied / skipped / downgraded / failed_terminal / pending_retry /
 //!   pending_readback / blocked_by_engine),
+//! - append-only partial-commit observations, independent of requested-state
+//!   satisfaction and retained across attempts,
 //! - retry on `RecoveryPlan::Retry`, respecting each cohort's `RetryAdvice`
 //!   deadline and resubmitting with its frozen key, within a campaign-wide
 //!   retry target allowance,
@@ -44,6 +46,9 @@ pub use readback::{
 /// the contract.
 #[derive(Debug, Default, Clone)]
 pub struct MutationCounters {
+    /// Append-only observations, not unique effects. Repeated attempts may
+    /// report the same effect; requested-state satisfaction never clears these.
+    pub partial_commit_observations: Vec<PartialCommitObservation>,
     /// First campaign failure, with all counters retained. Preflight failures
     /// (such as an unattached account) still use the method's `Err` return.
     pub error: Option<std::sync::Arc<crate::error::Error>>,
@@ -120,4 +125,11 @@ pub mod fanout {
             }
         })
     }
+}
+
+/// A partial write observed during a campaign, retained even after read-back.
+#[derive(Debug, Clone)]
+pub struct PartialCommitObservation {
+    pub target: Option<bifrost_types::ObjectId>,
+    pub error: bifrost_types::AccountError,
 }

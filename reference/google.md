@@ -181,24 +181,22 @@ Internal modules:
   session creation is allowed to finish so its response can supply the cleanup
   URI, and completed uploads finish their sharing leg. Cleanup uses one
   un-retried `DELETE` against the session URI, bounded by its
-  own deadline (`GDRIVE_CANCEL_TIMEOUT`), whose own failure is swallowed rather than replacing the
-  error the caller needs. Google's accepted-cancel status is `499`, which
-  bifrost-net surfaces as `Err(Status)` and not `Ok`; `499`, `404` and
-  `410` all count as cancelled. A 3xx answer to the cancel is not followed
-  and is not an accepted cancel: the session counts as abandoned. When the cancel fails, the original
-  `AccountError` is decorated through `into_builder` with support-only
-  text recording the abandoned session - decoration only, so kind,
-  message key and `RecoveryClass` are unchanged, and the pre-authenticated
-  session URI is deliberately kept out of that text. The failure is not
-  reclassified to `Protocol(PartialResponse)` / `Acknowledged`: Drive publishes
-  no file until the upload completes, so there is no target for a `CheckTarget`
-  / `DedupeByClientId` directive to name, and the reclassification would demote
-  a transient transport drop out of its retry lane. A link-step
-  failure after a completed upload leaves an uploaded-but-unlinked file
-  and no session, so it takes no cleanup path. Accepted residual: a caller
-  who drops the future mid-upload gets no cancel, because `Drop` cannot
-  await, and spawning the DELETE from `drop` would trade an expiring
-  session for a detached task outliving the account handle.
+  own deadline (`GDRIVE_CANCEL_TIMEOUT`). Its success, failure or unconfirmed
+  outcome is a typed compensation of the session step; it never replaces the
+  primary error. 499, 404 and 410 confirm cancellation. An unfollowed redirect
+  is a Failed compensation with its actual response error; an unadmitted URL
+  sends no cancel and records no compensation. Session creation, accepted chunks,
+  the completed file and the sharing permission are separate historical effects.
+  Non-final failed chunks update UploadSession; a failed final chunk creates an
+  incompletely identified CloudFile. A successful permission POST followed by a
+  failed webViewLink GET has an effectless primary and a committed permission.
+  These effects are Repeatable relative to hosting: replay may leave expiring
+  sessions or unlinked files, so recovery follows the failed leg. No session URL
+  enters scopes, and a failed cancel passes through
+  `bifrost_net::Error::redact_request_text` before it becomes the compensation,
+  so the transport's error text cannot carry the URL into an export. A successful session status without a usable
+  Location raises application to Uncertain, because the session may exist.
+  Dropping the future cannot await cancellation and spawns no detached cleanup.
 - `error.rs` - translation boundary from `crate::Error` to
   `AccountError` via the central `AccountErrorBuilder`.
 
@@ -633,12 +631,12 @@ fields and additional name entries. Custom email and phone labels use People
 before `searchContacts` so the cache is populated after mutations; a transient
 warmup failure is ignored because it only primes the cache, while terminal
 failures propagate. If modeled fields are acknowledged but a requested photo
-update or deletion then fails, support-only diagnostic context records that
-fields were updated. The photo error is decorated through `into_builder`,
-preserving its kind, contact scope, transmission evidence, recovery inputs,
-and retry timing. Permission refusals remain terminal, authentication loss
-still requires reauthorization, and throttling retains its retry hint.
-The earlier field write does not acknowledge the separate photo request. The account
+update or deletion then fails, the error records the committed Repeatable
+Updated contact effect with the photo request as its own Updated primary.
+Application comes from the photo leaf; the original kind, scope, transmission,
+recovery and timing are preserved. Replay refetches source metadata and converges
+on the requested values; versioned photo updates are refused before I/O.
+The account
 exposes the synthetic `google:contacts` address book plus People
 `contactGroups.list` groups. List/search accept no id, `google:contacts`, or
 `contactGroups/*` ids; group-scoped queries filter returned contacts by
@@ -746,9 +744,8 @@ the field patch is rejected, so the common malformed time shapes are refused
 before the first leg. Accepted limit: the `timezone` NAME is not validated (no
 time-zone database is carried, and a false refusal is worse than Google's
 400), so an unknown zone combined with a calendar move can still leave the
-event moved with a failed destination patch. That PATCH error retains its
-original classification and receives a user-safe continuation naming the
-destination scope as the retry target, plus support-only move context.
+event moved with a failed destination patch. That PATCH error retains its leaf classification and records the Blocking
+Moved effect plus the destination Updated primary.
 RSVP patches only `attendees` and re-sends no time.
 Projection failures are per item, not per page. `page_from_events` routes a
 refused event onto `Page::failed_ids` under its composite native id and
@@ -766,21 +763,13 @@ calendar, then applies any remaining field patch against the destination.
 Patch-local validation runs before the move, so a patch that could never
 be applied cannot strand the event in the destination calendar.
 That provider operation is non-atomic. If the move succeeds and the field
-PATCH fails, the returned error preserves the PATCH's original kind, recovery
-class and retry hint. Its `ErrorScope::Calendar` names the event under its
-*destination* calendar, and support-only text records the successful move.
-A user-safe diagnostic states that the move is already committed and tells
-the caller to continue with `event_update(destination_event_id, original_patch)`
-using the id from that scope, only when recovery permits retrying. The original
-source id must not be replayed. The destination id matches `patch.calendar_id`,
-so continuation skips `events.move` and sends only the field PATCH. Retry
-advice (including `SameRequest`) describes that destination PATCH; it does not
-authorize replay of the original composite call. This preserves permanent
-authorization failures, authentication recovery and rate-limit deadlines.
-The error model has no typed continuation field; callers must use the scoped
-id together with this public diagnostic.
-There is no compensating move because that would add another blind write and
-another partial-failure window.
+PATCH fails, the returned error preserves the PATCH's leaf classification,
+chain, hint and destination scope. A committed Blocking Moved step names source
+and destination Event ids; the Repeatable Updated primary names the destination.
+The operation recovery protects replay with PartialCommit, CheckTarget and
+ObserveOnly for retryable leaves, while leg_recovery preserves the PATCH advice.
+Auth/permission and terminal leaves retain their class with the record.
+No compensating move is issued.
 A present `EventPatch.recurrence` always writes the `recurrence` key; an
 empty `EventRecurrence` sends `[]` (the Google idiom for clearing
 RRULE/RDATE/EXDATE), while an absent recurrence patch omits the key.
@@ -1838,3 +1827,12 @@ Gmail's classifier can re-add IMPORTANT after a write, making a target
 unsatisfiable. After an uncertain write, such a target can spend its remaining
 attempt budget on writes that cannot stick. This bounded futility is accepted,
 like label-snapshot staleness.
+
+## Multi-step producer audit
+
+Calendar move/PATCH, People fields/photo and Drive hosting attach partial-commit
+records. Gmail chunked batchModify already reports per-item success, failure and
+uncertainty, as do bulk mutation streams. Reaction reads have no write effects.
+Single-request event/contact/filter creates are outside this multi-step contract,
+including acknowledged creates without a usable id. Other event/contact writes
+are single requests and need no multi-step record.

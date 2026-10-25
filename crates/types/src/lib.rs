@@ -115,6 +115,13 @@ pub use cursor::{
     SyncStrategy,
 };
 
+pub use error::partial::{
+    Application, Compensation, CompensationExport, CompensationOutcome, OperationPlan,
+    PartialCommit, PartialCommitBuilder, PartialCommitExport, PartialCommitTelemetry,
+    PlannedDirective, Prerequisites, PrimaryLeg, ReplaySafety, Step, StepEffect, StepExport,
+    StepId, StepOutcome, StepReplay, StepTargets, TargetRef, TargetRole,
+};
+
 // Error + recovery vocabulary.
 pub use error::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuildError, AccountErrorBuilder,

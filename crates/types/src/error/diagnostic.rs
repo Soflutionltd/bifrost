@@ -108,6 +108,7 @@ pub struct TelemetryView<'a> {
     pub reconcile_actions: &'a [ReconcileAction],
     pub transmission_state: Option<TransmissionState>,
     pub operation: Option<AccountOperation>,
+    pub partial_commit: Option<super::partial::PartialCommitTelemetry>,
 }
 
 pub type SupportExportMinimal<'a> = TelemetryView<'a>;
@@ -118,12 +119,14 @@ pub struct SupportExportConsented<'a> {
     pub user_safe_text: Vec<&'a str>,
     pub support_text: Vec<&'a str>,
     pub scope: Option<&'a ErrorScope>,
+    pub partial_commit: Option<super::partial::PartialCommitExport<'a>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SupportExportInternal<'a> {
     pub consented: SupportExportConsented<'a>,
     pub chain: Vec<CauseSummary<'a>>,
+    pub partial_commit_chains: Vec<(super::partial::StepId, Vec<CauseSummary<'a>>)>,
 }
 
 pub(crate) fn account_kind_discriminant(kind: &AccountErrorKind) -> &'static str {

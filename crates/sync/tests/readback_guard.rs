@@ -3816,3 +3816,176 @@ async fn an_uncertain_operation_local_retry_hint_delays_the_read_back() {
     assert_eq!(state.doors.lock().unwrap().len(), 2);
     assert_eq!(counters.applied, 1);
 }
+
+fn partial_error(leaf: AccountError, replay: bifrost_types::StepReplay) -> AccountError {
+    use bifrost_types::{Application, PartialCommitBuilder, PrimaryLeg, StepEffect, StepTargets};
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
+        StepEffect::Updated,
+        StepTargets::unknown(),
+        bifrost_types::StepReplay::Repeatable,
+        Application::from_leaf(&leaf),
+    ));
+    record.committed(StepEffect::Copied, StepTargets::complete(vec![]), replay);
+    leaf.into_builder()
+        .partial_commit(record)
+        .try_build()
+        .unwrap()
+}
+#[tokio::test(start_paused = true)]
+async fn a_blocking_partial_commit_is_read_back_not_resubmitted() {
+    let error = partial_error(retryable_transport(), bifrost_types::StepReplay::Blocking);
+    assert!(
+        matches!(error.recovery(),bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions==[bifrost_types::ReconcileAction::CheckTarget,bifrost_types::ReconcileAction::ObserveOnly])
+    );
+    let state = reassert_state(&["a"], vec![round(&["a"], ItemScript::Failed(error))]);
+    let (engine, id) = reassert_engine(&state, 3, 10, true, None).await;
+    let counters = cohort_run(&engine, &id, &["a"]).await.unwrap();
+    assert_eq!(state.doors.lock().unwrap().len(), 1);
+    assert_eq!(state.reads.lock().unwrap().len(), 1);
+    assert_eq!(counters.dedupe_by_client_id, 0);
+    assert_eq!(counters.partial_commit_observations.len(), 1);
+    assert_eq!(counters.pending_retry, 1);
+}
+#[tokio::test(start_paused = true)]
+async fn a_repeatable_partial_commit_keeps_the_retry_queue() {
+    let error = partial_error(retryable_transport(), bifrost_types::StepReplay::Repeatable);
+    assert!(error.recovery().is_retryable());
+    let state = reassert_state(
+        &["a"],
+        vec![
+            round(&["a"], ItemScript::Failed(error)),
+            round(&["a"], ItemScript::Applied),
+        ],
+    );
+    let (engine, id) = reassert_engine(&state, 2, 10, true, None).await;
+    let counters = cohort_run(&engine, &id, &["a"]).await.unwrap();
+    assert_eq!(state.doors.lock().unwrap().len(), 2);
+    assert!(state.reads.lock().unwrap().is_empty());
+    assert_eq!(counters.applied, 1);
+    assert_eq!(counters.partial_commit_observations.len(), 1);
+    assert_eq!(counters.dedupe_by_client_id, 0);
+}
+#[tokio::test(start_paused = true)]
+async fn partial_commit_observations_survive_a_later_plain_failure() {
+    let error = partial_error(retryable_transport(), bifrost_types::StepReplay::Repeatable);
+    let state = reassert_state(
+        &["a"],
+        vec![
+            round(&["a"], ItemScript::Failed(error)),
+            round(
+                &["a"],
+                ItemScript::Failed(unsupported(bifrost_types::AccountOperation::UpdateFlags)),
+            ),
+        ],
+    );
+    let (engine, id) = reassert_engine(&state, 2, 10, true, None).await;
+    let counters = cohort_run(&engine, &id, &["a"]).await.unwrap();
+    assert_eq!(counters.failed_terminal, 1);
+    assert_eq!(counters.partial_commit_observations.len(), 1);
+    assert_eq!(
+        counters.partial_commit_observations[0].target,
+        Some(ObjectId("a".into()))
+    );
+}
+#[tokio::test(start_paused = true)]
+async fn a_terminal_partial_commit_keeps_its_observation() {
+    let error = partial_error(
+        unsupported(bifrost_types::AccountOperation::UpdateFlags),
+        bifrost_types::StepReplay::Blocking,
+    );
+    let state = reassert_state(&["a"], vec![round(&["a"], ItemScript::Failed(error))]);
+    let (engine, id) = reassert_engine(&state, 2, 10, true, None).await;
+    let counters = cohort_run(&engine, &id, &["a"]).await.unwrap();
+    assert_eq!(counters.failed_terminal, 1);
+    assert_eq!(counters.partial_commit_observations.len(), 1);
+    assert_eq!(state.doors.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_compensation_throttle_is_held_under_its_own_scope() {
+    use bifrost_types::{
+        Application, CompensationOutcome, PartialCommitBuilder, PrimaryLeg, RetryHint, ServerCause,
+        ServerErrorKind, StepEffect, StepReplay, StepTargets, ThrottleBudget, ThrottleKey,
+    };
+    let primary = retryable_transport();
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
+        StepEffect::Updated,
+        StepTargets::unknown(),
+        StepReplay::Repeatable,
+        Application::from_leaf(&primary),
+    ));
+    let id = record.committed(
+        StepEffect::Created,
+        StepTargets::unknown(),
+        StepReplay::Repeatable,
+    );
+    let cleanup = AccountErrorBuilder::new(
+        AccountErrorKind::Server(ServerErrorKind::RateLimited),
+        Cause::Server(ServerCause::RateLimited {
+            retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(37))),
+        }),
+    )
+    .throttle_budget(ThrottleBudget::new("cleanup"))
+    .try_build()
+    .unwrap();
+    record.compensation(
+        StepEffect::Deleted,
+        StepTargets::unknown(),
+        vec![id],
+        CompensationOutcome::Unconfirmed(cleanup),
+    );
+    let error = primary
+        .into_builder()
+        .partial_commit(record)
+        .try_build()
+        .unwrap();
+    let state = reassert_state(
+        &["a"],
+        vec![
+            round(&["a"], ItemScript::Failed(error)),
+            round(&["a"], ItemScript::Applied),
+        ],
+    );
+    state.keys.lock().unwrap().insert(
+        ObjectId("a".into()),
+        ThrottleKey::Budget(ThrottleBudget::new("cleanup")),
+    );
+    let (engine, account) = reassert_engine(&state, 2, 10, true, None).await;
+    let start = tokio::time::Instant::now();
+    let counters = cohort_run(&engine, &account, &["a"]).await.unwrap();
+    assert!(start.elapsed() >= std::time::Duration::from_secs(37));
+    assert_eq!(counters.applied, 1);
+    assert_eq!(counters.partial_commit_observations.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn partial_commit_termination_is_one_observation_without_a_target() {
+    let script = RoundScript {
+        termination: Some(partial_error(
+            unsupported(bifrost_types::AccountOperation::UpdateFlags),
+            bifrost_types::StepReplay::Blocking,
+        )),
+        ..Default::default()
+    };
+    let state = reassert_state(&["a", "b"], vec![script]);
+    let (engine, id) = reassert_engine(&state, 2, 10, true, None).await;
+    let counters = cohort_run(&engine, &id, &["a", "b"]).await.unwrap();
+    assert_eq!(counters.partial_commit_observations.len(), 1);
+    assert!(counters.partial_commit_observations[0].target.is_none());
+}
+#[tokio::test(start_paused = true)]
+async fn partial_commit_observations_are_not_deduplicated_across_attempts() {
+    let error = partial_error(retryable_transport(), bifrost_types::StepReplay::Repeatable);
+    let state = reassert_state(
+        &["a"],
+        vec![
+            round(&["a"], ItemScript::Failed(error.clone())),
+            round(&["a"], ItemScript::Failed(error)),
+            round(&["a"], ItemScript::Applied),
+        ],
+    );
+    let (engine, id) = reassert_engine(&state, 2, 10, true, None).await;
+    let counters = cohort_run(&engine, &id, &["a"]).await.unwrap();
+    assert_eq!(counters.applied, 1);
+    assert_eq!(counters.partial_commit_observations.len(), 2);
+}

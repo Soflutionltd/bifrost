@@ -1,3 +1,7 @@
+use bifrost_types::{
+    Application, CompensationOutcome, ErrorScope, PartialCommitBuilder, PrimaryLeg, StepEffect,
+    StepReplay, StepTargets, TargetRef, TargetRole,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -124,7 +128,8 @@ pub(crate) fn set_keyword<T: HttpTransport>(
     Box::pin(async move {
         let ids = resolve_target(&mail, target, AccountOperation::SetKeyword).await?;
         let batch_size = super::factory::max_objects_in_set(&mail.client().session());
-        for (index, chunk) in ids.chunks(batch_size).enumerate() {
+        let mut progress = SetProgress::default();
+        for chunk in ids.chunks(batch_size) {
             let keyword_for_set = keyword.clone();
             let ids_for_set = chunk.to_vec();
             let mut response = match send_email_set(
@@ -144,26 +149,18 @@ pub(crate) fn set_keyword<T: HttpTransport>(
             {
                 Ok(response) => response,
                 Err(error) => {
-                    return Err(if index == 0 {
-                        error
-                    } else {
-                        partial_email_set_error(AccountOperation::SetKeyword, &error)
-                    });
+                    progress.call_failure(chunk, error);
+                    break;
                 }
             };
             for id in chunk {
-                if let Err(error) = response
-                    .updated(id)
-                    .map_err(to_acct_err(AccountOperation::SetKeyword))
-                {
-                    return Err(partial_email_set_error(
-                        AccountOperation::SetKeyword,
-                        &error,
-                    ));
-                }
+                progress.item(id, response.updated(id), AccountOperation::SetKeyword);
+            }
+            if progress.is_failed() {
+                break;
             }
         }
-        Ok(())
+        progress.finish(StepEffect::Updated)
     })
 }
 
@@ -228,81 +225,239 @@ fn resolve_foreign_headers(
     }
 }
 
-/// A successful exchange can still leave a multi-step write incomplete or
-/// its final effect unknown. Replaying the whole operation is unsafe.
-fn incomplete_multi_step_write(
-    op: AccountOperation,
+#[derive(Default)]
+struct SetProgress {
+    committed: Vec<EmailId>,
+    failed: Vec<FailedSet>,
+    after_chunk: Option<AccountError>,
+}
+struct FailedSet {
+    ids: Vec<EmailId>,
+    application: Application,
     error: AccountError,
-    detail: &str,
-) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Protocol(
-            bifrost_types::ProtocolErrorKind::PartialResponse,
-        ),
-        bifrost_types::Cause::Wire(bifrost_types::WireCause::MalformedResponse {
-            protocol: bifrost_types::Protocol::Jmap,
-            detail: Some(bifrost_types::DiagnosticText::support_only(detail)),
-        }),
-    )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(op)
-    .push_cause(bifrost_types::Cause::Attempt(
-        bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Acknowledged),
-    ))
-    .text(bifrost_types::DiagnosticText::user_safe(detail))
-    .text(bifrost_types::DiagnosticText::support_only(format!(
-        "underlying error: {error:?}"
-    )))
-    .try_build()
-    .expect("valid partial submission classification")
 }
-
-fn partial_email_set_error(op: AccountOperation, error: &AccountError) -> AccountError {
-    let detail = "The Email/set operation may have changed some messages before it failed or returned an incomplete result. Reconcile the affected messages before retrying.";
-    let mut builder = bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Protocol(
-            bifrost_types::ProtocolErrorKind::PartialResponse,
-        ),
-        bifrost_types::Cause::Wire(bifrost_types::WireCause::MalformedResponse {
-            protocol: bifrost_types::Protocol::Jmap,
-            detail: Some(bifrost_types::DiagnosticText::support_only(detail)),
-        }),
-    )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(op)
-    .idempotency_override(false)
-    .push_cause(bifrost_types::Cause::Attempt(
-        bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Acknowledged),
-    ))
-    .text(bifrost_types::DiagnosticText::user_safe(detail))
-    .text(bifrost_types::DiagnosticText::support_only(format!(
-        "underlying error: {error:?}"
-    )));
-    for cause in error.chain().iter().cloned() {
-        builder = builder.push_cause(cause);
+impl SetProgress {
+    fn is_failed(&self) -> bool {
+        !self.failed.is_empty() || self.after_chunk.is_some()
     }
-    builder
-        .try_build()
-        .expect("valid partial Email/set classification")
+    fn append(&mut self, other: Self) {
+        self.committed.extend(other.committed);
+        self.failed.extend(other.failed);
+        self.after_chunk = other.after_chunk;
+    }
+    fn call_failure(&mut self, ids: &[EmailId], error: AccountError) {
+        self.failed.push(FailedSet {
+            ids: ids.to_vec(),
+            application: Application::from_leaf(&error),
+            error,
+        });
+    }
+    fn item(&mut self, id: &EmailId, result: crate::Result<impl Sized>, op: AccountOperation) {
+        match result {
+            Ok(_) => self.committed.push(id.clone()),
+            Err(error) => {
+                let missing = matches!(error, crate::Error::IdNotFound(_));
+                let error = to_acct_err(op)(error);
+                let application = if missing {
+                    Application::Uncertain
+                } else {
+                    Application::from_leaf(&error)
+                };
+                self.failed.push(FailedSet {
+                    ids: vec![id.clone()],
+                    application,
+                    error,
+                });
+            }
+        }
+    }
+    fn finish(mut self, effect: StepEffect) -> Result<(), AccountError> {
+        let targets = |ids: &[EmailId]| {
+            StepTargets::complete(
+                ids.iter()
+                    .map(|id| {
+                        TargetRef::new(
+                            TargetRole::Subject,
+                            ErrorScope::Message {
+                                id: ObjectId(id.as_str().to_owned()),
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let (error, primary) = if let Some(error) = self.after_chunk {
+            (error, PrimaryLeg::effectless(StepTargets::unknown()))
+        } else if self.failed.is_empty() {
+            return Ok(());
+        } else {
+            let failure = self.failed.remove(0);
+            if self.failed.is_empty()
+                && self.committed.is_empty()
+                && failure.application != Application::Uncertain
+            {
+                return Err(failure.error);
+            }
+            let primary = PrimaryLeg::new(
+                effect,
+                targets(&failure.ids),
+                StepReplay::Repeatable,
+                failure.application,
+            );
+            (failure.error, primary)
+        };
+        let mut record = PartialCommitBuilder::new(primary);
+        for id in self.committed {
+            record.committed(effect, email_targets(Some(&id)), StepReplay::Repeatable);
+        }
+        for failure in self.failed {
+            record.failed_sibling(
+                Some(effect),
+                targets(&failure.ids),
+                StepReplay::Repeatable,
+                failure.application,
+                failure.error,
+            );
+        }
+        Err(finish_partial(error, record))
+    }
 }
 
-fn submission_create_error(error: crate::Error) -> (AccountError, bool) {
-    // These errors came from the submission handle, so Method names that
-    // call and Set came from its notCreated entry. Missing/invalid replies
-    // cannot establish rejection, even when the HTTP exchange succeeded.
-    let rejected = matches!(&error, crate::Error::Method(_) | crate::Error::Set(_));
-    let error = to_acct_err(AccountOperation::Send)(error);
-    if rejected {
-        (error, true)
+fn finish_partial(error: AccountError, record: PartialCommitBuilder) -> AccountError {
+    error
+        .into_builder()
+        .partial_commit(record)
+        .try_build()
+        .expect("valid JMAP partial commitment")
+}
+fn email_targets(id: Option<&EmailId>) -> StepTargets {
+    id.map_or_else(StepTargets::unknown, |id| {
+        StepTargets::complete(vec![TargetRef::new(
+            TargetRole::Subject,
+            ErrorScope::Message {
+                id: ObjectId(id.as_str().to_owned()),
+            },
+        )])
+    })
+}
+fn submission_targets(id: Option<&str>) -> StepTargets {
+    id.map_or_else(StepTargets::unknown, |id| {
+        StepTargets::complete(vec![TargetRef::new(
+            TargetRole::Subject,
+            ErrorScope::Submission {
+                id: ObjectId(id.to_owned()),
+            },
+        )])
+    })
+}
+fn submission_create_error(
+    error: crate::Error,
+    operation: AccountOperation,
+) -> (AccountError, bool) {
+    let rejected = match &error {
+        crate::Error::Set(_) => true,
+        crate::Error::Method(e) => !matches!(
+            e.error_type(),
+            crate::core::error::MethodErrorType::ServerPartialFail
+        ),
+        _ => false,
+    };
+    (to_acct_err(operation)(error), rejected)
+}
+/// A send whose submission did not succeed. `rejected` is a proven refusal
+/// (`notCreated`, or any method error except `serverPartialFail`): the
+/// primary takes `from_leaf`. Anything else - an unreadable envelope, a
+/// missing or malformed submission result, `serverPartialFail` - proves
+/// nothing about the submission and is raised to `Uncertain`; such a leaf is
+/// built from a received response and carries no `Unsent` evidence. `email`
+/// is the Email this call created, recorded as a committed `Created` step;
+/// `cleanup` is the destroy compensation, which only a proven refusal runs.
+fn failed_submission(
+    error: AccountError,
+    rejected: bool,
+    email: Option<&EmailId>,
+    cleanup: Option<CompensationOutcome>,
+) -> AccountError {
+    if rejected && email.is_none() {
+        return error;
+    }
+    let application = if rejected {
+        Application::from_leaf(&error)
     } else {
-        (
-            incomplete_multi_step_write(
-                AccountOperation::Send,
-                error,
-                "Submission outcome is unknown; the source Email was retained. Reconcile before sending again.",
-            ),
-            false,
-        )
+        Application::Uncertain
+    };
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
+        StepEffect::Submitted,
+        StepTargets::at_least(email_targets(email).refs),
+        StepReplay::Blocking,
+        application,
+    ));
+    if let Some(email) = email {
+        let targets = email_targets(Some(email));
+        let create = record.committed(StepEffect::Created, targets.clone(), StepReplay::Repeatable);
+        if let Some(outcome) = cleanup {
+            record.compensation(StepEffect::Deleted, targets, vec![create], outcome);
+        }
+    }
+    finish_partial(error, record)
+}
+/// A lone `Uncertain` submission over `subject` (the caller's draft for
+/// `draft_send`, unknown when the envelope was unreadable). Same raise as
+/// `failed_submission`, with no committed step.
+fn uncertain_submission(error: AccountError, subject: Option<&EmailId>) -> AccountError {
+    let record = PartialCommitBuilder::new(PrimaryLeg::new(
+        StepEffect::Submitted,
+        StepTargets::at_least(email_targets(subject).refs),
+        StepReplay::Blocking,
+        Application::Uncertain,
+    ));
+    finish_partial(error, record)
+}
+/// The submission was acknowledged but a result the call needs had no usable
+/// id. Both effects certainly happened; an Email without a known id is
+/// `Blocking` because a replay would send again while it is unidentified, and
+/// an unidentified committed `Blocking` step gates, so the result stays
+/// check-before-resend rather than the extraction leaf's terminal barrier.
+fn acknowledged_send_error(
+    error: AccountError,
+    email: Option<&EmailId>,
+    submission: Option<&str>,
+) -> AccountError {
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::effectless(StepTargets::unknown()));
+    record.committed(
+        StepEffect::Created,
+        email_targets(email),
+        if email.is_some() {
+            StepReplay::Repeatable
+        } else {
+            StepReplay::Blocking
+        },
+    );
+    record.committed(
+        StepEffect::Submitted,
+        submission_targets(submission),
+        StepReplay::Blocking,
+    );
+    finish_partial(error, record)
+}
+/// Map a whole-request failure at a send boundary. An evidence-less custom
+/// transport failure is stamped `InFlight` (a single-leg leaf that already
+/// reconciles); an unreadable envelope is stamped `Acknowledged` and recorded
+/// as an `Uncertain` submission over `subject`.
+fn send_boundary_error(
+    op: AccountOperation,
+    subject: Option<EmailId>,
+) -> impl FnOnce(crate::Error) -> AccountError {
+    move |error| {
+        let unreadable = matches!(error, crate::Error::ResponseDecode(_));
+        let mut ctx = super::error::JmapErrorContext::new(op);
+        ctx.send_boundary = true;
+        let error = super::error::into_account_error(error, ctx);
+        if unreadable {
+            uncertain_submission(error, subject.as_ref())
+        } else {
+            error
+        }
     }
 }
 
@@ -515,7 +670,7 @@ pub(crate) fn send_message<T: HttpTransport>(
         let mut response = batch
             .send()
             .await
-            .map_err(to_acct_err(AccountOperation::Send))?;
+            .map_err(send_boundary_error(AccountOperation::Send, None))?;
 
         // Inspect the submission outcome before extracting the preceding
         // Email create. A malformed Email result must not hide that the
@@ -523,7 +678,7 @@ pub(crate) fn send_message<T: HttpTransport>(
         let submission_result = response
             .get(&submission_handle)
             .and_then(|mut result| result.created(SUBMISSION_CREATE_ID))
-            .map_err(submission_create_error);
+            .map_err(|error| submission_create_error(error, AccountOperation::Send));
         let email_result = response
             .get(&email_handle)
             .map_err(to_acct_err(AccountOperation::Send))
@@ -547,14 +702,21 @@ pub(crate) fn send_message<T: HttpTransport>(
                     )
                     .await;
                 }
-                if rejected
-                    && let Ok((mut result, _)) = email_result
-                    && let Ok(email) = result.created(&email_create_id)
-                    && let Ok(email_id) = require_created_email_id(&email, AccountOperation::Send)
-                {
-                    discard_created_send_email(&mail, &email_states, &account_id, &email_id).await;
-                }
-                return Err(error);
+                let email = email_result
+                    .ok()
+                    .and_then(|(mut result, _)| result.created(&email_create_id).ok())
+                    .and_then(|email| {
+                        require_created_email_id(&email, AccountOperation::Send).ok()
+                    });
+                // The Email is destroyed only on a proven refusal, and only
+                // when this call created it.
+                let cleanup = match (&email, rejected) {
+                    (Some(email), true) => Some(
+                        discard_created_send_email(&mail, &email_states, &account_id, email).await,
+                    ),
+                    _ => None,
+                };
+                return Err(failed_submission(error, rejected, email.as_ref(), cleanup));
             }
         };
 
@@ -596,10 +758,12 @@ pub(crate) fn send_message<T: HttpTransport>(
             .and_then(|email| require_created_email_id(&email, AccountOperation::Send));
 
         let email_id = email_result.map_err(|error| {
-            incomplete_multi_step_write(
-                AccountOperation::Send,
+            acknowledged_send_error(
                 error,
-                "The submission was acknowledged, but the Email create result had no usable id. The send may have committed; reconcile before sending again.",
+                None,
+                submission
+                    .id()
+                    .map(crate::email_submission::EmailSubmissionId::as_str),
             )
         })?;
 
@@ -607,13 +771,7 @@ pub(crate) fn send_message<T: HttpTransport>(
         // cancel/reschedule. An immediate send keeps returning the email id.
         if scheduled.is_some() {
             let submission_id = require_created_submission_id(&submission, AccountOperation::Send)
-                .map_err(|error| {
-                    incomplete_multi_step_write(
-                        AccountOperation::Send,
-                        error,
-                        "The submission was acknowledged, but its create result had no usable id. Reconcile the schedule before sending again.",
-                    )
-                })?;
+                .map_err(|error| acknowledged_send_error(error, Some(&email_id), None))?;
             Ok(ObjectId(submission_id.into_string()))
         } else {
             Ok(ObjectId(email_id.into_string()))
@@ -694,11 +852,11 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
         let mut response = batch
             .send()
             .await
-            .map_err(to_acct_err(AccountOperation::Send))?;
+            .map_err(send_boundary_error(AccountOperation::Send, None))?;
         let submission_result = response
             .get(&submission_handle)
             .and_then(|mut result| result.created(SUBMISSION_CREATE_ID))
-            .map_err(submission_create_error);
+            .map_err(|error| submission_create_error(error, AccountOperation::Send));
         let email_result = response
             .get(&import_handle)
             .map_err(to_acct_err(AccountOperation::Send))
@@ -707,8 +865,8 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
                 (result, imported_state)
             });
 
-        match submission_result {
-            Ok(_) => {}
+        let submission = match submission_result {
+            Ok(submission) => submission,
             Err((error, rejected)) => {
                 if let Ok((_, imported_state)) = email_result.as_ref()
                     && !imported_state.is_empty()
@@ -721,16 +879,23 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
                     )
                     .await;
                 }
-                if rejected
-                    && let Ok((mut result, _)) = email_result
-                    && let Ok(email) = result.created(&import_create_id)
-                    && let Ok(email_id) = require_created_email_id(&email, AccountOperation::Send)
-                {
-                    discard_created_send_email(&mail, &email_states, &account_id, &email_id).await;
-                }
-                return Err(error);
+                let email = email_result
+                    .ok()
+                    .and_then(|(mut result, _)| result.created(&import_create_id).ok())
+                    .and_then(|email| {
+                        require_created_email_id(&email, AccountOperation::Send).ok()
+                    });
+                // The Email is destroyed only on a proven refusal, and only
+                // when this call created it.
+                let cleanup = match (&email, rejected) {
+                    (Some(email), true) => Some(
+                        discard_created_send_email(&mail, &email_states, &account_id, email).await,
+                    ),
+                    _ => None,
+                };
+                return Err(failed_submission(error, rejected, email.as_ref(), cleanup));
             }
-        }
+        };
         let implicit_email_state = response
             .get_method::<EmailSet>(&submission_handle.call_id)
             .ok()
@@ -763,33 +928,51 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
             })
             .and_then(|email| require_created_email_id(&email, AccountOperation::Send));
         let email_id = email_result.map_err(|error| {
-            incomplete_multi_step_write(
-                AccountOperation::Send,
+            acknowledged_send_error(
                 error,
-                "The submission was acknowledged, but the Email import result had no usable id. The send may have committed; reconcile before sending again.",
+                None,
+                submission
+                    .id()
+                    .map(crate::email_submission::EmailSubmissionId::as_str),
             )
         })?;
         Ok(ObjectId(email_id.into_string()))
     })
 }
 
+/// Destroy the Email a refused send created, and report how that cleanup
+/// ended. The outcome comes from `CompensationOutcome::from_error`, with one
+/// stated override: a decoded response missing the `destroyed(id)` result
+/// (mapped to `Protocol(MissingField)`) is `Unconfirmed`, never `Failed` -
+/// the destroy may have applied.
 async fn discard_created_send_email<T: HttpTransport>(
     mail: &MailAccount<T>,
     email_states: &StateMap,
     account_id: &str,
     email_id: &EmailId,
-) {
-    if email_id.as_str().is_empty() {
-        return;
-    }
-    let _ = destroy_emails(
+) -> CompensationOutcome {
+    match destroy_emails(
         mail,
         email_states,
         account_id,
         [email_id.clone()],
         AccountOperation::Send,
     )
-    .await;
+    .await
+    {
+        Ok(()) => CompensationOutcome::Succeeded,
+        Err(error)
+            if matches!(
+                error.kind(),
+                bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::MissingField
+                )
+            ) =>
+        {
+            CompensationOutcome::Unconfirmed(error)
+        }
+        Err(error) => CompensationOutcome::from_error(error),
+    }
 }
 
 pub(crate) fn attachment_upload<T: HttpTransport>(
@@ -871,13 +1054,16 @@ pub(crate) fn draft_create<T: HttpTransport>(
         let email = response
             .created(&create_id)
             .map_err(to_acct_err(AccountOperation::DraftCreate))?;
-        let email_id = require_created_email_id(&email, AccountOperation::DraftCreate)
-            .map_err(|error| {
-                incomplete_multi_step_write(
-                    AccountOperation::DraftCreate,
-                    error,
-                    "The draft was created, but its response had no usable id. Reconcile the draft before creating another.",
-                )
+        let email_id =
+            require_created_email_id(&email, AccountOperation::DraftCreate).map_err(|error| {
+                let mut record =
+                    PartialCommitBuilder::new(PrimaryLeg::effectless(StepTargets::unknown()));
+                record.committed(
+                    StepEffect::Created,
+                    StepTargets::unknown(),
+                    StepReplay::Blocking,
+                );
+                finish_partial(error, record)
             })?;
         Ok(bifrost_types::DraftHandle(email_id.into_string()))
     })
@@ -971,14 +1157,24 @@ pub(crate) fn draft_send<T: HttpTransport>(
         let submission_handle = request
             .call(submission_set)
             .map_err(to_acct_err(AccountOperation::DraftSend))?;
-        let mut response = request
-            .send()
-            .await
-            .map_err(to_acct_err(AccountOperation::DraftSend))?;
+        let mut response = request.send().await.map_err(send_boundary_error(
+            AccountOperation::DraftSend,
+            Some(draft_id.clone()),
+        ))?;
+        // A proven refusal is the plain leaf (a lone `NotApplied` primary);
+        // anything else is an uncertain submission of the caller's draft,
+        // which `draft_send` never compensates.
         response
             .get(&submission_handle)
             .and_then(|mut result| result.created(SUBMISSION_CREATE_ID))
-            .map_err(to_acct_err(AccountOperation::DraftSend))?;
+            .map_err(|error| {
+                let (error, rejected) = submission_create_error(error, AccountOperation::DraftSend);
+                if rejected {
+                    error
+                } else {
+                    uncertain_submission(error, Some(&draft_id))
+                }
+            })?;
         // The submission is already committed. A failed cache refresh must
         // not turn that success into an error that invites a duplicate send;
         // the stale state will be reconciled by the next conditional mutation.
@@ -1949,7 +2145,7 @@ pub(crate) fn move_thread<T: HttpTransport>(
         // let a message delivered to the thread in between be removed from
         // the source having never been added to the target.
         let ids = resolve_target(&mail, mutation_target, AccountOperation::BulkMove).await?;
-        patch_mailbox_membership_of(
+        let mut progress = patch_mailbox_membership_of(
             &mail,
             &email_states,
             &account_id,
@@ -1959,19 +2155,24 @@ pub(crate) fn move_thread<T: HttpTransport>(
             AccountOperation::BulkMove,
         )
         .await?;
-        if let Some(source) = source {
-            patch_mailbox_membership_of(
-                &mail,
-                &email_states,
-                &account_id,
-                &ids,
-                source,
-                false,
-                AccountOperation::RemoveFromContainer,
-            )
-            .await?;
+        if progress.is_failed() {
+            return progress.finish(StepEffect::Updated);
         }
-        Ok(())
+        if let Some(source) = source {
+            progress.append(
+                patch_mailbox_membership_of(
+                    &mail,
+                    &email_states,
+                    &account_id,
+                    &ids,
+                    source,
+                    false,
+                    AccountOperation::RemoveFromContainer,
+                )
+                .await?,
+            );
+        }
+        progress.finish(StepEffect::Updated)
     })
 }
 
@@ -2040,7 +2241,8 @@ pub(crate) fn delete_thread<T: HttpTransport>(
                 read_state,
                 AccountOperation::BulkDestroy,
             )
-            .await
+            .await?
+            .finish(StepEffect::Deleted)
         } else {
             let mutation_target = MutationTarget::Thread(thread);
             cross_account_container(&mutation_target, &trash, AccountOperation::BulkMove)?;
@@ -2053,7 +2255,7 @@ pub(crate) fn delete_thread<T: HttpTransport>(
             }
             // See `move_thread`: resolved once, both legs over that set.
             let ids = resolve_target(&mail, mutation_target, AccountOperation::BulkMove).await?;
-            patch_mailbox_membership_of(
+            let mut progress = patch_mailbox_membership_of(
                 &mail,
                 &email_states,
                 &account_id,
@@ -2063,19 +2265,24 @@ pub(crate) fn delete_thread<T: HttpTransport>(
                 AccountOperation::BulkMove,
             )
             .await?;
-            if let Some(source) = current {
-                patch_mailbox_membership_of(
-                    &mail,
-                    &email_states,
-                    &account_id,
-                    &ids,
-                    source,
-                    false,
-                    AccountOperation::RemoveFromContainer,
-                )
-                .await?;
+            if progress.is_failed() {
+                return progress.finish(StepEffect::Updated);
             }
-            Ok(())
+            if let Some(source) = current {
+                progress.append(
+                    patch_mailbox_membership_of(
+                        &mail,
+                        &email_states,
+                        &account_id,
+                        &ids,
+                        source,
+                        false,
+                        AccountOperation::RemoveFromContainer,
+                    )
+                    .await?,
+                );
+            }
+            progress.finish(StepEffect::Updated)
         }
     })
 }
@@ -2153,9 +2360,9 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
     ids: Vec<EmailId>,
     read_state: Option<String>,
     op: AccountOperation,
-) -> Result<(), AccountError> {
+) -> Result<SetProgress, AccountError> {
     if ids.is_empty() {
-        return Ok(());
+        return Ok(SetProgress::default());
     }
     let read_state = read_state.ok_or_else(|| {
         to_acct_err(op)(crate::Error::NotParsable(
@@ -2164,6 +2371,7 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
     })?;
     let batch_size = super::factory::max_objects_in_set(&mail.client().session());
     let mut if_in_state = read_state;
+    let mut progress = SetProgress::default();
     for (index, chunk) in ids.chunks(batch_size).enumerate() {
         let prior_state = state_cache::get(email_states, account_id).await;
         let set = EmailSet::new()
@@ -2172,12 +2380,8 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
         let mut response = match mail.call(set).await {
             Ok(response) => response,
             Err(error) => {
-                let error = to_acct_err(op)(error);
-                return Err(if index == 0 {
-                    error
-                } else {
-                    partial_email_set_error(op, &error)
-                });
+                progress.call_failure(chunk, to_acct_err(op)(error));
+                break;
             }
         };
         let new_state = response
@@ -2194,21 +2398,23 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
             .await;
         }
         for id in chunk {
-            if let Err(error) = response.destroyed(id).map_err(to_acct_err(op)) {
-                return Err(partial_email_set_error(op, &error));
-            }
+            progress.item(id, response.destroyed(id), op);
+        }
+        if progress.is_failed() {
+            break;
         }
         if index + 1 < ids.len().div_ceil(batch_size) {
             let Some(new_state) = new_state else {
                 let error = to_acct_err(op)(crate::Error::NotParsable(
                     "Email/set omitted newState before the next guarded destroy batch".to_string(),
                 ));
-                return Err(partial_email_set_error(op, &error));
+                progress.after_chunk = Some(error);
+                break;
             };
             if_in_state = new_state;
         }
     }
-    Ok(())
+    Ok(progress)
 }
 
 async fn patch_mailbox_membership<T: HttpTransport>(
@@ -2222,7 +2428,9 @@ async fn patch_mailbox_membership<T: HttpTransport>(
 ) -> Result<(), AccountError> {
     cross_account_container(&target, &container, op)?;
     let ids = resolve_target(mail, target, op).await?;
-    patch_mailbox_membership_of(mail, email_states, account_id, &ids, container, value, op).await
+    patch_mailbox_membership_of(mail, email_states, account_id, &ids, container, value, op)
+        .await?
+        .finish(StepEffect::Updated)
 }
 
 /// The membership patch over an ALREADY RESOLVED set of message ids.
@@ -2247,16 +2455,17 @@ async fn patch_mailbox_membership_of<T: HttpTransport>(
     container: ContainerId,
     value: bool,
     op: AccountOperation,
-) -> Result<(), AccountError> {
+) -> Result<SetProgress, AccountError> {
     if ids.is_empty() {
-        return Ok(());
+        return Ok(SetProgress::default());
     }
     // The owner check has established that the container names the
     // same account as the target, so the only work left is stripping the
     // qualification the selected account does not use.
     let mailbox = MailboxId::new(wire_id_for_mail(&container.0, mail.id_str()));
     let batch_size = super::factory::max_objects_in_set(&mail.client().session());
-    for (index, chunk) in ids.chunks(batch_size).enumerate() {
+    let mut progress = SetProgress::default();
+    for chunk in ids.chunks(batch_size) {
         let ids_for_set = chunk.to_vec();
         let mailbox_for_set = mailbox.clone();
         let mut response = match send_email_set(mail, email_states, account_id, op, move || {
@@ -2270,20 +2479,18 @@ async fn patch_mailbox_membership_of<T: HttpTransport>(
         {
             Ok(response) => response,
             Err(error) => {
-                return Err(if index == 0 {
-                    error
-                } else {
-                    partial_email_set_error(op, &error)
-                });
+                progress.call_failure(chunk, error);
+                break;
             }
         };
         for id in chunk {
-            if let Err(error) = response.updated(id).map_err(to_acct_err(op)) {
-                return Err(partial_email_set_error(op, &error));
-            }
+            progress.item(id, response.updated(id), op);
+        }
+        if progress.is_failed() {
+            break;
         }
     }
-    Ok(())
+    Ok(progress)
 }
 
 async fn resolve_target<T: HttpTransport>(
@@ -3886,29 +4093,69 @@ pub(crate) fn reschedule_send<T: HttpTransport>(
                 .with_parameter("holduntil", Some(rfc3339(scheduled)));
             submit.envelope(mail_from, rcpt_to.into_iter().map(SubmissionAddress::new));
         }
+        // The replacement create's application: `from_leaf` (a `notCreated`
+        // refusal is `NotApplied`; a transport drop or `serverPartialFail`
+        // is already `Uncertain`), raised to `Uncertain` only for an
+        // undecodable or missing result, or an evidence-less transport
+        // failure, and never over explicit `Unsent` evidence: a refused
+        // connection on the create must not be declared uncertain.
+        let replacement_error = |error: crate::Error| {
+            let raisable = matches!(
+                &error,
+                crate::Error::ResponseDecode(_)
+                    | crate::Error::IdNotFound(_)
+                    | crate::Error::CallNotFound(_)
+            ) || matches!(&error, crate::Error::Transport(transport) if transport.local.is_none());
+            let error = to_acct_err(AccountOperation::RescheduleSend)(error);
+            let unsent = error.chain().iter().any(|cause| {
+                matches!(
+                    cause,
+                    bifrost_types::Cause::Attempt(attempt)
+                        if attempt.transmission_state == bifrost_types::TransmissionState::Unsent
+                )
+            });
+            let application = if raisable && !unsent {
+                Application::Uncertain
+            } else {
+                Application::from_leaf(&error)
+            };
+            let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
+                StepEffect::Submitted,
+                submission_targets(None),
+                StepReplay::Blocking,
+                application,
+            ));
+            record.committed(
+                StepEffect::Cancelled,
+                submission_targets(Some(submission_id.as_str())),
+                StepReplay::Blocking,
+            );
+            finish_partial(error, record)
+        };
         let mut set_response = submission_account
             .call(set)
             .await
-            .map_err(to_acct_err(AccountOperation::RescheduleSend))
-            .map_err(|error| incomplete_multi_step_write(
-                AccountOperation::RescheduleSend,
-                error,
-                "The old schedule was canceled; replacement scheduling failed or is unconfirmed. Reconcile the submission before scheduling again.",
-            ))?;
+            .map_err(replacement_error)?;
         let new_submission = set_response
             .created(SUBMISSION_CREATE_ID)
-            .map_err(to_acct_err(AccountOperation::RescheduleSend))
-            .map_err(|error| incomplete_multi_step_write(
-                AccountOperation::RescheduleSend,
-                error,
-                "The old schedule was canceled; replacement scheduling failed or is unconfirmed. Reconcile the submission before scheduling again.",
-            ))?;
-        let new_id = require_created_submission_id(&new_submission, AccountOperation::RescheduleSend)
-            .map_err(|error| incomplete_multi_step_write(
-                AccountOperation::RescheduleSend,
-                error,
-                "The old schedule was canceled; the replacement response had no usable id. Reconcile the submission before scheduling again.",
-            ))?;
+            .map_err(replacement_error)?;
+        let new_id =
+            require_created_submission_id(&new_submission, AccountOperation::RescheduleSend)
+                .map_err(|error| {
+                    let mut record =
+                        PartialCommitBuilder::new(PrimaryLeg::effectless(StepTargets::unknown()));
+                    record.committed(
+                        StepEffect::Cancelled,
+                        submission_targets(Some(submission_id.as_str())),
+                        StepReplay::Blocking,
+                    );
+                    record.committed(
+                        StepEffect::Submitted,
+                        submission_targets(None),
+                        StepReplay::Blocking,
+                    );
+                    finish_partial(error, record)
+                })?;
         Ok(ObjectId(new_id.into_string()))
     })
 }
@@ -6080,6 +6327,7 @@ mod tests {
         requests: Arc<std::sync::Mutex<Vec<Vec<serde_json::Value>>>>,
         submission_seen: Arc<std::sync::atomic::AtomicBool>,
         submission_reply: Option<&'static str>,
+        cleanup_reply: Option<&'static str>,
         fail_submission: bool,
         fail_cancel: bool,
         fail_probe_after_submission: bool,
@@ -6098,6 +6346,7 @@ mod tests {
                 requests: Arc::new(std::sync::Mutex::new(Vec::new())),
                 submission_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 submission_reply: None,
+                cleanup_reply: None,
                 fail_submission,
                 fail_cancel,
                 fail_probe_after_submission,
@@ -6224,12 +6473,23 @@ mod tests {
                     }
                     "Email/set" => {
                         if let Some(destroyed) = args["destroy"].as_array() {
-                            serde_json::json!({
-                                "accountId": account_id,
-                                "oldState": args["ifInState"],
-                                "newState": "email-deleted-state",
-                                "destroyed": destroyed
-                            })
+                            if self.cleanup_reply == Some("drop") {
+                                return Err(crate::core::transport::TransportError::new(
+                                    "cleanup drop",
+                                ));
+                            }
+                            if self.cleanup_reply == Some("missing") {
+                                serde_json::json!({"accountId":account_id,"oldState":"before","newState":"after"})
+                            } else if self.cleanup_reply == Some("refused") {
+                                serde_json::json!({"accountId":account_id,"oldState":"before","newState":"after","notDestroyed":{"email-created":{"type":"forbidden"}}})
+                            } else {
+                                serde_json::json!({
+                                    "accountId": account_id,
+                                    "oldState": args["ifInState"],
+                                    "newState": "email-deleted-state",
+                                    "destroyed": destroyed
+                                })
+                            }
                         } else if let Some(updated) = args["update"].as_object() {
                             let updated = updated
                                 .keys()
@@ -6354,9 +6614,25 @@ mod tests {
                 };
                 if method == "EmailSubmission/set" && args["create"].is_object() {
                     match self.submission_reply {
+                        Some("envelope") => return Ok(Bytes::from_static(b"invalid envelope")),
+                        Some("partial") => {
+                            responses.push(
+                                serde_json::json!(["error", {"type":"serverPartialFail"}, call_id]),
+                            );
+                            continue;
+                        }
                         Some("transport") => {
                             return Err(crate::core::transport::TransportError::new(
                                 "scripted replacement transport failure",
+                            ));
+                        }
+                        Some("refused-connection") => {
+                            return Err(crate::core::transport::TransportError::from_net(
+                                bifrost_net::Error::Network {
+                                    message: "connection refused".into(),
+                                    transmission_state: bifrost_types::TransmissionState::Unsent,
+                                    source: None,
+                                },
                             ));
                         }
                         Some("missing") => continue,
@@ -6751,10 +7027,15 @@ mod tests {
                         error.recovery(),
                         bifrost_types::RecoveryClass::Reconcile(_)
                     ));
-                    assert!(error.chain().iter().any(|cause| matches!(cause,
-                        bifrost_types::Cause::Attempt(attempt)
-                        if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
-                    )));
+                    assert_eq!(
+                        error.partial_commit().unwrap().primary().application,
+                        Application::Uncertain
+                    );
+                    assert_eq!(
+                        error.partial_commit().unwrap().steps()[0].effect(),
+                        Some(StepEffect::Created)
+                    );
+                    assert!(error.partial_commit().unwrap().compensations().is_empty());
                 }
             }
         }
@@ -6794,19 +7075,15 @@ mod tests {
             );
             assert!(sets[1]["create"].is_object());
             assert_eq!(error.operation(), Some(AccountOperation::RescheduleSend));
-            assert!(matches!(
-                error.recovery(),
-                bifrost_types::RecoveryClass::Reconcile(_)
-            ));
-            assert!(
-                error
-                    .user_safe_text()
-                    .any(|text| text.contains("old schedule was canceled"))
+            assert_eq!(
+                error.partial_commit().unwrap().steps()[0].effect(),
+                Some(StepEffect::Cancelled)
             );
-            assert!(error.chain().iter().any(|cause| matches!(cause,
-                bifrost_types::Cause::Attempt(attempt)
-                if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
-            )));
+            if reply.is_none() || reply == Some("method") {
+                assert!(error.recovery().is_terminal());
+            } else {
+                assert!(error.recovery().requires_reconciliation());
+            }
         }
     }
 
@@ -6864,26 +7141,20 @@ mod tests {
         assert_eq!(
             error.kind(),
             &bifrost_types::AccountErrorKind::Protocol(
-                bifrost_types::ProtocolErrorKind::PartialResponse
+                bifrost_types::ProtocolErrorKind::MissingField
             )
         );
         assert!(matches!(
             error.recovery(),
             bifrost_types::RecoveryClass::Reconcile(_)
         ));
-        assert!(error.chain().iter().any(|cause| matches!(
-            cause,
-            bifrost_types::Cause::Attempt(attempt)
-                if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
-        )));
-        assert!(
-            error
-                .user_safe_text()
-                .any(|text| text.contains("submission was acknowledged"))
-        );
+
         assert_eq!(transport.calls("EmailSubmission/set").len(), 1);
         assert_eq!(transport.calls("Email/set").len(), 1);
         assert!(transport.calls("Email/set")[0].get("destroy").is_none());
+        assert!(
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.reason == bifrost_types::ReconcileReason::PartialCommit && a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget, bifrost_types::ReconcileAction::DedupeByClientId, bifrost_types::ReconcileAction::ObserveOnly])
+        );
     }
 
     #[tokio::test]
@@ -6939,17 +7210,16 @@ mod tests {
         assert_eq!(
             error.kind(),
             &bifrost_types::AccountErrorKind::Protocol(
-                bifrost_types::ProtocolErrorKind::PartialResponse
+                bifrost_types::ProtocolErrorKind::MissingField
             )
         );
-        assert!(
-            error
-                .user_safe_text()
-                .any(|text| text.contains("submission was acknowledged"))
-        );
+
         assert_eq!(transport.calls("EmailSubmission/set").len(), 1);
         assert_eq!(transport.calls("Email/import").len(), 1);
         assert!(transport.calls("Email/set").is_empty());
+        assert!(
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.reason == bifrost_types::ReconcileReason::PartialCommit && a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget, bifrost_types::ReconcileAction::DedupeByClientId, bifrost_types::ReconcileAction::ObserveOnly])
+        );
     }
 
     #[tokio::test]
@@ -6968,19 +7238,13 @@ mod tests {
         assert_eq!(
             error.kind(),
             &bifrost_types::AccountErrorKind::Protocol(
-                bifrost_types::ProtocolErrorKind::PartialResponse
+                bifrost_types::ProtocolErrorKind::MissingField
             )
         );
+
         assert!(
-            error
-                .user_safe_text()
-                .any(|text| text.contains("draft was created"))
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.reason == bifrost_types::ReconcileReason::PartialCommit && a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget, bifrost_types::ReconcileAction::DedupeByClientId, bifrost_types::ReconcileAction::ObserveOnly])
         );
-        assert!(error.chain().iter().any(|cause| matches!(
-            cause,
-            bifrost_types::Cause::Attempt(attempt)
-                if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
-        )));
     }
 
     #[tokio::test]
@@ -7037,16 +7301,15 @@ mod tests {
         assert_eq!(
             error.kind(),
             &bifrost_types::AccountErrorKind::Protocol(
-                bifrost_types::ProtocolErrorKind::PartialResponse
+                bifrost_types::ProtocolErrorKind::MissingField
             )
         );
-        assert!(
-            error
-                .user_safe_text()
-                .any(|text| text.contains("usable id"))
-        );
+
         assert_eq!(transport.calls("EmailSubmission/set").len(), 1);
         assert!(transport.calls("Email/set")[0].get("destroy").is_none());
+        assert!(
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.reason == bifrost_types::ReconcileReason::PartialCommit && a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget, bifrost_types::ReconcileAction::DedupeByClientId, bifrost_types::ReconcileAction::ObserveOnly])
+        );
     }
 
     #[tokio::test]
@@ -7202,6 +7465,9 @@ mod tests {
     struct DeleteThreadTransport {
         calls: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         fail_set_number: Option<usize>,
+        omit_new_state: bool,
+        partial_set: bool,
+        refuse_set_number: Option<usize>,
     }
 
     impl DeleteThreadTransport {
@@ -7209,6 +7475,9 @@ mod tests {
             Self {
                 calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 fail_set_number: None,
+                omit_new_state: false,
+                partial_set: false,
+                refuse_set_number: None,
             }
         }
 
@@ -7249,6 +7518,19 @@ mod tests {
                 return Err(crate::core::transport::TransportError::new(
                     "second Email/set batch failed",
                 ));
+            }
+            if method == "Email/set"
+                && self.refuse_set_number
+                    == Some(
+                        self.calls
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|c| c[0] == "Email/set")
+                            .count(),
+                    )
+            {
+                return Ok(Bytes::from(serde_json::json!({"sessionState":"session-1","methodResponses":[["error",{"type":"serverUnavailable"},call[2]]]}).to_string()));
             }
             let call_id = call[2].clone();
             let account_id = call[1]["accountId"].clone();
@@ -7337,6 +7619,9 @@ mod tests {
                         "oldState": prior,
                         "newState": next,
                     });
+                    if self.omit_new_state {
+                        result.as_object_mut().unwrap().remove("newState");
+                    }
                     if let Some(destroyed) = call[1].get("destroy") {
                         result["destroyed"] = destroyed.clone();
                         result["notDestroyed"] = serde_json::json!({});
@@ -7351,6 +7636,16 @@ mod tests {
                                 .collect(),
                         );
                         result["notUpdated"] = serde_json::json!({});
+                        if self.partial_set {
+                            let first = call[1]["update"]
+                                .as_object()
+                                .unwrap()
+                                .keys()
+                                .next()
+                                .unwrap();
+                            result["updated"].as_object_mut().unwrap().remove(first);
+                            result["notUpdated"] = serde_json::json!({first:{"type":"forbidden"}});
+                        }
                     }
                     result
                 }
@@ -7519,21 +7814,12 @@ mod tests {
         .await
         .expect_err("a failed later batch follows an acknowledged destroy");
 
-        assert_eq!(
-            error.kind(),
-            &bifrost_types::AccountErrorKind::Protocol(
-                bifrost_types::ProtocolErrorKind::PartialResponse
-            )
-        );
         assert!(matches!(
-            error.recovery(),
-            bifrost_types::RecoveryClass::Reconcile(_)
+            error.kind(),
+            bifrost_types::AccountErrorKind::Transport(_)
         ));
-        assert!(error.chain().iter().any(|cause| matches!(
-            cause,
-            bifrost_types::Cause::Attempt(attempt)
-                if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
-        )));
+        assert!(error.recovery().is_retryable());
+        assert!(!error.partial_commit().unwrap().steps().is_empty());
         assert_eq!(
             transport
                 .calls()
@@ -7541,6 +7827,296 @@ mod tests {
                 .filter(|call| call[0] == "Email/set")
                 .count(),
             2
+        );
+    }
+    async fn partial_send(
+        reply: &'static str,
+        cleanup: Option<&'static str>,
+    ) -> (AccountError, SendTransport) {
+        let mut transport = SendTransport::new(false, false, false, false);
+        transport.submission_reply = Some(reply);
+        transport.cleanup_reply = cleanup;
+        let error = send_message(
+            send_account(transport.clone()),
+            send_state_map(),
+            "primary".into(),
+            0,
+            None,
+            basic_send_request(),
+        )
+        .await
+        .unwrap_err();
+        (error, transport)
+    }
+    #[tokio::test]
+    async fn partial_commit_server_partial_fail_submission_retains_the_email() {
+        let (error, transport) = partial_send("partial", None).await;
+        let record = error.partial_commit().unwrap();
+        assert_eq!(record.primary().application, Application::Uncertain);
+        assert_eq!(record.steps()[0].effect(), Some(StepEffect::Created));
+        assert!(record.compensations().is_empty());
+        assert_eq!(transport.calls("Email/set").len(), 1);
+    }
+    #[tokio::test]
+    async fn partial_commit_unreadable_send_envelope_requires_a_check() {
+        let (error, _) = partial_send("envelope", None).await;
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ParseFailed
+            )
+        ));
+        assert!(
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget,bifrost_types::ReconcileAction::DedupeByClientId,bifrost_types::ReconcileAction::ObserveOnly])
+        );
+    }
+    #[tokio::test]
+    async fn partial_commit_evidence_less_send_drop_is_in_flight() {
+        let (error, _) = partial_send("transport", None).await;
+        assert!(error.partial_commit().is_none());
+        assert_eq!(Application::from_leaf(&error), Application::Uncertain);
+        assert!(error.recovery().requires_reconciliation());
+    }
+    #[tokio::test]
+    async fn partial_commit_missing_submission_result_records_the_created_email() {
+        let (error, _) = partial_send("missing", None).await;
+        assert_eq!(
+            error.partial_commit().unwrap().steps()[0].targets(),
+            &email_targets(Some(&EmailId::new("email-created")))
+        );
+    }
+    #[tokio::test]
+    async fn partial_commit_refused_submission_cleanup_failure_is_surfaced() {
+        let (error, _) = partial_send("method", Some("refused")).await;
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::NoPermission { .. }
+        ));
+        assert!(matches!(
+            error.partial_commit().unwrap().compensations()[0].outcome(),
+            CompensationOutcome::Failed(_)
+        ));
+    }
+    #[tokio::test]
+    async fn partial_commit_refused_submission_cleanup_unconfirmed_keeps_refusal() {
+        let (error, _) = partial_send("method", Some("missing")).await;
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::NoPermission { .. }
+        ));
+        assert!(matches!(
+            error.partial_commit().unwrap().compensations()[0].outcome(),
+            CompensationOutcome::Unconfirmed(_)
+        ));
+    }
+    #[tokio::test]
+    async fn partial_commit_draft_send_missing_submission_result_requires_a_check() {
+        let mut transport = SendTransport::new(false, false, false, false);
+        transport.submission_reply = Some("missing");
+        let error = draft_send(
+            send_account(transport),
+            send_state_map(),
+            "primary".into(),
+            bifrost_types::DraftHandle("draft".into()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.partial_commit().unwrap().primary().application,
+            Application::Uncertain
+        );
+        assert!(error.recovery().requires_reconciliation());
+        assert_eq!(error.operation(), Some(AccountOperation::DraftSend));
+        assert_eq!(
+            error.partial_commit().unwrap().primary().targets.refs[0].scope,
+            ErrorScope::Message {
+                id: ObjectId("draft".into())
+            }
+        );
+    }
+    #[tokio::test]
+    async fn partial_commit_reschedule_refused_replacement_reports_cancellation() {
+        let transport = SendTransport::new(true, false, false, false);
+        let error = reschedule_send(
+            send_account(transport),
+            3600,
+            ObjectId("old-submission".into()),
+            SystemTime::now() + std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.partial_commit().unwrap().steps()[0].effect(),
+            Some(StepEffect::Cancelled)
+        );
+        assert!(error.recovery().is_terminal());
+    }
+    /// A replacement create whose connection was refused carries explicit
+    /// `Unsent` evidence. It must build (never panic) and must not be raised
+    /// to an uncertain submission: no dedupe, but the committed cancellation
+    /// still protects the operation.
+    #[tokio::test]
+    async fn partial_commit_reschedule_unsent_replacement_is_not_uncertain() {
+        let mut transport = SendTransport::new(true, false, false, false);
+        transport.submission_reply = Some("refused-connection");
+        let error = reschedule_send(
+            send_account(transport),
+            3600,
+            ObjectId("old-submission".into()),
+            SystemTime::now() + std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
+        let record = error.partial_commit().unwrap();
+        assert_eq!(record.primary().application, Application::NotApplied);
+        assert_eq!(record.steps()[0].effect(), Some(StepEffect::Cancelled));
+        assert!(
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.reason == bifrost_types::ReconcileReason::PartialCommit && a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget, bifrost_types::ReconcileAction::ObserveOnly])
+        );
+    }
+    #[tokio::test]
+    async fn partial_commit_missing_new_state_after_destroy_is_terminal() {
+        let mut transport = DeleteThreadTransport::new();
+        transport.omit_new_state = true;
+        let mut session = serde_json::to_value(search_session()).unwrap();
+        session["capabilities"]["urn:ietf:params:jmap:core"]["maxObjectsInSet"] =
+            serde_json::json!(2);
+        let client = crate::client::Client::with_transport(
+            transport,
+            serde_json::from_value(session).unwrap(),
+            "https://example.test/.well-known/jmap",
+        )
+        .unwrap();
+        let mail = crate::account::Account::new(client, "primary");
+        let progress = destroy_thread_emails_if_unchanged(
+            &mail,
+            &send_state_map(),
+            "primary",
+            vec![
+                EmailId::new("one"),
+                EmailId::new("two"),
+                EmailId::new("three"),
+            ],
+            Some("state".into()),
+            AccountOperation::BulkDestroy,
+        )
+        .await
+        .unwrap();
+        let error = progress.finish(StepEffect::Deleted).unwrap_err();
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::ProviderContractViolation
+        ));
+        assert_eq!(error.partial_commit().unwrap().steps().len(), 2);
+    }
+    fn partial_chunk_account(
+        transport: DeleteThreadTransport,
+        batch_size: usize,
+    ) -> MailAccount<DeleteThreadTransport> {
+        let mut session = serde_json::to_value(search_session()).unwrap();
+        session["capabilities"]["urn:ietf:params:jmap:core"]["maxObjectsInSet"] =
+            serde_json::json!(batch_size);
+        let client = crate::client::Client::with_transport(
+            transport,
+            serde_json::from_value(session).unwrap(),
+            "https://example.test/.well-known/jmap",
+        )
+        .unwrap();
+        crate::account::Account::new(client, "primary")
+    }
+    #[tokio::test]
+    async fn partial_commit_chunk_drains_successes_after_the_first_failure() {
+        let mut transport = DeleteThreadTransport::new();
+        transport.partial_set = true;
+        let mail = partial_chunk_account(transport, 50);
+        let ids: Vec<_> = ["a", "b", "c"].into_iter().map(EmailId::new).collect();
+        let progress = patch_mailbox_membership_of(
+            &mail,
+            &send_state_map(),
+            "primary",
+            &ids,
+            ContainerId("dest".into()),
+            true,
+            AccountOperation::BulkMove,
+        )
+        .await
+        .unwrap();
+        let error = progress.finish(StepEffect::Updated).unwrap_err();
+        assert_eq!(error.partial_commit().unwrap().steps().len(), 2);
+        assert_eq!(
+            error.partial_commit().unwrap().steps()[1].targets(),
+            &email_targets(Some(&EmailId::new("c")))
+        );
+    }
+    #[tokio::test]
+    async fn partial_commit_first_chunk_call_failure_is_a_plain_leaf() {
+        let mail = partial_chunk_account(DeleteThreadTransport::failing_on_set(1), 2);
+        let progress = destroy_thread_emails_if_unchanged(
+            &mail,
+            &send_state_map(),
+            "primary",
+            vec![EmailId::new("a")],
+            Some("state".into()),
+            AccountOperation::BulkDestroy,
+        )
+        .await
+        .unwrap();
+        assert!(
+            progress
+                .finish(StepEffect::Deleted)
+                .unwrap_err()
+                .partial_commit()
+                .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn partial_commit_guarded_thread_destroy_later_chunk_refusal_retries() {
+        let mut transport = DeleteThreadTransport::new();
+        transport.refuse_set_number = Some(2);
+        let mail = partial_chunk_account(transport, 2);
+        let progress = destroy_thread_emails_if_unchanged(
+            &mail,
+            &send_state_map(),
+            "primary",
+            vec![EmailId::new("a"), EmailId::new("b"), EmailId::new("c")],
+            Some("state".into()),
+            AccountOperation::BulkDestroy,
+        )
+        .await
+        .unwrap();
+        let error = progress.finish(StepEffect::Deleted).unwrap_err();
+        assert!(error.recovery().is_retryable());
+        assert_eq!(error.partial_commit().unwrap().steps().len(), 2);
+        assert!(
+            error
+                .partial_commit()
+                .unwrap()
+                .steps()
+                .iter()
+                .all(|s| s.replay() == StepReplay::Repeatable)
+        );
+    }
+    #[tokio::test]
+    async fn partial_commit_move_thread_remove_leg_failure_keeps_add_leg() {
+        let mail = partial_chunk_account(DeleteThreadTransport::failing_on_set(2), 50);
+        let error = move_thread(
+            mail,
+            send_state_map(),
+            "primary".into(),
+            ThreadId("thread-1".into()),
+            ContainerId("dest".into()),
+            Some(ContainerId("source".into())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.partial_commit().unwrap().steps().len(), 5);
+        assert!(
+            error
+                .partial_commit()
+                .unwrap()
+                .steps()
+                .iter()
+                .all(|s| s.effect() == Some(StepEffect::Updated))
         );
     }
 }

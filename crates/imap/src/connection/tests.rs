@@ -2769,7 +2769,7 @@ mod withdrawal {
         c.await.unwrap().unwrap();
     }
     #[tokio::test(start_paused = true)]
-    async fn a_move_fallback_whose_store_is_withdrawn_after_the_copy_is_in_flight() {
+    async fn a_move_fallback_whose_store_is_withdrawn_keeps_copy_and_unsent_leaf() {
         let (conn, mut server) = pair("IMAP4rev1 UIDPLUS").await;
         select_inbox(&conn, &mut server).await;
         let conn2 = Arc::clone(&conn);
@@ -2792,8 +2792,10 @@ mod withdrawal {
         assert!(noop.contains(" NOOP"));
         buffered(&conn, one_queued(&conn)).await;
         let err = b.await.unwrap().unwrap_err();
-        assert!(matches!(err, Error::Timeout { .. }));
-        assert_eq!(err.attempt(), Some(InFlight));
+        assert!(
+            matches!(&err, Error::MoveFallbackIncomplete {stored_deleted:false,source,..} if matches!(source.as_ref(),Error::Timeout {..}))
+        );
+        assert_eq!(err.attempt(), Some(Unsent));
         assert!(conn.is_reusable());
         next_capability(&conn, &mut server, a, tag_of(&noop)).await;
     }

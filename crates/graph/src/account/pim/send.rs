@@ -10,6 +10,10 @@ use crate::account::graph_error::{
 use crate::client::Resource;
 use base64::Engine;
 use bifrost_types::{AccountError, AccountOperation, DraftHandle, MailboxId, ObjectId, SendAs};
+use bifrost_types::{
+    Application, ErrorScope, PartialCommitBuilder, PrimaryLeg, StepEffect, StepReplay, StepTargets,
+    TargetRef, TargetRole,
+};
 use serde_json::{Value, json};
 
 use super::common::*;
@@ -56,13 +60,19 @@ pub(crate) async fn send_message(
     if let Some(send_as) = &request.send_as {
         apply_send_as(&mut message, send_as, account.user_email.as_deref());
     }
-    let draft = create_draft_message(client, message).await?;
+    // The draft is the send's first leg, so its failure is stamped `Send`.
+    let created = post_draft_message(client, &message, AccountOperation::Send).await?;
+    let draft = send_created_draft(&created, "Graph draft create did not return an id")?;
     if let Some(at) = scheduled {
         // Stamp PidTagDeferredSendTime on the draft before send so
         // Graph queues it for deferred delivery.
-        stamp_deferred_send_time(client, &draft, at, AccountOperation::Send).await?;
+        stamp_deferred_send_time(client, &draft, at, AccountOperation::Send)
+            .await
+            .map_err(|e| send_progress_error(e, &draft, false, false))?;
     }
-    send_draft_message(client, &draft).await?;
+    send_draft_message(client, &draft)
+        .await
+        .map_err(|e| send_progress_error(e, &draft, scheduled.is_some(), true))?;
     // For a scheduled send-as, the draft lives in the shared mailbox, not
     // `/me`; the cancel/reschedule handle must carry the owning mailbox so
     // those ops route to the same `/users/{id}` client the draft was
@@ -98,15 +108,10 @@ pub(crate) async fn send_raw_message(
         )
         .await
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::Send)))?;
-    let id = created.get("id").and_then(Value::as_str).ok_or_else(|| {
-        pim_protocol_error(
-            AccountOperation::Send,
-            None,
-            "Graph MIME import did not return an id",
-        )
-    })?;
-    let draft = DraftHandle(id.to_string());
-    send_draft_message(client, &draft).await?;
+    let draft = send_created_draft(&created, "Graph MIME import did not return an id")?;
+    send_draft_message(client, &draft)
+        .await
+        .map_err(|e| send_progress_error(e, &draft, false, true))?;
     Ok(ObjectId(draft.0))
 }
 
@@ -299,4 +304,97 @@ pub(crate) async fn reschedule_send(
     let draft = DraftHandle(draft_id.to_string());
     stamp_deferred_send_time(client, &draft, scheduled, AccountOperation::RescheduleSend).await?;
     Ok(handle)
+}
+
+fn send_created_draft(created: &Value, detail: &'static str) -> Result<DraftHandle, AccountError> {
+    if let Some(id) = created
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return Ok(DraftHandle(id.to_owned()));
+    }
+    let error = pim_protocol_error(AccountOperation::Send, None, detail);
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::effectless(StepTargets::unknown()));
+    record.committed(
+        StepEffect::Created,
+        StepTargets::unknown(),
+        StepReplay::Repeatable,
+    );
+    Err(finish_partial(error, record))
+}
+fn send_progress_error(
+    error: AccountError,
+    draft: &DraftHandle,
+    stamped: bool,
+    submission: bool,
+) -> AccountError {
+    let targets = StepTargets::complete(vec![TargetRef::new(
+        TargetRole::Subject,
+        ErrorScope::Message {
+            id: ObjectId(draft.0.clone()),
+        },
+    )]);
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
+        if submission {
+            StepEffect::Submitted
+        } else {
+            StepEffect::Updated
+        },
+        targets.clone(),
+        if submission {
+            StepReplay::Blocking
+        } else {
+            StepReplay::Repeatable
+        },
+        Application::from_leaf(&error),
+    ));
+    record.committed(StepEffect::Created, targets.clone(), StepReplay::Repeatable);
+    if stamped {
+        record.committed(StepEffect::Updated, targets, StepReplay::Repeatable);
+    }
+    finish_partial(error, record)
+}
+
+#[cfg(test)]
+mod partial_commit_tests {
+    use super::*;
+    #[test]
+    fn partial_commit_send_refusal_reports_the_orphan_draft() {
+        let leaf =
+            AccountError::unsupported(AccountOperation::Send, bifrost_types::Protocol::Graph);
+        let error = send_progress_error(leaf.clone(), &DraftHandle("draft".into()), false, true);
+        assert_eq!(error.recovery(), leaf.recovery());
+        assert_eq!(
+            error.partial_commit().unwrap().steps()[0].effect(),
+            Some(StepEffect::Created)
+        );
+    }
+    #[test]
+    fn partial_commit_send_drop_reconciles() {
+        let leaf = into_account_error(
+            crate::error::GraphError::Net(bifrost_net::Error::Network {
+                message: "lost".into(),
+                transmission_state: bifrost_types::TransmissionState::InFlight,
+                source: None,
+            }),
+            GraphErrorContext::graph(AccountOperation::Send),
+        );
+        let error = send_progress_error(leaf, &DraftHandle("draft".into()), false, true);
+        assert_eq!(
+            error.partial_commit().unwrap().plan().replay,
+            bifrost_types::ReplaySafety::AfterObservation
+        );
+        assert!(
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget,bifrost_types::ReconcileAction::DedupeByClientId])
+        );
+    }
+    #[test]
+    fn partial_commit_draft_create_without_id_in_send_names_the_orphan() {
+        let error = send_created_draft(&json!({}), "missing id").unwrap_err();
+        assert_eq!(error.operation(), Some(AccountOperation::Send));
+        let record = error.partial_commit().unwrap();
+        assert!(!record.steps()[0].targets().complete);
+        assert_eq!(record.primary().effect, None);
+    }
 }

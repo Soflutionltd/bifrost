@@ -217,7 +217,12 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   `Location`. A failed upload deletes its session on its own bounded budget
   (`SESSION_CANCEL_TIMEOUT`), separate from the upload budget because the upload
   may have failed exactly because that budget ran out: one anonymous `DELETE`
-  on the admitted URL, never replacing the upload's own error, skipped once the
+  on the admitted URL, retaining its typed compensation outcome without
+  replacing the upload's own error (a failure first passes through
+  `bifrost_net::Error::redact_request_text`, since the transport's error text
+  names the URL and the compensation reaches exports; an unfollowed 3xx on the
+  cancel is a `Failed` compensation, `Protocol(ContractViolation)` naming the
+  status and never the `Location`, not a cancelled session), skipped once the
   account has shut down and abandoned if shutdown fires mid-cancel, and not
   spawned, so a caller who drops the hosting future gets no cancel and the
   session expires on OneDrive's clock. A 202 must carry a valid resume offset
@@ -1237,7 +1242,8 @@ Graph's, not the caller's, so returning on the first bad item left the etag
 of a message that demonstrably was destroyed in the LRU whenever its
 subresponse sorted after a failing sibling's, and a later conditioned write
 on that id then sent an `If-Match` for a message that no longer exists. The
-error surfaced is unchanged: the first failure in response order.
+primary error is the first failure in submission order, and every other failed
+or missing sub-request rides the partial-commit record as a sibling.
 
 `message_reactions` (`reactions.rs`) reads the two Outlook
 `singleValueExtendedProperties` (`OwnerReactionType`, `ReactionsCount`) over
@@ -2734,3 +2740,42 @@ prefix. Category names compare ASCII-case-insensitively. Unmodeled tokens
 are Indeterminate, even beside modeled tokens. Completed flags observe as
 unflagged. Public EWS items can judge only seen (see "Public-folder
 hydration" for the EWS `IsRead` exception).
+
+## Partial commitment of direct writes
+
+Send maps every leg, including draft creation, with AccountOperation::Send.
+An acknowledged draft/import without an id records an unidentified committed
+Created orphan with an effectless protocol primary. A stamp failure records the
+Repeatable created draft; a send failure adds any completed stamp and a Blocking
+Submitted primary. Uncertain sends gate observation with CheckTarget and
+DedupeByClientId, without ObserveOnly unless a separate barrier forbids replay.
+A refused send preserves its own recovery and reports the orphan draft. Replay
+can create another orphan, accepted clutter bounded by the retry budget; no new
+cleanup is introduced.
+
+The batch write transport drains every response and the missing-id sweep into
+BatchProgress. Public write owners choose Updated Repeatable, Deleted Repeatable
+or Moved Blocking. The primary is the first failure in submission order;
+additional failures retain their own errors as siblings. Every success remains
+committed. Moves preserve source and owner-qualified destination identities; a
+success without a usable new id has incomplete targets and gates observation.
+Thread permanentDelete aggregates earlier chunks before attaching once; a later
+chunk's whole `$batch` failure, or a local refusal while building it, is the
+primary over that chunk's ids with every earlier committed id as a step. Later
+unattempted chunks are absent. move_thread forwards add_to_container unchanged.
+The extended-property clear passes no per-request targets into the batch, so a
+successful DELETE never evicts the message's cached etag; its record names the
+messages from the caller's ids.
+
+OneDrive records a committed UploadSession before URL admission. Admission
+refusal is effectless and sends no cancel. Failed chunks distinguish session
+Updated from final CloudFile Created, while accepted earlier chunks remain
+historical. Existing session cancellation reverses only the session, never a
+possibly created file; its own outcome and error are retained. A failed
+createLink records the completed CloudFile. These effects are Repeatable
+by-products relative to hosting, and no pre-authenticated URL enters a scope.
+
+Bulk mutation streams already preserve per-item lanes and do not carry sibling
+records. Reaction reads and single-request event/contact writes have no
+multi-step producer to adopt. Standalone draft/filter creates with missing ids
+are outside the multi-step scope.

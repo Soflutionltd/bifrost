@@ -14,6 +14,10 @@ use crate::types::{BatchRequest, BatchRequestItem, BatchResponse, ODataCollectio
 use bifrost_types::{
     AccountError, AccountOperation, ContainerId, ErrorScope, Importance, MutationTarget, ObjectId,
 };
+use bifrost_types::{
+    Application, PartialCommitBuilder, PrimaryLeg, StepEffect, StepReplay, StepTargets, TargetRef,
+    TargetRole,
+};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
@@ -181,16 +185,16 @@ pub(super) async fn delete_extended_property(
             headers: None,
         });
     }
-    submit_write_batch(
-        account,
-        account
-            .batch_resource(ids)
-            .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?,
-        requests,
-        true,
-        operation,
-    )
-    .await
+    // `destroy` here only buys the 404 tolerance. No per-request targets are
+    // threaded into the batch: with targets, a successful DELETE would also
+    // evict the MESSAGE's cached etag, which a property clear must not do.
+    // The record still names each message, from `ids`.
+    let resource = account
+        .batch_resource(ids)
+        .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?;
+    let progress =
+        submit_write_batch_resource(account, resource, requests, &[], true, operation).await?;
+    batch_progress_error(progress, ids, StepEffect::Updated, StepReplay::Repeatable)
 }
 
 pub(crate) async fn set_is_read(
@@ -489,7 +493,15 @@ pub(super) async fn patch_messages(
         });
         targets.push(patch.id.clone());
     }
-    submit_write_batch_with_targets(account, requests, &targets, false, operation).await
+    let progress =
+        submit_write_batch_with_targets(account, requests, &targets, false, operation).await?;
+    // Repeatable: each public call refetches the etag it patches under.
+    batch_progress_error(
+        progress,
+        &targets,
+        StepEffect::Updated,
+        StepReplay::Repeatable,
+    )
 }
 
 pub(super) async fn move_messages(
@@ -552,7 +564,11 @@ pub(super) async fn move_messages(
         });
         targets.push(id.clone());
     }
-    submit_write_batch_with_targets(account, requests, &targets, false, operation).await
+    let progress =
+        submit_write_batch_with_targets(account, requests, &targets, false, operation).await?;
+    // Blocking: Graph assigns a moved message a new id, so a replay addresses
+    // a source id that no longer exists.
+    batch_progress_error(progress, &targets, StepEffect::Moved, StepReplay::Blocking)
 }
 
 pub(super) async fn message_values_for_ids(
@@ -567,29 +583,18 @@ pub(super) async fn message_values_for_ids(
     Ok(values)
 }
 
-pub(super) async fn submit_write_batch(
-    account: &GraphAccount,
-    resource: Resource,
-    requests: Vec<BatchRequestItem>,
-    destroy: bool,
-    operation: AccountOperation,
-) -> Result<(), AccountError> {
-    submit_write_batch_resource(account, resource, requests, &[], destroy, operation).await
-}
-
-/// Variant of `submit_write_batch` that threads per-request target
-/// message ids so per-item failures carry `ErrorScope::Message { id }`
-/// rather than the coarser `ErrorScope::Account`. `targets[i]` is the
-/// `ObjectId` of the request whose `BatchRequestItem::id == i.to_string()`;
-/// callers without per-request ids use `submit_write_batch` with explicit
-/// ownership instead.
+/// Submit one `$batch` of writes and return typed progress, never a record:
+/// the public operation that owns the replay judgment attaches it through
+/// `batch_progress_error`. `targets[i]` is the `ObjectId` of the request whose
+/// `BatchRequestItem::id == i.to_string()`, so per-item failures carry
+/// `ErrorScope::Message { id }` rather than the coarser `ErrorScope::Account`.
 pub(super) async fn submit_write_batch_with_targets(
     account: &GraphAccount,
     requests: Vec<BatchRequestItem>,
     targets: &[ObjectId],
     destroy: bool,
     operation: AccountOperation,
-) -> Result<(), AccountError> {
+) -> Result<BatchProgress, AccountError> {
     let resource = account
         .batch_resource(targets)
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?;
@@ -603,23 +608,21 @@ async fn submit_write_batch_resource(
     targets: &[ObjectId],
     destroy: bool,
     operation: AccountOperation,
-) -> Result<(), AccountError> {
+) -> Result<BatchProgress, AccountError> {
     if requests.is_empty() {
-        return Ok(());
+        return Ok(BatchProgress::default());
     }
     let ctx = GraphErrorContext::graph(operation);
     // Track every submitted request id (`BatchRequestItem::id`, assigned
     // `index.to_string()` 0..N-1 by the builders) so we can reconcile the
     // returned responses against them: Graph occasionally returns fewer
-    // `$batch` responses than requests, and a missing id means that
-    // message was never patched. Silently returning `Ok(())` would
-    // violate the batch accounting contract (every id accounted for
-    // exactly once), so an unaccounted id surfaces as an error.
-    // Kept as an ordered `Vec`, not a set: the sweep below reports ONE
-    // missing id and stamps its message on the error scope, so drawing it
-    // from a `HashSet` made the message an operator saw for a reproducible
-    // failure differ between runs. Submission order is the only stable
-    // choice, and a linear scan over at most 20 ids is free.
+    // `$batch` responses than requests, and a missing id is a sub-request
+    // whose fate is unknown. Silently treating it as done would violate
+    // the batch accounting contract (every id accounted for exactly once),
+    // so every unaccounted id becomes a failed, `Uncertain` entry.
+    // Kept as an ordered `Vec`, not a set, so the sweep visits missing ids
+    // in submission order and the reported failures are stable between
+    // runs of a reproducible failure.
     let replayable: std::collections::HashMap<_, _> = requests
         .iter()
         .map(|r| {
@@ -631,7 +634,7 @@ async fn submit_write_batch_resource(
         .collect();
     let expected_ids: Vec<String> = requests.iter().map(|r| r.id.clone()).collect();
     let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut first_error: Option<AccountError> = None;
+    let mut progress = BatchProgress::default();
     let response: BatchResponse = account
         .client
         .post_batch(
@@ -641,16 +644,23 @@ async fn submit_write_batch_resource(
         )
         .await
         .map_err(|e| into_account_error(e, ctx.clone()))?;
+    // The loop DRAINS every subresponse rather than stopping at the first bad
+    // item. `$batch` response order is Graph's, not the caller's: stopping
+    // early once left the etag of a message that demonstrably WAS destroyed
+    // in the cache whenever its subresponse sorted after a failing sibling's,
+    // and it dropped the successes the partial-commit record must report.
     for item in response.responses {
-        seen_ids.insert(item.id.clone());
+        // A repeated subresponse id is accounted once, by its first answer.
+        if !seen_ids.insert(item.id.clone()) {
+            continue;
+        }
         // Reuse the per-item outcome projector so 4xx/5xx items
         // build structured `AccountError`s with `Protocol::Graph`,
         // `AttemptCause(Acknowledged)`, `WireCause::Graph(signal)`
         // (when an envelope is present), and `Retry-After` -> throttle
         // scope translation. Per-item 2xx and destroy-404 short-
-        // circuit as `Succeeded`; everything else surfaces as
-        // `Failed(_)` carrying the classified error which we then
-        // unwrap into the function's single-error return contract.
+        // circuit as `Succeeded`; everything else surfaces as a failed
+        // entry carrying its own classified error.
         let headers = item
             .headers
             .map(|h| {
@@ -699,44 +709,49 @@ async fn submit_write_batch_resource(
         );
         match outcome {
             bifrost_types::ItemOutcome::Succeeded(_) => {
+                if let Ok(index) = item.id.parse::<usize>() {
+                    let new_id = item
+                        .body
+                        .as_ref()
+                        .and_then(|v| v.get("id"))
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(|id| {
+                            let owner = target.as_ref().and_then(|t| {
+                                crate::account::foreign::parse_message_id(t)
+                                    .owner()
+                                    .map(str::to_owned)
+                            });
+                            ObjectId(crate::account::foreign::qualify_with_owner(
+                                owner.as_deref(),
+                                id,
+                            ))
+                        });
+                    progress.committed.push((index, new_id));
+                }
                 if destroy && let Some(id) = target {
                     account.etag_index.write().await.remove(&id.0);
                 }
             }
             bifrost_types::ItemOutcome::Failed(failure) => {
-                if first_error.is_none() {
-                    first_error = Some(failure.error);
+                if let Ok(index) = item.id.parse() {
+                    progress.failed.push((
+                        index,
+                        Application::from_leaf(&failure.error),
+                        failure.error,
+                    ));
                 }
             }
             bifrost_types::ItemOutcome::Uncertain(uncertain) => {
-                if first_error.is_none() {
-                    first_error = Some(uncertain.error);
+                if let Ok(index) = item.id.parse() {
+                    progress
+                        .failed
+                        .push((index, Application::Uncertain, uncertain.error));
                 }
             }
         }
     }
-    // The loop DRAINS rather than returning on the first bad item, even
-    // though this surface answers once. `$batch` response order is Graph's,
-    // not the caller's, so returning early left the etag of a message that
-    // demonstrably WAS destroyed in the cache whenever its subresponse
-    // happened to sort after a failing sibling's - and a later conditioned
-    // write on that id then sent an `If-Match` for a message that no longer
-    // exists. Draining costs one pass over an already-decoded response and
-    // changes nothing the caller sees: the error returned is still the
-    // first failure in response order.
-    if let Some(error) = first_error {
-        return Err(error);
-    }
-    // Any submitted id with no corresponding response is ambiguous. The
-    // outer request was acknowledged (a 200 for the `$batch` envelope),
-    // which is no evidence either way about the omitted subrequest, so
-    // this must not report a clean `Ok(())` and must not assert the item
-    // was left alone. `Protocol(PartialResponse)` carries that ambiguity:
-    // idempotent operations retry, non-idempotent ones reconcile against
-    // the target. These direct write methods bypass the engine's bulk
-    // mutation funnel, so this is the only classification their callers
-    // see - the same rule the bulk path applies via its uncertain lane.
-    if let Some(missing) = expected_ids.iter().find(|id| !seen_ids.contains(*id)) {
+    for missing in expected_ids.iter().filter(|id| !seen_ids.contains(*id)) {
         let scope = missing
             .parse::<usize>()
             .ok()
@@ -744,16 +759,23 @@ async fn submit_write_batch_resource(
             .map(|id| ErrorScope::Message {
                 id: (id.0.clone()).into(),
             });
-        return Err(batch_response_missing(
+        let error = batch_response_missing(
             operation,
             scope,
             format!(
                 "Graph $batch returned no response for request {missing}; the item's fate is unknown"
             ),
             replayable.get(missing).copied().unwrap_or(false),
+        );
+        progress.failed.push((
+            missing.parse().expect("submitted numeric id"),
+            Application::Uncertain,
+            error,
         ));
     }
-    Ok(())
+    progress.failed.sort_by_key(|(index, _, _)| *index);
+    progress.committed.sort_by_key(|(index, _)| *index);
+    Ok(progress)
 }
 
 /// Cache the message etag under the caller-supplied (possibly
@@ -884,4 +906,129 @@ mod replay_tests {
             matches!(error.recovery(), RecoveryClass::Reconcile(a) if a.guidance.actions == [ReconcileAction::CheckTarget])
         );
     }
+}
+
+/// Typed progress of one or more `$batch` submissions, indexed by request
+/// position. `committed` holds every 2xx (and destroy-404) sub-request with
+/// the new id a successful move returned, owner-qualified for a shared
+/// mailbox; `failed` holds every refused, uncertain or missing sub-request
+/// with its own leaf and application. Unsent requests appear in neither.
+#[derive(Default)]
+pub(super) struct BatchProgress {
+    pub committed: Vec<(usize, Option<ObjectId>)>,
+    pub failed: Vec<(usize, Application, AccountError)>,
+}
+impl BatchProgress {
+    /// Fold a later chunk's progress in, shifting its indexes by the chunk's
+    /// start so they address the operation's full target list.
+    pub fn append(&mut self, other: Self, offset: usize) {
+        self.committed
+            .extend(other.committed.into_iter().map(|(i, id)| (i + offset, id)));
+        self.failed.extend(
+            other
+                .failed
+                .into_iter()
+                .map(|(i, app, e)| (i + offset, app, e)),
+        );
+    }
+}
+/// Attach the public operation's record over batch progress, with the effect
+/// and replay judgment the caller declares for its own operation. The primary
+/// is the first failure in submission order; every other failure is a sibling
+/// and every success a committed step. A lone refusal with nothing committed
+/// is returned as the plain leaf. A move success without a usable new id is
+/// recorded with incomplete targets, which gates.
+pub(super) fn batch_progress_error(
+    mut progress: BatchProgress,
+    targets: &[ObjectId],
+    effect: StepEffect,
+    replay: StepReplay,
+) -> Result<(), AccountError> {
+    if progress.failed.is_empty() {
+        return Ok(());
+    }
+    progress.failed.sort_by_key(|(index, _, _)| *index);
+    let (primary, application, error) = progress.failed.remove(0);
+    if progress.committed.is_empty()
+        && progress.failed.is_empty()
+        && application != Application::Uncertain
+    {
+        return Err(error);
+    }
+    let subject = |index: usize| {
+        targets.get(index).map_or_else(StepTargets::unknown, |id| {
+            StepTargets::complete(vec![TargetRef::new(
+                TargetRole::Subject,
+                ErrorScope::Message { id: id.clone() },
+            )])
+        })
+    };
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
+        effect,
+        subject(primary),
+        replay,
+        application,
+    ));
+    for (index, new_id) in progress.committed {
+        let targets = if effect == StepEffect::Moved {
+            let refs = targets
+                .get(index)
+                .map(|id| {
+                    TargetRef::new(TargetRole::Source, ErrorScope::Message { id: id.clone() })
+                })
+                .into_iter()
+                .chain(new_id.as_ref().map(|id| {
+                    TargetRef::new(
+                        TargetRole::Destination,
+                        ErrorScope::Message { id: id.clone() },
+                    )
+                }))
+                .collect();
+            if new_id.is_some() {
+                StepTargets::complete(refs)
+            } else {
+                StepTargets::at_least(refs)
+            }
+        } else {
+            subject(index)
+        };
+        record.committed(effect, targets, replay);
+    }
+    for (index, application, error) in progress.failed {
+        record.failed_sibling(Some(effect), subject(index), replay, application, error);
+    }
+    Err(finish_partial(error, record))
+}
+
+/// A whole `$batch` call failed after earlier chunks committed: the call's
+/// leaf is the primary over every id of the failed chunk, and every earlier
+/// committed id is a step. With nothing committed the leaf is returned plain.
+pub(super) fn batch_call_error(
+    progress: BatchProgress,
+    all_targets: &[ObjectId],
+    chunk_targets: &[ObjectId],
+    error: AccountError,
+    effect: StepEffect,
+    replay: StepReplay,
+) -> AccountError {
+    if progress.committed.is_empty() {
+        return error;
+    }
+    let subject =
+        |id: &ObjectId| TargetRef::new(TargetRole::Subject, ErrorScope::Message { id: id.clone() });
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
+        effect,
+        StepTargets::complete(chunk_targets.iter().map(subject).collect()),
+        replay,
+        Application::from_leaf(&error),
+    ));
+    for (index, _) in progress.committed {
+        let targets = all_targets
+            .get(index)
+            .map_or_else(StepTargets::unknown, |id| {
+                StepTargets::complete(vec![subject(id)])
+            });
+        record.committed(effect, targets, replay);
+    }
+    finish_partial(error, record)
 }

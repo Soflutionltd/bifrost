@@ -121,34 +121,71 @@ pub(crate) async fn delete_thread(
         // to choose these members. A second ETag read could otherwise authorize
         // deletion after a member moved out of Trash.
         let batch_size = account.capabilities.batching_policy.max_items.max(1);
-        for chunk in destroy.chunks(batch_size) {
-            let mut requests = Vec::with_capacity(chunk.len());
-            let mut targets = Vec::with_capacity(chunk.len());
-            for (index, (id, etag)) in chunk.iter().enumerate() {
-                requests.push(BatchRequestItem {
-                    id: index.to_string(),
-                    method: "POST".to_string(),
-                    url: message_batch_url(
+        let mut progress = BatchProgress::default();
+        let all_targets: Vec<_> = destroy.iter().map(|(id, _)| id.clone()).collect();
+        for (chunk_index, chunk) in destroy.chunks(batch_size).enumerate() {
+            let targets: Vec<_> = chunk.iter().map(|(id, _)| id.clone()).collect();
+            let requests: Result<Vec<BatchRequestItem>, AccountError> = chunk
+                .iter()
+                .enumerate()
+                .map(|(index, (id, etag))| -> Result<_, AccountError> {
+                    Ok(BatchRequestItem {
+                        id: index.to_string(),
+                        method: "POST".to_string(),
+                        url: message_batch_url(
+                            &account,
+                            id,
+                            "/permanentDelete",
+                            AccountOperation::BulkDestroy,
+                        )?,
+                        body: None,
+                        headers: Some(HashMap::from([("If-Match".to_string(), etag.clone())])),
+                    })
+                })
+                .collect();
+            // A local refusal while building a later chunk still reports the
+            // chunks already committed, like a failed `$batch` call.
+            let chunk_progress = match requests {
+                Ok(requests) => {
+                    submit_write_batch_with_targets(
                         &account,
-                        id,
-                        "/permanentDelete",
+                        requests,
+                        &targets,
+                        true,
                         AccountOperation::BulkDestroy,
-                    )?,
-                    body: None,
-                    headers: Some(HashMap::from([("If-Match".to_string(), etag.clone())])),
-                });
-                targets.push(id.clone());
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            match chunk_progress {
+                Ok(chunk_progress) => {
+                    let failed = !chunk_progress.failed.is_empty();
+                    progress.append(chunk_progress, chunk_index * batch_size);
+                    if failed {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    return Err(batch_call_error(
+                        progress,
+                        &all_targets,
+                        &targets,
+                        error,
+                        bifrost_types::StepEffect::Deleted,
+                        bifrost_types::StepReplay::Repeatable,
+                    ));
+                }
             }
-            submit_write_batch_with_targets(
-                &account,
-                requests,
-                &targets,
-                true,
-                AccountOperation::BulkDestroy,
-            )
-            .await?;
         }
-        Ok(())
+        // Deleted is Repeatable: a destroy-404 counts as success, so a replay
+        // of the public operation converges.
+        batch_progress_error(
+            progress,
+            &all_targets,
+            bifrost_types::StepEffect::Deleted,
+            bifrost_types::StepReplay::Repeatable,
+        )
     } else {
         let ids = members
             .into_iter()

@@ -8,6 +8,13 @@ use crate::ids::{MailboxId, ObjectId, ThreadId};
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorScope {
+    Submission {
+        id: ObjectId,
+    },
+    CloudFile {
+        id: String,
+    },
+    UploadSession,
     Account,
     Cursor(CursorScope),
     Mailbox {
@@ -76,6 +83,9 @@ impl<'a> ScopeFields<'a> {
 fn scope_fields(scope: &ErrorScope) -> ScopeFields<'_> {
     let fields = ScopeFields::new();
     match scope {
+        ErrorScope::Submission { id } => fields.push("kind", "submission").push("id", &id.0),
+        ErrorScope::CloudFile { id } => fields.push("kind", "cloud_file").push("id", id),
+        ErrorScope::UploadSession => fields.push("kind", "upload_session"),
         ErrorScope::Account => fields.push("kind", "account"),
         ErrorScope::Cursor(cursor) => cursor_scope_fields(fields.push("kind", "cursor"), cursor),
         ErrorScope::Mailbox { id } => fields.push("kind", "mailbox").push("id", &id.0),
@@ -344,6 +354,15 @@ mod tests {
     fn scope_fields_pin_the_serialized_shape() {
         let cases: Vec<(ErrorScope, Vec<(&str, &str)>)> = vec![
             (ErrorScope::Account, vec![("kind", "account")]),
+            (
+                ErrorScope::Submission { id: "s".into() },
+                vec![("kind", "submission"), ("id", "s")],
+            ),
+            (
+                ErrorScope::CloudFile { id: "f".into() },
+                vec![("kind", "cloud_file"), ("id", "f")],
+            ),
+            (ErrorScope::UploadSession, vec![("kind", "upload_session")]),
             (
                 ErrorScope::DirectoryGateway {
                     url: "https://dav.example.test/gal/".into(),

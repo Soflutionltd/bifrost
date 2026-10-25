@@ -2732,19 +2732,13 @@ mod tests {
             .await
             .expect_err("a failed cleanup is not a success");
 
-        assert!(
-            matches!(
-                error.kind(),
-                AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
-            ),
-            "a copied-but-not-removed contact is a partial response: {error:?}"
+        assert!(matches!(error.kind(), AccountErrorKind::Server(_)));
+        let record = error.partial_commit().expect("committed copy");
+        assert_eq!(
+            record.steps()[0].effect(),
+            Some(bifrost_types::StepEffect::Copied)
         );
-        // The classification, not just the kind. `ContactUpdate` is idempotent
-        // in the `AccountOperation` table, so `derive_protocol` answers
-        // `Retry(SameRequest)` for a `PartialResponse` unless the rebuilt error
-        // re-states the unreplayable declaration - and that retry re-runs a
-        // create-PUT against the destination the first attempt already
-        // occupied, forever.
+        assert_eq!(record.plan().replay, bifrost_types::ReplaySafety::Never);
         assert!(
             matches!(
                 error.recovery(),

@@ -262,18 +262,7 @@ pub(super) async fn create_draft_message(
     client: &GraphClient,
     message: Value,
 ) -> Result<DraftHandle, AccountError> {
-    let path = format!("{}/messages", client.api_path_prefix());
-    let created: Value = client
-        .post(
-            Resource::Outlook,
-            &path,
-            &message,
-            bifrost_net::ReplayPolicy::Never,
-        )
-        .await
-        .map_err(|e| {
-            into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftCreate))
-        })?;
+    let created = post_draft_message(client, &message, AccountOperation::DraftCreate).await?;
     let id = created.get("id").and_then(Value::as_str).ok_or_else(|| {
         pim_protocol_error(
             AccountOperation::DraftCreate,
@@ -282,6 +271,26 @@ pub(super) async fn create_draft_message(
         )
     })?;
     Ok(DraftHandle(id.to_string()))
+}
+
+/// POST a new draft and return the raw created resource. `operation` stamps
+/// the failure: `DraftCreate` for a standalone draft, `Send` when the draft is
+/// the first leg of a send.
+pub(super) async fn post_draft_message(
+    client: &GraphClient,
+    message: &Value,
+    operation: AccountOperation,
+) -> Result<Value, AccountError> {
+    let path = format!("{}/messages", client.api_path_prefix());
+    client
+        .post(
+            Resource::Outlook,
+            &path,
+            message,
+            bifrost_net::ReplayPolicy::Never,
+        )
+        .await
+        .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))
 }
 
 pub(super) async fn send_draft_message(

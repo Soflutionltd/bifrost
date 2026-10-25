@@ -1,3 +1,7 @@
+use bifrost_types::{
+    Application, ErrorScope, PartialCommitBuilder, PrimaryLeg, StepEffect, StepReplay, StepTargets,
+    TargetRef, TargetRole,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bifrost_types::{
@@ -530,10 +534,31 @@ async fn run_folder_mutation(
             account.folders.clear_modseqs(folder, uidvalidity, &uids);
             Some(Ok(outcome))
         }
-        Some(Err(err)) => Some(Err(super::account_error_with(
-            err,
-            super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
-        ))),
+        Some(Err(err)) => {
+            let progress = match &err {
+                crate::Error::MoveFallbackIncomplete {
+                    copy,
+                    stored_deleted,
+                    ..
+                } => Some((copy.clone(), *stored_deleted)),
+                _ => None,
+            };
+            let leaf = super::account_error_with(
+                err,
+                super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
+            );
+            Some(Err(if let Some((copy, stored_deleted)) = progress {
+                move_fallback_record(
+                    leaf,
+                    &copy,
+                    stored_deleted,
+                    folder,
+                    move_destination.expect("move destination validated"),
+                )
+            } else {
+                leaf
+            }))
+        }
     };
 
     let mut results = stale_results;
@@ -619,7 +644,7 @@ async fn run_destroy_mutation_groups(
             // The expunge failure applies only to the UIDs this round
             // actually marked `\Deleted`; the rest keep the STORE's own
             // verdict.
-            let expunge_error = expunge_failed_after_delete_mark(folder, err);
+            let expunge_error = destroy_expunge_error(folder, err);
             results.extend(
                 target_batch.settle(AccountOperation::BulkDestroy, folder, |target| {
                     let verdict = if expunge_uids.contains(&target.uid()) {
@@ -689,6 +714,7 @@ async fn run_flag_mutation_groups(
                         add,
                         remove,
                         unchanged_since,
+                        caller_guard: expected.is_some(),
                     },
                 )
                 .await,
@@ -760,6 +786,7 @@ struct PatchMutationWork<'a> {
     add: &'a HashSet<String>,
     remove: &'a HashSet<String>,
     unchanged_since: Option<u64>,
+    caller_guard: bool,
 }
 
 async fn run_patch_mutation_group(
@@ -822,7 +849,8 @@ async fn run_patch_mutation_group(
         None => Ok(StoreWireOutcome::Applied),
     };
     target_batch.settle(AccountOperation::UpdateFlags, folder, |target| {
-        let verdict = patch_mutation_verdict(target.uid(), &first, &second, folder);
+        let verdict =
+            patch_mutation_verdict(target.uid(), &first, &second, folder, work.caller_guard);
         target.seal(verdict)
     })
 }
@@ -845,21 +873,25 @@ fn patch_first_store_failure(err: crate::Error, folder: &MailboxName) -> Account
 /// STORE (a `MODIFIED` conflict, or the whole-command rejection that
 /// `PendingRetry`/`Failed` carry). Only a UID the add did apply to reaches
 /// the unguarded remove, and only there can the second STORE's answer make
-/// it `Succeeded(Applied)`.
+/// it `Succeeded(Applied)`. Any other answer there fails a leg after the add
+/// half committed, so the failure carries that add half as a record
+/// (`patch_second_store_error`).
 fn patch_mutation_verdict(
     uid: u32,
     first: &StoreWireOutcome,
     second: &Result<StoreWireOutcome, AccountError>,
     folder: &MailboxName,
+    caller_guard: bool,
 ) -> Verdict<MutationSuccess> {
     if !store_applied_uid(uid, first) {
         return mutation_verdict(uid, first, AccountOperation::UpdateFlags, folder);
     }
-    match second {
-        Ok(StoreWireOutcome::Applied) => Verdict::Succeeded(MutationSuccess::Applied),
-        Ok(_) => Verdict::Failed(store_failed_error(AccountOperation::UpdateFlags, folder)),
-        Err(error) => mutation_error_verdict(error),
-    }
+    let leaf = match second {
+        Ok(StoreWireOutcome::Applied) => return Verdict::Succeeded(MutationSuccess::Applied),
+        Ok(_) => store_failed_error(AccountOperation::UpdateFlags, folder),
+        Err(error) => error.clone(),
+    };
+    mutation_error_verdict(&patch_second_store_error(leaf, folder, caller_guard))
 }
 
 /// The single predicate for "the STORE applied to this UID".
@@ -1102,18 +1134,14 @@ fn failed_all(ids: Vec<DecodedObjectId>, error: AccountError) -> Vec<ItemOutcome
         .collect()
 }
 
-/// Which lane a wire error puts one target in. Transmission evidence
-/// decides: an `InFlight` attempt is `Uncertain` (the engine reads it back),
-/// an `Unsent` or server-acknowledged failure is `Failed`.
+/// A recorded primary determines its item lane; earlier commits never make
+/// a refused later command uncertain.
 fn mutation_error_verdict(error: &AccountError) -> Verdict<MutationSuccess> {
-    let in_flight = error.chain().iter().any(|cause| {
-        matches!(
-            cause,
-            Cause::Attempt(attempt)
-                if attempt.transmission_state == TransmissionState::InFlight
-        )
-    });
-    if in_flight {
+    let uncertain = error.partial_commit().map_or_else(
+        || Application::from_leaf(error) == Application::Uncertain,
+        |r| r.primary().application == Application::Uncertain,
+    );
+    if uncertain {
         Verdict::Uncertain(error.clone())
     } else {
         Verdict::Failed(error.clone())
@@ -1227,31 +1255,117 @@ pub(super) async fn expunge_uids_or_fall_back(
     conn.connection().expunge(timeout).await?;
     Ok(())
 }
-
-/// The STORE half of IMAP deletion is already acknowledged before this
-/// helper runs, so a failed UID EXPUNGE leaves a confirmed server-side
-/// partial effect: those messages are still flagged `\Deleted`.
-///
-/// The failure keeps its own classification. Collapsing every EXPUNGE
-/// error into `Protocol(PartialResponse)` would erase exactly the
-/// distinctions `reference/error-model.md` asks the producer to preserve -
-/// an auth loss, an ACL denial, a quota or rate-limit throttle, and a
-/// capability loss each derive a different `RecoveryClass`, and none of
-/// them is served by a generic reconcile. What this helper adds is the
-/// side-effect evidence, as support-only diagnostic text riding on the
-/// real error, so the engine can see both "why it failed" and "what
-/// already landed".
-fn expunge_failed_after_delete_mark(folder: &MailboxName, error: crate::Error) -> AccountError {
-    super::account_error_with(
+pub(super) fn folder_targets(folder: &MailboxName, role: TargetRole) -> StepTargets {
+    StepTargets::complete(vec![TargetRef::new(
+        role,
+        ErrorScope::Cursor(super::folder_scope(folder)),
+    )])
+}
+pub(super) fn finish_partial(error: AccountError, record: PartialCommitBuilder) -> AccountError {
+    error
+        .into_builder()
+        .partial_commit(record)
+        .try_build()
+        .expect("valid IMAP partial commitment")
+}
+fn destroy_expunge_error(folder: &MailboxName, error: crate::Error) -> AccountError {
+    let leaf = super::account_error_with(
         error,
         super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy)
-            .with_folder_scope(folder)
-            .with_extra_text(DiagnosticText::support_only(format!(
-                "UID EXPUNGE failed for {} after UID STORE +FLAGS.SILENT \\Deleted was \
-                 acknowledged; those messages remain flagged \\Deleted server-side",
-                folder.as_str(),
-            ))),
-    )
+            .with_folder_scope(folder),
+    );
+    let targets = folder_targets(folder, TargetRole::Subject);
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
+        StepEffect::Deleted,
+        targets.clone(),
+        StepReplay::Repeatable,
+        Application::from_leaf(&leaf),
+    ));
+    record.committed(StepEffect::MarkedDeleted, targets, StepReplay::Repeatable);
+    finish_partial(leaf, record)
+}
+fn patch_second_store_error(
+    leaf: AccountError,
+    folder: &MailboxName,
+    caller_guard: bool,
+) -> AccountError {
+    let targets = folder_targets(folder, TargetRole::Subject);
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
+        StepEffect::Updated,
+        targets.clone(),
+        StepReplay::Repeatable,
+        Application::from_leaf(&leaf),
+    ));
+    record.committed(
+        StepEffect::Updated,
+        targets,
+        if caller_guard {
+            StepReplay::Blocking
+        } else {
+            StepReplay::Repeatable
+        },
+    );
+    finish_partial(leaf, record)
+}
+fn move_fallback_record(
+    leaf: AccountError,
+    copy: &crate::types::CopyResult,
+    stored_deleted: bool,
+    folder: &MailboxName,
+    destination: &MailboxName,
+) -> AccountError {
+    let mut record = PartialCommitBuilder::new(PrimaryLeg::new(
+        if stored_deleted {
+            StepEffect::Deleted
+        } else {
+            StepEffect::MarkedDeleted
+        },
+        folder_targets(folder, TargetRole::Subject),
+        StepReplay::Repeatable,
+        Application::from_leaf(&leaf),
+    ));
+    let mut refs = vec![
+        TargetRef::new(
+            TargetRole::Source,
+            ErrorScope::Cursor(super::folder_scope(folder)),
+        ),
+        TargetRef::new(
+            TargetRole::Destination,
+            ErrorScope::Cursor(super::folder_scope(destination)),
+        ),
+    ];
+    if let Some(ResponseCode::CopyUid {
+        uid_validity,
+        dest_uids,
+        ..
+    }) = &copy.copy_uid
+    {
+        for range in dest_uids {
+            for uid in range.start.min(range.end.unwrap_or(range.start))
+                ..=range.start.max(range.end.unwrap_or(range.start))
+            {
+                refs.push(TargetRef::new(
+                    TargetRole::Destination,
+                    ErrorScope::Message {
+                        id: super::encode_object_id(destination, *uid_validity, uid),
+                    },
+                ));
+            }
+        }
+    }
+    record.committed(
+        StepEffect::Copied,
+        StepTargets::at_least(refs),
+        StepReplay::Blocking,
+    );
+    if stored_deleted {
+        record.committed(
+            StepEffect::MarkedDeleted,
+            folder_targets(folder, TargetRole::Subject),
+            StepReplay::Repeatable,
+        );
+    }
+    finish_partial(leaf, record)
 }
 
 fn split_by_uidvalidity(
@@ -1469,8 +1583,8 @@ mod tests {
     /// an engine that saw only `Protocol(PartialResponse)` would reconcile
     /// (or retry) both identically.
     #[test]
-    fn expunge_failure_keeps_its_classification_and_adds_the_side_effect_note() {
-        let denied = expunge_failed_after_delete_mark(
+    fn partial_commit_destroy_expunge_failure_marks_deleted() {
+        let denied = destroy_expunge_error(
             &folder(),
             crate::Error::No {
                 text: "permission denied".to_owned(),
@@ -1487,7 +1601,7 @@ mod tests {
             denied.kind()
         );
 
-        let over_quota = expunge_failed_after_delete_mark(
+        let over_quota = destroy_expunge_error(
             &folder(),
             crate::Error::No {
                 text: "over quota".to_owned(),
@@ -1506,12 +1620,16 @@ mod tests {
         );
 
         for err in [&denied, &over_quota] {
+            assert_eq!(
+                err.partial_commit().unwrap().steps()[0].effect(),
+                Some(StepEffect::MarkedDeleted)
+            );
             assert!(
-                err.support_consented().support_text.iter().any(|text| {
-                    text.contains("UID EXPUNGE failed")
-                        && text.contains("remain flagged \\Deleted server-side")
-                }),
-                "the confirmed partial side effect must be attached"
+                err.partial_commit()
+                    .unwrap()
+                    .steps()
+                    .iter()
+                    .all(|s| !matches!(s.outcome(), bifrost_types::StepOutcome::Failed { .. }))
             );
         }
     }
@@ -1715,7 +1833,7 @@ mod tests {
         let first = StoreWireOutcome::Modified(CompactUidSet::from_uids([2]));
         let second = Ok(StoreWireOutcome::Applied);
         let outcomes = settled(&[1, 2, 3], AccountOperation::UpdateFlags, |uid| {
-            patch_mutation_verdict(uid, &first, &second, &folder())
+            patch_mutation_verdict(uid, &first, &second, &folder(), false)
         });
         assert_eq!(outcomes.len(), 3);
         assert_eq!(
@@ -1739,7 +1857,7 @@ mod tests {
         let first = StoreWireOutcome::Modified(CompactUidSet::from_uids([2]));
         let second = Err(store_failed_error(AccountOperation::UpdateFlags, &folder()));
         let outcomes = settled(&[1, 2], AccountOperation::UpdateFlags, |uid| {
-            patch_mutation_verdict(uid, &first, &second, &folder())
+            patch_mutation_verdict(uid, &first, &second, &folder(), false)
         });
         assert!(
             outcomes
@@ -1758,6 +1876,13 @@ mod tests {
                 .all(|outcome| !matches!(outcome, ItemOutcome::Succeeded(_))),
             "a failed remove after a successful add must not claim a complete patch",
         );
+        // The add-applied UID's failure carries the committed add half.
+        assert!(outcomes.iter().any(|outcome| {
+            matches!(outcome, ItemOutcome::Failed(failure) if failure
+                .error
+                .partial_commit()
+                .is_some_and(|record| record.steps()[0].effect() == Some(StepEffect::Updated)))
+        }));
     }
 
     // A wire error on the first STORE of a two-sided patch decides only the
@@ -1768,7 +1893,7 @@ mod tests {
         let first = StoreWireOutcome::Applied;
         let second = Ok(StoreWireOutcome::Applied);
         let mut results = settled(&[1, 2], AccountOperation::UpdateFlags, |uid| {
-            patch_mutation_verdict(uid, &first, &second, &folder())
+            patch_mutation_verdict(uid, &first, &second, &folder(), false)
         });
         assert_eq!(
             results
@@ -1888,10 +2013,8 @@ mod tests {
     fn an_expunge_failure_applies_only_to_the_uids_it_marked() {
         let expunge_uids = [2u32];
         let outcome = StoreWireOutcome::Modified(CompactUidSet::from_uids([3]));
-        let expunge_error = expunge_failed_after_delete_mark(
-            &folder(),
-            crate::Error::Protocol("EXPUNGE refused".into()),
-        );
+        let expunge_error =
+            destroy_expunge_error(&folder(), crate::Error::Protocol("EXPUNGE refused".into()));
         let outcomes = settled(&[2, 3], AccountOperation::BulkDestroy, |uid| {
             if expunge_uids.contains(&uid) {
                 mutation_error_verdict(&expunge_error)
@@ -1958,5 +2081,101 @@ mod tests {
         assert_eq!(valid[0].uid, 2);
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].uid, 1);
+    }
+    fn partial_retry() -> AccountError {
+        AccountErrorBuilder::new(
+            AccountErrorKind::Server(ServerErrorKind::Unavailable),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+        )
+        .operation(AccountOperation::BulkMove)
+        .try_build()
+        .unwrap()
+    }
+    #[test]
+    fn partial_commit_move_fallback_retryable_store_refusal_is_protected() {
+        let error = move_fallback_record(
+            partial_retry(),
+            &crate::types::CopyResult::default(),
+            false,
+            &folder(),
+            &MailboxName::new("Archive").unwrap(),
+        );
+        assert!(
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget,bifrost_types::ReconcileAction::ObserveOnly])
+        );
+        assert!(matches!(mutation_error_verdict(&error), Verdict::Failed(_)));
+        assert!(
+            error
+                .partial_commit()
+                .unwrap()
+                .steps()
+                .iter()
+                .all(|s| !matches!(s.outcome(), bifrost_types::StepOutcome::Failed { .. }))
+        );
+    }
+    #[test]
+    fn partial_commit_move_fallback_expunge_missing_capability_keeps_copy() {
+        let leaf = super::super::account_error_with(
+            crate::Error::MissingCapability("UIDPLUS".into()),
+            super::super::error::ImapErrorContext::operation(AccountOperation::BulkMove)
+                .with_folder_scope(&folder()),
+        );
+        let error = move_fallback_record(
+            leaf,
+            &crate::types::CopyResult::default(),
+            true,
+            &folder(),
+            &MailboxName::new("Archive").unwrap(),
+        );
+        assert_eq!(error.partial_commit().unwrap().steps().len(), 2);
+        assert!(error.recovery().requires_reconciliation());
+    }
+    #[test]
+    fn partial_commit_move_fallback_state_changed_before_send_keeps_copy() {
+        let leaf = super::super::account_error_with(
+            crate::Error::StateChangedBeforeSend("changed".into()),
+            super::super::error::ImapErrorContext::operation(AccountOperation::BulkMove)
+                .with_folder_scope(&folder()),
+        );
+        let error = move_fallback_record(
+            leaf,
+            &crate::types::CopyResult::default(),
+            false,
+            &folder(),
+            &MailboxName::new("Archive").unwrap(),
+        );
+        assert_eq!(
+            error.partial_commit().unwrap().primary().application,
+            Application::NotApplied
+        );
+        assert!(error.recovery().requires_reconciliation());
+    }
+    #[test]
+    fn partial_commit_patch_second_store_failure_keeps_add_half() {
+        let error = patch_second_store_error(partial_retry(), &folder(), false);
+        assert!(error.recovery().is_retryable());
+        assert_eq!(
+            error.partial_commit().unwrap().steps()[0].replay(),
+            StepReplay::Repeatable
+        );
+    }
+    #[test]
+    fn partial_commit_conditional_patch_add_half_is_blocking() {
+        let error = patch_second_store_error(partial_retry(), &folder(), true);
+        assert!(
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget,bifrost_types::ReconcileAction::ObserveOnly])
+        );
+    }
+    #[test]
+    fn partial_commit_bulk_item_never_carries_siblings() {
+        let error = patch_second_store_error(partial_retry(), &folder(), true);
+        assert!(
+            error
+                .partial_commit()
+                .unwrap()
+                .steps()
+                .iter()
+                .all(|s| matches!(s.outcome(), bifrost_types::StepOutcome::Committed))
+        );
     }
 }

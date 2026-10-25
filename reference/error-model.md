@@ -39,10 +39,10 @@ secondary diagnostic evidence. The error retains the length of its original
 classification prefix across repeated rebuilds; derivation and transmission
 validation read only that prefix. On a fresh builder, all supplied causes
 participate in classification, including transmission and wire evidence.
-Producers combining outcomes must use a fresh builder to declare the combined
-kind and its own evidence before attaching history. This preserves existing
-net attempt-history/local-hold and DAV partial-sequence classifications while
-keeping sibling Graph push failures from reclassifying the first failure.
+Multi-step writes attach a partial-commit record to the unchanged leaf.
+Rebuilt builders allow one attachment and preserve an existing record;
+decoration never promotes historical evidence into the classification prefix.
+Net attempt-history/local-hold classifications retain their own evidence.
 Derived fields recompute on `try_build`. Builder overrides
 (`idempotency_override`, `throttle_scope`) are preserved across the
 round-trip, as is a `ServerCause` retry hint because it lives in the
@@ -206,9 +206,9 @@ QuotaExhausted, ConcurrencyConflict, RefreshTransient}`.
 
 `ReconcileAdvice { reason, guidance, retry_hint, throttle_scope }`:
 `ReconcileReason::{TransportDropAfterSend, PartialCompletionSignal,
-ThrottledMidFlight, InternalFailureAfterSend}`
+ThrottledMidFlight, InternalFailureAfterSend, PartialCommit}`
 plus `guidance.actions: Vec<ReconcileAction>` where `ReconcileAction`
-is `CheckTarget` / `DedupeByClientId`.
+is `CheckTarget` / `DedupeByClientId` / `ObserveOnly`.
 Both advice structs are explicitly `#[non_exhaustive]`.
 `ReconcileGuidance` is an ordinary constructible public struct, so the nested
 shape is not accidentally sealed.
@@ -447,7 +447,9 @@ work changes that. Nothing in this workspace offers one.
 persists a DIGEST: the exact classification (`AccountErrorKind`, `ErrorScope`,
 operation, provider, protocol) plus the whole `DiagnosticInfo`, rebuilt through
 `AccountErrorBuilder` with the canonical `Cause` its kind demands. Secondary
-cause payloads, `idempotency_override` and `throttle_scope` are lost. That is
+cause payloads, `idempotency_override`, `throttle_scope` and the partial-commit
+record are lost. Ledger rows are coverage/repair evidence, never replayed;
+attaching a record to synthesized causes would validate invented evidence. That is
 sound there only because the field is evidence an operator reads and never an
 input to a decision; see `reference/sync.md` under "Ledger envelope". Any future
 caller wanting to persist an error owes the same argument, because a restored
@@ -584,7 +586,7 @@ reason/actions/throttle for reconcile, none for terminal) via the
 `scope.rs`. `ErrorScope` (`#[non_exhaustive]`, custom `Serialize`)
 locates the failure: `Account`, `Cursor(CursorScope)`, and id-bearing
 `Mailbox` / `Message` / `Thread` / `Calendar` / `Event` / `Contact` plus the
-collection variants, plus `DirectoryGateway { url }` for a read-only directory
+collection variants, `Submission`, `CloudFile`, `UploadSession`, plus `DirectoryGateway { url }` for a read-only directory
 endpoint that a multi-gateway lookup skipped. The id-bearing variants use the same typed ids as
 the account surface (`MailboxId`, `ObjectId`, `ThreadId`, `CalendarId`,
 `EventId`, `ContactId`) and serialize their inner strings for support exports.
@@ -598,7 +600,8 @@ default idempotency source `derive` consults when no explicit
 `idempotency_override` is supplied. This is a logical-operation recovery
 policy, not proof that every HTTP leg of that operation is replayable.
 An event/contact update can contain a MOVE or conditional create-PUT; its
-request and partial-sequence failures must narrow the default to reconciliation.
+request failures narrow through net evidence, and multi-step writes derive
+operation recovery through their partial-commit record.
 The request's `ReplayPolicy` decides wire replay. When a non-replayable
 request may have committed, net stamps `idempotency_override(false)` during
 translation. The operation table is the default otherwise and for every
@@ -640,6 +643,7 @@ crates/types/src/error/
                    // (AccountErrorBuildError)
   kind.rs          // AccountErrorKind + subkind enums
   message_key.rs   // derive() stable dotted namespace
+  partial.rs       // historical effects, compensation, derived operation plan
   recovery.rs      // RecoveryClass, derive/suggest, RetryHint,
                    // EngineDirective, Fatal, ThrottleKey/Scope
   cause.rs         // Cause/CauseChain, Attempt/TransmissionState,
@@ -671,3 +675,69 @@ precondition or be refused with `Unsupported(operation)` before I/O. Unsupported
 token kinds, weak DAV validators and multi-request relocations that cannot keep
 the guard use that refusal, never a blind write. A server precondition rejection
 is `ConcurrencyConflict`, deriving `Retry(AfterStateRefresh, ConcurrencyConflict)`.
+
+## Partial commitment
+
+`partial.rs` records effects of a write without changing the failed leg's kind,
+message key, cause chain, classification prefix, scope, budgets or override.
+`recovery()` applies to the original operation; `leg_recovery()` preserves the
+primary failed leg's full advice. It is evidence, not an executable continuation.
+Terminal recovery means automatic execution has stopped, never that no effect
+occurred. A `Fatal` can carry a record.
+
+The public boundary attaches exactly once through `PartialCommitBuilder`.
+Composed operations accumulate crate-local progress and attach at their owner;
+there is no merge. `into_builder` preserves a record and allows decoration,
+but a second attachment fails `PartialCommitAlreadyAttached`. Other build
+invariants reject empty records, inconsistent application, nested records, and
+invalid compensation references or contradictory compensation evidence.
+
+Primary and sibling legs name optional effects and role-tagged `StepTargets`.
+Incomplete targets mean unknown identities or at least the supplied identities.
+`Application::from_leaf` is the producer rule: explicit classification-prefix
+InFlight or reconciling recovery means Uncertain, otherwise NotApplied.
+Effectless reads/local failures use NotApplicable. Decoration cannot influence
+this judgment. Committed steps remain historical facts. Successful compensation
+resolves only the named effect-bearing committed or uncertain steps; failed or
+unconfirmed cleanup preserves its own error. Unattempted targets are omitted.
+
+`StepReplay::Blocking` means replay duplicates the intended effect, changes
+identity or violates a precondition already made false. Repeatable includes
+orphan drafts and unlinked files, accepted by-products bounded by retry budgets.
+The derived `OperationPlan` retains all distinct engine directives and origins,
+auth and state prerequisites, terminal barriers, gating and residual effects.
+Unresolved committed Blocking effects or barriers force Never. Uncertain
+Blocking effects gate AfterObservation; observation must conclusively establish
+non-application before replay. Incomplete committed Blocking identities also
+gate. Uncertain Repeatable effects are residual, unless their leaf reconciles.
+Unconfirmed cleanup gates Blocking effects and retains Repeatable residuals.
+InternalFailureAfterSend contributes a terminal InternalFailure barrier.
+
+Scalar projection first preserves auth/permission remediation barriers, since
+observation cannot replace user action and terminal advice authorizes no replay.
+It then projects the first directive (all remain in the plan); directives never
+lift Never or bypass observation. Gating projects CheckTarget plus leg actions,
+record-driven DedupeByClientId and ObserveOnly when replay is Never. The reason
+is PartialCommit only with an unresolved committed Blocking effect, otherwise
+the first gating leg's reconcile reason or PartialCompletionSignal. Remaining
+barriers stay terminal. A committed Blocking prefix without gating projects a
+protected PartialCommit reconcile. Safe plans retry with state refresh before
+auth refresh in the scalar, retaining both prerequisites in the plan.
+Built-in request dispatch re-enters auth on every attempt; downstream accounts
+must honor both prerequisites themselves.
+
+ObserveOnly forbids resubmitting the original operation after read-back.
+DedupeByClientId comes from unresolved Blocking Created/Submitted effects,
+never the operation table; moves, copies and destroys do not acquire it.
+Projected reconciliation retains primary timing and scope, but a projected
+PartialCommit reason replaces ThrottledMidFlight. Repair reads carry no record
+today; any consumer needing throttle facts must use `throttle_observations()`,
+which yields primary, failed siblings and failed/unconfirmed cleanup with each
+leg's own recovery, scope and stamped budgets.
+
+Telemetry exports bounded per-effect committed counts, primary application,
+sibling and compensation counts, replay safety and the leg recovery class,
+without targets or text. Consented exports add role-tagged targets, completeness,
+step ids and compensation references/outcomes. Internal exports add sibling and
+compensation cause summaries. Submission and CloudFile scopes identify those
+resources; UploadSession deliberately carries no credential-bearing URL.

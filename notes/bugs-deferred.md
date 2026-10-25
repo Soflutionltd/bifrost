@@ -26,7 +26,7 @@ on its face, low value or not a defect.
 Direction agreed: the structural option - provider push and lifecycle loops
 become one-shot and the engine owns the outer loop, backoff, throttle holds and
 directive routing. Specify together with SYNC-009. It also absorbs the JMAP
-"push health as state" proposal (JMAP-034).
+"push health as state" proposal.
 
 Scope: sync adoption.
 

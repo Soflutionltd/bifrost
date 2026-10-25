@@ -93,7 +93,8 @@ pub use cancel::{Boundary, BoundaryRequest, BoundaryView};
 
 // Mutation pipeline entry points.
 pub use mutation::{
-    IdempotencyVendor, MutationCampaignId, MutationCounters, ReadbackOutcome, run_readback_guard,
+    IdempotencyVendor, MutationCampaignId, MutationCounters, PartialCommitObservation,
+    ReadbackOutcome, run_readback_guard,
 };
 
 // Multiplexer types consumers want to pattern-match against (the

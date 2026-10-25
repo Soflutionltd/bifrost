@@ -1037,3 +1037,10 @@ Local refusal helpers use `AccountError::unsupported` through the shared error
 funnel, retaining their provider, scope and diagnostic decoration.
 SMTP and LMTP final assembly use the shared constructor for unsupported
 classifications, retaining the transport protocol and transmission evidence.
+
+## Multi-step producer audit
+
+SMTP/LMTP submission is one transaction. Post-DATA per-recipient effects are
+already represented by the succeeded, failed and uncertain lanes in batch.rs
+and partial_completion_error. There is no applicable multi-step failure path
+requiring a partial-commit record above those lanes.

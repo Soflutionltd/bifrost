@@ -193,6 +193,52 @@ async fn raw_mime_import_posts_the_base64_octets_as_text_plain() {
     assert_eq!(requests[1].raw_body, None);
 }
 
+/// Clearing an extended property rides the destroy flag for its 404
+/// tolerance, but it is not a message destroy: the message's cached etag
+/// must survive, while a refusal still names the message in the record.
+#[tokio::test]
+async fn an_extended_property_clear_keeps_the_message_etag() {
+    let client = GraphClient::new("token");
+    client.script_rest([ScriptedRestResponse::json(
+        reqwest::StatusCode::OK,
+        json!({
+            "responses": [
+                {"id":"0", "status":204},
+                {"id":"1", "status":403, "body":{"error":{"code":"ErrorAccessDenied"}}}
+            ]
+        }),
+    )]);
+    let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    let cleared = ObjectId("cleared".to_string());
+    let refused = ObjectId("refused".to_string());
+    account
+        .etag_index
+        .write()
+        .await
+        .insert(cleared.0.clone(), "tag".to_string());
+    let error = delete_extended_property(
+        &account,
+        &[cleared.clone(), refused.clone()],
+        "String {00020329-0000-0000-C000-000000000046} Name x",
+        AccountOperation::SetExtendedProperty,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        account.etag_index.write().await.get(&cleared.0),
+        Some("tag".to_string())
+    );
+    let record = error.partial_commit().expect("one clear committed");
+    assert_eq!(
+        record.primary().targets.refs[0].scope,
+        ErrorScope::Message { id: refused }
+    );
+    assert_eq!(
+        record.steps()[0].targets().refs[0].scope,
+        ErrorScope::Message { id: cleared }
+    );
+}
+
 #[tokio::test]
 async fn write_batch_drains_past_a_failure_to_evict_a_later_destroy_etag() {
     let client = GraphClient::new("token");
@@ -229,17 +275,17 @@ async fn write_batch_drains_past_a_failure_to_evict_a_later_destroy_etag() {
             headers: None,
         },
     ];
-    assert!(
-        submit_write_batch_with_targets(
-            &account,
-            requests,
-            &[failed, destroyed.clone()],
-            true,
-            AccountOperation::BulkDestroy
-        )
-        .await
-        .is_err()
-    );
+    let progress = submit_write_batch_with_targets(
+        &account,
+        requests,
+        &[failed, destroyed.clone()],
+        true,
+        AccountOperation::BulkDestroy,
+    )
+    .await
+    .unwrap();
+    assert_eq!(progress.failed.len(), 1);
+    assert_eq!(progress.committed.len(), 1);
     assert_eq!(account.etag_index.write().await.get(&destroyed.0), None);
     assert_eq!(client.take_rest_requests().len(), 1);
 }
@@ -2244,5 +2290,207 @@ async fn deleting_a_thread_from_trash_only_destroys_members_in_trash() {
     assert_eq!(
         items[0]["url"],
         json!("/me/messages/trash-copy/permanentDelete")
+    );
+}
+
+#[tokio::test]
+async fn partial_commit_batch_keeps_success_refusal_and_missing_siblings() {
+    let client = GraphClient::new("token");
+    client.script_rest([ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({"responses":[
+        {"id":"1", "status":403, "body":{"error":{"code":"ErrorAccessDenied","message":"denied"}}},
+        {"id":"0", "status":200, "body":{"id":"new-a"}}
+    ]}))]);
+    let account =
+        GraphAccount::new_for_tests_with_shared(client, PushMode::GraphSubscriptions, &[]);
+    let ids: Vec<ObjectId> = ["a", "b", "c"]
+        .into_iter()
+        .map(|id| ObjectId(id.into()))
+        .collect();
+    let requests = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| BatchRequestItem {
+            id: index.to_string(),
+            method: "POST".into(),
+            url: format!("/me/messages/{}/move", id.0),
+            body: Some(json!({"destinationId":"dest"})),
+            headers: None,
+        })
+        .collect();
+    let progress = submit_write_batch_with_targets(
+        &account,
+        requests,
+        &ids,
+        false,
+        AccountOperation::AddToContainer,
+    )
+    .await
+    .unwrap();
+    let error = batch_progress_error(
+        progress,
+        &ids,
+        bifrost_types::StepEffect::Moved,
+        bifrost_types::StepReplay::Blocking,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.recovery(),
+        RecoveryClass::NoPermission { .. }
+    ));
+    let record = error.partial_commit().unwrap();
+    assert_eq!(record.steps().len(), 2);
+    assert_eq!(
+        record.steps()[0].targets().refs[1].scope,
+        ErrorScope::Message {
+            id: ObjectId("new-a".into())
+        }
+    );
+    assert_eq!(record.plan().gating.len(), 1);
+}
+#[test]
+fn partial_commit_batch_move_success_without_id_gates() {
+    let leaf = bifrost_types::AccountError::unsupported(
+        AccountOperation::AddToContainer,
+        bifrost_types::Protocol::Graph,
+    );
+    let progress = BatchProgress {
+        committed: vec![(0, None)],
+        failed: vec![(1, bifrost_types::Application::from_leaf(&leaf), leaf)],
+    };
+    let error = batch_progress_error(
+        progress,
+        &[ObjectId("a".into()), ObjectId("b".into())],
+        bifrost_types::StepEffect::Moved,
+        bifrost_types::StepReplay::Blocking,
+    )
+    .unwrap_err();
+    assert!(
+        !error.partial_commit().unwrap().steps()[0]
+            .targets()
+            .complete
+    );
+    assert_eq!(error.partial_commit().unwrap().plan().gating.len(), 1);
+    assert!(
+        matches!(error.recovery(), RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget,bifrost_types::ReconcileAction::ObserveOnly])
+    );
+}
+
+#[test]
+fn partial_commit_batch_reconciling_subresponse_is_uncertain() {
+    let leaf = crate::account::graph_error::batch_response_missing(
+        AccountOperation::AddToContainer,
+        Some(ErrorScope::Message {
+            id: ObjectId("a".into()),
+        }),
+        "missing answer",
+        false,
+    );
+    let progress = BatchProgress {
+        committed: vec![],
+        failed: vec![(0, bifrost_types::Application::from_leaf(&leaf), leaf)],
+    };
+    let error = batch_progress_error(
+        progress,
+        &[ObjectId("a".into())],
+        bifrost_types::StepEffect::Moved,
+        bifrost_types::StepReplay::Blocking,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.partial_commit().unwrap().primary().application,
+        bifrost_types::Application::Uncertain
+    );
+}
+#[tokio::test]
+async fn partial_commit_delete_thread_keeps_earlier_chunks() {
+    let client = GraphClient::new("token");
+    client.script_rest([
+        ScriptedRestResponse::json(reqwest::StatusCode::OK,json!({"value":[{"id":"a","parentFolderId":"TrashId","changeKey":"a-tag"},{"id":"b","parentFolderId":"TrashId","changeKey":"b-tag"}]})),
+        ScriptedRestResponse::json(reqwest::StatusCode::OK,json!({"id":"TrashId"})),
+        ScriptedRestResponse::json(reqwest::StatusCode::OK,json!({"responses":[{"id":"0","status":204}]})),
+        ScriptedRestResponse::json(reqwest::StatusCode::OK,json!({"responses":[{"id":"0","status":403,"body":{"error":{"code":"ErrorAccessDenied"}}}]})),
+    ]);
+    let mut account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    account.capabilities.batching_policy.max_items = 1;
+    let error = delete_thread(
+        account,
+        ThreadId("conversation".into()),
+        Some(ContainerId("TrashId".into())),
+    )
+    .await
+    .unwrap_err();
+    let record = error.partial_commit().unwrap();
+    assert_eq!(record.steps().len(), 1);
+    assert_eq!(
+        record.steps()[0].effect(),
+        Some(bifrost_types::StepEffect::Deleted)
+    );
+    assert_eq!(
+        record.steps()[0].targets().refs[0].scope,
+        ErrorScope::Message {
+            id: ObjectId("a".into())
+        }
+    );
+    assert_eq!(client.take_rest_requests().len(), 4);
+}
+
+/// A chunk refused locally, before its `$batch` is sent, still reports the
+/// chunks already committed. The refusal comes from `message_batch_url`: the
+/// server named a member id holding the shared-mailbox separator, so it
+/// parses as a message of a mailbox this account does not have.
+#[tokio::test]
+async fn partial_commit_delete_thread_keeps_earlier_chunks_on_a_local_refusal() {
+    let client = GraphClient::new("token");
+    client.script_rest([
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({"value":[
+                {"id":"a","parentFolderId":"TrashId","changeKey":"a-tag"},
+                {"id":"rogue\u{1f}b","parentFolderId":"TrashId","changeKey":"b-tag"}
+            ]}),
+        ),
+        ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({"id":"TrashId"})),
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({"responses":[{"id":"0","status":204}]}),
+        ),
+    ]);
+    let mut account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    account.capabilities.batching_policy.max_items = 1;
+    let error = delete_thread(
+        account,
+        ThreadId("conversation".into()),
+        Some(ContainerId("TrashId".into())),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        client.take_rest_requests().len(),
+        3,
+        "the refused chunk is never sent"
+    );
+    let record = error
+        .partial_commit()
+        .expect("the first chunk's destroy committed");
+    assert_eq!(
+        record.primary().application,
+        bifrost_types::Application::NotApplied
+    );
+    assert_eq!(
+        record.primary().targets.refs[0].scope,
+        ErrorScope::Message {
+            id: ObjectId("rogue\u{1f}b".into())
+        }
+    );
+    assert_eq!(record.steps().len(), 1);
+    assert_eq!(
+        record.steps()[0].effect(),
+        Some(bifrost_types::StepEffect::Deleted)
+    );
+    assert_eq!(
+        record.steps()[0].targets().refs[0].scope,
+        ErrorScope::Message {
+            id: ObjectId("a".into())
+        }
     );
 }

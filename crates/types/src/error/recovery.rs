@@ -191,6 +191,7 @@ pub struct ReconcileAdvice {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum ReconcileReason {
+    PartialCommit,
     TransportDropAfterSend,
     PartialCompletionSignal,
     ThrottledMidFlight,
@@ -208,6 +209,7 @@ pub struct ReconcileGuidance {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum ReconcileAction {
+    ObserveOnly,
     CheckTarget,
     DedupeByClientId,
 }
@@ -336,6 +338,10 @@ pub enum RemediationAction {
 /// need "the engine has nothing more to try" (operator-notification
 /// queues, permanent-failure dashboards) consume this type so the
 /// type system enforces the precondition.
+///
+/// A `Fatal` may carry a partial-commit record: terminal means no automatic
+/// execution recovery remains, never that nothing happened. Standing effects
+/// are in `AccountError::partial_commit`.
 #[derive(Debug, Clone)]
 pub struct Fatal(AccountError);
 
@@ -1482,7 +1488,24 @@ mod tests {
             None,
         );
 
-        for recovery in [&transport_drop, &partial, &internal] {
+        let recorded = crate::error::AccountErrorBuilder::new(
+            AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
+            Cause::Wire(crate::error::WireCause::MalformedResponse {
+                protocol: crate::error::Protocol::Jmap,
+                detail: None,
+            }),
+        )
+        .partial_commit(crate::error::PartialCommitBuilder::new(
+            crate::error::PrimaryLeg::new(
+                crate::error::StepEffect::Submitted,
+                crate::error::StepTargets::unknown(),
+                crate::error::StepReplay::Blocking,
+                crate::error::Application::Uncertain,
+            ),
+        ))
+        .try_build()
+        .unwrap();
+        for recovery in [&transport_drop, &partial, &internal, recorded.recovery()] {
             let RecoveryClass::Reconcile(advice) = recovery else {
                 panic!("expected Reconcile, got {recovery:?}");
             };

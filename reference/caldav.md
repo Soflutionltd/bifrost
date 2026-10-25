@@ -771,10 +771,13 @@ Supported calendar primitives:
   A server without MOVE falls back to PUT-to-new then DELETE-from-old. That
   order is the recoverable one: a failed copy leaves the event exactly where it
   was, while a failed delete leaves it readable in two places. The delete-leg
-  failure is wrapped `Protocol(PartialResponse)` with an acknowledged `Attempt`
-  (via `partial_sequence_error`, which `event_rsvp` now shares), so a consumer
-  can tell "not moved" from "copied but not cleaned up" and reconciles instead
-  of replaying a write that already landed.
+  failure keeps its leaf classification and carries a committed Copied step.
+  The relocation helper returns typed progress; event_update attaches once,
+  with source/destination targets and a Repeatable Deleted primary. A MOVE
+  followed by a failed PUT similarly records a Blocking Moved effect and
+  Repeatable Updated primary scoped to the destination. Retryable leaves
+  project to PartialCommit reconciliation with CheckTarget and ObserveOnly;
+  terminal and auth/permission leaves retain their classes and the record.
 
   A move-only patch is ONE request beyond the fetch - no content changed, so no
   write is issued and no partial-failure verdict can attach to a leg that was
@@ -830,12 +833,12 @@ Supported calendar primitives:
   discovery examines every href and uses the first case-insensitive
   `mailto:` URI.
   The outbox POST and local-resource PUT remain two server operations. Every
-  failure after the POST succeeds - the PUT itself and the local patch and
-  iCalendar encoding steps between them - is wrapped as a
-  `Protocol(PartialResponse)` carrying an acknowledged `Attempt` plus the
-  original cause chain. This routes the non-idempotent RSVP to reconciliation
-  and tells the consumer that the organizer may already have received it. The
-  flow is still not atomic; the error class is what communicates that.
+  failure after the POST succeeds records a committed Blocking Submitted
+  effect scoped to the event. The PUT primary is Repeatable Updated; local
+  patch/encoding failures are effectless. Leaf evidence is never replaced by
+  the POST's acknowledgement. A local refusal stays terminal with its record;
+  a retryable PUT projects PartialCommit with CheckTarget, DedupeByClientId and
+  ObserveOnly, preserving the PUT timing. The flow remains non-atomic.
 - `event_search` / `event_autocomplete` - non-empty searches issue
   CalDAV text-match `calendar-query` `REPORT`s over VEVENT summary,
   description, location, and attendee, asking for `getetag` only. The union of
@@ -1209,24 +1212,13 @@ defensive and unreachable today: DAV refreshes outside net, with bearer injectio
 disabled. A lone 501 remains data for MOVE fallback; a lone 503 reconciles and
 cannot consume a queued 405. A genuine first-attempt 412 stays a conflict.
 
-**And the declaration must survive a REBUILD.** That is the third place, and the
-easiest to miss. `partial_sequence_error` (caldav) and `partial_move_error`
-(both) reclassify a later leg's failure by minting a FRESH
-`AccountErrorBuilder::new(Protocol(PartialResponse), ..)` and copying only the
-cause chain across - an override is not a cause, so it does not ride along.
-Without re-stating it there, `derive_protocol` fell back to the operation table,
-called `EventUpdate` / `ContactUpdate` idempotent, and answered
-`Retry(SameRequest)` for a half-applied sequence: on a MOVE-less server the
-engine re-issues the update, finds no MOVE, create-PUTs the destination the first
-attempt already occupied, takes a 412 -> `Retry(AfterStateRefresh)`, and loops
-forever - or, before DELETE absorbed a gone target, GETs a 404 and reports a
-move that SUCCEEDED as `ProviderRefused`. Both wrappers therefore set
-`.idempotency_override(false)` unconditionally: a sequence whose earlier leg
-landed cannot be replayed from the top whatever the table says about the logical
-operation. RSVP was right only by accident, because `EventRsvp` is
-non-idempotent in the table. Pinned by
-`a_move_without_server_move_support_copies_then_deletes` and its CardDAV twin,
-which assert the `recovery()` and not only the kind.
+**Multi-step failures preserve the leaf.** Relocation returns crate-local
+Before, MovedThenPut or CopiedThenDelete progress, and the public update attaches
+a record exactly once. The plan protects committed Blocking moves/copies
+without reclassifying the later error or restating an idempotency override.
+RSVP likewise records the scheduling submission separately. The leaf's own
+classification prefix, timing and scope survive; operation recovery follows the
+record. Both dialects pin the failed cleanup through their relocation transcripts.
 
 One failure is deliberately NOT treated as reaching the server: a token source
 that cannot mint a credential. `transport_error` stamps `Attempt(Unsent)`, since

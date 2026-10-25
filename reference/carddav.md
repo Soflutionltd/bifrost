@@ -411,8 +411,8 @@ Supported contact primitives:
   **A cross-address-book move is PERFORMED**, by the same machinery and with
   the same guarantees as `bifrost-caldav::event_update`; see
   `reference/caldav.md` for the MOVE-then-fallback sequence, the `Overwrite: F`
-  and credential-gated `Destination` rules, the `Protocol(PartialResponse)`
-  verdict on a failed cleanup leg, and why a move-only patch issues no content
+  and credential-gated `Destination` rules, the typed partial-commit
+  record on a failed cleanup leg, and why a move-only patch issues no content
   write. The contact id is the resource URL and `contact_update` returns `()`,
   so the new id reaches the consumer through sync rather than the call.
 
@@ -796,8 +796,13 @@ conflict. Self-fetched validators pay the same accepted read-back cost.
 Net narrows possible-commit failures and `dispatch_once` also stamps DAV-minted
 failures. Ambiguous retryable statuses stop before another write, with 401/429
 refusal handling preserved. DAV's all-401 history exception is defensive and
-unreachable with today's outer credential-refresh walk. Partial-move wrappers
-still declare the whole sequence unreplayable when rebuilding a fresh error.
+unreachable with today's outer credential-refresh walk. Relocation returns
+Before, MovedThenPut or CopiedThenDelete progress. contact_update attaches once:
+committed Moved/Copied steps are Blocking, with source/destination contact
+identities; the Updated/Deleted primary is Repeatable and scoped to its target.
+The unchanged leaf supplies Application::from_leaf, recovery, hints and evidence.
+Retryable leaves project CheckTarget and ObserveOnly without dedupe; terminal
+and auth/permission leaves preserve their class and historical effects.
 Pinned by the create, conditional update, unconditional update, versioned delete,
 gone-target delete and relocate transcript tests in `client.rs`.
 

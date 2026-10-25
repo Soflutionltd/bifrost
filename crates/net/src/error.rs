@@ -359,6 +359,80 @@ impl Error {
             error => error,
         }
     }
+
+    /// This error with every free-text field that can quote the request URL
+    /// replaced by fixed text, and every boxed foreign source that can render
+    /// it dropped. Variants, transmission states, attempt evidence and
+    /// response evidence are kept, so the error classifies exactly as before.
+    ///
+    /// For a request whose URL is itself a credential (a pre-authenticated
+    /// upload session): the transport copies the HTTP stack's error text,
+    /// which names the URL, into `Network`, `Tls` and `InvalidRequest`, and
+    /// that text travels into support diagnostics. Server-supplied response
+    /// bodies and headers are not touched.
+    #[must_use]
+    pub fn redact_request_text(self) -> Self {
+        const REDACTED: &str = "detail withheld: the request URL is a credential";
+        let all = |attempts: Vec<Self>| {
+            attempts
+                .into_iter()
+                .map(Self::redact_request_text)
+                .collect::<Vec<_>>()
+        };
+        match self {
+            Self::LocalHold {
+                key,
+                held,
+                attempts,
+                may_have_committed,
+            } => Self::LocalHold {
+                key,
+                held,
+                attempts: all(attempts),
+                may_have_committed,
+            },
+            Self::AttemptHistory {
+                source,
+                attempts,
+                may_have_committed,
+            } => Self::AttemptHistory {
+                source: Box::new(source.redact_request_text()),
+                attempts: all(attempts),
+                may_have_committed,
+            },
+            Self::Network {
+                transmission_state, ..
+            } => Self::Network {
+                message: REDACTED.to_owned(),
+                transmission_state,
+                source: None,
+            },
+            Self::Tls {
+                transmission_state, ..
+            } => Self::Tls {
+                message: REDACTED.to_owned(),
+                transmission_state,
+            },
+            Self::InvalidRequest { field, .. } => Self::InvalidRequest {
+                field,
+                detail: REDACTED.to_owned(),
+            },
+            Self::RedirectRejected { .. } => Self::RedirectRejected {
+                message: REDACTED.to_owned(),
+            },
+            Self::MalformedRedirect { kind, .. } => Self::MalformedRedirect {
+                kind,
+                message: REDACTED.to_owned(),
+            },
+            Self::UnauthenticatedRedirectHop { final_response, .. } => {
+                Self::UnauthenticatedRedirectHop {
+                    message: REDACTED.to_owned(),
+                    final_response,
+                }
+            }
+            error => error,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -429,5 +503,68 @@ mod tests {
         // rather than coupling this to the `http` crate's reason phrases.
         assert!(rendered.starts_with("HTTP 418"), "got {rendered:?}");
         assert!(!rendered.contains("secret-token-in-body"));
+    }
+
+    /// Every text that can quote the request URL is withheld, through the
+    /// attempt-history envelope too, while the variant and transmission
+    /// state that classification reads survive.
+    #[test]
+    fn redact_request_text_withholds_the_url_and_keeps_the_shape() {
+        const URL: &str = "https://upload.example/session?token=secret";
+        let network = |state| Error::Network {
+            message: format!("error sending request for url ({URL})"),
+            transmission_state: state,
+            source: Some(Box::new(std::io::Error::other(URL))),
+        };
+        let error = Error::AttemptHistory {
+            source: Box::new(network(TransmissionState::InFlight)),
+            attempts: vec![
+                network(TransmissionState::Unsent),
+                Error::Tls {
+                    message: URL.to_owned(),
+                    transmission_state: TransmissionState::Unsent,
+                },
+                Error::InvalidRequest {
+                    field: "request",
+                    detail: URL.to_owned(),
+                },
+            ],
+            may_have_committed: true,
+        }
+        .redact_request_text();
+        assert!(!format!("{error:?} {error}").contains("upload.example"));
+        let Error::AttemptHistory {
+            source,
+            attempts,
+            may_have_committed: true,
+        } = error
+        else {
+            panic!("the envelope survives");
+        };
+        assert!(matches!(
+            *source,
+            Error::Network {
+                transmission_state: TransmissionState::InFlight,
+                source: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            attempts.as_slice(),
+            [
+                Error::Network {
+                    transmission_state: TransmissionState::Unsent,
+                    ..
+                },
+                Error::Tls {
+                    transmission_state: TransmissionState::Unsent,
+                    ..
+                },
+                Error::InvalidRequest {
+                    field: "request",
+                    ..
+                },
+            ]
+        ));
     }
 }

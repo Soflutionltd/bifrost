@@ -55,6 +55,7 @@ pub(crate) struct JmapErrorContext {
     pub(crate) scope: Option<ErrorScope>,
     pub(crate) state_based: bool,
     pub(crate) anchored_query: bool,
+    pub(crate) send_boundary: bool,
 }
 
 impl JmapErrorContext {
@@ -66,6 +67,7 @@ impl JmapErrorContext {
             scope: None,
             state_based: false,
             anchored_query: false,
+            send_boundary: false,
         }
     }
 
@@ -178,16 +180,29 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         )
         .try_build()
         .expect("valid account error classification"),
-        crate::Error::ResponseDecode(err) => build(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Jmap,
-                detail: Some(DiagnosticText::support_only(err.to_string())),
-            }),
-            &ctx,
-        )
-        .try_build()
-        .expect("valid account error classification"),
+        crate::Error::ResponseDecode(err) => {
+            let builder = build(
+                AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
+                Cause::Wire(WireCause::MalformedResponse {
+                    protocol: Protocol::Jmap,
+                    detail: Some(DiagnosticText::support_only(err.to_string())),
+                }),
+                &ctx,
+            );
+            // Only a send boundary knows this came from the received envelope:
+            // `From<serde_json::Error>` makes any stray `?` on a serde error a
+            // `ResponseDecode`, so elsewhere it is no evidence of an answer.
+            let builder = if ctx.send_boundary {
+                builder.push_cause(Cause::Attempt(AttemptCause::new(
+                    TransmissionState::Acknowledged,
+                )))
+            } else {
+                builder
+            };
+            builder
+                .try_build()
+                .expect("valid account error classification")
+        }
         crate::Error::CallNotFound(id) => build(
             AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
             Cause::Wire(WireCause::MalformedResponse {
@@ -1103,18 +1118,28 @@ fn convert_transport(
             Some(ThrottleScope::Account),
         )
     } else {
-        // Custom transport without bifrost-net evidence. No attempt
-        // cause: we have no wire-level signal about transmission.
-        build(
+        // Custom transport without bifrost-net evidence: no wire-level signal
+        // about transmission, so no attempt cause - except at a send
+        // boundary, which knows the transport was already handed the
+        // submission, so the failure is stamped `InFlight`.
+        let builder = build(
             AccountErrorKind::Transport(TransportErrorKind::Network),
             Cause::Transport(TransportCause::new(
                 TransportKind::Network,
-                Some(DiagnosticText::support_only(transport.message.clone())),
+                Some(DiagnosticText::support_only(transport.message)),
             )),
             &ctx,
-        )
-        .try_build()
-        .expect("valid account error classification")
+        );
+        let builder = if ctx.send_boundary {
+            builder.push_cause(Cause::Attempt(AttemptCause::new(
+                TransmissionState::InFlight,
+            )))
+        } else {
+            builder
+        };
+        builder
+            .try_build()
+            .expect("valid account error classification")
     }
 }
 
@@ -2465,6 +2490,21 @@ mod tests {
             err.kind(),
             &AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
         );
+        let attempt = |err: &AccountError| {
+            err.chain().iter().find_map(|cause| match cause {
+                Cause::Attempt(attempt) => Some(attempt.transmission_state),
+                _ => None,
+            })
+        };
+        // Outside a send boundary a `ResponseDecode` is no evidence that a
+        // response arrived: `From<serde_json::Error>` produces it for any
+        // serde failure.
+        assert_eq!(attempt(&err), None);
+        let mut ctx = JmapErrorContext::new(AccountOperation::Send);
+        ctx.send_boundary = true;
+        let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let err = into_account_error(crate::Error::ResponseDecode(json_err), ctx);
+        assert_eq!(attempt(&err), Some(TransmissionState::Acknowledged));
     }
 
     #[test]

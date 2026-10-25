@@ -51,7 +51,11 @@
 //!
 //! Version 5 adds Event resource (tag 11) and scope (tag 9) to the error
 //! digest. Versions 3 and 4 remain readable without those tags.
+//!
 //! Version 6 adds DirectoryGateway scope (tag 10); older versions reject it.
+//!
+//! Version 7 adds Submission, CloudFile and UploadSession scopes (tags 11-13);
+//! older versions reject them.
 //!
 //! A `BarrierIncident::resume_from` nests a whole cursor envelope through
 //! `encode_envelope` / `decode_envelope` rather than re-deriving one: the
@@ -84,10 +88,14 @@
 //! evidence, and operator evidence is what a digest preserves.
 //!
 //! What is NOT preserved, stated so a later reader does not assume otherwise:
-//! secondary `Cause` payloads, `idempotency_override`, and `throttle_scope`.
-//! The last two are overrides for deriving `RecoveryClass` on a live retry
-//! decision, and a restored ledger error is never retried through - it is read
-//! by an operator or an audit.
+//! secondary `Cause` payloads, `idempotency_override`, `throttle_scope`, and
+//! the partial-commit record. `idempotency_override` and `throttle_scope` are
+//! overrides for deriving `RecoveryClass` on a live retry decision, and a
+//! restored ledger error is never retried through - it is read by an operator
+//! or an audit. The partial-commit record is dropped for the same reason and
+//! one more: ledger rows record sync coverage and repair failures, never write
+//! failures, and attaching a record to a digest's synthesized cause would
+//! validate invented evidence.
 
 use std::collections::BTreeMap;
 
@@ -114,7 +122,7 @@ use crate::error::Error;
 /// Current ledger envelope version. Bumped whenever the layout below changes
 /// in a way an older decoder would misread, including a new tag in a
 /// vocabulary an older decoder would refuse.
-pub const LEDGER_ENVELOPE_VERSION: u32 = 6;
+pub const LEDGER_ENVELOPE_VERSION: u32 = 7;
 
 /// Lowest ledger envelope version still readable by this engine.
 ///
@@ -301,7 +309,7 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
 /// one.
 ///
 /// A no-op while every version in the readable window shares one layout
-/// (versions 4 through 6 only widened the error vocabulary). It exists as the
+/// (versions 4 through 7 only widened the error vocabulary). It exists as the
 /// named boundary anyway, for the same reason `migrate_change_cursor` does:
 /// the codec is the only place in the workspace that may hold ledger state in
 /// an older shape, so a fixup written anywhere else spreads knowledge of a dead
@@ -1079,6 +1087,15 @@ fn decode_error_kind(reader: &mut Reader<'_>) -> Result<AccountErrorKind, Error>
 
 fn encode_error_scope(out: &mut Vec<u8>, scope: &ErrorScope) {
     match scope {
+        ErrorScope::Submission { id } => {
+            out.push(11);
+            write_string(out, &id.0);
+        }
+        ErrorScope::CloudFile { id } => {
+            out.push(12);
+            write_string(out, id);
+        }
+        ErrorScope::UploadSession => out.push(13),
         ErrorScope::Account => out.push(0),
         ErrorScope::Cursor(cursor) => {
             out.push(1);
@@ -1146,6 +1163,13 @@ fn decode_error_scope(reader: &mut Reader<'_>) -> Result<ErrorScope, Error> {
         10 if reader.version >= 6 => ErrorScope::DirectoryGateway {
             url: reader.string()?,
         },
+        11 if reader.version >= 7 => ErrorScope::Submission {
+            id: ObjectId(reader.string()?),
+        },
+        12 if reader.version >= 7 => ErrorScope::CloudFile {
+            id: reader.string()?,
+        },
+        13 if reader.version >= 7 => ErrorScope::UploadSession,
         other => return Err(unknown_tag("error scope", other)),
     })
 }
@@ -1734,8 +1758,8 @@ mod tests {
     fn directory_gateway_scope_digest_round_trips_and_requires_version_six() {
         assert_eq!(
             &encode_ledger(&DebtLedger::new())[4..8],
-            &6u32.to_le_bytes(),
-            "the new error-scope vocabulary requires a version-six header",
+            &super::LEDGER_ENVELOPE_VERSION.to_le_bytes(),
+            "writers use the current envelope version",
         );
         let scope = bifrost_types::ErrorScope::DirectoryGateway {
             url: "https://dav.example.test/gal/".into(),
@@ -1827,6 +1851,30 @@ mod tests {
                 restored.recovery(),
                 &bifrost_types::RecoveryClass::InternalFailure
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod partial_commit_scope_tests {
+    use super::*;
+    #[test]
+    fn ledger_error_scope_v7_tags_round_trip() {
+        assert_eq!(LEDGER_ENVELOPE_VERSION, 7);
+        for scope in [
+            ErrorScope::Submission {
+                id: ObjectId("submission".into()),
+            },
+            ErrorScope::CloudFile { id: "file".into() },
+            ErrorScope::UploadSession,
+        ] {
+            let mut bytes = Vec::new();
+            encode_error_scope(&mut bytes, &scope);
+            assert_eq!(
+                decode_error_scope(&mut Reader::new(&bytes, 7)).unwrap(),
+                scope
+            );
+            assert!(decode_error_scope(&mut Reader::new(&bytes, 6)).is_err());
         }
     }
 }

@@ -79,3 +79,14 @@ pub(super) fn system_time_rfc3339(value: SystemTime) -> String {
 pub(super) fn system_time_naive_utc(value: SystemTime) -> String {
     utc_civil(value).strftime("%Y-%m-%dT%H:%M:%S").to_string()
 }
+
+pub(super) fn finish_partial(
+    error: AccountError,
+    record: bifrost_types::PartialCommitBuilder,
+) -> AccountError {
+    error
+        .into_builder()
+        .partial_commit(record)
+        .try_build()
+        .expect("valid Graph partial commitment")
+}

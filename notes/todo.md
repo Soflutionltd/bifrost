@@ -108,21 +108,15 @@ PUBLISHED SURFACE fence apply.
   bug-hunt ledgers, C-items from the 2026-09-04 hunt. All are tracked at
   the same level; none blocks ratatoskr.
 
-## IMAP composite partial completion
+## IMAP connection transition partial completion
 
-- Multi-command operations still report the later leaf's failure rather than
-  aggregate progress. In `uid_move_messages` after an acknowledged COPY, STORE
-  `NO [UNAVAILABLE]` is acknowledged but retryable; a COPY response dropping
-  UIDPLUS makes UID EXPUNGE refuse locally; an interleaved LOGOUT can cause
-  `StateChangedBeforeSend`. These paths can authorize replaying the COPY.
-  The current MOVE evidence floor covers evidence-bearing `Unsent` errors,
-  including first-write failures and `Closed`, but cannot represent all partial
-  outcomes. An aggregate-progress design must absorb or replace that floor.
-  Include later steps withdrawn while queued, dropped unclaimed by a dying
-  driver, and already expired at admission. Inspect `complete_auth` and
-  `unauthenticate` (including disposition after failed required CAPABILITY),
-  `run_starttls_upgrade`, `run_patch_mutation_group`, and
-  `run_destroy_mutation_groups` as members of the same class.
+- Inspect `complete_auth` and `unauthenticate` (including disposition after
+  failed required CAPABILITY), and `run_starttls_upgrade` for earlier committed
+  transitions followed by a later failure. Include later steps withdrawn while
+  queued, dropped unclaimed by a dying driver, and already expired at admission.
+  Write-side composite partial completion is covered by the shared
+  partial-commit record (`reference/error-model.md`); these
+  authentication/session-transition cases remain separate work.
 
 ## IMAP bandwidth admission after claim
 
@@ -292,3 +286,37 @@ An omitted id becomes `Error::IdNotFound` and then Protocol(MissingField), a
 terminal result without read-back. The bulk path's `set_id_unanswered` is the
 precedent: provider omission does not prove the write failed. This concerns
 first-response omission classification, independently of wire replay policy.
+
+## Partial-commit adoption laterals
+
+- IMAP send_message, send_raw_message and draft_send log a failed Sent APPEND
+  and return success; draft_send likewise logs a post-send discard failure.
+  The caller cannot learn that the Sent copy is missing or the draft lingers.
+  These paths return Ok after SMTP commits, so they are outside the adopted
+  failure-path contract in account/pim.rs.
+- IMAP container operations return a refresh_folders failure after the write
+  commits. The partial-commit record makes this honest; whether to return
+  success with a stale registry is a separate API decision.
+- Acknowledged single-request creates without a usable identity can invite a
+  duplicating manual retry: IMAP draft_create without APPENDUID, Google People
+  contact_create without resourceName, standalone Graph draft_create, Google
+  and Graph filter_create, and Google calendar event_create. These need their
+  own ruling; they are outside multi-step adoption. The committed-unidentified
+  partial-commit shape can carry them without inventing uncertainty.
+- Upload session URLs can reach support exports through transport messages.
+  bifrost-net's `send_error_to_error` builds `Error::Network { message }` from
+  reqwest's Display, which names the request URL, and `support_cause_from_source`
+  keeps that message as support-only text. For the Graph and Google chunk PUTs
+  the URL is the pre-authenticated session credential, and the chunk-PUT error
+  is the failure leaf. This predates partial commitment. The session cancel
+  DELETE, whose error is kept as a compensation, already passes through
+  `bifrost_net::Error::redact_request_text` at both cancel sites; the chunk
+  PUT still needs a URL-scrubbing decision at the net boundary or the upload
+  call sites.
+- Graph send_message leaves an orphan draft after a refused send; each automatic
+  retry can create another. This is accepted Repeatable clutter for the send
+  operation, bounded by retry budgets. Adding orphan cleanup is a separate
+  compensation decision; none was added in pim/send.rs.
+- Graph cancel_upload_session records a 404 or 410 as a Failed compensation,
+  though both mean the upload session is already gone. Google treats 404, 410
+  and 499 on its cancel as Succeeded. Decide whether Graph should match.
