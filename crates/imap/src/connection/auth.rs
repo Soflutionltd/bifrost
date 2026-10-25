@@ -352,10 +352,9 @@ impl ImapConnection {
             pass: pass.to_owned().into(),
         };
 
-        let caps_provided =
-            tokio::time::timeout(timeout, self.submit_regular(cmd, LoginConsumer::default()))
-                .await
-                .map_err(|_| Error::timeout_inflight())??;
+        let caps_provided = self
+            .submit_regular(cmd, LoginConsumer::default(), Some(deadline))
+            .await?;
 
         self.complete_auth(caps_provided, deadline).await
     }
@@ -424,10 +423,9 @@ impl ImapConnection {
 
         let consumer = AuthenticatePlainConsumer::new(encoded, has_sasl_ir);
         let deadline = tokio::time::Instant::now() + timeout;
-        let caps_provided =
-            tokio::time::timeout(timeout, self.submit_with_continuations(cmd, consumer))
-                .await
-                .map_err(|_| Error::timeout_inflight())??;
+        let caps_provided = self
+            .submit_with_continuations(cmd, consumer, Some(deadline))
+            .await?;
 
         self.complete_auth(caps_provided, deadline).await
     }
@@ -489,10 +487,9 @@ impl ImapConnection {
             crate::types::AuthMechanism::XOAuth2.name(),
         );
         let deadline = tokio::time::Instant::now() + timeout;
-        let caps_provided =
-            tokio::time::timeout(timeout, self.submit_with_continuations(cmd, consumer))
-                .await
-                .map_err(|_| Error::timeout_inflight())??;
+        let caps_provided = self
+            .submit_with_continuations(cmd, consumer, Some(deadline))
+            .await?;
 
         self.complete_auth(caps_provided, deadline).await
     }
@@ -565,10 +562,9 @@ impl ImapConnection {
             crate::types::AuthMechanism::OAuthBearer.name(),
         );
         let deadline = tokio::time::Instant::now() + timeout;
-        let caps_provided =
-            tokio::time::timeout(timeout, self.submit_with_continuations(cmd, consumer))
-                .await
-                .map_err(|_| Error::timeout_inflight())??;
+        let caps_provided = self
+            .submit_with_continuations(cmd, consumer, Some(deadline))
+            .await?;
 
         self.complete_auth(caps_provided, deadline).await
     }
@@ -602,10 +598,9 @@ impl ImapConnection {
 
         let consumer = AuthenticateCramMd5Consumer::new(user.to_owned(), pass.to_owned().into());
         let deadline = tokio::time::Instant::now() + timeout;
-        let caps_provided =
-            tokio::time::timeout(timeout, self.submit_with_continuations(cmd, consumer))
-                .await
-                .map_err(|_| Error::timeout_inflight())??;
+        let caps_provided = self
+            .submit_with_continuations(cmd, consumer, Some(deadline))
+            .await?;
 
         self.complete_auth(caps_provided, deadline).await
     }
@@ -722,10 +717,9 @@ impl ImapConnection {
         };
 
         let deadline = tokio::time::Instant::now() + timeout;
-        let caps_provided =
-            tokio::time::timeout(timeout, self.submit_with_continuations(cmd, consumer))
-                .await
-                .map_err(|_| Error::timeout_inflight())??;
+        let caps_provided = self
+            .submit_with_continuations(cmd, consumer, Some(deadline))
+            .await?;
 
         self.complete_auth(caps_provided, deadline).await
     }
@@ -768,17 +762,11 @@ impl ImapConnection {
         deadline: tokio::time::Instant,
     ) -> Result<(), Error> {
         if !caps_provided {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::timeout_inflight());
-            }
             // Send CAPABILITY via the driver. apply_side_effects inside
             // the driver updates the cached capabilities automatically
             // when it processes the untagged CAPABILITY or tagged
             // [CAPABILITY] response code (RFC 3501 Section7.2.1).
-            tokio::time::timeout(remaining, self.fetch_capabilities_via_driver())
-                .await
-                .map_err(|_| Error::timeout_inflight())??;
+            self.fetch_capabilities_via_driver(deadline).await?;
         }
         Ok(())
     }
@@ -799,16 +787,26 @@ impl ImapConnection {
         Ok(())
     }
 
-    /// Send CAPABILITY via the driver task and wait for completion.
+    /// Send CAPABILITY via the driver task and wait for completion, bounded
+    /// by the caller's operation `deadline` (an authentication or
+    /// UNAUTHENTICATE that already spent part of it). A deadline already gone
+    /// submits nothing and is `Timeout` / `Unsent`.
     ///
     /// The driver's `apply_side_effects` updates the cached capability set
     /// automatically. The consumer output is ignored  -  the canonical state
     /// lives in `ProtocolState` inside the driver.
-    async fn fetch_capabilities_via_driver(&self) -> Result<(), Error> {
+    async fn fetch_capabilities_via_driver(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), Error> {
         use super::dispatch::CapabilityConsumer;
 
         let _caps: Vec<Capability> = self
-            .submit_regular(Command::Capability, CapabilityConsumer::default())
+            .submit_regular(
+                Command::Capability,
+                CapabilityConsumer::default(),
+                Some(deadline),
+            )
             .await?;
         Ok(())
     }
@@ -852,26 +850,17 @@ impl ImapConnection {
 
         let deadline = tokio::time::Instant::now() + timeout;
 
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(
-                Command::Unauthenticate,
-                super::dispatch::TaggedOkConsumer::default(),
-            ),
+        self.submit_regular(
+            Command::Unauthenticate,
+            super::dispatch::TaggedOkConsumer::default(),
+            Some(deadline),
         )
-        .await
-        .map_err(|_| Error::timeout_inflight())??;
+        .await?;
 
         // RFC 8437 Section2: capabilities may change after unauthentication.
         // Unconditional refresh  -  the server SHOULD send caps but is not
         // required to.
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(Error::timeout_inflight());
-        }
-        tokio::time::timeout(remaining, self.fetch_capabilities_via_driver())
-            .await
-            .map_err(|_| Error::timeout_inflight())??;
+        self.fetch_capabilities_via_driver(deadline).await?;
 
         Ok(())
     }
@@ -897,8 +886,11 @@ impl ImapConnection {
             return Ok(());
         }
 
+        // No deadline of its own, by design: each caller decides whether to
+        // bound LOGOUT. Dropping this future before the driver claims the
+        // LOGOUT withdraws it unsent.
         let _: () = self
-            .submit_regular(Command::Logout, LogoutConsumer::default())
+            .submit_regular(Command::Logout, LogoutConsumer::default(), None)
             .await?;
         Ok(())
     }
@@ -907,142 +899,174 @@ impl ImapConnection {
     // Submit helpers
     // -----------------------------------------------------------------------
 
-    /// Submit a regular (non-continuation) command to the driver task
-    /// and await the typed result.
+    /// Submit a regular (non-continuation) command to the driver task and
+    /// await the typed result, bounded by `deadline` (`None`: unbounded).
+    ///
+    /// The deadline lives here, not at the call site, because only the
+    /// helper can see how far the submission got; see
+    /// `submit_driver_command` for the evidence each phase returns.
     pub(super) async fn submit_regular<C: super::dispatch::Consumer + 'static>(
         &self,
         cmd: Command,
         consumer: C,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<C::Output, Error>
     where
         C::Output: 'static,
     {
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let dcmd = driver::DriverCommand::Run {
-            command: cmd,
-            consumer: driver::DriverConsumer::Regular(
-                Box::new(consumer) as Box<dyn driver::ConsumerErased>
-            ),
-            result_tx,
-        };
-        if self.cmd_tx.send(dcmd).await.is_err() {
-            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
-        }
-        let guard = self.in_flight();
-        let received = result_rx.await;
-        guard.completed();
-        let result = match received {
-            Ok(inner) => inner?,
-            Err(_) => {
-                return Err(self.observe_driver_panic(TransmissionState::InFlight).await);
-            }
-        };
-        let output = *result
+        let result = self
+            .submit_driver_command(
+                (cmd, driver::DriverConsumer::Regular(Box::new(consumer))),
+                deadline,
+                |reply| driver::DriverCommand::Run { reply },
+            )
+            .await?;
+        result
             .downcast::<C::Output>()
-            .map_err(|_| Error::Internal("type mismatch in driver result".into()))?;
-        Ok(output)
+            .map(|output| *output)
+            .map_err(|_| Error::Internal("type mismatch in driver result".into()))
     }
 
-    /// Submit a streaming regular command to the driver task and await the
-    /// typed result.
+    /// Submit a streaming regular command and await the typed result,
+    /// bounded by `deadline`. A withdrawn command's consumer (and with it the
+    /// caller's item sender) is dropped in this frame at once, so a receiver
+    /// drained alongside this future ends at the deadline rather than when
+    /// the driver eventually dequeues the shell.
     pub(super) async fn submit_streaming<C: super::dispatch::StreamingConsumer + 'static>(
         &self,
         cmd: Command,
         consumer: C,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<C::Output, Error>
     where
         C::Output: 'static,
     {
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let dcmd = driver::DriverCommand::Run {
-            command: cmd,
-            consumer: driver::DriverConsumer::StreamingRegular(
-                Box::new(consumer) as Box<dyn driver::StreamingConsumerErased>
-            ),
-            result_tx,
-        };
-        if self.cmd_tx.send(dcmd).await.is_err() {
-            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
-        }
-        let guard = self.in_flight();
-        let received = result_rx.await;
-        guard.completed();
-        let result = match received {
-            Ok(inner) => inner?,
-            Err(_) => {
-                return Err(self.observe_driver_panic(TransmissionState::InFlight).await);
-            }
-        };
-        let output = *result
+        let result = self
+            .submit_driver_command(
+                (
+                    cmd,
+                    driver::DriverConsumer::StreamingRegular(Box::new(consumer)),
+                ),
+                deadline,
+                |reply| driver::DriverCommand::Run { reply },
+            )
+            .await?;
+        result
             .downcast::<C::Output>()
-            .map_err(|_| Error::Internal("type mismatch in driver result".into()))?;
-        Ok(output)
+            .map(|output| *output)
+            .map_err(|_| Error::Internal("type mismatch in driver result".into()))
     }
 
-    /// Submit a continuation-aware command to the driver task and await
-    /// the typed result.
+    /// Submit a continuation-aware command and await the typed result,
+    /// bounded by `deadline`.
     ///
-    /// Used by AUTHENTICATE (SASL PLAIN, XOAUTH2) which expect `+`
-    /// continuations during the response loop (RFC 3501 Section7.5).
+    /// Used by AUTHENTICATE (SASL PLAIN, XOAUTH2, OAUTHBEARER, CRAM-MD5,
+    /// SCRAM), which expects `+` continuations during the response loop
+    /// (RFC 3501 Section 7.5).
     pub(super) async fn submit_with_continuations<
         C: super::dispatch::ContinuationConsumer + 'static,
     >(
         &self,
         cmd: Command,
         consumer: C,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<C::Output, Error>
     where
         C::Output: 'static,
     {
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let dcmd = driver::DriverCommand::Run {
-            command: cmd,
-            consumer: driver::DriverConsumer::WithContinuations(
-                Box::new(consumer) as Box<dyn driver::ContinuationConsumerErased>
-            ),
-            result_tx,
-        };
-        if self.cmd_tx.send(dcmd).await.is_err() {
-            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
-        }
-        let guard = self.in_flight();
-        let received = result_rx.await;
-        guard.completed();
-        let result = match received {
-            Ok(inner) => inner?,
-            Err(_) => {
-                return Err(self.observe_driver_panic(TransmissionState::InFlight).await);
-            }
-        };
-        let output = *result
+        let result = self
+            .submit_driver_command(
+                (
+                    cmd,
+                    driver::DriverConsumer::WithContinuations(Box::new(consumer)),
+                ),
+                deadline,
+                |reply| driver::DriverCommand::Run { reply },
+            )
+            .await?;
+        result
             .downcast::<C::Output>()
-            .map_err(|_| Error::Internal("type mismatch in driver result".into()))?;
-        Ok(output)
+            .map(|output| *output)
+            .map_err(|_| Error::Internal("type mismatch in driver result".into()))
     }
 
-    /// Submit a stream upgrade (STARTTLS / COMPRESS) to the driver task.
+    /// Submit a stream upgrade (STARTTLS / COMPRESS), bounded by `deadline`.
     ///
-    /// The driver handles the entire upgrade sequence atomically: sends
-    /// the protocol command, awaits the tagged OK, then swaps the stream
-    /// using the `Poisoned` sentinel (I9, I10). No consumer is needed.
+    /// Once claimed, the driver handles the entire upgrade sequence
+    /// atomically: sends the protocol command, awaits the tagged OK, then
+    /// swaps the stream using the `Poisoned` sentinel (I9, I10). An upgrade
+    /// withdrawn before its claim was never written, and the stream is
+    /// untouched.
     pub(super) async fn submit_upgrade(
         &self,
         payload: driver::UpgradePayload,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<(), Error> {
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let dcmd = driver::DriverCommand::Upgrade { payload, result_tx };
-        if self.cmd_tx.send(dcmd).await.is_err() {
-            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
-        }
-        let guard = self.in_flight();
-        let received = result_rx.await;
-        guard.completed();
-        match received {
-            Ok(inner) => {
-                inner?;
-                Ok(())
+        self.submit_driver_command(payload, deadline, |reply| driver::DriverCommand::Upgrade {
+            reply,
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// The one submission body behind the four helpers.
+    ///
+    /// Admission is strict: reserve a channel slot under the deadline, re-check
+    /// the deadline (`may_send`), and only then send, with no suspension
+    /// between the last two. An expiry or a deadline already gone at
+    /// admission is `Timeout` / `Unsent` with nothing submitted; a closed
+    /// channel is a driver death stamped `Unsent`.
+    ///
+    /// After admission, an expiry is decided by `on_expiry`: withdrawn before
+    /// the driver's claim is `Timeout` / `Unsent` (never written, connection
+    /// untouched); an answer already buffered wins the tie; claimed and
+    /// unanswered is `timeout_inflight()`, and dropping the `Pending` then
+    /// abandons the connection unless the answer lands first. A reply the
+    /// driver dropped is a driver death stamped `Unsent` when it was never
+    /// claimed and `InFlight` once it was. `Unsent` is never inferred from the
+    /// timer alone after admission: only a won withdrawal earns it.
+    async fn submit_driver_command<P: Send, T>(
+        &self,
+        payload: P,
+        deadline: Option<tokio::time::Instant>,
+        command: impl FnOnce(super::reply::Reply<P, Result<T, Error>>) -> driver::DriverCommand,
+    ) -> Result<T, Error> {
+        use super::reply::{Expired, may_send, on_expiry, reply_channel};
+        let reserved = match deadline {
+            Some(deadline) => {
+                match tokio::time::timeout_at(deadline, self.cmd_tx.reserve()).await {
+                    Ok(result) => result,
+                    Err(_) => return Err(Error::timeout().with_attempt(TransmissionState::Unsent)),
+                }
             }
-            Err(_) => Err(self.observe_driver_panic(TransmissionState::InFlight).await),
+            None => self.cmd_tx.reserve().await,
+        };
+        let Ok(permit) = reserved else {
+            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
+        };
+        if !may_send(deadline, tokio::time::Instant::now(), false) {
+            return Err(Error::timeout().with_attempt(TransmissionState::Unsent));
+        }
+        let (reply, mut pending) = reply_channel(payload, &self.abandoned);
+        permit.send(command(reply));
+        let received = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, pending.recv()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return match on_expiry(&mut pending) {
+                        Expired::Answer(answer) => answer,
+                        Expired::Withdrawn => {
+                            Err(Error::timeout().with_attempt(TransmissionState::Unsent))
+                        }
+                        Expired::Claimed => Err(Error::timeout_inflight()),
+                    };
+                }
+            },
+            None => pending.recv().await,
+        };
+        match received {
+            Ok(result) => result,
+            Err(phase) => Err(self.observe_driver_panic(phase.attempt()).await),
         }
     }
 }

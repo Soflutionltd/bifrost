@@ -515,9 +515,8 @@ impl Error {
 
     /// Construct a `Timeout` with `InFlight` attempt evidence.
     ///
-    /// Used by command sites that submit to the driver and then time out
-    /// waiting for the response: the command bytes have already been sent
-    /// to the server by the time the outer timeout fires.
+    /// The driver had claimed the command before the deadline expired. It may
+    /// have written bytes; withdrawal can no longer prove it unsent.
     pub(crate) fn timeout_inflight() -> Self {
         Self::Timeout {
             attempt: Some(ImapAttempt::new(TransmissionState::InFlight)),
@@ -532,7 +531,7 @@ impl Error {
     /// Construct a `DriverGone` with no attempt-state evidence.
     ///
     /// Test-only. A driver death always has a phase relative to the caller
-    /// (`Unsent` when it never received a command, `InFlight` when it owned
+    /// (`Unsent` when it never claimed a command, `InFlight` when it had claimed
     /// one), and a missing phase reads as `Unsent`, so production code mints
     /// through [`Error::driver_gone_at`] or `observe_driver_panic`.
     #[cfg(test)]
@@ -541,8 +540,8 @@ impl Error {
     }
 
     /// Construct a `DriverGone` stamped with how far the caller's command
-    /// got: `Unsent` when the driver never received it, `InFlight` when the
-    /// driver owned it and died before answering.
+    /// got: `Unsent` when the driver never claimed it, `InFlight` when the
+    /// driver had claimed it and died before answering.
     pub(crate) const fn driver_gone_at(transmission_state: TransmissionState) -> Self {
         Self::DriverGone {
             attempt: Some(ImapAttempt::new(transmission_state)),

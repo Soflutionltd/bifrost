@@ -191,7 +191,7 @@ async fn invariant_driver_panic_surfaces_as_error() {
     });
 
     let result = conn
-        .submit_regular(Command::Capability, PanickingConsumer)
+        .submit_regular(Command::Capability, PanickingConsumer, None)
         .await;
     let _server = server_task.await.unwrap();
 
@@ -239,14 +239,14 @@ async fn invariant_driver_panic_subsequent_commands_fail() {
 
     // Trigger the panic via PanickingConsumer.
     let _ = conn
-        .submit_regular(Command::Capability, PanickingConsumer)
+        .submit_regular(Command::Capability, PanickingConsumer, None)
         .await;
     let _server = server_task.await.unwrap();
 
     // Post-panic: the next command must not hang.
     let result = tokio::time::timeout(
         Duration::from_millis(500),
-        conn.submit_regular(Command::Noop, dispatch::TaggedOkConsumer::default()),
+        conn.submit_regular(Command::Noop, dispatch::TaggedOkConsumer::default(), None),
     )
     .await;
 
@@ -936,7 +936,7 @@ async fn a_scram_server_final_error_cancels_and_leaves_the_connection_reusable()
     });
 
     let error = conn
-        .submit_with_continuations(command, consumer)
+        .submit_with_continuations(command, consumer, None)
         .await
         .expect_err("the server-final error must reject authentication");
     assert!(matches!(error, Error::Auth { .. }), "got {error:?}");
@@ -2399,6 +2399,7 @@ async fn a_refused_select_leaves_no_pending_selection_behind() {
                 }),
             },
             super::dispatch::TaggedOkConsumer::default(),
+            None,
         )
         .await
         .expect_err("a zero uidvalidity is refused");
@@ -2483,10 +2484,9 @@ async fn the_driver_refuses_a_batch_holding_a_command_that_cannot_be_pipelined()
         server
     });
 
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    conn.cmd_tx
-        .send(driver::DriverCommand::Pipeline {
-            commands: vec![
+    let (reply, mut pending) = super::reply::reply_channel(
+        (
+            vec![
                 Command::Noop,
                 Command::Append {
                     mailbox: "INBOX".into(),
@@ -2494,15 +2494,19 @@ async fn the_driver_refuses_a_batch_holding_a_command_that_cannot_be_pipelined()
                     multi: false,
                 },
             ],
-            consumers: vec![
-                Box::new(super::dispatch::TaggedOkConsumer::default()),
+            vec![
+                Box::new(super::dispatch::TaggedOkConsumer::default())
+                    as Box<dyn driver::ConsumerErased>,
                 Box::new(super::dispatch::AppendConsumer::default()),
             ],
-            result_tx,
-        })
+        ),
+        &conn.abandoned,
+    );
+    conn.cmd_tx
+        .send(driver::DriverCommand::Pipeline { reply })
         .await
         .expect("driver is running");
-    let Err(err) = result_rx.await.expect("driver answers") else {
+    let Err(err) = pending.recv().await.expect("driver answers") else {
         panic!("the batch must be refused");
     };
     assert!(matches!(err, Error::Internal(_)), "got {err:?}");
@@ -2557,4 +2561,345 @@ async fn idle_is_admitted_against_the_session_state() {
         .await
         .expect_err("IDLE is not legal before authentication");
     assert!(matches!(err, Error::InvalidState(_)), "got {err:?}");
+}
+
+mod withdrawal {
+    use super::*;
+    use crate::connection::test_support::{driver_pair, select_inbox};
+    use bifrost_types::TransmissionState::{InFlight, Unsent};
+    use std::sync::Arc;
+    use tokio::task::JoinHandle;
+
+    const LONG: Duration = Duration::from_secs(60);
+    const SHORT: Duration = Duration::from_secs(1);
+
+    async fn pair(caps: &str) -> (Arc<ImapConnection>, tokio::io::DuplexStream) {
+        let (conn, server) = driver_pair(&preauth_greeting(caps)).await;
+        (Arc::new(conn), server)
+    }
+    async fn head(
+        conn: &Arc<ImapConnection>,
+        server: &mut tokio::io::DuplexStream,
+    ) -> (JoinHandle<Result<(), Error>>, String) {
+        let conn = Arc::clone(conn);
+        let task = tokio::spawn(async move { conn.noop(LONG).await });
+        let line = read_line(server).await;
+        assert!(line.contains(" NOOP"));
+        (task, tag_of(&line).to_owned())
+    }
+    /// Channel capacity with exactly one command buffered (the head command,
+    /// once claimed, no longer occupies a slot).
+    fn one_queued(conn: &ImapConnection) -> usize {
+        conn.cmd_tx.max_capacity() - 1
+    }
+    async fn buffered(conn: &ImapConnection, capacity: usize) {
+        // Yielding remains runnable, so paused time cannot jump to the head's deadline.
+        for _ in 0..100 {
+            if conn.cmd_tx.capacity() == capacity {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "command was not buffered: expected {capacity}, got {}",
+            conn.cmd_tx.capacity()
+        );
+    }
+    fn append_task(
+        conn: &Arc<ImapConnection>,
+        timeout: Duration,
+    ) -> JoinHandle<Result<Option<(u32, u32)>, Error>> {
+        let conn = Arc::clone(conn);
+        tokio::spawn(async move { conn.append("INBOX", &[], None, b"hello", timeout).await })
+    }
+    async fn next_capability(
+        conn: &Arc<ImapConnection>,
+        server: &mut tokio::io::DuplexStream,
+        a: JoinHandle<Result<(), Error>>,
+        tag: &str,
+    ) {
+        respond(server, &format!("{tag} OK done\r\n")).await;
+        a.await.unwrap().unwrap();
+        let conn = Arc::clone(conn);
+        let c = tokio::spawn(async move { conn.capability(LONG).await });
+        let line = read_line(server).await;
+        assert!(
+            line.contains(" CAPABILITY"),
+            "withdrawn command reached wire: {line:?}"
+        );
+        respond(
+            server,
+            &format!("* CAPABILITY IMAP4rev1\r\n{} OK done\r\n", tag_of(&line)),
+        )
+        .await;
+        c.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_command_whose_caller_timed_out_is_never_written() {
+        let (conn, mut server) = pair("IMAP4rev1").await;
+        let (a, tag) = head(&conn, &mut server).await;
+        let b = append_task(&conn, SHORT);
+        buffered(&conn, one_queued(&conn)).await;
+        let err = b.await.unwrap().unwrap_err();
+        assert!(matches!(err, Error::Timeout { .. }));
+        assert_eq!(err.attempt(), Some(Unsent));
+        assert!(conn.is_reusable());
+        next_capability(&conn, &mut server, a, &tag).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_queued_command_withdraws_it_and_keeps_the_connection_reusable() {
+        let (conn, mut server) = pair("IMAP4rev1").await;
+        let (a, tag) = head(&conn, &mut server).await;
+        let mut b = Box::pin(conn.append("INBOX", &[], None, b"hello", LONG));
+        assert!(futures::poll!(&mut b).is_pending());
+        assert_eq!(conn.cmd_tx.capacity(), one_queued(&conn));
+        drop(b);
+        assert!(conn.is_reusable());
+        next_capability(&conn, &mut server, a, &tag).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_queued_streaming_fetch_writes_nothing_and_ends_its_item_channel() {
+        let (conn, mut server) = pair("IMAP4rev1").await;
+        select_inbox(&conn, &mut server).await;
+        let (a, tag) = head(&conn, &mut server).await;
+        let sequence_set = SequenceSet::new("1:*").unwrap();
+        let (mut rx, fut) = conn
+            .uid_fetch_stream(&sequence_set, &[FetchAttr::Uid], LONG)
+            .unwrap();
+        let mut fut = Box::pin(fut);
+        assert!(futures::poll!(&mut fut).is_pending());
+        assert_eq!(conn.cmd_tx.capacity(), one_queued(&conn));
+        drop(fut);
+        assert!(conn.is_reusable());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+        next_capability(&conn, &mut server, a, &tag).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_claimed_command_whose_caller_timed_out_is_in_flight_and_abandoned() {
+        let (conn, mut server) = pair("IMAP4rev1").await;
+        let b = append_task(&conn, SHORT);
+        assert!(read_line(&mut server).await.contains(" APPEND"));
+        let err = b.await.unwrap().unwrap_err();
+        assert!(matches!(err, Error::Timeout { .. }));
+        assert_eq!(err.attempt(), Some(InFlight));
+        assert!(!conn.is_reusable());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_command_queued_behind_a_connection_fatal_failure_is_unsent() {
+        let (conn, mut server) = pair("IMAP4rev1").await;
+        let (a, _) = head(&conn, &mut server).await;
+        let b = append_task(&conn, LONG);
+        buffered(&conn, one_queued(&conn)).await;
+        // No ALERT: it is published before BYE, changing the IDLE twin's departure.
+        respond(&mut server, "* BYE going away\r\n").await;
+        assert_eq!(b.await.unwrap().unwrap_err().attempt(), Some(Unsent));
+        assert!(a.await.unwrap().is_err());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_claimed_command_whose_peer_vanishes_is_in_flight() {
+        let (conn, mut server) = pair("IMAP4rev1").await;
+        let b = append_task(&conn, LONG);
+        assert!(read_line(&mut server).await.contains(" APPEND"));
+        drop(server);
+        assert_eq!(b.await.unwrap().unwrap_err().attempt(), Some(InFlight));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_claimed_command_whose_driver_is_aborted_unanswered_is_in_flight() {
+        let (conn, mut server) = pair("IMAP4rev1").await;
+        let b = append_task(&conn, LONG);
+        assert!(read_line(&mut server).await.contains(" APPEND"));
+        conn.terminate().await;
+        let err = b.await.unwrap().unwrap_err();
+        assert!(matches!(
+            err,
+            Error::DriverGone { .. } | Error::DriverPanicked { .. }
+        ));
+        assert_eq!(err.attempt(), Some(InFlight));
+    }
+    async fn fill(conn: &Arc<ImapConnection>) -> Vec<JoinHandle<Result<(), Error>>> {
+        let mut tasks = Vec::new();
+        for capacity in (0..conn.cmd_tx.max_capacity()).rev() {
+            let conn2 = Arc::clone(conn);
+            tasks.push(tokio::spawn(async move { conn2.noop(LONG).await }));
+            buffered(conn, capacity).await;
+        }
+        tasks
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_submission_that_times_out_before_channel_admission_is_unsent() {
+        let (conn, mut server) = pair("IMAP4rev1").await;
+        let (a, _) = head(&conn, &mut server).await;
+        let fillers = fill(&conn).await;
+        let err = conn.noop(SHORT).await.unwrap_err();
+        assert_eq!(err.attempt(), Some(Unsent));
+        assert!(matches!(err, Error::Timeout { .. }));
+        assert!(conn.is_reusable());
+        conn.terminate().await;
+        let _ = a.await;
+        for filler in fillers {
+            let _ = filler.await;
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_timeout_submits_nothing_and_is_unsent() {
+        let (conn, mut server) = pair("IMAP4rev1").await;
+        let capacity = conn.cmd_tx.capacity();
+        let err = conn.noop(Duration::ZERO).await.unwrap_err();
+        assert_eq!(conn.cmd_tx.capacity(), capacity);
+        assert!(matches!(err, Error::Timeout { .. }));
+        assert_eq!(err.attempt(), Some(Unsent));
+        let conn2 = Arc::clone(&conn);
+        let c = tokio::spawn(async move { conn2.capability(LONG).await });
+        let line = read_line(&mut server).await;
+        assert!(line.contains(" CAPABILITY"));
+        respond(
+            &mut server,
+            &format!("* CAPABILITY IMAP4rev1\r\n{} OK done\r\n", tag_of(&line)),
+        )
+        .await;
+        c.await.unwrap().unwrap();
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_move_fallback_whose_store_is_withdrawn_after_the_copy_is_in_flight() {
+        let (conn, mut server) = pair("IMAP4rev1 UIDPLUS").await;
+        select_inbox(&conn, &mut server).await;
+        let conn2 = Arc::clone(&conn);
+        let b = tokio::spawn(async move {
+            conn2
+                .uid_move_messages(&SequenceSet::new("1:*").unwrap(), "Archive", SHORT)
+                .await
+        });
+        let copy = read_line(&mut server).await;
+        assert!(copy.contains(" UID COPY"));
+        let conn2 = Arc::clone(&conn);
+        let a = tokio::spawn(async move { conn2.noop(LONG).await });
+        buffered(&conn, one_queued(&conn)).await;
+        respond(
+            &mut server,
+            &format!("{} OK [COPYUID 1 1 2] copied\r\n", tag_of(&copy)),
+        )
+        .await;
+        let noop = read_line(&mut server).await;
+        assert!(noop.contains(" NOOP"));
+        buffered(&conn, one_queued(&conn)).await;
+        let err = b.await.unwrap().unwrap_err();
+        assert!(matches!(err, Error::Timeout { .. }));
+        assert_eq!(err.attempt(), Some(InFlight));
+        assert!(conn.is_reusable());
+        next_capability(&conn, &mut server, a, tag_of(&noop)).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_cancelled_before_its_claim_is_never_written() {
+        let (conn, mut server) = pair("IMAP4rev1 IDLE").await;
+        let (a, tag) = head(&conn, &mut server).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut b = Box::pin(conn.idle(LONG, SHORT, cancel.clone()));
+        assert!(futures::poll!(&mut b).is_pending());
+        assert_eq!(conn.cmd_tx.capacity(), one_queued(&conn));
+        cancel.cancel();
+        assert!(matches!(b.await.unwrap(), IdleEvent::Cancelled));
+        assert!(conn.is_reusable());
+        next_capability(&conn, &mut server, a, &tag).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_cancelled_while_waiting_for_channel_capacity_returns_cancelled() {
+        let (conn, mut server) = pair("IMAP4rev1 IDLE").await;
+        let (a, _) = head(&conn, &mut server).await;
+        let fillers = fill(&conn).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut b = Box::pin(conn.idle(LONG, SHORT, cancel.clone()));
+        assert!(futures::poll!(&mut b).is_pending());
+        cancel.cancel();
+        assert!(matches!(
+            tokio::time::timeout(SHORT, b).await.unwrap().unwrap(),
+            IdleEvent::Cancelled
+        ));
+        assert!(conn.is_reusable());
+        conn.terminate().await;
+        let _ = a.await;
+        for filler in fillers {
+            let _ = filler.await;
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_leaving_on_another_commands_alert_before_its_claim_is_never_written() {
+        let (conn, mut server) = pair("IMAP4rev1 IDLE").await;
+        let (a, tag) = head(&conn, &mut server).await;
+        let mut b = Box::pin(conn.idle(LONG, SHORT, tokio_util::sync::CancellationToken::new()));
+        assert!(futures::poll!(&mut b).is_pending());
+        assert_eq!(conn.cmd_tx.capacity(), one_queued(&conn));
+        respond(&mut server, "* OK [ALERT] maintenance\r\n").await;
+        assert!(matches!(b.await.unwrap(), IdleEvent::Alert(_)));
+        assert!(conn.is_reusable());
+        next_capability(&conn, &mut server, a, &tag).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_queued_behind_a_connection_fatal_failure_is_unsent() {
+        let (conn, mut server) = pair("IMAP4rev1 IDLE").await;
+        let (a, _) = head(&conn, &mut server).await;
+        let mut b = Box::pin(conn.idle(LONG, SHORT, tokio_util::sync::CancellationToken::new()));
+        assert!(futures::poll!(&mut b).is_pending());
+        assert_eq!(conn.cmd_tx.capacity(), one_queued(&conn));
+        // No ALERT: it would publish an event before the fatal BYE short-circuit.
+        respond(&mut server, "* BYE going away\r\n").await;
+        assert_eq!(b.await.unwrap_err().attempt(), Some(Unsent));
+        assert!(a.await.unwrap().is_err());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_with_zero_timeout_submits_nothing() {
+        let (conn, mut server) = pair("IMAP4rev1 IDLE").await;
+        let capacity = conn.cmd_tx.capacity();
+        assert!(matches!(
+            conn.idle(
+                Duration::ZERO,
+                SHORT,
+                tokio_util::sync::CancellationToken::new()
+            )
+            .await
+            .unwrap(),
+            IdleEvent::Timeout
+        ));
+        assert_eq!(conn.cmd_tx.capacity(), capacity);
+        let conn2 = Arc::clone(&conn);
+        let c = tokio::spawn(async move { conn2.capability(LONG).await });
+        let line = read_line(&mut server).await;
+        assert!(line.contains(" CAPABILITY"));
+        respond(
+            &mut server,
+            &format!("* CAPABILITY IMAP4rev1\r\n{} OK done\r\n", tag_of(&line)),
+        )
+        .await;
+        c.await.unwrap().unwrap();
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_pipeline_queued_behind_a_command_is_never_written() {
+        let (conn, mut server) = pair("IMAP4rev1").await;
+        let (a, tag) = head(&conn, &mut server).await;
+        let mut b = Box::pin(
+            conn.pipeline()
+                .noop()
+                .list(String::new(), "*".into())
+                .execute(),
+        );
+        assert!(futures::poll!(&mut b).is_pending());
+        assert_eq!(conn.cmd_tx.capacity(), one_queued(&conn));
+        drop(b);
+        assert!(conn.is_reusable());
+        next_capability(&conn, &mut server, a, &tag).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_compress_withdrawn_before_its_claim_is_never_written() {
+        let (conn, mut server) = pair("IMAP4rev1 COMPRESS=DEFLATE").await;
+        let (a, tag) = head(&conn, &mut server).await;
+        let conn2 = Arc::clone(&conn);
+        let b = tokio::spawn(async move { conn2.compress(SHORT).await });
+        buffered(&conn, one_queued(&conn)).await;
+        assert_eq!(b.await.unwrap().unwrap_err().attempt(), Some(Unsent));
+        assert!(conn.is_reusable());
+        next_capability(&conn, &mut server, a, &tag).await;
+    }
 }

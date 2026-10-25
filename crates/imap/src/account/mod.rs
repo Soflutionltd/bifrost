@@ -1144,11 +1144,12 @@ pub(crate) fn boxed_receiver_stream<T: Send + 'static>(
 /// checkout it would not release until it next tried to send.
 ///
 /// Aborting is safe here precisely because the driver model already
-/// handles an abandoned command: every submit helper holds an
-/// `InFlightGuard` that marks the connection abandoned when its future is
-/// dropped mid-command, and `PooledConn::drop` parks only a member that is
-/// alive and not abandoned. So the abort returns the pooled connection (or
-/// retires it) rather than leaking it.
+/// handles a caller that leaves mid-command: a command the driver has not
+/// yet claimed is withdrawn (never written, connection still reusable), and
+/// leaving a claimed command without an answer marks the connection
+/// abandoned. `PooledConn::drop` parks only a member that is alive and not
+/// abandoned. So the abort returns the pooled connection (or retires it)
+/// rather than leaking it.
 pub(crate) fn guarded_receiver_stream<T: Send + 'static>(
     rx: tokio::sync::mpsc::Receiver<T>,
     task: tokio::task::JoinHandle<()>,

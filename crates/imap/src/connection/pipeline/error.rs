@@ -12,9 +12,10 @@ use crate::error::Error;
 pub enum PipelineError {
     /// The driver task has exited  -  the command channel is closed. Carries
     /// the observed `DriverGone` / `DriverPanicked`, stamped `Unsent` when
-    /// the batch never reached the driver and `InFlight` when the driver
-    /// owned it and died before answering, so a batch that may have been
-    /// written is not reported as one that certainly was not.
+    /// the driver never claimed the batch (the channel was closed at
+    /// admission, or the batch was dropped still queued) and `InFlight` when
+    /// the driver had claimed it and died before answering, so a batch that
+    /// may have been written is not reported as one that certainly was not.
     Disconnected(Error),
     /// A pipeline-level refusal of the whole batch before anything was
     /// written (a command the session state does not permit, an encoding

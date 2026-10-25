@@ -289,14 +289,17 @@ impl ImapConnection {
     /// `Disconnected`.
     ///
     /// `phase` is how far the caller's command got, and only the CALLER
-    /// knows it: `Unsent` when `cmd_tx.send` failed (the driver never
-    /// received the command), `InFlight` when the send succeeded and the
-    /// reply channel dropped (the driver owned the command when it died, so
-    /// it may have been written - "possibly transmitted", the convention
-    /// `timeout_inflight` uses). A non-idempotent command in the second
-    /// phase must be read back, not declared failed, so the phase is stamped
-    /// on every outcome here - including when another caller already took
-    /// the join handle, since the evidence cannot depend on being first.
+    /// knows it: `Unsent` when the driver never claimed the command (a
+    /// closed channel at admission, or a reply dropped while still queued),
+    /// `InFlight` when the driver had claimed the command and the reply
+    /// channel dropped (so it may have been written - "possibly
+    /// transmitted", the convention `timeout_inflight` uses). Non-wire
+    /// requests (`set_keepalive`) keep the send-based rule: `Unsent` when the
+    /// send failed, `InFlight` once it succeeded. A non-idempotent command
+    /// in the second phase must be read back, not declared failed, so the
+    /// phase is stamped on every outcome here - including when another
+    /// caller already took the join handle, since the evidence cannot depend
+    /// on being first.
     pub(super) async fn observe_driver_panic(&self, phase: TransmissionState) -> Error {
         let mut guard = self.driver_handle.handle.lock().await;
         let Some(handle) = guard.as_mut() else {
@@ -386,16 +389,15 @@ impl ImapConnection {
         validate_tls_server_name(&self.host)?;
 
         debug!("upgrading to TLS via STARTTLS");
-        tokio::time::timeout(
-            timeout,
-            self.submit_upgrade(driver::UpgradePayload::StartTls {
+        self.submit_upgrade(
+            driver::UpgradePayload::StartTls {
                 tls_connector,
                 server_name: self.host.clone(),
                 tls_active: std::sync::Arc::clone(&self.tls_active),
-            }),
+            },
+            Some(tokio::time::Instant::now() + timeout),
         )
-        .await
-        .map_err(|_| Error::timeout_inflight())??;
+        .await?;
         self.tls_active
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(())

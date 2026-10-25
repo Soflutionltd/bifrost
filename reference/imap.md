@@ -83,7 +83,7 @@ A MULTIAPPEND's APPENDUID uid-set is believed only when it names exactly as many
 
 `CopyConsumer` and `MoveConsumer` handle an untagged `* OK [COPYUID ...]` differently, because the tagged OK can carry a code of its own (under QRESYNC typically `HIGHESTMODSEQ`, RFC 7162) and a single slot let that code hide the COPYUID. `CopyResult` and `MoveResult` therefore carry two fields, filled by one shared `resolve_copyuid` on the success arm: `code` is the tagged code when it has one, else the retained untagged OK's code; `copy_uid` is the COPYUID wherever it came from (the tagged code when that is COPYUID, else the retained untagged OK), always a `ResponseCode::CopyUid` when present. The retained untagged OK is consumed exactly when it supplies `copy_uid`, i.e. whenever the tagged code is not itself COPYUID; when the tagged code is COPYUID the untagged one was not this command's answer and is surrendered at its wire position among the buffered responses. For MOVE an untagged COPYUID is the expected shape, not a quirk: RFC 6851 Section 4.3 asks a UIDPLUS server to send it in an untagged OK before the expunges, though some servers put it on the tagged OK instead. `MoveConsumer` retains only the first such OK, whole, with the length of its buffer at arrival; a second one is an ordinary untagged OK and is buffered. On a tagged NO the retained OK goes back into the buffer at its wire position (a COPYUID naming a move the server then failed is not this command's answer), and the EXPUNGE / VANISHED mutations are surrendered after the buffer, verbatim, as before.
 
-On the UID MOVE fallback (COPY, STORE, UID EXPUNGE, for servers without MOVE) `MoveResult::code` mirrors the native path's tagged code: it is the final UID EXPUNGE's tagged code (under QRESYNC the source mailbox's new `HIGHESTMODSEQ`), falling back to the COPY's `code` only when the EXPUNGE carried none, and `copy_uid` is the COPY's. The EXPUNGE runs through `ExpungeConsumer::with_tagged_code` so the plain consumer's discarded tagged code is available; the plain `uid_expunge` is unchanged.
+On the UID MOVE fallback (COPY, STORE, UID EXPUNGE, for servers without MOVE) `MoveResult::code` mirrors the native path's tagged code: it is the final UID EXPUNGE's tagged code (under QRESYNC the source mailbox's new `HIGHESTMODSEQ`), falling back to the COPY's `code` only when the EXPUNGE carried none, and `copy_uid` is the COPY's. The EXPUNGE runs through `ExpungeConsumer::with_tagged_code` so the plain consumer's discarded tagged code is available; the plain `uid_expunge` is unchanged. Once the COPY is acknowledged, the STORE and UID EXPUNGE errors pass through an evidence floor (`after_acknowledged_side_effect` in `connection/uid_ops.rs`): evidence that reads `Unsent` (explicit, or absent on a variant that can carry it) is restamped `InFlight`. The fallback reports a later step's leaf evidence as the outcome of the whole MOVE, and the account layer settles `Unsent` as `Failed` (retryable), so without the floor a STORE withdrawn while queued, dropped unclaimed by a dying driver, refused at admission with its deadline gone, or failing its first write with the socket counter unmoved would let the engine replay the MOVE, repeat the acknowledged COPY and duplicate messages. `InFlight` sends it to read-back instead. Acknowledged evidence is left alone, and variants that cannot carry evidence (`StateChangedBeforeSend`, local refusals such as `MissingCapability`) pass through unchanged; those cases, and composite partial completion generally, need an aggregate-progress representation that leaf transmission evidence cannot express.
 
 APPEND resolves APPENDLIMIT (RFC 7889) before writing anything: a numeric `APPENDLIMIT=<n>` capability is a global limit, a bare `APPENDLIMIT` sends a preflight `STATUS <mailbox> (APPENDLIMIT)`, and a server advertising both gets the most restrictive of the two. The STATUS reply is read from `items` *and* `ambiguous`, since NOTIFY STATUS makes the solicited reply wire-identical to a notification. Because that STATUS is a preflight, its failures are restamped `TransmissionState::Unsent` relative to the APPEND, as is a deadline that expires before submission: APPEND is non-idempotent, and leaking the helper's `InFlight` / `Acknowledged` evidence would send `DraftCreate` recovery down the reconcile path for a message no server ever saw.
 
@@ -101,24 +101,48 @@ dead parked members during checkout and never returns a dead checked-out
 member to the idle list. Tagged NO/BAD responses and local validation or
 capability errors leave the connection reusable.
 
-A timed-out or cancelled command is a third case: the driver is
-cancellation-safe and keeps executing the command after the caller's
-`tokio::time::timeout` fires, so the connection is neither dead nor idle.
-Each submit helper arms its `InFlightGuard` only after `cmd_tx.send` succeeds.
-A future dropped while the bounded channel is full never submitted a command
-and therefore does not abandon the connection. After submission, dropping the
-future before the driver's result arrives marks the connection `abandoned`,
-and `PooledConn::drop` parks only a member that `is_reusable()` (alive AND
-not abandoned). Without this, the next checkout queues behind the still
-running command and times out in turn, so one slow command cascades into a
-run of spurious timeouts on the same connection. IDLE is tracked the same
-way: its guard is armed after its command send, so a DONE handshake that times
-out or an `idle()` future dropped after submission leaves the connection
-abandoned, while token cancellation that completes DONE leaves it reusable
-(push re-IDLEs on it).
+A timed-out or cancelled command is a third case, decided by admission. Each
+wire command (`connection/reply.rs`) is queued, claimed, or withdrawn: one
+compare-exchange shared by the caller's `Pending` and the driver's `Reply`
+picks exactly one winner, and the command's payload is reachable only by the
+winner, so the driver can neither write nor answer a command it did not
+claim. The driver claims at the head of its queue, before `prepare_command`.
+The submit helpers own the deadline, because they are the only code that
+knows the phase, and admit strictly: reserve a channel slot under the
+deadline, re-check it, and only then send, so a deadline gone at or during
+admission submits nothing and is `Timeout` / `Unsent`. A caller that leaves
+before the driver claims its command withdraws it: it is never written, its
+payload (an APPEND's bytes, a streaming consumer and with it the caller's
+item sender) is released at once, the evidence is `Unsent`, and the
+connection is not abandoned. Once claimed, the driver completes the exchange
+(cancellation safety by socket ownership); a caller that leaves with no
+answer in hand reports `InFlight` and marks the connection `abandoned`. An
+answer already buffered when the deadline fires wins the tie. A reply
+dropped by a dead driver is `Unsent` when never claimed and `InFlight` once
+claimed, and does not mark the connection abandoned (it is already not
+reusable). A withdrawn command's shell keeps its channel slot until the
+driver dequeues it, so a channel full of withdrawn commands behind a stalled
+head still blocks new admissions until their deadlines (each then
+truthfully `Unsent`), while the connection reads reusable unless something
+abandoned it.
+
+`PooledConn::drop` parks only a member that `is_reusable()` (alive AND not
+abandoned). Without this, the next checkout queues behind the still running
+claimed command and times out in turn, so one slow command cascades into a
+run of spurious timeouts on the same connection. `Pipeline` execution admits
+the same way without a deadline: dropping it while it waits for channel
+capacity submits nothing and does not abandon the connection, and dropping
+it while queued withdraws the batch. IDLE follows the same arbiter: its
+admission races capacity against the cancel token and the event deadline,
+and every departure from its wait that would send DONE (an event, `Cancelled`,
+`Timeout`) first withdraws, returning the departure's value with nothing
+written when the IDLE was never claimed. A claimed IDLE must complete DONE; a
+DONE handshake that times out, or an `idle()` future dropped after the claim,
+leaves the connection abandoned, while token cancellation that completes
+DONE leaves it reusable (push re-IDLEs on it).
 
 An abandoned connection's LAST handle aborts its driver (`ImapConnection`'s
-`Drop`). The driver is still inside an exchange whose caller is gone; closing
+`Drop`). The driver claimed an exchange whose caller is gone; closing
 the command channel cannot reach a driver blocked in that exchange, so
 against a stalled peer it and its socket would otherwise outlive every
 handle, unreachable by `close()`. A connection that is not abandoned keeps
@@ -311,9 +335,11 @@ for astring labels, system labels verbatim); requesting them needs
 `X-GM-EXT-1`, and they count toward the buffered-FETCH byte estimate. The
 generic IMAP account layer assigns them no folder semantics.
 
-Cancellation safety comes from socket ownership: dropping a caller's
-future does not cancel an in-flight wire exchange. The driver completes
-the command and preserves framing before accepting the next command.
+From the claim onward, cancellation safety comes from socket ownership:
+dropping a caller's future does not cancel the wire exchange. The driver
+completes the command and preserves framing before accepting the next
+command. Before the claim nothing of the command exists on the wire, so a
+departing caller withdraws it instead (see "Connection state machine").
 
 ## Typed events
 
@@ -641,7 +667,7 @@ Negotiation in `factory.rs`:
 QRESYNC is a property a connection is BORN with, never acquired later. ENABLE is legal only before any mailbox has been selected in the session (RFC 5161 Section 3.1), and inventory and the PIM primitives select with no cursor, so checkout affinity routinely hands a QResync-cursor run a member that has already selected the folder. Hence:
 
 - The policy (`ImapAccount::qresync_enabled`, stored on the pool) is a strategy-admission flag only: it decides whether new work REQUESTS QRESYNC. Whether a connection does QRESYNC is its own committed profile, and wire interpretation reads that, or the form a response arrived in, never the policy. `disable_qresync_for_session` stops new requests and new dial-time ENABLEs; it cannot undo QRESYNC on members already enabled (RFC 7162 Section 3.2.3 gives no way back short of closing the connection), and nothing needs it to.
-- `Pool::dial` registers a new member and then, while the policy is set, runs `enable_qresync` before handing it out. That helper negotiates only when the profile supports both QRESYNC and ENABLE. A completed refusal on a reusable connection admits a healthy non-QRESYNC member; an ENABLE that times out (abandoned) or a dead connection retires it, terminated without LOGOUT. A pool closed during the dial also terminates without LOGOUT, since LOGOUT is unbounded.
+- `Pool::dial` registers a new member and then, while the policy is set, runs `enable_qresync` before handing it out. That helper negotiates only when the profile supports both QRESYNC and ENABLE. A completed refusal on a reusable connection admits a healthy non-QRESYNC member; an ENABLE that times out (withdrawn or abandoned) or a dead connection retires it, terminated without LOGOUT. A pool closed during the dial also terminates without LOGOUT, since LOGOUT is unbounded.
 - `select_for_sync` never issues ENABLE. It sends QRESYNC parameters only when the options carry them AND the connection has QRESYNC enabled, and reports which happened as `QresyncOutcome` (`Used`, `NotRequested`, `NotEnabledOnConnection`), decided when the command was built rather than read back from the policy later.
 
 Runtime downgrades:
@@ -909,8 +935,9 @@ with no wire read carry zero. An operation that emits no batch has no batch
 field in which to report its reads. The delta relies on exclusive data
 checkouts: a `PoolMember` is removed from the idle list until its `PooledConn`
 drops, and IDLE workers dial separate connections. Concurrent account streams
-therefore sample different connection counters. A cancelled in-flight command
-marks its connection abandoned, preventing reuse by another checkout. The shared
+therefore sample different connection counters. A cancelled command the
+driver had claimed marks its connection abandoned, preventing reuse by
+another checkout (one withdrawn before its claim wrote nothing). The shared
 counter is not a per-command attribution API for arbitrary concurrent users of
 one `ImapConnection`. Read-ahead can put several responses into one batch's byte
 count, and trailing reads after the last emitted batch have no batch field;
@@ -1011,9 +1038,9 @@ Revocation quarantines, not escalates. A shared-folder SELECT permission denial 
 
 Failures on the client side of the wire map to `Internal(_)` (`reference/error-model.md` owns its recovery: terminal `InternalFailure`, except `InFlight` on a non-idempotent operation, which reconciles), never to a provider fault. `Error::Internal` is a local invariant violation raised where the command framing is intact (before the first byte, or after the tagged completion), so it is not connection-fatal; it maps to `Internal(InvariantViolated)`. `Error::InternalMidExchange { message, attempt }` is a local invariant failure raised after bytes of the same exchange are on the wire: the SCRAM server signature missing from client state, the STARTTLS and COMPRESS refusals after the server's tagged OK (the stream is already swapped out), the post-STARTTLS CAPABILITY downcast, a literal continuation refused outside a pipeline, and the BYE digest without a status response. It also maps to `Internal(InvariantViolated)`, but the driver's view of the exchange can no longer be trusted, so it is connection-fatal, and its attempt state is REQUIRED (`Error::internal_mid_exchange(message, state)`), because some of the exchange was sent by construction and a missing state would read as `Unsent`. `Error::LocalRuntime` is a local facility failing at runtime (the system entropy source for a SCRAM nonce): neither the server's fault nor the caller's, not connection-fatal, `Internal(RuntimeFailure)`. `Error::DriverPanicked` maps to `Internal(Panicked)`; `Error::DriverGone` stays `Transport(Network)`. The phaseless `Error::driver_gone()` constructor is test-only: a missing phase reads as `Unsent`, so production mints through `driver_gone_at` or `observe_driver_panic`.
 
-A driver death carries the caller's phase. `ImapConnection::observe_driver_panic(phase)` turns a dead driver into `DriverPanicked` (with the panic message) or `DriverGone`, and stamps `phase` on every outcome, including when another caller already took the join handle, since the evidence cannot depend on being first. Only the caller knows the phase: `Unsent` when `cmd_tx.send` failed (the driver never received the command), `InFlight` when the send succeeded and the reply channel dropped (the driver owned the command when it died, so it may have been written). The submit helpers in `connection/auth.rs` (`submit_regular`, `submit_streaming`, `submit_with_continuations`, `submit_upgrade`), `set_keepalive`, IDLE's entry and completion waits, and `Pipeline` execution all pass it, so a non-idempotent command the driver owned when it died reconciles rather than being declared failed, and a `DriverGone` no longer skips that reconciliation for lack of a phase. `PipelineError::Disconnected` carries the stamped error rather than being a bare variant.
+A driver death carries the caller's phase. `ImapConnection::observe_driver_panic(phase)` turns a dead driver into `DriverPanicked` (with the panic message) or `DriverGone`, and stamps `phase` on every outcome, including when another caller already took the join handle, since the evidence cannot depend on being first. Only the caller knows the phase: `Unsent` when the driver never claimed the command, `InFlight` once it had claimed it. Admission failures and post-admission withdrawals are also `Unsent`. The submit helpers in `connection/auth.rs` (`submit_regular`, `submit_streaming`, `submit_with_continuations`, `submit_upgrade`), `set_keepalive`, IDLE's entry and completion waits, and `Pipeline` execution all pass it, so a non-idempotent command the driver had claimed when it died reconciles rather than being declared failed, and a `DriverGone` no longer skips that reconciliation for lack of a phase. `PipelineError::Disconnected` carries the stamped error rather than being a bare variant.
 
-IDLE is the case where the phase is easy to get wrong. `next_event` submits no command, so it stamps a driver death `Unsent`, which is not IDLE's phase. When `ImapConnection::idle` sees the event channel close (`DriverGone` / `DriverPanicked`), it first does a non-blocking `try_recv` on the IDLE result channel: the driver answers the IDLE command before exiting whenever it can, so the real outcome (a BYE, an I/O failure) is usually already there and is returned as the error (or `ServerTerminated` for an `Ok`), instead of being replaced by a generic `DriverGone`. With no answer it restamps the death `InFlight`, since the driver owned the command. Inside the driver, IDLE's own reads (the `+` grant wait, the loop, the DONE write, the post-DONE drain) stamp transport failures `InFlight` for the same reason; an EOF mid-IDLE used to carry no phase and read as `Unsent`.
+IDLE is the case where the phase is easy to get wrong. `next_event` submits no command, so it stamps a driver death `Unsent`, which is not IDLE's phase. When `ImapConnection::idle` sees the event channel close (`DriverGone` / `DriverPanicked`), it first does a non-blocking `Pending::try_take` on the IDLE result channel: the driver answers the IDLE command before exiting whenever it can, so the real outcome (a BYE, an I/O failure) is usually already there and is returned as the error (or `ServerTerminated` for an `Ok`), instead of being replaced by a generic `DriverGone`. With no answer it withdraws the IDLE and restamps the death `Unsent` if never claimed, or `InFlight` once claimed. Inside the driver, IDLE's own reads (the `+` grant wait, the loop, the DONE write, the post-DONE drain) stamp transport failures `InFlight` for the same reason; an EOF mid-IDLE used to carry no phase and read as `Unsent`.
 
 Local refusals made before the first byte follow the cross-crate rule in `reference/error-model.md` ("Local refusals") and each has its own variant, none of them connection-fatal: `InvalidInput` (caller input the encoder or a handle validator refuses) -> `Request(Malformed)`; `InvalidState` (a command the connection's local state does not permit - wrong session state, or UTF8=ONLY before `ENABLE UTF8=ACCEPT`) -> `Request(Malformed)`; `MissingCapability` (the server lacks an extension, or its revision removed the command, e.g. LSUB, STATUS RECENT or CHECK on rev2, or STATUS DELETED without rev2 or `QUOTA=RES-MESSAGE`) -> `Unsupported(op)`; `UnsupportedOperation` (a variant of a published `#[non_exhaustive]` request type this crate has not learned) -> `Unsupported(op)`; `StateChangedBeforeSend` (the driver's head-of-queue check found the session had moved) -> `ConcurrencyConflict` with `Unsent`. A session already in Logout is `Closed` with `Unsent` at either check, through the shared `helpers::state_refusal`. `MissingCapability` stays distinct from `UnsupportedOperation` because `should_disable_qresync` reads `MissingCapability` strings as evidence about the server.
 
@@ -1164,6 +1191,7 @@ crates/imap/src/
 |   |-- helpers.rs   - server_profile, drain_events, ...
 |   |-- lifecycle.rs - greeting, STARTTLS, ENABLE
 |   |-- pipeline/    - command pipelining
+|   |-- reply.rs     - queued/claimed/withdrawn admission arbiter
 |   |-- seq_ops.rs   - sequence-number command surface
 |   `-- uid_ops.rs   - UID command surface
 |-- account/         - bifrost_types::Account implementation

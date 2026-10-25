@@ -29,9 +29,12 @@ impl ImapConnection {
         // NOTIFICATIONOVERFLOW (RFC 5465 Section5.8) is handled automatically:
         // apply_side_effects clears the notify flags, so subsequent
         // snapshots have list=false.
-        tokio::time::timeout(timeout, self.submit_regular(cmd, ListConsumer::new()))
-            .await
-            .map_err(|_| Error::timeout_inflight())?
+        self.submit_regular(
+            cmd,
+            ListConsumer::new(),
+            Some(tokio::time::Instant::now() + timeout),
+        )
+        .await
     }
 
     /// LIST mailboxes with RFC 5258 selection options, multiple patterns, and
@@ -120,9 +123,8 @@ impl ImapConnection {
             filter_extended,
             selection_options.iter().map(|o| (*o).to_owned()).collect(),
         );
-        tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
+        self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
             .await
-            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// LIST with STATUS return option (RFC 5819 Section 2).
@@ -160,9 +162,12 @@ impl ImapConnection {
             pattern: pattern.mailbox_name()?.into(),
             status_items: status_items.to_owned(),
         };
-        tokio::time::timeout(timeout, self.submit_regular(cmd, ListStatusConsumer::new()))
-            .await
-            .map_err(|_| Error::timeout_inflight())?
+        self.submit_regular(
+            cmd,
+            ListStatusConsumer::new(),
+            Some(tokio::time::Instant::now() + timeout),
+        )
+        .await
     }
 
     /// SELECT a mailbox (RFC 3501 Section 6.3.1).
@@ -291,9 +296,8 @@ impl ImapConnection {
         //
         // State transitions (Selected on OK, Authenticated on NO) are
         // handled by the driver's apply_tagged via the in_select flag.
-        tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
+        self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
             .await
-            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// Validate QRESYNC parameters before SELECT/EXAMINE (RFC 7162 Section 3.2.5.2).
@@ -359,9 +363,12 @@ impl ImapConnection {
         let cmd = Command::Create {
             mailbox: mailbox.mailbox_name()?,
         };
-        tokio::time::timeout(timeout, self.submit_regular(cmd, CreateConsumer::default()))
-            .await
-            .map_err(|_| Error::timeout_inflight())?
+        self.submit_regular(
+            cmd,
+            CreateConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
+        )
+        .await
     }
 
     /// CREATE a mailbox with special-use attributes (RFC 6154 Section 3).
@@ -420,9 +427,12 @@ impl ImapConnection {
             mailbox: mailbox.mailbox_name()?,
             special_use: special_use.to_vec(),
         };
-        tokio::time::timeout(timeout, self.submit_regular(cmd, CreateConsumer::default()))
-            .await
-            .map_err(|_| Error::timeout_inflight())?
+        self.submit_regular(
+            cmd,
+            CreateConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
+        )
+        .await
     }
 
     /// DELETE a mailbox (RFC 3501 Section 6.3.4).
@@ -438,12 +448,12 @@ impl ImapConnection {
         let cmd = Command::Delete {
             mailbox: mailbox.mailbox_name()?,
         };
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, TaggedOkConsumer::default()),
+        self.submit_regular(
+            cmd,
+            TaggedOkConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// RENAME a mailbox (RFC 3501 Section 6.3.5).
@@ -461,12 +471,12 @@ impl ImapConnection {
             mailbox: mailbox.mailbox_name()?,
             new_name: new_name.mailbox_name()?,
         };
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, TaggedOkConsumer::default()),
+        self.submit_regular(
+            cmd,
+            TaggedOkConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// SUBSCRIBE to a mailbox (RFC 3501 Section 6.3.6).
@@ -485,12 +495,12 @@ impl ImapConnection {
         let cmd = Command::Subscribe {
             mailbox: mailbox.mailbox_name()?,
         };
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, TaggedOkConsumer::default()),
+        self.submit_regular(
+            cmd,
+            TaggedOkConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UNSUBSCRIBE from a mailbox (RFC 3501 Section 6.3.7).
@@ -506,12 +516,12 @@ impl ImapConnection {
         let cmd = Command::Unsubscribe {
             mailbox: mailbox.mailbox_name()?,
         };
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, TaggedOkConsumer::default()),
+        self.submit_regular(
+            cmd,
+            TaggedOkConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// LSUB  -  list subscribed mailboxes (RFC 3501 Section 6.3.9).
@@ -543,9 +553,12 @@ impl ImapConnection {
             reference: reference.mailbox_name()?.into(),
             pattern: pattern.mailbox_name()?.into(),
         };
-        tokio::time::timeout(timeout, self.submit_regular(cmd, LsubConsumer::default()))
-            .await
-            .map_err(|_| Error::timeout_inflight())?
+        self.submit_regular(
+            cmd,
+            LsubConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
+        )
+        .await
     }
 
     /// CLOSE the selected mailbox (RFC 3501 Section 6.4.2).
@@ -560,12 +573,12 @@ impl ImapConnection {
         use super::dispatch::TaggedOkConsumer;
 
         self.require_state(crate::types::CommandKind::Close)?;
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(Command::Close, TaggedOkConsumer::default()),
+        self.submit_regular(
+            Command::Close,
+            TaggedOkConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
         )
-        .await
-        .map_err(|_| Error::timeout_inflight())??;
+        .await?;
         Ok(())
     }
 
@@ -594,15 +607,12 @@ impl ImapConnection {
                 return Err(Error::MissingCapability("UNSELECT".into()));
             }
         }
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(
-                Command::Unselect,
-                super::dispatch::TaggedOkConsumer::default(),
-            ),
+        self.submit_regular(
+            Command::Unselect,
+            super::dispatch::TaggedOkConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
         )
-        .await
-        .map_err(|_| Error::timeout_inflight())??;
+        .await?;
         Ok(())
     }
 
@@ -630,9 +640,12 @@ impl ImapConnection {
             mailbox: mailbox.mailbox_name()?,
             items: items.to_owned(),
         };
-        tokio::time::timeout(timeout, self.submit_regular(cmd, StatusConsumer::new()))
-            .await
-            .map_err(|_| Error::timeout_inflight())?
+        self.submit_regular(
+            cmd,
+            StatusConsumer::new(),
+            Some(tokio::time::Instant::now() + timeout),
+        )
+        .await
     }
 }
 

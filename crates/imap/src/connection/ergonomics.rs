@@ -180,20 +180,17 @@ impl ImapConnection {
         if uids.as_sequence_set().as_str().contains('$') {
             self.require_searchres()?;
         }
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(
-                Command::UidFetch {
-                    sequence_set: uids.as_sequence_set().clone(),
-                    items: format_fetch_attrs(attrs),
-                    changed_since: None,
-                    vanished: false,
-                },
-                dispatch::FetchConsumer::with_limit(max_estimated_bytes),
-            ),
+        self.submit_regular(
+            Command::UidFetch {
+                sequence_set: uids.as_sequence_set().clone(),
+                items: format_fetch_attrs(attrs),
+                changed_since: None,
+                vanished: false,
+            },
+            dispatch::FetchConsumer::with_limit(max_estimated_bytes),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// Fetch full messages by UID without setting `\Seen`.

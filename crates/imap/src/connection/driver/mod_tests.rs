@@ -272,13 +272,15 @@ fn group_splits_distinct_kinds_that_share_an_untagged_response() {
 #[test]
 fn command_answer_follows_state_publication() {
     let order = std::cell::RefCell::new(Vec::new());
-    let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    let (reply, mut result_rx) = crate::connection::reply::reply_channel((), &flag);
+    let ((), result_tx) = reply.claim().unwrap();
 
     publish_then_answer(|| order.borrow_mut().push("published"), result_tx, ());
 
     assert_eq!(*order.borrow(), ["published"]);
     assert!(
-        result_rx.try_recv().is_ok(),
+        result_rx.try_take().is_some(),
         "the caller is answered after publication"
     );
 }

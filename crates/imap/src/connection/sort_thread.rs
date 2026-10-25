@@ -37,12 +37,12 @@ impl ImapConnection {
             charset: charset.to_owned(),
             criteria: criteria.to_owned(),
         };
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, super::dispatch::SortConsumer::default()),
+        self.submit_regular(
+            cmd,
+            super::dispatch::SortConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID SORT  -  server-side sorting returning UIDs (RFC 5256 Section 2).
@@ -72,12 +72,12 @@ impl ImapConnection {
             charset: charset.to_owned(),
             criteria: criteria.to_owned(),
         };
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, super::dispatch::SortConsumer::default()),
+        self.submit_regular(
+            cmd,
+            super::dispatch::SortConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     // -----------------------------------------------------------------------
@@ -120,12 +120,12 @@ impl ImapConnection {
             charset: charset.to_owned(),
             criteria: criteria.to_owned(),
         };
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, super::dispatch::ThreadConsumer::default()),
+        self.submit_regular(
+            cmd,
+            super::dispatch::ThreadConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID THREAD  -  server-side threading returning UIDs
@@ -163,11 +163,11 @@ impl ImapConnection {
             charset: charset.to_owned(),
             criteria: criteria.to_owned(),
         };
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, super::dispatch::ThreadConsumer::default()),
+        self.submit_regular(
+            cmd,
+            super::dispatch::ThreadConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 }

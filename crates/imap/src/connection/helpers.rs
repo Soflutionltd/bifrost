@@ -534,12 +534,12 @@ impl ImapConnection {
     /// Valid in any state (RFC 3501 Section 6.1.2). Returns an error only
     /// if the connection is closed (e.g. after LOGOUT).
     pub async fn noop(&self, timeout: Duration) -> Result<(), Error> {
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(Command::Noop, super::dispatch::TaggedOkConsumer::default()),
+        self.submit_regular(
+            Command::Noop,
+            super::dispatch::TaggedOkConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     // -----------------------------------------------------------------------
@@ -566,12 +566,12 @@ impl ImapConnection {
                 "CHECK is not defined in IMAP4rev2 (RFC 9051); use NOOP instead".into(),
             ));
         }
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(Command::Check, super::dispatch::TaggedOkConsumer::default()),
+        self.submit_regular(
+            Command::Check,
+            super::dispatch::TaggedOkConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     // -----------------------------------------------------------------------
@@ -588,15 +588,12 @@ impl ImapConnection {
     ///
     /// Valid in any state (RFC 3501 Section 6.1.1).
     pub async fn capability(&self, timeout: Duration) -> Result<Vec<Capability>, Error> {
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(
-                Command::Capability,
-                super::dispatch::CapabilityConsumer::default(),
-            ),
+        self.submit_regular(
+            Command::Capability,
+            super::dispatch::CapabilityConsumer::default(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 }
 

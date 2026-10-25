@@ -407,9 +407,9 @@ impl PoolInner {
 /// that cannot negotiate QRESYNC (no QRESYNC or no ENABLE capability; the
 /// connection simply serves CONDSTORE), a completed ENABLE, and a completed
 /// refusal (`NO` / `BAD`) on a connection still reusable. `Err` means the
-/// connection must not be handed out: the exchange did not finish (a timeout
-/// leaves it abandoned, with the driver still inside the ENABLE) or the
-/// connection is dead. The caller retires it.
+/// connection must not be handed out: the exchange did not finish (a timeout,
+/// the ENABLE withdrawn unsent or abandoned with the driver still inside it)
+/// or the connection is dead. The caller retires it.
 pub(crate) async fn enable_qresync(
     conn: &ImapConnection,
     timeout: std::time::Duration,

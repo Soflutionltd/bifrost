@@ -24,6 +24,7 @@ use super::dispatch::{
     BackpressureState, Consumer, ConsumerContext, ContinuationConsumer, ContinuationReply,
     Finalized, StreamingConsumer,
 };
+use super::reply::{ClaimedReply, Reply};
 mod events;
 mod idle;
 mod pipeline;
@@ -50,36 +51,38 @@ pub(in crate::connection) use upgrade::run_starttls_upgrade;
 /// (e.g., server `NO` response).
 pub(super) type PipelineResults = Vec<Result<Box<dyn std::any::Any + Send>, Error>>;
 
+type PipelinePayload = (Vec<Command>, Vec<Box<dyn ConsumerErased>>);
+
 /// A command submitted to the driver task over `cmd_tx`.
 ///
 /// Either a regular protocol command (with a type-erased consumer for
 /// response routing) or a stream upgrade (STARTTLS / COMPRESS) that
 /// the driver handles atomically without a consumer.
+///
+/// The four wire arms carry a [`Reply`] whose payload (the command, its
+/// consumer, the upgrade, the batch, IDLE's `done_rx`) is reachable only by
+/// winning [`Reply::claim`] at the head of the queue; a caller that withdrew
+/// first leaves the driver an empty shell to drop. The two non-wire arms
+/// keep a bare oneshot: nothing of theirs reaches the wire, so no claim is
+/// meaningful.
 pub(super) enum DriverCommand {
     /// Regular command  -  the driver checks, encodes and sends it from live
     /// state when it reaches the head of the queue, and routes responses to
     /// the consumer via the classification-based dispatcher.
     Run {
-        command: Command,
-        consumer: DriverConsumer,
-        result_tx: oneshot::Sender<Result<Box<dyn std::any::Any + Send>, Error>>,
+        reply: Reply<(Command, DriverConsumer), Result<Box<dyn std::any::Any + Send>, Error>>,
     },
     /// Stream upgrade  -  the driver sends the protocol command, awaits
     /// the tagged OK, then atomically swaps the stream using the
     /// `Poisoned` sentinel (I9, I10). No consumer needed.
     Upgrade {
-        payload: UpgradePayload,
-        result_tx: oneshot::Sender<Result<Box<dyn std::any::Any + Send>, Error>>,
+        reply: Reply<UpgradePayload, Result<Box<dyn std::any::Any + Send>, Error>>,
     },
     /// Pipelined batch  -  multiple commands submitted in one write,
-    /// responses routed to each consumer by tag.
+    /// responses routed to each consumer by tag. The payload holds the
+    /// commands and their per-command consumers, in parallel.
     Pipeline {
-        /// Commands to encode and send as a batch.
-        commands: Vec<Command>,
-        /// Per-command consumers, parallel to `commands`.
-        consumers: Vec<Box<dyn ConsumerErased>>,
-        /// Channel for the per-command results.
-        result_tx: oneshot::Sender<Result<PipelineResults, Error>>,
+        reply: Reply<PipelinePayload, Result<PipelineResults, Error>>,
     },
     /// Set TCP keepalive socket options (OS-level, not IMAP protocol).
     ///
@@ -99,10 +102,7 @@ pub(super) enum DriverCommand {
     /// events and publishes them via the event sink, and exits when
     /// `done_rx` fires or the server terminates IDLE (RFC 2177).
     Idle {
-        /// Handle signals DONE via this channel.
-        done_rx: oneshot::Receiver<()>,
-        /// Driver reports how IDLE ended.
-        result_tx: oneshot::Sender<Result<IdleTermination, Error>>,
+        reply: Reply<oneshot::Receiver<()>, Result<IdleTermination, Error>>,
     },
 }
 
@@ -406,7 +406,16 @@ pub(super) async fn driver_task(
             maybe_cmd = cmd_rx.recv() => {
                 let Some(cmd) = maybe_cmd else { break; };
                 match cmd {
-                    DriverCommand::Run { command, consumer, result_tx } => {
+                    DriverCommand::Run { reply } => {
+                        // Claim first: nothing is prepared, no tag drawn, no
+                        // effect armed and no byte written for a command its
+                        // caller withdrew, so skipping it leaves no state to
+                        // publish and cannot desynchronize the wire. The same
+                        // holds for the other three wire arms.
+                        let Some(((command, consumer), reply)) = reply.claim() else {
+                            trace!("driver: caller withdrew the command before it reached the head of the queue");
+                            continue;
+                        };
                         // Whether a failure can have touched the wire. A
                         // refusal made before the first byte leaves the
                         // framing intact, so it must not retire the
@@ -438,11 +447,15 @@ pub(super) async fn driver_task(
                             || {
                                 let _ = state_tx.send_replace(state.snapshot());
                             },
-                            result_tx,
+                            reply,
                             result,
                         );
                     }
-                    DriverCommand::Upgrade { payload, result_tx } => {
+                    DriverCommand::Upgrade { reply } => {
+                        let Some((payload, reply)) = reply.claim() else {
+                            trace!("driver: caller withdrew the upgrade before it reached the head of the queue");
+                            continue;
+                        };
                         let result = run_upgrade(
                             &mut wire_reader,
                             &mut state,
@@ -462,11 +475,15 @@ pub(super) async fn driver_task(
                             || {
                                 let _ = state_tx.send_replace(state.snapshot());
                             },
-                            result_tx,
+                            reply,
                             result,
                         );
                     }
-                    DriverCommand::Pipeline { commands, consumers, result_tx } => {
+                    DriverCommand::Pipeline { reply } => {
+                        let Some(((commands, consumers), reply)) = reply.claim() else {
+                            trace!("driver: caller withdrew the batch before it reached the head of the queue");
+                            continue;
+                        };
                         let result = match run_pipeline(
                             &mut wire_reader,
                             &mut state,
@@ -497,7 +514,7 @@ pub(super) async fn driver_task(
                             || {
                                 let _ = state_tx.send_replace(state.snapshot());
                             },
-                            result_tx,
+                            reply,
                             result,
                         );
                     }
@@ -512,7 +529,11 @@ pub(super) async fn driver_task(
                         // No protocol state changed  -  skip snapshot publish.
                         continue;
                     }
-                    DriverCommand::Idle { done_rx, result_tx } => {
+                    DriverCommand::Idle { reply } => {
+                        let Some((done_rx, reply)) = reply.claim() else {
+                            trace!("driver: caller withdrew IDLE before it reached the head of the queue");
+                            continue;
+                        };
                         let result = run_idle(
                             &mut wire_reader,
                             &mut state,
@@ -528,7 +549,7 @@ pub(super) async fn driver_task(
                             || {
                                 let _ = state_tx.send_replace(state.snapshot());
                             },
-                            result_tx,
+                            reply,
                             result,
                         );
                     }
@@ -932,21 +953,23 @@ async fn dispatch_response_loop(
 
 /// Publish the state snapshot before waking the command caller.
 ///
-/// A oneshot send may schedule the caller on another runtime worker
-/// immediately, so the watch snapshot must be visible first.
+/// `ClaimedReply::answer` may schedule the caller on another runtime worker
+/// immediately, so the watch snapshot must be visible first. Only a claimed
+/// command can be answered at all (`ClaimedReply` is the sole answering
+/// type), so this runs only for commands the driver took ownership of.
 ///
 /// The ordering is a convention every completion arm must follow, not a
 /// type-level guarantee: nothing stops a future arm from calling
-/// `result_tx.send` directly and answering a caller that then reads a stale
-/// snapshot. Making it unrepresentable (a result oneshot that cannot be
-/// answered without publishing) was considered and ruled not worth its
+/// `ClaimedReply::answer` directly and answering a caller that then reads a
+/// stale snapshot. Making it unrepresentable (an answering handle that cannot
+/// be used without publishing) was considered and ruled not worth its
 /// machinery while every completion arm lives in the one `match cmd` in
 /// `driver_task` directly above, where the deviation is visible by reading a
 /// single function. Revisit if a new state-changing driver command lane is
 /// added somewhere else.
-fn publish_then_answer<T>(publish: impl FnOnce(), result_tx: oneshot::Sender<T>, result: T) {
+fn publish_then_answer<T>(publish: impl FnOnce(), reply: ClaimedReply<T>, result: T) {
     publish();
-    let _ = result_tx.send(result);
+    reply.answer(result);
 }
 
 /// Turn a side-effect digest for an untagged response into the fatal BYE

@@ -113,12 +113,12 @@ impl ImapConnection {
         if changed_since.is_some() {
             self.require_condstore()?;
         }
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, dispatch::FetchConsumer::new()),
+        self.submit_regular(
+            cmd,
+            dispatch::FetchConsumer::new(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID FETCH with CHANGEDSINCE and VANISHED modifiers (RFC 7162 Section 3.2.6).
@@ -175,12 +175,12 @@ impl ImapConnection {
             changed_since: Some(mod_seq),
             vanished: true,
         };
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, dispatch::FetchVanishedConsumer::new(parsed_set)),
+        self.submit_regular(
+            cmd,
+            dispatch::FetchVanishedConsumer::new(parsed_set),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID FETCH with CHANGEDSINCE and VANISHED as a bounded stream.
@@ -229,15 +229,12 @@ impl ImapConnection {
             vanished: true,
         };
         let fut = async move {
-            tokio::time::timeout(
-                timeout,
-                self.submit_streaming(
-                    cmd,
-                    dispatch::BoundedStreamingFetchVanishedConsumer::new(tx, parsed_set),
-                ),
+            self.submit_streaming(
+                cmd,
+                dispatch::BoundedStreamingFetchVanishedConsumer::new(tx, parsed_set),
+                Some(tokio::time::Instant::now() + timeout),
             )
             .await
-            .map_err(|_| Error::timeout_inflight())?
         };
         Ok((rx, fut))
     }
@@ -317,15 +314,12 @@ impl ImapConnection {
         };
         let fut = async move {
             self.require_state(cmd.kind())?;
-            tokio::time::timeout(
-                timeout,
-                self.submit_streaming(
-                    cmd,
-                    dispatch::BoundedStreamingFetchConsumer::with_budget(tx, budget),
-                ),
+            self.submit_streaming(
+                cmd,
+                dispatch::BoundedStreamingFetchConsumer::with_budget(tx, budget),
+                Some(tokio::time::Instant::now() + timeout),
             )
             .await
-            .map_err(|_| Error::timeout_inflight())?
         };
         Ok((rx, fut))
     }
@@ -367,12 +361,12 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<(), Error> {
         self.require_state(cmd.kind())?;
-        tokio::time::timeout(
-            timeout,
-            self.submit_streaming(cmd, dispatch::BoundedStreamingFetchConsumer::new(tx)),
+        self.submit_streaming(
+            cmd,
+            dispatch::BoundedStreamingFetchConsumer::new(tx),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID SEARCH (RFC 3501 Section 6.4.4).
@@ -413,12 +407,12 @@ impl ImapConnection {
         // RFC 6855 Section 6: SEARCH criteria are free-form strings, so a
         // UTF8=ONLY server requires ENABLE UTF8=ACCEPT before SEARCH.
         self.check_utf8_only_enforced()?;
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, dispatch::SearchConsumer::new()),
+        self.submit_regular(
+            cmd,
+            dispatch::SearchConsumer::new(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID SEARCH with RETURN options (RFC 4731 Section 3.2).
@@ -478,12 +472,12 @@ impl ImapConnection {
         if Self::search_return_requests_save(&cmd) {
             self.require_searchres()?;
         }
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, dispatch::EsearchConsumer::new()),
+        self.submit_regular(
+            cmd,
+            dispatch::EsearchConsumer::new(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID STORE (RFC 3501 Section 6.4.6).
@@ -536,12 +530,12 @@ impl ImapConnection {
         if unchanged_since.is_some() {
             self.require_condstore()?;
         }
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, dispatch::StoreConsumer::new(unchanged_since)),
+        self.submit_regular(
+            cmd,
+            dispatch::StoreConsumer::new(unchanged_since),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID MOVE (RFC 6851 Section 3, RFC 9051 Appendix E item 2).
@@ -610,9 +604,12 @@ impl ImapConnection {
                 Option::None,
                 timeout,
             )
-            .await?;
-            let (expunged, expunge_code) =
-                self.uid_expunge_with_code(sequence_set, timeout).await?;
+            .await
+            .map_err(after_acknowledged_side_effect)?;
+            let (expunged, expunge_code) = self
+                .uid_expunge_with_code(sequence_set, timeout)
+                .await
+                .map_err(after_acknowledged_side_effect)?;
             // `code` mirrors the native path, where it is the MOVE's tagged
             // code: here the final UID EXPUNGE's tagged OK is that
             // counterpart (under QRESYNC, the source mailbox's new
@@ -643,12 +640,12 @@ impl ImapConnection {
         cmd: Command,
         timeout: Duration,
     ) -> Result<MoveResult, Error> {
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, dispatch::MoveConsumer::new()),
+        self.submit_regular(
+            cmd,
+            dispatch::MoveConsumer::new(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID COPY (RFC 3501 Section 6.4.7, RFC 4315 Section 3).
@@ -689,12 +686,12 @@ impl ImapConnection {
     ) -> Result<CopyResult, Error> {
         self.require_state(cmd.kind())?;
         self.check_utf8_only_enforced()?;
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, dispatch::CopyConsumer::new()),
+        self.submit_regular(
+            cmd,
+            dispatch::CopyConsumer::new(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID EXPUNGE (RFC 4315 UIDPLUS / RFC 9051 Section 6.4.9).
@@ -704,12 +701,12 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<ExpungeResult, Error> {
         let cmd = self.uid_expunge_command(sequence_set)?;
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, dispatch::ExpungeConsumer::new()),
+        self.submit_regular(
+            cmd,
+            dispatch::ExpungeConsumer::new(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID EXPUNGE that also returns the tagged OK's response code, for the
@@ -722,12 +719,12 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<(ExpungeResult, Option<ResponseCode>), Error> {
         let cmd = self.uid_expunge_command(sequence_set)?;
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, dispatch::ExpungeConsumer::with_tagged_code()),
+        self.submit_regular(
+            cmd,
+            dispatch::ExpungeConsumer::with_tagged_code(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// The local admission checks for UID EXPUNGE, then the command.
@@ -760,12 +757,32 @@ impl ImapConnection {
     /// 7162 Section 3.2.10).
     pub async fn expunge(&self, timeout: Duration) -> Result<ExpungeResult, Error> {
         self.require_state(crate::types::CommandKind::Expunge)?;
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(Command::Expunge, dispatch::ExpungeConsumer::new()),
+        self.submit_regular(
+            Command::Expunge,
+            dispatch::ExpungeConsumer::new(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
+    }
+}
+
+/// A step of a composite that runs after a non-idempotent step was
+/// acknowledged must not report the composite as unsent: the earlier side
+/// effect happened. In the UID MOVE fallback the COPY is that step, and a
+/// MOVE settled as unsent is retried, repeating the COPY and duplicating
+/// messages. Restamp evidence that reads `Unsent` (explicit, or absent on a
+/// variant that can carry it) as `InFlight`, so the operation is read back
+/// rather than replayed. Acknowledged evidence is left alone, and variants
+/// that cannot carry evidence (`StateChangedBeforeSend`, local refusals such
+/// as `MissingCapability`) pass through unchanged: `with_attempt` is a no-op
+/// for them. Those remaining cases need an aggregate partial-completion
+/// contract, which leaf transmission evidence cannot express.
+fn after_acknowledged_side_effect(error: Error) -> Error {
+    match error.attempt() {
+        None | Some(bifrost_types::TransmissionState::Unsent) => {
+            error.with_attempt(bifrost_types::TransmissionState::InFlight)
+        }
+        Some(_) => error,
     }
 }
 

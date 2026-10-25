@@ -40,8 +40,9 @@ impl ImapConnection {
     ///
     /// # Cancellation safety
     ///
-    /// Dropping the future returned by this method once the IDLE command
-    /// was submitted marks the connection abandoned, as does a DONE
+    /// Dropping the future before the driver claims IDLE withdraws it without
+    /// writing it and leaves the connection reusable. Dropping after claim
+    /// without a buffered answer marks it abandoned, as does a DONE
     /// handshake that times out: the driver may still be inside the IDLE
     /// exchange, so the connection is not reusable, and dropping its last
     /// handle aborts the driver. Use the `cancel` token to end IDLE and keep
@@ -84,38 +85,35 @@ impl ImapConnection {
         // (`InvalidState`); the driver re-checks at the head of its queue.
         self.require_state(crate::types::CommandKind::Idle)?;
 
-        // Submit IDLE to the driver task.
-        let (done_tx, done_rx) = oneshot::channel();
-        let (result_tx, result_rx) = oneshot::channel();
-        let dcmd = DriverCommand::Idle { done_rx, result_tx };
-        if self.cmd_tx.send(dcmd).await.is_err() {
-            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
-        }
-        // The IDLE exchange is the driver's from here. Like every other
-        // submission, it marks the connection abandoned unless the driver's
-        // answer to the IDLE command is actually received: a DONE handshake
-        // that times out, an early return, or a dropped future leaves the
-        // driver inside an exchange nobody will finish, and the connection
-        // must neither be reused nor outlive its last handle with a live
-        // driver (`ImapConnection`'s `Drop` aborts an abandoned one). Token
-        // cancellation that completes DONE is a completed exchange and leaves
-        // the connection reusable, which push relies on to re-IDLE.
-        let guard = self.in_flight();
-
-        // The driver is now in IDLE mode: it has sent "tag IDLE\r\n",
-        // received the `+` continuation, and is reading events from
-        // the wire. Events flow through the event_sink into our
-        // events_rx channel.
-        //
-        // We select on three signals:
-        // 1. cancel  -  user requested cancellation
-        // 2. next_event  -  an event arrived from the server
-        //    (includes timeout  -  next_event returns None on timeout)
-        // 3. result_rx  -  the driver exited IDLE on its own
-        //    (server-terminated or error)
-
+        use super::reply::{Expired, Withdrawal, may_send, on_expiry, reply_channel};
+        // Strict admission: the event deadline exists before anything is
+        // submitted, and channel capacity is raced against cancellation and
+        // that deadline, so a full channel cannot hold `idle()` past either.
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut result_rx = result_rx;
+        let permit = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(IdleEvent::Cancelled),
+            () = tokio::time::sleep_until(deadline) => return Ok(IdleEvent::Timeout),
+            reserved = self.cmd_tx.reserve() => match reserved {
+                Ok(permit) => permit,
+                Err(_) => return Err(self.observe_driver_panic(TransmissionState::Unsent).await),
+            },
+        };
+        let cancelled = cancel.is_cancelled();
+        if !may_send(Some(deadline), tokio::time::Instant::now(), cancelled) {
+            return Ok(if cancelled {
+                IdleEvent::Cancelled
+            } else {
+                IdleEvent::Timeout
+            });
+        }
+        let (done_tx, done_rx) = oneshot::channel();
+        let (reply, mut pending) = reply_channel(done_rx, &self.abandoned);
+        permit.send(DriverCommand::Idle { reply });
+        // Submitted, but not yet the driver's: only its claim at the head of
+        // the queue transfers the exchange. Until then every departure
+        // withdraws the IDLE (never written, DONE receiver released), and a
+        // dropped future does the same through `Pending`'s drop.
 
         // Loop until we get a meaningful event, timeout, or
         // cancellation. Some events (e.g., CapabilityChange) are
@@ -151,27 +149,27 @@ impl ImapConnection {
                             // exits whenever it can, so by the time the event
                             // channel reads closed the real outcome (a BYE,
                             // an I/O failure) is usually already waiting in
-                            // `result_rx`. This arm is polled first, so
+                            // `pending`. This arm is polled first, so
                             // without this look it replaced that outcome with
-                            // a generic `DriverGone`. `try_recv`, not an
+                            // a generic `DriverGone`. `try_take`, not an
                             // await: nothing guarantees the answer exists.
-                            return match result_rx.try_recv() {
-                                Ok(Ok(_)) => {
-                                    guard.completed();
-                                    Ok(IdleEvent::ServerTerminated)
-                                }
-                                Ok(Err(e)) => {
-                                    guard.completed();
-                                    Err(e)
-                                }
-                                // No answer: the driver owned the IDLE
-                                // command when it died (the send above
-                                // succeeded), so it may have been written:
-                                // `InFlight`, as on the P3 arm. `next_event`
-                                // stamps `Unsent` because IT sent nothing;
-                                // that is not this command's phase.
-                                Err(_) => {
-                                    Err(driver_death.with_attempt(TransmissionState::InFlight))
+                            //
+                            // With no answer the phase is the claim's, not
+                            // `next_event`'s (which stamps `Unsent` because IT
+                            // sent nothing): an IDLE still queued in the dying
+                            // driver's channel is withdrawn here and was never
+                            // written; a claimed one may have been. A
+                            // `try_take` that saw the reply dropped settled the
+                            // pending, so a dead driver is not marked abandoned.
+                            return match pending.try_take() {
+                                Some(Ok(_)) => Ok(IdleEvent::ServerTerminated),
+                                Some(Err(e)) => Err(e),
+                                None => {
+                                    let attempt = match pending.withdraw() {
+                                        Withdrawal::Withdrawn => TransmissionState::Unsent,
+                                        Withdrawal::Claimed => TransmissionState::InFlight,
+                                    };
+                                    Err(driver_death.with_attempt(attempt))
                                 }
                             };
                         }
@@ -181,29 +179,34 @@ impl ImapConnection {
                 // P3: Driver exited IDLE on its own (server-terminated
                 // or error). Lower priority than events so that events
                 // emitted before the tagged OK are delivered first.
-                idle_result = &mut result_rx => {
+                idle_result = pending.recv() => {
                     return match idle_result {
                         Ok(Ok(IdleTermination::ServerTerminated)) => {
-                            guard.completed();
                             Ok(IdleEvent::ServerTerminated)
                         }
                         Ok(Ok(IdleTermination::ClientDone)) => {
                             // Shouldn't happen  -  we haven't sent DONE.
                             // Treat as server-terminated.
-                            guard.completed();
                             Ok(IdleEvent::ServerTerminated)
                         }
                         Ok(Err(e)) => {
-                            guard.completed();
                             Err(e)
                         }
-                        Err(_) => Err(self.observe_driver_panic(TransmissionState::InFlight).await),
+                        Err(phase) => Err(self.observe_driver_panic(phase.attempt()).await),
                     };
                 }
             }
         };
 
-        // Send DONE to the driver and wait for it to finish IDLE.
+        // Every departure that would send DONE withdraws first. An IDLE the
+        // driver never claimed was never written: there is nothing to end,
+        // and the departure's value (an event already taken from the
+        // connection-wide queue is a real server event) is returned as is.
+        if pending.withdraw() == Withdrawal::Withdrawn {
+            return Ok(idle_event);
+        }
+        // A claimed IDLE is the driver's exchange from here, and must
+        // complete DONE to preserve framing.
         let _ = done_tx.send(());
         trace!("idle handle: sent DONE signal");
 
@@ -214,17 +217,19 @@ impl ImapConnection {
         // would otherwise park this future forever, past cancellation, past
         // account shutdown, and past `close()` (the IDLE connection is
         // dialed outside the pool, so the pool's drain never sees it).
-        match tokio::time::timeout(done_timeout, result_rx).await {
-            Ok(Ok(Ok(_))) => guard.completed(),
-            Ok(Ok(Err(e))) => {
-                guard.completed();
-                return Err(e);
-            }
-            Ok(Err(_)) => {
-                return Err(self.observe_driver_panic(TransmissionState::InFlight).await);
-            }
-            Err(_) => return Err(Error::timeout_inflight()),
-        }
+        let answer = match tokio::time::timeout(done_timeout, pending.recv()).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(phase)) => return Err(self.observe_driver_panic(phase.attempt()).await),
+            Err(_) => match on_expiry(&mut pending) {
+                Expired::Answer(answer) => answer,
+                Expired::Claimed => return Err(Error::timeout_inflight()),
+                Expired::Withdrawn => {
+                    debug_assert!(false, "DONE requires a claimed IDLE");
+                    return Err(Error::timeout_inflight());
+                }
+            },
+        };
+        answer?;
 
         Ok(idle_event)
     }

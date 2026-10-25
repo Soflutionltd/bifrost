@@ -252,12 +252,12 @@ impl ImapConnection {
         self.check_utf8_only_enforced()?;
         // RFC 5182 Section 2: SEARCHRES capability is required.
         self.require_searchres()?;
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, dispatch::SearchSaveConsumer::new()),
+        self.submit_regular(
+            cmd,
+            dispatch::SearchSaveConsumer::new(),
+            Some(tokio::time::Instant::now() + timeout),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// STORE by sequence number (RFC 3501 Section 6.4.6).

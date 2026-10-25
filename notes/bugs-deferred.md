@@ -20,22 +20,6 @@ on its face, low value or not a defect.
 
 # Specifications needed
 
-## IMAP-011 - Commands whose caller has gone are still executed
-
-**Needs a technical implementation specification** (owner, 2026-10-21): too
-consequential to resolve by ruling; it changes the documented cancellation
-contract.
-
-Scope: imap protocol.
-
-`driver_task`'s `Run` arm runs `prepare_command` and sends whatever it dequeues
-without checking `result_tx.is_closed()`. A command queued behind a slow one
-whose caller timed out (stamped `timeout_inflight`) is still written later,
-including non-idempotent APPEND / MOVE / STORE. Consistent with the documented
-"cancellation-safe, keeps executing", but skipping a command that has not
-reached the wire would turn an `InFlight` reconcile into a true `Unsent` and
-close a duplicate-append window.
-
 ## SHARED-014 - Provider-owned long-running loops each own their recovery triage and backoff
 
 **Needs a technical implementation specification** (owner, 2026-10-21).

@@ -337,7 +337,7 @@ operation is treated idempotent). The rules at altitude (read
   producer's attempt evidence, since a missing `Attempt` reads as `Unsent`:
   every producer that fails mid-exchange must stamp its transmission state
   (IMAP's driver death stamps the caller's phase - `Unsent` when the driver
-  never received the command, `InFlight` when it owned it).
+  never claimed the command, `InFlight` once it had).
 
 State-history expiry is not a provider contract violation. A producer with an
 engine cursor reports `SyncState(CursorInvalid)` with its cursor scope so the

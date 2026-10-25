@@ -82,19 +82,16 @@ impl ImapConnection {
             self.check_append_limit(message.data.len(), limit)?;
         }
 
-        tokio::time::timeout(
-            remaining_timeout(deadline)?,
-            self.submit_regular(
-                Command::Append {
-                    mailbox: mailbox.mailbox_name()?.into(),
-                    messages: vec![message],
-                    multi: false,
-                },
-                AppendConsumer::default(),
-            ),
+        self.submit_regular(
+            Command::Append {
+                mailbox: mailbox.mailbox_name()?.into(),
+                messages: vec![message],
+                multi: false,
+            },
+            AppendConsumer::default(),
+            Some(deadline),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// MULTIAPPEND  -  append multiple messages in a single APPEND command (RFC 3502).
@@ -151,19 +148,16 @@ impl ImapConnection {
             }
         }
 
-        tokio::time::timeout(
-            remaining_timeout(deadline)?,
-            self.submit_regular(
-                Command::Append {
-                    mailbox: mailbox.mailbox_name()?.into(),
-                    messages: messages.to_vec(),
-                    multi: true,
-                },
-                MultiAppendConsumer::new(messages.len()),
-            ),
+        self.submit_regular(
+            Command::Append {
+                mailbox: mailbox.mailbox_name()?.into(),
+                messages: messages.to_vec(),
+                multi: true,
+            },
+            MultiAppendConsumer::new(messages.len()),
+            Some(deadline),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// Resolve the effective APPENDLIMIT for one destination mailbox.
@@ -264,14 +258,4 @@ pub(super) fn mailbox_append_limit(status: &StatusResult) -> Result<Option<u64>,
 /// reconcile a message that was never written.
 fn unsent_preflight(error: Error) -> Error {
     error.with_attempt(bifrost_types::TransmissionState::Unsent)
-}
-
-/// Time left before the caller's deadline.
-///
-/// Expiry here is still before the APPEND is submitted, so it is `Unsent`: no APPEND
-/// octet has reached the driver.
-fn remaining_timeout(deadline: tokio::time::Instant) -> Result<Duration, Error> {
-    deadline
-        .checked_duration_since(tokio::time::Instant::now())
-        .ok_or_else(|| Error::timeout().with_attempt(bifrost_types::TransmissionState::Unsent))
 }

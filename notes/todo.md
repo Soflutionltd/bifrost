@@ -107,3 +107,46 @@ PUBLISHED SURFACE fence apply.
   N-items from the original post-phase-4 audit, B-items from the 2026-08
   bug-hunt ledgers, C-items from the 2026-09-04 hunt. All are tracked at
   the same level; none blocks ratatoskr.
+
+## IMAP composite partial completion
+
+- Multi-command operations still report the later leaf's failure rather than
+  aggregate progress. In `uid_move_messages` after an acknowledged COPY, STORE
+  `NO [UNAVAILABLE]` is acknowledged but retryable; a COPY response dropping
+  UIDPLUS makes UID EXPUNGE refuse locally; an interleaved LOGOUT can cause
+  `StateChangedBeforeSend`. These paths can authorize replaying the COPY.
+  The current MOVE evidence floor covers evidence-bearing `Unsent` errors,
+  including first-write failures and `Closed`, but cannot represent all partial
+  outcomes. An aggregate-progress design must absorb or replace that floor.
+  Include later steps withdrawn while queued, dropped unclaimed by a dying
+  driver, and already expired at admission. Inspect `complete_auth` and
+  `unauthenticate` (including disposition after failed required CAPABILITY),
+  `run_starttls_upgrade`, `run_patch_mutation_group`, and
+  `run_destroy_mutation_groups` as members of the same class.
+
+## IMAP bandwidth admission after claim
+
+- `send_wire_command` waits for `BandwidthBudget` after driver claim but before
+  the socket write. Caller expiry there conservatively reads `InFlight`.
+  Withdrawal through that window needs retirement rules for bytes buffered by
+  TLS even when the socket counter has not advanced.
+
+## IMAP abandoned checkout cascade
+
+- `run_flag_mutation_groups` and `run_destroy_mutation_groups` continue submitting
+  on the same checkout after an earlier command abandoned it. Later queued
+  commands withdraw truthfully as `Unsent`, but each still waits a full timeout.
+  Decide between failing fast on abandonment and obtaining another checkout.
+
+## IMAP unbounded LOGOUT outside pool drain
+
+- `PooledConn::replace_selected_member` awaits `old.conn.logout()` without a
+  deadline inside a live operation, retaining its permit against a silent peer.
+  The push cancellation path likewise awaits unbounded LOGOUT. Only the pool
+  drain currently provides an external timeout.
+
+## IMAP peer certificate lookup outside authentication deadline
+
+- `resolve_scram_binding` awaits `peer_certificate_der` before SCRAM-PLUS.
+  That non-wire request uses unbounded channel admission and reply waits, so
+  it can wait behind a stalled head command beyond the authentication deadline.

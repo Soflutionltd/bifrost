@@ -704,36 +704,37 @@ impl<T> Pipeline<'_, T> {
     /// whether its commands may be sent. A command the session does not permit
     /// is caller sequencing (`InvalidState`), refused before anything is
     /// submitted; the driver checks again at the head of its queue.
+    ///
+    /// Admission is strict and unbounded: a channel slot is reserved before
+    /// anything is submitted, so dropping this future while it waits for
+    /// capacity submits nothing and leaves the connection alone. Dropping it
+    /// after submission but before the driver claims the batch withdraws it
+    /// (never written, connection reusable); dropping it after the claim
+    /// without an answer marks the connection abandoned.
     async fn execute_raw(self) -> Result<Vec<Result<Box<dyn Any + Send>, Error>>, PipelineError> {
         for cmd in &self.commands {
             self.conn
                 .require_state(cmd.kind())
                 .map_err(PipelineError::Driver)?;
         }
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let dcmd = super::driver::DriverCommand::Pipeline {
-            commands: self.commands,
-            consumers: self.pending,
-            result_tx,
+        let permit = match self.conn.cmd_tx.reserve().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Err(PipelineError::Disconnected(
+                    self.conn
+                        .observe_driver_panic(bifrost_types::TransmissionState::Unsent)
+                        .await,
+                ));
+            }
         };
-        let guard = self.conn.in_flight();
-        if self.conn.cmd_tx.send(dcmd).await.is_err() {
-            guard.completed();
-            return Err(PipelineError::Disconnected(
-                self.conn
-                    .observe_driver_panic(bifrost_types::TransmissionState::Unsent)
-                    .await,
-            ));
-        }
-        let received = result_rx.await;
-        guard.completed();
-        match received {
+        let (reply, mut pending) =
+            super::reply::reply_channel((self.commands, self.pending), &self.conn.abandoned);
+        permit.send(super::driver::DriverCommand::Pipeline { reply });
+        match pending.recv().await {
             Ok(Ok(results)) => Ok(results),
             Ok(Err(e)) => Err(PipelineError::Driver(e)),
-            Err(_) => Err(PipelineError::Disconnected(
-                self.conn
-                    .observe_driver_panic(bifrost_types::TransmissionState::InFlight)
-                    .await,
+            Err(phase) => Err(PipelineError::Disconnected(
+                self.conn.observe_driver_panic(phase.attempt()).await,
             )),
         }
     }

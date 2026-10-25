@@ -37,6 +37,7 @@ mod lifecycle;
 pub(crate) mod literals;
 mod mailbox;
 pub(super) mod pipeline;
+mod reply;
 mod search_validation;
 mod seq_ops;
 mod sort_thread;
@@ -315,9 +316,8 @@ pub(crate) struct ImapConnection {
     host: String,
     /// Whether the current transport is encrypted.
     tls_active: Arc<std::sync::atomic::AtomicBool>,
-    /// Set when a submitted command's future is dropped before its result
-    /// arrives - the caller's `tokio::time::timeout` fired, or it was
-    /// cancelled. The driver is still executing that command, so the next
+    /// Set when a claimed command's caller leaves without an answer.
+    /// The driver is still executing that command, so the next
     /// command submitted on this connection queues behind it and is very
     /// likely to time out in turn. The flag makes the checkout unreusable
     /// so the cascade stops at one connection.
@@ -428,9 +428,9 @@ impl Drop for ImapConnection {
     }
 }
 
-/// Guard around one submitted command. Marks the connection abandoned
-/// unless [`completed`](Self::completed) is called, which happens only on
-/// the path where the driver's result has actually been received.
+/// Guard around keepalive setup, which submits no wire command. Marks the
+/// connection abandoned unless the driver result was received and
+/// [`completed`](Self::completed) was called.
 pub(super) struct InFlightGuard<'a> {
     flag: &'a std::sync::atomic::AtomicBool,
     completed: bool,
@@ -501,7 +501,7 @@ impl ImapConnection {
         self.is_alive() && !self.abandoned.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Open an in-flight guard for one submitted command.
+    /// Guard cancellation during non-wire keepalive setup.
     pub(super) fn in_flight(&self) -> InFlightGuard<'_> {
         InFlightGuard {
             flag: &self.abandoned,
