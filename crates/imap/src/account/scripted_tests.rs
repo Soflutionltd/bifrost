@@ -3298,11 +3298,24 @@ pub(super) async fn session_account(
     tokio::io::DuplexStream,
     super::test_support::ScriptedDials,
 ) {
+    session_account_with_budget(cap, count, notify, 1).await
+}
+
+async fn session_account_with_budget(
+    cap: usize,
+    count: usize,
+    notify: bool,
+    idle_connection_budget: usize,
+) -> (
+    ImapAccount,
+    tokio::io::DuplexStream,
+    super::test_support::ScriptedDials,
+) {
     let (conn, peer) = driver_pair(&preauth_greeting("IMAP4rev1 ACL")).await;
     let (connector, dials) =
         super::test_support::scripted_connector(vec![SESSION_GREETING.to_vec(); count]);
     let config = super::factory::ImapAccountConfig {
-        idle_connection_budget: 1,
+        idle_connection_budget,
         ..super::test_support::scripted_account_config(cap)
     };
     let mut parts = super::test_support::scripted_account_parts_from(conn, config, connector);
@@ -3311,13 +3324,14 @@ pub(super) async fn session_account(
 }
 
 async fn session_auth(peer: &mut tokio::io::DuplexStream, auth: &str) {
+    session_auth_with(peer, auth, "IMAP4rev1 IDLE UNSELECT BINARY").await;
+}
+
+async fn session_auth_with(peer: &mut tokio::io::DuplexStream, auth: &str, caps: &str) {
     assert!(auth.contains("AUTHENTICATE PLAIN"), "{auth}");
     respond(
         peer,
-        &format!(
-            "{} OK [CAPABILITY IMAP4rev1 IDLE UNSELECT BINARY] done\r\n",
-            tag_of(auth)
-        ),
+        &format!("{} OK [CAPABILITY {caps}] done\r\n", tag_of(auth)),
     )
     .await;
 }
@@ -3873,6 +3887,261 @@ async fn bye_and_server_termination_close_the_connection() {
             released,
             "the ended session released its push connection (bye = {bye})"
         );
+        drop(server);
+        drop(peer);
+        account.close().await.unwrap();
+    }
+}
+
+/// Everything the thread-default `tracing` subscriber writes, for asserting
+/// on a warning the code under test emits.
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .finish(),
+        )
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("captured log buffer poisoned"))?
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
+}
+
+async fn next_events_until(
+    session: &mut bifrost_types::AccountStream<bifrost_types::PushSessionEvent>,
+    last: fn(&bifrost_types::PushSessionEvent) -> bool,
+) -> Vec<bifrost_types::PushSessionEvent> {
+    use futures::StreamExt as _;
+    let mut events = Vec::new();
+    while let Some(event) = session.next().await {
+        let done = last(&event);
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    events
+}
+
+/// A non-NOTIFY account gives every accepted folder its own worker, so a
+/// session watching one of two folders goes straight to IDLE with no NOTIFY
+/// SET and no warning that the other folder goes unpushed: it has a worker of
+/// its own.
+#[tokio::test(start_paused = true)]
+async fn a_non_notify_worker_does_not_warn_about_folders_other_workers_cover() {
+    use bifrost_types::{Account, PushGate, PushLane, PushSessionEvent as E, SessionStop};
+    let logs = CapturedLogs::default();
+    let _logs = logs.install();
+    let (account, peer, mut dials) = session_account_with_budget(3, 1, false, 2).await;
+    let result = account
+        .push_subscribe(&[push_folder("INBOX"), push_folder("Archive")])
+        .await
+        .unwrap();
+    assert_eq!(result.outcomes.succeeded().len(), 2);
+    assert_eq!(account.push_lanes().len(), 2);
+    let mut session = account.push_stream(PushLane(0), SessionStop::never(), PushGate::open());
+    let setup = async {
+        let mut server = dials.servers.recv().await.unwrap();
+        let auth = read_line(&mut server).await;
+        session_auth(&mut server, &auth).await;
+        session_select(&mut server, "Archive").await;
+        server
+    };
+    let (events, mut server) = tokio::join!(
+        next_events_until(&mut session, |e| matches!(e, E::Established)),
+        setup
+    );
+    assert!(matches!(events.as_slice(), [E::Established]), "{events:?}");
+    let script = async {
+        let idle = read_line(&mut server).await;
+        assert!(idle.contains("IDLE"), "no NOTIFY SET before IDLE: {idle}");
+        respond(&mut server, "+ idling\r\n").await;
+        respond(&mut server, "* 2 EXISTS\r\n").await;
+        let done = read_line(&mut server).await;
+        assert!(done.contains("DONE"), "{done}");
+        respond(&mut server, &format!("{} OK idle done\r\n", tag_of(&idle))).await;
+    };
+    let (events, ()) = tokio::join!(
+        next_events_until(&mut session, |e| matches!(e, E::Healthy)),
+        script
+    );
+    assert!(matches!(events.as_slice(), [E::Healthy]), "{events:?}");
+    let text = logs.text();
+    assert!(
+        !text.contains("NOTIFY"),
+        "unexpected NOTIFY warning: {text}"
+    );
+    drop(session);
+    drop(server);
+    drop(peer);
+    account.close().await.unwrap();
+}
+
+/// A subscription change that leaves this slot's mailbox unchanged ends the
+/// IDLE round with DONE and re-issues IDLE on the same connection: no LOGOUT,
+/// no second dial, no coarse invalidation.
+#[tokio::test(start_paused = true)]
+async fn a_same_folder_resubscribe_re_idles_on_the_same_connection() {
+    use bifrost_types::{Account, PushGate, PushLane, PushSessionEvent as E, SessionStop};
+    let (account, peer, mut dials) = session_account(2, 1, false).await;
+    account
+        .push_subscribe(&[push_folder("INBOX")])
+        .await
+        .unwrap();
+    let mut session = account.push_stream(PushLane(0), SessionStop::never(), PushGate::open());
+    let setup = async {
+        let mut server = dials.servers.recv().await.unwrap();
+        let auth = read_line(&mut server).await;
+        session_auth(&mut server, &auth).await;
+        session_select(&mut server, "INBOX").await;
+        server
+    };
+    let (events, mut server) = tokio::join!(
+        next_events_until(&mut session, |e| matches!(e, E::Established)),
+        setup
+    );
+    assert!(matches!(events.as_slice(), [E::Established]), "{events:?}");
+    let script = async {
+        let idle = read_line(&mut server).await;
+        assert!(idle.contains("IDLE"), "{idle}");
+        respond(&mut server, "+ idling\r\n").await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        account
+            .push_subscribe(&[push_folder("INBOX")])
+            .await
+            .unwrap();
+        let done = read_line(&mut server).await;
+        assert!(done.contains("DONE"), "{done}");
+        respond(&mut server, &format!("{} OK idle done\r\n", tag_of(&idle))).await;
+        let again = read_line(&mut server).await;
+        assert!(again.contains("IDLE"), "re-IDLE, not a redial: {again}");
+        respond(&mut server, "+ idling\r\n").await;
+        respond(&mut server, "* 2 EXISTS\r\n").await;
+        let done = read_line(&mut server).await;
+        assert!(done.contains("DONE"), "{done}");
+        respond(&mut server, &format!("{} OK idle done\r\n", tag_of(&again))).await;
+    };
+    let (events, ()) = tokio::join!(
+        next_events_until(&mut session, |e| matches!(e, E::Healthy)),
+        script
+    );
+    assert!(matches!(events.as_slice(), [E::Healthy]), "{events:?}");
+    assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(session);
+    drop(server);
+    drop(peer);
+    account.close().await.unwrap();
+}
+
+/// On a NOTIFY account, a `NOTIFY SET` the server refuses collapses coverage
+/// to the selected mailbox while the subscribe outcome already reported every
+/// folder pushed. Every round whose registration did not take, the fresh one
+/// and a re-IDLE after a subscription change alike, must carry a coarse
+/// invalidation; a round whose registration took carries none.
+#[tokio::test(start_paused = true)]
+async fn a_refused_notify_registration_invalidates_on_fresh_and_interrupted_rounds() {
+    use bifrost_types::{
+        Account, HintPayload, InvalidationHint, PushGate, PushLane, PushSessionEvent as E,
+        SessionStop,
+    };
+    fn coarse(e: &E) -> bool {
+        matches!(
+            e,
+            E::Invalidated(InvalidationHint {
+                payload: HintPayload::Unknown,
+                ..
+            })
+        )
+    }
+    for refuse in [true, false] {
+        let (account, peer, mut dials) = session_account(2, 1, true).await;
+        account
+            .push_subscribe(&[push_folder("INBOX"), push_folder("Archive")])
+            .await
+            .unwrap();
+        let mut session = account.push_stream(PushLane(0), SessionStop::never(), PushGate::open());
+        let answer = |tag: &str| {
+            if refuse {
+                format!("{tag} NO unsupported filter\r\n")
+            } else {
+                format!("{tag} OK registered\r\n")
+            }
+        };
+        let setup = async {
+            let mut server = dials.servers.recv().await.unwrap();
+            let auth = read_line(&mut server).await;
+            session_auth_with(&mut server, &auth, "IMAP4rev1 IDLE UNSELECT NOTIFY").await;
+            session_select(&mut server, "Archive").await;
+            let notify = read_line(&mut server).await;
+            assert!(notify.contains("NOTIFY SET"), "{notify}");
+            assert!(notify.contains("INBOX"), "{notify}");
+            respond(&mut server, &answer(tag_of(&notify))).await;
+            server
+        };
+        let (fresh, mut server) = tokio::join!(
+            next_events_until(&mut session, |e| matches!(e, E::Established)),
+            setup
+        );
+        assert_eq!(fresh.iter().any(coarse), refuse, "fresh round: {fresh:?}");
+        let script = async {
+            let idle = read_line(&mut server).await;
+            assert!(idle.contains("IDLE"), "{idle}");
+            respond(&mut server, "+ idling\r\n").await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            account
+                .push_subscribe(&[push_folder("INBOX")])
+                .await
+                .unwrap();
+            let done = read_line(&mut server).await;
+            assert!(done.contains("DONE"), "{done}");
+            respond(&mut server, &format!("{} OK idle done\r\n", tag_of(&idle))).await;
+            let notify = read_line(&mut server).await;
+            assert!(notify.contains("NOTIFY SET"), "re-registered: {notify}");
+            respond(&mut server, &answer(tag_of(&notify))).await;
+            let again = read_line(&mut server).await;
+            assert!(again.contains("IDLE"), "{again}");
+            respond(&mut server, "+ idling\r\n").await;
+            respond(&mut server, "* 2 EXISTS\r\n").await;
+            let done = read_line(&mut server).await;
+            assert!(done.contains("DONE"), "{done}");
+            respond(&mut server, &format!("{} OK idle done\r\n", tag_of(&again))).await;
+        };
+        let (interrupted, ()) = tokio::join!(
+            next_events_until(&mut session, |e| matches!(e, E::Healthy)),
+            script
+        );
+        assert_eq!(
+            interrupted.iter().any(coarse),
+            refuse,
+            "interrupted round: {interrupted:?}"
+        );
+        assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(session);
         drop(server);
         drop(peer);
         account.close().await.unwrap();

@@ -173,7 +173,12 @@ pub(crate) fn push_subscribe(
             }
             accepted
         };
-        account.push.bump_generation();
+        // Only an accepted scope changes the subscription set. A bump for an
+        // all-refused subscribe would wake every live worker to re-choose an
+        // unchanged assignment, cancelling its IDLE round for nothing.
+        if !accepted.is_empty() {
+            account.push.bump_generation();
+        }
         let outcomes = outcomes.finalize(&expected).map_err(|error| {
             account_error_with(
                 crate::Error::Internal(error.to_string()),
@@ -395,7 +400,7 @@ pub(crate) fn push_stream(
             let mut first = true;
             loop {
                 let watched = { let scopes = account.push.scopes.lock().expect("push scopes lock poisoned"); subscribed_idle_folders(&scopes.by_handle) };
-                let notify = tokio::select! { () = stop.stopped() => break 'assignment, () = account.shutdown.cancelled() => break 'assignment, result = register_notify(&conn, &folder, &watched, account.command_timeout()) => result };
+                let notify = tokio::select! { () = stop.stopped() => break 'assignment, () = account.shutdown.cancelled() => break 'assignment, result = register_notify(&conn, &folder, &watched, account.push.supports_notify, account.command_timeout()) => result };
                 let registered = match notify {
                     Ok(registered) => registered,
                     Err(e) => {
@@ -472,9 +477,8 @@ enum ResubscribeAction {
 /// and it forces a coarse `Unknown` invalidation for a window a same-folder
 /// re-IDLE on the same connection never loses.
 ///
-/// The pure decision is pinned. The pool connector seam also makes the
-/// re-IDLE and NOTIFY-collapse wiring hermetically drivable; those additional
-/// wiring tests remain a separate work item.
+/// The pure decision is pinned here; its wiring through a live session is
+/// pinned by the scripted re-IDLE and NOTIFY-collapse transcripts.
 fn resubscribe_action(
     current: &crate::types::MailboxName,
     chosen: Option<&crate::types::MailboxName>,
@@ -600,6 +604,13 @@ fn notify_params(others: Vec<crate::types::MailboxArgument>) -> crate::types::No
 /// (`signal_coverage_established`), which this decision does not forbid
 /// because it fires only after a wait.
 ///
+/// `account_notify` is the topology the account chose at open
+/// (`PushState::supports_notify`). Without it, admission gives every accepted
+/// folder its own worker, so this session has nothing to register and no gap
+/// to warn about; it returns `false` silently, which
+/// `signal_notify_coverage_loss` reads as no gap in that topology. Only an
+/// account that planned on NOTIFY and got a session without it warns.
+///
 /// Returns whether every watched folder is covered. A server without
 /// NOTIFY leaves the loop watching only the selected mailbox. A rejected
 /// registration returns the error so the caller can forward non-Retry
@@ -612,6 +623,7 @@ async fn register_notify(
     conn: &crate::connection::ImapConnection,
     selected: &crate::types::MailboxName,
     watched: &[crate::types::MailboxName],
+    account_notify: bool,
     timeout: std::time::Duration,
 ) -> Result<bool, crate::Error> {
     let others: Vec<crate::types::MailboxArgument> = watched
@@ -621,6 +633,9 @@ async fn register_notify(
         .collect();
     if others.is_empty() {
         return Ok(true);
+    }
+    if !account_notify {
+        return Ok(false);
     }
     if !conn.server_profile().supports_notify() {
         tracing::warn!(
@@ -1084,6 +1099,22 @@ mod assignment_tests {
                 .contains_key(&folder.account_id())
         );
         assert!(choose_assignment(&account, 0).is_some());
+    }
+    #[tokio::test]
+    async fn a_subscribe_that_accepts_nothing_leaves_the_generation_alone() {
+        let (account, _peer) = account().await;
+        let before = *account.push.assignment.borrow();
+        let result = account
+            .push_subscribe(&[CursorScope::Account])
+            .await
+            .unwrap();
+        assert!(result.handle.is_none());
+        assert_eq!(*account.push.assignment.borrow(), before);
+        account
+            .push_subscribe(&[CursorScope::Folder(bifrost_types::FolderId("INBOX".into()))])
+            .await
+            .unwrap();
+        assert_ne!(*account.push.assignment.borrow(), before);
     }
     #[tokio::test]
     async fn an_all_excluded_lane_parks_until_the_subscription_set_changes() {

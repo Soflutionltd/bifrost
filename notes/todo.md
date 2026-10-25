@@ -147,28 +147,10 @@ PUBLISHED SURFACE fence apply.
   re-issued NOTIFY SET. Changes before registration are not invalidated.
   Pre-existing; the shared session budget does not widen this window.
 
-## IMAP push: pin the re-IDLE and NOTIFY-collapse wiring through the pool connector seam
-
-- The connector seam now supports hermetic worker transcripts. Pin both the
-  same-session re-IDLE path and register_notify's result reaching
-  signal_notify_coverage_loss on fresh and interrupted rounds.
-
 ## Session cap does not span account incarnations
 
 - A failed or cancelled factory open, or a closing incarnation during reopen,
   can leave a transport tail that the next incarnation's cap does not count.
-
-## IMAP push: false NOTIFY warning on non-NOTIFY accounts
-
-- register_notify warns that other subscribed folders will not be pushed on
-  every fresh session and Reidle round of a multi-folder non-NOTIFY account,
-  although each other folder has its own worker. signal_notify_coverage_loss
-  already treats false as no coverage gap in that topology.
-
-## IMAP push: push_subscribe bumps the generation when it accepted nothing
-
-- The unconditional bump wakes every worker without a scope-set change.
-  Gate it on a non-empty accepted set.
 
 ## IMAP DELETE / RENAME while a parked member has the target selected
 

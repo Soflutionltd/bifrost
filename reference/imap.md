@@ -1086,8 +1086,8 @@ application, never the historical successful command's evidence.
 
 Push is driven by engine-owned sessions. `push_lanes()` returns no lanes at
 zero capacity, one Connection lane with NOTIFY, otherwise one per carved-out
-push slot. Subscribe registers scopes and bumps the assignment watch; it
-spawns nothing. Each `push_stream(lane, stop, gate)` claims a shared lane
+push slot. Subscribe registers scopes and bumps the assignment watch only
+when it accepted at least one scope; it spawns nothing. Each `push_stream(lane, stop, gate)` claims a shared lane
 lease, waits for an assignment, reserves capacity, dials, SELECTs, registers
 NOTIFY and yields `Established`. Completed IDLE rounds yield `Healthy` and
 mapped invalidations. Setup alone never resets the engine's backoff (5s to
@@ -1103,6 +1103,10 @@ their slot from the filtered lexical assignment list, so an exclusion shifts
 higher slots and makes those sessions reconfigure once. All-excluded lanes
 park on the assignment watch; INBOX fallback never bypasses exclusions.
 
+NOTIFY registration follows the topology fixed at open: on an account
+without NOTIFY every admitted folder has its own worker, so a session never
+issues `NOTIFY SET` and does not warn about the other folders. Only a NOTIFY
+account whose session lacks the capability warns and invalidates coarsely.
 NOTIFY retry/reconcile failures report `UnitFailed` and retain selected-folder
 coverage plus coarse invalidations. A definite tagged command refusal may
 degrade with a support-only warning; authentication, authorization, BYE and
