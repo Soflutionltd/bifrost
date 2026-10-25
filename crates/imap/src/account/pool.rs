@@ -281,6 +281,19 @@ impl Pool {
         self.inner.sessions.available_permits()
     }
 
+    /// The recorded selection of every parked member, in parking order.
+    #[cfg(test)]
+    pub(crate) fn parked_selection(&self) -> Vec<Option<MailboxName>> {
+        self.inner
+            .idle
+            .lock()
+            .expect("pool lock poisoned")
+            .parked
+            .iter()
+            .map(|member| member.selected.clone())
+            .collect()
+    }
+
     pub(crate) async fn close(&self) {
         let completion = self
             .inner
@@ -445,6 +458,47 @@ impl PoolInner {
             }
         }
         idle.parked.push(member);
+    }
+
+    /// Bring every PARKED member recorded as selected on `target` off it
+    /// before a DELETE or RENAME of `target` goes out (RFC 2683 2.2.2). Each
+    /// is taken out of the parked list, then UNSELECTed and returned, or
+    /// retired when UNSELECT fails for any reason (no UNSELECT capability, a
+    /// refusal, a timeout): retirement is the one outcome that proves the
+    /// session no longer has the target selected. Members run concurrently.
+    ///
+    /// Checked-out members are out of reach: they belong to callers working
+    /// right now, and one of those may be working in the target itself.
+    async fn deselect_parked(&self, target: &MailboxName, timeout: std::time::Duration) {
+        let selected: Vec<PoolMember> = {
+            let mut idle = self.idle.lock().expect("pool lock poisoned");
+            let (selected, rest) = std::mem::take(&mut idle.parked)
+                .into_iter()
+                .partition(|member| member.selected.as_ref() == Some(target));
+            idle.parked = rest;
+            selected
+        };
+        futures::future::join_all(selected.into_iter().map(|mut member| async move {
+            // A session no longer `Selected` has left the target already;
+            // only the record is stale, and UNSELECT would be refused on
+            // state alone.
+            if !matches!(
+                member.conn.session_state(),
+                crate::connection::SessionState::Selected
+            ) {
+                member.selected = None;
+                self.return_member(member);
+                return;
+            }
+            match member.conn.unselect(timeout).await {
+                Ok(()) => {
+                    member.selected = None;
+                    self.return_member(member);
+                }
+                Err(_) => self.retire(member).await,
+            }
+        }))
+        .await;
     }
 
     /// Bounded LOGOUT, then abort and join: once this returns the member's
@@ -743,11 +797,16 @@ impl PooledConn {
     /// DELETE and RENAME for the selected mailbox. Prefer UNSELECT because
     /// it keeps the checkout on its existing connection; old servers without
     /// UNSELECT replace the selected member with a freshly dialed connection.
+    ///
+    /// Other parked members selected on the target are brought off it first
+    /// (`PoolInner::deselect_parked`), so no idle session of this account
+    /// holds the target selected when the command goes out.
     pub(crate) async fn deselect_target(
         &mut self,
         target: &MailboxName,
         timeout: std::time::Duration,
     ) -> Result<(), Error> {
+        self.pool.deselect_parked(target, timeout).await;
         let selected_target = self
             .member
             .as_ref()
@@ -1938,6 +1997,9 @@ mod tests {
         held.set_selected(folder("Archive"));
         let (other, _other_peer) = marked("UNSELECT").await;
         park(&pool, other, Some(folder("Archive")));
+        // The parked member's session never selected anything, so its stale
+        // record is cleared with no wire traffic. It stays parked: the
+        // replacement dials fresh instead of adopting it.
         let script = async {
             answer_logout(&mut peer).await;
             answer_dial(&mut dials).await
@@ -1954,7 +2016,7 @@ mod tests {
                 .supports(Capability::Binary)
         );
         assert_eq!(held.selected_affinity(), None);
-        assert_eq!(idle_selection(&pool), vec![Some(folder("Archive"))]);
+        assert_eq!(idle_selection(&pool), vec![None]);
     }
 
     #[tokio::test(start_paused = true)]

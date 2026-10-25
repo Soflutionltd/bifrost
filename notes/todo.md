@@ -146,12 +146,6 @@ PUBLISHED SURFACE fence apply.
 - A failed or cancelled factory open, or a closing incarnation during reopen,
   can leave a transport tail that the next incarnation's cap does not count.
 
-## IMAP DELETE / RENAME while a parked member has the target selected
-
-- deselect_target handles only its own checkout. Another parked member may
-  remain SELECTed on the target while DELETE or RENAME goes out, contrary to
-  RFC 2683 Section 2.2.2. Pre-existing.
-
 ## Account schema reset follow-ups
 
 - "`BackfillCheckpointWriter::persist` bypasses completion refusal and every

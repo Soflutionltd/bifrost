@@ -1097,6 +1097,77 @@ async fn deselect_fallback_releases_the_old_connection_before_redialing() {
     assert!(futures::poll!(&mut second).is_pending());
 }
 
+/// Another PARKED member left selected on the target must be brought off it
+/// before DELETE or RENAME goes out (RFC 2683 2.2.2), not only the caller's
+/// own checkout. An UNSELECT the server accepts returns the member to the
+/// pool unselected; one it refuses retires the member, since nothing else
+/// proves the session has left the target.
+#[tokio::test(start_paused = true)]
+async fn deselect_target_brings_other_parked_members_off_the_target() {
+    use bifrost_types::Account as _;
+    for unselect_ok in [true, false] {
+        let (account, peer, mut dials) = session_account(2, 1, false).await;
+        let folder = crate::types::MailboxName::new("Archive").unwrap();
+        let mut held = account.pool.checkout_any().await.unwrap();
+        let script = async {
+            let mut peer = dials.servers.recv().await.unwrap();
+            let auth = read_line(&mut peer).await;
+            session_auth(&mut peer, &auth).await;
+            peer
+        };
+        let (other, mut other_peer) = tokio::join!(account.pool.checkout_any(), script);
+        let mut other = other.unwrap();
+        let (result, ()) = tokio::join!(
+            account.select_folder(&mut other, &folder, None, false),
+            session_select(&mut other_peer, "Archive")
+        );
+        result.unwrap();
+        drop(other);
+        assert_eq!(account.pool.parked_selection(), vec![Some(folder.clone())]);
+
+        let script = async {
+            let unselect = tokio::time::timeout(Duration::from_secs(5), read_line(&mut other_peer))
+                .await
+                .expect("the parked member selected on the target must be deselected");
+            assert!(unselect.contains("UNSELECT"), "{unselect}");
+            if unselect_ok {
+                respond(
+                    &mut other_peer,
+                    &format!("{} OK unselected\r\n", tag_of(&unselect)),
+                )
+                .await;
+            } else {
+                respond(
+                    &mut other_peer,
+                    &format!("{} NO not now\r\n", tag_of(&unselect)),
+                )
+                .await;
+                let logout =
+                    tokio::time::timeout(Duration::from_secs(5), read_line(&mut other_peer))
+                        .await
+                        .expect("a member that refused UNSELECT must be retired");
+                assert!(logout.contains("LOGOUT"), "{logout}");
+                respond(
+                    &mut other_peer,
+                    &format!("* BYE closing\r\n{} OK done\r\n", tag_of(&logout)),
+                )
+                .await;
+            }
+        };
+        let (result, ()) = tokio::join!(
+            held.deselect_target(&folder, Duration::from_secs(5)),
+            script
+        );
+        result.unwrap();
+        let expected = if unselect_ok { vec![None] } else { Vec::new() };
+        assert_eq!(account.pool.parked_selection(), expected, "{unselect_ok}");
+        drop(held);
+        drop(other_peer);
+        drop(peer);
+        account.close().await.unwrap();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sync half: strategy dispatch, VANISHED/FETCH dedup, downgrades, checkpoints.
 //
