@@ -21,8 +21,8 @@ pub(crate) async fn push_subscribe(
 ) -> Result<bifrost_types::PushSubscription, AccountError> {
     // A subscription covering nothing is not a subscription. Registering it
     // anyway minted a handle over an empty group: teardown had no server id
-    // to walk, so the group was never retired and the renewal worker it
-    // started was never stopped. The engine already skips an empty scope
+    // to walk, so the group was never retired and kept the renewal lane
+    // believing it had a registration. The engine already skips an empty scope
     // list at its own reattach boundary, so this can only be a caller bug.
     if scopes.is_empty() {
         return Err(invalid_account_error(
@@ -67,7 +67,7 @@ pub(super) type ArmOutcome = (
 /// Each arm closes the ledger ITSELF, immediately before it registers
 /// anything: a `finalize` failure must be raised while nothing is live yet.
 /// Finalizing here, after the arm returned, meant the handle was already
-/// registered and its worker running when the `Err` - carrying no handle -
+/// registered and visible to push sessions when the `Err` - carrying no handle -
 /// went back to a caller who could therefore never unsubscribe it.
 ///
 /// Split out of `push_subscribe` so a test can hand it a ledger the arm
@@ -122,7 +122,7 @@ pub(super) fn push_item_ids(len: usize) -> Vec<bifrost_types::BatchItemId> {
 /// make `finalize` fail, and a failure is `Internal(InvariantViolated)`, not
 /// the provider contract violation it used to be filed as.
 ///
-/// Called by each arm BEFORE it registers a handle or starts a worker, never
+/// Called by each arm BEFORE it registers a handle or wakes a session, never
 /// after: see `subscribe_eligible`.
 pub(super) fn finalize_push_outcomes(
     outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,

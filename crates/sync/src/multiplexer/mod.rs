@@ -657,6 +657,12 @@ fn lag_warning(skipped: u64, abandoned: usize) -> MultiplexerEvent {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ReopenRequest {
+    /// Push directive stamped with the account instance that produced it.
+    PushRecovery {
+        scope: Option<CursorScope>,
+        error: AccountError,
+        generation: u64,
+    },
     /// Account error observed at the scope's stream terminus.
     Recovery {
         scope: Option<CursorScope>,
@@ -946,8 +952,25 @@ impl Multiplexer {
         let lifecycle_throttles = Arc::clone(&throttles);
         let lifecycle_account_id = account_id.clone();
         let lifecycle_handle = tokio::spawn(async move {
-            let mut reconnect_delay = LIFECYCLE_RECONNECT_MIN;
+            let mut backoff =
+                crate::backoff::ReconnectBackoff::new(bifrost_types::BackoffPolicy::new(
+                    LIFECYCLE_RECONNECT_MIN,
+                    LIFECYCLE_RECONNECT_MAX,
+                    false,
+                ));
+            let mut carry = false;
             loop {
+                if carry {
+                    tokio::select! {
+                        () = lifecycle_shutdown.cancelled() => return,
+                        changed = lifecycle_generation.changed() => {
+                            if changed.is_err() { return; }
+                            continue;
+                        }
+                        () = tokio::time::sleep(backoff.carried_delay()) => {}
+                    }
+                    carry = false;
+                }
                 // Recheck shared holds after every wake; sibling work can
                 // extend one while this reader is waiting.
                 if let Some(wait) = crate::recovery::account_throttle_wait(
@@ -958,7 +981,7 @@ impl Multiplexer {
                         () = lifecycle_shutdown.cancelled() => return,
                         changed = lifecycle_generation.changed() => {
                             if changed.is_err() { return; }
-                            reconnect_delay = LIFECYCLE_RECONNECT_MIN;
+                            carry = true;
                         }
                         () = tokio::time::sleep(wait) => {}
                     }
@@ -968,6 +991,7 @@ impl Multiplexer {
                 let mut stream = acc.scope_lifecycle_stream();
                 let mut retry_wait = Duration::ZERO;
                 let mut reopened = false;
+                let mut failure_delay = None;
                 loop {
                     tokio::select! {
                             () = lifecycle_shutdown.cancelled() => return,
@@ -982,16 +1006,19 @@ impl Multiplexer {
                             let Some(ev) = next else { break; };
                             if matches!(
                                 &ev,
-                                bifrost_types::ScopeLifecycleEvent::Lifecycle(_)
+                                bifrost_types::ScopeLifecycleEvent::Lifecycle(_) | bifrost_types::ScopeLifecycleEvent::Polled
                             ) {
-                                reconnect_delay = LIFECYCLE_RECONNECT_MIN;
+                                backoff.reset();
                             }
                             let lifecycle = match ev {
+                                bifrost_types::ScopeLifecycleEvent::Polled => continue,
                                 bifrost_types::ScopeLifecycleEvent::Lifecycle(lc) => lc,
                                 bifrost_types::ScopeLifecycleEvent::Terminated(err) => {
+                                    let delay = backoff.record_failure(crate::backoff::jitter_seed());
+                                    failure_delay = Some(delay);
                                     let policy = lifecycle_termination(&err);
                                     retry_wait = lifecycle_retry_wait(
-                                        &err, reconnect_delay, &lifecycle_throttles,
+                                        &err, delay, &lifecycle_throttles,
                                         &lifecycle_account_id,
                                     );
                                     match policy {
@@ -999,10 +1026,9 @@ impl Multiplexer {
                                         | LifecycleTermination::ForwardAndReconnect => {
                                             // Hand the classified error to the
                                             // engine exactly once. The reopen
-                                            // path owns the three-strike
-                                            // budget, so one dead lifecycle
-                                            // stream cannot enqueue unbounded
-                                            // account reopens.
+                                            // path owns replacement; this reader
+                                            // carries its failure count across
+                                            // generations to pace persistent faults.
                                             if lifecycle_reopen
                                                 .send(ReopenRequest::Recovery {
                                                     scope: None,
@@ -1070,21 +1096,20 @@ impl Multiplexer {
                     }
                 }
                 if reopened {
-                    reconnect_delay = LIFECYCLE_RECONNECT_MIN;
+                    carry = true;
                     continue;
                 }
+                let delay = failure_delay
+                    .unwrap_or_else(|| backoff.record_failure(crate::backoff::jitter_seed()));
                 tokio::select! {
                     () = lifecycle_shutdown.cancelled() => return,
                     changed = lifecycle_generation.changed() => {
                         if changed.is_err() { return; }
-                        reconnect_delay = LIFECYCLE_RECONNECT_MIN;
+                        carry = true;
                         continue;
                     }
-                    () = tokio::time::sleep(reconnect_delay.max(retry_wait)) => {}
+                    () = tokio::time::sleep(delay.max(retry_wait)) => {}
                 }
-                reconnect_delay = reconnect_delay
-                    .saturating_mul(2)
-                    .min(LIFECYCLE_RECONNECT_MAX);
             }
         });
 

@@ -3,8 +3,10 @@
 //! Every Account-trait batched stream yields `SyncEvent<T>`, where
 //! `SyncEvent::Batch(Batch<T>)` is the dominant variant. The
 //! checkpoint travels inside the batch so the consumer persists data
-//! and cursor in one transaction. `push_stream` yields raw
-//! `WatchEvent`s - those are wake-up signals, not paged data.
+//! and cursor in one transaction. `WatchEvent` is what a consumer's
+//! out-of-process receiver hands to `InvalidationSink::push` - wake-up
+//! signals, not paged data. In-process push sessions yield
+//! `PushSessionEvent` (see the `push` module).
 
 use std::time::Duration;
 
@@ -886,20 +888,10 @@ impl InventoryEntry {
     }
 }
 
-/// Push wake-up event. Push surfaces are wake-ups, not change feeds.
-///
-/// `Terminated(AccountError)` carries a classified error when the push
-/// stream ends and cannot be reconnected without engine intervention
-/// (auth lost, subscription deleted, schema break). It is the push
-/// equivalent of [`SyncEvent::Terminated`]. `Disconnected` /
-/// `Reconnected` remain advisory: a transient transport drop emits
-/// `Disconnected` followed by `Reconnected` once the renewer succeeds.
-///
-/// `Warning(Warning)` carries a structured advisory event (renewal
-/// hiccups, throttle telemetry, etc.) without ending the stream. Push
-/// transports that classify a transient error use this rather than
-/// bare-`tracing::warn!` so consumers and the engine see a typed
-/// signal.
+/// Consumer-injected push vocabulary for `InvalidationSink::push`.
+/// Invalidations may coalesce into wider reconciles. Health and advisory
+/// events are broadcast synchronously; classified failures route through
+/// engine recovery. A refused directive is returned to the caller to retry.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum WatchEvent {
@@ -926,9 +918,7 @@ pub enum PushSource {
     GmailPubsub,
     GraphSubscription,
     EwsStreaming,
-    /// Engine-synthesized: the sink overflowed and the precise source
-    /// could not be preserved; the wake-up is a coalesced full
-    /// reconcile.
+    /// Engine- or provider-synthesized wide wake-up.
     Coalesced,
 }
 
@@ -944,11 +934,26 @@ pub enum HintPayload {
 
 /// Sink for out-of-process push events (Gmail Pub/Sub listeners,
 /// Graph webhook receivers). The consumer wires its receiver to
-/// invoke `push` on every event; the engine merges sink-injected
-/// events with in-process events into one logical push channel per
-/// account.
+/// invoke `push` on every event. Invalidations enter bounded pending state;
+/// control events are acted on synchronously. Callers must retain and retry
+/// `SinkPush::Refused`, including through a consumer pause.
 pub trait InvalidationSink: Send + Sync + 'static {
-    fn push(&self, account: AccountId, event: WatchEvent);
+    fn push(&self, account: AccountId, event: WatchEvent) -> SinkPush;
+}
+
+/// Result of synchronous consumer push delivery.
+#[must_use = "a refused event is handed back for the caller to retry"]
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SinkPush {
+    /// Recorded or acted on, possibly as a wider invalidation.
+    Accepted,
+    /// A directive could not be queued: the account is paused or
+    /// checkpointing, or its recovery queue is full. Resubmit after resume
+    /// or once the queue drains. Refusals may persist through a pause.
+    Refused(WatchEvent),
+    /// No such account is attached.
+    NotAttached,
 }
 
 /// Consumer-to-producer control handle returned alongside every

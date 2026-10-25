@@ -23,14 +23,13 @@ mod pim;
 mod public_folder;
 mod push;
 mod push_stream;
+mod push_tasks;
 mod reactions;
 mod scopes;
-mod worker_slot;
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use bifrost_types::{
@@ -45,11 +44,11 @@ use bifrost_types::{
     ObjectId, OpenedAccount, Page, Priority, Projection, RsvpStatus, ScopeLifecycleEvent,
     SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
     ServerFilterPatch, SkippedScope, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration,
-    ThreadId, VacationConfig, WatchEvent,
+    ThreadId, VacationConfig,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use tokio::sync::{RwLock, broadcast, watch};
+use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
 
 // pub: consumers build a GraphClient before registering GraphAccountFactory with the engine.
@@ -95,49 +94,32 @@ pub(crate) struct GraphAccount {
     pub(crate) capabilities: AccountCapabilities,
     pub(crate) push_endpoint: Option<PushEndpoint>,
     pub(crate) push_mode: PushMode,
-    pub(crate) push_tx: broadcast::Sender<WatchEvent>,
-    /// Terminal push health is sticky for this account instance. Broadcast
-    /// carries ordinary health edges and invalidations; this watch value lets
-    /// late or lagged readers still observe a terminal failure.
-    pub(crate) push_terminal: watch::Sender<Option<AccountError>>,
+    pub(crate) push_lease: bifrost_types::LaneLease,
+    pub(crate) push_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    pub(crate) graph_topology: Arc<watch::Sender<u64>>,
+    pub(crate) pending_gaps: Arc<std::sync::Mutex<std::collections::VecDeque<CursorScope>>>,
+    pub(crate) ews_ledger: Arc<std::sync::Mutex<ews_stream::EwsLedger>>,
     pub(crate) cursor_index: Arc<RwLock<CursorIndex>>,
     pub(crate) folder_tree: Arc<RwLock<FolderTree>>,
     pub(crate) graph_subscriptions:
         Arc<RwLock<HashMap<SubscriptionHandle, GraphSubscriptionGroup>>>,
-    pub(crate) graph_worker: worker_slot::WorkerSlot,
     /// Subscription ids recreated under a handle the handle cannot name.
     /// Unlike the rest of the push state this is NOT fresh per instance: the
     /// factory hands every account it opens the same ledger, so an orphan
     /// retried on a reopened instance still reaches them.
     pub(crate) recreated_subscription_ids: push::RecreatedSubscriptionIds,
-    /// Whether push is currently believed to be DOWN, so `Reconnected` can be
-    /// edge-triggered off it rather than published on every successful
-    /// subscribe.
-    ///
-    /// `WatchEvent::Reconnected` is the engine's full-reconcile trigger: the
-    /// push reconciler answers it with an account-wide `Coalesced` /
-    /// `HintPayload::Unknown` invalidation over every registered cursor
-    /// scope. A first subscribe has no gap to cover - the engine has just
-    /// established or resumed those cursors itself - so publishing one there
-    /// bought a redundant reconcile of the whole account per subscribe. The
-    /// latch lives on the account rather than inside the renewal worker
-    /// because the two emitters must agree: the worker raises it when a
-    /// renewal tick fails, and a subscribe that lands while push is degraded
-    /// is a genuine recovery edge and owes the event. Shared across every
-    /// `GraphAccount` clone, and reset by construction on reopen.
-    pub(crate) push_disconnected: Arc<AtomicBool>,
     pub(crate) ews_subscriptions: Arc<RwLock<HashMap<SubscriptionHandle, EwsSubscriptionState>>>,
-    pub(crate) ews_worker: worker_slot::WorkerSlot,
     /// Monotone generation counter bumped by `subscribe_ews` /
-    /// `unsubscribe_ews` on every change to `ews_subscriptions`. The EWS
-    /// worker marks the current generation seen immediately before each
+    /// `unsubscribe_ews` on every change to `ews_subscriptions`. An EWS
+    /// session marks the current generation seen immediately before each
     /// read of that map, so a bump can never be lost between reading and
-    /// waiting: an idle worker wakes to subscribe, a live one abandons its
-    /// long poll and re-subscribes to the new scope union. A `watch`
-    /// generation rather than a `Notify` because a `Notify` permit stored
-    /// by the registration that starts the worker would be consumed right
-    /// after its first Subscribe and read as a topology change - turning
-    /// every first registration into a guaranteed redundant resubscribe.
+    /// waiting: a parked session wakes to subscribe, a live one releases its
+    /// subscription and ends `Reconfigure` so the next session subscribes to
+    /// the new scope union. A `watch` generation rather than a `Notify`
+    /// because a `Notify` permit stored by the registration that wakes a
+    /// parked session would be consumed right after its first Subscribe and
+    /// read as a topology change - turning every first registration into a
+    /// guaranteed redundant resubscribe.
     pub(crate) ews_topology: Arc<watch::Sender<u64>>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) etag_index: Arc<RwLock<EtagIndex>>,
@@ -208,10 +190,8 @@ pub(crate) struct GraphAccount {
 /// cache, so keep only a fixed working set.
 pub(crate) const ETAG_INDEX_MAX_ENTRIES: usize = 10_000;
 
-/// How long `close()` waits for the EWS worker to release its streaming
-/// subscription before aborting it. Long enough for one round trip to a
-/// healthy Exchange, short enough that an unresponsive one cannot make
-/// `close()` hang.
+/// One join bound for account-owned push effects. Unfinished tasks are
+/// detached on expiry, preserving release and recreate install-or-undo work.
 const CLOSE_WORKER_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A change key plus the recency ticket that orders it in `EtagIndex::order`.
@@ -346,8 +326,6 @@ impl GraphAccount {
         public_folders: Option<PublicFolderScope>,
         user_email: Option<String>,
     ) -> Self {
-        let (push_tx, _) = broadcast::channel(256);
-        let (push_terminal, _) = watch::channel(None);
         let shared_clients = shared_clients_map(&client, shared_mailboxes);
         // `pim_methods.send_as` mirrors this map, so derive it from the map
         // AFTER `shared_clients_map` has dropped unroutable keys: a config
@@ -360,16 +338,16 @@ impl GraphAccount {
             capabilities: capabilities::build_capabilities(push_mode, has_shared_mailboxes),
             push_endpoint,
             push_mode,
-            push_tx,
-            push_terminal,
+            push_lease: bifrost_types::LaneLease::new(),
+            push_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            graph_topology: Arc::new(watch::Sender::new(0)),
+            pending_gaps: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            ews_ledger: Arc::new(std::sync::Mutex::new(ews_stream::EwsLedger::default())),
             cursor_index: Arc::new(RwLock::new(CursorIndex::default())),
             folder_tree: Arc::new(RwLock::new(FolderTree::default())),
             graph_subscriptions: Arc::new(RwLock::new(HashMap::new())),
-            graph_worker: worker_slot::worker_slot(),
             recreated_subscription_ids: Arc::default(),
-            push_disconnected: Arc::new(AtomicBool::new(false)),
             ews_subscriptions: Arc::new(RwLock::new(HashMap::new())),
-            ews_worker: worker_slot::worker_slot(),
             ews_topology: Arc::new(watch::channel(0_u64).0),
             shutdown: CancellationToken::new(),
             etag_index: Arc::new(RwLock::new(EtagIndex::default())),
@@ -1101,8 +1079,17 @@ impl Account for GraphAccount {
         Box::pin(async move { push::push_unsubscribe(account, handle).await })
     }
 
-    fn push_stream(&self) -> AccountStream<WatchEvent> {
-        push_stream::push_stream(self.clone())
+    fn push_lanes(&self) -> Vec<bifrost_types::PushLaneSpec> {
+        push_stream::push_lanes(self)
+    }
+
+    fn push_stream(
+        &self,
+        lane: bifrost_types::PushLane,
+        stop: bifrost_types::SessionStop,
+        gate: bifrost_types::PushGate,
+    ) -> AccountStream<bifrost_types::PushSessionEvent> {
+        push_stream::push_stream(self.clone(), lane, stop, gate)
     }
 
     fn open_blob(&self, handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {
@@ -1674,45 +1661,31 @@ impl Account for GraphAccount {
             // second `cancel()` here because the walk is infallible and
             // cancels unconditionally as its first step.
             push::retire_all_graph_subscriptions(&account).await;
-            if let Some(worker) = worker_slot::take_worker(&account.ews_worker).await {
-                // Join rather than abort: the worker observes the cancelled
-                // token, then sends an EWS `Unsubscribe` for whatever
-                // streaming subscription it is holding. An abort here would
-                // preempt exactly that, and Exchange caps streaming
-                // subscriptions per mailbox, so each reopen would burn one
-                // until it timed out on its own. The join is bounded because
-                // the release is a network round trip and `close()` must not
-                // be able to hang on an unresponsive server.
-                let mut worker = worker;
-                if tokio::time::timeout(CLOSE_WORKER_JOIN_TIMEOUT, &mut worker)
+            // Claim a release for every live or orphaned EWS subscription,
+            // then join every account-owned push task (those releases and any
+            // Graph recreate install-or-undo) under ONE bound. A handle still
+            // running at the bound is dropped, never aborted: dropping a
+            // `JoinHandle` detaches its task, which then runs to completion,
+            // and those tasks own server-side cleanup that must not be cut
+            // short.
+            ews_stream::retire_ledger(&account);
+            let handles = std::mem::take(&mut *account.push_tasks.lock().expect("push tasks lock"));
+            let deadline = tokio::time::Instant::now() + CLOSE_WORKER_JOIN_TIMEOUT;
+            let mut left_running = 0_usize;
+            for mut handle in handles {
+                if tokio::time::timeout_at(deadline, &mut handle)
                     .await
                     .is_err()
                 {
-                    tracing::warn!(
-                        target: "bifrost_graph::ews",
-                        "EWS worker did not release its subscription within \
-                         the close() budget; aborting"
-                    );
-                    worker.abort();
+                    left_running += 1;
                 }
             }
-            // The renewal worker stops cooperatively: it observes the
-            // cancelled token between renewals and drops an in-flight PATCH,
-            // and it awaits the task that recreates a vanished subscription,
-            // so joining it here also waits for that task's install-or-undo
-            // DELETE. The join is bounded like the EWS one, and aborting on
-            // timeout is safe rather than merely honest: the recreate runs
-            // in its own task, which an abort of the worker does not touch.
-            if let Some(mut worker) = worker_slot::take_worker(&account.graph_worker).await
-                && tokio::time::timeout(CLOSE_WORKER_JOIN_TIMEOUT, &mut worker)
-                    .await
-                    .is_err()
-            {
+            if left_running > 0 {
                 tracing::warn!(
-                    target: "bifrost_graph::webhooks",
-                    "Graph renewal worker did not stop within the close() budget; aborting"
+                    target: "bifrost_graph::push",
+                    left_running,
+                    "push cleanup tasks outlived the close() budget; left running detached"
                 );
-                worker.abort();
             }
             Ok(())
         })

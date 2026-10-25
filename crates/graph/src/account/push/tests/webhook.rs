@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use bifrost_types::{
     AccountErrorKind, AccountId, AccountOperation, CursorScope, FolderId, ObjectType,
-    SubscriptionHandle, WatchEvent,
+    SubscriptionHandle,
 };
 
 use crate::account::push::common::PushEndpoint;
@@ -389,60 +389,6 @@ async fn unsubscribing_an_unknown_handle_is_a_no_op() {
         .expect("unknown handle unsubscribes cleanly");
 }
 
-/// `Reconnected` is the engine's account-wide full-reconcile trigger, so it
-/// is owed only on a real recovery edge. A first subscribe has no gap to
-/// cover - the engine established or resumed those cursors moments earlier -
-/// and publishing one there charged every account one redundant reconcile
-/// over every registered scope at startup.
-#[tokio::test]
-async fn a_first_webhook_subscribe_publishes_no_reconnect() {
-    let client = GraphClient::new("token");
-    client.script_rest([
-        ScriptedRestResponse::json(
-            reqwest::StatusCode::CREATED,
-            serde_json::json!({"id":"first","expirationDateTime":"2099-01-01T00:00:00Z"}),
-        ),
-        ScriptedRestResponse::json(
-            reqwest::StatusCode::CREATED,
-            serde_json::json!({"id":"second","expirationDateTime":"2099-01-01T00:00:00Z"}),
-        ),
-    ]);
-    let mut account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
-    account.push_endpoint = Some(PushEndpoint {
-        webhook_url: "https://example.test/webhook".to_string(),
-        client_state: "secret".to_string(),
-    });
-    let mut events = account.push_tx.subscribe();
-
-    push_subscribe(account.clone(), vec![email_scope("inbox")])
-        .await
-        .expect("the first subscribe succeeds");
-    assert!(
-        events.try_recv().is_err(),
-        "a first subscribe owes no reconcile"
-    );
-
-    // Now push IS down: the renewal worker has latched it. The next
-    // successful subscribe is a genuine recovery edge and still emits, so
-    // nothing that relied on the event for gap coverage loses it.
-    account
-        .push_disconnected
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    push_subscribe(account.clone(), vec![email_scope("archive")])
-        .await
-        .expect("the second subscribe succeeds");
-    assert!(
-        matches!(events.try_recv(), Ok(WatchEvent::Reconnected)),
-        "a subscribe on a degraded account is the recovery edge"
-    );
-    assert!(
-        !account
-            .push_disconnected
-            .load(std::sync::atomic::Ordering::SeqCst),
-        "the latch is cleared by the edge it fires on"
-    );
-}
-
 // ---- cancellation safety of the webhook `push_subscribe` ----------------
 //
 // The scripted-wire helpers (`webhook_account`, `created`, `deleted`,
@@ -799,7 +745,7 @@ async fn an_orphan_never_deletes_what_this_instance_owns() {
     );
 }
 
-/// The renewal worker replaced a vanished subscription under a handle, the
+/// The renewal session replaced a vanished subscription under a handle, the
 /// old instance's teardown never landed, and the engine retries the handle on
 /// a reopened instance of the same factory. The handle string names only the
 /// subscribe-time id; the replacement is reached through the factory-shared
@@ -890,7 +836,7 @@ async fn a_recreated_id_flagged_by_a_terminal_renewal_failure_is_still_torn_down
         ]),
     );
     record_recreated_id(&mut recreated_ids(&account), &handle, "gone", "recreated");
-    // The renewal worker's terminal-failure path.
+    // The renewal session's terminal-failure path.
     mark_subscription_terminated(&account, &handle, "recreated").await;
     assert_eq!(
         recreated_ids(&account).get(&handle),

@@ -1,188 +1,194 @@
-//! Push reconciler + `InvalidationSink` implementation.
+//! Push: the bounded invalidation ingress, the `InvalidationSink`
+//! implementation, the reconciler and the engine-owned push lanes.
 //!
-//! Two push paths converge on one per-account `mpsc::Sender<WatchEvent>`:
-//! - In-process: the multiplexer forwards `Account::push_stream` items.
+//! Two push paths converge on one per-account [`PushIngress`]:
+//! - In-process: the lane supervisor (`lanes`) drives every
+//!   `Account::push_stream` session and hands its `Invalidated` items to
+//!   the ingress.
 //! - Out-of-process: the consumer holds an `Arc<dyn InvalidationSink>`
 //!   (from `SyncEngine::invalidation_sink`) and calls `push` from its
-//!   Pub/Sub or webhook receiver.
+//!   Pub/Sub or webhook receiver; invalidations enter the ingress and
+//!   control events are acted on synchronously (`route_watch_event`).
 //!
-//! The reconciler reads the merged stream and runs `changes_stream`
-//! for each affected scope via `drive_to_completion`. Output flows to
-//! the same broadcast as the multiplexer's, so consumers do not see
-//! "push-derived" vs "poll-derived" changes - just one unified
-//! `Change` stream.
-
+//! The reconciler drains the ingress into its work set and drives the
+//! affected scopes. Output flows to the same broadcast as the
+//! multiplexer's, so consumers see one unified `Change` stream.
+pub mod health;
+pub mod ingress;
+pub(crate) mod lanes;
 pub mod reconciler;
 pub mod subscription;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-
+use crate::cancel::{BoundaryRequest, BoundaryView};
+use crate::multiplexer::{ChangeDelivery, MultiplexerEvent, ReopenRequest};
+use crate::recovery::{RecoveryPlan, ThrottleBucket, directive_target_scope, plan_recovery};
 use bifrost_types::{
-    AccountId, HintPayload, InvalidationHint, InvalidationSink, PushSource, WatchEvent,
+    AccountId, CursorScope, InvalidationSink, SinkPush, SyncEvent, Warning, WarningKind, WatchEvent,
 };
 use dashmap::DashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
+pub use ingress::{PendingPush, PushIngress};
 pub use reconciler::{Reconciler, scopes_for_hint};
 pub(crate) use subscription::RegisteredSubscription;
 pub use subscription::SubscriptionRegistry;
 
+/// What the sink needs of one attached account to act on a consumer push.
+#[derive(Debug, Clone)]
+pub struct SinkTarget {
+    pub ingress: Arc<PushIngress>,
+    pub delivery: Arc<ChangeDelivery>,
+    pub reopen_tx: mpsc::Sender<ReopenRequest>,
+    pub throttles: Arc<std::sync::Mutex<ThrottleBucket>>,
+    /// The account's boundary, read synchronously (`peek`) before an engine
+    /// directive is queued.
+    pub boundary: BoundaryView,
+}
+
 /// Engine-side `InvalidationSink` implementation.
 ///
-/// `senders` is the registry of per-account mpsc senders. `attach`
-/// inserts; `detach` removes. The drop counter is exposed as
+/// `targets` is the registry of attached accounts: `attach` inserts,
+/// `detach` removes. The coarsening counter is exposed as
 /// `bifrost_sync_push_dropped_total`.
 #[derive(Debug)]
 pub struct InvalidationSinkInner {
-    senders: DashMap<AccountId, SinkSender>,
-    drop_counter: Arc<AtomicU64>,
-}
-
-#[derive(Debug, Clone)]
-enum SinkSender {
-    Queued(mpsc::UnboundedSender<WatchEvent>),
-    Direct(mpsc::Sender<WatchEvent>),
+    targets: DashMap<AccountId, SinkTarget>,
+    coarsened: Arc<AtomicU64>,
 }
 
 impl InvalidationSinkInner {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            senders: DashMap::new(),
-            drop_counter: Arc::new(AtomicU64::new(0)),
+            targets: DashMap::new(),
+            coarsened: Arc::new(AtomicU64::new(0)),
         }
     }
-
-    pub fn register(&self, account: AccountId, sender: mpsc::Sender<WatchEvent>) {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            // A single per-registration forwarder is the ordering point for
-            // every out-of-process event. In particular, once one event has
-            // to wait for bounded queue space, a later push cannot bypass it
-            // through a successful `try_send`.
-            // A sticky full-reconcile bit can replace invalidation payloads,
-            // but cannot encode arbitrary Warning or Terminated payloads or
-            // preserve their order. This synchronous, non-blocking sink has
-            // no backpressure result: making ingress bounded requires an
-            // explicit control-event overflow policy or a different API.
-            // Retain the queue until that policy is chosen; a bit alone would
-            // silently discard control information this path promises to keep.
-            let (ingress_tx, ingress_rx) = mpsc::unbounded_channel();
-            let drops = Arc::clone(&self.drop_counter);
-            handle.spawn(forward_events(ingress_rx, sender, drops, None));
-            self.senders.insert(account, SinkSender::Queued(ingress_tx));
-            return;
-        }
-        // `register` is engine machinery and normally runs on the engine's
-        // Tokio runtime. Keep the off-runtime fallback explicit for callers
-        // that construct the sink directly: it cannot wait for capacity.
-        self.senders.insert(account, SinkSender::Direct(sender));
+    /// Route consumer pushes for `account` to `target`, replacing any
+    /// earlier registration.
+    pub fn register(&self, account: AccountId, target: SinkTarget) {
+        self.targets.insert(account, target);
     }
-
+    /// Stop routing pushes for `account` and close its ingress, so the
+    /// reconciler finishes its sweep and returns.
     pub fn unregister(&self, account: &AccountId) {
-        self.senders.remove(account);
+        if let Some((_, target)) = self.targets.remove(account) {
+            target.ingress.close();
+        }
     }
-
+    /// Number of distinct-hint coarsenings into a full reconcile. No
+    /// reconciliation obligation is lost by a coarsening.
     #[must_use]
     pub fn dropped(&self) -> u64 {
-        self.drop_counter.load(Ordering::Relaxed)
+        self.coarsened.load(Ordering::Relaxed)
+    }
+    /// An ingress counting its coarsenings on this sink's counter.
+    #[must_use]
+    pub fn new_ingress(&self, capacity: usize) -> Arc<PushIngress> {
+        Arc::new(PushIngress::with_counter(
+            capacity,
+            Arc::clone(&self.coarsened),
+        ))
     }
 }
-
-async fn forward_events(
-    mut ingress: mpsc::UnboundedReceiver<WatchEvent>,
-    sender: mpsc::Sender<WatchEvent>,
-    drops: Arc<AtomicU64>,
-    waiting: Option<mpsc::UnboundedSender<()>>,
-) {
-    while let Some(event) = ingress.recv().await {
-        match sender.try_send(event) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Closed(_)) => break,
-            Err(mpsc::error::TrySendError::Full(rejected)) => {
-                let lossless = requires_lossless_delivery(&rejected);
-                let delivery = if lossless {
-                    rejected
-                } else {
-                    // Count payload coarsening immediately, even if the
-                    // replacement is delivered. A later timeout can also
-                    // lose delivery; the metric cannot distinguish the two.
-                    drops.fetch_add(1, Ordering::Relaxed);
-                    coalesced_event(rejected)
-                };
-                if let Some(waiting) = &waiting {
-                    let _ = waiting.send(());
-                }
-                if lossless {
-                    if sender.send(delivery).await.is_err() {
-                        break;
-                    }
-                } else {
-                    // This timeout can lose the reconcile request itself,
-                    // not merely its specific payload. Removing it alone
-                    // would let one stalled reconciler retain an unlimited
-                    // ingress backlog. A durable pending bit needs a wakeup
-                    // owned by the reconciler as well as a control-event
-                    // overflow policy; it is not a replacement for this whole
-                    // mixed event queue.
-                    let deadline = tokio::time::Duration::from_millis(100);
-                    let _ = tokio::time::timeout(deadline, sender.send(delivery)).await;
-                }
-            }
-        }
-    }
-}
-
 impl Default for InvalidationSinkInner {
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl InvalidationSink for InvalidationSinkInner {
-    fn push(&self, account: AccountId, event: WatchEvent) {
-        let Some(tx) = self.senders.get(&account) else {
-            return;
+    fn push(&self, account: AccountId, event: WatchEvent) -> SinkPush {
+        let Some(target) = self.targets.get(&account) else {
+            return SinkPush::NotAttached;
         };
-        let SinkSender::Direct(tx) = tx.value() else {
-            if let SinkSender::Queued(tx) = tx.value() {
-                let _ = tx.send(event);
-            }
-            return;
-        };
-        match tx.try_send(event) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(rejected)) => {
-                let _ = rejected;
-                self.drop_counter.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                // Account detached during in-flight push.
-            }
-        }
+        route_watch_event(target.value(), &account, event)
     }
 }
 
-#[must_use]
-pub(crate) fn requires_lossless_delivery(event: &WatchEvent) -> bool {
-    matches!(event, WatchEvent::Terminated(_) | WatchEvent::Warning(_))
+pub(crate) fn broadcast(target: &SinkTarget, event: SyncEvent<bifrost_types::Change>) {
+    let _ = target.delivery.sender().send(MultiplexerEvent {
+        scope: CursorScope::Account,
+        event: Arc::new(event),
+        checkpoint: None,
+        publication: None,
+    });
 }
 
-pub(crate) fn coalesced_event(event: WatchEvent) -> WatchEvent {
-    let source = match event {
-        WatchEvent::Invalidated { hint } => hint.source,
-        WatchEvent::Disconnected | WatchEvent::Reconnected => PushSource::Coalesced,
-        _ => PushSource::Coalesced,
-    };
-    WatchEvent::Invalidated {
-        hint: InvalidationHint {
-            source,
-            payload: HintPayload::Unknown,
+/// The single synchronous handler for a consumer-injected event. Nothing
+/// control-shaped is stored: invalidations enter the bounded ingress,
+/// warnings and terminal failures are broadcast at once, throttles are
+/// recorded at once, and an engine directive is either queued on the reopen
+/// channel or handed back as `Refused` (boundary not `Run`, or queue full).
+/// Control events therefore overtake invalidations still pending in the
+/// ingress, which nothing downstream depends on.
+pub(crate) fn route_watch_event(
+    target: &SinkTarget,
+    account: &AccountId,
+    event: WatchEvent,
+) -> SinkPush {
+    match event {
+        WatchEvent::Invalidated { hint } => target.ingress.invalidate(&hint.payload),
+        WatchEvent::Reconnected => target.ingress.request_full(),
+        WatchEvent::Disconnected => broadcast(
+            target,
+            SyncEvent::Warning(Warning::user_safe(
+                WarningKind::Other,
+                "push transport disconnected",
+            )),
+        ),
+        WatchEvent::Warning(warning) => broadcast(target, SyncEvent::Warning(warning)),
+        WatchEvent::Terminated(error) => match plan_recovery(error.clone()) {
+            RecoveryPlan::Engine(directive) => {
+                if target.boundary.peek() != BoundaryRequest::Run {
+                    return SinkPush::Refused(WatchEvent::Terminated(error));
+                }
+                return match target.reopen_tx.try_send(ReopenRequest::Recovery {
+                    scope: directive_target_scope(&directive),
+                    error,
+                }) {
+                    Ok(()) => SinkPush::Accepted,
+                    Err(mpsc::error::TrySendError::Full(ReopenRequest::Recovery {
+                        error, ..
+                    })) => SinkPush::Refused(WatchEvent::Terminated(error)),
+                    Err(_) => SinkPush::NotAttached,
+                };
+            }
+            RecoveryPlan::Retry(advice) => {
+                crate::recovery::record_throttle(&target.throttles, account, &advice, &error);
+                broadcast(
+                    target,
+                    SyncEvent::Warning(Warning::user_safe(
+                        WarningKind::Other,
+                        "push stream terminated with retryable recovery",
+                    )),
+                );
+            }
+            RecoveryPlan::Reconcile(advice) => {
+                crate::recovery::record_reconcile_throttle(
+                    &target.throttles,
+                    account,
+                    &advice,
+                    &error,
+                );
+                broadcast(
+                    target,
+                    SyncEvent::Warning(Warning::user_safe(
+                        WarningKind::Other,
+                        "push stream terminated with retryable recovery",
+                    )),
+                );
+            }
+            RecoveryPlan::Terminal(fatal) => {
+                broadcast(target, SyncEvent::Terminated(fatal.into_inner()));
+            }
         },
+        _ => target.ingress.request_full(),
     }
+    SinkPush::Accepted
 }
 
-/// Convenience: wrap in an `Arc`.
 #[must_use]
 pub fn shared_sink() -> Arc<InvalidationSinkInner> {
     Arc::new(InvalidationSinkInner::new())
@@ -191,188 +197,198 @@ pub fn shared_sink() -> Arc<InvalidationSinkInner> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bifrost_types::{AccountOperation, CursorScope, Warning, WarningKind};
-
-    fn invalidated() -> WatchEvent {
-        WatchEvent::Invalidated {
-            hint: InvalidationHint {
-                source: PushSource::ImapNotify,
-                payload: HintPayload::Unknown,
-            },
-        }
-    }
-
-    #[tokio::test]
-    async fn full_sink_preserves_warning_from_a_non_runtime_thread() {
-        let sink = Arc::new(InvalidationSinkInner::new());
-        let account = AccountId("warning".into());
-        let (tx, mut rx) = mpsc::channel(1);
-        sink.register(account.clone(), tx.clone());
-        tx.try_send(invalidated()).expect("fill queue");
-
-        let outside = Arc::clone(&sink);
-        std::thread::spawn(move || {
-            outside.push(
-                account,
-                WatchEvent::Warning(Warning::user_safe(WarningKind::Other, "preserve me")),
-            );
-        })
-        .join()
-        .expect("push thread");
-
-        assert!(matches!(
-            rx.recv().await,
-            Some(WatchEvent::Invalidated { .. })
-        ));
-        let delivered = rx.recv().await;
-        assert!(matches!(delivered, Some(WatchEvent::Warning(_))));
-        assert_eq!(sink.dropped(), 0, "a delivered warning was not dropped");
-    }
-
-    #[tokio::test]
-    async fn full_sink_preserves_terminated_classification() {
-        let sink = Arc::new(InvalidationSinkInner::new());
-        let account = AccountId("terminated".into());
-        let (tx, mut rx) = mpsc::channel(1);
-        sink.register(account.clone(), tx.clone());
-        tx.try_send(invalidated()).expect("fill queue");
-        let error = crate::recovery::restart_scope_error(
-            CursorScope::Account,
-            AccountOperation::SyncChanges,
-        );
-
-        sink.push(account, WatchEvent::Terminated(error));
-
-        assert!(matches!(
-            rx.recv().await,
-            Some(WatchEvent::Invalidated { .. })
-        ));
-        let delivered = rx.recv().await;
-        assert!(matches!(delivered, Some(WatchEvent::Terminated(_))));
-        assert_eq!(sink.dropped(), 0, "a delivered termination was not dropped");
-    }
-
-    #[tokio::test]
-    async fn full_sink_counts_a_coalesced_invalidation_as_dropped() {
-        let sink = Arc::new(InvalidationSinkInner::new());
-        let account = AccountId("coalesced".into());
-        let (tx, mut rx) = mpsc::channel(1);
-        sink.register(account.clone(), tx.clone());
-        tx.try_send(invalidated()).expect("fill queue");
-
-        sink.push(account, invalidated());
-
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
-            while sink.dropped() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("forwarder observes the full queue");
-
-        assert!(matches!(
-            rx.recv().await,
-            Some(WatchEvent::Invalidated { .. })
-        ));
-        assert!(matches!(
-            rx.recv().await,
-            Some(WatchEvent::Invalidated { .. })
-        ));
-        assert_eq!(sink.dropped(), 1, "the replaced invalidation was dropped");
-    }
-
-    #[tokio::test]
-    async fn queued_forwarder_cannot_deliver_a_later_event_first() {
-        let (bounded_tx, mut bounded_rx) = mpsc::channel(1);
-        bounded_tx
-            .try_send(invalidated())
-            .expect("fill bounded queue");
-        let (ingress_tx, ingress_rx) = mpsc::unbounded_channel();
-        let (waiting_tx, mut waiting_rx) = mpsc::unbounded_channel();
-        let drops = Arc::new(AtomicU64::new(0));
-        let worker = tokio::spawn(forward_events(
-            ingress_rx,
-            bounded_tx,
-            drops,
-            Some(waiting_tx),
-        ));
-        let first = WatchEvent::Warning(Warning::user_safe(WarningKind::Other, "first"));
-        let second = WatchEvent::Warning(Warning::user_safe(WarningKind::Other, "second"));
-        ingress_tx.send(first).expect("queue first");
-        waiting_rx.recv().await.expect("first is waiting for space");
-        ingress_tx.send(second).expect("queue second behind first");
-
-        assert!(matches!(
-            bounded_rx.recv().await,
-            Some(WatchEvent::Invalidated { .. })
-        ));
-        let WatchEvent::Warning(first) = bounded_rx.recv().await.expect("first warning") else {
-            panic!("first queued event was bypassed");
+    use crate::cancel::Boundary;
+    use bifrost_types::{
+        AccountError, AccountErrorBuilder, AccountErrorKind, Cause, StateCause, SyncStateErrorKind,
+    };
+    fn setup() -> (
+        InvalidationSinkInner,
+        AccountId,
+        SinkTarget,
+        Boundary,
+        mpsc::Receiver<ReopenRequest>,
+        tokio::sync::broadcast::Receiver<MultiplexerEvent>,
+    ) {
+        let sink = InvalidationSinkInner::new();
+        let account = AccountId("sink".into());
+        let (boundary, view) = Boundary::new();
+        let (reopen_tx, reopen_rx) = mpsc::channel(1);
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let target = SinkTarget {
+            ingress: sink.new_ingress(1),
+            delivery: Arc::new(ChangeDelivery::new(tx)),
+            reopen_tx,
+            throttles: Arc::new(std::sync::Mutex::new(ThrottleBucket::new())),
+            boundary: view,
         };
-        let WatchEvent::Warning(second) = bounded_rx.recv().await.expect("second warning") else {
-            panic!("second queued event missing");
-        };
-        assert_eq!(first.message.as_str(), "first");
-        assert_eq!(second.message.as_str(), "second");
-        drop(ingress_tx);
-        worker.await.expect("forwarder exits");
+        sink.register(account.clone(), target.clone());
+        (sink, account, target, boundary, reopen_rx, rx)
     }
-
-    /// With no captured runtime handle nothing can wait for queue space, so
-    /// even a lossless event hitting a full queue is discarded - and a
-    /// discard the metric does not count is control information lost with no
-    /// trace. This test runs entirely off-runtime so `register` never
-    /// captures a handle.
-    #[test]
-    fn no_runtime_discard_of_a_lossless_event_is_counted() {
-        let sink = Arc::new(InvalidationSinkInner::new());
-        let account = AccountId("no-runtime".into());
-        let (tx, mut rx) = mpsc::channel(1);
-        sink.register(account.clone(), tx.clone());
-        tx.try_send(invalidated()).expect("fill queue");
-
-        sink.push(
-            account,
-            WatchEvent::Warning(Warning::user_safe(WarningKind::Other, "discarded")),
-        );
-
-        assert_eq!(sink.dropped(), 1, "the discarded warning must be counted");
-        assert!(matches!(rx.try_recv(), Ok(WatchEvent::Invalidated { .. })));
-        assert!(
-            rx.try_recv().is_err(),
-            "nothing could redeliver the warning"
-        );
+    fn restart() -> AccountError {
+        AccountErrorBuilder::new(
+            AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
+            Cause::State(StateCause::CapabilityChanged { delta: None }),
+        )
+        .try_build()
+        .expect("restart")
     }
-
     #[test]
-    fn full_reconcile_cannot_represent_control_events() {
-        let warning = WatchEvent::Warning(Warning::user_safe(WarningKind::Other, "diagnostic"));
-        let terminated = WatchEvent::Terminated(crate::recovery::restart_scope_error(
-            CursorScope::Account,
-            AccountOperation::SyncChanges,
+    fn sink_reconnected_requests_a_full_reconcile() {
+        let (sink, account, target, _, _, _) = setup();
+        assert!(matches!(
+            sink.push(account, WatchEvent::Reconnected),
+            SinkPush::Accepted
         ));
-        for control in [warning, terminated] {
-            assert!(requires_lossless_delivery(&control));
-            // The only state a full-reconcile bit can regenerate has lost
-            // both the diagnostic and the recovery classification.
+        assert!(target.ingress.take().full);
+    }
+    #[test]
+    fn sink_push_for_an_unknown_account_is_not_attached() {
+        assert!(matches!(
+            InvalidationSinkInner::new().push(AccountId("unknown".into()), WatchEvent::Reconnected),
+            SinkPush::NotAttached
+        ));
+    }
+    #[test]
+    fn sink_engine_directive_is_refused_with_its_event_when_the_reopen_queue_is_full() {
+        let (sink, account, _, _boundary, mut reopen, _) = setup();
+        assert!(matches!(
+            sink.push(account.clone(), WatchEvent::Terminated(restart())),
+            SinkPush::Accepted
+        ));
+        let error = restart();
+        let SinkPush::Refused(WatchEvent::Terminated(returned)) =
+            sink.push(account, WatchEvent::Terminated(error.clone()))
+        else {
+            panic!("must return original event");
+        };
+        assert_eq!(returned.message_key(), error.message_key());
+        assert!(reopen.try_recv().is_ok());
+        assert!(reopen.try_recv().is_err());
+    }
+    #[test]
+    fn sink_engine_directive_is_refused_while_the_boundary_is_not_run() {
+        let (sink, account, _, boundary, mut reopen, _) = setup();
+        for request in [BoundaryRequest::Pause, BoundaryRequest::CheckpointNow] {
+            boundary.set(request);
             assert!(matches!(
-                coalesced_event(control),
-                WatchEvent::Invalidated { .. }
+                sink.push(account.clone(), WatchEvent::Terminated(restart())),
+                SinkPush::Refused(WatchEvent::Terminated(_))
+            ));
+            assert!(reopen.try_recv().is_err());
+        }
+        boundary.set(BoundaryRequest::Run);
+        assert!(matches!(
+            sink.push(account, WatchEvent::Terminated(restart())),
+            SinkPush::Accepted
+        ));
+        assert!(reopen.try_recv().is_ok());
+    }
+    /// A terminal failure is acted on inside `push` itself: the broadcast
+    /// carries `SyncEvent::Terminated` with the pushed error before `push`
+    /// returns, and nothing is stored for later - no ingress obligation, no
+    /// reopen request.
+    #[test]
+    fn sink_terminal_is_broadcast_as_terminated_at_push_time() {
+        let (sink, account, target, _, mut reopen, mut rx) = setup();
+        let error = crate::test_common::unsupported(bifrost_types::AccountOperation::PushStream);
+        assert!(error.recovery().is_terminal());
+        assert!(matches!(
+            sink.push(account, WatchEvent::Terminated(error.clone())),
+            SinkPush::Accepted
+        ));
+        let event = rx.try_recv().expect("broadcast before push returned");
+        let SyncEvent::Terminated(broadcast) = event.event.as_ref() else {
+            panic!("expected Terminated, got {:?}", event.event);
+        };
+        assert_eq!(broadcast.message_key(), error.message_key());
+        assert!(broadcast.recovery().is_terminal());
+        assert!(rx.try_recv().is_err(), "exactly one broadcast");
+        let pending = target.ingress.take();
+        assert!(!pending.full && pending.scopes.is_empty() && pending.memberships.is_empty());
+        assert!(reopen.try_recv().is_err());
+    }
+    #[test]
+    fn sink_terminal_is_broadcast_account_scoped() {
+        let (sink, account, _, _, _, mut rx) = setup();
+        let error = crate::test_common::unsupported(bifrost_types::AccountOperation::PushStream)
+            .into_builder()
+            .scope(bifrost_types::ErrorScope::Cursor(CursorScope::Folder(
+                bifrost_types::FolderId("folder".into()),
+            )))
+            .try_build()
+            .expect("scoped error");
+        assert!(matches!(
+            sink.push(account, WatchEvent::Terminated(error)),
+            SinkPush::Accepted
+        ));
+        let event = rx.try_recv().expect("immediate broadcast");
+        assert_eq!(event.scope, CursorScope::Account);
+        assert!(matches!(event.event.as_ref(), SyncEvent::Terminated(_)));
+    }
+    #[test]
+    fn sink_warning_and_disconnect_are_broadcast_without_queueing() {
+        let (sink, account, _, _, _, mut rx) = setup();
+        assert!(matches!(
+            sink.push(
+                account.clone(),
+                WatchEvent::Warning(Warning::user_safe(WarningKind::Other, "advice"))
+            ),
+            SinkPush::Accepted
+        ));
+        assert!(matches!(
+            sink.push(account, WatchEvent::Disconnected),
+            SinkPush::Accepted
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                rx.try_recv().expect("immediate broadcast").event.as_ref(),
+                SyncEvent::Warning(_)
             ));
         }
     }
-
     #[test]
-    fn only_control_information_requires_lossless_delivery() {
-        let warning = WatchEvent::Warning(Warning::user_safe(WarningKind::Other, "warning"));
-        let terminated = WatchEvent::Terminated(crate::recovery::restart_scope_error(
-            CursorScope::Account,
-            AccountOperation::SyncChanges,
+    fn sink_never_blocks_on_a_full_queue_from_a_non_runtime_thread() {
+        let (sink, account, _, _boundary, _reopen, _) = setup();
+        std::thread::spawn(move || {
+            assert!(matches!(
+                sink.push(account.clone(), WatchEvent::Terminated(restart())),
+                SinkPush::Accepted
+            ));
+            assert!(matches!(
+                sink.push(account, WatchEvent::Terminated(restart())),
+                SinkPush::Refused(_)
+            ));
+        })
+        .join()
+        .expect("non-runtime receiver returns");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn sink_retry_termination_records_its_throttle_at_push_time() {
+        use bifrost_types::{RetryHint, ServerCause, ServerErrorKind, ThrottleScope};
+        let (sink, account, target, _, _, mut rx) = setup();
+        let error = AccountErrorBuilder::new(
+            AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            Cause::Server(ServerCause::RateLimited {
+                retry_hint: Some(RetryHint::After(std::time::Duration::from_secs(20))),
+            }),
+        )
+        .throttle_scope(ThrottleScope::Account)
+        .try_build()
+        .expect("throttle");
+        assert!(matches!(
+            sink.push(account.clone(), WatchEvent::Terminated(error)),
+            SinkPush::Accepted
         ));
-        assert!(requires_lossless_delivery(&warning));
-        assert!(requires_lossless_delivery(&terminated));
-        assert!(!requires_lossless_delivery(&invalidated()));
-        assert!(!requires_lossless_delivery(&WatchEvent::Disconnected));
-        assert!(!requires_lossless_delivery(&WatchEvent::Reconnected));
+        assert_eq!(
+            crate::recovery::account_throttle_wait(&target.throttles, &account),
+            Some(std::time::Duration::from_secs(20))
+        );
+        assert!(matches!(
+            rx.try_recv().expect("warning").event.as_ref(),
+            SyncEvent::Warning(_)
+        ));
     }
 }
+
+#[cfg(test)]
+mod lane_tests;

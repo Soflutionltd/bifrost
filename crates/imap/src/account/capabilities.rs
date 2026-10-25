@@ -87,8 +87,8 @@ pub(crate) fn build_capabilities(
         blob_digest_pre_download: false,
         // Push capacity is carved out of `pool_cap` and is zero at a
         // single-session cap. Advertising push the account will refuse for
-        // every scope would keep bifrost-sync's push forwarder open with
-        // every subscribe refused.
+        // every scope would tell bifrost-sync to try push subscribes that
+        // are all refused (and the account declares no lanes anyway).
         push: if profile.supports(Capability::Idle) && push_capacity > 0 {
             PushCapability::InProcess
         } else {

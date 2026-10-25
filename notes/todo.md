@@ -135,11 +135,6 @@ PUBLISHED SURFACE fence apply.
   abandoned one first: a nested checkout waits forever at pool_cap = 1 or
   when data capacity is exhausted. Its permit returns only at driver exit.
 
-## IMAP unbounded LOGOUT outside pool drain
-
-- The push cancellation path awaits unbounded LOGOUT. The pool drain
-  provides an external timeout; until driver exit the push slot remains held.
-
 ## IMAP peer certificate lookup outside authentication deadline
 
 - `resolve_scram_binding` awaits `peer_certificate_der` before SCRAM-PLUS.
@@ -320,3 +315,34 @@ first-response omission classification, independently of wire replay policy.
 - Graph cancel_upload_session records a 404 or 410 as a Failed compensation,
   though both mean the upload session is already gone. Google treats 404, 410
   and 499 on its cancel as Succeeded. Decide whether Graph should match.
+
+## Push and lifecycle pause policy
+
+- Lifecycle streams continue polling while the account boundary is paused.
+  The multiplexer owns their pacing but does not consult the boundary before
+  opening or polling them. Decide whether pause should park lifecycle work.
+- Push sessions retain the previous pause behavior: only directive submission
+  is boundary-gated. Registration maintenance may need to keep server watches
+  alive, while Connection lanes retain live transports. Decide their pause
+  semantics together with lifecycle polling.
+
+## Scope disable and push subscriptions
+
+- DisableScope quarantines a cursor but does not narrow desired push
+  subscriptions. An IMAP folder excluded after SELECT refusal remains in the
+  subscription registry until consumer unsubscribe or account replacement.
+  Decide whether engine scope quarantine should also change desired coverage.
+
+## Generation stamps on non-push recovery producers
+
+- Poll tasks, the reconciler, lifecycle reader and deferred inventory still
+  enqueue unstamped ReopenRequest::Recovery. A request queued before reattach
+  can act on the replacement. Push session requests carry a generation checked
+  under the reopen lock; extending that fence to other producers is separate.
+
+## Push terminal event semantics
+
+- A terminal push unit failure broadcasts account-scoped SyncEvent::Terminated
+  while polling continues. Its error carries the failing unit's attribution.
+  Decide whether this needs a distinct structured notification; changing it to
+  a folder-scoped termination could incorrectly imply that folder polling died.

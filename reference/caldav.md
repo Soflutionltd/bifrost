@@ -1028,7 +1028,7 @@ and the next successful filtered REPORT reports them `Destroyed`. That flap is
 the accepted price of a degrade that must not drop real events; it does not
 occur where the content type labels the task.
 
-All mail, contact, filter, blob, push, and settings methods return
+All mail, contact, filter, blob, push subscription CRUD, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CalDav`.
 `set_priority` and `set_bandwidth_cap` forward to `client.net()`, the crate's
 `AccountNet` handle, so DAV traffic is scheduled and metered like every other
@@ -1405,3 +1405,8 @@ Local refusal helpers use `AccountError::unsupported` through the shared error
 funnel, retaining their provider, scope and diagnostic decoration.
 `Account::protocol` returns `Protocol::CalDav`, including for inherited
 default-method refusals.
+
+## Push sessions
+
+`push_lanes` is empty. Every lane passed to `push_stream` fails with
+`Internal(AccountContract)` because CalDAV exposes no push lane.

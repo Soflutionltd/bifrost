@@ -27,7 +27,7 @@ use bifrost_types::{
     PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
     ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
     ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
-    VacationConfig, WatchEvent,
+    VacationConfig,
 };
 use bytes::Bytes;
 use futures::stream;
@@ -199,8 +199,19 @@ impl Account for SettingsAccount {
         })
     }
 
-    fn push_stream(&self) -> AccountStream<WatchEvent> {
-        Box::pin(stream::empty())
+    fn push_stream(
+        &self,
+        lane: bifrost_types::PushLane,
+        _stop: bifrost_types::SessionStop,
+        _gate: bifrost_types::PushGate,
+    ) -> AccountStream<bifrost_types::PushSessionEvent> {
+        Box::pin(futures::stream::iter([
+            bifrost_types::PushSessionEvent::Failed(bifrost_types::push_lane_contract_error(
+                self.protocol(),
+                lane,
+                "not a lane of this account",
+            )),
+        ]))
     }
 
     fn open_blob(&self, _handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {

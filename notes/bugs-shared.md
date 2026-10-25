@@ -18,8 +18,7 @@ crate hand-rolls, bypasses or reimplements something `bifrost-net`,
 `bifrost-types` or `bifrost-sync` owns, and the copy disagrees with the shared
 one or escapes its guarantee. Adoption findings confined to one provider were
 filed in that provider's document. What remains here spans crates or roots in a
-shared crate. Entries needing a specification or set aside as low value are in
-`notes/bugs-deferred.md`.
+shared crate.
 
 ## SHARED-019 - A proxy 407 maps to `AuthLost`, implying the wrong remedy
 

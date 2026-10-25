@@ -89,72 +89,7 @@ pub(super) fn no_subscribable_push_scopes(failed: &[bifrost_types::BatchFailure]
         .expect("valid decorated push failure classification")
 }
 
-/// Raise the account's push-down latch, emitting `Disconnected` on the edge.
-///
-/// The latch moves whether or not the send lands. `push_tx` is a broadcast
-/// sender, so a send with no subscriber is discarded, and a consumer that
-/// attaches mid-outage will later be handed a `Reconnected` whose matching
-/// `Disconnected` it never saw. That asymmetry is deliberate, because the
-/// surviving half is the conservative one: `Reconnected` costs the engine a
-/// whole-account `Coalesced` reconcile, while the lost `Disconnected` is an
-/// advisory warning carrying no coverage obligation (the sync reconciler
-/// answers it with a `Warning` and nothing else, and holds no connectivity
-/// state that the missing half could make WRONG).
-///
-/// Gating the latch on a successful send inverts that trade. The outage
-/// would go unrecorded, so the recovery would raise no edge, and a consumer
-/// present for the recovery would lose the reconcile that covers the gap -
-/// a missed reconcile in place of a superfluous one. The latch records the
-/// outage the account had, not the outage somebody was listening for.
-///
-/// If the lost warning ever matters, the sound repair is prime-on-subscribe:
-/// have `push_stream` yield `Disconnected` as its first item while the latch
-/// is up. That adds no reconciles, only the advisory warning. Not built,
-/// because nothing needs it yet.
-pub(super) fn mark_push_disconnected(account: &crate::account::GraphAccount) {
-    if !account
-        .push_disconnected
-        .swap(true, std::sync::atomic::Ordering::SeqCst)
-    {
-        let _ = account
-            .push_tx
-            .send(bifrost_types::WatchEvent::Disconnected);
-    }
-}
-
-/// Clear the account's push-down latch, emitting `Reconnected` on the edge.
-///
-/// Edge-triggered on purpose: `Reconnected` costs the engine a full reconcile
-/// of every registered cursor scope, so it is owed only where coverage was
-/// actually lost and regained. A subscribe on a healthy account is not that
-/// edge. Returns whether the event was published.
-pub(super) fn mark_push_reconnected(account: &crate::account::GraphAccount) -> bool {
-    if account
-        .push_disconnected
-        .swap(false, std::sync::atomic::Ordering::SeqCst)
-    {
-        let _ = account.push_tx.send(bifrost_types::WatchEvent::Reconnected);
-        return true;
-    }
-    false
-}
-
-/// Publish `Reconnected` unconditionally and clear the latch.
-///
-/// For the one caller that KNOWS a coverage gap happened without the latch
-/// ever going up: the renewal worker's recreate of a subscription Graph had
-/// already dropped. The resource had no live subscription between its
-/// disappearance and the create, and Graph replays nothing for that window,
-/// so the reconcile is owed even though no renewal tick reported a failure.
-pub(super) fn announce_push_recovered(account: &crate::account::GraphAccount) {
-    account
-        .push_disconnected
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    let _ = account.push_tx.send(bifrost_types::WatchEvent::Reconnected);
-}
-
-/// `push_subscribe` on (or racing) a closed account. A runtime failure, never
-/// retried; shared by both arms.
+/// A closed account refuses subscription registration in either push mode.
 pub(super) fn account_closed_error() -> AccountError {
     into_account_error(
         crate::error::GraphError::RuntimeFailure {
@@ -189,9 +124,10 @@ const GRAPH_HANDLE_PREFIX: &str = "graph2:";
 /// account identity is attached. Decoded so a handle persisted in that shape
 /// can still tear down its orphan; it carries no binding to check.
 const UNBOUND_GRAPH_HANDLE_PREFIX: &str = "graph1:";
-/// Prefix of an EWS handle: `ews1:<token>`. An EWS streaming subscription is
-/// bound to the worker's connection and dies with it, so the handle needs no
-/// server state; the prefix only lets any instance recognise it as such.
+/// Prefix of an EWS handle: `ews1:<token>`. An EWS streaming subscription
+/// belongs to a push session and the account's release ledger, not to the
+/// handle, so the handle needs no server state; the prefix only lets any
+/// instance recognise it as such.
 const EWS_HANDLE_PREFIX: &str = "ews1:";
 
 /// What a handle asks an instance to tear down.

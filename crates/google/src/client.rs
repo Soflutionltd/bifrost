@@ -143,6 +143,16 @@ impl GmailClient {
         client
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_clock(
+        &self,
+        clock: Arc<dyn Fn() -> std::time::SystemTime + Send + Sync>,
+    ) -> Self {
+        let mut client = self.clone();
+        client.wall_clock = clock;
+        client
+    }
+
     pub(crate) fn with_quota_project(&self, id: String) -> Self {
         let mut client = self.clone();
         client.quota_project = Some(bifrost_types::ThrottleBudget::new(format!(

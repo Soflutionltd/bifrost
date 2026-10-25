@@ -64,6 +64,7 @@ pub(super) async fn run_orphan_teardown_retrier(ctx: SlotContext, interval: Dura
         }
         let account = ctx.current.load_full();
         for handle in ctx.subscriptions.orphans(&ctx.account_id) {
+            let _topology = super::TopologyBump(&ctx.push_topology);
             let result = tokio::select! {
                 biased;
                 () = ctx.shutdown.cancelled() => return,

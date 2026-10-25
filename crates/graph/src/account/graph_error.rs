@@ -403,8 +403,8 @@ fn soap_fault_to_account_error(
     // The third element flags a throttle path (rate-limit / quota): the
     // engine needs a `throttle_scope` so it buckets the EWS backoff (at the
     // account, see `throttle_scope_for`). Without it `ErrorServerBusy` ->
-    // `RateLimited` carries no scope and the EWS worker hot-loops on
-    // `SameRequest`, unlike the REST 429 path.
+    // `RateLimited` carries no scope, so no engine hold paces the EWS lane's
+    // next session the way the REST 429 path is paced.
     let (kind, cause, throttle) = match code {
         SoapFaultCode::Server => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
@@ -2841,7 +2841,7 @@ mod tests {
 
     // End-to-end through the wire parse: `ErrorServerBusy` in a 200-OK
     // body must reach `Server(RateLimited)` with an `Account` throttle
-    // scope so the EWS worker backs off instead of hot-looping.
+    // scope so the engine holds the EWS lane's next session.
     #[test]
     fn wire_error_server_busy_is_rate_limited_with_account_throttle() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>

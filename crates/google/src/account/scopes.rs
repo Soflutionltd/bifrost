@@ -168,7 +168,10 @@ pub(crate) fn scope_lifecycle_stream(
     client: Arc<GmailClient>,
     shutdown: CancellationToken,
 ) -> AccountStream<ScopeLifecycleEvent> {
-    scope_lifecycle_stream_with_baseline(client, shutdown, Default::default())
+    Box::pin(
+        scope_lifecycle_stream_with_baseline(client, shutdown, Default::default())
+            .filter(|event| futures::future::ready(!matches!(event, ScopeLifecycleEvent::Polled))),
+    )
 }
 
 pub(crate) fn scope_lifecycle_stream_with_baseline(
@@ -184,71 +187,71 @@ pub(crate) fn scope_lifecycle_stream_with_baseline(
         next_delay: None,
     };
     Box::pin(stream::unfold(state, |mut state| async move {
-        loop {
-            // Do not drain a queued diff after account closure.
-            if state.ended || state.shutdown.is_cancelled() {
-                return None;
-            }
-            let event = state
+        // Do not drain a queued diff after account closure.
+        if state.ended || state.shutdown.is_cancelled() {
+            return None;
+        }
+        let event = state
+            .baseline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .pop_front();
+        if let Some(event) = event {
+            return Some((ScopeLifecycleEvent::Lifecycle(event), state));
+        }
+        if !state.await_next_poll().await {
+            return None;
+        }
+
+        let poll = Arc::clone(
+            &state
                 .baseline
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pending
-                .pop_front();
-            if let Some(event) = event {
-                return Some((ScopeLifecycleEvent::Lifecycle(event), state));
-            }
-            if !state.await_next_poll().await {
-                return None;
-            }
-
-            let poll = Arc::clone(
-                &state
+                .poll,
+        );
+        let _poll = tokio::select! {
+            biased;
+            () = state.shutdown.cancelled() => return None,
+            guard = poll.lock() => guard,
+        };
+        // A previous reader may have queued a diff while this one waited.
+        let event = state
+            .baseline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .pop_front();
+        if let Some(event) = event {
+            return Some((ScopeLifecycleEvent::Lifecycle(event), state));
+        }
+        let snapshot = tokio::select! {
+            biased;
+            () = state.shutdown.cancelled() => return None,
+            result = fetch_scope_snapshot(&state.client) => result,
+        };
+        match snapshot {
+            Ok(new) => {
+                state.note_poll_succeeded();
+                let mut baseline = state
                     .baseline
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .poll,
-            );
-            let _poll = tokio::select! {
-                biased;
-                () = state.shutdown.cancelled() => return None,
-                guard = poll.lock() => guard,
-            };
-            // A previous reader may have queued a diff while this one waited.
-            let event = state
-                .baseline
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pending
-                .pop_front();
-            if let Some(event) = event {
-                return Some((ScopeLifecycleEvent::Lifecycle(event), state));
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                baseline.pending =
+                    record_lifecycle_snapshot(&mut baseline.last_emitted, new).into();
+                drop(baseline);
+                Some((ScopeLifecycleEvent::Polled, state))
             }
-            let snapshot = tokio::select! {
-                biased;
-                () = state.shutdown.cancelled() => return None,
-                result = fetch_scope_snapshot(&state.client) => result,
-            };
-            match snapshot {
-                Ok(new) => {
-                    state.note_poll_succeeded();
-                    let mut baseline = state
-                        .baseline
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    baseline.pending =
-                        record_lifecycle_snapshot(&mut baseline.last_emitted, new).into();
-                }
-                Err(error) => {
-                    let acct = super::error::into_account_error(
-                        error,
-                        super::error::GmailErrorContext::containers_list(),
-                    );
-                    // The engine owns retry, throttle holds and reconnect cadence.
-                    // Baseline AND undelivered events survive replacement streams.
-                    state.ended = true;
-                    return Some((ScopeLifecycleEvent::Terminated(acct), state));
-                }
+            Err(error) => {
+                let acct = super::error::into_account_error(
+                    error,
+                    super::error::GmailErrorContext::containers_list(),
+                );
+                // The engine owns retry, throttle holds and reconnect cadence.
+                // Baseline AND undelivered events survive replacement streams.
+                state.ended = true;
+                Some((ScopeLifecycleEvent::Terminated(acct), state))
             }
         }
     }))
@@ -440,6 +443,39 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_label_poll_yields_polled_after_its_commit() {
+        let (client, _) = scripted_client(vec![ok_json(
+            json!({"labels": [{"id":"one", "name":"One"}]}),
+        )]);
+        let baseline = LifecycleBaseline::default();
+        let mut stream = scope_lifecycle_stream_with_baseline(
+            client,
+            CancellationToken::new(),
+            Arc::clone(&baseline),
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(ScopeLifecycleEvent::Polled)
+        ));
+        assert!(baseline.lock().expect("baseline").last_emitted.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_label_poll_yields_no_polled() {
+        let (client, _) = scripted_client(vec![unavailable()]);
+        let mut stream = scope_lifecycle_stream_with_baseline(
+            client,
+            CancellationToken::new(),
+            Default::default(),
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(ScopeLifecycleEvent::Terminated(_))
+        ));
+        assert!(stream.next().await.is_none());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn project_hold_label_lifecycle_makes_no_wire_calls() {
@@ -709,10 +745,15 @@ mod tests {
         ]);
         let baseline = LifecycleBaseline::default();
         let make_stream = || {
-            scope_lifecycle_stream_with_baseline(
-                Arc::clone(&client),
-                CancellationToken::new(),
-                Arc::clone(&baseline),
+            Box::pin(
+                scope_lifecycle_stream_with_baseline(
+                    Arc::clone(&client),
+                    CancellationToken::new(),
+                    Arc::clone(&baseline),
+                )
+                .filter(|event| {
+                    futures::future::ready(!matches!(event, ScopeLifecycleEvent::Polled))
+                }),
             )
         };
         let mut first = make_stream();

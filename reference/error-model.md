@@ -262,6 +262,12 @@ implementation that failed: this library, or the consumer's own `Account`
 implementation; derived for every `Internal(_)` kind, on either of its
 recovery arms).
 
+Lifecycle streams report their first classified failure and end. The engine
+owns reconnect pacing, throttle holds and directive routing; it treats Retry
+and Reconcile as a paced re-run of the lifecycle read. Completed `Polled`
+heartbeats or lifecycle changes reset the consecutive-failure count, while
+account replacement carries it forward.
+
 ### Central derivation
 
 `recovery::derive(kind, scope, operation, chain, throttle_scope,

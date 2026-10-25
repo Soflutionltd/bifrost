@@ -740,7 +740,7 @@ async fn non_notify_push_reports_the_folder_beyond_its_budget_as_poll_only() {
     // the assertion is that a non-NOTIFY account runs its whole push
     // capacity rather than the single worker a NOTIFY account needs.
     assert_eq!(
-        account.push.task_cancel.lock().unwrap().len(),
+        account.push_lanes().len(),
         2,
         "a non-NOTIFY account runs one IDLE worker per push session"
     );
@@ -3289,7 +3289,7 @@ async fn caller_modseq_rejects_stale_flags_while_absent_keeps_cached_guard() {
 
 const SESSION_GREETING: &[u8] = b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR] ready\r\n";
 
-async fn session_account(
+pub(super) async fn session_account(
     cap: usize,
     count: usize,
     notify: bool,
@@ -3355,7 +3355,7 @@ async fn push_is_refused_entirely_when_pool_cap_leaves_no_room() {
         assert_eq!(result.outcomes.failed().len(), 2);
         assert!(result.outcomes.succeeded().is_empty());
         assert!(result.handle.is_none());
-        assert!(account.push.task_cancel.lock().unwrap().is_empty());
+        assert!(account.push_lanes().is_empty());
         assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         drop(peer);
         account.close().await.unwrap();
@@ -3363,9 +3363,9 @@ async fn push_is_refused_entirely_when_pool_cap_leaves_no_room() {
 }
 
 /// NOTIFY folds every folder onto one session, so the smallest cap with
-/// push room admits any number of folders on a single worker.
+/// push room admits any number of folders on a single lane.
 #[tokio::test]
-async fn a_notify_account_admits_every_folder_on_one_worker() {
+async fn a_notify_account_admits_every_folder_on_one_lane() {
     use bifrost_types::Account as _;
     let (account, peer, _) = session_account(2, 0, true).await;
     let scopes: Vec<_> = ["A", "B", "C", "D", "E"]
@@ -3375,7 +3375,7 @@ async fn a_notify_account_admits_every_folder_on_one_worker() {
     let result = account.push_subscribe(&scopes).await.unwrap();
     assert_eq!(result.outcomes.succeeded().len(), 5);
     assert!(result.outcomes.failed().is_empty());
-    assert_eq!(account.push.task_cancel.lock().unwrap().len(), 1);
+    assert_eq!(account.push_lanes().len(), 1);
     drop(peer);
     account.close().await.unwrap();
 }
@@ -3391,6 +3391,7 @@ async fn an_idle_worker_session_counts_against_pool_cap() {
         .push_subscribe(&[push_folder("INBOX")])
         .await
         .unwrap();
+    let driver = drive_push_until_shutdown(&account);
     let mut push_peer = dials.servers.recv().await.unwrap();
     let auth = read_line(&mut push_peer).await;
     session_auth(&mut push_peer, &auth).await;
@@ -3406,6 +3407,7 @@ async fn an_idle_worker_session_counts_against_pool_cap() {
     drop(push_peer);
     drop(peer);
     account.close().await.unwrap();
+    driver.await.unwrap();
 }
 
 /// A generation bump while the worker authenticates must not cancel the
@@ -3423,6 +3425,7 @@ async fn a_subscription_change_mid_dial_keeps_the_pending_session() {
             .unwrap()
             .handle
             .unwrap();
+        let driver = drive_push_until_shutdown(&account);
         let mut push_peer = dials.servers.recv().await.unwrap();
         let auth = read_line(&mut push_peer).await;
         if reassign {
@@ -3440,6 +3443,7 @@ async fn a_subscription_change_mid_dial_keeps_the_pending_session() {
         drop(push_peer);
         drop(peer);
         account.close().await.unwrap();
+        driver.await.unwrap();
     }
 }
 
@@ -3450,7 +3454,11 @@ async fn a_push_session_that_waited_for_capacity_invalidates_the_folder_it_start
     use bifrost_types::Account as _;
     use futures::StreamExt as _;
     let (account, peer, mut dials) = session_account(2, 2, false).await;
-    let mut events = account.push_stream();
+    let mut events = account.push_stream(
+        bifrost_types::PushLane(0),
+        bifrost_types::SessionStop::never(),
+        bifrost_types::PushGate::open(),
+    );
     let _held = account.pool.checkout_any().await.unwrap();
     let script = async {
         let mut peer = dials.servers.recv().await.unwrap();
@@ -3477,14 +3485,11 @@ async fn a_push_session_that_waited_for_capacity_invalidates_the_folder_it_start
         let auth = read_line(&mut push_peer).await;
         session_auth(&mut push_peer, &auth).await;
         session_select(&mut push_peer, "INBOX").await;
-        session_idle(&mut push_peer).await;
         push_peer
     };
     let (event, push_peer) = tokio::join!(events.next(), script);
     assert!(
-        matches!(event, Some(bifrost_types::WatchEvent::Invalidated {
-        hint: bifrost_types::InvalidationHint { payload: bifrost_types::HintPayload::SpecificCursorScope(scope), .. }
-    }) if scope == push_folder("INBOX"))
+        matches!(event, Some(bifrost_types::PushSessionEvent::Invalidated(bifrost_types::InvalidationHint { payload: bifrost_types::HintPayload::SpecificCursorScope(scope), .. })) if scope == push_folder("INBOX"))
     );
     drop(push_peer);
     drop(peer);
@@ -3498,50 +3503,63 @@ async fn a_push_session_dialed_at_once_publishes_no_coverage_invalidation() {
     use bifrost_types::Account as _;
     use futures::StreamExt as _;
     let (account, peer, mut dials) = session_account(2, 1, false).await;
-    let mut events = account.push_stream();
+    let mut events = account.push_stream(
+        bifrost_types::PushLane(0),
+        bifrost_types::SessionStop::never(),
+        bifrost_types::PushGate::open(),
+    );
     account
         .push_subscribe(&[push_folder("INBOX")])
         .await
         .unwrap();
-    let mut push_peer = dials.servers.recv().await.unwrap();
-    let auth = read_line(&mut push_peer).await;
-    session_auth(&mut push_peer, &auth).await;
-    session_select(&mut push_peer, "INBOX").await;
-    session_idle(&mut push_peer).await;
-    drop(push_peer);
+    let script = async {
+        let mut push_peer = dials.servers.recv().await.unwrap();
+        let auth = read_line(&mut push_peer).await;
+        session_auth(&mut push_peer, &auth).await;
+        session_select(&mut push_peer, "INBOX").await;
+        push_peer
+    };
+    let (event, push_peer) = tokio::join!(events.next(), script);
     assert!(matches!(
-        events.next().await,
-        Some(bifrost_types::WatchEvent::Disconnected)
+        event,
+        Some(bifrost_types::PushSessionEvent::Established)
     ));
+    drop(push_peer);
+    assert!(
+        matches!(events.next().await, Some(bifrost_types::PushSessionEvent::Failed(e)) if e.recovery().is_retryable())
+    );
     drop(peer);
     account.close().await.unwrap();
 }
 
 /// The refusing connector stands in for an unreachable host, so a push
-/// worker whose dial it refuses must take the retryable arm (Disconnected,
-/// backoff, redial) and latch no terminal push error. Every push admission
-/// test built on `scripted_account_parts` relies on this.
+/// session whose dial it refuses must end `Failed` with a retryable class
+/// and never redial on its own: the engine owns the backoff and the next
+/// session. Every push admission test built on `scripted_account_parts`
+/// relies on this.
 #[tokio::test(start_paused = true)]
-async fn a_refused_push_dial_is_retried_not_latched_as_terminal() {
+async fn a_refused_push_dial_fails_the_session_without_redialing() {
     use bifrost_types::Account as _;
     use futures::StreamExt as _;
     let (account, peer, dials) = session_account(2, 0, false).await;
-    let mut events = account.push_stream();
+    let mut events = account.push_stream(
+        bifrost_types::PushLane(0),
+        bifrost_types::SessionStop::never(),
+        bifrost_types::PushGate::open(),
+    );
     account
         .push_subscribe(&[push_folder("INBOX")])
         .await
         .unwrap();
     assert!(matches!(
         events.next().await,
-        Some(bifrost_types::WatchEvent::Disconnected)
+        Some(bifrost_types::PushSessionEvent::Failed(e)) if e.recovery().is_retryable()
     ));
-    assert!(!account.push.has_terminal_error());
     tokio::time::sleep(Duration::from_secs(60)).await;
     assert!(
-        dials.calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-        "the worker redials after its backoff"
+        dials.calls.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        "the session must not redial"
     );
-    assert!(!account.push.has_terminal_error());
     drop(peer);
     account.close().await.unwrap();
 }
@@ -3586,4 +3604,277 @@ async fn flags_only_fetch_without_flags_is_a_missing_field_failure() {
     );
     assert!(matches!(&items[1], ItemOutcome::Succeeded(_)));
     script.await.unwrap();
+}
+
+fn drive_push_until_shutdown(account: &super::ImapAccount) -> tokio::task::JoinHandle<()> {
+    use bifrost_types::Account;
+    use futures::StreamExt;
+    let mut session = account.push_stream(
+        bifrost_types::PushLane(0),
+        bifrost_types::SessionStop::never(),
+        bifrost_types::PushGate::open(),
+    );
+    tokio::spawn(async move { while session.next().await.is_some() {} })
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_nonexistent_selected_folder_is_excluded_and_the_session_reconfigures() {
+    use bifrost_types::{
+        Account, PushGate, PushLane, PushSessionEnd as End, PushSessionEvent as E, SessionStop,
+    };
+    use futures::StreamExt;
+    let (account, peer, mut dials) = session_account(2, 1, false).await;
+    account
+        .push_subscribe(&[push_folder("gone")])
+        .await
+        .unwrap();
+    let mut session = account.push_stream(PushLane(0), SessionStop::never(), PushGate::open());
+    let script = async {
+        let mut server = dials.servers.recv().await.unwrap();
+        let auth = read_line(&mut server).await;
+        session_auth(&mut server, &auth).await;
+        let select = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!("{} NO [NONEXISTENT] gone\r\n", tag_of(&select)),
+        )
+        .await;
+        server
+    };
+    let (event, server) = tokio::join!(session.next(), script);
+    assert!(matches!(event, Some(E::UnitFailed(_))));
+    assert!(matches!(
+        session.next().await,
+        Some(E::Ended(End::Reconfigure))
+    ));
+    drop(session);
+    let mut parked = account.push_stream(PushLane(0), SessionStop::never(), PushGate::open());
+    let mut next = Box::pin(parked.next());
+    assert!(futures::poll!(&mut next).is_pending());
+    assert_eq!(dials.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(next);
+    drop(parked);
+    drop(server);
+    drop(peer);
+    account.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_second_session_on_a_driven_lane_fails_the_lease() {
+    use bifrost_types::{Account, PushGate, PushLane, PushSessionEvent as E, SessionStop};
+    use futures::StreamExt;
+    let (account, peer, _) = session_account(2, 0, false).await;
+    let mut first = account.push_stream(PushLane(0), SessionStop::never(), PushGate::open());
+    let mut next = Box::pin(first.next());
+    assert!(futures::poll!(&mut next).is_pending());
+    let mut second = account.push_stream(PushLane(0), SessionStop::never(), PushGate::open());
+    assert!(
+        matches!(second.next().await, Some(E::Failed(e)) if matches!(e.kind(), bifrost_types::AccountErrorKind::Internal(bifrost_types::InternalErrorKind::AccountContract)))
+    );
+    drop(next);
+    drop(first);
+    let mut third = account.push_stream(PushLane(0), SessionStop::never(), PushGate::open());
+    let mut next = Box::pin(third.next());
+    assert!(futures::poll!(&mut next).is_pending());
+    drop(next);
+    drop(third);
+    drop(peer);
+    account.close().await.unwrap();
+}
+
+async fn completed_push_round_and_stop(healthy: bool) {
+    use bifrost_types::{
+        Account, PushGate, PushLane, PushSessionEnd as End, PushSessionEvent as E, SessionStop,
+    };
+    use futures::StreamExt;
+    let (account, peer, mut dials) = session_account(2, 1, false).await;
+    account
+        .push_subscribe(&[push_folder("INBOX")])
+        .await
+        .unwrap();
+    let (stopper, stop) = SessionStop::pair();
+    let mut stopper = Some(stopper);
+    let mut session = account.push_stream(PushLane(0), stop, PushGate::open());
+    let setup = async {
+        let mut server = dials.servers.recv().await.unwrap();
+        let auth = read_line(&mut server).await;
+        session_auth(&mut server, &auth).await;
+        session_select(&mut server, "INBOX").await;
+        server
+    };
+    let (event, mut server) = tokio::join!(session.next(), setup);
+    assert!(matches!(event, Some(E::Established)));
+    let script = async {
+        let idle = read_line(&mut server).await;
+        assert!(idle.contains("IDLE"));
+        respond(&mut server, "+ idling\r\n").await;
+        if healthy {
+            respond(&mut server, "* 2 EXISTS\r\n").await;
+        } else {
+            stopper.take().unwrap().stop();
+        }
+        let done = read_line(&mut server).await;
+        assert!(done.contains("DONE"), "{done}");
+        respond(
+            &mut server,
+            &format!("{} OK idle complete\r\n", tag_of(&idle)),
+        )
+        .await;
+        if !healthy {
+            let logout = read_line(&mut server).await;
+            assert!(logout.contains("LOGOUT"));
+            respond(
+                &mut server,
+                &format!("* BYE done\r\n{} OK logged out\r\n", tag_of(&logout)),
+            )
+            .await;
+        }
+    };
+    let (event, ()) = tokio::join!(session.next(), script);
+    if healthy {
+        assert!(matches!(event, Some(E::Healthy)));
+    } else {
+        assert!(matches!(event, Some(E::Ended(End::Stopped))));
+    }
+    drop(session);
+    drop(server);
+    drop(peer);
+    account.close().await.unwrap();
+}
+#[tokio::test(start_paused = true)]
+async fn a_completed_idle_round_reports_healthy() {
+    completed_push_round_and_stop(true).await;
+}
+#[tokio::test(start_paused = true)]
+async fn a_stopped_session_logs_out_before_ending() {
+    completed_push_round_and_stop(false).await;
+}
+
+/// A BYE whose code classifies terminal ends the session `Failed` without
+/// excluding the selected folder. The BYE arrives before the `+` grant, so the
+/// driver's grant wait raises it as `Error::Bye` and the session sees it
+/// through `idle()`'s error arm - the only way a BYE reaches the live session.
+/// The defensive `IdleEvent::Bye` arm is pinned by a unit test in `push.rs`.
+#[tokio::test(start_paused = true)]
+async fn a_bye_never_excludes_the_selected_folder() {
+    use bifrost_types::{Account, PushGate, PushLane, PushSessionEvent as E, SessionStop};
+    use futures::StreamExt;
+    let (account, peer, mut dials) = session_account(2, 1, false).await;
+    account
+        .push_subscribe(&[push_folder("INBOX")])
+        .await
+        .unwrap();
+    let mut session = account.push_stream(PushLane(0), SessionStop::never(), PushGate::open());
+    let setup = async {
+        let mut server = dials.servers.recv().await.unwrap();
+        let auth = read_line(&mut server).await;
+        session_auth(&mut server, &auth).await;
+        session_select(&mut server, "INBOX").await;
+        server
+    };
+    let (event, mut server) = tokio::join!(session.next(), setup);
+    assert!(matches!(event, Some(E::Established)));
+    let script = async {
+        let idle = read_line(&mut server).await;
+        assert!(idle.contains("IDLE"));
+        respond(&mut server, "* BYE [NOPERM] denied\r\n").await;
+    };
+    let (event, ()) = tokio::join!(session.next(), script);
+    assert!(matches!(event, Some(E::Failed(e)) if e.recovery().is_terminal()));
+    drop(session);
+    drop(server);
+    // The next dial is refused by the connector. An excluded assignment would
+    // park instead of attempting it, so this also pins the session's wiring.
+    let mut next = account.push_stream(PushLane(0), SessionStop::never(), PushGate::open());
+    let event = tokio::time::timeout(Duration::from_secs(30), next.next())
+        .await
+        .unwrap();
+    assert!(matches!(event, Some(E::Failed(e)) if e.recovery().is_retryable()));
+    drop(next);
+    drop(peer);
+    account.close().await.unwrap();
+}
+
+/// A server BYE and a server-initiated IDLE termination both leave the push
+/// connection unusable, so the live session ends on the round that saw them
+/// instead of reporting the round healthy and re-issuing IDLE on a dead
+/// socket. They end differently: the BYE is classified like any other
+/// connection failure (a plain BYE is `Server(Unavailable)`) and ends
+/// `Failed`, while a tagged completion the client never asked for carries no
+/// error and ends `Lost`. Either way the session releases its push slot.
+///
+/// The driver short-circuits an untagged BYE read during IDLE into
+/// `Error::Bye` before emitting any event, so on the wire the BYE reaches the
+/// session through `idle()`'s error arm, not as `IdleEvent::Bye`. The test
+/// pins the outcome on that live path.
+#[tokio::test(start_paused = true)]
+async fn bye_and_server_termination_close_the_connection() {
+    use bifrost_types::{
+        Account, AccountErrorKind, PushGate, PushLane, PushSessionEnd as End,
+        PushSessionEvent as E, ServerErrorKind, SessionStop,
+    };
+    use futures::StreamExt;
+    for bye in [true, false] {
+        let (account, peer, mut dials) = session_account(2, 1, false).await;
+        account
+            .push_subscribe(&[push_folder("INBOX")])
+            .await
+            .unwrap();
+        let mut session = account.push_stream(PushLane(0), SessionStop::never(), PushGate::open());
+        let setup = async {
+            let mut server = dials.servers.recv().await.unwrap();
+            let auth = read_line(&mut server).await;
+            session_auth(&mut server, &auth).await;
+            session_select(&mut server, "INBOX").await;
+            server
+        };
+        let (event, mut server) = tokio::join!(session.next(), setup);
+        assert!(matches!(event, Some(E::Established)));
+        assert_eq!(account.push.available_push_slots(), 0);
+        let script = async {
+            let idle = read_line(&mut server).await;
+            assert!(idle.contains("IDLE"), "{idle}");
+            respond(&mut server, "+ idling\r\n").await;
+            if bye {
+                respond(&mut server, "* BYE logging out\r\n").await;
+            } else {
+                respond(
+                    &mut server,
+                    &format!("{} OK IDLE ended by server\r\n", tag_of(&idle)),
+                )
+                .await;
+            }
+        };
+        let (event, ()) = tokio::join!(session.next(), script);
+        if bye {
+            assert!(
+                matches!(&event, Some(E::Failed(e)) if matches!(e.kind(), AccountErrorKind::Server(ServerErrorKind::Unavailable))),
+                "a BYE ends the session Failed with its classification, got {event:?}"
+            );
+        } else {
+            assert!(
+                matches!(event, Some(E::Ended(End::Lost))),
+                "a server-terminated IDLE ends the session Lost, got {event:?}"
+            );
+        }
+        assert!(session.next().await.is_none(), "the session has ended");
+        drop(session);
+        // The slot is held until the dropped connection's driver exits, which
+        // may tail a LOGOUT nobody answers; paused time lets that run out.
+        let mut released = false;
+        for _ in 0..600 {
+            if account.push.available_push_slots() == 1 {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert!(
+            released,
+            "the ended session released its push connection (bye = {bye})"
+        );
+        drop(server);
+        drop(peer);
+        account.close().await.unwrap();
+    }
 }

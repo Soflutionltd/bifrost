@@ -34,6 +34,11 @@ pub mod ids;
 pub mod mime;
 pub mod mutation;
 pub mod page;
+pub mod push;
+pub use push::{
+    BackoffPolicy, LaneLease, LaneLeaseGuard, PushGate, PushLane, PushLaneKind, PushLaneSpec,
+    PushSessionEnd, PushSessionEvent, SessionStop, SessionStopper, push_lane_contract_error,
+};
 pub mod repair;
 pub mod search;
 pub mod settings;
@@ -148,7 +153,7 @@ pub use events::{
     InventoryBatch, InventoryCompletion, InventoryEntry, InventoryEvent, InventoryPartition,
     InventoryPartitioning, ObjectChange, ObjectChangeKind, PageBoundary, PageCheckpoint, Partition,
     PartitionEnd, PauseReason, Priority, Progress, PushSource, ScopeChange, ScopeChangeKind,
-    SyncEvent, WatchEvent, lift_complete_walk,
+    SinkPush, SyncEvent, WatchEvent, lift_complete_walk,
 };
 
 // Provider-native repair of coverage debt.

@@ -38,6 +38,7 @@ sha2 = { workspace = true }
 # `SyncEngine::attach`. The test only mints factories and the
 # never-polled future; no network round-trip runs.
 [dev-dependencies]
+async-stream = { workspace = true }
 # `start_paused = true` (virtual-time tests: reopen backoff schedule,
 # bounded lifecycle park) needs `test-util`. Declared here rather than
 # relied on through workspace feature unification, which does not hold

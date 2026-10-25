@@ -125,7 +125,7 @@ fn account_with(submission_available: bool, foreign_submission_id: Option<&str>)
     let shutdown = CancellationToken::new();
     // `push_available: false` leaves the reader task unspawned, so nothing
     // here opens a socket.
-    let ws = WsState::spawn(
+    let ws = WsState::new(
         client.clone(),
         false,
         shutdown.clone(),
@@ -814,4 +814,21 @@ fn the_bare_jmap_snapshot_advertises_both_answers() {
     let caps = account().capabilities().clone();
     assert!(caps.pim_methods.set_keyword, "some flag is true");
     assert!(!caps.pim_methods.send_message, "some flag is false");
+}
+
+#[test]
+fn push_lanes_follow_websocket_capability_and_reconnect_policy() {
+    let mut account = account();
+    assert!(account.push_lanes().is_empty());
+    account.ws.available = true;
+    account.ws.policy.initial = std::time::Duration::from_secs(7);
+    account.ws.policy.max = std::time::Duration::from_secs(70);
+    let lanes = account.push_lanes();
+    assert_eq!(lanes.len(), 1);
+    assert_eq!(lanes[0].kind, bifrost_types::PushLaneKind::Connection);
+    assert_eq!(
+        lanes[0].backoff.initial(),
+        std::time::Duration::from_secs(7)
+    );
+    assert_eq!(lanes[0].backoff.max(), std::time::Duration::from_secs(70));
 }

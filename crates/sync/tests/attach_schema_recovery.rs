@@ -47,7 +47,7 @@ use bifrost_types::{
     Projection, ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause,
     RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
     ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
-    VacationConfig, WatchEvent,
+    VacationConfig,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{BackfillCheckpoint, Checkpoint};
@@ -590,8 +590,19 @@ impl Account for HealAccount {
         })
     }
 
-    fn push_stream(&self) -> AccountStream<WatchEvent> {
-        Box::pin(stream::empty())
+    fn push_stream(
+        &self,
+        lane: bifrost_types::PushLane,
+        _stop: bifrost_types::SessionStop,
+        _gate: bifrost_types::PushGate,
+    ) -> AccountStream<bifrost_types::PushSessionEvent> {
+        Box::pin(futures::stream::iter([
+            bifrost_types::PushSessionEvent::Failed(bifrost_types::push_lane_contract_error(
+                self.protocol(),
+                lane,
+                "not a lane of this account",
+            )),
+        ]))
     }
 
     fn open_blob(&self, _handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {
@@ -1439,7 +1450,7 @@ async fn failed_attach_closes_the_opened_account() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reattach_refreshes_topology_subscriptions_and_lifecycle_handle() {
     let account_id = AccountId("full-reattach".to_owned());
     let old_scope = CursorScope::Account;
@@ -1522,6 +1533,10 @@ async fn reattach_refreshes_topology_subscriptions_and_lifecycle_handle() {
         "successful reopen closes exactly the old handle"
     );
 
+    // This double's lifecycle stream is empty, so its failed-open count
+    // crosses replacement. Allow the earned delay before checking the new
+    // handle; healthy streams are separately pinned to reopen immediately.
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
     for _ in 0..200 {
         if lifecycle_calls
             .lock()

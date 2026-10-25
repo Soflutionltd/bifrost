@@ -7,8 +7,9 @@ Every request declares its `ReplayPolicy`; the table lives at the call sites.
 Unabsorbed DELETEs and calendar updates are Never; read batches are Idempotent.
 Absolute by-id renames, filter updates and deferred-send timestamps deliberately
 use Idempotent despite the enclosing operation table's conservative default.
-EWS reads are Idempotent; streaming reads disable net network retries so the
-stream worker retains reconnect accounting. Subscribe is Never.
+EWS reads are Idempotent; streaming reads disable net network retries so a
+lost stream ends its push session and the engine's lane backoff paces the next
+one. Subscribe is Never.
 A non-replayable request stops at its first ambiguous retryable status, with
 401/429 refusal handling preserved. [503, 200 with subrequest 412] stops at 503
 and reconciles; a first-response 200/412 remains a conflict. Missing conditional
@@ -92,33 +93,27 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
     `unsubscribe_graph`, `close()`'s `retire_all_graph_subscriptions`, and the
     `mark_group_tearing_down` / `remove_subscription_from_groups` pair that
     makes it race-free against renewal.
-  - `push/renewal.rs` - the renewal health worker that re-issues expiring
-    subscriptions, recreates a vanished one (`replace_gone_subscription`, which
-    hands `create_and_install_replacement` to a spawned task, and
-    `install_replacement`), emits Disconnected/Reconnected/Terminated on
-    renewal failure, keeps a terminally failed row for teardown, and retires
-    its own worker slot.
+  - `push/renewal.rs` - due-row maintenance sessions, account-owned recreate
+    install-or-undo tasks, committed gap obligations and terminal row retirement.
   - `push/ews.rs` - the EWS streaming arm: `ews_subscribable_folder_id`, the
     `restId` -> `ewsId` translation (`translation_input_chunks` /
     `reconcile_translated_ews_scopes`), and the `EwsSubscriptionState`
-    registration plus topology bump the worker reads. Like the webhook arm it
+    registration plus topology bump the session reads. Like the webhook arm it
     refuses a closed account (`shutdown` cancelled, which only `close()` does)
     before the translation request, and re-checks under the registration write
-    lock for a `close()` that began mid-translation; no worker is spawned for a
-    dead account.
+    lock for a `close()` that began mid-translation, so a dead account gains no
+    registration no session will ever stream.
   - `push/tests/` - the push suite, split along the same seams: `fixtures.rs`
     (the subscription-row, scope, translation-input and ledger builders more
     than one arm needs), `webhook.rs`, `renewal.rs`, `ews.rs`, and
     `dispatch.rs` for the mode-agnostic contract - the per-scope lane rules and
     the whole-request refusals, which run in both push modes and belong to
     neither arm.
-- `push_stream.rs` - the broadcast-backed `push_stream` adapter, selecting the
-  receiver against the shutdown token and a watch latch for terminal health,
-  plus `publish_terminal` and `ensure_ews_worker`, the spawn-on-demand helper
-  `subscribe_ews` calls.
+- `push_stream.rs` - lane declarations and session dispatch by push mode.
+- `push_tasks.rs` - tracks account-owned effects that survive session drop.
 - `ews_stream.rs` - EWS Streaming Notifications fallback:
   Subscribe / GetStreamingEvents / Unsubscribe XML, scope
-  recovery, the long-lived worker loop - generic over the crate-private
+  recovery, sessions and release ledger - generic over the crate-private
   `EwsExecute` transport seam (`EwsClient` in production, a scripted
   double in tests). One-shot SOAP calls use the buffered `execute` funnel;
   `GetStreamingEvents` uses its separate chunked response seam and frames
@@ -129,14 +124,13 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   otherwise-valid response without reporting a failure. A framed response
   message keeps its typed `EwsError`: a classified response error inside
   the stream (`ErrorAccessDenied` and friends) exits through
-  `WatchEvent::Terminated`, and only a malformed or truncated frame
-  reconnects. At `push_subscribe` (in `push/ews.rs`),
+  `PushSessionEvent::Failed`; malformed or truncated frames end `Lost`. At `push_subscribe` (in `push/ews.rs`),
   Graph REST folder `restId`s are translated once through
   `/me/translateExchangeIds` - deduplicated and chunked to Graph's 1,000-id
   request cap - to `ewsId`s and retained beside their `CursorScope` in
   subscription state: the SOAP Subscribe body uses those EWS ids and
   notification routing maps the returned EWS parent id back to every original
-  scope without a second request. The worker deduplicates equal `ewsId`s for
+  scope without a second request. The session deduplicates equal `ewsId`s for
   the Subscribe body while preserving every DISTINCT matching scope for
   invalidation.
 - `public_folder.rs` - no-delta-token public-folder sync: the
@@ -701,8 +695,8 @@ copy a filled slot, and nothing empties it - so an empty or poisoned slot
 is `GraphError::Internal` /
 `EwsError::Internal` -> `Internal(InvariantViolated)`. It used to be minted as
 `Network(Unsent)`, which the engine retried forever although a retry of the
-same request never attaches anything. The EWS streaming worker reports it as
-`WatchEvent::Terminated` rather than exiting silently; best-effort
+same request never attaches anything. The EWS streaming session reports it as
+`PushSessionEvent::Failed` rather than exiting silently; best-effort
 public-folder discovery reports it as an operator warning, like the rest of
 that leg.
 
@@ -868,15 +862,13 @@ mailboxes always install.
     `Protocol(ContractViolation)` and transport failures, and flattening a
     provider contract violation or a retryable 500 into `Request(Malformed)`
     would derive `ClientBug` for a fault the caller cannot fix.
-- The built `AccountCapabilities`; the push mode plus optional endpoint; a
-  `broadcast::Sender<WatchEvent>` for ordinary health edges and invalidations,
-  plus a `watch::Sender<Option<AccountError>>` that latches terminal health for
-  `push_stream` readers.
+- The built `AccountCapabilities`, push mode and optional endpoint, shared
+  lane lease, effect-task registry, topology watches, gap queue and EWS ledger.
 - An `Arc<RwLock<CursorIndex>>` (scope list) and `Arc<RwLock<FolderTree>>`
   (parent map).
 - `HashMap<SubscriptionHandle, GraphSubscriptionGroup>` (webhook) +
-  `HashMap<SubscriptionHandle, EwsSubscriptionState>` (EWS) + worker join slots
-  and a `CancellationToken`.
+  `HashMap<SubscriptionHandle, EwsSubscriptionState>` (EWS), with a
+  `CancellationToken`.
 - A bounded LRU `etag_index` of mail HTTP entity-tags (powering `If-Match`; mutation
   preflight reads refresh recency, `MESSAGE_SELECT` explicitly requests
   `changeKey`; the shared JSON projection prefers `@odata.etag` and otherwise
@@ -920,9 +912,8 @@ Autodiscover POST are counted too. Each engine stream takes one accumulator and 
 `metered()` is a `self.clone()` with two client fields swapped, so it produces
 a SECOND `GraphAccount` value over the same account. Every field that must be
 one thing per account has to be `Arc`-shared for that to hold - which is why
-the maps, the worker slots, and the `push_disconnected` health latch all are.
-A `watch::Sender` is itself a clone-shared handle, so the terminal push latch
-also stays one value across the metered view.
+the maps, lane lease, EWS ledger, pending gaps and effect-task registry all are.
+Topology watch senders are also clone-shared handles.
 A plain (non-`Arc`) field carrying account state silently FORKS across the
 metered view: the metered half would mutate its own copy, and the two halves
 would then disagree about, say, whether push is currently down - a divergence
@@ -952,42 +943,34 @@ the operation. The long-lived
 streaming counter is complete only when fully drained, and push traffic is not
 an engine batch.
 
-Reopen is engine-delegated: on drop or after `close()`, the engine calls
-`GraphAccountFactory::open` again for a fresh `GraphAccount` (empty caches, a
-fresh push terminal latch, and a fresh shutdown token); the factory holds the
-client, so the new account reads the token source's current value.
-`push_stream` wraps the broadcast receiver and terminal watch receiver in a
-`stream::unfold` selecting against the same token. Terminal health is stored
-before its broadcast send, so a subscriber arriving later reads the latched
-error, and a lagged subscriber reads it instead of losing it to ring overflow.
+Reopen is engine-delegated. A replacement has fresh caches, lane lease,
+EWS ledger, pending gaps and shutdown token. The engine drains the retiring
+session set before starting the replacement's lanes. Health lives in the engine;
+there is no provider terminal latch or event broadcast adapter.
 
-`close()` retires SERVER-side state before it stops any worker, because neither
-kind of subscription dies because this process did. In order:
+`close()` retires SERVER-side state first, because neither kind of
+subscription dies because this process did. In order:
 `retire_all_graph_subscriptions` cancels the shutdown token (its first step,
 before it looks at any group, and `close()`'s only cancel), then walks
 `graph_subscriptions` and runs the teardown per handle (best-effort - a DELETE
 failure is logged, never returned, since `close()` must still complete and the
 engine has no recovery for "the server kept a subscription"); `close()` then
-JOINS the EWS worker under `CLOSE_WORKER_JOIN_TIMEOUT` rather than aborting it,
-so the worker's own `Shutdown` arm gets to send its EWS `Unsubscribe` (aborting
-preempted exactly that, and Exchange caps streaming subscriptions per mailbox,
-so every reopen burned one until it timed out); and finally JOINS the renewal
-worker under the same budget, aborting only on timeout (see "Cancellation
-safety of the renewal recreate"). Without the walk, each reopen stranded one
-live webhook subscription per resource still POSTing to the consumer's
-receiver.
+marks the EWS release ledger retired and claims a release for every `Live` and
+`Orphaned` streaming subscription (Exchange caps streaming subscriptions per
+mailbox, so a reopen that skipped this burned one until it timed out); and
+finally awaits every handle in `push_tasks` (those releases and any webhook
+recreate install-or-undo) under ONE `CLOSE_WORKER_JOIN_TIMEOUT`. A handle still
+running at the bound is dropped, never aborted, so its task runs to completion
+detached; the close logs how many were left. Without the walk, each reopen
+stranded one live webhook subscription per resource still POSTing to the
+consumer's receiver.
 
-`run_worker`'s `Shutdown` and `Terminated` exits both call
-`release_subscription`, like the `Resubscribe` / `Disconnected` exits.
-Leaking on a terminal exit is worse than leaking on a reconnect: nothing in
-that worker's remaining lifetime comes back for it.
-
-A broadcast `Lagged` on that receiver yields a synthesized
-`Invalidated { source: Coalesced, payload: Unknown }`, not a `continue`. The
-dropped events are the only record that those scopes changed and are never
-replayed, so swallowing the overflow converts a recoverable burst into
-indefinite staleness for the affected folders; a coalesced whole-account
-invalidation is exactly what `PushSource::Coalesced` exists for.
+Every EWS session exit - stop, topology change, transport loss, classified
+failure - awaits the release of the subscription it created before yielding its
+terminal item. Leaking on a terminal exit would be worse than leaking on a
+reconnect: no later session of a parked lane comes back for it. A session
+dropped before it could release leaves the entry `Orphaned` for the next
+session's start or `close()`.
 
 ## Capabilities
 
@@ -1001,8 +984,8 @@ invalidation is exactly what `PushSource::Coalesced` exists for.
 - `push` depends on `PushMode`: `GraphSubscriptions` -> `WebhookOrEwsStream`
   (out-of-process: subscription CRUD on the Account, HTTPS receiver wired by the
   consumer into the engine `InvalidationSink`; `push_in_process()` false);
-  `EwsStreaming` -> `InProcess` (the EWS worker forwards `Invalidated` on
-  `push_stream`; `push_in_process()` true).
+  `EwsStreaming` -> `InProcess` (the EWS `Connection` lane's sessions yield
+  `Invalidated` from `push_stream`; `push_in_process()` true).
 - `mutation.concurrency: ExpectedVersion` enables mail flags and contact/event
   update and delete, with mail move/destroy disabled.
   `bulk_set_flags_if_version` sends the target's ETag in the message PATCH's
@@ -1269,7 +1252,7 @@ not a provider contract violation. The push door's ledger
 same reason: every arm files each positional id exactly once from its own
 scope list, and server answers are looked up by key, never iterated into the
 ledger. Each push arm calls `finalize_push_outcomes` itself, before it inserts a
-handle or starts a worker (see the push section), so a `finalize` failure is
+handle or wakes a session (see the push section), so a `finalize` failure is
 raised while nothing is live.
 
 The `hydrated_from_value` projector maps `FlagsOnly`
@@ -1513,8 +1496,8 @@ capability surface.
 
 `push_subscribe(scopes)` rejects an EMPTY scope list as `Request(Malformed)`
 before mode dispatch, so in both modes (a subscription covering nothing
-registered a group teardown could never retire and started a renewal worker
-nothing could stop; the engine already skips empty lists at its own reattach
+registered a group teardown could never retire and kept the renewal lane
+believing it had a registration; the engine already skips empty lists at its own reattach
 boundary). It then groups by Graph
 subscription resource, files any scope with no subscribable resource into the
 failed lane, creates one server
@@ -1522,14 +1505,14 @@ subscription per resource, and best-effort deletes any already-created
 subscriptions if a later create fails or the outcome ledger cannot be closed
 (`roll_back_created`). Closing the ledger (`finalize_push_outcomes`) is the
 webhook arm's own step, taken after the last create and BEFORE the group is
-registered or the renewal worker started. It used to run in the dispatcher
+registered or visible to a renewal session. It used to run in the dispatcher
 after the arm returned, so a `finalize` failure returned `Err` - no handle -
-over subscriptions the worker kept renewing and no caller could name to
+over subscriptions the renewer kept renewing and no caller could name to
 unsubscribe. Now that failure path has registered nothing and only rolls back
 the server-side creates; a DELETE that fails there is logged and left to
 Graph's own expiry, since no group holds the row. The EWS arm closes its ledger
-the same way before it installs scopes, bumps the topology or spawns the
-worker; it creates nothing server-side beforehand, so there is nothing to undo.
+the same way before it installs scopes or bumps the topology; it creates
+nothing server-side beforehand, so there is nothing to undo.
 The arm answers with `(Option<handle>, outcomes)` and the dispatcher only turns
 a handle-less answer into the whole-request `Err`. The handle's random token is
 minted BEFORE the first create: `new_handle_token` is fallible (a failed host
@@ -1538,28 +1521,25 @@ there has written nothing. Minted afterwards, the same failure would return an
 error over live server-side subscriptions with no handle any teardown could
 name them by, orphaning them until they expire. The handle itself is assembled
 after the creates because it embeds their ids (next paragraph). It stores `(server_id, expires_at)` in a
-`GraphSubscriptionGroup`, and emits `Reconnected`. `push_unsubscribe`
+`GraphSubscriptionGroup`, and bumps the registration topology. `push_unsubscribe`
 deletes each server subscription BEFORE dropping its local state, so a failed
 DELETE leaves that subscription and every not-yet-attempted sibling reachable
 under the handle for a later retry. Keeping the group registered across those
 awaits means "registered" no longer implies "live", so
 `mark_group_tearing_down` sets a `tearing_down` marker on the group in the
-same write-lock acquisition that snapshots its server ids: the renewal worker
+same write-lock acquisition that snapshots its server ids: a renewal pass
 skips condemned groups in `due_renewals` and `install_replacement` refuses
 them, because a replacement created after the snapshot is one teardown can
 never name - it would stay registered and delivering while
 `push_unsubscribe` reported success. The marker is monotone (a later
 `push_subscribe` mints a new handle) and a plain flag rather than a lock, so
-neither path holds anything across a round trip. Teardown lets the renewal
-worker exit once no live groups remain; condemned groups retained for a DELETE
-retry do not keep it ticking. A worker that decides to exit clears its own
-`graph_worker` slot BEFORE releasing the subscriptions guard that made the
-decision, and `push_unsubscribe` holds that same guard across its abort: a
-concurrent `push_subscribe` cannot install its live group until the slot is
-empty, so its `ensure_graph_worker` always spawns a replacement. Without that
-ordering a new subscription could observe a still-unfinished `JoinHandle`,
-decline to spawn, and never be renewed. Lock order is subscriptions-then-worker
-on every path.
+neither path holds anything across a round trip. Once no live group remains
+the renewal session parks on `graph_topology` instead of running passes;
+condemned groups retained for a DELETE retry do not keep it ticking. Both
+`create_and_register` and `unsubscribe_graph` bump `graph_topology` after
+their committed write, and the session marks the topology seen BEFORE it reads
+the groups, so a registration landing between that read and the wait still
+wakes it. No provider task needs spawning or aborting on either path.
 
 Handles are self-describing so a teardown retried on a newer account instance
 still works. The engine keeps a handle whose teardown failed and retries
@@ -1575,13 +1555,13 @@ always matches. The unbound `graph1:<hex token>:<id>,...` shape, minted before
 the binding (or when no `AccountNet` is attached), still decodes and tears
 down, carrying no binding to check. An EWS handle is `ews1:<hex token>` and
 carries nothing: the
-streaming subscription is the worker's connection and dies with it, so an
-unknown EWS handle is correctly a no-op. `push_unsubscribe` routes by the
+streaming subscription belongs to a push session and the account's release
+ledger, not to the handle, so an unknown EWS handle is correctly a no-op. `push_unsubscribe` routes by the
 decoded handle, not the instance's push mode (a reopen may switch modes), and
 falls back to the mode for a handle of neither shape. For a handle this
 instance knows, `unsubscribe_graph` keeps the registered-group path above. For
 one it does not, `unsubscribe_orphan` DELETEs the ids decoded from that handle
-plus the ids the renewal worker recreated under it on an earlier instance (404/410
+plus the ids a renewal pass recreated under it on an earlier instance (404/410
 count as gone), attempts every id even after a failure, and returns the first
 failure so the engine keeps the orphan. The recreated ids live in
 `RecreatedSubscriptionIds`, a ledger keyed by handle that `GraphAccountFactory`
@@ -1593,9 +1573,9 @@ other exits are not teardown: a later recreate swaps the id for its own, and a
 fully successful orphan teardown clears the handle's entry.
 
 A terminal renewal failure (auth lost, permission revoked and the like) does
-not remove the row: it sets `GraphSubscriptionState::terminated`. The renewal
-worker skips a flagged row (`due_renewals`) and a group holding only flagged
-rows does not keep the worker alive (`has_live_graph_subscription_group`), but
+not remove the row: it sets `GraphSubscriptionState::terminated`. A renewal
+pass skips a flagged row (`due_renewals`) and a group holding only flagged
+rows leaves the renewal session parked (`has_live_graph_subscription_group`), but
 `push_unsubscribe` and `close()` still DELETE it. Removing the row instead
 took a group's last subscription out of `close()`'s reach - only an explicit
 teardown of the handle could still find it - and Graph kept delivering until
@@ -1614,7 +1594,7 @@ account it is handed to.
 
 The webhook receiver is not in this crate: consumers mount an HTTPS
 endpoint at `PushEndpoint::webhook_url` and feed invalidations into the
-engine `InvalidationSink`; `push_stream` carries health only.
+engine `InvalidationSink`; `push_stream` maintains registrations and reports session progress and failures.
 
 `resource_for_scope` builds one resource per scope, and for calendars that
 means `{prefix}/calendars/{native}/events` - the same calendar id
@@ -1642,71 +1622,29 @@ constructor and no locally generated fallback: a `clientState` this crate mints
 and discards is a secret nobody holds, which left the receiver with nothing to
 check while the field made the subscription look validated.
 
-#### Renewal worker
+#### Renewal sessions
 
-The worker wakes every 10 min, renews everything inside the 30 min
-threshold, and emits `Disconnected` / `Reconnected` / `Terminated`
-accordingly. `GraphSubscriptionState` retains the `CursorScope`s its resource
-covers, and `due_renewals` carries them through, so a terminal failure's
-`Terminated` names what lost coverage: `ErrorScope::Cursor(scope)` when the
-resource covers exactly one scope, which is every ordinary case now that each
-resource string is built from one folder or calendar id. `subscribe_graph` used
-to discard the scopes it grouped, leaving the engine with a terminal push
-failure it could not attribute to anything.
+Webhook mode exposes one Registration lane when an endpoint is configured.
+Subscribe creates and registers rows and bumps `graph_topology`; it spawns no
+worker. Sessions claim the lane lease, mark topology seen before reading the
+groups, and park while no live group exists. They scan due rows immediately,
+then every ten minutes after fully successful passes. Rows inside thirty
+minutes of expiry are renewed once each, after `PushGate::clear`.
 
-Create and renewal requests default to 10,080 minutes and clamp explicit
-requests at that value. These are basic Outlook message, event and contact
-subscriptions without resource data, matching the seven-day maximum in the
-[Microsoft subscription resource documentation](https://learn.microsoft.com/en-us/graph/api/resources/subscription?view=graph-rest-1.0).
+Every failure is reported as `UnitFailed`, with precise scope attribution
+when the row covers one scope. Terminal rows remain registered for teardown
+but are never renewed again. Any non-terminal failure or still-retired row
+ends the pass `Incomplete`; only a fully healthy pass yields `Healthy`.
+The engine owns recovery, ten-minute failure pacing and retained lane health.
+A registration established at session start never clears a prior Down state.
 
-The health latch those events are edge-triggered off is the ACCOUNT's
-(`GraphAccount::push_disconnected`), not the worker's local flag, and
-`push/common.rs` owns the three transitions: `mark_push_disconnected` /
-`mark_push_reconnected` publish on the edge, `announce_push_recovered`
-publishes unconditionally for the one caller that knows a gap happened
-without the latch ever rising (the recreate of a subscription Graph had
-already dropped). `subscribe_graph` reads the same latch, so a successful
-subscribe emits `Reconnected` only while push is degraded. It used to emit on
-every subscribe including the first one an account ever makes, and
-`Reconnected` is the engine push reconciler's full-reconcile trigger (a
-`Coalesced` / `HintPayload::Unknown` invalidation over every registered
-scope), so each account paid one redundant account-wide reconcile at startup.
-Nothing depended on the spurious event: `SyncEngine::subscribe_push` only
-records the handle and its covered scopes, and reattach re-establishes its
-cursors itself - and an event published during a reattach's `push_subscribe`
-races the stream forwarder's swap onto the new account anyway, so it was never
-reliable gap coverage. Same shape as the EWS worker's `owes_reconnect` state
-and as the google crate's fix (google-B8).
-
-Terminal health uses a separate `watch::Sender<Option<AccountError>>`.
-`publish_terminal` stores the error before broadcasting it, and
-`push_stream` yields that error once and ends. This state is sticky only for
-the opened account; reopening starts with an empty terminal latch.
-
-Three further rules make the renewal path safe:
-
-- A renewal that 404/410s (`subscription_is_gone`) is not retryable - Graph
-  retains no deleted subscription to PATCH - so the worker creates a
-  replacement for the same resource. The stale state stays installed until
-  the replacement is in hand: dropping it first meant a failed create left
-  the resource with no row at all, so no later tick could see it as due and
-  coverage was lost until reopen or an explicit resubscribe. A failed
-  create classifies **the create error**, not the already-known 404, so its
-  recovery class decides whether another tick is worth it.
-- `install_replacement` is a plain `get_mut`, never
-  `entry().or_insert_with()`, and it also refuses a group marked
-  `tearing_down`. The due list is a snapshot, so a concurrent
-  `push_unsubscribe` can retire the handle - or condemn it and start
-  deleting from its own snapshot - while the create is in flight;
-  re-registering (or quietly joining) the group there would tell the caller
-  teardown succeeded while notifications kept arriving. In both cases the
-  worker deletes the subscription it just minted instead (best effort - the
-  caller's `push_unsubscribe` may already have returned).
-- A successful replacement emits `Reconnected`. The resource had NO live
-  subscription between its disappearance and the create, and Graph does not
-  replay notifications for that window; `Reconnected` is the only event the
-  reconciler turns into a full reconcile across every registered scope, so
-  without it the missed changes wait for the ordinary poll interval.
+Gone rows (404/410) are recreated in account-owned tasks. A successful install
+records every affected scope in `pending_gaps` under the registration lock.
+Sessions pop and yield one invalidation at a time, before scans and after each
+pass, so dropped sessions cannot lose sibling gap obligations. Install uses
+`get_mut`, refuses missing or tearing-down groups, and undoes an unaccepted
+create. Scope attribution and classification use the failure that actually
+blocked renewal or recreation. Default and maximum expiry are seven days.
 
 #### Cancellation safety of the webhook `push_subscribe`
 
@@ -1743,99 +1681,42 @@ notification URL, which can also delete another process's identical
 subscription. A process exit or runtime shutdown kills the task like any other.
 The same holds for the renewal recreate below.
 
-#### Cancellation safety of the renewal recreate
+#### Cancellation safety of renewal effects
 
-The renewal worker used to run `replace_gone_subscription` inline, and `close()`
-aborted the worker (as does `unsubscribe_graph` when the last group goes). An
-abort landing after the create returned and before the new id was recorded, or
-mid-way through the undo DELETE, stranded a live server subscription that no
-group knew. Now:
-
-- `replace_gone_subscription` spawns `create_and_install_replacement` on the
-  runtime and only awaits it. The create, the install and the undo belong to a
-  task the worker's abort, cancel or drop cannot reach. There is no ack
-  hand-off, unlike `push_subscribe`: the install is its own effect and no
-  caller holds anything that could be lost. A lost result costs only the
-  `Reconnected` the worker would have announced, and the worker is only ever
-  cancelled when the account is closing or the handle is being retired. A task
-  panic reaches the worker as `GraphError::RuntimeFailure`.
-- The install re-checks the shutdown token under the write lock it installs
-  under, and `retire_all_graph_subscriptions` cancels before it walks, so a
-  create racing `close()` is either installed before the cancel (the walk
-  snapshots it) or refused and deleted; never neither. The group's
-  `tearing_down` marker refuses the same install once the walk reaches that
-  handle; the token check keeps the rule local rather than resting on the
-  walk's ordering. A create that starts on an already closed account is
-  skipped (`Replacement::AccountClosed`).
-- A handle retired before the create returns (group gone) is the same undo:
-  the fresh subscription is DELETEd, and a failed DELETE is logged only. There
-  is no group left to hold the id for a retry, so it lives until Graph's
-  own expiry.
-- The worker is cooperative: each renewal PATCH is raced against the token
-  (`biased`, so a cancelled token sends nothing), and a PATCH in flight is
-  dropped, which is harmless because a renewal creates nothing. `close()` now
-  JOINS the worker under `CLOSE_WORKER_JOIN_TIMEOUT` and aborts only on
-  timeout. The join is what makes `close()` wait for an in-flight undo DELETE;
-  the abort on timeout is safe because that DELETE lives in the spawned task.
-  `unsubscribe_graph` still aborts the worker when the last group is removed,
-  which is likewise safe now.
+Recreate install-or-undo runs in an account-owned task tracked in `push_tasks`.
+The installation checks shutdown under the group write lock; close cancels
+before walking those rows. A refused install deletes the fresh subscription.
+A dropped session cannot cancel the task or erase its committed gap. Close
+awaits tracked tasks under one bounded join, dropping remaining handles
+without aborting the effects if the bound expires.
 
 ### EWS streaming mode (`PushMode::EwsStreaming`)
 
-`push_subscribe` installs an `EwsSubscriptionState` and starts the EWS
-worker. The arm itself creates nothing server-side (the worker owns the EWS
-Subscribe, is never aborted except by `close()` after its bounded join, and
-never races its Subscribe against cancellation, so a Subscribe whose id it read
-is always released). What a dropped caller could strand is the LOCAL
-registration: inserted, then parked on the worker-slot lock, handle never
-delivered, streamed until `close()`. A `RegistrationGuard` is armed in the same
-synchronous step as the insert (no await between them) and, if dropped armed,
-spawns `unsubscribe_ews`; `subscribe_ews` disarms it just before returning the
-handle. The worker: it subscribes to the union of active folders, long-polls
-`GetStreamingEvents`, maps notifications to cursor scopes, and emits
-`Invalidated`. Failures use `ews_error_to_account_error`
-(terminal terminates; transient emits `Disconnected`, then both Subscribe
-failures and broken long-polls share capped exponential reconnect backoff with
-jitter).
-The REST-id translation response is reconciled per requested scope. A stale or
-refused folder enters the failed lane with its scope and Graph code while valid
-siblings are retained in the EWS subscription. An all-refused request has no
-handle, so bifrost-sync cannot record rejected scopes as push-covered.
-Scope registrations ride a `watch`-channel generation counter
-(`ews_topology`): the worker marks the generation seen immediately before
-every read of the subscription map, so a change can never fall between a
-read and a wait - a stored-permit `Notify` here turned the registration
-that starts the worker into a phantom topology change and a guaranteed
-redundant second subscription. A bump while the stream is live cancels the
-in-flight `GetStreamingEvents`: the worker
-retires the abandoned subscription with a best-effort EWS `Unsubscribe`
-(Exchange holds streaming subscriptions against a per-mailbox quota, so
-leaking one per scope change accrues until each times out), subscribes to
-the current union, and then emits `Reconnected` - never `Disconnected`,
-since nothing failed - because a change raised in the handoff window was
-delivered to neither subscription and `Reconnected` is the engine's
-full-reconcile trigger. Streaming subscriptions carry no resume state:
-`StreamingSubscriptionRequest` admits only `FolderIds` and `EventTypes`,
-so the Subscribe body is watermark-free (a `<t:Watermark>` there is a
-schema violation that broke every resubscribe once a watermark had been
-recorded), and gap coverage is always the `Reconnected` reconcile. The
-subscribe / long-poll / unsubscribe cycle is pinned hermetically through
-`EwsExecute` with a scripted transport. The worker is spawned only after a
-handle has installed a scope. If a topology change leaves the union empty, it
-retires the abandoned server-side subscription and exits rather than parking
-for the account lifetime; a later subscribe observes the emptied slot and
-starts a fresh worker.
+EWS mode exposes one Connection lane with 5s to 320s engine backoff and
+quarter jitter. Subscribe translates REST IDs, commits scopes and bumps
+`ews_topology` with no await after the commit. It creates no EWS subscription
+and starts no worker. A session claims the lane lease and parks without scopes.
+It subscribes to the deduplicated folder union, yields `Established`, and
+long-polls GetStreamingEvents. Completed polls yield `Healthy`; notifications
+map to the registered cursor scopes. Errors end `Failed` with their original
+classification, parse/truncation losses end `Lost`, topology ends `Reconfigure`,
+and stop ends `Stopped`. Every terminal item follows release of the known ID.
+The engine handles handoff reconciliation at the next establishment.
+Connection sessions do not consult the maintenance gate after setup.
 
-Both push modes share one worker-slot discipline (`worker_slot.rs`): a
-registration writes its state under the registration lock, drops that lock,
-and only then calls `ensure_worker`; a worker that decides to exit calls
-`retire_worker_slot` while it STILL holds the registration guard that made
-the decision. Lock order is registration-then-worker in both modes and
-`ensure_worker` takes only the worker lock, so the pair cannot deadlock.
-Without the guard-held retirement, a concurrent subscribe saw a
-still-unfinished `JoinHandle`, declined to spawn, and was left with no
-worker once the old one returned - push silently dead. That bug appeared
-independently in each mode before the lifecycle was unified.
+Each known subscription ID lives in `EwsLedger` with the transport that created
+it. Release atomically claims Live or Orphaned into Releasing with one shared
+completion. Concurrent close/session release waits on that same completion;
+success removes the ID, failure retains an orphan unless the ledger is retired.
+Dropping a live session leaves its ID orphaned for the next session or close.
+Subscribe is not raced against stop, so a response received after stop/close is
+recorded and released. A response that never arrives can leave an unknowable
+server ID, which lapses server-side. Streaming Subscribe carries no watermark.
+
+Close retires webhook rows, marks the EWS ledger retired, claims all known
+releases and joins account-owned effects under one timeout. Timed-out task
+handles are detached rather than aborted. No worker slot, broadcast channel,
+terminal latch or provider reconnect loop remains.
 
 `push_subscribe` refuses any `Folder` (public-folder) scope as
 `Unsupported(PushSubscribe)` in both modes, per scope rather than per request:
@@ -1849,12 +1730,8 @@ addressable only with its mailbox's routing headers while Subscribe sends
 namespace. Both are refused locally rather than turned into a remote failure
 that reads as a provider fault. The predicate returns the scope's native
 `restId` instead of a bool, so the check and the extraction are one step and
-no later phase can re-derive the id differently. `push_stream` reads ordinary
-events from a `broadcast::Receiver<WatchEvent>` and terminal health from its
-watch latch, and selects against shutdown;
-the EWS worker is (re-)spawned by `subscribe_ews`, whose
-`ensure_ews_worker` helper starts a fresh worker whenever the slot is
-empty or its task has finished.
+no later phase can re-derive the id differently. Session notifications route
+through the retained translated registrations.
 
 #### REST-to-EWS id translation
 
@@ -2339,7 +2216,7 @@ The same transport fact governs control flow, not just classification:
 subresponse, EWS HTTP failure, OneDrive chunk PUT) and the response evidence
 a `bifrost_net::Error` preserved. Matching only `GraphError::Response` made it
 permanently false on the live path, so `delete_subscription` failed on an
-already-vanished row and the renewal worker never took its recreate branch.
+already-vanished row and the renewer never took its recreate branch.
 
 `GraphErrorContext
 { protocol, operation, scope, idempotency_override }` threads the operation so
@@ -2693,9 +2570,10 @@ exhausted" without them.
 
 ### Push failure routing
 
-The EWS streaming worker retries locally only for `RecoveryClass::Retry`, at Subscribe, HTTP stream, and classified frame failures. Every other classification is forwarded as `WatchEvent::Terminated` so the sync reconciler can act on engine directives and reconciliation.
-
-One exception, at Subscribe only: a retry-candidate status (5xx or a policy-listed status) that net declined to replay because Subscribe is declared `ReplayPolicy::Never`. It classifies as `Reconcile`, but backing off and resubscribing is its reconciliation (a subscription the failed call may have minted is never polled and lapses server-side), so it takes the `Disconnected` and backoff path (`subscribe_status_stopped_by_replay_policy`). A transport drop past `Unsent` on Subscribe still terminates.
+Sessions report every classified failure to the engine. Reconcile re-runs the
+session after engine pacing: unknown Subscribe IDs lapse, known IDs are
+released through the ledger, and webhook effects are installed or undone by
+account-owned tasks. Providers never perform failure backoff or route directives.
 
 ## Unsupported error construction
 

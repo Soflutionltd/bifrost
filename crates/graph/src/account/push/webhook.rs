@@ -2,7 +2,7 @@
 //! subscription creation with rollback, the registered `GraphSubscriptionGroup`
 //! state, and teardown (`push_unsubscribe` plus `close()`'s best-effort walk).
 //!
-//! The renewal worker that keeps these subscriptions alive lives in
+//! The renewal session that keeps these subscriptions alive lives in
 //! `super::renewal`.
 
 use std::collections::HashMap;
@@ -11,22 +11,21 @@ use bifrost_types::{
     AccountError, AccountOperation, CursorScope, ErrorScope, ObjectType, SubscriptionHandle,
 };
 
+use crate::account::GraphAccount;
 use crate::account::graph_error::{GraphErrorContext, into_account_error};
-use crate::account::{GraphAccount, PushMode};
 use crate::webhooks::{create_subscription, delete_subscription};
 
 use super::common::{
-    DecodedHandle, account_closed_error, decode_handle, graph_handle, mark_push_reconnected,
-    new_handle_token, unsupported_push_error, unsupported_push_scope_error,
+    DecodedHandle, account_closed_error, decode_handle, graph_handle, new_handle_token,
+    unsupported_push_error, unsupported_push_scope_error,
 };
 use super::dispatch::{ArmOutcome, finalize_push_outcomes};
-use super::renewal::run_graph_subscription_worker;
 
-/// Server ids the renewal worker recreated under a handle, which the handle
+/// Server ids the renewal session recreated under a handle, which the handle
 /// string itself cannot name.
 ///
 /// A handle carries the ids of its subscribe time (`common::graph_handle`),
-/// and the engine stores that string unchanged. When the renewal worker
+/// and the engine stores that string unchanged. When the renewal session
 /// replaces a vanished subscription, the replacement's id lives only in the
 /// instance's group - so if that instance's teardown fails and the engine
 /// retries the handle as an orphan on a reopened instance, the replacement
@@ -67,7 +66,7 @@ pub(crate) struct GraphSubscriptionGroup {
     ///
     /// Teardown deletes over the network, so the group must stay registered
     /// across those awaits for a failed DELETE to remain retryable. That
-    /// keeps the handle visible to the renewal worker, whose recreate path
+    /// keeps the handle visible to the renewal session, whose recreate path
     /// would otherwise install a replacement into a group teardown has
     /// already snapshotted: the removal that follows only knows the stale
     /// server id, so the replacement would stay registered and live while
@@ -102,12 +101,12 @@ pub(crate) struct GraphSubscriptionState {
     /// which scopes to fall back to polling. Every other error path in this
     /// crate carries an `ErrorScope`.
     pub(crate) scopes: Vec<CursorScope>,
-    /// Whether the renewal worker has already warned about an unparseable
+    /// Whether the renewal session has already warned about an unparseable
     /// `expires_at` for this subscription, so the warning fires once per
     /// subscription rather than once per renewal tick.
     pub(crate) warned_unparseable_expiry: bool,
     /// A renewal of this subscription failed terminally (auth lost,
-    /// permission revoked and the like), so the renewal worker no longer
+    /// permission revoked and the like), so the renewal session no longer
     /// renews or recreates it. The row stays registered: a subscription we
     /// stopped renewing is not one that stopped existing, and `close()` and
     /// `push_unsubscribe` still DELETE it. Removing the row instead took a
@@ -122,8 +121,8 @@ pub(crate) struct GraphSubscriptionState {
 /// The ledger is closed HERE, between the last create and the registration,
 /// not by the dispatcher afterwards. `finalize` is fallible (an unfiled or
 /// double-filed lane id is this crate's invariant breaking), and it used to
-/// run after the group was registered and the renewal worker started: a
-/// failure returned `Err` - no handle - over subscriptions the worker kept
+/// run after the group was registered and the renewal session started: a
+/// failure returned `Err` - no handle - over subscriptions the sessions kept
 /// renewing and no caller could ever name to unsubscribe. Closed before the
 /// registration, the failure path has registered nothing and only has to
 /// roll back the server-side creates, exactly as a failed create does.
@@ -284,7 +283,7 @@ async fn run_subscribe(
     if received {
         return;
     }
-    // The group is registered and the worker running, but no caller holds
+    // The group is registered and renewable, but no caller holds
     // the handle, so no `push_unsubscribe` will ever name it. Retire it the
     // way a caller would. If a DELETE fails the group stays registered
     // (marked `tearing_down`), which is exactly what lets `close()` retry it.
@@ -355,8 +354,8 @@ async fn create_and_register(
     }
 
     // Every lane must be filed before anything becomes live. See the
-    // function doc: on this path nothing is registered and no worker was
-    // started, so rolling back the creates is the whole cleanup.
+    // function doc: on this path nothing is registered and no session can
+    // see the rows, so rolling back the creates is the whole cleanup.
     let outcomes = match finalize_push_outcomes(outcomes, expected) {
         Ok(outcomes) => outcomes,
         Err(error) => {
@@ -386,16 +385,10 @@ async fn create_and_register(
     );
     groups.insert(handle.clone(), GraphSubscriptionGroup::live(subscriptions));
     drop(groups);
-    // Only on the recovery EDGE. `Reconnected` is the engine's account-wide
-    // full-reconcile trigger, and a first subscribe has no gap to cover: the
-    // engine established or resumed these cursors moments earlier and is
-    // already streaming them. Publishing it unconditionally charged every
-    // subscribe - including the first one an account ever makes - one
-    // redundant reconcile over every registered scope. A subscribe that lands
-    // while the renewal worker has push latched down is a real recovery and
-    // still emits.
-    mark_push_reconnected(account);
-    ensure_graph_worker(account.clone()).await;
+    // Wake a session parked without registrations after the committed insert.
+    account
+        .graph_topology
+        .send_modify(|n| *n = n.wrapping_add(1));
     Ok((Some(handle), outcomes))
 }
 
@@ -438,7 +431,7 @@ async fn roll_back_created(account: &GraphAccount, subscriptions: &[GraphSubscri
 ///   subscription this instance still renews. The registered handle is the
 ///   only door to those.
 ///
-/// Besides the ids the handle names, it deletes the ones the renewal worker
+/// Besides the ids the handle names, it deletes the ones the renewal session
 /// recreated under it on an earlier instance (`RecreatedSubscriptionIds`),
 /// and forgets those once every DELETE has succeeded.
 ///
@@ -540,24 +533,9 @@ pub(super) async fn unsubscribe_graph(
             })?;
         forget_deleted_subscription(&account, &handle, &server_id).await;
     }
-    // "No groups left" and "stop the worker" must be one atomic step against
-    // a concurrent `push_subscribe`, which inserts its live group under the
-    // WRITE lock and only then calls `ensure_graph_worker`. Sampling
-    // emptiness and dropping the guard first would let that subscribe see the
-    // still-running worker, decline to spawn a replacement, and then have it
-    // aborted here - leaving a live subscription with nothing renewing it.
-    // Holding the guard makes the insert wait until the slot is empty. The
-    // named binding is deliberate: the same guarantee via a temporary in the
-    // condition would rest on `if`-temporary scoping rather than on
-    // something a reader can see. Lock order is subscriptions-then-worker
-    // here and in the worker's own retire path; nothing takes them inverted.
-    let groups = account.graph_subscriptions.read().await;
-    if groups.is_empty()
-        && let Some(worker) = account.graph_worker.lock().await.take()
-    {
-        worker.abort();
-    }
-    drop(groups);
+    account
+        .graph_topology
+        .send_modify(|n| *n = n.wrapping_add(1));
     Ok(())
 }
 
@@ -571,8 +549,8 @@ pub(super) async fn unsubscribe_graph(
 /// subscription per resource per reopen. Nothing in the `Account` contract
 /// promises `push_unsubscribe` before `close()`, so `close()` has to do it.
 ///
-/// Failures are logged, not returned: `close()` must still retire its
-/// workers, and the engine has no useful
+/// Failures are logged, not returned: `close()` must still settle its
+/// account-owned push tasks, and the engine has no useful
 /// recovery for "the server kept a subscription we asked it to drop".
 pub(crate) async fn retire_all_graph_subscriptions(account: &GraphAccount) {
     // Cancel BEFORE the walk: an in-flight `push_subscribe`, and a renewal
@@ -625,7 +603,7 @@ async fn begin_graph_teardown(
 /// delete, without retiring their local state.
 ///
 /// Marking and snapshotting happen under the SAME write lock, which is what
-/// makes the pair race-free against the renewal worker: any recreate that
+/// makes the pair race-free against the renewal session: any recreate that
 /// installs before this call is in the snapshot, and any recreate that
 /// resolves after it sees the marker and refuses. The state itself stays
 /// registered so a failed DELETE leaves that id and every later id
@@ -645,19 +623,6 @@ pub(super) fn mark_group_tearing_down(
             .map(|state| state.server_id.clone())
             .collect(),
     )
-}
-
-pub(super) async fn ensure_graph_worker(account: GraphAccount) {
-    if account.push_mode != PushMode::GraphSubscriptions {
-        return;
-    }
-    let worker_account = account.clone();
-    crate::account::worker_slot::ensure_worker(&account.graph_worker, move || {
-        tokio::spawn(async move {
-            run_graph_subscription_worker(worker_account).await;
-        })
-    })
-    .await;
 }
 
 /// Stop renewing one subscription whose renewal failed terminally, keeping

@@ -3760,3 +3760,87 @@ async fn a_failed_account_clear_keeps_reattach_ownership() {
     drop(tx);
     writer.await.expect("writer");
 }
+
+/// The detach-race cleanup in `subscribe_push` deletes a subscription it could
+/// not register, and that delete is a `push_unsubscribe` like any other: it
+/// must bump the push topology, and only once the provider call has finished.
+/// The slot is gone from the engine by then, so the version is read off the
+/// slot's own sender, held from before the detach.
+///
+/// Ablation: dropping the cleanup task's `TopologyBump` leaves the version one
+/// short after the delete completes; bumping before the provider call instead
+/// of across it moves the version while the delete is still parked.
+#[tokio::test(start_paused = true)]
+async fn the_detach_race_cleanup_bumps_the_push_topology_after_its_delete() {
+    use crate::test_common::{PushLog, StubAccount, StubFactory};
+    use bifrost_types::{AccountId, CursorScope, FolderId, PushCapability};
+
+    async fn settle(mut done: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if done() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("condition never held");
+    }
+
+    let scopes = vec![CursorScope::Folder(FolderId("inbox".into()))];
+    let log = Arc::new(PushLog::default());
+    let mut caps = crate::test_common::caps();
+    caps.push = PushCapability::WebhookOrEwsStream;
+    let account = Arc::new(StubAccount {
+        caps,
+        push_label: "first".to_owned(),
+        push_log: Arc::clone(&log),
+        ..StubAccount::new(scopes.clone())
+    });
+    let subscribe_gate = Arc::new(tokio::sync::Notify::new());
+    *account.push_subscribe_park.lock().expect("park lock") =
+        Some((0, Arc::clone(&subscribe_gate)));
+    let unsubscribe_gate = Arc::new(tokio::sync::Notify::new());
+    *account.push_unsubscribe_park.lock().expect("park lock") = Some(Arc::clone(&unsubscribe_gate));
+
+    let id = AccountId("detach-race-topology".into());
+    let engine = Arc::new(super::SyncEngine::builder().build().expect("engine"));
+    engine
+        .attach(
+            id.clone(),
+            Arc::new(StubFactory::queue(vec![Arc::clone(&account)])),
+        )
+        .await
+        .expect("attach");
+    let slot = Arc::clone(engine.accounts.get(&id).expect("attached slot").value());
+    let topology = slot.push_topology_tx.subscribe();
+
+    let subscribing = {
+        let engine = Arc::clone(&engine);
+        let id = id.clone();
+        let scopes = scopes.clone();
+        tokio::spawn(async move { engine.subscribe_push(&id, &scopes).await })
+    };
+    settle(|| !log.subscribed().is_empty()).await;
+    engine.detach(&id).await.expect("detach");
+    let before = *topology.borrow();
+
+    subscribe_gate.notify_one();
+    settle(|| !log.unsubscribed().is_empty()).await;
+    assert_eq!(
+        *topology.borrow(),
+        before + 1,
+        "only the subscribe has bumped; the cleanup delete is still in flight"
+    );
+
+    unsubscribe_gate.notify_one();
+    let outcome = subscribing.await.expect("subscribe task");
+    assert!(
+        matches!(outcome, Err(crate::Error::AccountNotAttached(_))),
+        "{outcome:?}"
+    );
+    assert_eq!(log.unsubscribed().len(), 1);
+    assert_eq!(
+        *topology.borrow(),
+        before + 2,
+        "the cleanup delete bumps the topology once it completes"
+    );
+}

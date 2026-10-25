@@ -21,6 +21,7 @@ workspace = true
 default = []
 
 [dependencies]
+async-stream = { workspace = true }
 base64 = { workspace = true }
 bifrost-types = { path = "../types" }
 bifrost-net = { path = "../net" }

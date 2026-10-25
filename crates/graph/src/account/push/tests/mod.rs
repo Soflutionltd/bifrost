@@ -7,9 +7,10 @@
 //! the whole-request refusals - which is exercised through `push_subscribe` in
 //! both push modes and belongs to neither arm.
 
-mod common;
 mod dispatch;
 mod ews;
 mod fixtures;
 mod renewal;
 mod webhook;
+
+mod renewal_sessions;

@@ -30,16 +30,3 @@ range, get, create, update, RSVP and search have no passthrough, and the new
 `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
 Whether the engine is meant to be the consumer's single door for calendar, as
 it is for contacts, decides whether this is an omission.
-
-## SYNC-009 - Push ingress can still lose or unboundedly queue control events
-
-**Needs a technical implementation specification** (owner, 2026-10-21): too
-consequential to resolve by ruling. Specify together with SHARED-014, which
-reshapes how push reaches the engine.
-
-Needs a ruling. The 100 ms coalesced-send timeout can drop an invalidation and
-the per-registration ingress is still unbounded. A sticky needs-full-reconcile
-flag keeps the invalidation intent but cannot carry warning payloads,
-termination classifications or their ordering, so a bounded lossless ingress
-needs a control-event overflow policy or an API change. Reasoning is at both
-code sites and a test shows the semantic loss.

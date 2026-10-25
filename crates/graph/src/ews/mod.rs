@@ -275,15 +275,15 @@ pub(crate) struct EwsClient {
 
 /// A streaming EWS response body. GetStreamingEvents keeps one HTTP response
 /// open and emits response-message frames as Exchange has notifications, so
-/// this must stay chunked all the way to the account worker.
+/// this must stay chunked all the way to the account's push session.
 pub(crate) type EwsBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, EwsError>> + Send>>;
 
-/// The seam between the EWS worker loops and the wire.
+/// The seam between the EWS push session and the wire.
 ///
 /// `EwsClient::execute` is the single-result SOAP funnel used by the
-/// streaming worker, so a scripted implementation of this one method is
+/// streaming session, so a scripted implementation of this one method is
 /// enough to drive the whole Subscribe / GetStreamingEvents / Unsubscribe
-/// cycle hermetically. The streaming worker takes `impl EwsExecute`
+/// cycle hermetically. The streaming session takes `impl EwsExecute`
 /// instead of the concrete client for exactly that reason; `EwsClient` is
 /// the production implementation.
 ///

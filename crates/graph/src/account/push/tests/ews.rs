@@ -475,39 +475,6 @@ fn spawn_subscribe_ews(
     })
 }
 
-/// The caller is dropped after the registration was inserted, while
-/// `ensure_ews_worker` waits for the worker slot. Nobody holds the handle, so
-/// the registration must be retired by the guard.
-///
-/// Fails if `RegistrationGuard` is not armed in `subscribe_ews` (or its drop
-/// stops calling `unsubscribe_ews`): the registration then stays for the life
-/// of the account.
-#[tokio::test]
-async fn a_dropped_ews_subscribe_retires_the_registration_nobody_received() {
-    let client = GraphClient::new("token");
-    client.script_rest([translate_ok()]);
-    let account = GraphAccount::new_for_tests(client.clone(), PushMode::EwsStreaming);
-
-    let slot_blocked = account.ews_worker.lock().await;
-    let caller = spawn_subscribe_ews(&account);
-    assert!(
-        settle(|| registration_count(&account) == Some(1)).await,
-        "registered, parked on the worker slot"
-    );
-    caller.abort();
-    let _ = caller.await;
-    drop(slot_blocked);
-
-    assert!(
-        settle(|| registration_count(&account) == Some(0)).await,
-        "the unreceived registration is retired"
-    );
-    assert!(
-        account.ews_worker.lock().await.is_none(),
-        "and no worker was left running for it"
-    );
-}
-
 /// The normal path disarms: a caller that receives the handle keeps its
 /// registration.
 ///
@@ -519,7 +486,6 @@ async fn a_received_ews_subscribe_keeps_its_registration() {
     let account = GraphAccount::new_for_tests(client.clone(), PushMode::EwsStreaming);
     // A worker already occupies the slot, so none is spawned against the
     // scripted wire.
-    *account.ews_worker.lock().await = Some(tokio::spawn(std::future::pending()));
 
     let (handle, _) = spawn_subscribe_ews(&account)
         .await
@@ -530,9 +496,7 @@ async fn a_received_ews_subscribe_keeps_its_registration() {
         tokio::task::yield_now().await;
     }
     assert_eq!(registration_count(&account), Some(1));
-    if let Some(worker) = account.ews_worker.lock().await.take() {
-        worker.abort();
-    }
+    assert!(*account.ews_topology.borrow() > 0);
 }
 
 /// A closed account is refused before the translation request, as the webhook
@@ -556,7 +520,6 @@ async fn subscribing_ews_on_a_closed_account_registers_nothing() {
     assert!(matches!(error.kind(), AccountErrorKind::Internal(_)));
     assert_eq!(client.wire_attempts(), 0);
     assert_eq!(registration_count(&account), Some(0));
-    assert!(account.ews_worker.lock().await.is_none());
 }
 
 /// `close()` began while the translation was in flight: the registration step
@@ -584,5 +547,4 @@ async fn an_ews_subscribe_racing_close_does_not_register() {
         .expect("not aborted")
         .expect_err("a closing account hands out no handle");
     assert_eq!(registration_count(&account), Some(0));
-    assert!(account.ews_worker.lock().await.is_none());
 }

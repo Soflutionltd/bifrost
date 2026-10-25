@@ -30,8 +30,9 @@ is unavailable. Like `Page`, `OpenedAccount` is deliberately not
 `#[non_exhaustive]`: every factory constructs it, so a future lane
 breaks every constructor.
 `Account::close()` is idempotent local teardown. It closes protocol
-connections and workers but does not delete durable server-side push
-subscriptions, which use `push_unsubscribe`.
+connections and workers. It does not delete durable server-side push
+subscriptions unless the provider documents that it does (Graph deletes its
+webhook rows); explicit teardown uses `push_unsubscribe`.
 
 ## Account trait tiers
 
@@ -42,7 +43,7 @@ follows:
 |---|---:|
 | capabilities, provider metadata, and scheduling controls | 5 |
 | cursor discovery, lifecycle, inventory, hydration stream, and changes | 12 |
-| push | 3 |
+| push | 4 |
 | blob and raw-message reads | 3 |
 | streaming bulk mutation | 8 |
 | mail mutation primitives | 8 |
@@ -229,10 +230,16 @@ unchanged cursor forever. A guard that only refuses the batch would trade a
 nonsense state for a silent non-progressing scope.
 
 `ScopeLifecycleEvent` carries created, renamed, and deleted membership
-events or a structured termination. `WatchEvent` carries invalidation,
+events, `Polled` after a fully successful poll and state commit, or a
+structured termination. Providers own successful poll cadence and end on
+their first failure; engine reconnect backoff resets only on `Polled` or
+a lifecycle change, and carries its count across account replacement. `WatchEvent` carries invalidation,
 connection-health, warning, and termination signals. `InvalidationSink`
 is synchronous so an out-of-process webhook or Pub/Sub receiver can
-feed the engine from a non-async thread.
+feed the engine from a non-async thread. Its `SinkPush` result returns refused
+directives for resubmission after a pause or queue saturation. Invalidations
+are retained as bounded intent and may widen into a full reconcile; controls
+are handled synchronously and may overtake pending invalidations.
 
 `Control::pause` and `Control::checkpoint_now` return
 `Result<Option<Checkpoint>, AccountError>`. `None` means the stream is
@@ -439,6 +446,7 @@ crates/types/src/
   capabilities.rs     declarative feature and dispatch shapes
   cursor.rs           cursor scope, membership scope, cursor state
   events.rs           SyncEvent, Batch, Checkpoint, Control, push hints
+  push.rs             lanes, sessions, stop, maintenance gate, pacing and lease
   coverage.rs         inventory coverage domains, reports, obligations
   mutation.rs         mutation targets, flags, labels, fingerprints
   repair.rs           inventory repair requests and terminal outcomes
@@ -506,3 +514,19 @@ AccountError exposes the record, failed-leg recovery and per-leg throttle
 observations. The builder validates application and compensation evidence before
 freezing the derived operation plan. Telemetry and support tiers export the
 record at their respective consent levels; see `reference/error-model.md`.
+
+`push.rs` defines normalized `BackoffPolicy` values for engine-owned pacing.
+
+## Push sessions
+
+`Account::push_lanes` declares independent Connection or Registration slots.
+`push_stream(lane, stop, gate)` drives one re-runnable session: establishment
+is separate from demonstrated `Healthy` progress, all failures reach the
+engine, and each terminal event follows cleanup. `LaneLease` enforces one
+live driver per lane. Invalid and concurrently driven lanes fail with an
+Internal(AccountContract) error. Direct consumers must drive and pace every
+lane; subscribe only registers coverage. Registration maintenance checks
+`PushGate` before each request and retains committed gap obligations in
+account state until yielded. Effects needing to survive drop run in
+account-owned tasks or actors. SessionStop resolves on explicit stop or
+stopper drop. WatchEvent remains the external receiver-to-sink vocabulary.

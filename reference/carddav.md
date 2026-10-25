@@ -718,9 +718,11 @@ absolute native-id namespace the snapshot, inventory, and changes lanes
 use, `failed_ids` included, so a path-only href from the server cannot
 give one contact two ids.
 
-All mail, filter, blob, push, calendar, and settings methods return
+All mail, filter, blob, push subscription CRUD, calendar, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CardDav`.
-`push_stream` and `scope_lifecycle_stream` are empty streams.
+`push_lanes` is empty. Every lane passed to `push_stream` fails with
+`Internal(AccountContract)` because this account has no push lane.
+`scope_lifecycle_stream` is empty.
 `set_priority` and `set_bandwidth_cap` forward to `client.net()`, the crate's
 `AccountNet` handle, so DAV traffic is scheduled and metered like every other
 HTTP protocol crate's. A CardDAV leg composed into an IMAP-shaped account is

@@ -20,7 +20,6 @@ use bifrost_types::{
     MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus,
     SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
     ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
-    WatchEvent,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use futures::stream::Stream;
@@ -511,9 +510,19 @@ impl Account for ImapAccount {
         push::push_unsubscribe(self.clone(), handle)
     }
 
-    // Account: forwards IDLE/NOTIFY wakeups as WatchEvents; direct users call idle().
-    fn push_stream(&self) -> AccountStream<WatchEvent> {
-        push::push_stream(self.clone())
+    // One IDLE/NOTIFY session per lane, driven by the engine; direct users
+    // of the connection layer call idle().
+    fn push_lanes(&self) -> Vec<bifrost_types::PushLaneSpec> {
+        push::push_lanes(self)
+    }
+
+    fn push_stream(
+        &self,
+        lane: bifrost_types::PushLane,
+        stop: bifrost_types::SessionStop,
+        _gate: bifrost_types::PushGate,
+    ) -> AccountStream<bifrost_types::PushSessionEvent> {
+        push::push_stream(self.clone(), lane, stop)
     }
 
     // IMAP does not yet mint BlobHandles from BODYSTRUCTURE part metadata.

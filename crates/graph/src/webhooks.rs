@@ -180,7 +180,7 @@ fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
 /// Renewing is the safe direction for an unparseable expiry (the alternative
 /// is a subscription that silently dies at its real expiry), so `None` from
 /// the parser answers "expiring". The unparseable value itself is a defect
-/// worth seeing; the renewal worker logs it once per subscription via
+/// worth seeing; the renewal session logs it once per subscription via
 /// `ExpiryCheck::Unparseable` rather than once per tick.
 pub(crate) fn check_expiry(expiration_iso: &str, threshold_minutes: i64) -> ExpiryCheck {
     let Some(expiry) = parse_iso8601_to_unix(expiration_iso) else {
@@ -374,7 +374,7 @@ mod tests {
         }
     }
 
-    /// `subscription_is_gone` is the gate on the renewal worker's
+    /// `subscription_is_gone` is the gate on the renewal session's
     /// recreate path: only a subscription Graph no longer has may be
     /// replaced by a fresh create. A throttle or an auth failure must
     /// stay a plain renewal failure - recreating on those would mint a

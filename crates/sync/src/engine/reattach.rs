@@ -22,6 +22,14 @@ pub(crate) struct RecoveryContext<'a> {
     pub capabilities: &'a Arc<std::sync::RwLock<AccountCapabilities>>,
     pub subscriptions: &'a Arc<SubscriptionRegistry>,
     pub account_generation_tx: &'a watch::Sender<u64>,
+    /// The lane supervisor's retirement watch (drained generation plus
+    /// one). Reattach waits on it before closing the account it replaced.
+    pub push_retired: &'a watch::Sender<u64>,
+    /// Bound on that wait (`EngineConfig::detach_timeout`).
+    pub push_drain_wait: Duration,
+    /// The generation a `ReopenRequest::PushRecovery` was stamped with;
+    /// `None` for every other request kind.
+    pub expected_generation: Option<u64>,
     pub reopen_lock: &'a Arc<AsyncMutex<()>>,
     /// Slot-lifetime open-skip lane; a successful reattach replaces it
     /// with the replacement open's `OpenedAccount::skipped_scopes`.
@@ -132,6 +140,9 @@ pub(crate) async fn handle_account_error(
                 EngineDirective::RestartAccount | EngineDirective::DowngradeStrategy(_) => None,
                 _ => Some(ctx.reopen_lock.lock().await),
             };
+            if _reopen_guard.is_some() && stale_push_generation(ctx) {
+                return RecoveryFollowUp::None;
+            }
             deferred = handle_engine_directive(ctx, scope, directive, error).await;
         }
         RecoveryPlan::Terminal(fatal) => {
@@ -253,6 +264,12 @@ async fn handle_engine_directive(
             restart_account(ctx).await;
         }
         EngineDirective::DowngradeStrategy(downgrade) => {
+            // Fence even the warning before releasing the lock for restart's
+            // independently admitted loop.
+            let warning_guard = ctx.reopen_lock.lock().await;
+            if stale_push_generation(ctx) {
+                return RecoveryFollowUp::None;
+            }
             // Route the warning to the scope the downgrade is actually
             // about: the originating error's cursor scope when it names
             // one (the same signal the immediate re-establish below
@@ -270,6 +287,7 @@ async fn handle_engine_directive(
                 )
                 .with_protocol_detail(DiagnosticText::support_only(format!("{downgrade:?}"))),
             );
+            drop(warning_guard);
             // Only an account that actually restarted gets the scope repair.
             // `restart_scope` deletes the scope's cursor before it
             // re-establishes; after an exhausted budget the account is
@@ -290,6 +308,19 @@ async fn handle_engine_directive(
             // scope's directive again after resume.
             if let Some(ErrorScope::Cursor(scoped)) = error.scope() {
                 let _reopen_guard = ctx.reopen_lock.lock().await;
+                // A stamped request's own restart bumped the generation once;
+                // anything else means a later replacement owns the account now.
+                if ctx
+                    .expected_generation
+                    .is_some_and(|g| *ctx.account_generation_tx.borrow() != g.saturating_add(1))
+                {
+                    tracing::debug!(
+                        target: "bifrost.sync.recovery",
+                        account = ?ctx.account_id,
+                        "declining stale push scope repair after strategy downgrade"
+                    );
+                    return RecoveryFollowUp::None;
+                }
                 restart_scope(ctx, scoped.clone()).await;
             }
         }
@@ -2032,6 +2063,7 @@ async fn reattach_account_paced(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *skips = next_skips;
         }
+        let retiring_generation = *ctx.account_generation_tx.borrow();
         ctx.account_generation_tx
             .send_modify(|generation| *generation = generation.saturating_add(1));
 
@@ -2084,6 +2116,28 @@ async fn reattach_account_paced(
         // Through the guard, which owes this close until it returns: a drop
         // parked here (or before it) closes the old connection instead of
         // leaking it.
+        let mut retired = ctx.push_retired.subscribe();
+        let drained = async {
+            loop {
+                if *retired.borrow_and_update() > retiring_generation {
+                    break;
+                }
+                if retired.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        if tokio::time::timeout(ctx.push_drain_wait, drained)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                target: "bifrost.sync.recovery",
+                account = ?ctx.account_id,
+                retiring_generation,
+                "push lanes did not drain within the bound; closing the old account anyway"
+            );
+        }
         if let Err(error) = guard.close_owed().await {
             pacing.record_holds(ctx, &error);
             tracing::warn!(
@@ -2170,6 +2224,9 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
                 continue 'restart;
             };
             let reopen_guard = Arc::clone(ctx.reopen_lock).lock_owned().await;
+            if stale_push_generation(ctx) {
+                return false;
+            }
             if pacing.pending_wait(ctx, None, None).is_zero() {
                 break (reopen_guard, activity);
             }
@@ -2580,3 +2637,21 @@ async fn run_establish(
 #[cfg(test)]
 #[path = "reattach_tests.rs"]
 mod recovery_establishment_tests;
+
+/// True when this request is stamped (`ReopenRequest::PushRecovery`) with an
+/// account generation that has since been replaced. Called under the reopen
+/// lock, before any effect: reattach swaps the account and bumps the
+/// generation under that same lock, so the read cannot straddle a swap.
+fn stale_push_generation(ctx: &RecoveryContext<'_>) -> bool {
+    let stale = ctx
+        .expected_generation
+        .is_some_and(|g| g != *ctx.account_generation_tx.borrow());
+    if stale {
+        tracing::debug!(
+            target: "bifrost.sync.recovery",
+            account = ?ctx.account_id,
+            "declining stale push recovery"
+        );
+    }
+    stale
+}

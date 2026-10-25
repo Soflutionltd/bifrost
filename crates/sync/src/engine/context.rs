@@ -34,6 +34,9 @@ pub(super) struct SlotContext {
     pub capabilities: Arc<std::sync::RwLock<AccountCapabilities>>,
     pub subscriptions: Arc<SubscriptionRegistry>,
     pub account_generation_tx: watch::Sender<u64>,
+    pub push_retired: watch::Sender<u64>,
+    pub push_topology: watch::Sender<u64>,
+    pub push_drain_wait: Duration,
     pub reopen_lock: Arc<AsyncMutex<()>>,
     /// Slot-lifetime open-skip lane; a successful reattach replaces it
     /// with the replacement open's `OpenedAccount::skipped_scopes`.
@@ -74,8 +77,22 @@ impl SlotContext {
     /// reset, could not complete), when nothing else would raise it again. See
     /// [`DeferredScopeRepairs`] and [`DeferredSchemaReset`].
     pub(super) async fn recover(&self, scope: Option<CursorScope>, error: AccountError) {
+        self.recover_stamped(scope, error, None).await;
+    }
+
+    /// [`Self::recover`] for a request stamped with the account generation
+    /// that raised it (`ReopenRequest::PushRecovery`): every engine-directive
+    /// arm declines it as stale, under the reopen lock and before any effect,
+    /// once the account it described has been replaced.
+    pub(super) async fn recover_stamped(
+        &self,
+        scope: Option<CursorScope>,
+        error: AccountError,
+        expected_generation: Option<u64>,
+    ) {
         let writer = self.writer();
-        let recovery = self.recovery(&writer);
+        let mut recovery = self.recovery(&writer);
+        recovery.expected_generation = expected_generation;
         let followup = handle_account_error(&recovery, scope, error).await;
         self.park_followup(followup);
     }
@@ -160,6 +177,9 @@ impl SlotContext {
             capabilities: &self.capabilities,
             subscriptions: &self.subscriptions,
             account_generation_tx: &self.account_generation_tx,
+            push_retired: &self.push_retired,
+            push_drain_wait: self.push_drain_wait,
+            expected_generation: None,
             reopen_lock: &self.reopen_lock,
             open_skips: &self.open_skips,
             shutdown: &self.shutdown,

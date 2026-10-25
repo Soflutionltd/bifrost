@@ -35,7 +35,7 @@ use bifrost_types::{
     Priority, Projection, ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass,
     RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
     ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
-    VacationConfig, WatchEvent,
+    VacationConfig,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{Calendar, CalendarEvent};
@@ -191,10 +191,42 @@ pub type ScopeKeysHook = Arc<dyn Fn(&CursorScope) -> Vec<bifrost_types::Throttle
 pub type UnsubscribeErrorHook =
     Arc<dyn Fn(&SubscriptionHandle) -> Option<AccountError> + Send + Sync>;
 
+/// One step of a scripted push session (`StubAccount::push_sessions`).
+#[derive(Clone)]
+pub enum SessionStep {
+    /// Yield this item; a `Failed` or `Ended` marks the session ended.
+    Emit(bifrost_types::PushSessionEvent),
+    /// Wait for the notify before the next step.
+    Park(Arc<tokio::sync::Notify>),
+    /// Wait for stop, then end `Stopped`.
+    AwaitStop,
+    /// Wait for stop, spend the duration on cleanup, then end `Stopped`.
+    AwaitStopFor(std::time::Duration),
+    /// Await `gate.clear()` and record the instant it cleared.
+    AwaitGate,
+}
+
+/// What one `push_stream` call of the stub did.
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    pub lane: bifrost_types::PushLane,
+    pub opened: tokio::time::Instant,
+    pub stopped: bool,
+    pub ended: bool,
+    pub gates: Vec<tokio::time::Instant>,
+}
+
 /// Configurable `Account` double. Construct with [`StubAccount::new`], then
 /// set hooks for the surfaces the test drives; everything else answers
 /// `Unsupported` or an empty stream.
 pub struct StubAccount {
+    /// Returned by `push_lanes`; a lane not in it gets the S11 failure.
+    pub push_lane_specs: Vec<bifrost_types::PushLaneSpec>,
+    /// One script per `push_stream` call on a declared lane; an empty queue
+    /// parks until stop and ends `Stopped`.
+    pub push_sessions: Mutex<std::collections::VecDeque<Vec<SessionStep>>>,
+    /// One record per `push_stream` call on a declared lane.
+    pub push_session_log: Arc<Mutex<Vec<SessionRecord>>>,
     pub caps: AccountCapabilities,
     /// Optional failure returned by the caller-version flag door.
     pub versioned_flags_error: Option<AccountError>,
@@ -237,6 +269,12 @@ pub struct StubAccount {
     pub memberships: Vec<MembershipScope>,
     /// Fail the next membership discovery; arm after attach when needed.
     pub memberships_error: Mutex<Option<AccountError>>,
+    /// Scripted lifecycle streams: while non-empty, each
+    /// `scope_lifecycle_stream` call pops one and yields exactly its events,
+    /// taking precedence over `lifecycle_rx`.
+    pub lifecycle_scripts: Mutex<std::collections::VecDeque<Vec<ScopeLifecycleEvent>>>,
+    /// The instant of every `scope_lifecycle_stream` call.
+    pub lifecycle_opens: Arc<Mutex<Vec<tokio::time::Instant>>>,
     /// Lifecycle events fired on demand, taken by the FIRST
     /// `scope_lifecycle_stream` call; later calls (a reopen re-subscribes)
     /// get an empty stream. Holding the sender keeps the stream open, which
@@ -459,6 +497,9 @@ impl StubAccount {
     #[must_use]
     pub fn new(scopes: Vec<CursorScope>) -> Self {
         Self {
+            push_lane_specs: Vec::new(),
+            push_sessions: Mutex::new(Default::default()),
+            push_session_log: Arc::new(Mutex::new(Vec::new())),
             caps: caps(),
             scopes,
             establishment: |scope| CursorEstablishment::Ready(cursor_for(scope, b"stub-ready")),
@@ -475,6 +516,8 @@ impl StubAccount {
             memberships: Vec::new(),
             memberships_error: Mutex::new(None),
             lifecycle_rx: Mutex::new(None),
+            lifecycle_scripts: Mutex::new(Default::default()),
+            lifecycle_opens: Arc::new(Mutex::new(Vec::new())),
             walked: Arc::new(Mutex::new(Vec::new())),
             established: Arc::new(Mutex::new(Vec::new())),
             closed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -626,6 +669,18 @@ impl Account for StubAccount {
     }
 
     fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
+        self.lifecycle_opens
+            .lock()
+            .expect("lifecycle opens lock")
+            .push(tokio::time::Instant::now());
+        if let Some(events) = self
+            .lifecycle_scripts
+            .lock()
+            .expect("lifecycle scripts lock")
+            .pop_front()
+        {
+            return Box::pin(stream::iter(events));
+        }
         match self.lifecycle_rx.lock().expect("lifecycle lock").take() {
             Some(rx) => Box::pin(stream::unfold(rx, |mut rx| async move {
                 rx.recv().await.map(|event| (event, rx))
@@ -845,8 +900,67 @@ impl Account for StubAccount {
         })
     }
 
-    fn push_stream(&self) -> AccountStream<WatchEvent> {
-        Box::pin(stream::empty())
+    fn push_lanes(&self) -> Vec<bifrost_types::PushLaneSpec> {
+        self.push_lane_specs.clone()
+    }
+    fn push_stream(
+        &self,
+        lane: bifrost_types::PushLane,
+        stop: bifrost_types::SessionStop,
+        gate: bifrost_types::PushGate,
+    ) -> AccountStream<bifrost_types::PushSessionEvent> {
+        use bifrost_types::{PushSessionEnd as End, PushSessionEvent as E};
+        if !self.push_lane_specs.iter().any(|s| s.lane == lane) {
+            return Box::pin(stream::iter([E::Failed(
+                bifrost_types::push_lane_contract_error(
+                    self.protocol(),
+                    lane,
+                    "not a lane of this account",
+                ),
+            )]));
+        }
+        let steps = self
+            .push_sessions
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| vec![SessionStep::AwaitStop]);
+        let log = Arc::clone(&self.push_session_log);
+        let index = {
+            let mut log = log.lock().unwrap();
+            let index = log.len();
+            log.push(SessionRecord {
+                lane,
+                opened: tokio::time::Instant::now(),
+                stopped: false,
+                ended: false,
+                gates: Vec::new(),
+            });
+            index
+        };
+        Box::pin(async_stream::stream! {
+            for step in steps {
+                match step {
+                    SessionStep::Emit(event) => {
+                        if matches!(event, E::Failed(_) | E::Ended(_)) { log.lock().unwrap()[index].ended = true; }
+                        yield event;
+                    }
+                    SessionStep::Park(notify) => notify.notified().await,
+                    SessionStep::AwaitStop | SessionStep::AwaitStopFor(_) => {
+                        stop.stopped().await;
+                        log.lock().unwrap()[index].stopped = true;
+                        if let SessionStep::AwaitStopFor(delay) = step { tokio::time::sleep(delay).await; }
+                        log.lock().unwrap()[index].ended = true;
+                        yield E::Ended(End::Stopped);
+                        return;
+                    }
+                    SessionStep::AwaitGate => {
+                        gate.clear().await;
+                        log.lock().unwrap()[index].gates.push(tokio::time::Instant::now());
+                    }
+                }
+            }
+        })
     }
 
     fn open_blob(&self, _handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {

@@ -1,14 +1,14 @@
 //! Push reconciler task.
 //!
-//! One task per account. Reads `WatchEvent`s off the per-account mpsc
-//! and, on `Invalidated`, runs `changes_stream` against the current
+//! One task per account. Drains bounded invalidation intent and retains
+//! pending scopes across pauses and repairs, driving `changes_stream` against the current
 //! cursor for each affected scope. Output flows to the multiplexer's
 //! broadcast so consumers see a single unified `Change` stream.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use bifrost_types::{Account, AccountId, CursorScope, HintPayload, InvalidationHint, WatchEvent};
+use bifrost_types::{Account, AccountId, CursorScope, HintPayload};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -17,10 +17,8 @@ use arc_swap::ArcSwap;
 use crate::cancel::BoundaryView;
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
-use crate::error::{Error, Warning};
-use crate::multiplexer::{
-    ChangeDelivery, ChangesEvent, MultiplexerEvent, ReopenRequest, drive_changes_stream,
-};
+use crate::error::Error;
+use crate::multiplexer::{ChangeDelivery, ChangesEvent, ReopenRequest, drive_changes_stream};
 
 pub struct Reconciler {
     pub account_id: AccountId,
@@ -47,70 +45,122 @@ pub struct Reconciler {
     /// terminally failed scope - re-broadcasting `Terminated` and re-running
     /// a wire call that cannot succeed.
     pub scope_tokens: crate::multiplexer::ScopeTokens,
+    pub account_generation: tokio::sync::watch::Receiver<u64>,
+    #[cfg(test)]
+    pub(crate) attempts: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+#[derive(Default)]
+struct WorkSet {
+    full: bool,
+    scopes: HashSet<CursorScope>,
+    hold: Option<(u64, tokio::time::Instant)>,
+}
+
+impl WorkSet {
+    fn merge(
+        &mut self,
+        pending: super::PendingPush,
+        registry: &CursorRegistry,
+        ingress: &super::PushIngress,
+    ) -> bool {
+        let hinted = !pending.scopes.is_empty() || !pending.memberships.is_empty();
+        self.full |= pending.full;
+        if !self.full {
+            self.scopes.extend(pending.scopes);
+            for membership in pending.memberships {
+                self.scopes
+                    .extend(registry.scopes_for_membership(&membership));
+            }
+            if hinted && self.scopes.len() > ingress.capacity() {
+                self.full = true;
+                ingress.count_coarsening();
+            }
+        }
+        if self.full {
+            self.scopes.clear();
+        }
+        pending.closed
+    }
 }
 
 impl Reconciler {
-    /// Run the reconciler loop. Returns when the channel closes or
-    /// the shutdown token trips. Honors the account boundary: when
-    /// the engine flips to `Pause` (e.g. `OperatorOverrideRequired`
-    /// or `RetryBudgetExhausted`), pushes park alongside polls until
-    /// the consumer flips to `Resume`. Buffered `WatchEvent`s remain
-    /// in the channel and drain on resume.
-    pub async fn run(mut self, mut rx: mpsc::Receiver<WatchEvent>) {
-        // Hinted scopes held by a SCOPE-LOCAL throttle (a key the account
-        // declares for that scope alone, such as one mailbox's budget). They
-        // are kept here instead of being slept on inside a sweep: the
-        // reconciler is one task for the whole account, so a sleep inside
-        // `reconcile` would stall every later hint - for healthy mailboxes,
-        // `Reconnected`, `Terminated` - behind one mailbox's Retry-After.
-        // Only the scope is held; no cursor snapshot, lease, permit or
-        // activity guard survives the wait. A hint for a scope already
-        // deferred is absorbed by the set, and one that arrives during a
-        // drive waits in the channel and re-marks the scope once read, so no
-        // invalidation is lost - events are processed BETWEEN drives, which
-        // is the granularity this task has always had.
-        let mut deferred: HashSet<CursorScope> = HashSet::new();
+    /// Retain invalidation work across pause, checkpoint and account repair.
+    /// Control events are handled synchronously by the sink.
+    pub async fn run(mut self, ingress: Arc<super::PushIngress>) {
+        let mut work = WorkSet::default();
+        let mut deferred = HashSet::new();
+        let mut closed = false;
         loop {
-            // Park while the account is paused. The boundary watch
-            // notifies on every state change; we wake when it flips
-            // back to `Run`.
-            while matches!(self.boundary.peek(), crate::cancel::BoundaryRequest::Pause) {
+            while matches!(
+                self.boundary.peek(),
+                crate::cancel::BoundaryRequest::Pause
+                    | crate::cancel::BoundaryRequest::CheckpointNow
+            ) {
                 tokio::select! {
                     () = self.shutdown.cancelled() => return,
-                    changed = self.boundary.changed() => {
-                        match changed {
-                            Some(crate::cancel::BoundaryRequest::Run) => break,
-                            // Re-check the watch after every state change:
-                            // only Pause keeps this wait active. Run resumes
-                            // here; CheckpointNow and Stop leave the pause
-                            // wait too. The drive's boundary arm handles
-                            // Stop, while CheckpointNow has no reconciler
-                            // action.
-                            Some(_) => continue,
-                            None => return,
-                        }
-                    }
+                    changed = self.boundary.changed() => if changed.is_none() { return; },
                 }
             }
-            // Wake for the earliest deferred scope whose hold has passed. A
-            // deferred scope with no pending hold any more is due now.
-            let next_due = self.next_deferred_due(&deferred);
+            if self.shutdown.is_cancelled() {
+                return;
+            }
+            closed |= work.merge(ingress.take(), &self.cursors, &ingress);
+            if let Some((generation, until)) = work.hold {
+                let current = *self.account_generation.borrow_and_update();
+                if generation != current || tokio::time::Instant::now() >= until {
+                    work.hold = None;
+                }
+            }
+            let ready: Vec<_> = deferred
+                .iter()
+                .filter(|scope| {
+                    crate::recovery::throttle_wait(
+                        &self.throttles,
+                        &self.account_id,
+                        &self.scope_keys(scope),
+                    )
+                    .is_none()
+                })
+                .cloned()
+                .collect();
+            for scope in ready {
+                deferred.remove(&scope);
+                work.scopes.insert(scope);
+            }
+            if work.hold.is_none() && (work.full || !work.scopes.is_empty()) {
+                if work.full {
+                    work.full = false;
+                    work.scopes.extend(self.cursors.all_scopes());
+                }
+                if let Err(error) = self.drive_scopes(&mut work, &mut deferred).await {
+                    tracing::warn!(target: "bifrost.sync.reconcile", %error, "push reconcile failed");
+                }
+                if closed {
+                    return;
+                }
+                continue;
+            }
+            if closed {
+                return;
+            }
+            let next_due = if work.hold.is_some() {
+                None
+            } else {
+                self.next_deferred_due(&deferred)
+            };
+            let hold_wait = work
+                .hold
+                .map(|(_, until)| until.saturating_duration_since(tokio::time::Instant::now()));
             tokio::select! {
                 () = self.shutdown.cancelled() => return,
-                maybe_event = rx.recv() => {
-                    let Some(event) = maybe_event else { return; };
-                    self.handle(event, &mut deferred).await;
+                () = ingress.changed() => {},
+                () = sleep_or_forever(next_due) => {},
+                () = sleep_or_forever(hold_wait) => {},
+                changed = self.account_generation.changed(), if work.hold.is_some() => {
+                    if changed.is_err() { return; }
                 }
-                () = sleep_or_forever(next_due) => {
-                    // Copied, not drained: `drive_scopes` removes each
-                    // scope as it DISPATCHES it, so a sweep that returns
-                    // early (a terminal error, an account-wide directive)
-                    // leaves every scope it never reached still deferred.
-                    let due: Vec<CursorScope> = deferred.iter().cloned().collect();
-                    if let Err(err) = self.drive_scopes(due, &mut deferred).await {
-                        tracing::warn!(target: "bifrost.sync.reconcile", error=%err, "deferred reconcile failed");
-                    }
-                }
+                changed = self.boundary.changed() => if changed.is_none() { return; },
             }
         }
     }
@@ -137,136 +187,22 @@ impl Reconciler {
             .min()
     }
 
-    async fn handle(&mut self, event: WatchEvent, deferred: &mut HashSet<CursorScope>) {
-        match event {
-            WatchEvent::Invalidated { hint } => {
-                if let Err(err) = self.reconcile(&hint, deferred).await {
-                    tracing::warn!(target: "bifrost.sync.reconcile", error=%err, "reconcile failed");
-                }
-            }
-            WatchEvent::Disconnected => {
-                let _ = self.delivery.sender().send(self.warning_event(
-                    "push transport disconnected",
-                    bifrost_types::WarningKind::Other,
-                ));
-            }
-            WatchEvent::Reconnected => {
-                // Treat reconnect as a full reconcile across every
-                // registered cursor scope.
-                let hint = InvalidationHint {
-                    source: bifrost_types::PushSource::Coalesced,
-                    payload: HintPayload::Unknown,
-                };
-                if let Err(err) = self.reconcile(&hint, deferred).await {
-                    tracing::warn!(target: "bifrost.sync.reconcile", error=%err, "post-reconnect reconcile failed");
-                }
-            }
-            WatchEvent::Terminated(error) => {
-                // Push stream cannot be reconnected without engine
-                // intervention. Plan recovery and route engine
-                // directives through the reopen channel so the engine
-                // restarts the subscription (or escalates per its
-                // budget). Terminal classes broadcast a Terminated
-                // event so consumers observe the structured error.
-                use crate::recovery::{RecoveryPlan, directive_target_scope, plan_recovery};
-                let original = error.clone();
-                match plan_recovery(error) {
-                    RecoveryPlan::Engine(directive) => {
-                        let scope = directive_target_scope(&directive);
-                        let _ = self
-                            .reopen_tx
-                            .send(ReopenRequest::Recovery {
-                                scope,
-                                error: original,
-                            })
-                            .await;
-                    }
-                    RecoveryPlan::Retry(advice) => {
-                        // Push streams cannot retry inline; the
-                        // forwarder reconnects on the next iteration.
-                        // But a retryable termination can still carry a
-                        // provider-documented throttle deadline (the
-                        // stream died on a 429), and dropping it here
-                        // would hide it from polls and sibling
-                        // accounts. Record, then surface the warning.
-                        crate::recovery::record_throttle(
-                            &self.throttles,
-                            &self.account_id,
-                            &advice,
-                            &original,
-                        );
-                        let warning = bifrost_types::Warning::user_safe(
-                            bifrost_types::WarningKind::Other,
-                            "push stream terminated with retryable recovery",
-                        );
-                        let me = MultiplexerEvent {
-                            scope: CursorScope::Account,
-                            event: Arc::new(bifrost_types::SyncEvent::Warning(warning)),
-                            checkpoint: None,
-                            publication: None,
-                        };
-                        let _ = self.delivery.sender().send(me);
-                    }
-                    RecoveryPlan::Reconcile(advice) => {
-                        crate::recovery::record_reconcile_throttle(
-                            &self.throttles,
-                            &self.account_id,
-                            &advice,
-                            &original,
-                        );
-                        // Surface a warning so dashboards observe the
-                        // hiccup; the forwarder reconnects on its next
-                        // iteration.
-                        let warning = bifrost_types::Warning::user_safe(
-                            bifrost_types::WarningKind::Other,
-                            "push stream terminated with retryable recovery",
-                        );
-                        let me = MultiplexerEvent {
-                            scope: CursorScope::Account,
-                            event: Arc::new(bifrost_types::SyncEvent::Warning(warning)),
-                            checkpoint: None,
-                            publication: None,
-                        };
-                        let _ = self.delivery.sender().send(me);
-                    }
-                    RecoveryPlan::Terminal(fatal) => {
-                        let me = MultiplexerEvent {
-                            scope: CursorScope::Account,
-                            event: Arc::new(bifrost_types::SyncEvent::Terminated(
-                                fatal.into_inner(),
-                            )),
-                            checkpoint: None,
-                            publication: None,
-                        };
-                        let _ = self.delivery.sender().send(me);
-                    }
-                }
-            }
-            // `WatchEvent` is `#[non_exhaustive]`; an unknown variant
-            // is treated as a no-op wakeup.
-            _ => {}
-        }
-    }
-
-    async fn reconcile(
-        &self,
-        hint: &InvalidationHint,
-        deferred: &mut HashSet<CursorScope>,
-    ) -> Result<(), Error> {
-        let scopes = scopes_for_hint(&self.cursors, &hint.payload);
-        self.drive_scopes(scopes, deferred).await
-    }
-
     /// Drive each scope once, deferring any held by a scope-local throttle.
     /// Parking, deletion and every hold are re-checked here at DISPATCH, not
     /// when the scope was queued, so a scope deferred and then parked or
     /// deleted is never driven.
     async fn drive_scopes(
-        &self,
-        scopes: Vec<CursorScope>,
+        &mut self,
+        work: &mut WorkSet,
         deferred: &mut HashSet<CursorScope>,
     ) -> Result<(), Error> {
+        let scopes: Vec<_> = work.scopes.iter().cloned().collect();
         for scope in scopes {
+            #[cfg(test)]
+            if let Some(attempts) = &self.attempts {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            work.scopes.remove(&scope);
             // This dispatch speaks for any older deferral of the same scope:
             // drop it, so a fresh hint that drives the scope does not leave a
             // due entry behind for the timer to drive a second time. Every
@@ -440,10 +376,11 @@ impl Reconciler {
                 }
             };
             match outcome {
-                ChangesEvent::Advanced
-                | ChangesEvent::Done
-                | ChangesEvent::Stopped
-                | ChangesEvent::Paused => {}
+                ChangesEvent::Advanced | ChangesEvent::Done | ChangesEvent::Stopped => {}
+                ChangesEvent::Paused => {
+                    work.scopes.insert(scope);
+                    return Ok(());
+                }
                 ChangesEvent::Terminated(error) => {
                     use crate::recovery::{
                         RecoveryPlan, directive_target_scope, plan_recovery, retry_delay,
@@ -523,6 +460,11 @@ impl Reconciler {
                                 })
                                 .await;
                             if account_wide {
+                                work.hold = Some((
+                                    *self.account_generation.borrow_and_update(),
+                                    tokio::time::Instant::now()
+                                        + std::time::Duration::from_secs(30),
+                                ));
                                 return Ok(());
                             }
                             continue;
@@ -559,16 +501,6 @@ impl Reconciler {
             deferred.insert(scope.clone());
         }
     }
-
-    fn warning_event(&self, message: &str, kind: bifrost_types::WarningKind) -> MultiplexerEvent {
-        let warning = Warning::user_safe(kind, message);
-        MultiplexerEvent {
-            scope: CursorScope::Account,
-            event: Arc::new(bifrost_types::SyncEvent::Warning(warning)),
-            checkpoint: None,
-            publication: None,
-        }
-    }
 }
 
 /// Sleep for `due`, or never when nothing is deferred.
@@ -603,5 +535,164 @@ pub fn scopes_for_hint(registry: &CursorRegistry, hint: &HintPayload) -> Vec<Cur
         // reconcile under uncertainty - that is the contract for
         // `Unknown` and the safest default for any new variant.
         _ => registry.all_scopes(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::push::{PendingPush, PushIngress};
+    use bifrost_types::{FolderId, MembershipScope};
+    fn scope(name: &str) -> CursorScope {
+        CursorScope::Folder(FolderId(name.into()))
+    }
+    struct Harness {
+        ingress: Arc<PushIngress>,
+        boundary: crate::cancel::Boundary,
+        shutdown: CancellationToken,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Harness {
+        fn new(parked: bool, missing: bool, refused: bool) -> Self {
+            let account_id = AccountId("retained-work".into());
+            let account: Arc<dyn Account> =
+                Arc::new(crate::test_common::StubAccount::new(vec![scope("one")]));
+            let cursors = Arc::new(CursorRegistry::new());
+            if !missing {
+                cursors.put(crate::test_common::cursor_for(&scope("one"), b"live"));
+            }
+            let (boundary, view) = crate::cancel::Boundary::new();
+            let (priority, _) = tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+            let (bandwidth, _) = tokio::sync::watch::channel(None);
+            let control =
+                SyncControl::new(account_id.clone(), boundary.clone(), priority, bandwidth);
+            let (tx, _) = tokio::sync::broadcast::channel(8);
+            let (reopen_tx, _) = mpsc::channel(8);
+            let gate =
+                crate::scheduler::BudgetGate::new(crate::scheduler::ConcurrencyBudget::default());
+            gate.register(account_id.clone());
+            let scheduler =
+                crate::scheduler::Scheduler::new(crate::types::SchedulerConfig::default(), gate);
+            if refused {
+                scheduler.budget().forget(&account_id);
+            }
+            let tokens = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            if parked {
+                tokens
+                    .lock()
+                    .expect("tokens")
+                    .insert(scope("one"), crate::multiplexer::ScopeToken::tombstone());
+            }
+            let ingress = Arc::new(PushIngress::new(4));
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let shutdown = CancellationToken::new();
+            let reconciler = Reconciler {
+                account_id,
+                account: Arc::new(ArcSwap::from_pointee(account)),
+                cursors,
+                delivery: Arc::new(ChangeDelivery::new(tx)),
+                boundary: view,
+                shutdown: shutdown.clone(),
+                control,
+                reopen_tx,
+                throttles: Arc::new(std::sync::Mutex::new(crate::recovery::ThrottleBucket::new())),
+                scheduler,
+                scope_tokens: tokens,
+                account_generation: tokio::sync::watch::channel(0).1,
+                attempts: Some(Arc::clone(&attempts)),
+            };
+            let task = tokio::spawn(reconciler.run(Arc::clone(&ingress)));
+            Self {
+                ingress,
+                boundary,
+                shutdown,
+                attempts,
+                task,
+            }
+        }
+        fn attempts(&self) -> usize {
+            self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        async fn settle(&self) {
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+        }
+        async fn close(self) {
+            self.shutdown.cancel();
+            self.task.await.expect("reconciler joins");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_checkpoint_now_allows_at_most_one_drive_attempt() {
+        let harness = Harness::new(false, false, false);
+        harness
+            .boundary
+            .set(crate::cancel::BoundaryRequest::CheckpointNow);
+        harness.ingress.request_full();
+        harness.settle().await;
+        assert!(
+            harness.attempts() <= 1,
+            "checkpointing must not spin at admission"
+        );
+        harness.boundary.set(crate::cancel::BoundaryRequest::Run);
+        harness.settle().await;
+        assert_eq!(harness.attempts(), 1);
+        harness.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn undispatchable_scopes_are_discharged_without_spinning() {
+        for (parked, missing, refused) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let harness = Harness::new(parked, missing, refused);
+            harness
+                .ingress
+                .invalidate(&HintPayload::SpecificCursorScope(scope("one")));
+            harness.settle().await;
+            assert_eq!(harness.attempts(), 1);
+            harness.settle().await;
+            assert_eq!(harness.attempts(), 1);
+            harness.close().await;
+        }
+    }
+
+    #[test]
+    fn a_membership_hint_resolves_to_its_scopes_at_merge_time() {
+        let registry = CursorRegistry::new();
+        let membership = MembershipScope::Folder(FolderId("folder".into()));
+        let ingress = PushIngress::new(4);
+        ingress.invalidate(&HintPayload::SpecificMembership(membership.clone()));
+        registry.link_membership(membership, scope("one"));
+        let mut work = WorkSet::default();
+        work.merge(ingress.take(), &registry, &ingress);
+        assert_eq!(work.scopes, HashSet::from([scope("one")]));
+    }
+
+    #[test]
+    fn the_work_set_coarsens_on_merge_but_not_on_its_own_full_resolution() {
+        let registry = CursorRegistry::new();
+        let ingress = PushIngress::new(1);
+        let mut work = WorkSet::default();
+        for name in ["one", "two"] {
+            let pending = PendingPush {
+                scopes: HashSet::from([scope(name)]),
+                ..PendingPush::default()
+            };
+            work.merge(pending, &registry, &ingress);
+        }
+        assert!(work.full && work.scopes.is_empty());
+        assert_eq!(ingress.coarsened(), 1);
+        work.full = false;
+        work.scopes.extend([scope("one"), scope("two")]);
+        work.merge(PendingPush::default(), &registry, &ingress);
+        assert!(!work.full);
+        assert_eq!(work.scopes.len(), 2);
+        assert_eq!(ingress.coarsened(), 1);
     }
 }

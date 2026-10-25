@@ -820,8 +820,8 @@ where
                                 // with no id - notably the asynchronous
                                 // rejection of a push-enable frame, which
                                 // carries no id - is yielded exactly as before,
-                                // which is what the push reader's reconnect
-                                // logic reads.
+                                // which is what ends the push session
+                                // `Failed`.
                                 let request_id = err.request_id.clone();
                                 let error: crate::Error = ProblemDetails::from(err).into();
                                 let unrouted = match request_id.as_deref() {
@@ -860,7 +860,7 @@ where
                 // `Protocol(PartialResponse) + Attempt(Acknowledged)`.
                 // The stream yields the error and keeps reading rather than
                 // ending: recoverability is the consumer's call. The sync
-                // push reader breaks on first error; a future consumer that
+                // push session ends on the first error; a future consumer that
                 // does not must, or a persistently erroring socket that
                 // never terminates becomes a spin.
                 Err(err) => yield Err(crate::Error::WebSocketRuntime(err)),
@@ -1523,8 +1523,8 @@ mod tests {
     /// It must fail the waiter rather than ride the push stream, where
     /// the caller would never see it. One carrying no id - notably the
     /// asynchronous rejection of a push-enable frame, which has no id -
-    /// still reaches the stream, which is what the push reader's
-    /// reconnect logic reads.
+    /// still reaches the stream, which is what ends the push session
+    /// `Failed`.
     #[tokio::test]
     async fn a_request_error_fails_the_waiter_it_names() {
         let pending = Arc::new(PendingRequests::new());

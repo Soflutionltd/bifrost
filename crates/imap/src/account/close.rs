@@ -18,7 +18,6 @@ pub(crate) fn close(account: ImapAccount) -> AccountFuture<Result<(), AccountErr
                 // every caller must observe the same sub-account teardown result.
                 account.closed.store(true, Ordering::Release);
                 account.shutdown.cancel();
-                account.push.stop();
                 let account = account.clone();
                 let task = tokio::spawn(async move {
                     // Sends admitted before closure finish their side effects before

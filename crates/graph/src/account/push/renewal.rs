@@ -1,7 +1,4 @@
-//! The webhook renewal health worker: the tick loop that re-issues expiring
-//! Graph subscriptions, recreates the ones Graph has already dropped, emits
-//! `Disconnected` / `Reconnected` / `Terminated` on the push channel, and
-//! retires its own worker slot when nothing is left to renew.
+//! Webhook maintenance sessions and account-owned recreate effects.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -15,55 +12,38 @@ use crate::webhooks::{
     subscription_is_gone,
 };
 
-use super::common::{
-    PushEndpoint, announce_push_recovered, mark_push_disconnected, mark_push_reconnected,
-};
+use super::common::PushEndpoint;
 use super::webhook::{
     GraphSubscriptionGroup, GraphSubscriptionState, mark_subscription_terminated, recreated_ids,
 };
 
-pub(super) const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
+pub(crate) const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub(super) const RENEWAL_THRESHOLD_MINUTES: i64 = 30;
 
-pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
-    // The health latch is the ACCOUNT's, not this worker's. `subscribe_graph`
-    // reads the same flag to decide whether its own `Reconnected` is owed, and
-    // a worker-local copy let a subscribe during a degraded period announce a
-    // recovery this worker still believed had not happened (and, before the
-    // latch existed at all, announce one on every first subscribe).
-    loop {
-        tokio::select! {
-            () = account.shutdown.cancelled() => return,
-            () = tokio::time::sleep(RENEWAL_CHECK_INTERVAL) => {}
-        }
-
-        let due = {
-            let mut groups = account.graph_subscriptions.write().await;
-            if !has_live_graph_subscription_group(&groups) {
-                // Retire the slot BEFORE releasing the guard that made this
-                // decision. A concurrent `push_subscribe` cannot install its
-                // live group until this guard drops, so by the time its
-                // `ensure_graph_worker` runs the slot is empty and it spawns a
-                // replacement. Observing the emptiness here and letting the
-                // task merely run out instead left a window where the new
-                // subscription saw a still-unfinished `JoinHandle`, declined
-                // to spawn, and was never renewed until some later subscribe.
-                retire_graph_worker_slot(&account).await;
-                return;
+pub(crate) fn renewal_session(
+    account: GraphAccount,
+    stop: bifrost_types::SessionStop,
+    gate: bifrost_types::PushGate,
+) -> bifrost_types::AccountStream<bifrost_types::PushSessionEvent> {
+    use bifrost_types::{PushSessionEnd as End, PushSessionEvent as E};
+    Box::pin(async_stream::stream! {
+        let Some(_lease) = account.push_lease.try_claim() else { yield E::Failed(bifrost_types::push_lane_contract_error(bifrost_types::Protocol::Graph, bifrost_types::PushLane(0), "already driven")); return; };
+        let mut topology = account.graph_topology.subscribe();
+        let mut established = false;
+        loop {
+            while let Some(scope) = pop_gap(&account) { yield E::Invalidated(gap_hint(scope)); }
+            topology.borrow_and_update();
+            let live = { let groups = account.graph_subscriptions.read().await; has_live_graph_subscription_group(&groups) };
+            if !live {
+                tokio::select! { () = stop.stopped() => break, () = account.shutdown.cancelled() => break, _ = topology.changed() => {} }
+                continue;
             }
-            due_renewals(&mut groups)
-        };
-
+            if !established { established = true; yield E::Established; }
+            let due = { let mut groups = account.graph_subscriptions.write().await; due_renewals(&mut groups) };
+        // Whether any row in this pass failed non-terminally. Every row is
+        // attempted once regardless (a failing row must not starve its
+        // siblings); the pass then ends `Incomplete` instead of `Healthy`.
         let mut had_error = false;
-        // Whether this tick recreated at least one vanished subscription, and
-        // so owes the engine a reconcile for the window its resource had no
-        // subscription at all. ONE per tick, however many it recreated:
-        // `Reconnected` is account-wide (a `Coalesced` / `HintPayload::Unknown`
-        // invalidation over every registered scope), so the second and later
-        // emissions of a tick reconcile exactly what the first already did -
-        // and a tick that finds several subscriptions vanished is precisely
-        // the case where the redundant reconciles cost the most.
-        let mut recovered_gap = false;
         for DueRenewal {
             handle,
             server_id,
@@ -71,16 +51,11 @@ pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
             scopes,
         } in due
         {
-            // Cooperative cancellation, checked first (`biased`) at every due
-            // row: once `close()` has cancelled the token no further request
-            // is issued, and a PATCH already in flight is dropped. Dropping a
-            // renewal is harmless - it creates nothing, and the row it was
-            // extending is being deleted. The step that DOES create server
-            // state, the recreate below, runs in its own task and so is not
-            // affected by this worker being cancelled, joined or aborted.
+            tokio::select! { () = stop.stopped() => { yield E::Ended(End::Stopped); return; }, () = account.shutdown.cancelled() => { yield E::Ended(End::Stopped); return; }, () = gate.clear() => {} }
             let renewal = tokio::select! {
                 biased;
-                () = account.shutdown.cancelled() => return,
+                () = account.shutdown.cancelled() => { yield E::Ended(End::Stopped); return; },
+                () = stop.stopped() => { yield E::Ended(End::Stopped); return; },
                 result = renew_subscription(&account.client, &server_id, None) => result,
             };
             match renewal {
@@ -115,14 +90,12 @@ pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
                                     // The resource had NO live subscription
                                     // between its disappearance and this
                                     // create, and Graph does not replay
-                                    // notifications for that window.
-                                    // `Reconnected` is the only event the
-                                    // engine turns into a full reconcile
-                                    // across every registered scope, so
-                                    // without it the changes missed while the
-                                    // subscription was absent wait for the
-                                    // ordinary poll interval.
-                                    recovered_gap = true;
+                                    // notifications for that window. The
+                                    // install queued the row's scopes on
+                                    // `pending_gaps` under the same lock,
+                                    // and the drain after this pass (or the
+                                    // next session, if this one is dropped)
+                                    // invalidates them.
                                     continue;
                                 }
                                 Ok(
@@ -154,14 +127,11 @@ pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
                         _ => context,
                     };
                     let account_error = into_account_error(error, context);
-                    // Terminal recovery classes (AuthLost,
-                    // NeedsPolicyChange, NoPermission, etc.) cannot
-                    // be recovered without engine intervention.
-                    // Surface them on the push channel so the engine
-                    // tears the subscription down. Retryable classes
-                    // ride out the next renewal tick - we log
-                    // structured telemetry instead of formatted text
-                    // so the dashboard can group on kind / message-key.
+                    // Every failure is reported to the engine as
+                    // `UnitFailed`, which owns its throttle, directive or
+                    // terminal broadcast. The structured telemetry is
+                    // logged here too so dashboards can group on kind /
+                    // message-key.
                     {
                         let telemetry = account_error.telemetry_fields();
                         tracing::warn!(
@@ -180,37 +150,48 @@ pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
                         // A 404 from the replacement create is a permanent
                         // refusal for this resource (for example, its folder
                         // was deleted). Keep the old row reachable by
-                        // teardown, but stop the worker from issuing the same
-                        // doomed PATCH and POST on every tick.
+                        // teardown, but stop every later pass from issuing the
+                        // same doomed PATCH and POST.
                         // Flagged, not removed: renewing stops, but teardown
                         // must still be able to DELETE it.
                         mark_subscription_terminated(&account, &handle, &server_id).await;
-                        super::super::push_stream::publish_terminal(&account, account_error);
+
                     }
-                    had_error = true;
+                    had_error |= !account_error.recovery().is_terminal();
+                    yield E::UnitFailed(account_error);
                 }
             }
         }
 
-        // Order matters when a tick both recreated one subscription and failed
-        // another: the recovery is announced first (it names a gap that really
-        // happened and clears the latch), then the health latch is raised for
-        // the resource that is still failing. That is the same event sequence
-        // the per-recreate emission produced, minus its duplicates.
-        if recovered_gap {
-            announce_push_recovered(&account);
+        while let Some(scope) = pop_gap(&account) { yield E::Invalidated(gap_hint(scope)); }
+        let retired = { let groups = account.graph_subscriptions.read().await; groups.values().any(|g| !g.tearing_down && g.subscriptions.iter().any(|s| s.terminated)) };
+        if had_error || retired { yield E::Ended(End::Incomplete); return; }
+        yield E::Healthy;
+        tokio::select! { () = stop.stopped() => break, () = account.shutdown.cancelled() => break, () = tokio::time::sleep(RENEWAL_CHECK_INTERVAL) => {} }
         }
-        if had_error {
-            mark_push_disconnected(&account);
-        } else {
-            mark_push_reconnected(&account);
-        }
+        yield E::Ended(End::Stopped);
+    })
+}
+fn pop_gap(account: &GraphAccount) -> Option<CursorScope> {
+    account
+        .pending_gaps
+        .lock()
+        .expect("push gap lock")
+        .pop_front()
+}
+/// A recreated row's coverage gap: one precise scope, so it names the Graph
+/// subscription source rather than the wide-wake-up `Coalesced`.
+fn gap_hint(scope: CursorScope) -> bifrost_types::InvalidationHint {
+    bifrost_types::InvalidationHint {
+        source: bifrost_types::PushSource::GraphSubscription,
+        payload: bifrost_types::HintPayload::SpecificCursorScope(scope),
     }
 }
 
 /// Whether any registered subscription still needs renewing. A condemned
 /// group and a `terminated` row both stay registered for teardown's sake and
-/// both need nothing from the worker, so neither keeps it alive.
+/// both need nothing from a renewal pass, so with only those left a session
+/// parks instead of running one.
 pub(super) fn has_live_graph_subscription_group(
     groups: &HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
 ) -> bool {
@@ -219,16 +200,7 @@ pub(super) fn has_live_graph_subscription_group(
     })
 }
 
-/// Clear the worker slot on the way out of `run_graph_subscription_worker`,
-/// so `ensure_graph_worker` starts a fresh worker for the next subscription.
-/// See `worker_slot` for the ordering rule this call is one half of; the
-/// caller must still hold the `graph_subscriptions` guard that decided to
-/// exit.
-async fn retire_graph_worker_slot(account: &GraphAccount) {
-    crate::account::worker_slot::retire_worker_slot(&account.graph_worker).await;
-}
-
-/// One subscription inside the renewal threshold, with everything the worker
+/// One subscription inside the renewal threshold, with everything a pass
 /// needs to renew it, recreate it, or report what it covered.
 #[derive(Debug, Clone)]
 pub(super) struct DueRenewal {
@@ -284,7 +256,7 @@ pub(super) fn due_renewals(
     due
 }
 
-/// What happened to a subscription the renewal worker had to recreate.
+/// What happened to a subscription a renewal pass had to recreate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Replacement {
     /// The fresh subscription took the vanished one's place in the group.
@@ -312,17 +284,10 @@ struct ReplaceRequest {
 /// stale entry in place for the next renewal tick to retry - the resource
 /// keeps a row that reads as due rather than silently losing coverage.
 ///
-/// The create, the install and the undo run in a task the ACCOUNT's runtime
-/// owns; this future only awaits it. The renewal worker is cancelled by
-/// `close()`, aborted by `unsubscribe_graph` when the last group goes, and
-/// dropped by the runtime, and an inline body was torn down wherever it stood:
-/// after the create returned and before the new id was recorded, or in the
-/// middle of the undo DELETE, which stranded a live server subscription no
-/// group knew about. A spawned task is not torn down by its awaiter going
-/// away, and it has no hand-off to acknowledge: the install is its own effect
-/// (there is no caller holding a handle to it), so a lost result costs only
-/// the `Reconnected` the worker would have announced, and the worker is only
-/// ever cancelled when the account is closing or the handle is being retired.
+/// The account owns the create, install and undo task. Dropping its session
+/// only drops the reply receiver; committed gap obligations remain queued for
+/// the next session. Close awaits these effects under its bounded join and
+/// detaches unfinished tasks instead of aborting them.
 ///
 /// What cannot be made safe: a create whose response never arrived may have
 /// succeeded on Graph and its id is unknowable (see `run_subscribe` in
@@ -343,14 +308,18 @@ pub(super) async fn replace_gone_subscription(
         resource: resource.to_string(),
         scopes: scopes.to_vec(),
     };
-    tokio::spawn(async move { create_and_install_replacement(&account, request).await })
-        .await
-        .unwrap_or_else(|_| {
-            // The task panicked or the runtime is shutting down under it.
-            Err(crate::error::GraphError::RuntimeFailure {
-                message: "the webhook replacement task ended without an answer".to_string(),
-            })
+    let (reply, response) = tokio::sync::oneshot::channel();
+    let owner = account.clone();
+    let task = tokio::spawn(async move {
+        let _ = reply.send(create_and_install_replacement(&owner, request).await);
+    });
+    crate::account::push_tasks::track(&account, task);
+    response.await.unwrap_or_else(|_| {
+        // The task panicked or the runtime is shutting down under it.
+        Err(crate::error::GraphError::RuntimeFailure {
+            message: "the webhook replacement task ended without an answer".to_string(),
         })
+    })
 }
 
 async fn create_and_install_replacement(
@@ -388,6 +357,7 @@ async fn create_and_install_replacement(
         terminated: false,
     };
     let created_id = replacement.server_id.clone();
+    let gap_scopes = replacement.scopes.clone();
 
     let mut groups = account.graph_subscriptions.write().await;
     // Checked under the write lock and paired with `retire_all_graph_
@@ -401,6 +371,11 @@ async fn create_and_install_replacement(
     let installed = !account.shutdown.is_cancelled()
         && install_replacement(&mut groups, &handle, &stale_server_id, replacement);
     if installed {
+        account
+            .pending_gaps
+            .lock()
+            .expect("push gap lock")
+            .extend(gap_scopes);
         // The handle string cannot name the new id, so record it where an
         // orphan teardown on a reopened instance will look; see
         // `RecreatedSubscriptionIds`. Under the same write lock as the
@@ -458,7 +433,7 @@ pub(super) fn record_recreated_id(
 /// the caller deletes the subscription it just minted. Two refusals:
 ///
 /// - `handle` is no longer registered. The lookup is a plain `get_mut`,
-///   never an `entry().or_insert_with()`: the worker's due list is a
+///   never an `entry().or_insert_with()`: a pass's due list is a
 ///   snapshot, and a concurrent `push_unsubscribe` can retire the handle
 ///   before the replacement lands. Re-creating the group there would
 ///   contradict a teardown the caller was already told succeeded.

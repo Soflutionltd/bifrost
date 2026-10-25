@@ -69,6 +69,9 @@ impl Fixture {
             capabilities: &slot.capabilities,
             subscriptions: &self.engine.subscriptions,
             account_generation_tx: &slot.account_generation_tx,
+            push_retired: &slot.push_retired_tx,
+            push_drain_wait: Duration::from_secs(30),
+            expected_generation: None,
             reopen_lock: &slot.reopen_lock,
             open_skips: &slot.open_skips,
             shutdown: &slot.shutdown,
@@ -1177,4 +1180,42 @@ async fn completed_reset_establishments_park_as_scope_repairs_on_a_second_pause(
     };
     assert_eq!(scopes, HashMap::from([(SCOPE, 0)]));
     fixture.engine.detach(&fixture.id).await.expect("detach");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stale_push_recovery_is_declined_after_its_account_was_replaced() {
+    let initial = Arc::new(common::StubAccount::new(vec![]));
+    let replacement = Arc::new(common::StubAccount::new(vec![]));
+    let fixture = Fixture::new(Arc::new(common::StubFactory::queue(vec![
+        initial,
+        Arc::clone(&replacement),
+        Arc::new(common::StubAccount::new(vec![])),
+    ])))
+    .await;
+    let error = bifrost_types::AccountErrorBuilder::new(
+        bifrost_types::AccountErrorKind::SyncState(
+            bifrost_types::SyncStateErrorKind::CapabilityChanged,
+        ),
+        Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
+    )
+    .try_build()
+    .unwrap();
+    for _ in 0..2 {
+        fixture
+            .slot
+            .reopen_tx
+            .send(ReopenRequest::PushRecovery {
+                scope: None,
+                error: error.clone(),
+                generation: 0,
+            })
+            .await
+            .unwrap();
+    }
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(*fixture.slot.account_generation_tx.borrow(), 1);
+    assert_eq!(replacement.closed.load(Ordering::SeqCst), 0);
+    fixture.engine.shutdown().await.unwrap();
 }

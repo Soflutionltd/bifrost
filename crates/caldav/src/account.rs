@@ -618,8 +618,19 @@ impl Account for CalDavAccount {
         unsupported_future(AccountOperation::PushUnsubscribe)
     }
 
-    fn push_stream(&self) -> AccountStream<WatchEvent> {
-        Box::pin(stream::empty())
+    fn push_stream(
+        &self,
+        lane: bifrost_types::PushLane,
+        _stop: bifrost_types::SessionStop,
+        _gate: bifrost_types::PushGate,
+    ) -> AccountStream<bifrost_types::PushSessionEvent> {
+        Box::pin(futures::stream::iter([
+            bifrost_types::PushSessionEvent::Failed(bifrost_types::push_lane_contract_error(
+                self.protocol(),
+                lane,
+                "not a lane of this account",
+            )),
+        ]))
     }
 
     fn open_blob(&self, _handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {

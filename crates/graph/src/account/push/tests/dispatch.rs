@@ -186,8 +186,8 @@ fn subscription_handles_are_distinct_hex_tokens() {
 
 /// An empty scope list is not a subscription. Registering one minted a
 /// handle over an empty group: teardown had no server id to walk, so the
-/// group was never retired and the renewal worker it started was never
-/// stopped. Both modes refuse it before any state is installed.
+/// group was never retired and kept the renewal lane believing it had a
+/// registration. Both modes refuse it before any state is installed.
 #[tokio::test]
 async fn subscribing_to_no_scopes_is_rejected_in_both_modes() {
     for mode in [PushMode::GraphSubscriptions, PushMode::EwsStreaming] {
@@ -294,10 +294,6 @@ async fn a_ledger_that_cannot_close_leaves_nothing_registered_in_either_mode() {
         account.graph_subscriptions.read().await.is_empty(),
         "no group may be registered behind an Err that carries no handle"
     );
-    assert!(
-        account.graph_worker.lock().await.is_none(),
-        "no renewal worker may be started for it"
-    );
     let requests = client.take_rest_requests();
     assert_eq!(
         requests
@@ -330,7 +326,6 @@ async fn a_ledger_that_cannot_close_leaves_nothing_registered_in_either_mode() {
         &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated)
     );
     assert!(account.ews_subscriptions.read().await.is_empty());
-    assert!(account.ews_worker.lock().await.is_none());
     assert_eq!(*account.ews_topology.borrow(), 0);
 }
 

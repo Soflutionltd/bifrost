@@ -241,7 +241,7 @@ impl AccountFactory for JmapAccountFactory {
             // account-level `Folder` scope instead of the primary type
             // scope.
             let push_routing = Arc::new(PushRouting::new(primary_id.clone(), seed_states.keys()));
-            let ws = WsState::spawn(
+            let ws = WsState::new(
                 client.clone(),
                 caps.push_in_process(),
                 shutdown.clone(),

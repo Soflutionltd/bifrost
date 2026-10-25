@@ -96,8 +96,8 @@ pub struct MultiplexerConfig {
     /// Ceiling on the adaptive cadence (interval doubles on five
     /// consecutive no-change ticks up to this maximum).
     pub poll_max: Duration,
-    /// Bound on the per-account `WatchEvent` buffer fed by the push
-    /// reconciler.
+    /// Distinct hinted scopes and memberships retained before collapsing
+    /// into one full reconcile.
     pub watch_capacity: usize,
     /// Bound on the per-account broadcast carrying the unified
     /// `account_changes_stream` payload.
@@ -203,7 +203,7 @@ impl Default for BackfillConfig {
 
 /// Push reconciler config.
 ///
-/// Capacity for the per-account `WatchEvent` mpsc lives on
+/// Capacity for per-account pending invalidation intent lives on
 /// `MultiplexerConfig::watch_capacity`; push-only knobs live here.
 #[derive(Debug, Clone, Copy)]
 pub struct PushConfig {
@@ -282,6 +282,9 @@ pub(crate) struct AccountSlot {
     /// lived push and lifecycle streams select on it so they drop the
     /// old stream even when that stream never terminates itself.
     pub account_generation_tx: watch::Sender<u64>,
+    pub push_health_tx: watch::Sender<crate::push::health::PushHealth>,
+    pub push_topology_tx: watch::Sender<u64>,
+    pub push_retired_tx: watch::Sender<u64>,
     pub reopen_lock: Arc<tokio::sync::Mutex<()>>,
     pub capabilities: Arc<std::sync::RwLock<AccountCapabilities>>,
     pub multiplexer: MultiplexerHandle,
@@ -364,8 +367,8 @@ pub(crate) enum WorkerRole {
     ControlApplier,
     /// Push reconciler: turns watch events into driven scopes.
     PushReconciler,
-    /// Drains `Account::push_stream` into the per-account watch queue.
-    PushForwarder,
+    /// Supervises push sessions and their bounded cleanup.
+    PushLanes,
     /// The per-scope poll multiplexer.
     Multiplexer,
     /// Walks registered scopes and runs their backfill partitions.

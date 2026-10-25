@@ -42,7 +42,7 @@ use bifrost_types::{
     Checkpoint, CursorEstablishment, CursorScope, DiagnosticText, EngineDirective, ErrorScope,
     InvalidationSink, InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope,
     MutationSuccess, OpenedAccount, PageBoundary, PauseReason, Priority, ReconcileAction,
-    ReconcileAdvice, RecoveryClass, RetryAdvice, SkippedScope, SyncEvent, WatchEvent,
+    ReconcileAdvice, RecoveryClass, RetryAdvice, SkippedScope, SyncEvent,
 };
 use dashmap::DashMap;
 use futures::stream::StreamExt;
@@ -546,7 +546,8 @@ impl SyncEngine {
         // before cleanup begins. It does NOT claim publication has stopped.
         //
         // Respond promptly: the control applier, the bandwidth feed, the push
-        // forwarder, the multiplexer main loop, the push reconciler, and
+        // lane supervisor (which then drains its sessions within its
+        // `drain_bound`), the multiplexer main loop, the push reconciler, and
         // backfill and deferred inventory while in their subscriber / pause /
         // throttle / capacity / admission waits.
         //
@@ -1023,6 +1024,9 @@ impl SyncEngine {
             capabilities: &slot.capabilities,
             subscriptions: &self.subscriptions,
             account_generation_tx: &slot.account_generation_tx,
+            push_retired: &slot.push_retired_tx,
+            push_drain_wait: self.config.detach_timeout,
+            expected_generation: None,
             reopen_lock: &slot.reopen_lock,
             open_skips: &slot.open_skips,
             shutdown: &slot.shutdown,
@@ -1194,6 +1198,17 @@ impl SyncEngine {
         self.accounts.iter().map(|r| r.key().clone()).collect()
     }
 
+    /// Observe current push coverage, including from a late subscriber.
+    pub fn push_health(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<watch::Receiver<crate::push::health::PushHealth>, Error> {
+        self.accounts
+            .get(account_id)
+            .map(|s| s.push_health_tx.subscribe())
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))
+    }
+
     /// Server-side subscription teardown.
     pub async fn unsubscribe_push(&self, account_id: &AccountId) -> Result<(), Error> {
         let slot = self
@@ -1211,6 +1226,7 @@ impl SyncEngine {
         let mut failed = Vec::new();
         let mut first_error = None;
         for record in records {
+            let _topology = TopologyBump(&slot.push_topology_tx);
             if let Err(error) = account.push_unsubscribe(record.handle.clone()).await {
                 tracing::warn!(target: "bifrost.sync.reconcile", error=?error, "push_unsubscribe failed; retaining handle for retry");
                 if first_error.is_none() {
@@ -1267,7 +1283,10 @@ impl SyncEngine {
             return Err(Error::AccountNotAttached(account_id.clone()));
         }
         let account = slot.current.load_full();
-        let result = account.push_subscribe(scopes).await?;
+        let result = {
+            let _topology = TopologyBump(&slot.push_topology_tx);
+            account.push_subscribe(scopes).await?
+        };
         let covered = accepted_push_scopes(&result);
         for failure in result.outcomes.failed() {
             tracing::warn!(
@@ -1296,7 +1315,9 @@ impl SyncEngine {
             // Detached onto its own task and then awaited, so a caller that drops
             // this future while the delete is parked cannot strand the handle.
             let handle = handle.clone();
+            let topology = slot.push_topology_tx.clone();
             let cleanup = tokio::spawn(async move {
+                let _topology = TopologyBump(&topology);
                 if let Err(error) = account.push_unsubscribe(handle).await {
                     tracing::warn!(
                         target: "bifrost.sync.push",
@@ -1364,5 +1385,12 @@ impl Drop for SyncEngine {
         //     engine. Otherwise workers may keep running briefly,
         //     and any unacknowledged cursor advances are lost.
         self.root_cancel.cancel();
+    }
+}
+
+struct TopologyBump<'a>(&'a watch::Sender<u64>);
+impl Drop for TopologyBump<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|v| *v = v.saturating_add(1));
     }
 }

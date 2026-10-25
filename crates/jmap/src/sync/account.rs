@@ -17,7 +17,7 @@ use bifrost_types::{
     Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo,
     RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendAs, SendRequest, ServerFilter,
     ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
-    SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -708,8 +708,45 @@ impl Account for JmapAccount {
         )
     }
 
-    fn push_stream(&self) -> AccountStream<WatchEvent> {
-        push::stream(self.ws.tx.subscribe(), self.shutdown.clone())
+    fn push_lanes(&self) -> Vec<bifrost_types::PushLaneSpec> {
+        if !self.ws.available {
+            return Vec::new();
+        }
+        vec![bifrost_types::PushLaneSpec {
+            lane: bifrost_types::PushLane(0),
+            kind: bifrost_types::PushLaneKind::Connection,
+            backoff: bifrost_types::BackoffPolicy::new(
+                self.ws.policy.initial,
+                self.ws.policy.max,
+                false,
+            ),
+        }]
+    }
+    fn push_stream(
+        &self,
+        lane: bifrost_types::PushLane,
+        stop: bifrost_types::SessionStop,
+        _gate: bifrost_types::PushGate,
+    ) -> AccountStream<bifrost_types::PushSessionEvent> {
+        if lane != bifrost_types::PushLane(0) || !self.ws.available {
+            return Box::pin(futures::stream::iter([
+                bifrost_types::PushSessionEvent::Failed(bifrost_types::push_lane_contract_error(
+                    bifrost_types::Protocol::Jmap,
+                    lane,
+                    "not a lane of this account",
+                )),
+            ]));
+        }
+        push::session(
+            self.client.clone(),
+            Arc::clone(&self.ws.enabled),
+            Arc::clone(&self.ws.push_state),
+            self.shutdown.clone(),
+            self.ws.policy,
+            Arc::clone(&self.ws.routing),
+            self.ws.lease.clone(),
+            stop,
+        )
     }
 
     fn open_blob(&self, handle: BlobHandle) -> AccountStream<SyncEvent<bytes::Bytes>> {
@@ -1564,16 +1601,15 @@ impl Account for JmapAccount {
         let close_completion = Arc::clone(&self.close_completion);
         let client = self.client.clone();
         let shutdown = self.shutdown.clone();
-        let reader = self.ws.reader_handle();
         let subscriptions = Arc::clone(&self.subscriptions);
         let enabled = Arc::clone(&self.ws.enabled);
         let push_state = Arc::clone(&self.ws.push_state);
-        // The same bound the reader applies to its own setup awaits. Both
-        // steps below are WebSocket sink writes or a task join, and a
-        // half-open socket parks either indefinitely - which would block
-        // the engine's teardown and reopen on a connection that is already
-        // gone. Teardown must be bounded on exactly the paths that motivated
-        // bounding the reader.
+        // The same bound a push session applies to its own setup awaits.
+        // The disable below is a WebSocket sink write, and a half-open
+        // socket parks it indefinitely - which would block the engine's
+        // teardown and reopen on a connection that is already gone.
+        // Teardown must be bounded on exactly the paths that motivated
+        // bounding the session's setup.
         let teardown_timeout = self.ws.teardown_timeout();
 
         close_once(close_completion, move || {
@@ -1595,9 +1631,8 @@ impl Account for JmapAccount {
                     // subscription with it, so this is not a close failure.
                     Err(_) => Ok(()),
                 };
-                // The task is joined before this shared completion resolves,
-                // so every close caller observes the reader's stop.
-                super::push::join_reader(&reader, teardown_timeout).await;
+                // No reader task to join: push sessions are engine-driven and
+                // observe `shutdown`, cancelled above, at every await.
                 close_outcome(result)
             }
         })

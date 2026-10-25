@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backfill;
+mod backoff;
 pub mod cancel;
 pub mod control;
 pub mod cursor;
@@ -52,7 +53,7 @@ pub use engine::{SyncEngine, SyncEngineBuilder};
 pub use bifrost_types::{Control, Priority};
 
 // Push surface (sink + watch events).
-pub use bifrost_types::{InvalidationSink, WatchEvent};
+pub use bifrost_types::{InvalidationSink, SinkPush, WatchEvent};
 
 // Engine-side error and the shared warning vocabulary. Terminal
 // account errors are surfaced through `bifrost_types::Fatal` (the
@@ -100,3 +101,5 @@ pub use mutation::{
 // Multiplexer types consumers want to pattern-match against (the
 // per-account broadcast yields `MultiplexerEvent`).
 pub use multiplexer::{ChangesReceiver, MultiplexerEvent, ReopenRequest};
+
+pub use push::health::{PushHealth, PushLaneHealth, PushLaneState};

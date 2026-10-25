@@ -45,16 +45,18 @@ pub enum BlobRangeSupport {
 #[non_exhaustive]
 pub enum PushCapability {
     /// JMAP WebSocket / SSE, IMAP IDLE/NOTIFY, EWS streaming
-    /// notifications. Push events flow on the in-process
-    /// `push_stream`.
+    /// notifications. Notifications ride the account's `Connection`
+    /// push lanes (`Account::push_stream` sessions).
     InProcess,
     /// Gmail Pub/Sub. Subscription CRUD lives on the Account; the
     /// listener is wired by the consumer and feeds the engine's
-    /// `InvalidationSink`.
+    /// `InvalidationSink`. The account's `Registration` lane only
+    /// maintains the watch.
     OutOfProcessPubsub,
     /// Microsoft Graph `/subscriptions` webhooks. Subscription CRUD
     /// lives on the Account; the receiver is wired by the consumer
-    /// and feeds the `InvalidationSink`.
+    /// and feeds the `InvalidationSink`. The account's `Registration`
+    /// lane only maintains the rows.
     WebhookOrEwsStream,
     /// Protocol exposes no push primitive; engine falls back to
     /// poll-only scheduling.
@@ -482,12 +484,12 @@ pub struct AccountCapabilities {
 }
 
 impl AccountCapabilities {
-    /// True iff `push_stream` delivers `Invalidated` events directly
-    /// (IMAP IDLE / NOTIFY, JMAP WebSocket, EWS streaming
-    /// notifications). False for out-of-process push paths (Gmail
-    /// Pub/Sub, Graph webhooks), where `Invalidated` arrives via
-    /// the engine's `InvalidationSink` and `push_stream` carries
-    /// only optional subscription-health transitions.
+    /// True iff push sessions carry the notifications themselves
+    /// (IMAP IDLE / NOTIFY, JMAP WebSocket, EWS streaming). False for
+    /// out-of-process push paths (Gmail Pub/Sub, Graph webhooks),
+    /// where `Invalidated` arrives via the engine's
+    /// `InvalidationSink` and the account's push session only
+    /// maintains the server registration.
     ///
     /// Derived from `push` so the two encodings cannot drift.
     #[must_use]

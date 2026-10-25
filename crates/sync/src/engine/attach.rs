@@ -229,12 +229,9 @@ impl SyncEngine {
         let (priority_tx, priority_rx) = watch::channel(Priority::Normal);
         let (bandwidth_cap_tx, bandwidth_cap_rx) = watch::channel(None);
 
-        // Per-account watch-event sender / receiver. The reconciler
-        // owns the receiver; the multiplexer (in-process forwarder)
-        // and the engine's `InvalidationSink` both feed the sender.
-        let (watch_tx, watch_rx) =
-            mpsc::channel::<WatchEvent>(self.config.multiplexer.watch_capacity);
-        self.sink.register(account_id.clone(), watch_tx.clone());
+        let ingress = self
+            .sink
+            .new_ingress(self.config.multiplexer.watch_capacity);
 
         // Per-account ack channel: consumers push
         // (scope, checkpoint) here after committing the matching
@@ -288,6 +285,15 @@ impl SyncEngine {
         // observation that the channel is bounded and the listener is serial
         // is not that evidence.
         let (reopen_tx, mut reopen_rx) = mpsc::channel::<ReopenRequest>(16);
+
+        let sink_target = crate::push::SinkTarget {
+            ingress: Arc::clone(&ingress),
+            delivery: Arc::clone(&delivery),
+            reopen_tx: reopen_tx.clone(),
+            throttles: Arc::clone(&throttles),
+            boundary: boundary_view.clone(),
+        };
+        self.sink.register(account_id.clone(), sink_target.clone());
 
         let mut workers: Vec<WorkerTask> = Vec::new();
 
@@ -391,117 +397,53 @@ impl SyncEngine {
             throttles: Arc::clone(&throttles),
             scheduler: self.scheduler.clone(),
             scope_tokens: Arc::clone(&scope_tokens),
+            account_generation: account_generation_rx.clone(),
+            #[cfg(test)]
+            attempts: None,
         };
         spawn(
             crate::types::WorkerRole::PushReconciler,
-            tokio::spawn(reconciler.run(watch_rx)),
+            tokio::spawn(reconciler.run(Arc::clone(&ingress))),
         );
 
-        // Push forwarder: drain `Account::push_stream` into the
-        // per-account mpsc. In-process accounts carry invalidations
-        // and health here; out-of-process accounts may carry only
-        // subscription-health transitions.
-        {
-            let acc = Arc::clone(&current);
-            let aid = account_id.clone();
-            let tx = watch_tx.clone();
-            let sd = shutdown.clone();
-            let mut generation = account_generation_rx.clone();
-            spawn(
-                crate::types::WorkerRole::PushForwarder,
-                tokio::spawn(async move {
-                    let mut reconnect_delay = Duration::from_millis(50);
-                    loop {
-                        if sd.is_cancelled() {
-                            return;
-                        }
-                        let acc_arc = acc.load_full();
-                        if acc_arc.capabilities().push == bifrost_types::PushCapability::None {
-                            tokio::select! {
-                                () = sd.cancelled() => return,
-                                changed = generation.changed() => {
-                                    if changed.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        let mut stream = acc_arc.push_stream();
-                        let mut received = false;
-                        let mut reopened = false;
-                        loop {
-                            tokio::select! {
-                                () = sd.cancelled() => return,
-                                changed = generation.changed() => {
-                                    if changed.is_err() {
-                                        return;
-                                    }
-                                    reopened = true;
-                                    break;
-                                }
-                                next = stream.next() => {
-                                    let Some(event) = next else { break; };
-                                    if !matches!(&event, WatchEvent::Terminated(_)) {
-                                        received = true;
-                                    }
-                                    match tx.try_send(event) {
-                                        Ok(()) => {}
-                                        Err(mpsc::error::TrySendError::Full(rejected)) => {
-                                            tracing::trace!(
-                                                target: "bifrost.sync.changes",
-                                                account = ?aid,
-                                                "in-process push: queue full, coalesced"
-                                            );
-                                            let lossless =
-                                                crate::push::requires_lossless_delivery(&rejected);
-                                            let delivery = if lossless {
-                                                rejected
-                                            } else {
-                                                crate::push::coalesced_event(rejected)
-                                            };
-                                            if lossless {
-                                                tokio::select! {
-                                                    () = sd.cancelled() => return,
-                                                    _ = tx.send(delivery) => {}
-                                                }
-                                            } else {
-                                                tokio::select! {
-                                                    () = sd.cancelled() => return,
-                                                    _ = tokio::time::timeout(
-                                                        Duration::from_millis(100),
-                                                        tx.send(delivery),
-                                                    ) => {}
-                                                }
-                                            }
-                                        }
-                                        Err(mpsc::error::TrySendError::Closed(_)) => return,
-                                    }
-                                }
-                            }
-                        }
-                        if reopened {
-                            reconnect_delay = Duration::from_millis(50);
-                            continue;
-                        }
-                        if received {
-                            reconnect_delay = Duration::from_millis(50);
-                        }
-                        // push_stream ended; loop reloads the (possibly
-                        // reopened) handle and restarts. Exponential
-                        // backoff prevents an empty stream implementation
-                        // from reconstructing itself 20 times per second.
-                        tokio::select! {
-                            () = sd.cancelled() => return,
-                            () = tokio::time::sleep(reconnect_delay) => {}
-                        }
-                        reconnect_delay = reconnect_delay
-                            .saturating_mul(2)
-                            .min(Duration::from_secs(30));
-                    }
-                }),
-            );
-        }
+        let (push_health_tx, _) = watch::channel(crate::push::health::PushHealth {
+            generation: 0,
+            lanes: if current.load().capabilities().push == bifrost_types::PushCapability::None {
+                Vec::new()
+            } else {
+                current
+                    .load()
+                    .push_lanes()
+                    .into_iter()
+                    .map(|spec| crate::push::health::PushLaneHealth {
+                        lane: spec.lane,
+                        kind: spec.kind,
+                        state: crate::push::health::PushLaneState::Starting,
+                    })
+                    .collect()
+            },
+        });
+        let (push_topology_tx, push_topology_rx) = watch::channel(0_u64);
+        let (push_retired_tx, _) = watch::channel(0_u64);
+        let push_lanes = crate::push::lanes::PushLanes {
+            account_id: account_id.clone(),
+            current: Arc::clone(&current),
+            generation: account_generation_rx.clone(),
+            topology: push_topology_rx,
+            ingress: Arc::clone(&ingress),
+            delivery: Arc::clone(&delivery),
+            reopen_tx: reopen_tx.clone(),
+            throttles: Arc::clone(&throttles),
+            boundary: boundary_view.clone(),
+            shutdown: shutdown.clone(),
+            health: push_health_tx.clone(),
+            retired: push_retired_tx.clone(),
+            drain_bound: self.config.detach_timeout / 2,
+        };
+        spawn(
+            crate::types::WorkerRole::PushLanes,
+            tokio::spawn(push_lanes.run()),
+        );
 
         // Spawn the multiplexer.
         let multiplexer_cancel = shutdown.child_token();
@@ -558,6 +500,9 @@ impl SyncEngine {
             capabilities: Arc::clone(&capabilities),
             subscriptions: Arc::clone(&self.subscriptions),
             account_generation_tx: account_generation_tx.clone(),
+            push_retired: push_retired_tx.clone(),
+            push_topology: push_topology_tx.clone(),
+            push_drain_wait: self.config.detach_timeout,
             reopen_lock: Arc::clone(&reopen_lock),
             open_skips: Arc::clone(&open_skips),
             shutdown: shutdown.clone(),
@@ -618,6 +563,11 @@ impl SyncEngine {
                         req = reopen_rx.recv() => {
                             let Some(req) = req else { return; };
                             match req {
+                                ReopenRequest::PushRecovery { scope, error, generation } => {
+                                    reopen_ctx
+                                        .recover_stamped(scope, error, Some(generation))
+                                        .await;
+                                }
                                 ReopenRequest::Recovery { scope, error } => {
                                     reopen_ctx.recover(scope, error).await;
                                 }
@@ -754,6 +704,9 @@ impl SyncEngine {
             factory,
             current,
             account_generation_tx,
+            push_health_tx,
+            push_topology_tx,
+            push_retired_tx,
             reopen_lock,
             capabilities,
             multiplexer,

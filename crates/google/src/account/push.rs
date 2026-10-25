@@ -1,15 +1,15 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AccountStream, BatchItemId, BatchOutcomeBuilder,
-    CursorScope, ErrorScope, SubscriptionHandle, WatchEvent,
+    CursorScope, ErrorScope, SubscriptionHandle,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::GmailClient;
@@ -223,12 +223,23 @@ impl PubSubConfig {
 
 pub(crate) struct PubSubControl {
     commands: mpsc::Sender<WatchCommand>,
-    health_tx: broadcast::Sender<WatchEvent>,
-    terminal: Arc<Mutex<Option<AccountError>>>,
+    schedule: watch::Receiver<Option<tokio::time::Instant>>,
+    gap: Arc<AtomicBool>,
+    fresh: Arc<AtomicBool>,
+    lease: bifrost_types::LaneLease,
+    available: bool,
     shutdown: CancellationToken,
 }
 
+enum RenewOutcome {
+    Renewed,
+    NotDue,
+    NotWatched,
+}
 enum WatchCommand {
+    Renew {
+        reply: oneshot::Sender<Result<RenewOutcome, AccountError>>,
+    },
     Subscribe {
         reply: oneshot::Sender<Result<SubscriptionHandle, AccountError>>,
     },
@@ -247,6 +258,13 @@ enum WatchCommand {
     #[cfg(test)]
     HasHandles {
         reply: oneshot::Sender<bool>,
+    },
+    /// Empties the handle set without touching the lifecycle or the schedule:
+    /// the only way to reach `Watched` with no handles, which the `Renew` arm
+    /// declines as `NotWatched` against a schedule it leaves unchanged.
+    #[cfg(test)]
+    ClearHandles {
+        reply: oneshot::Sender<()>,
     },
 }
 
@@ -277,24 +295,41 @@ impl PubSubControl {
         shutdown: CancellationToken,
         mailbox: &str,
     ) -> Self {
-        let (health_tx, _) = broadcast::channel(32);
+        let (schedule_tx, schedule) = watch::channel(None);
         let (commands, receiver) = mpsc::channel(16);
-        let terminal = Arc::new(Mutex::new(None));
+        let gap = Arc::new(AtomicBool::new(false));
+        let fresh = Arc::new(AtomicBool::new(false));
+        let available = config.is_some();
         tokio::spawn(watch_actor(
             client,
             config,
             shutdown.clone(),
-            health_tx.clone(),
-            Arc::clone(&terminal),
+            schedule_tx,
+            Arc::clone(&gap),
+            Arc::clone(&fresh),
             receiver,
             WatchOwnership::new(mailbox_watch(mailbox)),
         ));
         Self {
             commands,
-            health_tx,
-            terminal,
+            schedule,
+            gap,
+            fresh,
+            lease: bifrost_types::LaneLease::new(),
+            available,
             shutdown,
         }
+    }
+
+    pub(crate) fn lanes(&self) -> Vec<bifrost_types::PushLaneSpec> {
+        if !self.available {
+            return Vec::new();
+        }
+        vec![bifrost_types::PushLaneSpec {
+            lane: bifrost_types::PushLane(0),
+            kind: bifrost_types::PushLaneKind::Registration,
+            backoff: bifrost_types::BackoffPolicy::new(RENEW_RETRY_AFTER, RENEW_RETRY_AFTER, false),
+        }]
     }
 
     #[cfg(test)]
@@ -315,6 +350,16 @@ impl PubSubControl {
         let (reply, response) = oneshot::channel();
         let _ = self.commands.send(WatchCommand::HasHandles { reply }).await;
         response.await.unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn clear_handles(&self) {
+        let (reply, response) = oneshot::channel();
+        let _ = self
+            .commands
+            .send(WatchCommand::ClearHandles { reply })
+            .await;
+        let _ = response.await;
     }
 }
 
@@ -446,248 +491,180 @@ pub(crate) async fn close_watch(pubsub: &PubSubControl) {
 
 pub(crate) fn push_stream(
     pubsub: Arc<PubSubControl>,
-    shutdown: CancellationToken,
-) -> AccountStream<WatchEvent> {
-    let receiver = pubsub.health_tx.subscribe();
-    Box::pin(futures::stream::unfold(
-        (receiver, shutdown, pubsub, false),
-        |(mut receiver, shutdown, pubsub, ended)| async move {
-            if ended || shutdown.is_cancelled() {
-                return None;
-            }
-            let terminal = pubsub
-                .terminal
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            if let Some(error) = terminal {
-                return Some((
-                    WatchEvent::Terminated(error),
-                    (receiver, shutdown, pubsub, true),
-                ));
-            }
-            let event = tokio::select! {
-                biased;
-                () = shutdown.cancelled() => return None,
-                result = receiver.recv() => match result {
-                    Ok(event) => event,
-                    Err(broadcast::error::RecvError::Lagged(dropped)) => {
-                        let terminal = pubsub.terminal.lock()
-                            .unwrap_or_else(PoisonError::into_inner).clone();
-                        if let Some(error) = terminal {
-                            WatchEvent::Terminated(error)
-                        } else {
-                            WatchEvent::Warning(bifrost_types::Warning::support_only(
-                                bifrost_types::WarningKind::Other,
-                                format!("gmail push health stream lagged; {dropped} health events were lost"),
-                            ))
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                },
+    lane: bifrost_types::PushLane,
+    stop: bifrost_types::SessionStop,
+    gate: bifrost_types::PushGate,
+) -> AccountStream<bifrost_types::PushSessionEvent> {
+    use bifrost_types::{PushSessionEnd as End, PushSessionEvent as E};
+    Box::pin(async_stream::stream! {
+        if lane != bifrost_types::PushLane(0) || !pubsub.available { yield E::Failed(bifrost_types::push_lane_contract_error(bifrost_types::Protocol::Gmail, lane, "not a lane of this account")); return; }
+        let Some(_lease) = pubsub.lease.try_claim() else { yield E::Failed(bifrost_types::push_lane_contract_error(bifrost_types::Protocol::Gmail, lane, "already driven")); return; };
+        let mut schedule = pubsub.schedule.clone();
+        let mut established = false;
+        loop {
+            if pubsub.gap.swap(false, Ordering::AcqRel) { yield E::Invalidated(gap_hint()); }
+            let due = *schedule.borrow_and_update();
+            let Some(due) = due else {
+                tokio::select! { () = stop.stopped() => break, () = pubsub.shutdown.cancelled() => break, r = schedule.changed() => if r.is_err() { break; } }
+                continue;
             };
-            let ended = matches!(event, WatchEvent::Terminated(_));
-            Some((event, (receiver, shutdown, pubsub, ended)))
-        },
-    ))
+            if !established { established = true; yield E::Established; }
+            if pubsub.fresh.swap(false, Ordering::AcqRel) { yield E::Healthy; }
+            if due > tokio::time::Instant::now() {
+                tokio::select! { () = stop.stopped() => break, () = pubsub.shutdown.cancelled() => break, _ = schedule.changed() => continue, () = tokio::time::sleep_until(due) => {} }
+            }
+            tokio::select! { () = stop.stopped() => break, () = pubsub.shutdown.cancelled() => break, () = gate.clear() => {} }
+            let (reply, response) = oneshot::channel();
+            tokio::select! { () = stop.stopped() => break, () = pubsub.shutdown.cancelled() => break, r = pubsub.commands.send(WatchCommand::Renew { reply }) => if r.is_err() { break; } }
+            let result = tokio::select! { () = stop.stopped() => break, () = pubsub.shutdown.cancelled() => break, r = response => r };
+            match result {
+                Ok(Ok(RenewOutcome::Renewed)) => {
+                    if pubsub.gap.swap(false, Ordering::AcqRel) { yield E::Invalidated(gap_hint()); }
+                    yield E::Healthy;
+                },
+                // `NotDue` and `NotWatched` mean the actor's state moved past
+                // the schedule this session read. Loop on the newer schedule,
+                // but never re-send against the one it already refused: that
+                // would spin if the actor declines without republishing.
+                Ok(Ok(_)) => {
+                    if !schedule.has_changed().unwrap_or(false) {
+                        tokio::select! { () = stop.stopped() => break, () = pubsub.shutdown.cancelled() => break, r = schedule.changed() => if r.is_err() { break; } }
+                    }
+                },
+                Ok(Err(e)) => { yield E::Failed(e); return; },
+                Err(_) => break,
+            }
+        }
+        yield E::Ended(End::Stopped);
+    })
+}
+fn gap_hint() -> bifrost_types::InvalidationHint {
+    bifrost_types::InvalidationHint {
+        source: bifrost_types::PushSource::Coalesced,
+        payload: bifrost_types::HintPayload::SpecificCursorScope(CursorScope::Account),
+    }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "actor owns independent watch state handles"
+)]
 async fn watch_actor(
     client: Arc<GmailClient>,
     config: Option<PubSubConfig>,
     shutdown: CancellationToken,
-    health_tx: broadcast::Sender<WatchEvent>,
-    terminal: Arc<Mutex<Option<AccountError>>>,
+    schedule: watch::Sender<Option<tokio::time::Instant>>,
+    gap: Arc<AtomicBool>,
+    fresh: Arc<AtomicBool>,
     mut commands: mpsc::Receiver<WatchCommand>,
     mut ownership: WatchOwnership,
 ) {
     let mut lifecycle = WatchLifecycle::Unwatched;
     let mut handles = HashSet::new();
-    let mut disconnected = false;
-    // Consecutive failed renewal attempts, so the transient-failure
-    // `Warning` reports how deep the failure run is instead of a
-    // constant 1. Cleared by any completed request (subscribe or
-    // renewal), which is the same edge the `disconnected` latch uses.
-    let mut consecutive_renewal_failures: u32 = 0;
-    let mut retry_after = None;
+    let mut lapsed: Option<Option<SystemTime>> = None;
     loop {
-        // A claim is held only while this actor owns a live watch. Claims are
-        // taken eagerly (inside the serialized exchange that created the
-        // watch) and dropped here lazily; a late release only makes another
-        // instance skip a stop, which is the cheap direction.
         if !matches!(
             lifecycle,
             WatchLifecycle::Watched { .. } | WatchLifecycle::Renewing
         ) {
             ownership.release();
         }
-        // Computed WITHOUT consuming `retry_after`. This runs on every trip
-        // around the loop, including trips that end in a command rather than
-        // in the renewal timer, and a `take()` here let any command arriving
-        // during the five-minute failure backoff erase the damper - for a
-        // watch with no expiration the next computation then fell back to
-        // the six-day default, stretching a transient-failure retry into six
-        // days of dead push. The damper is cleared where the timer actually
-        // fires, and on the paths that install a fresh lifecycle state.
-        let delay = match &lifecycle {
-            WatchLifecycle::Watched { expiration, .. } => Some(
-                retry_after.unwrap_or_else(|| renewal_delay_at(*expiration, client.wall_now())),
-            ),
-            _ => None,
-        };
         tokio::select! {
             biased;
             command = commands.recv() => {
                 let Some(command) = command else { return; };
                 match command {
                     WatchCommand::Subscribe { reply } => {
-                        let result = actor_subscribe(
-                            &client, config.as_ref(), &shutdown,
-                            &mut lifecycle, &mut handles, &mut ownership,
-                        ).await;
+                        let was_unwatched = matches!(lifecycle, WatchLifecycle::Unwatched);
+                        let result = actor_subscribe(&client, config.as_ref(), &shutdown, &mut lifecycle, &mut handles, &mut ownership).await;
                         if result.is_ok() {
-                            // A completed subscribe is a completed request,
-                            // so the Disconnected latch is cleared here to
-                            // keep Reconnected edge-triggered. It does NOT
-                            // clear `retry_after`: a transient-failure
-                            // damper reset by a *subscribe* is how an
-                            // endless subscribe-then-die loop escapes its
-                            // backoff.
-                            if disconnected {
-                                let _ = health_tx.send(WatchEvent::Reconnected);
+                            if was_unwatched && let Some(previous) = lapsed.take() {
+                                if previous.is_none_or(|expiry| expiry <= client.wall_now()) { gap.store(true, Ordering::Release); }
+                                fresh.store(true, Ordering::Release);
                             }
-                            disconnected = false;
-                            consecutive_renewal_failures = 0;
+                            publish_schedule(&schedule, &lifecycle, &client);
                         }
                         let _ = reply.send(result);
                     }
-                    // Accepted: because commands are biased ahead of the
-                    // shutdown arm, an unsubscribe already queued when
-                    // `close()` cancels the token can still issue a wire
-                    // `users.stop` after close intent. The transport is still
-                    // attached at that point and stopping the watch is what
-                    // close wants anyway, so this small hole in "no wire
-                    // traffic after shutdown" is deliberate.
+                    WatchCommand::Renew { reply } => {
+                        if shutdown.is_cancelled() {
+                            lifecycle = WatchLifecycle::Retired;
+                            schedule.send_replace(None);
+                            let _ = reply.send(Ok(RenewOutcome::NotWatched));
+                            continue;
+                        }
+                        let WatchLifecycle::Watched { history_id, expiration } = &lifecycle else { let _ = reply.send(Ok(RenewOutcome::NotWatched)); continue; };
+                        if handles.is_empty() { let _ = reply.send(Ok(RenewOutcome::NotWatched)); continue; }
+                        if schedule.borrow().is_some_and(|due| due > tokio::time::Instant::now()) { let _ = reply.send(Ok(RenewOutcome::NotDue)); continue; }
+                        let previous_history = history_id.clone(); let previous_expiration = *expiration;
+                        lifecycle = WatchLifecycle::Renewing;
+                        schedule.send_replace(None);
+                        let Some(config) = config.as_ref() else { lifecycle = WatchLifecycle::Unwatched; let _ = reply.send(Ok(RenewOutcome::NotWatched)); continue; };
+                        let result = watch_claimed(&client, config, &mut ownership).await;
+                        let result = match result {
+                            Ok(response) => {
+                                if commit_watched(&client, &shutdown, &mut lifecycle, &response, &mut ownership).await {
+                                    if previous_expiration.is_none_or(|expiry| expiry <= client.wall_now()) { gap.store(true, Ordering::Release); }
+                                    publish_schedule(&schedule, &lifecycle, &client);
+                                    Ok(RenewOutcome::Renewed)
+                                } else { Err(closed_error(AccountOperation::PushSubscribe)) }
+                            }
+                            Err(e) => {
+                                let e = error::into_account_error(e, error::GmailErrorContext::push_subscribe());
+                                if e.recovery().is_terminal() {
+                                    lifecycle = WatchLifecycle::Unwatched;
+                                    lapsed = Some(previous_expiration);
+                                } else if shutdown.is_cancelled() { lifecycle = WatchLifecycle::Retired; }
+                                else {
+                                    lifecycle = WatchLifecycle::Watched { history_id: previous_history, expiration: previous_expiration };
+                                    schedule.send_replace(Some(tokio::time::Instant::now()));
+                                }
+                                Err(e)
+                            }
+                        };
+                        let _ = reply.send(result);
+                    }
                     WatchCommand::Unsubscribe { handle, reply } => {
-                        let result = actor_unsubscribe(
-                            &client, handle, &mut lifecycle, &mut handles, &mut ownership,
-                        ).await;
+                        let result = actor_unsubscribe(&client, handle, &mut lifecycle, &mut handles, &mut ownership).await;
+                        if !matches!(lifecycle, WatchLifecycle::Watched { .. }) { schedule.send_replace(None); }
                         let _ = reply.send(result);
                     }
                     WatchCommand::Close { reply } => {
                         actor_close(&client, &mut lifecycle, &mut handles, &mut ownership).await;
+                        schedule.send_replace(None);
                         let _ = reply.send(());
                     }
                     #[cfg(test)]
-                    WatchCommand::SeedHandle { handle, reply } => {
-                        handles.insert(handle.0);
-                        let _ = reply.send(());
-                    }
+                    WatchCommand::SeedHandle { handle, reply } => { handles.insert(handle.0); let _ = reply.send(()); }
                     #[cfg(test)]
-                    WatchCommand::HasHandles { reply } => {
-                        let _ = reply.send(!handles.is_empty());
-                    }
+                    WatchCommand::HasHandles { reply } => { let _ = reply.send(!handles.is_empty()); }
+                    #[cfg(test)]
+                    WatchCommand::ClearHandles { reply } => { handles.clear(); let _ = reply.send(()); }
                 }
             }
             () = shutdown.cancelled(), if !matches!(lifecycle, WatchLifecycle::Retired) => {
                 lifecycle = WatchLifecycle::Retired;
-                retry_after = None;
-            }
-            () = async { tokio::time::sleep(delay.expect("guarded renewal delay")).await }, if delay.is_some() => {
-                // The wait this damper asked for has now been served.
-                retry_after = None;
-                let WatchLifecycle::Watched { history_id, expiration } = &lifecycle else {
-                    continue;
-                };
-                let previous_history_id = history_id.clone();
-                let previous_expiration = *expiration;
-                lifecycle = WatchLifecycle::Renewing;
-                let Some(config) = config.as_ref() else {
-                    lifecycle = WatchLifecycle::Unwatched;
-                    continue;
-                };
-                // Deliberately NOT raced against `shutdown.cancelled()`.
-                // An unbiased select between the token and the request can
-                // pick the completed request, and every commit after that
-                // point would install a watch nobody will ever renew or
-                // stop. The request runs to completion and the decision to
-                // keep its result is made by `commit_watched`, which cannot
-                // lose that race because it reads the token after the
-                // response is already in hand.
-                let result = watch_claimed(&client, config, &mut ownership).await;
-                match result {
-                    Ok(response) => {
-                        if !commit_watched(
-                            &client, &shutdown, &mut lifecycle, &response, &mut ownership,
-                        ).await {
-                            retry_after = None;
-                            continue;
-                        }
-                        retry_after = None;
-                        consecutive_renewal_failures = 0;
-                        if disconnected {
-                            let _ = health_tx.send(WatchEvent::Reconnected);
-                            disconnected = false;
-                        }
-                    }
-                    Err(err) => {
-                        let damp = renewal_status_stopped_by_replay_policy(&err);
-                        let account_error = error::into_account_error(
-                            err, error::GmailErrorContext::push_subscribe(),
-                        );
-                        // Only Retry belongs to this reconnect loop. Engine and Reconcile
-                        // must reach the sync reconciler through Terminated too, with
-                        // one exception: a retry-candidate status that net refused to
-                        // replay (see `renewal_status_stopped_by_replay_policy`).
-                        if !account_error.recovery().is_retryable() && !damp {
-                            // Publish the latch before waking receivers. It survives ring
-                            // overflow and subscriptions made after this actor retires.
-                            *terminal.lock().unwrap_or_else(PoisonError::into_inner) =
-                                Some(account_error.clone());
-                            let _ = health_tx.send(WatchEvent::Terminated(account_error));
-                            lifecycle = WatchLifecycle::Unwatched;
-                            retry_after = None;
-                            disconnected = false;
-                            consecutive_renewal_failures = 0;
-                            continue;
-                        }
-                        consecutive_renewal_failures =
-                            consecutive_renewal_failures.saturating_add(1);
-                        let warning = bifrost_types::Warning::support_only(
-                            bifrost_types::WarningKind::OperatorAttentionNeeded,
-                            format!("gmail Pub/Sub renewal transient failure: {}", account_error.message_key()),
-                        ).with_retry_count(consecutive_renewal_failures);
-                        let _ = health_tx.send(WatchEvent::Warning(warning));
-                        if !disconnected {
-                            let _ = health_tx.send(WatchEvent::Disconnected);
-                            disconnected = true;
-                        }
-                        if shutdown.is_cancelled() {
-                            lifecycle = WatchLifecycle::Retired;
-                            retry_after = None;
-                            continue;
-                        }
-                        lifecycle = WatchLifecycle::Watched {
-                            history_id: previous_history_id,
-                            expiration: previous_expiration,
-                        };
-                        retry_after = Some(RENEW_RETRY_AFTER);
-                    }
-                }
+                schedule.send_replace(None);
             }
         }
     }
 }
+fn publish_schedule(
+    schedule: &watch::Sender<Option<tokio::time::Instant>>,
+    lifecycle: &WatchLifecycle,
+    client: &GmailClient,
+) {
+    schedule.send_replace(match lifecycle {
+        WatchLifecycle::Watched { expiration, .. } => {
+            Some(tokio::time::Instant::now() + renewal_delay_at(*expiration, client.wall_now()))
+        }
+        _ => None,
+    });
+}
 
-/// Install a Gmail watch and return its handle.
-///
-/// Emits no health event of its own. `WatchEvent::Reconnected` is
-/// edge-triggered off the actor's `disconnected` latch by the caller: a
-/// subscribe is the consumer's FIRST act, so announcing a reconnect from
-/// here published an event before any consumer could hold a
-/// `push_stream()` receiver, and `broadcast` drops messages with no
-/// receivers - making the stream's first observable state depend on
-/// scheduling rather than on the watch.
+/// Install a watch through the actor's serialized mailbox ownership.
+/// Gap and fresh-watch obligations are committed by the caller alongside the
+/// lifecycle transition; the engine owns retained health and failure pacing.
 async fn actor_subscribe(
     client: &GmailClient,
     config: Option<&PubSubConfig>,
@@ -906,34 +883,6 @@ async fn watch_once(
         .await
 }
 
-/// Whether a renewal `users.watch` failed on a retry-candidate status (a
-/// 5xx, or a status listed in the retry policy) that net stopped retrying,
-/// rather than on a definite refusal or a transport drop.
-///
-/// `watch_once` declares `/watch` `ReplayPolicy::Never`, so net does not
-/// replay such a status and reports it as an ambiguity envelope
-/// (`AttemptHistory` with `may_have_committed`) that classifies as
-/// `Reconcile` under `PushSubscribe`. For a renewal that advice is already
-/// satisfied by the renewer's own damped retry: `users.watch` replaces
-/// whatever watch the mailbox has, so re-calling it five minutes later
-/// converges whether or not the failed call committed, and the previous
-/// watch stays live meanwhile because renewal fires a day before expiry.
-/// Terminating instead would end the push lane on one gateway 503, which a
-/// bare budget-exhausted status (classified `Retry`) never did. Only the
-/// renewer reads this; the first `users.watch` in `actor_subscribe` returns
-/// its `Reconcile` to the caller unchanged.
-fn renewal_status_stopped_by_replay_policy(error: &crate::Error) -> bool {
-    let net = match error {
-        crate::Error::Net(net) => net,
-        crate::Error::ObservedNet(observed) => &observed.error,
-        _ => return false,
-    };
-    matches!(
-        net.terminal(),
-        bifrost_net::Error::RetryBudgetExhausted { .. }
-    )
-}
-
 async fn stop_watch(client: &GmailClient) -> crate::Result<()> {
     client
         .post_no_content("/stop", &json!({}), bifrost_net::ReplayPolicy::Never)
@@ -972,6 +921,16 @@ mod tests {
     use reqwest::StatusCode;
 
     use super::*;
+    pub(super) fn test_session(
+        control: &Arc<PubSubControl>,
+    ) -> AccountStream<bifrost_types::PushSessionEvent> {
+        push_stream(
+            Arc::clone(control),
+            bifrost_types::PushLane(0),
+            bifrost_types::SessionStop::never(),
+            bifrost_types::PushGate::open(),
+        )
+    }
 
     #[tokio::test(start_paused = true)]
     async fn project_hold_watch_renewer_makes_no_wire_calls() {
@@ -992,7 +951,7 @@ mod tests {
             shutdown.clone(),
             "quota-hold@push.test",
         ));
-        let mut health = control.health_tx.subscribe();
+        let mut health = test_session(&control);
         push_subscribe(Arc::clone(&control), vec![CursorScope::Account])
             .await
             .unwrap();
@@ -1013,10 +972,14 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(script.requests().len(), 1);
-        assert!(
-            std::iter::from_fn(|| health.try_recv().ok())
-                .any(|event| matches!(event, WatchEvent::Warning(_)))
-        );
+        assert!(matches!(
+            health.next().await,
+            Some(bifrost_types::PushSessionEvent::Established)
+        ));
+        assert!(matches!(
+            health.next().await,
+            Some(bifrost_types::PushSessionEvent::Failed(_))
+        ));
         shutdown.cancel();
         for _ in 0..16 {
             tokio::task::yield_now().await;
@@ -1044,7 +1007,7 @@ mod tests {
         }
     }
 
-    fn scripted_client(
+    pub(super) fn scripted_client(
         steps: impl IntoIterator<Item = Canned>,
     ) -> (Arc<GmailClient>, Arc<ScriptedDispatch>) {
         let script = ScriptedDispatch::new(steps);
@@ -1061,7 +1024,7 @@ mod tests {
         )
     }
 
-    fn canned(status: StatusCode) -> Canned {
+    pub(super) fn canned(status: StatusCode) -> Canned {
         Canned::Response {
             status,
             headers: reqwest::header::HeaderMap::new(),
@@ -1307,66 +1270,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_health_survives_late_and_lagged_subscribers() {
-        let (health_tx, _) = broadcast::channel(1);
-        let (commands, _receiver) = mpsc::channel(1);
-        let pubsub = Arc::new(PubSubControl {
-            commands,
-            health_tx,
-            terminal: Default::default(),
-            shutdown: CancellationToken::new(),
-        });
-        let mut lagged = push_stream(Arc::clone(&pubsub), CancellationToken::new());
-        let error = super::super::account_closed_error(AccountOperation::PushSubscribe);
-        *pubsub.terminal.lock().unwrap() = Some(error.clone());
-        pubsub
-            .health_tx
-            .send(WatchEvent::Terminated(error))
-            .unwrap();
-        for _ in 0..3 {
-            pubsub.health_tx.send(WatchEvent::Disconnected).unwrap();
-        }
-        let mut late = push_stream(pubsub, CancellationToken::new());
-        for stream in [&mut lagged, &mut late] {
-            assert!(matches!(
-                stream.next().await,
-                Some(WatchEvent::Terminated(_))
-            ));
-            assert!(stream.next().await.is_none());
-        }
-    }
-
-    #[tokio::test]
-    async fn lagged_health_stream_emits_a_warning_with_the_loss_count() {
-        let (health_tx, _) = broadcast::channel(32);
-        let (commands, _receiver) = mpsc::channel(1);
-        let pubsub = Arc::new(PubSubControl {
-            commands,
-            health_tx: health_tx.clone(),
-            terminal: Default::default(),
-            shutdown: CancellationToken::new(),
-        });
-        let shutdown = CancellationToken::new();
-        let mut stream = push_stream(pubsub, shutdown);
-        for _ in 0..33 {
-            health_tx
-                .send(WatchEvent::Disconnected)
-                .expect("stream receiver is subscribed");
-        }
-
-        match stream.next().await {
-            Some(WatchEvent::Warning(warning)) => {
-                assert_eq!(warning.kind, bifrost_types::WarningKind::Other);
-                assert_eq!(
-                    warning.message.as_str(),
-                    "gmail push health stream lagged; 1 health events were lost",
-                );
-            }
-            event => panic!("expected a lag warning, got {event:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn handle_removal_distinguishes_unknown_remaining_and_last() {
         let mut handles = HashSet::new();
         let first = SubscriptionHandle("first".to_string());
@@ -1510,7 +1413,7 @@ mod tests {
             shutdown,
             "terminal-renewal@push.test",
         ));
-        let mut health = pubsub.health_tx.subscribe();
+        let mut health = test_session(&pubsub);
 
         push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
             .await
@@ -1518,22 +1421,30 @@ mod tests {
         tokio::time::advance(MIN_RENEW_DELAY + Duration::from_secs(1)).await;
         loop {
             if matches!(
-                health.recv().await.expect("health event"),
-                WatchEvent::Terminated(_)
+                health.next().await.expect("session event"),
+                bifrost_types::PushSessionEvent::Failed(_)
             ) {
                 break;
             }
         }
 
-        let mut late = push_stream(Arc::clone(&pubsub), CancellationToken::new());
-        assert!(matches!(late.next().await, Some(WatchEvent::Terminated(_))));
-        assert!(late.next().await.is_none());
+        assert!(health.next().await.is_none());
+        drop(health);
 
         push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
             .await
             .expect("subscribe after terminal renewal restarts the lifecycle");
         tokio::time::advance(MIN_RENEW_DELAY + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
+        let mut next = test_session(&pubsub);
+        while !matches!(
+            next.next().await,
+            Some(bifrost_types::PushSessionEvent::Healthy)
+        ) {}
+        while !matches!(
+            next.next().await,
+            Some(bifrost_types::PushSessionEvent::Healthy)
+        ) {}
         pubsub.shutdown.cancel();
         assert_eq!(
             script.requests().len(),
@@ -1586,7 +1497,7 @@ mod tests {
             shutdown,
             "terminal-renewal@push.test",
         ));
-        let mut health = pubsub.health_tx.subscribe();
+        let mut health = test_session(&pubsub);
 
         push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
             .await
@@ -1594,22 +1505,26 @@ mod tests {
         tokio::time::advance(MIN_RENEW_DELAY + Duration::from_secs(1)).await;
         loop {
             if matches!(
-                health.recv().await.expect("health event"),
-                WatchEvent::Terminated(ref error) if error.recovery().requires_engine_action()
+                health.next().await.expect("session event"),
+                bifrost_types::PushSessionEvent::Failed(ref error) if error.recovery().requires_engine_action()
             ) {
                 break;
             }
         }
 
-        let mut late = push_stream(Arc::clone(&pubsub), CancellationToken::new());
-        assert!(matches!(late.next().await, Some(WatchEvent::Terminated(_))));
-        assert!(late.next().await.is_none());
+        assert!(health.next().await.is_none());
+        drop(health);
 
         push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
             .await
             .expect("subscribe after terminal renewal restarts the lifecycle");
         tokio::time::advance(MIN_RENEW_DELAY + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
+        let mut next = test_session(&pubsub);
+        while !matches!(
+            next.next().await,
+            Some(bifrost_types::PushSessionEvent::Healthy)
+        ) {}
         pubsub.shutdown.cancel();
         assert_eq!(
             script.requests().len(),
@@ -1618,15 +1533,15 @@ mod tests {
         );
     }
 
-    /// The failure damper must survive unrelated actor traffic. The delay is
-    /// recomputed on every loop trip, and consuming `retry_after` during that
-    /// computation meant any command landing inside the five-minute backoff
-    /// erased it - for a watch with no expiration the next computation fell
-    /// back to `DEFAULT_RENEW_AFTER`, turning a transient renewal failure
-    /// into six days of dead push. The renewal must still fire on the
-    /// five-minute cadence after a command interrupts the wait.
+    /// A non-terminal renewal failure (here a `/watch` 503 net declined to
+    /// replay, classified `Reconcile`) must not park the watch: the actor
+    /// restores `Watched` with the schedule due NOW, so the session the
+    /// engine starts after its backoff renews at once, even with unrelated
+    /// actor traffic in between. Parking it, or recomputing the delay from
+    /// a watch with no expiration, would turn a transient failure into six
+    /// days of dead push.
     #[tokio::test(start_paused = true)]
-    async fn a_command_during_the_renewal_backoff_does_not_erase_the_damper() {
+    async fn a_reconcilable_renewal_failure_keeps_the_watch_due_for_the_next_session() {
         let (client, script) = scripted_client([
             // Subscribe: a watch with NO expiration, so the fallback delay
             // is the six-day default - the value the erased damper falls
@@ -1663,30 +1578,49 @@ mod tests {
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
+        let mut session = test_session(&pubsub);
+        assert!(matches!(
+            session.next().await,
+            Some(bifrost_types::PushSessionEvent::Established)
+        ));
+        assert!(
+            matches!(session.next().await, Some(bifrost_types::PushSessionEvent::Failed(e)) if e.recovery().requires_reconciliation())
+        );
+        drop(session);
         assert_eq!(script.requests().len(), 2, "the failing renewal ran");
 
         // Unrelated actor traffic inside the backoff window.
         let _ = pubsub.has_handles().await;
 
+        // The engine's lane backoff (five minutes for this lane) elapses.
         tokio::time::advance(RENEW_RETRY_AFTER + Duration::from_secs(1)).await;
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
+        let mut session = test_session(&pubsub);
+        assert!(matches!(
+            session.next().await,
+            Some(bifrost_types::PushSessionEvent::Established)
+        ));
+        while !matches!(
+            session.next().await,
+            Some(bifrost_types::PushSessionEvent::Healthy)
+        ) {}
         shutdown.cancel();
         assert_eq!(
             script.requests().len(),
             3,
-            "the damped retry must fire five minutes after the failure, \
-             not six days after a command recomputed the delay",
+            "the next session must renew at once, not six days after a \
+             recomputed delay",
         );
     }
 
-    /// The renewer's damping exception covers exactly the status net declined
-    /// to replay. The 503 must classify as non-retryable on its own (or the
-    /// renewer tests above would pass without the exception), and a definite
-    /// refusal must stay outside it.
+    /// The classifications the renewal failure arms rely on: a 503 net
+    /// declined to replay is `Reconcile` (so the actor keeps the watch due
+    /// rather than parking it), and a definite refusal is terminal (so the
+    /// actor goes `Unwatched` and a later subscribe starts a fresh watch).
     #[tokio::test]
-    async fn only_a_non_replayed_retry_candidate_status_is_damped() {
+    async fn an_unreplayed_watch_status_is_classified_for_engine_reconciliation() {
         let config = PubSubConfig::new("projects/p/topics/t");
         let (client, _script) = scripted_client([
             canned(StatusCode::SERVICE_UNAVAILABLE),
@@ -1696,85 +1630,21 @@ mod tests {
         let unavailable = watch_once(&client, &config)
             .await
             .expect_err("a 503 fails the watch");
-        assert!(renewal_status_stopped_by_replay_policy(&unavailable));
         let classified =
             error::into_account_error(unavailable, error::GmailErrorContext::push_subscribe());
         assert!(
             classified.recovery().requires_reconciliation(),
-            "a non-replayed 503 on `/watch` reconciles, so only the exception keeps it local: {:?}",
+            "a non-replayed 503 on `/watch` reconciles: {:?}",
             classified.recovery(),
         );
 
         let refused = watch_once(&client, &config)
             .await
             .expect_err("a 400 fails the watch");
-        assert!(!renewal_status_stopped_by_replay_policy(&refused));
-    }
-
-    /// Two health-lane properties that used to be wrong in opposite
-    /// directions.
-    ///
-    /// `Reconnected` is edge-triggered off the `disconnected` latch, so the
-    /// FIRST subscribe announces nothing. It used to fire unconditionally
-    /// from inside `actor_subscribe`, before any consumer could hold a
-    /// `push_stream()` receiver - and `broadcast` drops messages with no
-    /// receivers, so whether the stream opened on `Reconnected` or on
-    /// nothing depended on scheduling.
-    ///
-    /// The transient-failure `Warning` counts consecutive failures instead
-    /// of reporting a constant 1, so an operator reading the lane can tell
-    /// one stumble from a sustained outage.
-    #[tokio::test(start_paused = true)]
-    async fn renewal_failures_escalate_the_warning_count_and_first_subscribe_is_silent() {
-        let (client, _script) = scripted_client([
-            // Subscribe: no expiration, so renewal falls back to the default.
-            Canned::Response {
-                status: StatusCode::OK,
-                headers: reqwest::header::HeaderMap::new(),
-                body: Bytes::from_static(br#"{"historyId":"1"}"#),
-            },
-            // One 503 (a non-replayed `Reconcile` the renewer damps) and one
-            // 429 (a refusal classified `Retry`): both shapes count.
-            canned(StatusCode::SERVICE_UNAVAILABLE),
-            canned(StatusCode::TOO_MANY_REQUESTS),
-        ]);
-        let shutdown = CancellationToken::new();
-        let pubsub = Arc::new(PubSubControl::new(
-            Arc::clone(&client),
-            Some(PubSubConfig::new("projects/p/topics/t")),
-            shutdown.clone(),
-            "warning-count@push.test",
-        ));
-        let mut health = pubsub.health_tx.subscribe();
-
-        push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
-            .await
-            .expect("subscribe issues the watch");
         assert!(
-            health.try_recv().is_err(),
-            "a first subscribe has nothing to reconnect FROM, so it must be silent",
-        );
-
-        let mut counts = Vec::new();
-        tokio::time::advance(DEFAULT_RENEW_AFTER + Duration::from_secs(1)).await;
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::advance(RENEW_RETRY_AFTER + Duration::from_secs(1)).await;
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
-        shutdown.cancel();
-        while let Ok(event) = health.try_recv() {
-            if let WatchEvent::Warning(warning) = event {
-                counts.push(warning.retry_count);
-            }
-        }
-
-        assert_eq!(
-            counts,
-            vec![1, 2],
-            "consecutive renewal failures must escalate the reported count",
+            error::into_account_error(refused, error::GmailErrorContext::push_subscribe())
+                .recovery()
+                .is_terminal()
         );
     }
 
@@ -2194,4 +2064,10 @@ mod tests {
         let filtered = PubSubConfig::new("t").with_label_ids(["INBOX", "Label_1"]);
         assert_eq!(filtered.label_ids, vec!["INBOX", "Label_1"]);
     }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::tests::*;
+    include!("push_session_tests.rs");
 }

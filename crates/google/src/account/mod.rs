@@ -33,7 +33,7 @@ use bifrost_types::{
     MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, OpenedAccount, Page, Priority,
     Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
     ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
-    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -566,8 +566,16 @@ impl Account for GoogleAccount {
         push::push_unsubscribe(Arc::clone(&self.pubsub), handle)
     }
 
-    fn push_stream(&self) -> AccountStream<WatchEvent> {
-        push::push_stream(Arc::clone(&self.pubsub), self.shutdown.clone())
+    fn push_lanes(&self) -> Vec<bifrost_types::PushLaneSpec> {
+        self.pubsub.lanes()
+    }
+    fn push_stream(
+        &self,
+        lane: bifrost_types::PushLane,
+        stop: bifrost_types::SessionStop,
+        gate: bifrost_types::PushGate,
+    ) -> AccountStream<bifrost_types::PushSessionEvent> {
+        push::push_stream(Arc::clone(&self.pubsub), lane, stop, gate)
     }
 
     fn open_blob(&self, handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {

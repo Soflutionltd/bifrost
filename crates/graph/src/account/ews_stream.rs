@@ -1,19 +1,18 @@
 use std::collections::HashSet;
+#[cfg(test)]
 use std::time::Duration;
 
 use bifrost_types::{
     AccountOperation, CursorScope, DiagnosticText, HintPayload, InvalidationHint, PushSource,
-    WatchEvent,
 };
 use futures::StreamExt;
 use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::{BytesStart, Event};
-use tokio::sync::watch;
 
 use crate::ews::{
-    EwsBodyStream, EwsClient, EwsError, EwsExecute, EwsHeaders, check_response_error,
-    try_push_general_ref, xml_escape,
+    EwsClient, EwsError, EwsExecute, EwsHeaders, check_response_error, try_push_general_ref,
+    xml_escape,
 };
 
 use super::GraphAccount;
@@ -51,256 +50,169 @@ struct NotificationBuilder {
     parent_folder_change_key: Option<String>,
 }
 
-#[derive(Debug)]
-enum StreamLoopExit {
-    /// The registered EWS scope set changed. Re-subscribe without reporting
-    /// a transport disconnect: this is a local topology update, not a
-    /// degraded push connection. The worker still emits `Reconnected` once
-    /// the replacement subscription is live, because a change arriving in
-    /// the handoff window - queued only on the abandoned subscription, or
-    /// predating the new one - is delivered to neither, and `Reconnected`
-    /// is the engine's full-reconcile trigger.
-    Resubscribe,
-    Disconnected,
-    Shutdown,
-    /// Terminal classification (auth lost, conditional-access, etc.)
-    /// surfaced through the EWS worker. The worker exits and emits
-    /// `WatchEvent::Terminated(error)` on the push channel.
-    Terminated(bifrost_types::AccountError),
-}
-
-pub(crate) async fn run_streaming_worker(account: GraphAccount) {
-    let Some(account_net) = account.client.account_net() else {
-        // Unreachable (the factory attaches before any `GraphAccount`
-        // exists), so it is the client's own invariant failing. Report it
-        // on the push channel rather than only logging: a silent exit would
-        // leave the push registration standing with no worker behind it and
-        // no health event to say so.
-        tracing::warn!("[Graph EWS] Streaming worker started with no attached transport");
-        let error = crate::account::graph_error::ews_error_to_account_error(
-            crate::ews::EwsError::Internal(
-                "EWS streaming worker has no attached account transport".into(),
-            ),
-            crate::account::graph_error::GraphErrorContext::ews(
-                bifrost_types::AccountOperation::PushSubscribe,
-            ),
-        );
-        super::push_stream::publish_terminal(&account, error);
-        return;
-    };
-    let ews = EwsClient::new(account_net, account.client.ews_url());
-    run_worker(account, ews).await;
-}
-
-/// The worker loop behind `run_streaming_worker`, generic over the EWS
-/// transport so the Subscribe / GetStreamingEvents / Unsubscribe cycle is
-/// drivable by an in-process scripted transport in tests.
-async fn run_worker<E: EwsExecute>(account: GraphAccount, ews: E) {
-    let mut topology = account.ews_topology.subscribe();
-    // A transport failure was reported as `Disconnected`; the next
-    // successful Subscribe owes a `Reconnected`.
-    let mut disconnected = false;
-    let mut backoff = ReconnectBackoff::default();
-    // A topology handoff abandoned a live subscription; the replacement owes
-    // a `Reconnected` for the coverage gap, without any `Disconnected`
-    // having been (correctly) emitted.
-    let mut coverage_gap = false;
-
-    loop {
-        if account.shutdown.is_cancelled() {
-            return;
-        }
-        // Mark the current topology generation seen BEFORE reading the scope
-        // map. A bump landing after this point - even while the Subscribe
-        // below is in flight - makes the next `changed()` fire, so no
-        // registration can slip between the read and the wait.
-        topology.borrow_and_update();
-        // Read the registration map and, if it has emptied, retire the
-        // worker slot WITHOUT releasing the guard in between. A worker is
-        // spawned only after `subscribe_ews` has installed a scope, so an
-        // empty union means the final handle was removed, not that work is
-        // about to arrive - the worker exits. Doing that without clearing
-        // the slot under the same guard is a race: a concurrent
-        // `subscribe_ews` inserts, its `ensure_ews_worker` sees this
-        // still-unfinished `JoinHandle`, declines to spawn, and then this
-        // task returns - leaving the new subscription with no worker and
-        // push silently dead. Holding the guard makes that insert wait
-        // until the slot is empty. This mirrors the Graph webhook worker's
-        // `retire_graph_worker_slot`; the shared rule lives in
-        // `worker_slot`.
-        let registrations = account.ews_subscriptions.read().await;
-        let scopes =
-            dedupe_by_ews_folder(registrations.values().flat_map(|state| state.scopes.iter()));
-        if scopes.is_empty() {
-            super::worker_slot::retire_worker_slot(&account.ews_worker).await;
-            drop(registrations);
-            return;
-        }
-        drop(registrations);
-
-        match subscribe(&ews, &scopes).await {
-            Ok(subscription_id) => {
-                if disconnected || coverage_gap {
-                    // The only event the engine turns into a full reconcile
-                    // across every registered scope. It covers both the
-                    // transport outage and the topology-handoff window, in
-                    // which EWS delivered notifications to nobody.
-                    let _ = account.push_tx.send(WatchEvent::Reconnected);
-                    disconnected = false;
-                    coverage_gap = false;
-                }
-                match run_get_events_loop(
-                    &ews,
-                    &account,
-                    &mut topology,
-                    &subscription_id,
-                    &mut backoff,
-                )
-                .await
-                {
-                    // No backoff on this arm, deliberately. A server that
-                    // repeatedly answers long polls with an explicit
-                    // resubscribe directive will spin this loop, and that was
-                    // examined and judged defensible rather than fixed: each
-                    // cycle is a full server-directed round trip, not a
-                    // client-side hot spin, and honouring an explicit server
-                    // instruction promptly is the right response to it. The
-                    // `Disconnected` arm below is where an unhealthy peer
-                    // lands, and that one does back off. Flagged, not changed.
-                    StreamLoopExit::Resubscribe => {
-                        coverage_gap = true;
-                        release_subscription(&ews, &subscription_id).await;
-                    }
-                    StreamLoopExit::Disconnected => {
-                        disconnected = true;
-                        release_subscription(&ews, &subscription_id).await;
-                        let failures = backoff.record_failure();
-                        wait_before_reconnect(&account, failures).await;
-                    }
-                    // Exchange holds streaming subscriptions against a
-                    // per-mailbox quota and does not retire one because the
-                    // client went away, so the terminal exits owe the same
-                    // Unsubscribe the reconnect exits do. Leaking here is
-                    // worse than leaking on a reconnect: nothing in this
-                    // worker's lifetime will ever come back for it. `close()`
-                    // joins rather than aborts precisely so the `Shutdown`
-                    // release below gets to run.
-                    StreamLoopExit::Terminated(error) => {
-                        release_subscription(&ews, &subscription_id).await;
-                        super::push_stream::publish_terminal(&account, error);
-                        return;
-                    }
-                    StreamLoopExit::Shutdown => {
-                        release_subscription(&ews, &subscription_id).await;
-                        return;
-                    }
-                }
-            }
-            Err(error) => {
-                let back_off = subscribe_status_stopped_by_replay_policy(&error);
-                let account_error = ews_error_to_account_error(
-                    error,
-                    GraphErrorContext::ews(AccountOperation::PushSubscribe),
-                );
-                // Only Retry belongs to this reconnect loop. Engine and Reconcile
-                // must reach the sync reconciler through Terminated too, with
-                // one exception: a retry-candidate status that net refused to
-                // replay (see `subscribe_status_stopped_by_replay_policy`).
-                if !account_error.recovery().is_retryable() && !back_off {
-                    super::push_stream::publish_terminal(&account, account_error);
-                    return;
-                }
-                let telemetry = account_error.telemetry_fields();
-                tracing::warn!(
-                    target: "bifrost_graph::ews",
-                    message_key = telemetry.message_key,
-                    recovery = telemetry.recovery_discriminant,
-                    "EWS Subscribe failed"
-                );
-                if !disconnected {
-                    let _ = account.push_tx.send(WatchEvent::Disconnected);
-                    disconnected = true;
-                }
-                let failures = backoff.record_failure();
-                wait_before_reconnect(&account, failures).await;
-            }
-        }
-    }
-}
-
-/// Reconnect backoff state for one worker lifetime.
-///
-/// The counter is raised by every failure exit and cleared ONLY by
-/// `record_healthy_read`, which `run_get_events_loop` calls where a
-/// `GetStreamingEvents` long poll completed a full response. A successful
-/// `Subscribe` is deliberately NOT the reset signal: a broken proxy or an
-/// idle-timeout appliance can produce an endless subscribe-then-die loop in
-/// which every Subscribe succeeds, and resetting there restores exactly the
-/// hot reconnect spin the backoff exists to stop. Without any reset the
-/// opposite failure appears - unrelated blips accumulate over hours of
-/// healthy operation until every later outage waits the full cap.
+pub(crate) type EwsReleaser = std::sync::Arc<
+    dyn Fn(String) -> futures::future::BoxFuture<'static, Result<(), EwsError>> + Send + Sync,
+>;
+type Completion = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
 #[derive(Default)]
-struct ReconnectBackoff {
-    failures: u32,
+pub(crate) struct EwsLedger {
+    retired: bool,
+    entries: std::collections::HashMap<String, EwsEntry>,
+}
+struct EwsEntry {
+    state: EwsEntryState,
+    releaser: EwsReleaser,
+}
+enum EwsEntryState {
+    Live,
+    Orphaned,
+    Releasing(Completion),
 }
 
-impl ReconnectBackoff {
-    /// A long poll returned a complete response: the connection is proven
-    /// healthy, so the next outage starts from the shortest delay again.
-    fn record_healthy_read(&mut self) {
-        self.failures = 0;
+fn release(account: &GraphAccount, id: &str) -> Completion {
+    use futures::FutureExt;
+    let mut ledger = account.ews_ledger.lock().expect("EWS ledger lock");
+    let Some(entry) = ledger.entries.get_mut(id) else {
+        return futures::future::ready(()).boxed().shared();
+    };
+    if let EwsEntryState::Releasing(done) = &entry.state {
+        return done.clone();
     }
-
-    fn record_failure(&mut self) -> u32 {
-        self.failures = self.failures.saturating_add(1);
-        self.failures
+    let releaser = std::sync::Arc::clone(&entry.releaser);
+    let id = id.to_owned();
+    let owner = account.clone();
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let done = async move {
+        let _ = rx.await;
+    }
+    .boxed()
+    .shared();
+    entry.state = EwsEntryState::Releasing(done.clone());
+    let task = tokio::spawn(async move {
+        let result = releaser(id.clone()).await;
+        let mut ledger = owner.ews_ledger.lock().expect("EWS ledger lock");
+        if result.is_ok() || ledger.retired {
+            ledger.entries.remove(&id);
+        } else if let Some(entry) = ledger.entries.get_mut(&id) {
+            entry.state = EwsEntryState::Orphaned;
+        }
+        if let Err(error) = result {
+            tracing::debug!(?error, "EWS Unsubscribe failed");
+        }
+        let _ = tx.send(());
+    });
+    // Ledger -> task registry is the lock order. Publish the handle before
+    // close can observe Releasing, so a claimed release cannot slip between
+    // its ledger snapshot and its task join.
+    super::push_tasks::track(account, task);
+    drop(ledger);
+    done
+}
+pub(crate) fn retire_ledger(account: &GraphAccount) {
+    let ids = {
+        let mut ledger = account.ews_ledger.lock().expect("EWS ledger lock");
+        ledger.retired = true;
+        ledger.entries.keys().cloned().collect::<Vec<_>>()
+    };
+    for id in ids {
+        drop(release(account, &id));
+    }
+}
+struct LiveSubscription {
+    account: GraphAccount,
+    id: String,
+}
+impl Drop for LiveSubscription {
+    fn drop(&mut self) {
+        let mut ledger = self.account.ews_ledger.lock().expect("EWS ledger lock");
+        if let Some(entry) = ledger.entries.get_mut(&self.id)
+            && matches!(entry.state, EwsEntryState::Live)
+        {
+            entry.state = EwsEntryState::Orphaned;
+        }
     }
 }
 
-async fn wait_before_reconnect(account: &GraphAccount, failures: u32) {
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u64;
-    let delay = reconnect_delay(failures, seed);
-    tokio::select! {
-        () = account.shutdown.cancelled() => {}
-        () = tokio::time::sleep(delay) => {}
-    }
+pub(crate) fn streaming_session(
+    account: GraphAccount,
+    stop: bifrost_types::SessionStop,
+) -> bifrost_types::AccountStream<bifrost_types::PushSessionEvent> {
+    let Some(net) = account.client.account_net() else {
+        return Box::pin(futures::stream::once(async {
+            bifrost_types::PushSessionEvent::Failed(ews_error_to_account_error(
+                EwsError::Internal("EWS session has no attached account transport".into()),
+                GraphErrorContext::ews(AccountOperation::PushStream),
+            ))
+        }));
+    };
+    let ews = std::sync::Arc::new(EwsClient::new(net, account.client.ews_url()));
+    ews_session(account, ews, stop)
 }
 
-fn reconnect_delay(failures: u32, jitter_seed: u64) -> Duration {
-    let exponent = failures.saturating_sub(1).min(6);
-    let base = 5_u64.saturating_mul(1_u64 << exponent);
-    let jitter = jitter_seed % (base / 4 + 1);
-    Duration::from_secs(base.saturating_add(jitter))
-}
-
-/// Best-effort EWS `Unsubscribe` for a streaming subscription the worker is
-/// abandoning (reconnect or topology handoff). Dropping the hanging
-/// `GetStreamingEvents` request does not retire the server-side
-/// subscription: Exchange caps concurrent streaming subscriptions per
-/// mailbox, so silently leaking one per scope change accumulates against
-/// that quota until each abandoned subscription times out on its own.
-/// Failure is logged, never surfaced - the replacement Subscribe is the
-/// operation whose outcome matters, and after a transport failure this
-/// request is expected to fail right along with it.
-async fn release_subscription<E: EwsExecute>(ews: &E, subscription_id: &str) {
-    let body = build_unsubscribe_request(subscription_id);
-    if let Err(error) = ews
-        .execute(
-            &body,
-            &EwsHeaders::default(),
-            bifrost_net::ReplayPolicy::Idempotent,
-        )
-        .await
-    {
-        tracing::debug!(
-            target: "bifrost_graph::ews",
-            error = ?error,
-            "EWS Unsubscribe for an abandoned streaming subscription failed"
-        );
-    }
+fn ews_session<E: EwsExecute + Send + Sync + 'static>(
+    account: GraphAccount,
+    ews: std::sync::Arc<E>,
+    stop: bifrost_types::SessionStop,
+) -> bifrost_types::AccountStream<bifrost_types::PushSessionEvent> {
+    use bifrost_types::{PushSessionEnd as End, PushSessionEvent as E};
+    use futures::FutureExt;
+    Box::pin(async_stream::stream! {
+        let Some(_lease) = account.push_lease.try_claim() else { yield E::Failed(bifrost_types::push_lane_contract_error(bifrost_types::Protocol::Ews, bifrost_types::PushLane(0), "already driven")); return; };
+        let orphans = { let ledger = account.ews_ledger.lock().expect("EWS ledger lock"); ledger.entries.iter().filter(|(_, e)| matches!(e.state, EwsEntryState::Orphaned)).map(|(id, _)| id.clone()).collect::<Vec<_>>() };
+        for id in orphans { drop(release(&account, &id)); }
+        let mut topology = account.ews_topology.subscribe();
+        let scopes = loop {
+            topology.borrow_and_update();
+            let scopes = { let registrations = account.ews_subscriptions.read().await; dedupe_by_ews_folder(registrations.values().flat_map(|state| state.scopes.iter())) };
+            if !scopes.is_empty() { break scopes; }
+            tokio::select! { () = stop.stopped() => { yield E::Ended(End::Stopped); return; }, () = account.shutdown.cancelled() => { yield E::Ended(End::Stopped); return; }, _ = topology.changed() => {} }
+        };
+        // Let Subscribe finish so its server id can be recorded and released.
+        let id = match subscribe(ews.as_ref(), &scopes).await { Ok(id) => id, Err(e) => { yield E::Failed(ews_error_to_account_error(e, GraphErrorContext::ews(AccountOperation::PushSubscribe))); return; } };
+        let transport = std::sync::Arc::clone(&ews);
+        let releaser: EwsReleaser = std::sync::Arc::new(move |id| {
+            let transport = std::sync::Arc::clone(&transport);
+            async move { transport.execute(&build_unsubscribe_request(&id), &EwsHeaders::default(), bifrost_net::ReplayPolicy::Idempotent).await.map(|_| ()) }.boxed()
+        });
+        let retired = { let mut ledger = account.ews_ledger.lock().expect("EWS ledger lock"); ledger.entries.insert(id.clone(), EwsEntry { state: EwsEntryState::Live, releaser }); ledger.retired };
+        let _live = LiveSubscription { account: account.clone(), id: id.clone() };
+        if retired || stop.is_stopped() || account.shutdown.is_cancelled() { release(&account, &id).await; yield E::Ended(End::Stopped); return; }
+        yield E::Established;
+        let outcome = 'poll: loop {
+            let body = build_get_streaming_events_request(&id, 30);
+            let headers = EwsHeaders::default();
+            let response = tokio::select! {
+                () = stop.stopped() => break E::Ended(End::Stopped),
+                () = account.shutdown.cancelled() => break E::Ended(End::Stopped),
+                _ = topology.changed() => break E::Ended(End::Reconfigure),
+                response = ews.execute_streaming(&body, &headers) => response,
+            };
+            let mut response = match response { Ok(response) => response, Err(e) => break E::Failed(ews_error_to_account_error(e, GraphErrorContext::ews(AccountOperation::PushStream))) };
+            let mut decoder = StreamingFrameDecoder { buffered: Vec::new() };
+            loop {
+                let chunk = tokio::select! {
+                    () = stop.stopped() => break 'poll E::Ended(End::Stopped),
+                    () = account.shutdown.cancelled() => break 'poll E::Ended(End::Stopped),
+                    _ = topology.changed() => break 'poll E::Ended(End::Reconfigure),
+                    chunk = response.next() => chunk,
+                };
+                let Some(chunk) = chunk else { if decoder.has_partial_frame() { break 'poll E::Ended(End::Lost); } break; };
+                let chunk = match chunk { Ok(chunk) => chunk, Err(e) => break 'poll E::Failed(ews_error_to_account_error(e, GraphErrorContext::ews(AccountOperation::PushStream))) };
+                let frames = match decoder.push(&chunk) { Ok(frames) => frames, Err(_) => break 'poll E::Ended(End::Lost) };
+                for frame in frames {
+                    let notifications = match notifications_from_streaming_frame(&frame) {
+                        Ok(n) => n,
+                        Err(EwsError::MalformedXml(_)) => break 'poll E::Ended(End::Lost),
+                        Err(e) => break 'poll E::Failed(ews_error_to_account_error(e, GraphErrorContext::ews(AccountOperation::PushStream))),
+                    };
+                    for hint in streaming_hints(&account, notifications).await { yield E::Invalidated(hint); }
+                }
+            }
+            yield E::Healthy;
+        };
+        release(&account, &id).await;
+        yield outcome;
+    })
 }
 
 pub(crate) fn parse_streaming_notifications(
@@ -388,8 +300,9 @@ pub(crate) fn parse_streaming_notifications(
 /// Subscribe response may include belongs to the pull/push subscription
 /// families and cannot be fed back into a `StreamingSubscriptionRequest`
 /// (the schema admits only `FolderIds` and `EventTypes`), so nothing here
-/// extracts it. Gap coverage is the worker's `Reconnected` emission, not a
-/// resume token.
+/// extracts it. Gap coverage is the full reconcile the engine owes at the
+/// next session's `Established` after any lost, failed or reconfigured
+/// session, not a resume token.
 pub(crate) fn parse_subscribe_response(xml: &str) -> Result<Vec<String>, String> {
     let mut reader = Reader::from_str(xml);
     let mut current_tag = String::new();
@@ -508,129 +421,6 @@ async fn subscribe<E: EwsExecute>(
             "EWS Subscribe returned no StreamingSubscription".to_string(),
         ))
     })
-}
-
-/// Whether an EWS `Subscribe` failed on a retry-candidate status (a 5xx, or
-/// a status listed in the retry policy) that net stopped retrying, rather
-/// than on a definite refusal or a transport drop.
-///
-/// `subscribe` declares the request `ReplayPolicy::Never` because each call
-/// mints a new subscription, so net does not replay such a status and
-/// reports it as an ambiguity envelope that classifies as `Reconcile` under
-/// `PushSubscribe`. In this worker that advice is already satisfied by the
-/// backoff-and-resubscribe arm: a subscription the failed call may have
-/// created is never polled and lapses server-side on its own, and the next
-/// `Subscribe` is the read that settles what is live. Terminating instead
-/// would end the EWS lane on one gateway 503, which a bare budget-exhausted
-/// status (classified `Retry`) never did. A transport drop past `Unsent`
-/// still terminates, as it did before the request was declared `Never`.
-fn subscribe_status_stopped_by_replay_policy(error: &EwsError) -> bool {
-    matches!(
-        error,
-        EwsError::Transport(net)
-            if matches!(net.terminal(), bifrost_net::Error::RetryBudgetExhausted { .. })
-    )
-}
-
-async fn run_get_events_loop<E: EwsExecute>(
-    ews: &E,
-    account: &GraphAccount,
-    topology: &mut watch::Receiver<u64>,
-    subscription_id: &str,
-    backoff: &mut ReconnectBackoff,
-) -> StreamLoopExit {
-    // The subscription this loop polls is fixed for the lifetime of the
-    // loop and lives nowhere else; the worker re-subscribes (minting a
-    // fresh id) on reconnect or a local scope-topology change, retiring
-    // this one with a best-effort Unsubscribe.
-    loop {
-        if account.shutdown.is_cancelled() {
-            return StreamLoopExit::Shutdown;
-        }
-        let body = build_get_streaming_events_request(subscription_id, 30);
-        // A streaming subscription covers the scope union that existed when
-        // `subscribe` ran. Adding or removing a handle changes that union,
-        // so do not leave the old subscription alive until its 30-minute
-        // request expires. Dropping this in-flight request is intentional:
-        // the outer worker retires the abandoned subscription and
-        // immediately subscribes to the current scope set.
-        let headers = EwsHeaders::default();
-        let result = tokio::select! {
-            () = account.shutdown.cancelled() => return StreamLoopExit::Shutdown,
-            changed = topology.changed() => {
-                return match changed {
-                    Ok(()) => StreamLoopExit::Resubscribe,
-                    // The sender lives on the account this worker holds a
-                    // clone of; a closed channel means teardown.
-                    Err(_) => StreamLoopExit::Shutdown,
-                };
-            }
-            result = ews.execute_streaming(&body, &headers) => result,
-        };
-        match result {
-            Ok(stream) => match consume_streaming_events(stream, account, topology).await {
-                Ok(()) => {
-                    // A long poll ran to a complete response. That, and not
-                    // a bare successful Subscribe, is what proves the
-                    // connection healthy, so it is the only reset point.
-                    backoff.record_healthy_read();
-                    continue;
-                }
-                Err(StreamLoopExit::Resubscribe) => return StreamLoopExit::Resubscribe,
-                Err(StreamLoopExit::Shutdown) => return StreamLoopExit::Shutdown,
-                Err(StreamLoopExit::Disconnected) => {
-                    // A parse miss mid-long-poll is not necessarily a
-                    // permanent contract violation: Microsoft interleaves
-                    // keep-alive / status frames into the streaming
-                    // response, and a single malformed chunk should
-                    // reconnect (re-subscribe), not tear push down for
-                    // good. The HTTP-error branch already reconnects;
-                    // treat a transient parse failure the same way rather
-                    // than terminating.
-                    let account_error = ews_error_to_account_error(
-                        EwsError::MalformedXml(DiagnosticText::support_only(
-                            "EWS streaming response ended with an incomplete or invalid frame"
-                                .to_string(),
-                        )),
-                        GraphErrorContext::ews(AccountOperation::PushStream),
-                    );
-                    let telemetry = account_error.telemetry_fields();
-                    tracing::warn!(
-                        target: "bifrost_graph::ews",
-                        message_key = telemetry.message_key,
-                        recovery = telemetry.recovery_discriminant,
-                        "EWS GetStreamingEvents parse failed; reconnecting"
-                    );
-                    let _ = account.push_tx.send(WatchEvent::Disconnected);
-                    return StreamLoopExit::Disconnected;
-                }
-                // A response error the frame consumer classified as
-                // terminal (authorization lost, conditional access) exits
-                // the worker; see `classify_frame_failure`.
-                Err(StreamLoopExit::Terminated(error)) => {
-                    return StreamLoopExit::Terminated(error);
-                }
-            },
-            Err(error) => {
-                let account_error = ews_error_to_account_error(
-                    error,
-                    GraphErrorContext::ews(AccountOperation::PushStream),
-                );
-                if !account_error.recovery().is_retryable() {
-                    return StreamLoopExit::Terminated(account_error);
-                }
-                let telemetry = account_error.telemetry_fields();
-                tracing::warn!(
-                    target: "bifrost_graph::ews",
-                    message_key = telemetry.message_key,
-                    recovery = telemetry.recovery_discriminant,
-                    "EWS GetStreamingEvents failed"
-                );
-                let _ = account.push_tx.send(WatchEvent::Disconnected);
-                return StreamLoopExit::Disconnected;
-            }
-        }
-    }
 }
 
 /// EWS holds the outer SOAP document open for the duration of a streaming
@@ -790,71 +580,11 @@ fn notifications_from_streaming_frame(
         .map_err(|error| EwsError::MalformedXml(DiagnosticText::support_only(error)))
 }
 
-async fn consume_streaming_events(
-    mut stream: EwsBodyStream,
-    account: &GraphAccount,
-    topology: &mut watch::Receiver<u64>,
-) -> Result<(), StreamLoopExit> {
-    let mut decoder = StreamingFrameDecoder {
-        buffered: Vec::new(),
-    };
-    loop {
-        let next = tokio::select! {
-            () = account.shutdown.cancelled() => return Err(StreamLoopExit::Shutdown),
-            changed = topology.changed() => {
-                return Err(if changed.is_ok() {
-                    StreamLoopExit::Resubscribe
-                } else {
-                    StreamLoopExit::Shutdown
-                });
-            }
-            chunk = stream.next() => chunk,
-        };
-        let Some(chunk) = next else {
-            return (!decoder.has_partial_frame())
-                .then_some(())
-                .ok_or(StreamLoopExit::Disconnected);
-        };
-        let chunk = chunk.map_err(|_| StreamLoopExit::Disconnected)?;
-        let frames = decoder
-            .push(&chunk)
-            .map_err(|_| StreamLoopExit::Disconnected)?;
-        for frame in frames {
-            let notifications =
-                notifications_from_streaming_frame(&frame).map_err(classify_frame_failure)?;
-            emit_streaming_notifications(account, notifications).await;
-        }
-    }
-}
-
-/// Decide whether a failed frame ends the worker or just the connection.
-///
-/// A malformed or truncated frame is transient - Exchange interleaves
-/// keep-alive and status frames into the streaming response, and a single
-/// bad chunk should reconnect. A CLASSIFIED response error is not: an
-/// `ErrorAccessDenied` inside the stream derives `NoPermission`, which
-/// nothing in this worker can fix, so reconnecting forever would burn a
-/// subscribe against the mailbox quota every few seconds and never report
-/// the failure. All non-Retry classifications, including engine directives,
-/// exit through `WatchEvent::Terminated` as the HTTP-error path does.
-fn classify_frame_failure(error: EwsError) -> StreamLoopExit {
-    let account_error =
-        ews_error_to_account_error(error, GraphErrorContext::ews(AccountOperation::PushStream));
-    classified_push_failure(account_error)
-}
-
-fn classified_push_failure(account_error: bifrost_types::AccountError) -> StreamLoopExit {
-    if !account_error.recovery().is_retryable() {
-        StreamLoopExit::Terminated(account_error)
-    } else {
-        StreamLoopExit::Disconnected
-    }
-}
-
-async fn emit_streaming_notifications(
+async fn streaming_hints(
     account: &GraphAccount,
     notifications: Vec<EwsStreamingNotification>,
-) {
+) -> Vec<InvalidationHint> {
+    let mut hints = Vec::new();
     for notification in notifications {
         let payloads = match notification.parent_folder_id.as_deref() {
             Some(folder_id) => {
@@ -871,19 +601,17 @@ async fn emit_streaming_notifications(
             None => vec![HintPayload::Unknown],
         };
         for payload in payloads {
-            let _ = account.push_tx.send(WatchEvent::Invalidated {
-                hint: InvalidationHint {
-                    source: PushSource::EwsStreaming,
-                    payload,
-                },
+            hints.push(InvalidationHint {
+                source: PushSource::EwsStreaming,
+                payload,
             });
         }
     }
+    hints
 }
 
-/// The union the worker subscribes to. The worker itself inlines this read
-/// so it can retire its slot under the same guard (see the exit path in
-/// `run_worker`); this wrapper exists for tests that only want the union.
+/// The union a session subscribes to. The session inlines this read (see
+/// `ews_session`); this wrapper exists for tests that only want the union.
 #[cfg(test)]
 async fn active_ews_scopes(account: &GraphAccount) -> Vec<EwsSubscriptionScope> {
     let states = account.ews_subscriptions.read().await;
@@ -1028,84 +756,6 @@ mod tests {
     use super::super::push::EwsSubscriptionState;
     use super::*;
 
-    #[test]
-    fn engine_directives_leave_the_stream_worker() {
-        use bifrost_types::{
-            AccountErrorBuilder, AccountErrorKind, Cause, StateCause, SyncStateErrorKind,
-        };
-        let error = AccountErrorBuilder::new(
-            AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged { delta: None }),
-        )
-        .operation(AccountOperation::PushStream)
-        .protocol(bifrost_types::Protocol::Ews)
-        .try_build()
-        .expect("capability error");
-        assert!(error.recovery().requires_engine_action());
-        assert!(matches!(
-            classified_push_failure(error),
-            StreamLoopExit::Terminated(_)
-        ));
-    }
-
-    #[test]
-    fn frame_failures_only_reconnect_for_retry() {
-        use crate::ews::SoapFaultCode;
-        for (code, retry) in [
-            (SoapFaultCode::ErrorStreamingSubscriptionInvalid, true),
-            (SoapFaultCode::ErrorAccessDenied, false),
-            (SoapFaultCode::ErrorNonExistentMailbox, false),
-        ] {
-            let result = classify_frame_failure(EwsError::SoapFault {
-                code,
-                detail: DiagnosticText::support_only("scripted fault"),
-            });
-            if retry {
-                assert!(matches!(result, StreamLoopExit::Disconnected));
-            } else {
-                assert!(matches!(result, StreamLoopExit::Terminated(_)));
-            }
-        }
-    }
-
-    #[test]
-    fn reconnect_backoff_grows_and_caps_with_bounded_jitter() {
-        assert_eq!(reconnect_delay(1, 0), Duration::from_secs(5));
-        assert_eq!(reconnect_delay(2, 0), Duration::from_secs(10));
-        assert_eq!(reconnect_delay(8, 0), Duration::from_secs(320));
-        assert_eq!(reconnect_delay(80, 0), Duration::from_secs(320));
-        assert!(reconnect_delay(3, u64::MAX) <= Duration::from_secs(25));
-    }
-
-    /// The backoff must be cleared by a demonstrated healthy long-poll
-    /// READ, not by a successful Subscribe. Without any reset, unrelated
-    /// blips accumulate over a worker's whole lifetime until every later
-    /// outage waits the full cap even after hours of healthy streaming.
-    #[tokio::test]
-    async fn a_healthy_long_poll_read_resets_the_reconnect_backoff() {
-        let account =
-            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
-        let good = r#"<m:GetStreamingEventsResponseMessage ResponseClass="Success"><m:Notifications><t:Notification><t:SubscriptionId>sub-1</t:SubscriptionId><t:NewMailEvent><t:ItemId Id="item-1"/><t:ParentFolderId Id="folder-1"/></t:NewMailEvent></t:Notification></m:Notifications></m:GetStreamingEventsResponseMessage>"#;
-        let (scripted, _requests) = scripted(vec![
-            ScriptStep::Respond(good.to_string()),
-            ScriptStep::Respond(
-                r#"<m:GetStreamingEventsResponseMessage ResponseClass="Success"><m:Notifications>"#
-                    .to_string(),
-            ),
-        ]);
-        let (_topology_tx, mut topology) = watch::channel(0_u64);
-        let mut backoff = ReconnectBackoff { failures: 5 };
-        let exit =
-            run_get_events_loop(&scripted, &account, &mut topology, "sub-1", &mut backoff).await;
-        assert!(
-            matches!(exit, StreamLoopExit::Disconnected),
-            "the truncated second poll disconnects"
-        );
-        assert_eq!(
-            backoff.failures, 0,
-            "the completed first long poll cleared the accumulated failures"
-        );
-    }
     use crate::client::GraphClient;
 
     #[test]
@@ -1468,7 +1118,7 @@ mod tests {
 
     #[test]
     fn a_status_frame_without_a_parent_folder_parses_without_fabricating_one() {
-        // The worker maps a missing parent folder onto an account-wide
+        // The session maps a missing parent folder onto an account-wide
         // `Unknown` hint; the parser must report the absence honestly
         // rather than defaulting to an empty FolderId.
         let xml = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
@@ -1634,7 +1284,7 @@ mod tests {
         }
     }
 
-    // ----- worker-loop tests over the scripted EWS transport -----
+    // ----- session tests over the scripted EWS transport -----
 
     const NOTIFICATION_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
@@ -1696,12 +1346,13 @@ mod tests {
     }
 
     enum ScriptStep {
+        Delayed(std::sync::Arc<tokio::sync::Notify>, String),
         Respond(String),
         Fail(EwsError),
         /// A long poll with nothing to say: the request is reported to the
         /// test and the future then never resolves, exactly like a hanging
-        /// `GetStreamingEvents`. The worker leaves it via its `select!`
-        /// (shutdown or topology change).
+        /// `GetStreamingEvents`. The session leaves it via its `select!`
+        /// (stop, shutdown or topology change).
         Hang,
     }
 
@@ -1742,6 +1393,10 @@ mod tests {
             let _ = self.request_tx.send(body_xml.to_string());
             match step {
                 ScriptStep::Respond(xml) => Ok(xml),
+                ScriptStep::Delayed(ready, xml) => {
+                    ready.notified().await;
+                    Ok(xml)
+                }
                 ScriptStep::Fail(error) => Err(error),
                 ScriptStep::Hang => std::future::pending().await,
             }
@@ -1758,27 +1413,6 @@ mod tests {
         account
             .ews_topology
             .send_modify(|generation| *generation = generation.wrapping_add(1));
-    }
-
-    #[tokio::test]
-    async fn an_uncertain_subscribe_is_forwarded_for_reconciliation() {
-        let account =
-            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
-        let mut events = account.push_tx.subscribe();
-        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
-        let (scripted, mut requests) = scripted(vec![ScriptStep::Fail(EwsError::Transport(
-            bifrost_net::Error::Network {
-                message: "lost subscribe response".to_owned(),
-                transmission_state: bifrost_types::TransmissionState::InFlight,
-                source: None,
-            },
-        ))]);
-        run_worker(account.clone(), scripted).await;
-        assert!(requests.recv().await.is_some());
-        match events.try_recv().expect("termination") {
-            WatchEvent::Terminated(error) => assert!(error.recovery().requires_reconciliation()),
-            other => panic!("expected reconciliation termination, got {other:?}"),
-        }
     }
 
     /// The envelope net builds when a `Never` request meets a 503: one
@@ -1798,388 +1432,7 @@ mod tests {
         })
     }
 
-    /// A 5xx on the `Never` Subscribe classifies as `Reconcile`, but the
-    /// worker's backoff-and-resubscribe is that reconciliation, so the lane
-    /// reports `Disconnected`, resubscribes and reports `Reconnected` instead
-    /// of terminating. The classification is asserted first: were the 503
-    /// already `Retry`, the worker half would pass without the exception.
-    #[tokio::test(start_paused = true)]
-    async fn an_unreplayed_subscribe_status_backs_off_and_resubscribes() {
-        let classified = ews_error_to_account_error(
-            unreplayed_unavailable(),
-            GraphErrorContext::ews(AccountOperation::PushSubscribe),
-        );
-        assert!(
-            classified.recovery().requires_reconciliation(),
-            "{:?}",
-            classified.recovery()
-        );
-        assert!(subscribe_status_stopped_by_replay_policy(
-            &unreplayed_unavailable()
-        ));
-
-        let account =
-            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
-        let mut events = account.push_tx.subscribe();
-        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
-        let (scripted, mut requests) = scripted(vec![
-            ScriptStep::Fail(unreplayed_unavailable()),
-            ScriptStep::Respond(subscribe_response_xml("sub-1")),
-            ScriptStep::Hang,
-            ScriptStep::Respond(unsubscribe_response_xml()),
-        ]);
-        let worker = tokio::spawn(run_worker(account.clone(), scripted));
-
-        let failed = requests.recv().await.expect("first subscribe");
-        assert!(failed.contains("<m:Subscribe>"), "{failed}");
-        let retried = requests.recv().await.expect("resubscribe after backoff");
-        assert!(retried.contains("<m:Subscribe>"), "{retried}");
-        let poll = requests
-            .recv()
-            .await
-            .expect("long poll on the new subscription");
-        assert!(
-            poll.contains("<t:SubscriptionId>sub-1</t:SubscriptionId>"),
-            "{poll}"
-        );
-        assert!(matches!(events.try_recv(), Ok(WatchEvent::Disconnected)));
-        assert!(matches!(events.try_recv(), Ok(WatchEvent::Reconnected)));
-
-        account.shutdown.cancel();
-        worker.await.expect("worker joins");
-        assert!(
-            !matches!(events.try_recv(), Ok(WatchEvent::Terminated(_))),
-            "a backed-off Subscribe status must not end the lane"
-        );
-    }
-
-    /// The registration that starts the worker bumps the topology BEFORE
-    /// the worker exists. That pre-recorded change must not read as a
-    /// later topology update: the worker subscribes once and settles into
-    /// its long poll, rather than immediately abandoning the first
-    /// subscription and minting a redundant second one.
-    #[tokio::test]
-    async fn the_first_registration_subscribes_exactly_once() {
-        let account =
-            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
-        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
-        let (scripted, mut requests) = scripted(vec![
-            ScriptStep::Respond(subscribe_response_xml("sub-1")),
-            ScriptStep::Hang,
-            ScriptStep::Respond(unsubscribe_response_xml()),
-        ]);
-        let worker = tokio::spawn(run_worker(account.clone(), scripted));
-
-        let subscribe_body = requests.recv().await.expect("subscribe request");
-        assert!(subscribe_body.contains("<m:Subscribe>"), "{subscribe_body}");
-        assert!(
-            subscribe_body.contains(r#"<t:FolderId Id="folder-1"/>"#),
-            "{subscribe_body}"
-        );
-        let poll_body = requests.recv().await.expect("long-poll request");
-        assert!(
-            poll_body.contains("<t:SubscriptionId>sub-1</t:SubscriptionId>"),
-            "{poll_body}"
-        );
-
-        account.shutdown.cancel();
-        worker.await.expect("worker joins");
-        // Shutdown releases the subscription: Exchange holds streaming
-        // subscriptions against a per-mailbox quota and does not retire one
-        // because the client stopped polling.
-        let unsubscribe = requests.recv().await.expect("unsubscribe on shutdown");
-        assert!(
-            unsubscribe.contains("<m:SubscriptionId>sub-1</m:SubscriptionId>"),
-            "{unsubscribe}"
-        );
-        assert!(
-            requests.try_recv().is_err(),
-            "one Subscribe, one long poll, one release are the whole conversation"
-        );
-    }
-
-    /// A `push_subscribe` while the stream is live: the worker abandons the
-    /// long poll, retires the old subscription with an EWS Unsubscribe (the
-    /// server holds streaming subscriptions against a per-mailbox quota),
-    /// subscribes to the enlarged union without a watermark (the streaming
-    /// schema has none), and emits exactly one `Reconnected` - covering the
-    /// handoff window EWS delivered into nowhere - with no false
-    /// `Disconnected`.
-    #[tokio::test]
-    async fn a_topology_change_hands_off_the_stream_without_a_false_disconnect() {
-        let account =
-            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
-        let mut events = account.push_tx.subscribe();
-        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
-        let (scripted, mut requests) = scripted(vec![
-            ScriptStep::Respond(subscribe_response_xml("sub-1")),
-            ScriptStep::Hang,
-            ScriptStep::Respond(unsubscribe_response_xml()),
-            ScriptStep::Respond(subscribe_response_xml("sub-2")),
-            ScriptStep::Hang,
-            ScriptStep::Respond(unsubscribe_response_xml()),
-        ]);
-        let worker = tokio::spawn(run_worker(account.clone(), scripted));
-
-        let first_subscribe = requests.recv().await.expect("first subscribe");
-        assert!(
-            first_subscribe.contains(r#"<t:FolderId Id="folder-1"/>"#),
-            "{first_subscribe}"
-        );
-        let _first_poll = requests.recv().await.expect("first long poll");
-
-        // A second handle registers while the long poll hangs.
-        register(&account, "h2", vec![ews_scope("rest-b", "folder-2")]).await;
-
-        let unsubscribe = requests.recv().await.expect("unsubscribe of sub-1");
-        assert!(unsubscribe.contains("<m:Unsubscribe>"), "{unsubscribe}");
-        assert!(
-            unsubscribe.contains("<m:SubscriptionId>sub-1</m:SubscriptionId>"),
-            "{unsubscribe}"
-        );
-
-        let second_subscribe = requests.recv().await.expect("replacement subscribe");
-        assert!(
-            second_subscribe.contains(r#"<t:FolderId Id="folder-1"/>"#),
-            "{second_subscribe}"
-        );
-        assert!(
-            second_subscribe.contains(r#"<t:FolderId Id="folder-2"/>"#),
-            "{second_subscribe}"
-        );
-        assert!(
-            !second_subscribe.contains("Watermark"),
-            "{second_subscribe}"
-        );
-
-        let second_poll = requests.recv().await.expect("second long poll");
-        assert!(
-            second_poll.contains("<t:SubscriptionId>sub-2</t:SubscriptionId>"),
-            "{second_poll}"
-        );
-
-        // `Reconnected` was sent before the second poll's request went out,
-        // so it is already buffered: the handoff gap gets its reconcile.
-        let event = events.try_recv().expect("one push event");
-        assert!(
-            matches!(event, WatchEvent::Reconnected),
-            "expected Reconnected, got {event:?}"
-        );
-        assert!(
-            events.try_recv().is_err(),
-            "a local topology change is not a transport disconnect"
-        );
-
-        account.shutdown.cancel();
-        worker.await.expect("worker joins");
-        let released = requests.recv().await.expect("unsubscribe on shutdown");
-        assert!(
-            released.contains("<m:SubscriptionId>sub-2</m:SubscriptionId>"),
-            "{released}"
-        );
-    }
-
-    /// End-to-end dispatch: a streamed notification for a subscribed folder
-    /// comes back as `Invalidated` hints naming that folder's scope, and
-    /// the loop keeps polling the same subscription.
-    #[tokio::test]
-    async fn a_streamed_notification_invalidates_the_folder_scope() {
-        let account =
-            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
-        let mut events = account.push_tx.subscribe();
-        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
-        let (scripted, mut requests) = scripted(vec![
-            ScriptStep::Respond(subscribe_response_xml("sub-1")),
-            ScriptStep::Respond(NOTIFICATION_XML.to_string()),
-            ScriptStep::Hang,
-            ScriptStep::Respond(unsubscribe_response_xml()),
-        ]);
-        let worker = tokio::spawn(run_worker(account.clone(), scripted));
-
-        let _subscribe = requests.recv().await.expect("subscribe");
-        let _first_poll = requests.recv().await.expect("first long poll");
-        let _second_poll = requests
-            .recv()
-            .await
-            .expect("re-poll after the notification");
-
-        // The fixture carries two events on folder-1; each maps to the one
-        // registered scope.
-        for _ in 0..2 {
-            let event = events.try_recv().expect("invalidation");
-            match event {
-                WatchEvent::Invalidated { hint } => {
-                    assert!(matches!(hint.source, PushSource::EwsStreaming));
-                    match hint.payload {
-                        HintPayload::SpecificCursorScope(scope) => {
-                            assert_eq!(scope, email_scope("rest-a"));
-                        }
-                        other => panic!("expected a specific scope hint, got {other:?}"),
-                    }
-                }
-                other => panic!("expected Invalidated, got {other:?}"),
-            }
-        }
-        assert!(events.try_recv().is_err());
-
-        account.shutdown.cancel();
-        worker.await.expect("worker joins");
-    }
-
-    /// The same dispatch, over a response that binds the EWS namespaces to
-    /// prefixes other than `m:`/`t:`. The framing keys on local names, so
-    /// this is an ordinary notification - not a silently discarded one.
-    #[tokio::test]
-    async fn a_notification_under_an_alien_namespace_prefix_still_invalidates() {
-        const ALIEN_PREFIX_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<x:Envelope xmlns:x="http://schemas.xmlsoap.org/soap/envelope/">
-  <x:Body>
-    <a:GetStreamingEventsResponse xmlns:a="http://schemas.microsoft.com/exchange/services/2006/messages"
-                                  xmlns:b="http://schemas.microsoft.com/exchange/services/2006/types">
-      <a:ResponseMessages>
-        <a:GetStreamingEventsResponseMessage ResponseClass="Success">
-          <a:Notifications>
-            <b:Notification>
-              <b:SubscriptionId>sub-1</b:SubscriptionId>
-              <b:NewMailEvent>
-                <b:ItemId Id="item-1"/>
-                <b:ParentFolderId Id="folder-1"/>
-              </b:NewMailEvent>
-            </b:Notification>
-          </a:Notifications>
-        </a:GetStreamingEventsResponseMessage>
-      </a:ResponseMessages>
-    </a:GetStreamingEventsResponse>
-  </x:Body>
-</x:Envelope>"#;
-
-        let account =
-            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
-        let mut events = account.push_tx.subscribe();
-        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
-        let (scripted, mut requests) = scripted(vec![
-            ScriptStep::Respond(subscribe_response_xml("sub-1")),
-            ScriptStep::Respond(ALIEN_PREFIX_XML.to_string()),
-            ScriptStep::Hang,
-            ScriptStep::Respond(unsubscribe_response_xml()),
-        ]);
-        let worker = tokio::spawn(run_worker(account.clone(), scripted));
-
-        let _subscribe = requests.recv().await.expect("subscribe");
-        let _first_poll = requests.recv().await.expect("first long poll");
-        let _second_poll = requests
-            .recv()
-            .await
-            .expect("re-poll after the notification");
-
-        match events.try_recv().expect("invalidation") {
-            WatchEvent::Invalidated { hint } => match hint.payload {
-                HintPayload::SpecificCursorScope(scope) => {
-                    assert_eq!(scope, email_scope("rest-a"));
-                }
-                other => panic!("expected a specific scope hint, got {other:?}"),
-            },
-            other => panic!("expected Invalidated, got {other:?}"),
-        }
-
-        account.shutdown.cancel();
-        worker.await.expect("worker joins");
-    }
-
-    /// A CLASSIFIED response error inside the stream is terminal, not a
-    /// reconnect. `ErrorAccessDenied` derives `NoPermission`, which no
-    /// amount of resubscribing fixes; flattening the typed `EwsError` into
-    /// a string turned it into an endless disconnect-and-resubscribe loop
-    /// that burned a subscription against the mailbox quota each time and
-    /// never told the engine anything.
-    #[tokio::test]
-    async fn a_terminal_response_error_in_the_stream_terminates_instead_of_reconnecting() {
-        const ACCESS_DENIED_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
-  <s:Body>
-    <m:GetStreamingEventsResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
-                                  xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
-      <m:ResponseMessages>
-        <m:GetStreamingEventsResponseMessage ResponseClass="Error">
-          <m:MessageText>Access is denied. Check credentials and try again.</m:MessageText>
-          <m:ResponseCode>ErrorAccessDenied</m:ResponseCode>
-        </m:GetStreamingEventsResponseMessage>
-      </m:ResponseMessages>
-    </m:GetStreamingEventsResponse>
-  </s:Body>
-</s:Envelope>"#;
-
-        let account =
-            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
-        let mut events = account.push_tx.subscribe();
-        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
-        // Deliberately short: a reconnect loop would demand a second
-        // Subscribe and blow up on the exhausted script instead of
-        // quietly passing.
-        let (scripted, mut requests) = scripted(vec![
-            ScriptStep::Respond(subscribe_response_xml("sub-1")),
-            ScriptStep::Respond(ACCESS_DENIED_XML.to_string()),
-            ScriptStep::Respond(unsubscribe_response_xml()),
-        ]);
-        let worker = tokio::spawn(run_worker(account.clone(), scripted));
-
-        let _subscribe = requests.recv().await.expect("subscribe");
-        let _poll = requests.recv().await.expect("long poll");
-        // The worker exits on its own: no shutdown, no topology change.
-        worker.await.expect("worker joins");
-
-        let release = requests.recv().await.expect("the subscription is released");
-        assert!(
-            release.contains("<m:SubscriptionId>sub-1</m:SubscriptionId>"),
-            "{release}"
-        );
-        assert!(
-            requests.try_recv().is_err(),
-            "a terminal error must not resubscribe"
-        );
-
-        match events.try_recv().expect("a terminal push event") {
-            WatchEvent::Terminated(error) => {
-                assert!(error.recovery().is_terminal(), "{error:?}");
-                assert_eq!(error.protocol(), Some(bifrost_types::Protocol::Ews));
-            }
-            other => panic!("expected Terminated, got {other:?}"),
-        }
-    }
-
-    /// The worker retires its own slot while still holding the guard that
-    /// told it the registration map is empty. Returning without clearing
-    /// the slot let a concurrent `subscribe_ews` see a still-unfinished
-    /// `JoinHandle`, decline to spawn a replacement, and end up with no EWS
-    /// worker at all once this task returned.
-    #[tokio::test]
-    async fn the_worker_clears_its_slot_when_the_last_registration_is_gone() {
-        let account =
-            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
-        // Stand in for the handle `ensure_ews_worker` installed: a task
-        // that never finishes, so `is_finished` cannot paper over a slot
-        // this exit failed to clear.
-        *account.ews_worker.lock().await = Some(tokio::spawn(std::future::pending()));
-
-        let (scripted, mut requests) = scripted(Vec::new());
-        run_worker(account.clone(), scripted).await;
-
-        assert!(
-            account.ews_worker.lock().await.is_none(),
-            "the exiting worker must leave an empty slot for the next subscribe"
-        );
-        assert!(
-            requests.try_recv().is_err(),
-            "an empty registration map subscribes to nothing"
-        );
-
-        // What the emptied slot buys: the next registration starts a fresh
-        // worker rather than trusting the departed one.
-        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
-        super::super::push_stream::ensure_ews_worker(account.clone()).await;
-        assert!(account.ews_worker.lock().await.is_some());
-        account.shutdown.cancel();
-    }
+    include!("ews_session_tests.rs");
 }
 
 #[cfg(test)]

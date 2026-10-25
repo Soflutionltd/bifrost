@@ -99,9 +99,12 @@ async fn push_invalidation_drives_mid_poll_cadence_without_waiting_for_the_sleep
     )
     .await;
 
-    engine
-        .invalidation_sink()
-        .push(account_id.clone(), unknown_hint());
+    assert!(matches!(
+        engine
+            .invalidation_sink()
+            .push(account_id.clone(), unknown_hint()),
+        bifrost_types::SinkPush::Accepted
+    ));
 
     wait_until(
         "push must drive during the one-hour poll cadence sleep",
@@ -176,9 +179,12 @@ async fn a_push_drive_account_contract_error_is_published_and_parks_its_scope() 
         .account_changes_observer(&account_id)
         .expect("account observer");
 
-    engine
-        .invalidation_sink()
-        .push(account_id.clone(), unknown_hint());
+    assert!(matches!(
+        engine
+            .invalidation_sink()
+            .push(account_id.clone(), unknown_hint()),
+        bifrost_types::SinkPush::Accepted
+    ));
 
     wait_until(
         "the push hint must drive the failing scope and its sibling",
@@ -209,21 +215,30 @@ async fn a_push_drive_account_contract_error_is_published_and_parks_its_scope() 
             payload: HintPayload::SpecificCursorScope(scope),
         },
     };
-    engine
-        .invalidation_sink()
-        .push(account_id.clone(), specific_hint(sibling_scope.clone()));
+    assert!(matches!(
+        engine
+            .invalidation_sink()
+            .push(account_id.clone(), specific_hint(sibling_scope.clone())),
+        bifrost_types::SinkPush::Accepted
+    ));
     wait_until(
         "the sibling hint acts as a barrier after the terminal sweep",
         Duration::from_secs(5),
         || sibling_drives.load(Ordering::SeqCst) >= 3,
     )
     .await;
-    engine
-        .invalidation_sink()
-        .push(account_id.clone(), specific_hint(failed_scope));
-    engine
-        .invalidation_sink()
-        .push(account_id.clone(), specific_hint(sibling_scope));
+    assert!(matches!(
+        engine
+            .invalidation_sink()
+            .push(account_id.clone(), specific_hint(failed_scope)),
+        bifrost_types::SinkPush::Accepted
+    ));
+    assert!(matches!(
+        engine
+            .invalidation_sink()
+            .push(account_id.clone(), specific_hint(sibling_scope)),
+        bifrost_types::SinkPush::Accepted
+    ));
     wait_until(
         "the sibling hint completes after the terminal-scope hint",
         Duration::from_secs(5),
@@ -300,9 +315,12 @@ async fn a_failed_hinted_scope_reaches_recovery_without_abandoning_its_siblings(
     let established_before = established.lock().expect("established lock").len();
     assert_eq!(established_before, 2, "attach establishes both scopes once");
 
-    engine
-        .invalidation_sink()
-        .push(account_id.clone(), unknown_hint());
+    assert!(matches!(
+        engine
+            .invalidation_sink()
+            .push(account_id.clone(), unknown_hint()),
+        bifrost_types::SinkPush::Accepted
+    ));
 
     // Property one: the sweep did not stop at the first failure. Keyed on
     // per-scope drive counts, not a total, so one scope driven twice cannot

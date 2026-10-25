@@ -19,8 +19,8 @@ SyncEngine
     Multiplexer task        -> per-scope poll + lifecycle + reopen
     Backfill orchestrator   -> partition runner per scope
                                (parks on the account's backfill bound)
-    Push reconciler task    -> reads per-account mpsc<WatchEvent>
-    Push forwarder task     -> Account::push_stream -> per-account mpsc
+    Push reconciler task    -> drains bounded invalidation intent
+    Push lane supervisor    -> Account::push_stream -> bounded ingress / recovery
     Ack writer task         -> AckRequest -> CheckpointStore
     Control applier task    -> priority / bandwidth-cap watchers
     Bandwidth feed (optional) -> BandwidthMeter -> control atomic
@@ -32,7 +32,7 @@ SyncEngine
     CursorRegistry (scope -> cursor; membership index)
     LaneGate (per account; the backfill bound's wait plus its admission)
     CheckpointStore (consumer-provided; InMemoryCheckpointStore for tests)
-    InvalidationSinkInner (per-account ingress senders)
+    InvalidationSinkInner (per-account SinkTargets)
     SubscriptionRegistry (per-engine push subscription handles)
 ```
 
@@ -127,10 +127,10 @@ engine.shutdown().await?; // explicit cleanup; preferred over Drop
    cursors cover every membership; folder-typed cursors cover the
    matching folder; query cursors cover the matching query).
 6. Spawn workers: ack writer, control applier, push reconciler,
-   push forwarder, multiplexer,
+   push lane supervisor, multiplexer,
    backfill orchestrator, deferred-inventory worker (if any),
    reopen listener, bandwidth feed (if a meter is wired). Store
-   all `WorkerTask`s. The push forwarder parks while
+   all `WorkerTask`s. The push lane supervisor parks while
    `PushCapability::None` and wakes on the reopen-generation signal,
    so a capability change does not require spawning a new task.
 7. Return `SyncControl`.
@@ -255,8 +255,9 @@ What cancel-first claims is narrow: **cancellation is REQUESTED for every
 account before cleanup begins.** It does not establish quiescence and does not
 mean publication has stopped.
 
-**Respond promptly**: the control applier, the bandwidth feed, the push
-forwarder, the multiplexer main loop, the push reconciler, and backfill and
+**Respond promptly**: the control applier, the bandwidth feed, the push lane
+supervisor (which then drains its sessions within `drain_bound`), the
+multiplexer main loop, the push reconciler, and backfill and
 deferred inventory while in their subscriber / pause / throttle / capacity /
 admission waits.
 
@@ -585,7 +586,7 @@ forever on an unknown handle. It does not always delete anything: IMAP and JMAP 
 server state in the account instance, so a retry that reaches a newer
 connection is a no-op and the provider-side subscription then lives until it
 expires. Graph's webhook handles carry their subscription ids, and its factory
-shares the ids its renewal worker recreated, so a Graph retry on a newer
+shares the ids its renewal sessions recreated, so a Graph retry on a newer
 connection does delete (and the owning account's `close()`, which the guard
 runs, deletes its webhook rows too).
 Known residue: a drop parked inside `push_subscribe` itself may leave a
@@ -1020,7 +1021,9 @@ and the accompanying warning is what tells the consumer to reconcile.
   replacement account whenever the reopen-generation watch changes;
   a naturally-ended or retryable stream reconnects with exponential
   backoff from 30 seconds to 480 seconds. Opening a stream alone does
-  not reset the delay; a lifecycle event or account replacement does.
+  not reset the delay; only a `Polled` heartbeat or lifecycle event does.
+  Replacement carries the consecutive-failure count and waits its earned
+  delay before opening the new stream.
   Retry and reconcile errors record shared throttle holds and wait at
   least the larger of the backoff and provider retry hint. The reader
   rechecks account-wide holds before opening another stream, and both
@@ -1028,9 +1031,9 @@ and the accompanying warning is what tells the consumer to reconcile.
   requests retain transport ownership of token refresh.
   JMAP forwards read failures, including failures of its expired-history
   snapshot repair; successful expired-history repair stays local because
-  its Mailbox position is private to lifecycle. Google still retries
-  locally: its stream-local diff baseline must become account-owned
-  before reconnect can preserve changes across a failed label poll.
+  its Mailbox position is private to lifecycle. Google commits its baseline
+  and pending differences in account state before yielding `Polled`.
+  Both providers end on the first failure and let the engine retry.
   A terminal lifecycle error is broadcast once and parks the reader
   until account replacement. Engine directives are handed to the reopen
   channel exactly once per stream failure - only `RestartAccount`, the one
@@ -1872,91 +1875,76 @@ broadcast nor a recovery outcome for the replacement.
 
 ## Push
 
-`InvalidationSinkInner` maps each account to an ordered ingress sender
-(or a direct bounded sender off-runtime), plus a drop counter. `attach` calls
-`register(account, watch_tx)` with the per-account bounded mpsc
-(capacity `MultiplexerConfig::watch_capacity`, default 256) that
-the reconciler reads; `detach` calls `unregister`. The drop
-counter is exposed as `bifrost_sync_push_dropped_total`.
+`InvalidationSinkInner` maps attached accounts to `SinkTarget`s. Each target
+holds a bounded `PushIngress`, delivery gate, recovery sender, throttle bucket
+and account boundary. The ingress stores invalidation intent only: distinct
+cursor scopes and memberships, or one full-reconcile bit. Past
+`MultiplexerConfig::watch_capacity` (default 256) it clears the sets and keeps
+the full bit. `dropped()` and `bifrost_sync_push_dropped_total` count these
+coarsenings, including coarsenings of merged reconciler work. No reconcile is
+lost. Its synchronous mutex and latched `Notify` work off-runtime too.
+Unregister closes the ingress and wakes its reader.
 
-Implements `bifrost_types::InvalidationSink::push`:
-`try_send` first; on `Full`, increment the drop counter only for
-coalescible invalidations and connection-health transitions. They are
-coalesced into one `HintPayload::Unknown` send with a 100ms bound. If the
-reconciler stays busy past that deadline, the reconcile request itself is
-lost until a later hint or poll; the counter therefore measures delivery
-loss as well as payload coarsening. Connection-health transitions can also
-lose their warning when replaced by an invalidation.
-`Terminated` and `Warning` are lossless control information on the runtime
-forwarder path. Each
-registration made on a Tokio runtime creates one ordered forwarder on that
-runtime and stores its unbounded ingress sender, so calls from receiver
-threads outside Tokio do not depend on whichever account registered first
-and later events cannot bypass an event waiting for bounded queue space. A
-registration made outside Tokio is explicitly a direct, non-waiting fallback;
-a full queue drops and counts every event. `Closed` (account detached
-mid-push) is silently ignored.
+`InvalidationSink::push` returns `SinkPush`: `Accepted`, `Refused(event)` or
+`NotAttached`. It acts on controls synchronously: reconnect requests a full
+reconcile, disconnect and warnings broadcast account-scoped warnings, retry
+and reconcile failures record shared throttles and warn, terminal failures
+broadcast account-scoped `SyncEvent::Terminated`. A push termination parks no
+poll; its error retains its original scope attribution. Engine directives
+are submitted to the bounded recovery queue only while the boundary reads
+`Run`; a full queue or a paused/checkpointing boundary returns the original
+event for resubmission. A refusal may persist through a consumer pause.
+Controls intentionally overtake pending invalidations: invalidations are
+idempotent wake-ups and no control verdict discharges them.
 
-The ingress queue remains unbounded. A sticky full-reconcile bit would bound
-invalidation storage and avoid the timeout loss, but cannot retain arbitrary
-warning payloads, termination classifications, or their ordering. Bounding
-this synchronous sink's entire mixed event ingress requires an explicit
-control-event overflow policy or a backpressure-capable API. The bounded
-`watch_capacity` applies to the reconciler channel, not total sink storage.
+The reconciler owns a persistent work set. It resolves memberships at merge
+time and full reconciliation at sweep time, retaining undispatched scopes.
+Merges exceeding the hint capacity coarsen to full; resolving a full sweep
+against a larger registry does not itself coarsen. A paused drive restores its
+scope and parks under both `Pause` and `CheckpointNow`. Scope-local throttle
+holds defer only their scopes. Account-wide directives retain the remainder
+under a hold until the generation changes or 30 seconds elapse; the stored
+generation, rather than a bare watch wake, decides whether it changed. Ready
+work sweeps before the task waits, so resuming needs no additional hint.
+Parked, deleted and refused scopes discharge their work rather than spin.
+Account errors from drives enter the same recovery path as stream terminations.
 
-The in-process push forwarder spawned in `attach` runs the same
-overflow policy against its per-account `tx`: redundant invalidations
-collapse to an `Unknown` reconcile request, while warnings and
-terminations retain their original classification.
+`PushLanes` owns the session set for each account generation. It runs lanes
+concurrently, applies their declared backoff and account holds, routes every
+unit/session failure, and resets failure counts only on `Healthy`. Counts
+cross replacement generations. Connection coverage losses owe a full reconcile
+at the next establishment; Registration cutover debt is reconciled at lane
+start. Terminal Connection failures broadcast once and park until topology or
+generation changes. Blind reconfiguration is paced from the fourth attempt.
+A session failing `Engine(RestartAccount)` waits, once its stamped request is
+submitted, up to 30 seconds for the generation it asked for before its own
+backoff. A lane going `Down` while no lane of its generation is `Down` or
+`Parked` broadcasts the "push transport disconnected" warning (a parking lane
+broadcasts its `Terminated` instead); recovery broadcasts nothing (the owed
+reconcile is the signal).
 
-`push::reconciler` receives `WatchEvent::Invalidated { hint }`,
-calls `scopes_for_hint(&cursors, &hint.payload)` (which consults
-the membership index populated at attach), then drives
-`changes_stream` to completion for each affected scope.
+Lane directives are stamped `PushRecovery { generation, scope, error }` and
+validated under the reopen lock before effects. Pending directives flush only
+while the account boundary reads Run, without blocking session polling or
+stop. Every engine subscribe/unsubscribe call outside reattach bumps topology,
+including cancellation and orphan retries. Maintenance sessions receive a gate
+that rechecks account holds before each request.
 
-A drive that returns an ENGINE-INTERNAL error is logged for that scope and does
-not abandon the remaining scopes of the hint. A drive that returns
-`Error::Account` is NOT: an account error already carries a derived recovery
-verdict, so it is normalized onto the `Terminated(err)` path below, exactly as
-the poll loop's `handle_drive_outcome` does. Logging it instead would leave the
-offending cursor installed and stall the scope until an unrelated poll happened
-to reproduce the failure. The two properties hold together: the sweep survives
-one scope's failure, and the failing scope still reaches recovery.
+`push_health(account)` returns a retained watch of each lane's Starting, Up,
+Down (failure count and latest error), Parked or Draining state. Only Down and
+Parked make `any_down()` true. Registration establishment does not clear Down;
+only demonstrated healthy maintenance does. Health updates are per lane entry,
+and receivers are notified only when an entry's state changes (a `Healthy`
+per IDLE round or WebSocket frame does not wake them). Every lane of a retiring
+generation reads `Draining`, whether it stopped mid-session or mid-backoff.
 
-On
-`Terminated(err)`, the reconciler routes through
-`crate::recovery::plan_recovery` and forwards
-`RecoveryPlan::Engine(directive)` to the slot's reopen channel
-carrying the original account error. `Retry(advice)` and
-`Reconcile(advice)` record their deadline in the shared throttle bucket and
-then SKIP that scope, continuing the sweep. They deliberately do NOT sleep the
-delay out: this is one task for the whole account, so a provider `Retry-After`
-of minutes naming one scope froze every other scope's push reconciliation for
-that long while the watch channel filled and coalesced behind it. The sleep was
-redundant with the bucket, which every drive path consults - including the top
-of each scope in this sweep, under a shutdown select. Pinned by
-`a_throttled_scope_does_not_freeze_the_account_wide_sweep`.
-
-`directive_target_scope` IS the blast radius, and the sweep obeys it:
-`Some(scope)` names one scope to reset, so the hint's remaining scopes are
-still swept after the handoff, while `None` (`RestartAccount`,
-`SchemaIncompatible`, `OperatorOverrideRequired`) is account-wide and ends the
-sweep, because driving further scopes into cursors the engine is about to
-discard only burns wire calls.
-
-`Disconnected` emits an account-scoped
-`WarningKind::Other` with message "push transport disconnected".
-`Reconnected` emits no warning and triggers a full
-`HintPayload::Unknown` reconcile whose synthetic source is
-`PushSource::Coalesced`.
-
-`WatchEvent::Terminated(AccountError)` (push streams that classify
-their own exit) flows through the same `plan_recovery` dispatch:
-engine directives route through the reopen channel, terminal
-classes broadcast `SyncEvent::Terminated(err)` so consumers observe
-the structured error, and retryable / reconcilable verdicts emit a
-warning while the in-process forwarder reconnects on its next
-iteration.
+Generation retirement stops sessions and keeps polling bounded cleanup for
+half the detach timeout, forwarding only invalidations. The next set starts
+only after the old set drains. Reattach waits before closing the old account.
+The retirement watch stores generation + 1, with zero meaning nothing retired;
+this distinguishes generation zero's completed drain from initial state.
+Detach drains workers before closing the account. Providers retain ownership
+of effects that must survive a dropped stream.
 
 `SubscriptionRegistry` (per-engine `DashMap<AccountId,
 Vec<RegisteredSubscription>>`) stashes each returned handle together
@@ -2332,7 +2320,7 @@ addressed to unattached accounts.
 
 `MutationConfig` (`fanout_buffer = 256`, `retry_queue_cap =
 4096`) lives on `EngineConfig::mutation`. `PushConfig` holds
-push-only knobs (the per-account `WatchEvent` mpsc capacity lives
+push-only knobs (the per-account pending invalidation capacity lives
 on `MultiplexerConfig::watch_capacity`): today
 `orphan_teardown_retry_interval`, default 15 minutes, `None` to
 disable. Each attached account runs an `OrphanTeardownRetrier`
@@ -3682,8 +3670,8 @@ admission permit or activity guard spans a hold wait, and waits never consume
 mutation attempts. Account-wide holds still cover every cohort.
 
 Both sides are wired. Recording: the reopen listener, the poll loop's
-and push reconciler's Retry and Reconcile arms (both the per-drive
-terminations and the reconciler's top-level `WatchEvent::Terminated`),
+and push reconciler's per-drive Retry and Reconcile arms, the sink's
+synchronous `WatchEvent::Terminated` handler,
 and the mutation campaigns (per-item outcomes and stream-level
 terminations) and their read-back (every per-item hydration failure the
 guard absorbs as uncertain, through the crate-internal
@@ -3875,10 +3863,11 @@ crates/sync/src/
     scope_walk.rs         // ScopeWalkDriver: partition sequencing;
                           // a barrier stops the whole scope walk
   push/
-    mod.rs                // InvalidationSinkInner
-                          // (per-account ingress) + coalesced_event
-    reconciler.rs         // hint -> scope -> changes_stream;
-                          // warning_event on Disconnected/Reconnected
+    mod.rs                // InvalidationSinkInner, synchronous controls
+    ingress.rs            // Bounded pending invalidation intent
+    lanes.rs              // Session supervision, pacing, generation drain
+    health.rs             // Retained per-lane coverage state
+    reconciler.rs         // Retained work set -> changes_stream
     subscription.rs       // SubscriptionRegistry (per-engine DashMap)
   mutation/
     mod.rs                // MutationCounters,
@@ -3905,6 +3894,7 @@ crates/sync/src/
     mod.rs                // four-lane Scheduler + admission dispatcher
     lanes.rs              // bounded LaneQueue + LaneShedPolicy
                           // (DropOldest default / DropNewest)
+    backoff.rs            // Consecutive-failure pacing, carried across replacement
     budget.rs             // BudgetGate (account-pool lifecycle and cancellation)
   cancel/
     mod.rs boundary.rs    // safe-boundary mechanism

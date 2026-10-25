@@ -27,7 +27,7 @@ use bifrost_types::{
     Projection, ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause,
     RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
     ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
-    VacationConfig, WatchEvent,
+    VacationConfig,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{Calendar, CalendarEvent};
@@ -296,8 +296,19 @@ impl Account for FlagsAccount {
         })
     }
 
-    fn push_stream(&self) -> AccountStream<WatchEvent> {
-        Box::pin(stream::empty())
+    fn push_stream(
+        &self,
+        lane: bifrost_types::PushLane,
+        _stop: bifrost_types::SessionStop,
+        _gate: bifrost_types::PushGate,
+    ) -> AccountStream<bifrost_types::PushSessionEvent> {
+        Box::pin(futures::stream::iter([
+            bifrost_types::PushSessionEvent::Failed(bifrost_types::push_lane_contract_error(
+                self.protocol(),
+                lane,
+                "not a lane of this account",
+            )),
+        ]))
     }
 
     fn open_blob(&self, _handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {
@@ -2036,8 +2047,19 @@ impl Account for JudgingAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         self.inner.push_unsubscribe(_handle)
     }
-    fn push_stream(&self) -> AccountStream<WatchEvent> {
-        self.inner.push_stream()
+    fn push_stream(
+        &self,
+        lane: bifrost_types::PushLane,
+        _stop: bifrost_types::SessionStop,
+        _gate: bifrost_types::PushGate,
+    ) -> AccountStream<bifrost_types::PushSessionEvent> {
+        Box::pin(futures::stream::iter([
+            bifrost_types::PushSessionEvent::Failed(bifrost_types::push_lane_contract_error(
+                self.protocol(),
+                lane,
+                "not a lane of this account",
+            )),
+        ]))
     }
     fn open_blob(&self, _handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {
         self.inner.open_blob(_handle)
@@ -2840,8 +2862,19 @@ impl Account for ReassertAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         self.inner.push_unsubscribe(_handle)
     }
-    fn push_stream(&self) -> AccountStream<WatchEvent> {
-        self.inner.push_stream()
+    fn push_stream(
+        &self,
+        lane: bifrost_types::PushLane,
+        _stop: bifrost_types::SessionStop,
+        _gate: bifrost_types::PushGate,
+    ) -> AccountStream<bifrost_types::PushSessionEvent> {
+        Box::pin(futures::stream::iter([
+            bifrost_types::PushSessionEvent::Failed(bifrost_types::push_lane_contract_error(
+                self.protocol(),
+                lane,
+                "not a lane of this account",
+            )),
+        ]))
     }
     fn open_blob(&self, _handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {
         self.inner.open_blob(_handle)

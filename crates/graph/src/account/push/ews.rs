@@ -1,10 +1,10 @@
-//! The EWS streaming arm of `push_subscribe`: which scopes the streaming
-//! worker can subscribe to at all, the one-shot `restId` -> `ewsId`
+//! The EWS streaming arm of `push_subscribe`: which scopes a streaming
+//! session can subscribe to at all, the one-shot `restId` -> `ewsId`
 //! translation their Subscribe body needs, and the registered subscription
-//! state the worker reads.
+//! state the session reads.
 //!
-//! The worker itself lives in `super::super::ews_stream`; it is spawned by
-//! `push_stream::ensure_ews_worker`.
+//! The engine drives sessions in `super::super::ews_stream`. Registration
+//! creates no EWS subscription and starts no provider worker.
 
 use crate::client::Resource;
 use std::collections::{HashMap, HashSet};
@@ -28,9 +28,9 @@ use super::dispatch::{ArmOutcome, finalize_push_outcomes};
 pub(crate) struct EwsSubscriptionState {
     /// The Graph cursor scope and EWS id for its folder. Graph `restId` and
     /// EWS `ewsId` are distinct opaque formats. The live EWS subscription id
-    /// is NOT stored here: it is worker-local state, minted per Subscribe
-    /// and abandoned (with a best-effort Unsubscribe) on every reconnect or
-    /// topology handoff, so nothing outside the worker's loop may hold it.
+    /// is NOT stored here: it is minted per session Subscribe, recorded in
+    /// the account's EWS release ledger, and released at the session's end
+    /// (or by a later session or `close()` when the session was dropped).
     pub(crate) scopes: Vec<EwsSubscriptionScope>,
 }
 
@@ -82,9 +82,9 @@ pub(super) struct ConvertIdError {
 pub(super) const TRANSLATE_EXCHANGE_IDS_MAX_INPUTS: usize = 1_000;
 
 /// The Graph `restId` this scope contributes to the EWS Subscribe request, or
-/// `None` when the EWS streaming worker cannot subscribe to it at all.
+/// `None` when an EWS streaming session cannot subscribe to it at all.
 ///
-/// Two exclusions, both of which the worker would otherwise turn into a
+/// Two exclusions, both of which the session would otherwise turn into a
 /// remote failure that reads as a provider fault instead of the caller's
 /// unsupported request:
 ///
@@ -114,13 +114,13 @@ pub(super) fn ews_subscribable_folder_id(scope: &CursorScope) -> Option<String> 
 }
 
 /// The EWS arm of `push_subscribe`: translate, close the ledger, and only
-/// then register the scopes and start the worker.
+/// then register the scopes and wake the session.
 ///
 /// The ledger is closed before the registration for the same reason as the
 /// webhook arm: a `finalize` failure after the insert returned `Err` with no
-/// handle over a registration the worker kept streaming and nothing could
+/// handle over a registration a session kept streaming and nothing could
 /// ever unsubscribe. This arm creates nothing server-side before the insert
-/// (the worker owns the EWS Subscribe), so closing first leaves a failure
+/// (the session owns the EWS Subscribe), so closing first leaves a failure
 /// with nothing to undo.
 pub(super) async fn subscribe_ews(
     account: GraphAccount,
@@ -144,8 +144,8 @@ pub(super) async fn subscribe_ews(
     }
     // A closed account is refused before the translation request, as the
     // webhook arm refuses before its first POST: registering here would only
-    // spawn a worker that sees the cancelled token and exits at once, leaving
-    // a registration no live worker streams. `shutdown` is cancelled by
+    // leave a registration no session will ever stream, since every session
+    // ends on the cancelled token. `shutdown` is cancelled by
     // `close()` alone, so a live account never takes this branch.
     if account.shutdown.is_cancelled() {
         return Err(account_closed_error());
@@ -156,7 +156,7 @@ pub(super) async fn subscribe_ews(
         return Ok((None, outcomes));
     }
     // An EWS handle carries no server state: the streaming subscription is
-    // the worker's connection and dies with it, so a handle retried on a
+    // the session's and is released with it, so a handle retried on a
     // newer instance has nothing left to delete (`unsubscribe_ews` on an
     // unknown handle is the correct no-op).
     let handle = ews_handle(&new_handle_token()?);
@@ -168,59 +168,15 @@ pub(super) async fn subscribe_ews(
         return Err(account_closed_error());
     }
     registrations.insert(handle.clone(), EwsSubscriptionState { scopes });
-    // Armed in the same synchronous step as the insert: there is no await
-    // between the two, so no drop point exists at which the registration is
-    // installed and unguarded. The awaits after it (the worker slot lock) are
-    // where a dropped caller would otherwise leave a registration whose handle
-    // nobody received - one no `push_unsubscribe` can ever name, that the
-    // worker would stream (and hold a server-side Exchange subscription for)
-    // until `close()`.
-    let registration = RegistrationGuard::new(account.clone(), handle.clone());
+    // Registration is the final effect; there is no await after this commit.
     drop(registrations);
-    // Bump the topology generation AFTER the map write: the worker only
+    // Bump the topology generation AFTER the map write: a session only
     // re-reads the map after observing a generation it has not seen, so the
     // read this bump provokes is guaranteed to include the new registration.
     account
         .ews_topology
         .send_modify(|generation| *generation = generation.wrapping_add(1));
-    crate::account::push_stream::ensure_ews_worker(account).await;
-    registration.disarm();
     Ok((Some(handle), outcomes))
-}
-
-/// Retires a registration whose `subscribe_ews` future was dropped before it
-/// returned the handle.
-///
-/// `unsubscribe_ews` is async (it takes the registration lock), so the drop
-/// hands it to a task on the current runtime; with no runtime to hand it to
-/// (the drop is itself runtime teardown) there is nothing left to leak into.
-struct RegistrationGuard {
-    armed: Option<(GraphAccount, SubscriptionHandle)>,
-}
-
-impl RegistrationGuard {
-    fn new(account: GraphAccount, handle: SubscriptionHandle) -> Self {
-        Self {
-            armed: Some((account, handle)),
-        }
-    }
-
-    fn disarm(mut self) {
-        self.armed = None;
-    }
-}
-
-impl Drop for RegistrationGuard {
-    fn drop(&mut self) {
-        let Some((account, handle)) = self.armed.take() else {
-            return;
-        };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = unsubscribe_ews(account, handle).await;
-            });
-        }
-    }
 }
 
 /// The error context for the translation request itself.

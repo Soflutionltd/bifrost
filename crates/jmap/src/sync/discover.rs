@@ -367,6 +367,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                         // The burst is over; the next poll starts a new
                         // walk from the just-committed state.
                         state_walk.reset_changes_burst(&new_state);
+                        yield ScopeLifecycleEvent::Polled;
                         poll_pause(&shutdown, &mut session_changes).await;
                     }
                 }
@@ -418,6 +419,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                                 break;
                             }
                         }
+                        yield ScopeLifecycleEvent::Polled;
                         poll_pause(&shutdown, &mut session_changes).await;
                         continue;
                     }
@@ -677,6 +679,16 @@ mod tests {
         .to_string()
     }
 
+    fn skip_polled(
+        stream: AccountStream<ScopeLifecycleEvent>,
+    ) -> AccountStream<ScopeLifecycleEvent> {
+        Box::pin(
+            stream.filter(|event| {
+                futures::future::ready(!matches!(event, ScopeLifecycleEvent::Polled))
+            }),
+        )
+    }
+
     fn lifecycle_stream(
         replies: impl IntoIterator<Item = String>,
     ) -> (
@@ -702,6 +714,21 @@ mod tests {
     /// The full-control variant: caller picks `maxObjectsInGet` and gets
     /// the recorded request log back.
     fn lifecycle_stream_with_limit(
+        replies: impl IntoIterator<Item = String>,
+        names: HashMap<String, String>,
+        max_objects_in_get: usize,
+    ) -> (
+        AccountStream<ScopeLifecycleEvent>,
+        CancellationToken,
+        StateMap,
+        Recorder,
+    ) {
+        let (stream, shutdown, states, recorder) =
+            raw_lifecycle_stream_with_limit(replies, names, max_objects_in_get);
+        (skip_polled(stream), shutdown, states, recorder)
+    }
+
+    fn raw_lifecycle_stream_with_limit(
         replies: impl IntoIterator<Item = String>,
         names: HashMap<String, String>,
         max_objects_in_get: usize,
@@ -760,6 +787,54 @@ mod tests {
             }, "s0"]]
         })
         .to_string()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_completed_mailbox_changes_burst_yields_polled() {
+        let mut first: serde_json::Value =
+            serde_json::from_str(&mailbox_changes_reply("session-1", &[])).expect("fixture");
+        first["methodResponses"][0][1]["hasMoreChanges"] = true.into();
+        let mut last: serde_json::Value =
+            serde_json::from_str(&mailbox_changes_reply("session-1", &[])).expect("fixture");
+        last["methodResponses"][0][1]["oldState"] = "mbx-2".into();
+        last["methodResponses"][0][1]["newState"] = "mbx-3".into();
+        let (mut stream, shutdown, states, requests) = raw_lifecycle_stream_with_limit(
+            [first.to_string(), last.to_string()],
+            HashMap::new(),
+            256,
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(ScopeLifecycleEvent::Polled)
+        ));
+        assert_eq!(requests.lock().expect("requests").len(), 2);
+        assert_eq!(
+            states.lock().await.get("primary"),
+            Some(&Some("mbx-3".into()))
+        );
+        shutdown.cancel();
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_name_hydration_yields_no_polled() {
+        let (mut stream, _, states, _) = raw_lifecycle_stream_with_limit(
+            [
+                mailbox_changes_reply("session-1", &["new"]),
+                method_failure("serverFail"),
+            ],
+            HashMap::new(),
+            256,
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(ScopeLifecycleEvent::Terminated(_))
+        ));
+        assert!(stream.next().await.is_none());
+        assert_eq!(
+            states.lock().await.get("primary"),
+            Some(&Some("mbx-1".into()))
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -914,7 +989,7 @@ mod tests {
         let names = Arc::new(Mutex::new(HashMap::new()));
         let shutdown = CancellationToken::new();
         let open_stream = || {
-            scope_lifecycle(
+            skip_polled(scope_lifecycle(
                 mail.clone(),
                 CoreLimits {
                     max_objects_in_get: 256,
@@ -925,7 +1000,7 @@ mod tests {
                 Arc::clone(&names),
                 shutdown.clone(),
                 client.clone(),
-            )
+            ))
         };
         let mut first = open_stream();
         assert!(matches!(

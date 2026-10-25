@@ -46,7 +46,6 @@ use crate::directory::{DirectoryCard, DirectoryGroup, DirectoryGroupId, Director
 use crate::error::{AccountError, AccountOperation, ItemOutcome, MutationSuccess};
 use crate::events::{
     Change, InventoryEvent, InventoryPartition, InventoryPartitioning, Priority, SyncEvent,
-    WatchEvent,
 };
 use crate::filter::{
     FilterValidation, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
@@ -299,15 +298,11 @@ pub trait Account: Send + Sync {
     /// ask about (folder trees, labels, mailboxes, queries)? Bounded.
     fn discover_memberships(&self) -> AccountStream<SyncEvent<MembershipScope>>;
 
-    /// Ongoing scope lifecycle events (folder created, renamed, deleted).
-    ///
-    /// Yields `ScopeLifecycleEvent::Lifecycle(_)` for scope changes
-    /// and `ScopeLifecycleEvent::Terminated(AccountError)` when the
-    /// long-running poll cannot continue. The structured terminal
-    /// signal lets the engine escalate auth-lost or schema breaks
-    /// observed by the lifecycle poller; previously the protocol
-    /// could only sleep-and-retry silently because the stream element
-    /// type was a bare `ScopeLifecycle` with no terminal carrier.
+    /// Ongoing scope changes and `Polled` heartbeats after complete successful
+    /// polls. The provider owns healthy poll cadence. The first failure yields
+    /// `Terminated` and ends; no provider retry follows it. The engine owns
+    /// reconnect, backoff, throttle holds and directive routing. Only `Polled`
+    /// or `Lifecycle` resets backoff; account replacement carries the count.
     fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent>;
 
     /// Initial cursor establishment. The engine calls this exactly
@@ -530,17 +525,62 @@ pub trait Account: Send + Sync {
         handle: SubscriptionHandle,
     ) -> AccountFuture<Result<(), AccountError>>;
 
-    /// Event stream from the protocol crate to the engine. Contents
-    /// depend on `push_in_process`:
+    /// The push lanes this account instance runs, constant for its life.
+    /// Empty when push is unavailable. The engine reads it once per account
+    /// generation and only when `capabilities().push` is not `None`.
+    fn push_lanes(&self) -> Vec<crate::PushLaneSpec> {
+        Vec::new()
+    }
+
+    /// One push session on `lane`. The session contract:
     ///
-    /// - In-process (IMAP IDLE, JMAP WebSocket, EWS streaming): full
-    ///   `WatchEvent` traffic - `Invalidated` + `Disconnected` +
-    ///   `Reconnected`.
-    /// - Out-of-process (Gmail Pub/Sub, Graph webhooks):
-    ///   `Invalidated` events flow through `InvalidationSink`, not
-    ///   here. The stream may carry `Disconnected` / `Reconnected` on
-    ///   sustained subscription-health failure, or yield nothing.
-    fn push_stream(&self) -> AccountStream<WatchEvent>;
+    /// - S1. A session is re-runnable: every effect it may have committed
+    ///   before failing or being dropped is idempotent under re-run,
+    ///   self-expiring, or recorded in account state for the next session or
+    ///   `close()` to settle. The engine therefore paces `Reconcile` exactly
+    ///   like `Retry`.
+    /// - S2. A session never retries after a failure. A `Connection` session
+    ///   ends at its first failure (`Failed` or `Ended(Lost)`), except that a
+    ///   failure local to one unit of its assignment is reported as
+    ///   `UnitFailed`, the unit is removed, and the session ends
+    ///   `Ended(Reconfigure)`; and a retryable failure of an optional
+    ///   coverage extension is reported as `UnitFailed` while the session
+    ///   continues on its base coverage.
+    /// - S3. A `Registration` session runs maintenance passes, the first at
+    ///   session start. A pass attempts every due unit once, reports every
+    ///   unit failure as `UnitFailed`, retires terminal units in provider
+    ///   state, and ends `Ended(Incomplete)` if any unit failed
+    ///   non-terminally or any unit is still retired; only a clean pass
+    ///   yields `Healthy`. A whole-session fault ends `Failed`.
+    /// - S4. `Healthy` means demonstrated healthy wire progress; setup alone
+    ///   is not progress.
+    /// - S5. Coverage gaps the provider learns of are invalidated by the
+    ///   provider. A `Registration` session commits each gap to account
+    ///   state with the effect that revealed it and removes one obligation
+    ///   immediately before yielding its `Invalidated`, so a dropped session
+    ///   leaves the rest for the next one.
+    /// - S6. The terminal item (`Ended` or `Failed`) follows the session's
+    ///   own cleanup, and the stream then ends.
+    /// - S7. On `stop` the session performs bounded cleanup and ends
+    ///   `Ended(Stopped)`; the caller keeps polling until then.
+    /// - S8. Dropping a session never corrupts account state; effects that
+    ///   must outlive a drop run in account-owned tasks, and `close()`
+    ///   settles them, bounded.
+    /// - S9. `Established` precedes any coverage-dependent progress.
+    /// - S10. `UnitFailed` errors carry their own scope attribution.
+    /// - S11. One live session per lane: a second concurrent session on a
+    ///   driven lane, or a session on a lane not in `push_lanes()`, yields
+    ///   one `Failed(push_lane_contract_error(..))` and ends.
+    /// - S12. Without the engine nothing runs push: a direct consumer must
+    ///   drive and pace every lane itself. `push_subscribe` only registers.
+    /// - S13. A `Registration` session awaits `gate.clear()` before every
+    ///   maintenance request; `Connection` sessions do not consult the gate.
+    fn push_stream(
+        &self,
+        lane: crate::PushLane,
+        stop: crate::SessionStop,
+        gate: crate::PushGate,
+    ) -> AccountStream<crate::PushSessionEvent>;
 
     /// Open a blob for streaming download.
     fn open_blob(&self, handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>>;

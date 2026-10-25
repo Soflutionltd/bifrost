@@ -1084,14 +1084,34 @@ application, never the historical successful command's evidence.
 
 ### Push lifecycle
 
-Dial, SELECT, NOTIFY registration and IDLE errors are classified as `PushStream` with the selected folder scope. Only `Retry` emits transport disconnects and uses the redial backoff. Every other class is latched as `WatchEvent::Terminated` for late or lagged readers, and the failed worker releases its connection and parks until subscription reconfiguration or shutdown. A replacement subscription clears the latch. Deleted, renamed and revoked folders therefore do not cause timer-driven redials. The slot remains alive so reconfiguration can assign it another folder.
+Push is driven by engine-owned sessions. `push_lanes()` returns no lanes at
+zero capacity, one Connection lane with NOTIFY, otherwise one per carved-out
+push slot. Subscribe registers scopes and bumps the assignment watch; it
+spawns nothing. Each `push_stream(lane, stop, gate)` claims a shared lane
+lease, waits for an assignment, reserves capacity, dials, SELECTs, registers
+NOTIFY and yields `Established`. Completed IDLE rounds yield `Healthy` and
+mapped invalidations. Setup alone never resets the engine's backoff (5s to
+300s). Every connection error ends `Failed`; EOF ends `Lost`.
 
-Events published while no `push_stream` receiver exists are retained in a
-bounded queue and delivered when a receiver attaches. If that queue fills, the
-pending history collapses to one account-wide coalesced invalidation and the
-latest connection state.
+SELECT excludes a folder only for terminal recovery or `DisableScope` for
+that folder, reports `UnitFailed`, then ends `Reconfigure`. Exclusions are
+stamped with the subscription version and expire when the subscribed set
+changes or the account is replaced. Stale attempts cannot exclude a new
+version's folder. Account-wide directives and repairable scope failures end
+`Failed` without excluding. BYE and IDLE errors never exclude. Lanes take
+their slot from the filtered lexical assignment list, so an exclusion shifts
+higher slots and makes those sessions reconfigure once. All-excluded lanes
+park on the assignment watch; INBOX fallback never bypasses exclusions.
 
-The IDLE workers are account-owned, not subscription-owned. With NOTIFY one worker covers the selected folder plus every other accepted folder through `NOTIFY SET`; without it the account starts one worker per unit of carved-out push capacity, each covering one folder. At zero push capacity no worker starts. Defaults allow two push sessions without NOTIFY or one with it, inside four physical sessions. At the default non-NOTIFY push ceiling, two sessions remain for data. With no push subscribed, data checkouts may use every session `pool_cap` allows; push establishment then depends on retiring a parked data member or waiting for a checked-out one to come back. A worker without an assignment parks. Each push session holds both a shared session permit and a push slot through driver exit, so reassignment and reconnect tails cannot consume the last data slot. A redial waits for the previous push driver's LOGOUT tail; NOTIFY reassignment serializes behind that single slot.
+NOTIFY retry/reconcile failures report `UnitFailed` and retain selected-folder
+coverage plus coarse invalidations. A definite tagged command refusal may
+degrade with a support-only warning; authentication, authorization, BYE and
+transport failures end `Failed`. A same-folder subscription change re-IDLEs
+on the same connection. A different assignment invalidates broadly and ends
+`Reconfigure`. Stop completes the IDLE DONE handshake and bounded LOGOUT
+before `Ended(Stopped)`. Drop releases the session; physical capacity stays
+held through driver exit. No provider retry loop, broadcast queue or terminal
+latch remains. Connection sessions ignore the maintenance gate.
 
 Push always dials fresh and never adopts or parks a data member. A previously selected data connection may carry unsolicited mailbox-less FETCH, VANISHED or EXISTS events; adopting it would absorb those into the wrong folder's cache. To make room, fresh acquisition retires a parked member or waits for a checked-out member to return. That wait may be as long as a data stream; polling continues meanwhile. Capacity and worker topology are fixed at open from the admission profile, even if a later dial advertises different capabilities.
 
@@ -1099,17 +1119,11 @@ Acquisition has two phases. During the capacity wait, subscription changes re-ch
 
 Admission is per scope, under the same lock as the insert, so two concurrent subscribes cannot both take the last slot. A folder already pushed costs no new session and is always admitted; without NOTIFY, a new distinct folder is admitted in request order while `covered.len() < push_capacity`; nothing is admitted at zero push capacity. Admission accepts exactly what worker assignment can watch: a folder scope whose name fails `MailboxName::new` (NUL/CR/LF) is refused into the failed lane, because `subscribed_idle_folders` drops such names and admitting one would report it as pushed while burning a slot on a mailbox no worker can SELECT. Every admitted folder always has a worker, because without NOTIFY admission caps the admitted set at the push capacity, which is also the worker count - but the folder-to-slot *index* is recomputed lexically from the whole subscribed set on every wake, so a folder's slot number is not stable across subscription changes even though its coverage is. When push capacity is exhausted, `push_subscribe` puts excess scopes in `PushSubscription.outcomes.failed` as `Unsupported(PushSubscribe)` carrying budget-specific diagnostic text; a subscribe that accepts nothing returns no handle. bifrost-sync records only the succeeded scopes and keeps the rest in the polling lane - it never suppresses polling on push coverage, which is what keeps a refused folder visible. Unsubscribe frees a folder slot once its last handle leaves.
 
-Workers are woken by a `watch` generation counter rather than a `Notify`. With several workers, `notify_one` would wake one and leave the rest on a stale assignment, and `notify_waiters` stores nothing, so a worker in the window between finding no folder and awaiting the wake would park forever. The `watch` generation latches; each worker marks it seen *before* reading the scope set, so a change landing in that window still wakes it.
-
-IDLE alone reports only the SELECTed mailbox. On NOTIFY servers, `NOTIFY SET` (RFC 5465 Section 3) extends that one session to every accepted folder: `(selected (MessageNew MessageExpunge FlagChange))` plus the same events under a `mailboxes` filter naming every other watched folder. Events on those arrive as STATUS responses (Section 4), which `map_idle_event` turns into per-folder invalidations. The registration asks for no fetch attributes and no initial STATUS snapshot. A session that waited for capacity publishes its own per-folder coverage invalidations; the immediate-acquisition path still avoids a snapshot burst. Servers without NOTIFY use the bounded worker pool above. A server that advertises NOTIFY and has positive push capacity admits its whole requested scope list because one session covers it, so a runtime `NOTIFY SET` rejection leaves the account with one worker and push for the selected mailbox only, while `push_subscribe` has already reported every scope as succeeded.
-
-That report cannot be retracted - `BatchOutcome` is settled and returned before the first dial, and the `Account` surface has no per-scope demotion event - so the collapse is handled the way `reference/sync.md` requires a missed push to be handled: it degrades to a coarser invalidation rather than to silence. `register_notify` returns whether the registration took, or an error that the worker classifies and forwards unless it is Retry. A missing NOTIFY capability and retryable registration failures retain the coarse coverage fallback, and `signal_notify_coverage_loss` turns a `false` on a NOTIFY-advertising account into one account-wide `HintPayload::Unknown`. Registration is re-attempted on every redial and on every resubscribe-interrupted round, so the uncovered folders keep receiving a coarse invalidation at the IDLE cadence instead of nothing. It is gated on the account-level NOTIFY capability deliberately: without NOTIFY the account runs one worker per admitted folder and a `false` means only "this worker had no others to fold in", so firing there would invalidate the whole account once per IDLE round on every non-NOTIFY server. `register_notify` still logs the warning naming how many folders the rejection leaves unpushed, and those folders remain polled, since polling is never suppressed on push coverage.
-
-A scope-set change cancels the in-flight IDLE round through a child token so the folder choice can be re-evaluated. `ImapConnection::idle` gives cancellation strict priority over queued server events, so the round returns `Cancelled` while events may still be queued. The DONE drain itself does not throw those away - `drain_idle_responses` emits them to the event sink and they survive into the next `idle()` round - so what loses them is dropping the connection, not the cancellation.
-
-The interrupt therefore re-chooses BEFORE deciding (`resubscribe_action`, pure). When the new scope set assigns this slot the same mailbox - the common case, since subscribing or unsubscribing some other folder does not move slot 0 - the worker re-IDLEs on the SAME connection: no redial (a full connect+auth+SELECT per subscription change is what providers with per-user connection-rate limits punish), no coarse invalidation (nothing was lost), and the event the round did return is published normally. `NOTIFY SET` is re-issued for the new watched set on that same session. Only a different assignment, or none, breaks out to redial, and only that path absorbs the round's event and emits the coarse `HintPayload::Unknown` invalidation (`signal_idle_interrupt_loss`). A `BYE` or server termination that lands in the interrupted round is not a re-IDLE candidate at all: it takes the ordinary closed-connection path (`Disconnected`, redial with backoff), because the socket is gone regardless of what the scope set now says. Reconfiguring subscriptions degrades to a broader reconcile, never to silent push loss for the scopes that stayed.
-
-The DONE handshake carries the account's `command_timeout`, the same bound every other command has. A peer whose TCP is alive but which never answers the tagged OK for IDLE would otherwise park the push loop past cancellation, past `account.shutdown`, and past `close()`. The bound turns that into an `Error::Timeout`, a `Disconnected` event, and a redial.
+Assignment changes use a latched watch version marked seen before choosing,
+so changes during setup remain visible to the first IDLE round. Capacity
+waits keep one reservation across assignment changes; dial/auth is interrupted
+only by stop or shutdown. A session that waited for capacity invalidates each
+covered folder before establishment; an immediate acquisition does not.
 
 Every connection minted by the pool is registered with a weak connection handle and a shared driver-task owner, including parked, checked-out, and dedicated IDLE sessions. `Pool::close` sets the closed flag, closes the session semaphore, clears member waiters, drains the parked list and registry, concurrently requests LOGOUT on every live connection under one `command_timeout`, then joins each driver. Drivers whose connection handles already disappeared are already running the driver's bounded best-effort LOGOUT; close waits for it up to `LOGOUT_DRAIN_TIMEOUT` and aborts and joins on expiry.
 
@@ -1140,8 +1154,6 @@ The `registry` mutex is the linearization point that protects pool registration 
 The return side takes the matching linearization under the idle lock. Returning a reusable member checks `closed` while holding that lock, before either handing to the oldest waiter or parking. A return either lands before the drain and is drained, or observes the flag and parks nothing. Cancellation removes a waiter synchronously and returns an already handed member through the same FIFO path, so dropping an acquisition cannot strand capacity.
 
 Registration prunes completed driver tasks. A missing connection handle alone does not make a registration stale: the driver may still be completing its bounded best-effort LOGOUT, and the registry keeps its join handle until that finishes. This also bounds registry growth when a non-NOTIFY push worker reconnects across a network outage.
-
-A failed dial or SELECT backs off from 5s, doubling to a 300s ceiling, and resets on the first successful SELECT. The wait races the cancel and shutdown tokens rather than sleeping through them, and `Disconnected` is emitted once per disconnection rather than once per failed attempt.
 
 ### Concurrency conflicts and UNCHANGEDSINCE
 
@@ -1241,7 +1253,7 @@ crates/imap/src/
 |   |-- parts.rs           - BODYSTRUCTURE part traversal + part-handle codec (unwired)
 |   |-- pim.rs             - unified PIM primitives + conveniences
 |   |-- pool.rs            - per-folder connection checkout
-|   |-- push.rs            - IDLE-driven WatchEvents
+|   |-- push.rs            - IDLE-driven push sessions
 |   |-- sieve.rs           - ManageSieve script filters
 |   `-- scopes.rs          - folder discovery, lifecycle stream
 |-- types/           - internal protocol types plus public Credentials / AuthPolicy

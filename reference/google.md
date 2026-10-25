@@ -326,7 +326,7 @@ account-scoped clone attached to `bifrost-net` under the engine
   `establish_initial_cursor` to mint a cursor without a second
   network call.
 - `pubsub: Arc<PubSubControl>` holding the watch actor command sender,
-  shutdown token, and a `broadcast::Sender<WatchEvent>`. The actor task owns the
+  shutdown token, due-time watch, gap/fresh flags and lane lease. The actor owns the
   optional config, lifecycle state, active-handle set, and its claim on the
   mailbox's shared watch exclusively. It is built from the profile's email
   address, the key under which instances coordinate `users.stop`.
@@ -900,6 +900,10 @@ nothing cached, the operation fails rather than canonicalizing against
 an empty vocabulary; a populated stale cache stays usable when a later
 refresh fails.
 
+A complete successful label poll commits its baseline and pending changes
+before yielding `ScopeLifecycleEvent::Polled`; partial failures yield no
+heartbeat. The engine uses this heartbeat to reset reconnect backoff.
+
 `scope_lifecycle_stream` shares an account-owned baseline and pending event
 queue, independent of the label vocabulary cache. The first successful label
 fetch seeds the baseline without emitting Created events. Later polls diff
@@ -1174,79 +1178,31 @@ request or one with no account scope returns `Err` because no watch was
 created. A failed `users.watch` also returns `Err`, so no successful scope is
 claimed when the request itself failed.
 
-A subscribe emits `WatchEvent::Reconnected` only when the actor's
-`disconnected` latch is set - that is, only when it genuinely reconnects.
-A FIRST subscribe is silent: it is the consumer's opening act, so
-announcing a reconnect from there published an event before any consumer
-could hold a `push_stream()` receiver, and `broadcast` drops messages with
-no receivers, making the stream's first observable state a function of
-task scheduling rather than of the watch.
+The account exposes one Registration lane when Pub/Sub is configured. The
+watch actor owns handles, mailbox ownership and all server effects, but no
+renewal timer or failure damper. It publishes a due-time watch and accepts
+`Renew` commands. The session waits for the due time, checks the engine's
+`PushGate`, asks the actor to renew, and reports `Healthy` on completion or
+ends `Failed` on any classified error. The engine applies the five-minute
+failure backoff. A new session scans immediately and adds no cadence delay.
+Successful cadence remains one day before expiry, six days without expiry,
+with a five-minute floor.
 
-One actor task owns the four-state lifecycle (`Unwatched`, `Watched`, `Renewing`,
-`Retired`), the active handles, subscription commands, renewal timing, and close.
-There is no renewer handle for another task to clear or restart. Its renewal arm:
+Terminal renewal errors move the actor to Unwatched; Retry, Reconcile and
+Engine errors retain the previous watch and keep it due now. No error is
+locally retried. The actor never races a watch request against shutdown or
+session stop: it completes and `commit_watched` either installs it or retires
+it with best-effort stop. Dropping a session cannot cancel that effect.
 
-- Sleeps until `renewal_delay(expiration)` - one day before
-  the expiration timestamp from Gmail, or `DEFAULT_RENEW_AFTER`
-  (six days) if no expiration was returned. Computed renewal delays
-  have a five-minute floor, including already-expired timestamps, so
-  a short or unchanged watch expiration cannot create a successful
-  hot renewal loop.
-- Re-issues `users.watch` and replaces history id and expiration together in one
-  state transition.
-- On failure, the actor classifies through
-  `error::into_account_error(_, GmailErrorContext::push_subscribe())`. The
-  context scopes the error to `CursorScope::Account` because the watch covers
-  that cursor. The actor retries locally only for `RecoveryClass::Retry`, plus
-  one exception: a retry-candidate status (5xx or a policy-listed status) that
-  net declined to replay because `/watch` is declared `ReplayPolicy::Never`.
-  That error classifies as `Reconcile`, but the damped re-watch is its
-  reconciliation (`users.watch` replaces whatever watch the mailbox has, and
-  the old watch stays live until expiry), so it takes the retry path
-  (`renewal_status_stopped_by_replay_policy`). Every other class,
-  including engine directives and reconciliation, emits
-  `WatchEvent::Terminated(AccountError)` and returns to `Unwatched`, so a later
-  subscribe command starts a fresh watch and renewal schedule. Retry classes
-  emit a structured
-  `WatchEvent::Warning` per failure (support-only text carrying the
-  message key) plus `WatchEvent::Disconnected` (once) and retry after
-  `RENEW_RETRY_AFTER` (five minutes); the next success emits
-  `WatchEvent::Reconnected`. Every failure goes
-  through the classifier first. The warning's `retry_count` is the number
-  of CONSECUTIVE renewal failures, cleared by any completed request
-  (subscribe or renewal) and by a terminal classification, so an operator
-  reading the lane can tell one stumble from a sustained outage.
-- Selects on `shutdown.cancelled()` against the renewal sleep, biased so that a
-  cancelled account retires rather than renewing when both are ready in the same
-  poll. Cancellation moves the actor to `Retired`.
-- Deliberately does **not** race `shutdown.cancelled()` against the `users.watch`
-  request itself, on either the renewal or the subscribe path. An unbiased
-  `select!` between the token and the request can pick the completed request, and
-  any commit after that point installs a watch nobody renews and no `close()`
-  retires - the orphan-watch failure the shutdown check exists to prevent. The
-  request runs to completion and `commit_watched` decides afterwards whether we
-  are still allowed to own it. It is the single place a response becomes
-  `Watched`; if the account retired underneath the request it pins `Retired`,
-  issues a best-effort `users.stop` for the watch it just refused, and reports
-  failure. A check on the committed value cannot lose that race, where a check in
-  a `select!` arm can.
-
-  Subscribe additionally checks shutdown before queueing the command and again on
-  entry to the actor, so the common post-close case costs no wire traffic at all.
-  The handle envelope is encoded before the commit: an encode failure after it
-  would leave `Watched` installed with no handle in the set, so `close()` would
-  skip `users.stop` and the renewer would keep the orphan alive.
-
-A successful subscribe clears the `Disconnected` latch so `Reconnected` stays
-edge-triggered, but deliberately does not clear the transient-failure
-`retry_after` damper: a backoff reset by a *subscribe* rather than by a completed
-request is how a subscribe-then-die loop escapes its backoff. The damper also
-survives unrelated actor traffic: the per-loop delay computation reads it
-without consuming it, and it is cleared only where the renewal timer actually
-fires or a fresh lifecycle state is installed. Consuming it during the
-computation let any command landing inside the five-minute backoff erase it,
-and for a watch with no expiration the recomputed delay then fell back to the
-six-day default.
+Renewal compares the previous expiry with completion wall time. A gap is
+committed atomically with the watch and drained as one account invalidation.
+After terminal failure, a later subscribe also compares the lapsed watch's
+expiry, records any gap, and sets `fresh`. Its next session reports `Healthy`
+for that successful watch call, restoring health without waiting days for
+renewal. An initial subscribe has no gap or fresh signal. Sessions enforce
+one driver with `LaneLease`, report `Established` once coverage exists, and
+end `Stopped` on stop or shutdown. Health is engine state, with no broadcast
+ring or terminal replay latch in the actor.
 
 `push_subscribe`, renewals, `push_unsubscribe`, and close are actor messages or
 actor-owned transitions, so no lifecycle state is assembled from independently
@@ -1301,14 +1257,6 @@ a second consumer in the process using another topic, errs toward skipping the
 stop. Residual: instances in OTHER processes are invisible to the registry and
 `users.stop` cannot be scoped to a watch, so cross-process teardown of a shared
 mailbox can still stop a live watch until the next renewal.
-
-`push_stream` adapts the 32-event broadcast health ring with shutdown wiring.
-The actor also latches terminal failures in account-owned state before
-broadcasting them. Each stream checks that latch before receiving and after
-lag, emits `Terminated` once, then ends. Late subscribers therefore see the
-terminal failure too. The latch lasts for the account instance, including if
-an explicit subscribe restarts the watch actor's lifecycle. Lag without a
-terminal latch emits a support-only warning with the number of events lost.
 
 The Pub/Sub message payload itself is not parsed by this crate;
 the consumer subscribes to the Pub/Sub topic out of process,
