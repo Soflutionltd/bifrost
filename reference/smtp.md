@@ -788,7 +788,8 @@ An unoffered cancellation refunds only the current tail; issued sibling slots
 never move. Finite retunes price future reservations without changing issued
 sizes or times. Crossing unlimited invalidates queued reservations; async waiters
 wake on policy changes. Pending TLS writes retain the original offered length
-across retunes, as required for native-tls retries.
+across retunes, as required for native-tls retries, clamped only to a shorter
+buffer the caller re-polls with.
 
 For a constant finite cap `c`, the per-direction bound over `T` seconds is
 `c * (T + 1) + A`, where `A` is all unspent allowances at the window start,

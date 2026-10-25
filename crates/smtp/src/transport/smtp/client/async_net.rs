@@ -493,13 +493,20 @@ impl AsyncWrite for AsyncNetworkStream {
             return Poll::Ready(Ok(0));
         }
         std::task::ready!(this.poll_admission(cx, BandwidthDirection::Outbound, buf.len()));
-        let offer = this.retry_len.unwrap_or_else(|| {
-            this.out_grant
-                .as_ref()
-                .expect("admitted write")
-                .granted()
-                .min(buf.len())
-        });
+        // A retry keeps its pending length, but never past the buffer it is
+        // handed: `AsyncWrite` lets a caller re-poll with a shorter buffer,
+        // and slicing past it would panic. A TLS session that refuses the
+        // shorter retry reports an error; that is the caller's contract.
+        let offer = this.retry_len.map_or_else(
+            || {
+                this.out_grant
+                    .as_ref()
+                    .expect("admitted write")
+                    .granted()
+                    .min(buf.len())
+            },
+            |pending| pending.min(buf.len()),
+        );
         let buf = &buf[..offer];
         let result = match &mut this.inner {
             InnerAsyncNetworkStream::TokioTcp(s) => Pin::new(s).poll_write(cx, buf),
@@ -812,6 +819,31 @@ mod tokio_test {
             vec![100_000, 100_000],
             "the retry must offer the pending length, not one second of the new cap"
         );
+    }
+
+    /// `AsyncWrite` does not require a re-poll after `Pending` to pass the same
+    /// buffer. A retry handed a shorter one offers that shorter buffer; it
+    /// used to slice at the stale pending length and panic.
+    #[tokio::test(crate = "tokio")]
+    async fn a_pending_retry_with_a_shorter_buffer_offers_the_shorter_buffer() {
+        let peer = RetryRecordingPeer::default();
+        let offers = Arc::clone(&peer.offers);
+        let mut stream = AsyncNetworkStream::from_raw_stream_for_test(Box::new(peer));
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            Pin::new(&mut stream)
+                .poll_write(&mut cx, &[b'x'; 100])
+                .is_pending(),
+            "the peer answers the first offer Pending"
+        );
+        let Poll::Ready(Ok(written)) = Pin::new(&mut stream).poll_write(&mut cx, &[b'y'; 10])
+        else {
+            panic!("the shorter retry must go out");
+        };
+        assert_eq!(written, 10);
+        assert_eq!(*offers.lock().expect("offer log"), vec![100, 10]);
     }
 
     /// Under a cap, a single write offers at most one second of it, so a body

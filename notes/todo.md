@@ -158,14 +158,6 @@ PUBLISHED SURFACE fence apply.
   remain SELECTed on the target while DELETE or RENAME goes out, contrary to
   RFC 2683 Section 2.2.2. Pre-existing.
 
-## SMTP AsyncNetworkStream::poll_write slices with a stale retry length
-
-- poll_write in crates/smtp/src/transport/smtp/client/async_net.rs keeps the
-  offer length from an earlier Pending write and slices the next buffer with
-  it. A caller re-polling with a shorter buffer would panic. Looks unreachable
-  today: a dropped write leaves the connection Broken and the pool discards
-  it.
-
 ## Account schema reset follow-ups
 
 - "`BackfillCheckpointWriter::persist` bypasses completion refusal and every
