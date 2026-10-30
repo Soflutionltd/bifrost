@@ -96,6 +96,9 @@ pub struct SmtpSubmissionConfig {
     /// Append sent messages to the Sent folder unless the caller says
     /// otherwise via `SendRequest::save_to_sent`.
     pub save_to_sent_default: bool,
+    /// Permit AUTH over a `SubmissionTls::Plaintext` connection. Off by
+    /// default: the credentials would cross the network in clear.
+    pub allow_cleartext_auth: bool,
 }
 
 impl SmtpSubmissionConfig {
@@ -114,7 +117,16 @@ impl SmtpSubmissionConfig {
             pool: None,
             default_from,
             save_to_sent_default: true,
+            allow_cleartext_auth: false,
         }
+    }
+
+    /// Allow AUTH over an unencrypted connection. Only for local test
+    /// servers; production submission must use TLS or STARTTLS.
+    #[must_use]
+    pub fn allow_cleartext_auth(mut self) -> Self {
+        self.allow_cleartext_auth = true;
+        self
     }
 
     /// Override the port (defaults follow the TLS mode: 465 / 587 / 587).
@@ -199,7 +211,7 @@ impl SubmissionTransport {
             }
             SubmissionTls::Plaintext => {
                 AsyncSmtpTransport::<TokioExecutor>::builder_dangerous(cfg.host.clone())
-                    .dangerous_allow_insecure_auth(true)
+                    .dangerous_allow_insecure_auth(cfg.allow_cleartext_auth)
             }
         };
 
@@ -414,6 +426,69 @@ mod tests {
             }
             SmtpCredentials::Password { .. } => panic!("expected OAuth2 credentials"),
         }
+    }
+
+    /// A plaintext relay advertising AUTH must not receive the password
+    /// unless the config explicitly opts in.
+    #[tokio::test]
+    async fn plaintext_submission_refuses_auth_by_default() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let mut received = Vec::new();
+            write.write_all(b"220 relay.test\r\n").await.expect("greet");
+            while let Ok(Some(line)) = lines.next_line().await {
+                let reply: &[u8] = if line.starts_with("EHLO") {
+                    b"250-relay.test\r\n250 AUTH PLAIN LOGIN\r\n"
+                } else if line.starts_with("QUIT") {
+                    b"221 bye\r\n"
+                } else {
+                    b"502 no\r\n"
+                };
+                received.push(line);
+                if write.write_all(reply).await.is_err() {
+                    break;
+                }
+            }
+            received
+        });
+
+        let cfg = SmtpSubmissionConfig::new(
+            "127.0.0.1",
+            SubmissionTls::Plaintext,
+            bifrost_types::Address::bare("user@example.com"),
+        )
+        .with_port(port)
+        .with_timeout(Duration::from_secs(5));
+        let transport = SubmissionTransport::build(
+            &cfg,
+            &Credentials::password("user", "secret"),
+            None,
+            Arc::new(std::sync::atomic::AtomicU64::new(super::super::UNLIMITED_BANDWIDTH)),
+        )
+        .expect("build");
+        let envelope = SubmissionEnvelope {
+            from: bifrost_types::Address::bare("user@example.com"),
+            recipients: vec![bifrost_types::Address::bare("rcpt@example.com")],
+        };
+        let outcome = transport
+            .send_rfc5322(&envelope, b"Subject: t\r\n\r\nbody\r\n", None)
+            .await;
+        drop(transport);
+
+        assert!(outcome.is_err(), "plaintext AUTH must be refused");
+        let received = server.await.expect("server task");
+        assert!(
+            received.iter().all(|line| !line.starts_with("AUTH")),
+            "credentials crossed a plaintext connection: {received:?}"
+        );
     }
 
     #[test]
