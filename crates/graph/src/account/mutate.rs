@@ -655,6 +655,19 @@ fn patch_for_flags(op: &FlagOp) -> Value {
                 "categories".to_string(),
                 json!(categories_from_flags(flags)),
             );
+            // An absent pin is left alone rather than written as "unpinned":
+            // the unpin marker is the current time, and Outlook sorts the
+            // folder on it, so stamping it on every message a `Set` touches
+            // would reorder them as if they had just arrived.
+            if flags
+                .iter()
+                .any(|flag| graph_flag_field(flag) == Some(GraphFlagField::Pinned))
+            {
+                body.insert(
+                    "singleValueExtendedProperties".to_string(),
+                    super::pin::pin_properties(true),
+                );
+            }
         }
         FlagOp::Patch { add, remove } => {
             apply_flag_adds(&mut body, add);
@@ -678,6 +691,15 @@ fn apply_flag_adds(body: &mut serde_json::Map<String, Value>, flags: &HashSet<St
     {
         body.insert("flag".to_string(), json!({ "flagStatus": "flagged" }));
     }
+    if flags
+        .iter()
+        .any(|flag| graph_flag_field(flag) == Some(GraphFlagField::Pinned))
+    {
+        body.insert(
+            "singleValueExtendedProperties".to_string(),
+            super::pin::pin_properties(true),
+        );
+    }
 }
 
 fn apply_flag_removes(body: &mut serde_json::Map<String, Value>, flags: &HashSet<String>) {
@@ -692,6 +714,15 @@ fn apply_flag_removes(body: &mut serde_json::Map<String, Value>, flags: &HashSet
         .any(|flag| graph_flag_field(flag) == Some(GraphFlagField::Flagged))
     {
         body.insert("flag".to_string(), json!({ "flagStatus": "notFlagged" }));
+    }
+    if flags
+        .iter()
+        .any(|flag| graph_flag_field(flag) == Some(GraphFlagField::Pinned))
+    {
+        body.insert(
+            "singleValueExtendedProperties".to_string(),
+            super::pin::pin_properties(false),
+        );
     }
 }
 
@@ -747,6 +778,7 @@ fn canonical_flag_name(flag: &str) -> String {
     match graph_flag_field(&normalized) {
         Some(GraphFlagField::Read) => "\\seen".to_string(),
         Some(GraphFlagField::Flagged) => "\\flagged".to_string(),
+        Some(GraphFlagField::Pinned) => super::pin::PINNED_FLAG.to_string(),
         None => normalized,
     }
 }
@@ -755,6 +787,7 @@ fn canonical_flag_name(flag: &str) -> String {
 enum GraphFlagField {
     Read,
     Flagged,
+    Pinned,
 }
 
 /// The single alias table for both PATCH projection and contradiction checks.
@@ -766,6 +799,8 @@ fn graph_flag_field(flag: &str) -> Option<GraphFlagField> {
         || flag.eq_ignore_ascii_case("starred")
     {
         Some(GraphFlagField::Flagged)
+    } else if flag.eq_ignore_ascii_case(super::pin::PINNED_FLAG) {
+        Some(GraphFlagField::Pinned)
     } else {
         None
     }
@@ -1242,6 +1277,33 @@ mod tests {
             body.get("flag"),
             Some(&json!({ "flagStatus": "notFlagged" }))
         );
+    }
+
+    #[test]
+    fn the_pin_flag_writes_and_clears_the_outlook_pin_properties() {
+        let pinned = patch_for_flags(&FlagOp::Add(flag_set(&["$pinned"])));
+        assert_eq!(
+            pinned.get("singleValueExtendedProperties"),
+            Some(&super::super::pin::pin_properties(true))
+        );
+        assert!(pinned.get("flag").is_none());
+
+        let unpinned = patch_for_flags(&FlagOp::Remove(flag_set(&["$Pinned"])));
+        let properties = unpinned["singleValueExtendedProperties"]
+            .as_array()
+            .expect("unpin writes the properties");
+        assert_eq!(properties.len(), 2);
+        assert!(
+            properties
+                .iter()
+                .all(|property| property["value"] != "4500-09-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn set_without_the_pin_leaves_the_outlook_sort_date_alone() {
+        let body = patch_for_flags(&FlagOp::Set(flag_set(&["\\Seen"])));
+        assert!(body.get("singleValueExtendedProperties").is_none());
     }
 
     #[test]

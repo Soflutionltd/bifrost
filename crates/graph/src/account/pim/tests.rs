@@ -2098,3 +2098,20 @@ fn an_explicitly_cleared_draft_field_still_emits_its_clear() {
     assert_eq!(message.get("cc"), None);
     assert_eq!(message.get("ccRecipients"), Some(&json!([])));
 }
+
+#[test]
+fn an_outlook_pin_hydrates_as_the_pinned_flag() {
+    let pinned = json!({
+        "isRead": true,
+        "singleValueExtendedProperties": [
+            { "id": "SystemTime 0xF01", "value": "4500-09-01T00:00:00Z" }
+        ]
+    });
+    assert!(flags_from_message(&pinned).contains("$pinned"));
+    assert!(!flags_from_message(&json!({ "isRead": true })).contains("$pinned"));
+    assert!(
+        hydrate_select(false).contains("$expand=singleValueExtendedProperties"),
+        "the pin marker must ride the hydration read"
+    );
+    assert!(hydrate_select(true).contains("$expand=attachments,singleValueExtendedProperties"));
+}

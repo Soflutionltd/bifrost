@@ -196,9 +196,9 @@ pub(super) fn select_query(select: &str) -> String {
 
 pub(super) fn hydrate_select(include_attachments: bool) -> &'static str {
     if include_attachments {
-        "$select=id,conversationId,subject,bodyPreview,body,uniqueBody,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,parentFolderId,isRead,importance,categories,flag,internetMessageHeaders,internetMessageId,hasAttachments,changeKey&$expand=attachments"
+        "$select=id,conversationId,subject,bodyPreview,body,uniqueBody,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,parentFolderId,isRead,importance,categories,flag,internetMessageHeaders,internetMessageId,hasAttachments,changeKey&$expand=attachments,singleValueExtendedProperties($filter=id%20eq%20'SystemTime%200x0F01')"
     } else {
-        "id,conversationId,subject,bodyPreview,body,uniqueBody,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,parentFolderId,isRead,importance,categories,flag,internetMessageHeaders,internetMessageId,hasAttachments,changeKey"
+        "$select=id,conversationId,subject,bodyPreview,body,uniqueBody,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,parentFolderId,isRead,importance,categories,flag,internetMessageHeaders,internetMessageId,hasAttachments,changeKey&$expand=singleValueExtendedProperties($filter=id%20eq%20'SystemTime%200x0F01')"
     }
 }
 
@@ -430,6 +430,9 @@ pub(super) fn flags_from_message(value: &Value) -> HashSet<String> {
         .is_some_and(|status| status.eq_ignore_ascii_case("flagged"))
     {
         flags.insert("\\flagged".to_string());
+    }
+    if crate::account::pin::is_pinned(value) {
+        flags.insert(crate::account::pin::PINNED_FLAG.to_string());
     }
     for category in categories_from_value(value) {
         flags.insert(format!("category:{category}"));

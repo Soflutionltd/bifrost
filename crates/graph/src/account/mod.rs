@@ -20,6 +20,7 @@ mod groups;
 mod inventory;
 mod mutate;
 mod pim;
+mod pin;
 mod public_folder;
 mod push;
 mod push_stream;
