@@ -414,6 +414,10 @@ pub(super) fn graph_message_date(value: &Value) -> Option<SystemTime> {
         .and_then(parse_graph_datetime)
 }
 
+/// Outlook's "flag marked complete" (`flagStatus: complete`). Not the
+/// `\flagged` star: a completed follow-up is no longer flagged.
+pub(crate) const FLAG_COMPLETE_FLAG: &str = "$flag-complete";
+
 pub(super) fn flags_from_message(value: &Value) -> HashSet<String> {
     let mut flags = HashSet::new();
     if value
@@ -423,13 +427,15 @@ pub(super) fn flags_from_message(value: &Value) -> HashSet<String> {
     {
         flags.insert("\\seen".to_string());
     }
-    if value
+    let flag_status = value
         .get("flag")
         .and_then(|flag| flag.get("flagStatus"))
-        .and_then(Value::as_str)
-        .is_some_and(|status| status.eq_ignore_ascii_case("flagged"))
-    {
+        .and_then(Value::as_str);
+    if flag_status.is_some_and(|status| status.eq_ignore_ascii_case("flagged")) {
         flags.insert("\\flagged".to_string());
+    }
+    if flag_status.is_some_and(|status| status.eq_ignore_ascii_case("complete")) {
+        flags.insert(FLAG_COMPLETE_FLAG.to_string());
     }
     if crate::account::pin::is_pinned(value) {
         flags.insert(crate::account::pin::PINNED_FLAG.to_string());

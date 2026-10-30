@@ -2100,6 +2100,15 @@ fn an_explicitly_cleared_draft_field_still_emits_its_clear() {
 }
 
 #[test]
+fn a_completed_outlook_flag_hydrates_as_flag_complete_not_as_flagged() {
+    let flags = flags_from_message(&json!({ "flag": { "flagStatus": "complete" } }));
+    assert!(flags.contains("$flag-complete"));
+    assert!(!flags.contains("\\flagged"));
+    let flags = flags_from_message(&json!({ "flag": { "flagStatus": "flagged" } }));
+    assert!(!flags.contains("$flag-complete"));
+}
+
+#[test]
 fn an_outlook_pin_hydrates_as_the_pinned_flag() {
     let pinned = json!({
         "isRead": true,
