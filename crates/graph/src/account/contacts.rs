@@ -261,11 +261,10 @@ pub(crate) async fn directory_search(
     let (mut url, mut skip) = match decode_paged_cursor(&account, page_cursor, operation)? {
         Some(position) => position,
         None => {
-            let prefix = account.client.api_path_prefix();
             let top = top_for_limit(limit, 999);
             let first = account
                 .client
-                .api_url(&directory_search_path(&prefix, &query, top))
+                .api_url(&directory_search_path(&query, top))
                 .map_err(|error| into_error(error, operation))?;
             (first, 0)
         }
@@ -321,8 +320,10 @@ pub(crate) async fn directory_search(
     })
 }
 
-fn directory_search_path(prefix: &str, query: &str, top: u32) -> String {
-    let base = format!("{prefix}/users?$select={DIRECTORY_SELECT}&$top={top}");
+/// The directory is tenant-wide: `/users`, never under `/me` (which has no
+/// `users` navigation and answers 400).
+fn directory_search_path(query: &str, top: u32) -> String {
+    let base = format!("/users?$select={DIRECTORY_SELECT}&$top={top}");
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return base;
@@ -1515,8 +1516,8 @@ mod tests {
 
     #[test]
     fn directory_search_url_escapes_query_into_startswith_filter() {
-        let path = directory_search_path("/me", "O'Hara", 50);
-        assert!(path.starts_with(&format!("/me/users?$select={DIRECTORY_SELECT}&$top=50")));
+        let path = directory_search_path("O'Hara", 50);
+        assert!(path.starts_with(&format!("/users?$select={DIRECTORY_SELECT}&$top=50")));
         // The single quote is doubled, and the whole filter is URL-encoded.
         let filter = "startswith(displayName,'O''Hara') or startswith(mail,'O''Hara')";
         assert!(path.contains(&format!(
@@ -1528,13 +1529,13 @@ mod tests {
     #[test]
     fn directory_search_empty_query_omits_filter() {
         assert_eq!(
-            directory_search_path("/me", "", 999),
-            format!("/me/users?$select={DIRECTORY_SELECT}&$top=999")
+            directory_search_path("", 999),
+            format!("/users?$select={DIRECTORY_SELECT}&$top=999")
         );
         // Whitespace-only is treated as empty.
         assert_eq!(
-            directory_search_path("/me", "   ", 999),
-            format!("/me/users?$select={DIRECTORY_SELECT}&$top=999")
+            directory_search_path("   ", 999),
+            format!("/users?$select={DIRECTORY_SELECT}&$top=999")
         );
     }
 
@@ -1580,7 +1581,7 @@ mod tests {
         // both of these from a /users row unless they are asked for.
         assert!(DIRECTORY_SELECT.contains("otherMails"));
         assert!(DIRECTORY_SELECT.contains("proxyAddresses"));
-        assert!(directory_search_path("/me", "", 999).contains("otherMails,proxyAddresses"));
+        assert!(directory_search_path("", 999).contains("otherMails,proxyAddresses"));
     }
 
     #[test]
