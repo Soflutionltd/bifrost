@@ -120,6 +120,8 @@ fn object_type_name(ty: ObjectType) -> &'static str {
 #[non_exhaustive]
 pub enum AccountOperation {
     CategoryDefinitionsList,
+    CategoryDefinitionUpsert,
+    CategoryDefinitionDelete,
     MessageReactionsRead,
     Discover,
     EstablishCursor,
@@ -274,6 +276,7 @@ impl AccountOperation {
                 | Self::EventDelete
                 | Self::EventRsvp
                 | Self::Expunge
+                | Self::CategoryDefinitionDelete
         )
     }
 }

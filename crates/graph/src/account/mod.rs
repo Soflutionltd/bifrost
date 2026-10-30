@@ -1208,6 +1208,19 @@ impl Account for GraphAccount {
         Box::pin(async move { categories::category_definitions_list(account).await })
     }
 
+    fn category_definition_upsert(
+        &self,
+        definition: bifrost_types::CategoryDefinition,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { categories::category_definition_upsert(account, definition).await })
+    }
+
+    fn category_definition_delete(&self, name: String) -> AccountFuture<Result<(), AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { categories::category_definition_delete(account, name).await })
+    }
+
     fn message_reactions(
         &self,
         ids: &[bifrost_types::ObjectId],

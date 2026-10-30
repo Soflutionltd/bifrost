@@ -188,6 +188,21 @@ pub trait Account: Send + Sync {
         Box::pin(async { Err(unsupported_error(AccountOperation::CategoryDefinitionsList)) })
     }
 
+    /// Create the category `definition.name`, or set its colour when it
+    /// already exists. A category's name cannot change once created.
+    fn category_definition_upsert(
+        &self,
+        _definition: CategoryDefinition,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported_error(AccountOperation::CategoryDefinitionUpsert)) })
+    }
+
+    /// Delete the category named `name`. Messages keep the name in their
+    /// own category list; only the definition (and its colour) goes.
+    fn category_definition_delete(&self, _name: String) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported_error(AccountOperation::CategoryDefinitionDelete)) })
+    }
+
     /// Read reaction state. Providers preserving per-item failures override this.
     fn message_reactions(
         &self,

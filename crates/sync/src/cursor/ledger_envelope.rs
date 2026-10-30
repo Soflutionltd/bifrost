@@ -1313,6 +1313,8 @@ const OPERATIONS: &[AccountOperation] = &[
     AccountOperation::EventAutocomplete,
     AccountOperation::Close,
     AccountOperation::Expunge,
+    AccountOperation::CategoryDefinitionUpsert,
+    AccountOperation::CategoryDefinitionDelete,
 ];
 
 fn encode_operation(operation: AccountOperation) -> u8 {

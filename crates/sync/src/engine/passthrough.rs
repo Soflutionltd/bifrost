@@ -500,6 +500,30 @@ impl SyncEngine {
             .await?)
     }
 
+    /// Forwards to the account's provider category create/recolor surface.
+    pub async fn category_definition_upsert(
+        &self,
+        account_id: &AccountId,
+        definition: bifrost_types::CategoryDefinition,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .category_definition_upsert(definition)
+            .await?)
+    }
+
+    /// Forwards to the account's provider category delete surface.
+    pub async fn category_definition_delete(
+        &self,
+        account_id: &AccountId,
+        name: String,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .category_definition_delete(name)
+            .await?)
+    }
+
     /// Forwards to the account's provider reaction-read surface.
     pub async fn message_reactions(
         &self,
