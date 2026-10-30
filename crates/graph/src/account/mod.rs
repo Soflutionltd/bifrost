@@ -42,10 +42,10 @@ use bifrost_types::{
     EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Importance,
     InventoryEvent, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
-    ObjectId, OpenedAccount, Page, Priority, Projection, RsvpStatus, ScopeLifecycleEvent,
-    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
-    ServerFilterPatch, SkippedScope, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration,
-    ThreadId, VacationConfig, WatchEvent,
+    ObjectId, OpenedAccount, Page, Priority, Projection, RsvpReply, RsvpStatus,
+    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
+    ServerFilterId, ServerFilterPatch, SkippedScope, SubscriptionHandle, SyncEvent, SyncStrategy,
+    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -1446,7 +1446,17 @@ impl Account for GraphAccount {
         status: RsvpStatus,
     ) -> AccountFuture<Result<(), AccountError>> {
         let account = self.clone();
-        Box::pin(async move { calendar::rsvp(account, event, status).await })
+        Box::pin(async move { calendar::rsvp(account, event, status, RsvpReply::default()).await })
+    }
+
+    fn event_rsvp_reply(
+        &self,
+        event: EventId,
+        status: RsvpStatus,
+        reply: RsvpReply,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { calendar::rsvp(account, event, status, reply).await })
     }
 
     fn event_search(

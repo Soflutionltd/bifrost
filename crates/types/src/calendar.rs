@@ -96,6 +96,28 @@ pub enum RsvpStatus {
     Unknown,
 }
 
+/// What an RSVP carries to the organizer beyond the status itself.
+///
+/// The default is the silent status change `AccountCalendar::event_rsvp`
+/// performs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RsvpReply {
+    /// Note sent along with the response.
+    pub comment: Option<String>,
+    /// Whether the organizer is notified. Protocols without this switch
+    /// keep their own scheduling behaviour.
+    pub send_response: bool,
+    /// Alternative slot offered with a tentative or declined response.
+    pub proposed_time: Option<ProposedTime>,
+}
+
+/// Alternative meeting slot proposed by an invitee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProposedTime {
+    pub start: jiff::Timestamp,
+    pub end: jiff::Timestamp,
+}
+
 /// Attendee role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

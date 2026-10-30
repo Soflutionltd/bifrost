@@ -2,7 +2,7 @@ use bifrost_types::{
     AccountError, AccountOperation, AttendeeRole, Calendar, CalendarEvent, CalendarId,
     CalendarProvenance, EventAttendee, EventAvailability, EventCreate, EventId, EventOrganizer,
     EventPatch, EventRange, EventRecurrence, EventSearchRequest, EventStatus, EventTime,
-    EventVisibility, Page, ProtocolKind, RsvpStatus,
+    EventVisibility, Page, ProtocolKind, RsvpReply, RsvpStatus,
 };
 use jiff::civil;
 use jiff::tz::{Offset, TimeZone};
@@ -329,21 +329,53 @@ pub(crate) async fn rsvp(
     account: GraphAccount,
     event: EventId,
     status: RsvpStatus,
+    reply: RsvpReply,
 ) -> Result<(), AccountError> {
     let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventRsvp)?;
     let action = rsvp_action(status)?;
+    let body = rsvp_body(status, reply)?;
     let path = format!("{}/{action}", event_url(&account, &calendar_id, &event_id));
     account
         .client
-        .post_no_response(
-            &path,
-            &GraphRsvpAction {
-                comment: None,
-                send_response: false,
-            },
-        )
+        .post_no_response(&path, &body)
         .await
         .map_err(|error| into_error(error, AccountOperation::EventRsvp))
+}
+
+/// Graph rejects `proposedNewTime` on accept and without `sendResponse`.
+fn rsvp_body(status: RsvpStatus, reply: RsvpReply) -> Result<GraphRsvpAction, AccountError> {
+    let proposed_new_time = match reply.proposed_time {
+        None => None,
+        Some(_) if status == RsvpStatus::Accepted => {
+            return Err(unsupported_error(
+                AccountOperation::EventRsvp,
+                "Graph only accepts a proposed time with a tentative or declined response"
+                    .to_string(),
+            ));
+        }
+        Some(_) if !reply.send_response => {
+            return Err(unsupported_error(
+                AccountOperation::EventRsvp,
+                "Graph only accepts a proposed time when the response is sent".to_string(),
+            ));
+        }
+        Some(slot) => Some(GraphTimeSlot {
+            start: utc_graph_time(slot.start),
+            end: utc_graph_time(slot.end),
+        }),
+    };
+    Ok(GraphRsvpAction {
+        comment: reply.comment,
+        send_response: reply.send_response,
+        proposed_new_time,
+    })
+}
+
+fn utc_graph_time(at: jiff::Timestamp) -> GraphDateTime {
+    GraphDateTime {
+        date_time: Some(at.strftime("%Y-%m-%dT%H:%M:%S").to_string()),
+        time_zone: Some("UTC".to_string()),
+    }
 }
 
 /// Sentinel prefix marking a `page_cursor` minted by the Graph Search API
@@ -2285,8 +2317,17 @@ struct GraphEventPatch {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphRsvpAction {
+    #[serde(skip_serializing_if = "Option::is_none")]
     comment: Option<String>,
     send_response: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proposed_new_time: Option<GraphTimeSlot>,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphTimeSlot {
+    start: GraphDateTime,
+    end: GraphDateTime,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2393,6 +2434,57 @@ struct GraphRecurrenceRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rsvp_body_sends_comment_and_proposed_time() {
+        let reply = RsvpReply {
+            comment: Some("Next week?".to_string()),
+            send_response: true,
+            proposed_time: Some(bifrost_types::ProposedTime {
+                start: "2026-11-02T14:00:00Z".parse().unwrap(),
+                end: "2026-11-02T15:00:00Z".parse().unwrap(),
+            }),
+        };
+        let body = serde_json::to_value(rsvp_body(RsvpStatus::Tentative, reply).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "comment": "Next week?",
+                "sendResponse": true,
+                "proposedNewTime": {
+                    "start": {"dateTime": "2026-11-02T14:00:00", "timeZone": "UTC"},
+                    "end": {"dateTime": "2026-11-02T15:00:00", "timeZone": "UTC"},
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn rsvp_body_default_is_silent() {
+        let body =
+            serde_json::to_value(rsvp_body(RsvpStatus::Accepted, RsvpReply::default()).unwrap())
+                .unwrap();
+        assert_eq!(body, json!({"sendResponse": false}));
+    }
+
+    #[test]
+    fn rsvp_body_rejects_proposals_graph_refuses() {
+        let slot = bifrost_types::ProposedTime {
+            start: "2026-11-02T14:00:00Z".parse().unwrap(),
+            end: "2026-11-02T15:00:00Z".parse().unwrap(),
+        };
+        let on_accept = RsvpReply {
+            send_response: true,
+            proposed_time: Some(slot),
+            ..RsvpReply::default()
+        };
+        assert!(rsvp_body(RsvpStatus::Accepted, on_accept).is_err());
+        let silent = RsvpReply {
+            proposed_time: Some(slot),
+            ..RsvpReply::default()
+        };
+        assert!(rsvp_body(RsvpStatus::Declined, silent).is_err());
+    }
 
     fn graph_time(value: &str) -> GraphDateTime {
         GraphDateTime {

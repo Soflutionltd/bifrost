@@ -26,7 +26,7 @@ use futures::stream::Stream;
 use crate::blob::{BlobHandle, ByteRange};
 use crate::calendar::{
     Calendar, CalendarEvent, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
-    RsvpStatus,
+    RsvpReply, RsvpStatus,
 };
 use crate::capabilities::{AccountCapabilities, StarredFlagShape};
 use crate::cloud::{CloudUploadMeta, HostedAttachment};
@@ -990,6 +990,21 @@ pub trait Account: Send + Sync {
         event: EventId,
         status: RsvpStatus,
     ) -> AccountFuture<Result<(), AccountError>>;
+
+    /// RSVP carrying a comment, an organizer notification choice or a
+    /// proposed new time. Protocols without a reply surface accept only
+    /// replies that add nothing to the status change.
+    fn event_rsvp_reply(
+        &self,
+        event: EventId,
+        status: RsvpStatus,
+        reply: RsvpReply,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        if reply.comment.is_none() && reply.proposed_time.is_none() {
+            return self.event_rsvp(event, status);
+        }
+        Box::pin(async { Err(unsupported_error(AccountOperation::EventRsvp)) })
+    }
 
     /// Provider-side event search.
     fn event_search(

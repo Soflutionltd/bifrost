@@ -60,7 +60,7 @@ pub use calendar::{
     AttendeeRole, Calendar, CalendarEvent, CalendarId, CalendarProvenance, EventAttendee,
     EventAvailability, EventCreate, EventId, EventOrganizer, EventPatch, EventRange,
     EventRecurrence, EventReminder, EventSearchRequest, EventStatus, EventTime, EventVisibility,
-    ReminderRelativeTo, ReminderTrigger, RsvpStatus,
+    ProposedTime, ReminderRelativeTo, ReminderTrigger, RsvpReply, RsvpStatus,
 };
 
 // Cloud-storage attachment hosting.
