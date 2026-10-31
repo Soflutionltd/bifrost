@@ -1106,6 +1106,15 @@ impl SyncEngine {
         Arc::<InvalidationSinkInner>::clone(&self.sink)
     }
 
+    /// Longest throttle wait pending for `account_id` (its own deadline or a
+    /// tenant / provider deadline it shares), `None` when the account may
+    /// drive work now. Lets a consumer that schedules its own re-reads stand
+    /// down while the provider is pushing back.
+    #[must_use]
+    pub fn account_throttle_wait(&self, account_id: &AccountId) -> Option<Duration> {
+        crate::recovery::account_throttle_wait(&self.throttles, account_id)
+    }
+
     /// Currently-known accounts. Useful for tests / observability.
     #[must_use]
     pub fn attached_account_ids(&self) -> Vec<AccountId> {

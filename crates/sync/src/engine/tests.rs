@@ -3556,3 +3556,31 @@ fn a_failed_resume_read_walks_from_scratch_on_both_plan_shapes() {
         "a failed read restarts at page 0, never at a guessed offset"
     );
 }
+
+/// A consumer pacing its own re-reads sees the same deadline the engine's
+/// workers wait on, including one recorded against a tenant the account
+/// belongs to, and nothing once it has passed.
+#[tokio::test(start_paused = true)]
+async fn account_throttle_wait_reports_own_and_shared_deadlines() {
+    let engine = super::SyncEngine::builder().build().expect("engine");
+    let account = bifrost_types::AccountId("acc-throttled".into());
+    assert_eq!(engine.account_throttle_wait(&account), None);
+
+    let now = tokio::time::Instant::now();
+    engine
+        .throttles
+        .lock()
+        .expect("throttle bucket")
+        .record_for(
+            &account,
+            bifrost_types::ThrottleKey::Tenant("contoso".into()),
+            now + std::time::Duration::from_secs(30),
+        );
+    assert_eq!(
+        engine.account_throttle_wait(&account),
+        Some(std::time::Duration::from_secs(30))
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    assert_eq!(engine.account_throttle_wait(&account), None);
+}
