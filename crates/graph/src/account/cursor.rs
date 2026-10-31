@@ -102,7 +102,10 @@ pub(crate) fn routing_error(error: crate::error::GraphError) -> CursorError {
 /// v4: an acknowledged initial-inventory page has a next link but no delta
 /// link; the payload distinguishes that resumable inventory position from a
 /// live changes cursor so bifrost-sync can restart the right stream.
-pub(crate) const GRAPH_CURSOR_ENVELOPE_VERSION: u32 = 4;
+/// v5: delta links minted with `$top` carry that cap into every later round,
+/// and the inventory behind them stopped after one page. Refusing them
+/// reseeds every scope with paging through `Prefer: odata.maxpagesize`.
+pub(crate) const GRAPH_CURSOR_ENVELOPE_VERSION: u32 = 5;
 pub(crate) const CHANGE_CURSOR_ENVELOPE_VERSION: u32 =
     bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION;
 

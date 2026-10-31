@@ -453,7 +453,7 @@ fn initial_delta_request(
             match ty {
                 ObjectType::Email => Ok((
                     format!(
-                        "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SELECT}&$top=50"
+                        "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SELECT}"
                     ),
                     None,
                 )),
@@ -470,7 +470,7 @@ fn initial_delta_request(
                 }
                 ObjectType::Contact => Ok((
                     format!(
-                        "{prefix}/contactFolders/{encoded}/contacts/delta?$select={CONTACT_SELECT}&$top=250"
+                        "{prefix}/contactFolders/{encoded}/contacts/delta?$select={CONTACT_SELECT}"
                     ),
                     None,
                 )),
@@ -567,11 +567,16 @@ fn event_aliases(a: &CursorScope, b: &CursorScope) -> bool {
     aliased && fa == fb
 }
 
+/// Delta page size goes in `Prefer`, never `$top`: Graph reads `$top` on a
+/// delta round as a cap on the whole round and answers its first page with
+/// a delta link, so every folder larger than one page stopped there.
+const DELTA_PAGE_PREFER: &str = "odata.maxpagesize=50";
+
 async fn fetch_page(
     client: &crate::client::GraphClient,
     url: &AdmittedUrl,
 ) -> Result<ODataCollection<Value>, crate::error::GraphError> {
-    client.get(url).await
+    client.get_prefer(url, DELTA_PAGE_PREFER).await
 }
 
 fn internet_header(value: &Value, name: &str) -> Option<String> {
@@ -793,6 +798,9 @@ mod tests {
             requests[1].url,
             "https://graph.microsoft.com/v1.0/next?page=2"
         );
+        for request in &requests {
+            assert_eq!(request.prefer.as_deref(), Some(DELTA_PAGE_PREFER));
+        }
     }
 
     /// A delta server that hands back a `nextLink` the walk has already
@@ -1520,7 +1528,7 @@ mod tests {
         ] {
             assert!(url.contains(field), "{field} missing from {url}");
         }
-        assert!(url.contains("$top=50"));
+        assert!(!url.contains("$top"), "{url}");
         // `changeKey` is the documented concurrency token. The OData etag
         // remains a useful fallback, but inventory must request it directly.
         assert!(url.contains("changeKey"), "{url}");
