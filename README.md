@@ -18,12 +18,9 @@ Per-crate architecture references live in [`reference/`](reference/). Working ex
 
 ## License
 
-Licensed under either of
+This branch is source-available under the [PolyForm Shield License 1.0.0](LICENSE): you may use, modify and contribute, but not build a competing product from it. Contributions need the [Courly Contributor License Agreement](https://github.com/Soflutionltd/courly/blob/main/CLA.md).
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+The code published upstream at [folknor/bifrost](https://github.com/folknor/bifrost) remains available under the Apache License 2.0 ([text](LICENSES/Apache-2.0.txt)) or the MIT license ([text](LICENSES/MIT.txt)), at your option; see [NOTICE](NOTICE).
 
 ## Acknowledgements
 
@@ -40,7 +37,3 @@ This product includes software originally developed by the lettre authors as the
 The `bifrost-smtp` crate descends from that work.
 
 This product includes software originally developed by Anees Iqbal as the [`daaki-imap`](https://github.com/steelbrain/daaki) crate, licensed under MIT. The `bifrost-imap` crate descends from daaki commit `e81a169c52afee65eb8a2fdfd252f8ebaacdb997`; local changes include bifrost workspace metadata, a tokio plus native-tls transport policy, and parser migration work for nom 8.
-
-## License
-
-This branch is source-available under the [PolyForm Shield License 1.0.0](LICENSE): you may use, modify and contribute, but not build a competing product from it. Contributions need the [Courly Contributor License Agreement](https://github.com/Soflutionltd/courly/blob/main/CLA.md). See [NOTICE](NOTICE) for the code that remains under its original Apache 2.0 or MIT license.

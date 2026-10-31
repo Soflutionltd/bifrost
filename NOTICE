@@ -11,5 +11,7 @@ remains available under those licenses. Every change and addition made by
 Soflution Ltd from 30 October 2026 onward is licensed under the PolyForm
 Shield License 1.0.0.
 
-The bifrost-smtp crate is derived from lettre (https://github.com/lettre/lettre)
-and keeps its MIT license.
+bifrost-jmap descends from jmap-client by Stalwart Labs LLC (Apache-2.0 OR
+MIT), bifrost-smtp from lettre (MIT) and bifrost-imap from daaki-imap by
+Anees Iqbal (MIT). Their copyright notices are listed in README.md under
+Acknowledgements, and bifrost-smtp keeps its MIT license.
