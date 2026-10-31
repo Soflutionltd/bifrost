@@ -14,6 +14,11 @@ pub(crate) struct ODataCollection<T> {
     pub(crate) delta_link: Option<ProviderLink>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct GraphItemId {
+    pub(crate) id: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GraphMailFolder {

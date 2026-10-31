@@ -18,6 +18,7 @@ mod get;
 mod graph_error;
 mod groups;
 mod inventory;
+mod message_ids;
 mod mutate;
 mod pim;
 mod pin;
@@ -1230,6 +1231,14 @@ impl Account for GraphAccount {
         let account = self.clone();
         let ids = ids.to_vec();
         Box::pin(async move { reactions::message_reactions(account, &ids).await })
+    }
+
+    fn folder_message_ids(
+        &self,
+        folder: bifrost_types::FolderId,
+    ) -> AccountFuture<Result<Vec<bifrost_types::ObjectId>, AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { message_ids::folder_message_ids(&account, folder).await })
     }
 
     fn container_create(

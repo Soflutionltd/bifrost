@@ -55,7 +55,7 @@ use crate::filter::{
     FilterValidation, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
 };
 use crate::hydration::{HydrationProjection, Importance, Message, ThreadHydration};
-use crate::ids::{AccountId, ObjectId, SubscriptionHandle, ThreadId};
+use crate::ids::{AccountId, FolderId, ObjectId, SubscriptionHandle, ThreadId};
 use crate::mutation::{FlagOp, HydratedObject, IdempotencyKey, Projection};
 use crate::page::{Page, SkippedScope};
 use crate::repair::{InventoryRepairEvent, InventoryRepairOutcome, InventoryRepairRequest};
@@ -209,6 +209,16 @@ pub trait Account: Send + Sync {
         _ids: &[ObjectId],
     ) -> AccountFuture<Result<crate::BatchOutcome<MessageReactionState>, AccountError>> {
         Box::pin(async { Err(unsupported_error(AccountOperation::MessageReactionsRead)) })
+    }
+
+    /// Every message id the server holds in `folder`, read without any
+    /// message content so it stays cheap on a large mailbox. A listing that
+    /// cannot finish is an error, never a partial list.
+    fn folder_message_ids(
+        &self,
+        _folder: FolderId,
+    ) -> AccountFuture<Result<Vec<ObjectId>, AccountError>> {
+        Box::pin(async { Err(unsupported_error(AccountOperation::SyncInventory)) })
     }
 
     /// Apply the engine's current priority hint to this account.

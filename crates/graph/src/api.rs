@@ -1,7 +1,7 @@
 use crate::client::GraphClient;
 use crate::error::GraphError;
 use crate::paging::PageWalk;
-use crate::types::{GraphMailFolder, GraphMessageRule, GraphProfile, ODataCollection};
+use crate::types::{GraphItemId, GraphMailFolder, GraphMessageRule, GraphProfile, ODataCollection};
 
 impl GraphClient {
     pub(crate) async fn get_profile(&self) -> Result<GraphProfile, GraphError> {
@@ -72,6 +72,28 @@ impl GraphClient {
         }
 
         Ok(folders)
+    }
+
+    pub(crate) async fn list_folder_message_ids(
+        &self,
+        folder_id: &str,
+    ) -> Result<Vec<String>, GraphError> {
+        let prefix = self.api_path_prefix();
+        let encoded = bifrost_net::url::encode_path_component(folder_id);
+        let mut ids = Vec::new();
+        let mut walk = PageWalk::new("messages");
+        let mut next_url = Some(self.api_url(&format!(
+            "{prefix}/mailFolders/{encoded}/messages?$select=id&$top=1000"
+        ))?);
+
+        while let Some(url) = next_url {
+            walk.enter(&url)?;
+            let page: ODataCollection<GraphItemId> = self.get(&url).await?;
+            ids.extend(page.value.into_iter().map(|item| item.id));
+            next_url = self.admit_next(page.next_link.as_ref())?;
+        }
+
+        Ok(ids)
     }
 
     pub(crate) async fn list_message_rules(&self) -> Result<Vec<GraphMessageRule>, GraphError> {
