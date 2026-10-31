@@ -936,6 +936,11 @@ impl Account for GraphAccount {
         inventory::resume_inventory_stream(self.clone(), cursor)
     }
 
+    fn is_superseded_cursor(&self, cursor: &ChangeCursor) -> bool {
+        cursor.server_state.protocol == bifrost_types::ProtocolKind::Graph
+            && cursor.server_state.envelope_version < cursor::GRAPH_CURSOR_ENVELOPE_VERSION
+    }
+
     fn get_stream(
         &self,
         ids: AccountStream<ObjectId>,
@@ -1664,6 +1669,30 @@ mod tests {
         .expect("inventory cursor encodes");
 
         assert!(Account::is_inventory_cursor(&account(), &cursor));
+    }
+
+    #[test]
+    fn only_an_older_graph_envelope_is_superseded() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".into()),
+            ty: ObjectType::Email,
+        };
+        let mut cursor = encode_cursor(
+            scope.clone(),
+            GraphCursorPayload::new(
+                kind_for_scope(&scope).expect("scope maps"),
+                &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
+                None,
+            ),
+        )
+        .expect("delta cursor encodes");
+        assert!(!Account::is_superseded_cursor(&account(), &cursor));
+
+        cursor.server_state.envelope_version = super::cursor::GRAPH_CURSOR_ENVELOPE_VERSION - 1;
+        assert!(Account::is_superseded_cursor(&account(), &cursor));
+
+        cursor.server_state.protocol = bifrost_types::ProtocolKind::Jmap;
+        assert!(!Account::is_superseded_cursor(&account(), &cursor));
     }
 
     /// The predicate must mirror `inventory_resume_stream`'s COMPLETE

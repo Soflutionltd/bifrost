@@ -673,7 +673,9 @@ impl SyncEngine {
         // what `handle_schema_incompatible` would have done, scoped to
         // the one cursor that cannot be read. (sync-D10)
         match self.checkpoints.get_change_cursor(account_id, &scope).await {
-            Ok(Some(existing)) if existing.validate_envelope().is_ok() => {
+            Ok(Some(existing))
+                if existing.validate_envelope().is_ok() && !account.is_superseded_cursor(&existing) =>
+            {
                 if account.is_inventory_cursor(&existing) {
                     return Ok(InitialScope::DeferredInventory(DeferredInventory::Resume(
                         existing,

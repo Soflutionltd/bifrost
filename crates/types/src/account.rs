@@ -306,6 +306,19 @@ pub trait Account: Send + Sync {
         self.inventory_resume_stream(cursor.clone()).is_some()
     }
 
+    /// Whether `cursor` was minted under an older protocol-owned envelope
+    /// this build refuses. Pure classification, no I/O.
+    ///
+    /// The outer `ChangeCursor` envelope can be current while the protocol's
+    /// inner payload version is not. Installed as a live cursor, such a row is
+    /// refused by the first `changes_stream` poll, and that refusal resets
+    /// every scope of the account, cutting off whatever multi-page inventory
+    /// was still running. Attach drops these rows up front instead, so each
+    /// scope reseeds once.
+    fn is_superseded_cursor(&self, _cursor: &ChangeCursor) -> bool {
+        false
+    }
+
     /// Which inventory partition shape this account can serve for
     /// `scope`. Implementations that do not override this keep the
     /// original full-pass behavior.

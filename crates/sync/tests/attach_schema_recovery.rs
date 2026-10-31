@@ -90,6 +90,10 @@ fn caps() -> AccountCapabilities {
     }
 }
 
+/// Server state `HealAccount` reports as minted under an older protocol
+/// envelope, while the outer `ChangeCursor` envelope stays current.
+const SUPERSEDED_STATE: &[u8] = b"superseded";
+
 fn cursor_for(scope: &CursorScope, state: &[u8]) -> ChangeCursor {
     ChangeCursor {
         scope: scope.clone(),
@@ -428,6 +432,10 @@ impl Account for HealAccount {
 
     fn describe_cursor(&self, _cursor: &ChangeCursor) -> CursorDescriptor {
         unreachable!("describe_cursor not exercised by attach recovery tests")
+    }
+
+    fn is_superseded_cursor(&self, cursor: &ChangeCursor) -> bool {
+        cursor.server_state.bytes == SUPERSEDED_STATE
     }
 
     fn discover_cursor_scopes(&self) -> AccountStream<SyncEvent<CursorScope>> {
@@ -1189,6 +1197,77 @@ async fn attach_heals_an_undecodable_cursor_instead_of_failing() {
         persisted.server_state.bytes,
         b"freshly-established".to_vec()
     );
+
+    engine.detach(&account_id).await.expect("detach succeeds");
+    assert_eq!(closed.load(Ordering::SeqCst), 1);
+}
+
+/// A row whose outer envelope is current but whose protocol payload is a
+/// superseded version must not be installed as a live cursor: the first
+/// changes poll would refuse it and reset every scope of the account,
+/// cutting off the inventory still walking the others. Attach drops it
+/// and re-establishes that one scope.
+#[tokio::test]
+async fn attach_reseeds_a_superseded_cursor_instead_of_installing_it() {
+    let account_id = AccountId("superseded-heal".to_owned());
+    let superseded = CursorScope::Type(bifrost_types::ObjectType::Email);
+    let current = CursorScope::Type(bifrost_types::ObjectType::Mailbox);
+    let store = Arc::new(PoisonedStore::default());
+    for (scope, state) in [
+        (&superseded, SUPERSEDED_STATE),
+        (&current, b"current".as_slice()),
+    ] {
+        let ledger = store
+            .get_ledger(&account_id)
+            .await
+            .expect("empty ledger reads");
+        store
+            .apply_transition(
+                &account_id,
+                CheckpointTransition {
+                    checkpoint: Checkpoint::Change(cursor_for(scope, state)),
+                    ledger,
+                },
+            )
+            .await
+            .expect("seed cursor");
+    }
+    let established = Arc::new(Mutex::new(Vec::new()));
+    let closed = Arc::new(AtomicUsize::new(0));
+
+    let engine = SyncEngine::builder()
+        .checkpoints(Arc::clone(&store) as Arc<dyn CheckpointStore>)
+        .build()
+        .expect("default engine config is valid");
+    let factory: Arc<dyn AccountFactory> = Arc::new(HealFactory::new(
+        vec![superseded.clone(), current.clone()],
+        Arc::clone(&established),
+        Arc::clone(&closed),
+    ));
+
+    engine
+        .attach(account_id.clone(), factory)
+        .await
+        .expect("a superseded cursor must not fail the attach");
+
+    assert_eq!(store.deleted(), vec![superseded.clone()]);
+    assert_eq!(
+        *established.lock().expect("established lock"),
+        vec![superseded.clone()],
+        "only the superseded scope is re-established; the current one resumes"
+    );
+    let reseeded = store
+        .get_change_cursor(&account_id, &superseded)
+        .await
+        .expect("reseeded row reads")
+        .expect("re-establishment persists a replacement cursor");
+    assert_eq!(reseeded.server_state.bytes, b"freshly-established".to_vec());
+    let resumed = store
+        .get_change_cursor(&account_id, &current)
+        .await
+        .expect("current row reads")
+        .expect("current cursor is kept");
+    assert_eq!(resumed.server_state.bytes, b"current".to_vec());
 
     engine.detach(&account_id).await.expect("detach succeeds");
     assert_eq!(closed.load(Ordering::SeqCst), 1);
