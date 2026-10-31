@@ -19,9 +19,9 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-license = "Apache-2.0 OR MIT"
-repository = "https://github.com/folknor/bifrost"
-authors = ["folk@folk.wtf"]
+license = "LicenseRef-PolyForm-Shield-1.0.0"
+repository = "https://github.com/Soflutionltd/bifrost"
+authors = ["folk@folk.wtf", "Soflution Ltd"]
 
 [workspace.dependencies]
 # Async runtime

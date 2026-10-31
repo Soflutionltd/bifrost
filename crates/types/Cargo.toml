@@ -1,5 +1,6 @@
 [package]
 name = "bifrost-types"
+publish = false
 description = "Shared Account trait, sync events, and capability types for the bifrost workspace"
 version.workspace = true
 edition.workspace = true

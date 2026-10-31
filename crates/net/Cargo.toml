@@ -1,5 +1,6 @@
 [package]
 name = "bifrost-net"
+publish = false
 description = "Shared HTTP transport for the bifrost JMAP, Gmail, and Graph clients"
 version.workspace = true
 edition.workspace = true

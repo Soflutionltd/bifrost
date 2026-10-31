@@ -1,5 +1,6 @@
 [package]
 name = "bifrost-imap"
+publish = false
 description = "IMAP Account implementation for bifrost"
 version.workspace = true
 rust-version.workspace = true

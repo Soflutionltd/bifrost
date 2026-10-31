@@ -1,5 +1,6 @@
 [package]
 name = "bifrost-dav-core"
+publish = false
 description = "Private shared WebDAV layer for the bifrost CalDAV and CardDAV clients"
 version.workspace = true
 edition.workspace = true

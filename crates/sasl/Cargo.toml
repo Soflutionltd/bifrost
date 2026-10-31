@@ -1,5 +1,6 @@
 [package]
 name = "bifrost-sasl"
+publish = false
 description = "Private shared SASL/SCRAM layer for the bifrost IMAP and SMTP clients"
 version.workspace = true
 edition.workspace = true

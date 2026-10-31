@@ -1,5 +1,6 @@
 [package]
 name = "bifrost-google"
+publish = false
 description = "Google Account implementation for bifrost"
 version.workspace = true
 edition.workspace = true

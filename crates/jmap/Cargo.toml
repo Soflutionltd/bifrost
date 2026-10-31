@@ -1,5 +1,6 @@
 [package]
 name = "bifrost-jmap"
+publish = false
 description = "JMAP Account implementation for bifrost"
 version.workspace = true
 edition.workspace = true

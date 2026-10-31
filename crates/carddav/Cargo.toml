@@ -1,5 +1,6 @@
 [package]
 name = "bifrost-carddav"
+publish = false
 description = "CardDAV Account implementation for bifrost"
 version.workspace = true
 edition.workspace = true

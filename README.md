@@ -1,6 +1,6 @@
 # bifrost
 
-Rust clients for email/calendar/contact protocols, built for [ratatoskr](https://github.com/folknor/ratatoskr).
+Rust clients for email/calendar/contact protocols, the protocol engine of [Courly](https://github.com/Soflutionltd/courly).
 
 > **Bifrost** - the rainbow bridge that connects Asgard to the other realms in Norse cosmology. These crates connect a single client to many email-server realms.
 
@@ -40,3 +40,7 @@ This product includes software originally developed by the lettre authors as the
 The `bifrost-smtp` crate descends from that work.
 
 This product includes software originally developed by Anees Iqbal as the [`daaki-imap`](https://github.com/steelbrain/daaki) crate, licensed under MIT. The `bifrost-imap` crate descends from daaki commit `e81a169c52afee65eb8a2fdfd252f8ebaacdb997`; local changes include bifrost workspace metadata, a tokio plus native-tls transport policy, and parser migration work for nom 8.
+
+## License
+
+This branch is source-available under the [PolyForm Shield License 1.0.0](LICENSE): you may use, modify and contribute, but not build a competing product from it. Contributions need the [Courly Contributor License Agreement](https://github.com/Soflutionltd/courly/blob/main/CLA.md). See [NOTICE](NOTICE) for the code that remains under its original Apache 2.0 or MIT license.

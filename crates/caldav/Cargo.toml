@@ -1,5 +1,6 @@
 [package]
 name = "bifrost-caldav"
+publish = false
 description = "CalDAV Account implementation for bifrost"
 version.workspace = true
 edition.workspace = true

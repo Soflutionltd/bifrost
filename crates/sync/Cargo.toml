@@ -1,5 +1,6 @@
 [package]
 name = "bifrost-sync"
+publish = false
 description = "Sync engine that drives bifrost-types Account implementations: scheduler, backfill, push reconciliation, mutation pipeline."
 version.workspace = true
 edition.workspace = true
