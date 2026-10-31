@@ -6,7 +6,7 @@ This branch of bifrost is licensed under the PolyForm Shield License 1.0.0
 
 bifrost is derived from https://github.com/folknor/bifrost, Copyright its
 authors, licensed under the Apache License 2.0 or the MIT license, at your
-option (see LICENSE-APACHE and LICENSE-MIT). The code as published there
+option (see LICENSES/Apache-2.0.txt and LICENSES/MIT.txt). The code as published there
 remains available under those licenses. Every change and addition made by
 Soflution Ltd from 30 October 2026 onward is licensed under the PolyForm
 Shield License 1.0.0.
