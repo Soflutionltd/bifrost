@@ -389,10 +389,14 @@ pub(super) async fn fetch_message_value(
         bifrost_net::url::encode_path_component(parsed.native_id()),
         select_query(select)
     );
-    let value = client
-        .get_json(&path)
-        .await
-        .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::Hydrate)))?;
+    let value = client.get_json(&path).await.map_err(|e| {
+        into_account_error(
+            e,
+            GraphErrorContext::graph(AccountOperation::Hydrate).with_scope(ErrorScope::Message {
+                id: id.0.clone().into(),
+            }),
+        )
+    })?;
     // Cache the etag under the encoded id (the key the mutation paths
     // look up), preserving the owner so the conditioned write routes
     // back to the same mailbox.
@@ -798,6 +802,33 @@ mod tests {
         assert!(
             client.take_rest_requests().is_empty(),
             "the refusal must come before the etag GET"
+        );
+    }
+
+    /// A message gone from the mailbox reads as `NotFound(Message)`, the
+    /// classification a consumer relies on to tell a vanished message from
+    /// a server fault.
+    #[tokio::test]
+    async fn reading_a_vanished_message_is_not_found() {
+        let client = GraphClient::new("token");
+        client.script_rest([crate::client::ScriptedRestResponse::json(
+            reqwest::StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "error": {
+                    "code": "ErrorItemNotFound",
+                    "message": "The specified object was not found in the store."
+                }
+            }),
+        )]);
+        let account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
+
+        let error = fetch_message_value(&account, &ObjectId("AAMkgone".to_string()), "id")
+            .await
+            .expect_err("a vanished message cannot be read");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::NotFound(bifrost_types::ResourceKind::Message)
         );
     }
 }
