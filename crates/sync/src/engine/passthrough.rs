@@ -131,6 +131,21 @@ impl SyncEngine {
         Ok(self.live_account(account_id)?.get_stream(ids, projection))
     }
 
+    /// Enumerate every object the server currently holds in `scope`.
+    ///
+    /// Forwards to [`Account::inventory_stream`]. Unlike the engine's own
+    /// backfill walk, nothing is published to subscribers and no cursor or
+    /// checkpoint moves: this is the consumer's door to comparing the
+    /// server's full membership against its own store. Only a `Done` whose
+    /// coverage is complete proves the listing whole.
+    pub fn inventory_stream(
+        &self,
+        account_id: &AccountId,
+        scope: CursorScope,
+    ) -> Result<AccountStream<bifrost_types::InventoryEvent>, Error> {
+        Ok(self.live_account(account_id)?.inventory_stream(scope))
+    }
+
     /// Hydrate a single message at a specific projection level.
     ///
     /// Forwards to [`Account::message_hydrate`]. Prefer this over a
