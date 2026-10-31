@@ -228,6 +228,21 @@ impl CursorRegistry {
         leases.retain(|_, lease| Arc::strong_count(lease) > 1);
     }
 
+    /// Replace a live scope's cursor with `cursor`, keeping its incarnation.
+    ///
+    /// Returns whether the registry changed. A scope that is not registered is
+    /// left alone: rewinding must never resurrect a deleted scope.
+    pub fn rewind(&self, cursor: ChangeCursor) -> bool {
+        let mut guard = self.state.write().expect("poisoned");
+        match guard.cursors.get(&cursor.scope) {
+            Some(current) if *current != cursor => {
+                guard.cursors.insert(cursor.scope.clone(), cursor);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Read a snapshot of the cursor for a scope.
     #[must_use]
     pub fn snapshot(&self, scope: &CursorScope) -> Option<ChangeCursor> {

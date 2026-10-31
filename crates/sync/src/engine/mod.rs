@@ -1263,6 +1263,47 @@ impl SyncEngine {
             .map_err(|_| Error::Other("capabilities lock poisoned".into()))
     }
 
+    /// Put every live scope back on its last ACKNOWLEDGED change cursor.
+    ///
+    /// A drive installs the cursor of a batch in the registry when it publishes
+    /// the batch, before any consumer acknowledges it. When the acknowledging
+    /// receiver lags, those batches are gone from the ring, and a delta token
+    /// such as Graph's `@odata.deltaLink` is not replayable: the next drive
+    /// from the advanced cursor never sees the lost changes again. Call this
+    /// after re-subscribing so the next drives replay from the durable
+    /// cursor. Replayed changes the consumer already wrote are idempotent.
+    ///
+    /// Each scope is rewound under its drive lease, so a drive in flight
+    /// finishes first. Rows the account would not resume as a live changes
+    /// cursor (an inventory position, a superseded envelope) are skipped.
+    /// Returns how many scopes moved.
+    pub async fn rewind_to_acknowledged(&self, account_id: &AccountId) -> Result<usize, Error> {
+        let slot = self
+            .accounts
+            .get(account_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        let account = Arc::clone(&*slot.current.load_full());
+        let mut rewound = 0;
+        for scope in slot.cursors.all_scopes() {
+            let _lease = slot.cursors.claim_drive(&scope).await;
+            let Some(durable) = self.checkpoints.get_change_cursor(account_id, &scope).await?
+            else {
+                continue;
+            };
+            if durable.validate_envelope().is_err()
+                || account.is_inventory_cursor(&durable)
+                || account.is_superseded_cursor(&durable)
+            {
+                continue;
+            }
+            if slot.cursors.rewind(durable) {
+                rewound += 1;
+            }
+        }
+        Ok(rewound)
+    }
+
     /// Scheduler handle for advanced consumers (tests, instrumentation).
     #[must_use]
     pub fn scheduler(&self) -> Scheduler {
