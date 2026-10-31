@@ -1283,6 +1283,8 @@ async fn deleting_a_shared_thread_resolves_trash_in_the_owner_mailbox() {
         json!("/users/shared%40contoso.com/messages/AAMkmsg/move")
     );
     assert_eq!(sub["body"]["destinationId"], json!("SharedTrash"));
+    // Graph answers 400 to a subrequest body without a declared type.
+    assert_eq!(sub["headers"]["Content-Type"], json!("application/json"));
 }
 
 /// The cache is keyed PER MAILBOX, and each key resolves against its

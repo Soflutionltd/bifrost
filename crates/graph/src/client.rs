@@ -819,7 +819,17 @@ impl GraphClient {
         &self,
         batch: &crate::types::BatchRequest,
     ) -> Result<crate::types::BatchResponse, GraphError> {
-        self.post("/$batch", batch).await
+        // Graph rejects a subrequest whose body does not declare its type
+        // ("Write request with id '0' does not contain a Content-Type
+        // header"), so every body-carrying item gets one here.
+        let mut batch = batch.clone();
+        for item in batch.requests.iter_mut().filter(|item| item.body.is_some()) {
+            item.headers
+                .get_or_insert_with(Default::default)
+                .entry("Content-Type".to_string())
+                .or_insert_with(|| "application/json".to_string());
+        }
+        self.post("/$batch", &batch).await
     }
 
     async fn request<T: DeserializeOwned, B: Serialize>(

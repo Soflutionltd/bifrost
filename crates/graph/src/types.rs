@@ -167,7 +167,7 @@ pub(crate) struct BatchRequestItem {
     pub(crate) headers: Option<std::collections::HashMap<String, String>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct BatchRequest {
     pub(crate) requests: Vec<BatchRequestItem>,
 }
