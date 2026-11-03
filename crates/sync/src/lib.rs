@@ -38,6 +38,7 @@ pub mod push;
 pub mod recovery;
 pub mod repair;
 pub mod scheduler;
+mod stall;
 pub mod types;
 
 // Engine entry types.

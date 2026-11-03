@@ -476,7 +476,9 @@ impl CursorRegistry {
         F: FnOnce(ChangeCursor, DriveGeneration) -> Fut,
         Fut: Future<Output = T>,
     {
-        let guard = self.claim_drive(scope).await;
+        let guard =
+            crate::stall::warn_while_pending(self.claim_drive(scope), "drive lease wait", scope)
+                .await;
         // Cursor and token come out of ONE read: taken separately, a delete
         // landing between them yields a cursor with no token, which is exactly
         // the uncovered drive this method exists to rule out.
@@ -490,7 +492,7 @@ impl CursorRegistry {
             "every registered cursor carries a liveness token"
         );
         let generation = guard.drive_generation();
-        let driving = drive(cursor, generation);
+        let driving = crate::stall::warn_while_pending(drive(cursor, generation), "drive", scope);
         let Some(cancel) = cancel else {
             return Some(driving.await);
         };

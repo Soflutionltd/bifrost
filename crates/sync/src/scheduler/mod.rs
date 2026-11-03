@@ -374,6 +374,7 @@ impl Scheduler {
         kind: WorkKind,
     ) -> Result<BudgetPermit, crate::Error> {
         self.ensure_dispatcher();
+        let account_log = account.clone();
         let (tx, rx) = oneshot::channel();
         {
             let mut admission = self.inner.admission.lock().expect("poisoned");
@@ -392,7 +393,8 @@ impl Scheduler {
             admission.lanes[lane].push_back(AdmissionRequest { account, kind, tx });
         }
         self.inner.admitted.notify_one();
-        rx.await
+        crate::stall::warn_while_pending(rx, "scheduler admission", &(&account_log, kind))
+            .await
             .map_err(|_| crate::Error::Other("scheduler admission was abandoned".into()))
     }
 
