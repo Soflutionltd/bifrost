@@ -2124,5 +2124,15 @@ fn an_outlook_pin_hydrates_as_the_pinned_flag() {
         hydrate_select(false).contains("$expand=singleValueExtendedProperties"),
         "the pin marker must ride the hydration read"
     );
-    assert!(hydrate_select(true).contains("$expand=attachments,singleValueExtendedProperties"));
+    assert!(hydrate_select(true).contains("),singleValueExtendedProperties"));
+}
+
+#[test]
+fn hydration_expands_attachment_metadata_without_their_bytes() {
+    let select = hydrate_select(true);
+    assert!(select.contains(
+        "$expand=attachments($select=id,name,contentType,size,isInline,\
+         microsoft.graph.fileAttachment/contentId)"
+    ));
+    assert!(!select.contains("contentBytes"));
 }

@@ -194,9 +194,12 @@ pub(super) fn select_query(select: &str) -> String {
     }
 }
 
+/// Attachments are expanded as metadata only: an unselected expansion carries
+/// every file's `contentBytes`, and the bytes are read through `open_blob`.
+/// `contentId` exists only on the derived file type, so it must be cast.
 pub(super) fn hydrate_select(include_attachments: bool) -> &'static str {
     if include_attachments {
-        "$select=id,conversationId,subject,bodyPreview,body,uniqueBody,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,parentFolderId,isRead,importance,categories,flag,internetMessageHeaders,internetMessageId,hasAttachments,changeKey&$expand=attachments,singleValueExtendedProperties($filter=id%20eq%20'SystemTime%200x0F01')"
+        "$select=id,conversationId,subject,bodyPreview,body,uniqueBody,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,parentFolderId,isRead,importance,categories,flag,internetMessageHeaders,internetMessageId,hasAttachments,changeKey&$expand=attachments($select=id,name,contentType,size,isInline,microsoft.graph.fileAttachment/contentId),singleValueExtendedProperties($filter=id%20eq%20'SystemTime%200x0F01')"
     } else {
         "$select=id,conversationId,subject,bodyPreview,body,uniqueBody,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,parentFolderId,isRead,importance,categories,flag,internetMessageHeaders,internetMessageId,hasAttachments,changeKey&$expand=singleValueExtendedProperties($filter=id%20eq%20'SystemTime%200x0F01')"
     }
