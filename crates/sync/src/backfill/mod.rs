@@ -55,6 +55,15 @@ impl BackfillRegistry {
             .map(|r| *r.value())
     }
 
+    /// Whether any scope of `account` is still being walked, including one
+    /// queued behind another and not yet started.
+    #[must_use]
+    pub fn has_running(&self, account: &AccountId) -> bool {
+        self.inner
+            .iter()
+            .any(|entry| entry.key().0 == *account && *entry.value() == BackfillState::Running)
+    }
+
     pub fn forget_account(&self, account: &AccountId) {
         self.inner.retain(|(candidate, _), _| candidate != account);
     }
@@ -89,5 +98,33 @@ mod tests {
             registry.snapshot(&second, &scope),
             Some(BackfillState::Running)
         );
+    }
+
+    #[test]
+    fn only_a_running_scope_of_the_account_counts_as_running() {
+        let registry = BackfillRegistry::new();
+        let account = AccountId("account".into());
+        let other = AccountId("other".into());
+        registry.mark(
+            account.clone(),
+            CursorScope::Account,
+            BackfillState::Pending,
+        );
+        registry.mark(other.clone(), CursorScope::Account, BackfillState::Running);
+        assert!(!registry.has_running(&account));
+
+        registry.mark(
+            account.clone(),
+            CursorScope::Account,
+            BackfillState::Running,
+        );
+        assert!(registry.has_running(&account));
+
+        registry.mark(
+            account.clone(),
+            CursorScope::Account,
+            BackfillState::Completed,
+        );
+        assert!(!registry.has_running(&account));
     }
 }

@@ -535,12 +535,26 @@ impl SyncEngine {
         // before broadcasting cold-start inventory batches, so those
         // batches do not vanish during attach.
         if !deferred_inventory_scopes.is_empty() {
+            // Marked before the worker runs: the scopes are walked one after
+            // another, and a queued one must already read as unfinished.
+            for inventory in &deferred_inventory_scopes {
+                self.backfill_registry.mark(
+                    account_id.clone(),
+                    inventory.scope().clone(),
+                    BackfillState::Running,
+                );
+            }
             let inventory_ctx = ctx.clone();
+            let registry = Arc::clone(&self.backfill_registry);
             spawn(
                 crate::types::WorkerRole::DeferredInventory,
                 tokio::spawn(async move {
-                    run_deferred_inventory_establishment(inventory_ctx, deferred_inventory_scopes)
-                        .await;
+                    run_deferred_inventory_establishment(
+                        inventory_ctx,
+                        registry,
+                        deferred_inventory_scopes,
+                    )
+                    .await;
                 }),
             );
         }
@@ -825,6 +839,7 @@ pub(super) fn scope_covers_membership(scope: &CursorScope, membership: &Membersh
 
 pub(super) async fn run_deferred_inventory_establishment(
     ctx: SlotContext,
+    registry: Arc<BackfillRegistry>,
     scopes: Vec<DeferredInventory>,
 ) {
     // Owned handles for the walk itself; `ctx` stays intact so a
@@ -952,8 +967,11 @@ pub(super) async fn run_deferred_inventory_establishment(
                 )
                 .await;
                 match marker {
-                    super::backfill::MarkerOutcome::Published => {}
+                    super::backfill::MarkerOutcome::Published => {
+                        registry.mark(account_id.clone(), scope.clone(), BackfillState::Completed);
+                    }
                     super::backfill::MarkerOutcome::Withheld => {
+                        registry.mark(account_id.clone(), scope.clone(), BackfillState::Pending);
                         tracing::warn!(
                             target: "bifrost.sync.backfill",
                             account = ?account_id,
@@ -983,6 +1001,7 @@ pub(super) async fn run_deferred_inventory_establishment(
                 }
             }
             Ok(crate::multiplexer::FusionOutcome::NoCursor) => {
+                registry.mark(account_id.clone(), scope.clone(), BackfillState::Pending);
                 tracing::warn!(
                     target: "bifrost.sync.changes",
                     account = ?account_id,
@@ -991,9 +1010,11 @@ pub(super) async fn run_deferred_inventory_establishment(
                 );
             }
             Ok(crate::multiplexer::FusionOutcome::Terminated(error)) => {
+                registry.mark(account_id.clone(), scope.clone(), BackfillState::Pending);
                 ctx.recover(Some(scope.clone()), error).await;
             }
             Err(err) => {
+                registry.mark(account_id.clone(), scope.clone(), BackfillState::Pending);
                 tracing::warn!(
                     target: "bifrost.sync.changes",
                     account = ?account_id,

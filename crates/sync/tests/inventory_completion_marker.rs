@@ -8,6 +8,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bifrost_sync::backfill::BackfillState;
 use bifrost_sync::{CheckpointStore, EngineConfig, InMemoryCheckpointStore, SyncEngine};
 use bifrost_types::{AccountFactory, AccountId, CursorScope, ObjectType};
 
@@ -39,6 +40,10 @@ async fn an_inventory_established_scope_is_recorded_as_backfilled() {
         .attach(account_id.clone(), factory)
         .await
         .expect("attach succeeds");
+    assert!(
+        engine.backfill_registry().has_running(&account_id),
+        "a scope waiting for its inventory must not read as backfilled"
+    );
 
     let mut events = engine
         .account_changes_stream(&account_id)
@@ -76,6 +81,16 @@ async fn an_inventory_established_scope_is_recorded_as_backfilled() {
     .await
     .expect("the inventory walk must leave a durable completion marker");
     assert_eq!(marker.scope, scope);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while engine.backfill_registry().snapshot(&account_id, &scope)
+            != Some(BackfillState::Completed)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the established scope must read as backfilled");
+    assert!(!engine.backfill_registry().has_running(&account_id));
 
     reader.abort();
     engine.detach(&account_id).await.expect("detach succeeds");
