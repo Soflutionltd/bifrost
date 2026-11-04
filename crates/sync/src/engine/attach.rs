@@ -846,7 +846,7 @@ pub(super) async fn run_deferred_inventory_establishment(
         if shutdown.is_cancelled() {
             return;
         }
-        let outcome = loop {
+        let (outcome, fence_at_walk_start, undelivered_before) = loop {
             if !control.wait_until_running(&shutdown).await {
                 return;
             }
@@ -896,6 +896,8 @@ pub(super) async fn run_deferred_inventory_establishment(
                     }
                 },
             };
+            let fence_at_walk_start = coverage.scope_fence(&scope);
+            let undelivered_before = coverage.undelivered_watermark(&scope);
             let acc_arc = account.load_full();
             let acc: &dyn Account = acc_arc.as_ref().as_ref();
             let fusion = crate::multiplexer::InventoryFusion {
@@ -930,10 +932,38 @@ pub(super) async fn run_deferred_inventory_establishment(
             if matches!(result, Err(Error::ShuttingDown)) {
                 return;
             }
-            break result;
+            break (result, fence_at_walk_start, undelivered_before);
         };
         match outcome {
             Ok(crate::multiplexer::FusionOutcome::Established) => {
+                // The inventory walked the whole scope, so record it as
+                // backfilled: otherwise the next attach, where the scope is
+                // no longer fusion-owned, walks and re-hydrates all of it.
+                let marker = super::backfill::emit_backfill_complete(
+                    Some(&ctx.changes_tx),
+                    &scope,
+                    0,
+                    &control,
+                    &shutdown,
+                    &ctx.lane_gate(),
+                    &ctx.delivery,
+                    undelivered_before,
+                    fence_at_walk_start,
+                )
+                .await;
+                match marker {
+                    super::backfill::MarkerOutcome::Published => {}
+                    super::backfill::MarkerOutcome::Withheld => {
+                        tracing::warn!(
+                            target: "bifrost.sync.backfill",
+                            account = ?account_id,
+                            scope = ?scope,
+                            "deferred inventory: completion marker withheld; the scope is \
+                             backfilled on the next attach"
+                        );
+                    }
+                    super::backfill::MarkerOutcome::ShuttingDown => return,
+                }
                 let current = account.load_full();
                 // No shutdown arm on this provider poll, unlike the walk above:
                 // a wedged `discover_memberships` keeps this worker alive until
