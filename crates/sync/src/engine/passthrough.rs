@@ -146,6 +146,20 @@ impl SyncEngine {
             .await?)
     }
 
+    /// One page of the server's message search. Forwards to
+    /// [`Account::search_messages`]: nothing is published and no cursor
+    /// moves; pass the page's `next_cursor` back for the next page.
+    pub async fn search_messages(
+        &self,
+        account_id: &AccountId,
+        request: bifrost_types::SearchRequest,
+    ) -> Result<bifrost_types::Page<bifrost_types::ObjectId>, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .search_messages(request)
+            .await?)
+    }
+
     /// Hydrate a single message at a specific projection level.
     ///
     /// Forwards to [`Account::message_hydrate`]. Prefer this over a
