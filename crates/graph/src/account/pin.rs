@@ -16,6 +16,10 @@ use serde_json::{Value, json};
 /// The engine flag the pin state travels as, both directions.
 pub(crate) const PINNED_FLAG: &str = "$pinned";
 
+/// The `$expand` item that reads the pin marker, URL-encoded.
+pub(crate) const PIN_EXPAND: &str =
+    "singleValueExtendedProperties($filter=id%20eq%20'SystemTime%200x0F01')";
+
 const PIN_PROPERTY_ID: &str = "SystemTime 0x0F01";
 const PIN_SORT_PROPERTY_ID: &str = "SystemTime 0x0F02";
 const PINNED_AT: &str = "4500-09-01T00:00:00Z";

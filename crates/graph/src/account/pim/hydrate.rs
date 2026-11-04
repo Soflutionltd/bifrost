@@ -29,15 +29,20 @@ pub(crate) async fn message_hydrate(
     if let Some(folder) = ews_read_folder(&message) {
         return public_message_hydrate(&account, &message, &folder, projection).await;
     }
+    let owner = crate::account::foreign::parse_message_id(&message)
+        .owner()
+        .map(str::to_string);
+    if includes_attachment_metadata(projection)
+        && let Some(value) = account.prefetched.take(&message.0)
+    {
+        return message_from_value(&value, projection, owner.as_deref());
+    }
     let value = fetch_message_value(
         &account,
         &message,
         hydrate_select(includes_attachment_metadata(projection)),
     )
     .await?;
-    let owner = crate::account::foreign::parse_message_id(&message)
-        .owner()
-        .map(str::to_string);
     message_from_value(&value, projection, owner.as_deref())
 }
 

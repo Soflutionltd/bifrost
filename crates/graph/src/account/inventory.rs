@@ -15,6 +15,7 @@ use super::cursor::{
     GraphCursorPayload, GraphPageMarker, encode_cursor, kind_for_scope, scope_for_kind,
 };
 use super::graph_error::{GraphErrorContext, cursor_error_to_account_error};
+use super::pin::PIN_EXPAND;
 
 const EVENT_SELECT: &str = "\
 id,subject,bodyPreview,start,end,isAllDay,location,organizer,\
@@ -234,6 +235,9 @@ fn inventory_stream_from(
                         .memberships
                         .push(bifrost_types::MembershipScope::Mailbox(owner.clone()));
                 }
+                if matches!(scope, CursorScope::FolderType { ty: ObjectType::Email, .. }) {
+                    account.prefetched.park(entry.id.0.clone(), value);
+                }
                 entries.push(entry);
             }
 
@@ -451,9 +455,13 @@ fn initial_delta_request(
             let native = super::foreign::parse_folder(folder).native_id().to_string();
             let encoded = bifrost_net::url::encode_path_component(&native);
             match ty {
+                // Newest first, so a first sync shows recent mail at once. The
+                // only order message delta accepts; without one, Graph's order
+                // is unspecified. The pin property rides along so a page value
+                // can answer hydration on its own (`PrefetchedMessages`).
                 ObjectType::Email => Ok((
                     format!(
-                        "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SELECT}"
+                        "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SELECT}&$expand={PIN_EXPAND}&$orderby=receivedDateTime%20desc"
                     ),
                     None,
                 )),
@@ -655,6 +663,14 @@ mod tests {
         };
         let url = initial_delta_url(&account, &scope).expect("email scope is supported");
         assert!(url.starts_with("/me/mailFolders/inbox/messages/delta?"));
+        assert!(
+            url.ends_with("&$orderby=receivedDateTime%20desc"),
+            "a first sync must walk newest first: {url}"
+        );
+        assert!(
+            url.contains("&$expand=singleValueExtendedProperties("),
+            "a page value must carry the pin marker to answer hydration: {url}"
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@ mod message_ids;
 mod mutate;
 mod pim;
 mod pin;
+mod prefetch;
 mod public_folder;
 mod push;
 mod push_stream;
@@ -138,6 +139,7 @@ pub(crate) struct GraphAccount {
     /// Folder ids are stable for one opened account, and a fresh account on
     /// reopen starts with an empty cache.
     pub(crate) trash_folder_ids: Arc<RwLock<HashMap<String, String>>>,
+    pub(crate) prefetched: Arc<prefetch::PrefetchedMessages>,
     /// Public-folder routing map, keyed by native EWS `FolderId`. A
     /// folder present here is a public folder: it establishes via the
     /// public-folder inventory pass and polls via the no-delta-token
@@ -363,6 +365,7 @@ impl GraphAccount {
             shutdown: CancellationToken::new(),
             etag_index: Arc::new(RwLock::new(EtagIndex::default())),
             trash_folder_ids: Arc::new(RwLock::new(HashMap::new())),
+            prefetched: Arc::new(prefetch::PrefetchedMessages::default()),
             routing_map: Arc::new(RwLock::new(HashMap::new())),
             public_folder_meta: Arc::new(RwLock::new(HashMap::new())),
             public_item_classes: Arc::new(RwLock::new(HashMap::new())),

@@ -323,6 +323,39 @@ fn ews_full_hydration_reports_attachment_metadata_with_blob_source() {
     assert!(!attachment.truncated);
 }
 
+#[tokio::test]
+async fn hydration_answers_from_the_inventory_page_without_a_request() {
+    let client = crate::client::GraphClient::new("token");
+    client.script_rest([]);
+    let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    account.prefetched.park(
+        "m1".to_string(),
+        json!({
+            "id": "m1",
+            "subject": "Devis",
+            "hasAttachments": false,
+            "isRead": true,
+            "body": { "contentType": "html", "content": "<p>Bonjour</p>" },
+            "singleValueExtendedProperties": [
+                { "id": "SystemTime 0xF01", "value": "4500-09-01T00:00:00Z" }
+            ]
+        }),
+    );
+
+    let message = message_hydrate(
+        account,
+        ObjectId("m1".to_string()),
+        HydrationProjection::FullWithBlobs,
+    )
+    .await
+    .expect("a parked page value hydrates");
+
+    assert_eq!(message.subject.as_deref(), Some("Devis"));
+    assert_eq!(message.body_html.as_deref(), Some("<p>Bonjour</p>"));
+    assert!(message.flags.contains("$pinned"));
+    assert!(client.take_rest_requests().is_empty());
+}
+
 #[test]
 fn graph_full_hydration_reports_attachment_metadata_with_blob_source() {
     let value = json!({
