@@ -19,6 +19,7 @@ mod tests;
 
 pub(crate) use containers::{
     container_create, container_delete, container_move, container_rename, containers_list,
+    well_known_folder_roles,
 };
 pub(crate) use drafts::{draft_create, draft_discard, draft_send, draft_update};
 pub(crate) use hydrate::{ews_read_folder, message_hydrate};

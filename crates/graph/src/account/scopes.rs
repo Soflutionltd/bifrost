@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use bifrost_types::{
     AccessErrorKind, AccountError, AccountErrorKind, AccountOperation, Batch, Checkpoint,
-    CursorScope, FolderId, MembershipScope, ObjectType, PageBoundary, ScopeLifecycle, SyncEvent,
-    Warning, WarningKind,
+    CursorScope, FolderId, FolderRole, MembershipScope, ObjectType, PageBoundary, ScopeLifecycle,
+    SyncEvent, Warning, WarningKind,
 };
 
 use super::GraphAccount;
@@ -136,6 +136,12 @@ async fn discover_cursor_scopes_inner(
         );
     }
 
+    // A first sync walks the folders in this order, and the user waits on
+    // the Inbox, not on years of Deleted Items.
+    let roles = super::pim::well_known_folder_roles(&account.client).await;
+    let mut mail_folders = mail_folders;
+    mail_folders.sort_by_key(|folder| first_sync_rank(roles.get(&folder.id).copied()));
+
     let mut scopes = Vec::new();
     for folder in mail_folders {
         scopes.push(CursorScope::FolderType {
@@ -196,6 +202,19 @@ async fn discover_cursor_scopes_inner(
     }
 
     Ok((scopes, warnings))
+}
+
+fn first_sync_rank(role: Option<FolderRole>) -> u8 {
+    match role {
+        Some(FolderRole::Inbox) => 0,
+        Some(FolderRole::Sent) => 1,
+        Some(FolderRole::Drafts) => 2,
+        Some(FolderRole::Archive) => 3,
+        None => 4,
+        Some(FolderRole::Spam) => 5,
+        Some(FolderRole::Trash) => 6,
+        Some(_) => 4,
+    }
 }
 
 async fn discover_memberships_inner(
@@ -260,13 +279,18 @@ mod tests {
     #[tokio::test]
     async fn discovery_reuses_the_listing_open_seeded_and_lists_again_on_re_run() {
         let client = GraphClient::new("token");
-        // Exactly ONE listing response is scripted. A discovery that walks
-        // the hierarchy while the seed is present would take it, and the
-        // re-run below would then hit the exhausted-script panic.
-        client.script_rest([crate::client::ScriptedRestResponse::json(
-            reqwest::StatusCode::OK,
-            serde_json::json!({ "value": [{ "id": "relisted", "displayName": "Relisted" }] }),
-        )]);
+        // Exactly ONE listing response is scripted, between the two runs'
+        // well-known role lookups. A discovery that walks the hierarchy while
+        // the seed is present would take it, and the re-run below would then
+        // hit the exhausted-script panic.
+        client.script_rest(
+            unresolved_roles()
+                .chain([crate::client::ScriptedRestResponse::json(
+                    reqwest::StatusCode::OK,
+                    serde_json::json!({ "value": [{ "id": "relisted", "displayName": "Relisted" }] }),
+                )])
+                .chain(unresolved_roles()),
+        );
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
         *account.open_folder_seed.write().await = Some(vec![crate::types::GraphMailFolder {
             id: "seeded".to_string(),
@@ -288,7 +312,7 @@ mod tests {
             "the first discovery answers from open's listing"
         );
         assert!(
-            client.take_rest_requests().is_empty(),
+            !client.take_rest_requests().iter().any(is_folder_listing),
             "the first discovery must issue no folder listing of its own"
         );
         assert!(
@@ -309,8 +333,76 @@ mod tests {
             "a second discovery walks the hierarchy so new folders are noticed"
         );
         assert!(
-            !client.take_rest_requests().is_empty(),
+            client.take_rest_requests().iter().any(is_folder_listing),
             "the re-run issues the listing"
+        );
+    }
+
+    /// One answer per well-known folder lookup, in `WELL_KNOWN_FOLDERS`
+    /// order: inbox, sentItems, drafts, deletedItems, junkEmail, archive.
+    fn roles(ids: [Option<&str>; 6]) -> Vec<crate::client::ScriptedRestResponse> {
+        ids.into_iter()
+            .map(|id| match id {
+                Some(id) => crate::client::ScriptedRestResponse::json(
+                    reqwest::StatusCode::OK,
+                    serde_json::json!({ "id": id }),
+                ),
+                None => crate::client::ScriptedRestResponse::json(
+                    reqwest::StatusCode::NOT_FOUND,
+                    serde_json::json!({ "error": { "code": "ErrorItemNotFound" } }),
+                ),
+            })
+            .collect()
+    }
+
+    fn unresolved_roles() -> impl Iterator<Item = crate::client::ScriptedRestResponse> {
+        roles([None; 6]).into_iter()
+    }
+
+    fn is_folder_listing(request: &crate::client::RestRequest) -> bool {
+        request.url.contains("displayName")
+    }
+
+    #[tokio::test]
+    async fn discovery_walks_the_inbox_first_and_deleted_items_last() {
+        let client = GraphClient::new("token");
+        client.script_rest(roles([
+            Some("inbox-id"),
+            Some("sent-id"),
+            None,
+            Some("trash-id"),
+            Some("junk-id"),
+            None,
+        ]));
+        let account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
+        let folder = |id: &str| crate::types::GraphMailFolder {
+            id: id.to_string(),
+            display_name: Some(id.to_string()),
+            child_folder_count: Some(0),
+            parent_folder_id: None,
+        };
+        *account.open_folder_seed.write().await = Some(vec![
+            folder("trash-id"),
+            folder("custom-id"),
+            folder("junk-id"),
+            folder("sent-id"),
+            folder("inbox-id"),
+        ]);
+
+        let (scopes, _) = discover_cursor_scopes_inner(&account)
+            .await
+            .expect("discovery succeeds from the seeded listing");
+
+        let order: Vec<&str> = scopes
+            .iter()
+            .map(|scope| match scope {
+                CursorScope::FolderType { folder, .. } => folder.0.as_str(),
+                other => panic!("unexpected scope {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            order,
+            ["inbox-id", "sent-id", "custom-id", "junk-id", "trash-id"]
         );
     }
 

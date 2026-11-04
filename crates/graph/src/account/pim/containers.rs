@@ -328,7 +328,7 @@ pub(crate) async fn container_delete(
 /// Resolve the well-known folder ids of ONE mailbox. Takes the client
 /// rather than the account: a shared mailbox's well-known folders are its
 /// own, so the caller picks the client the lookup must run on.
-pub(super) async fn well_known_folder_roles(client: &GraphClient) -> HashMap<String, FolderRole> {
+pub(crate) async fn well_known_folder_roles(client: &GraphClient) -> HashMap<String, FolderRole> {
     let mut roles = HashMap::new();
     for (name, role) in WELL_KNOWN_FOLDERS {
         let path = format!(
