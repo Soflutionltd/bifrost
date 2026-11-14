@@ -6,7 +6,7 @@ use std::{
 };
 
 use ed25519_compact::{KeyPair, Seed};
-use rsa::{RsaPrivateKey, pkcs1::DecodeRsaPrivateKey, pkcs1v15::Pkcs1v15Sign};
+use rsa::{PrivateKey as RsaPrivateKey, pkcs1::DecodeRsaPrivateKey, pkcs1v15::Pkcs1v15Sign};
 use sha2::{Digest, Sha256};
 
 use crate::message::{
@@ -458,7 +458,7 @@ fn dkim_sign_fixed_time(message: &mut Message, dkim_config: &DkimConfig, timesta
 
 #[cfg(test)]
 mod test {
-    use rsa::{RsaPrivateKey, pkcs1::DecodeRsaPrivateKey};
+    use rsa::{PrivateKey as RsaPrivateKey, pkcs1::DecodeRsaPrivateKey};
 
     use super::{
         super::{

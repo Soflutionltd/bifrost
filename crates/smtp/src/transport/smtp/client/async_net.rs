@@ -628,7 +628,7 @@ mod tokio_test {
         // Poll the read exactly once. A read gated on outbound debt returns
         // Pending here; a read gated only on inbound debt returns the reply.
         let mut buf = [0_u8; 10];
-        let mut read = Box::pin(stream.read(&mut buf));
+        let mut read = std::pin::pin!(stream.read(&mut buf));
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         let polled = read.as_mut().poll(&mut cx);

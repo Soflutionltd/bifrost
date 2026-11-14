@@ -2145,7 +2145,7 @@ mod tests {
             drive_pending(request.as_mut()).await;
             active.push(request);
         }
-        let mut fifth = Box::pin(alias.get::<serde_json::Value>(Resource::Outlook, &url));
+        let mut fifth = std::pin::pin!(alias.get::<serde_json::Value>(Resource::Outlook, &url));
         drive_pending(fifth.as_mut()).await;
         assert_eq!(primary.wire_attempts(), 4);
         assert_eq!(limit.in_flight(), 4);

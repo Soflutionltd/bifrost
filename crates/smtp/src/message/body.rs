@@ -112,6 +112,13 @@ impl Body {
                 default_content_type,
             },
             ContentTransferEncoding::QuotedPrintable => {
+                // Quoted-printable text mode only treats CRLF as a hard line
+                // break and escapes a bare LF as `=0A` (quoted_printable 0.5.2
+                // onward), so a bare LF is turned into CRLF first. That keeps
+                // a bare LF as a line break, which is how it was always
+                // emitted before.
+                let mut buf = buf;
+                in_place_crlf_bytes(&mut buf);
                 let encoded = quoted_printable::encode(buf);
 
                 Self {

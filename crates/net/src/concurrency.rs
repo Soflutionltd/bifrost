@@ -348,7 +348,7 @@ mod tests {
         let _second = limit.acquire().await;
         assert_eq!(limit.in_flight(), 2);
 
-        let mut third = Box::pin(limit.acquire());
+        let mut third = std::pin::pin!(limit.acquire());
         let (waker, wake_count) = counting_waker();
         assert!(
             poll_with_waker(third.as_mut(), &waker).is_pending(),
@@ -434,7 +434,7 @@ mod tests {
     async fn growing_a_limit_wakes_a_newly_admitted_waiter() {
         let limit = ConcurrencyLimit::new(1);
         let held = limit.acquire().await;
-        let mut waiter = Box::pin(limit.acquire());
+        let mut waiter = std::pin::pin!(limit.acquire());
         let (waker, wake_count) = counting_waker();
         assert!(poll_with_waker(waiter.as_mut(), &waker).is_pending());
 
@@ -454,7 +454,7 @@ mod tests {
     async fn a_repolled_waiter_registers_its_latest_waker() {
         let limit = ConcurrencyLimit::new(1);
         let held = limit.acquire().await;
-        let mut waiter = Box::pin(limit.acquire());
+        let mut waiter = std::pin::pin!(limit.acquire());
         let (old_waker, old_wakes) = counting_waker();
         let (new_waker, new_wakes) = counting_waker();
 
@@ -540,7 +540,7 @@ mod tests {
         let limit = ConcurrencyLimit::new(3);
         let held = limit.acquire_weighted(2).await;
         let mut head = Box::pin(limit.acquire_weighted(2));
-        let mut follower = Box::pin(limit.acquire());
+        let mut follower = std::pin::pin!(limit.acquire());
         let (waker, wake_count) = counting_waker();
         assert!(pending(head.as_mut()));
         assert!(
@@ -858,7 +858,7 @@ mod pipeline_tests {
         let held = first.acquire().await;
         let limit = ConcurrencyLimit::new(1);
         let account = account(&script, Some(limit.clone()));
-        let mut request = Box::pin(
+        let mut request = std::pin::pin!(
             account
                 .get("https://limit.test/overflow")
                 .without_bearer_auth()

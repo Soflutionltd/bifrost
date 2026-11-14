@@ -50,7 +50,7 @@ tokio = { workspace = true, optional = true }
 tokio-native-tls = { workspace = true, optional = true }
 
 sha2 = { workspace = true, features = ["oid"], optional = true }
-rsa = { version = "0.10.0-rc.18", optional = true }
+rsa = { version = "0.10.0", optional = true, features = ["pkcs1v15"] }
 ed25519-compact = { version = "2", optional = true }
 
 [dev-dependencies]

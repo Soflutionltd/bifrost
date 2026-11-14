@@ -865,7 +865,11 @@ mod test {
             .unwrap();
 
         let formatted = email.formatted();
-        assert!(formatted.ends_with(b"\r\nbefore\r\n.\r\nafter"));
+        assert!(
+            formatted.ends_with(b"\r\nbefore\r\n.\r\nafter"),
+            "formatted message: {:?}",
+            String::from_utf8_lossy(&formatted)
+        );
     }
 
     #[cfg(feature = "dkim")]

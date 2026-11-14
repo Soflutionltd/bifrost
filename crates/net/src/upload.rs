@@ -205,7 +205,7 @@ mod tests {
             let _pause = dispatch_clock.pause();
             futures::future::pending::<()>().await;
         };
-        let mut bound = Box::pin(clock.bound(dispatch, Some(Duration::from_secs(1))));
+        let mut bound = std::pin::pin!(clock.bound(dispatch, Some(Duration::from_secs(1))));
         assert!(futures::FutureExt::now_or_never(bound.as_mut()).is_none());
         tokio::time::advance(Duration::from_secs(3)).await;
         assert!(matches!(
