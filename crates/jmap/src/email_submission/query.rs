@@ -1,10 +1,7 @@
 use jiff::Timestamp;
 use serde::Serialize;
 
-use crate::core::{
-    query::{self, QueryObject},
-    set::from_timestamp,
-};
+use crate::core::query::{self, QueryObject};
 use crate::email::EmailId;
 use crate::identity::IdentityId;
 use crate::thread::ThreadId;
@@ -88,16 +85,12 @@ impl Filter {
         Filter::UndoStatus { value }
     }
 
-    pub(crate) fn before(value: i64) -> Self {
-        Filter::Before {
-            value: from_timestamp(value),
-        }
+    pub(crate) fn before(value: Timestamp) -> Self {
+        Filter::Before { value }
     }
 
-    pub(crate) fn after(value: i64) -> Self {
-        Filter::After {
-            value: from_timestamp(value),
-        }
+    pub(crate) fn after(value: Timestamp) -> Self {
+        Filter::After { value }
     }
 }
 

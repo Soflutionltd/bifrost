@@ -18,9 +18,9 @@ inside the protocol consumers, never the other way around.
   constant-time `PartialEq`, redacted `Debug`, `as_str` / `as_bytes` /
   `into_zeroizing`, plus `From<String>` / `From<&str>` /
   `From<Zeroizing<String>>` / `Deref<Target=str>` / `AsRef<str>`. Each protocol
-  crate keeps its own secret type and converts at the boundary (IMAP has
-  `From<bifrost_sasl::Secret> for SecretString`, which moves the inner
-  allocation so no plaintext copy is left un-zeroized).
+  crate can consume it directly; IMAP
+  `types/secret.rs::SecretString` is an alias, with no duplicate storage or
+  equality implementation.
 - `SaslError` - `#[non_exhaustive]`. `Protocol(String)` for malformed or
   unexpected SASL/SCRAM messages and peer-controlled input (the server's
   certificate); `InvalidCredential(String)` for a caller-supplied username or
@@ -43,16 +43,30 @@ inside the protocol consumers, never the other way around.
   `ChannelBinding`. A data-carrying enum, not a discriminant-plus-data struct,
   so the GS2 header and the `c=` value never desync. A PLUS consumer MUST build
   its client-first header from `gs2_header()`, not a literal.
-- `select_scram_rung(hash, plus, advertised, binding_data)` - shared RFC 5802
-  Section 6 selection of one advertised rung and its `ScramChannelBinding`.
-  Protocol callers supply their advertised set and walk their own preference
-  order. PLUS requires binding data; an advertised PLUS suppresses its unbound
-  counterpart. An unbound rung with usable local binding sends `y,,` and
-  `c=eSws`, allowing a binding-capable server to detect stripped PLUS
-  advertisements. Without usable binding it sends `n,,` and `c=biws`.
-  Certificate parsing errors propagate before selection; they are not treated
-  as absent binding. Direct IMAP calls that explicitly choose unbound SCRAM
-  without mechanism negotiation retain `n,,`, per RFC 5802 Section 6.
+- `Mechanism` (`negotiation.rs`) owns the mechanism vocabulary, wire names,
+  case-insensitive `from_name`, and SCRAM hash/binding projection. SASL `Login`
+  and the legacy command `ImapLogin` are distinct identities. SMTP's public
+  eight-variant `Mechanism` is a protocol support adapter to this vocabulary;
+  it retains every previously selectable mechanism, including SASL LOGIN.
+- `MechanismName` owns open wire identities: known names project to `Mechanism`,
+  unknown extensions retain their text. IMAP AUTH capabilities, server profiles
+  and AUTHENTICATE commands use it. Wire encoders still validate atom syntax.
+- `ChannelBindingData` is opaque certificate-derived data, minted by
+  `binding_from_peer_certificate(Option<&[u8]>)`. Absence returns `None`;
+  certificate errors propagate rather than becoming a skip.
+- `scram_rung(mechanism, advertised, binding)` replaces the old multi-purpose
+  selector. Its `ScramRung` carries the mechanism and actual GS2 input;
+  `ScramSkip` distinguishes NotAdvertised, PlusWithoutBinding and
+  DowngradeForbidden. No synthetic empty binding or echoed input hash is needed.
+  Unbound SCRAM with usable binding sends `y,,`; without it, `n,,`.
+  A direct IMAP caller explicitly choosing unbound SCRAM retains `n,,`.
+- `negotiate(advertised, policy, encrypted, binding)` owns the local ladder.
+  `NegotiationPolicy` supplies the supported/allowed set, OAuth versus password
+  credentials and explicit insecure opt-in. Results retain typed local skips
+  alongside successful selections, whose SCRAM rung carries binding forward.
+  IMAP performs binding-dependent resolution under its attempt deadline after
+  the preliminary policy ladder; SMTP carries the resolved selection straight
+  into the exchange. Neither retries a wire refusal.
 - `tls_server_end_point(cert_der) -> Result<Vec<u8>, SaslError>` - RFC 5929
   Section 4 `tls-server-end-point` binding data: the hash of the whole
   DER-encoded certificate, using the hash named by the cert's own
@@ -95,8 +109,7 @@ inside the protocol consumers, never the other way around.
 - `plain_payload(authzid, authcid, password) -> Result<Secret, SaslError>`
   (`plain.rs`) - RFC 4616 raw PLAIN bytes, assembled directly in zeroizing
   storage. Refuses NUL in every field as `InvalidCredential` before framing.
-  IMAP and ManageSieve use it with an empty authorization identity; SMTP
-  retains its own NUL-validating builder. ManageSieve also uses the shared
+  IMAP, ManageSieve and SMTP use it with an empty authorization identity. ManageSieve also uses the shared
   XOAUTH2 builder and keeps its base64 payload and authentication command in
   zeroizing storage.
 - `OAuthMechanism` - `#[non_exhaustive]` `{ Xoauth2, OAuthBearer }`.
@@ -168,6 +181,10 @@ correct:
 - RFC 5802 SHA-1 client-final + server signature (`scram.rs`), now passing
   `ScramChannelBinding::None` - proves the `None` path stays byte-identical to
   the old `c=biws`.
+- Shared policy (`negotiation.rs`): mechanism identity and extension retention,
+  TLS refusal for all mechanisms with explicit opt-in, bound SHA-1 preference,
+  PLUS allow-list downgrade suppression, and canonical OAuth preference with
+  XOAUTH2 still selectable.
 - Shared SCRAM negotiation (`scram.rs`): both hashes select `n`, `y`, and `p`
   with the exact GS2 header and `c=` bytes; unavailable, unadvertised, and
   suppressed rungs are rejected. IMAP and SMTP consumer tests independently
@@ -223,38 +240,43 @@ advertised, and enforce RFC 5802 Section 6 downgrade protection (see
 `verify_server_final` via `ScramExchange`. OAuth (XOAUTH2 / OAUTHBEARER)
 payload construction now lives here (`xoauth2_payload` / `oauthbearer_payload`),
 collapsing the formerly duplicated IMAP and SMTP builders. The crate owns SCRAM rung eligibility and GS2 selection via
-`select_scram_rung`; protocol crates retain preference order and retry policy.
+`scram_rung` and `negotiate`; protocol crates retain wire sequencing.
 EdDSA leaf-cert channel binding is deliberately a hard error until an
 evidence-driven vector pins the binding hash a real server uses.
 
 ## Mechanism preference
 
-When password credentials are configured, each protocol crate picks the
-strongest mechanism the server advertises, in this canonical order:
+`negotiation.rs` is the policy owner for all three protocol consumers.
+`authentication_allowed` requires TLS for every automatically selected
+mechanism on every protocol, SCRAM included (IMAP SCRAM used to be allowed over
+plaintext), unless the caller explicitly opts into insecure authentication.
+This is a repository owner ruling: an enterprise client should not send
+credentials or a SCRAM exchange over an unencrypted channel by default. SCRAM
+hides the password but not the exchange, and it cannot protect the mail or
+script traffic that follows. IMAP's `allow_cleartext_without_tls`, SMTP's
+`dangerous_allow_insecure_auth` and ManageSieve's auth policy preserve that
+explicit escape hatch. Direct IMAP mechanism methods remain explicit choices.
 
-1. SCRAM-SHA-256-PLUS
-2. SCRAM-SHA-1-PLUS
-3. SCRAM-SHA-256
-4. SCRAM-SHA-1
-5. PLAIN (only over TLS)
+The canonical password order is SCRAM-SHA-256-PLUS, SCRAM-SHA-1-PLUS,
+SCRAM-SHA-256, SCRAM-SHA-1, PLAIN, CRAM-MD5, SASL LOGIN, IMAP LOGIN. A bound
+SHA-1 exchange outranks unbound SHA-256. Protocol support sets filter this order:
+SMTP supports its existing eight mechanisms; IMAP supports its existing nine
+choices, with CRAM-MD5 and legacy LOGIN opt-in; ManageSieve currently supports
+only PLAIN and XOAUTH2. No new wire exchange is implied by the common vocabulary.
+LOGIN is opt-in for SMTP as well. Enterprise users expect a legacy method only
+when configured, rather than an automatic downgrade.
 
-A channel-bound SHA-1 exchange outranks an unbound SHA-256 one, so
-SCRAM-SHA-1-PLUS sits above SCRAM-SHA-256. LOGIN and any other
-cleartext-credential mechanism are never auto-selected when something
-stronger is on offer; they are opt-in only (IMAP `AuthPolicy::allow_login`,
-SMTP an explicit `authentication(...)` list - LOGIN is not in SMTP's default
-`PASSWORD_MECHANISMS`). OAuth (XOAUTH2 / OAUTHBEARER) is an orthogonal path:
-when OAuth credentials are configured the SCRAM ladder does not apply. RFC 5802
-Section 6 downgrade protection drops the unbound `SCRAM-SHA-N` rung whenever
-`SCRAM-SHA-N-PLUS` is advertised. A PLUS rung is skipped only when TLS has no
-peer certificate. A present certificate whose binding computation fails is a
-hard protocol error and cannot fall through to PLAIN. Binding availability is
-resolved for unbound SCRAM too, so absence of PLUS still produces the required
-`y` signal when binding is usable. The protocol ladder shapes deliberately differ: IMAP's `password_mechanism_ladder` returns an ordered
-`Attempt`/`Reject` list because its driver walks past locally rejected rungs, while SMTP's
-`password_mechanism` returns exactly one mechanism because SMTP never retries after a wire
-rejection - descending to an unbound mechanism or PLAIN on a 535 would be the very downgrade the
-Section 6 rule exists to prevent. See `reference/imap.md` / `reference/smtp.md`.
+OAuth is an orthogonal credential path. `OAUTH_PREFERENCE` chooses standardized
+OAUTHBEARER before XOAUTH2, independent of the allow-list order. A caller can
+still select XOAUTH2 by allowing only it.
+
+RFC 5802 section 6 suppresses an unbound SCRAM rung whenever the matching PLUS
+mechanism is advertised, even if PLUS is excluded by the caller's allow-list.
+A missing certificate may skip PLUS; a present certificate that cannot be
+processed is a hard error. The real certificate-derived binding travels with
+SMTP's selection into the exchange; there is no second selection or assertion
+that the selected rung remains eligible. IMAP skips only local refusals and live
+capability disappearance; both protocols treat a wire rejection as final.
 
 ## Non-goals
 

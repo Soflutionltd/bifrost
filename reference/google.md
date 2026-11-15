@@ -149,9 +149,14 @@ Internal modules:
   `PubSubControl` watch actor, and the process-wide `MailboxWatch`
   registry that coordinates `users.stop` across instances of one mailbox.
 - `mutation.rs` - `bulk_set_flags`, `bulk_move`, `bulk_destroy`.
-- `pim.rs` - Phase 3.6 PIM primitives: message/thread label
-  mutations, MIME send and drafts, search translation, container
-  CRUD, identities, vacation responder, message/thread hydration.
+- `pim.rs` - mail primitive dispatch facade and shared local error helpers.
+  Its `pim/` modules own separate responsibilities and their tests:
+  `labels_single.rs` owns single-message/thread label writes and relocation;
+  `compose.rs` owns send, drafts, `MailDocument` and rendering;
+  `hydrate.rs` maps Gmail message/thread payloads through the shared MIME selector;
+  `search.rs` adapts search requests to the shared query encoder;
+  `settings.rs` owns containers, identities and vacation settings.
+  `pim/test_support.rs` supplies shared hermetic fixtures.
 - `filters.rs` - Gmail settings filter list/create/delete and
   typed-rule mapping.
 - `query.rs` - shared Gmail query encoder; search predicates adapt to filter
@@ -506,7 +511,7 @@ awaits session cleanup rather than dropping the multi-request future.
   unsupported (no update/replace endpoint).
 - `conveniences.starred: LabelMembership`. The default
   `set_starred` convenience dispatches to Gmail's `STARRED` label.
-  Replied and forwarded convenience flags are false because Gmail
+  Replied and forwarded convenience shapes are `None` because Gmail
   derives that state from messages rather than exposing a writeable
   flag. `mdn_sent_via_keyword` is false: Gmail's read-receipt model is
   read-only, so `mark_mdn_sent` returns `Unsupported(MarkMdnSent)`.
@@ -2056,8 +2061,18 @@ earlier accepted bodies as uncertain and leaves unattempted ids for re-issue;
 submission-level evidence cannot replace those per-id facts.
 
 Google send rendering uses `bifrost_types::compose::validate_send_recipients`
-on the resolved document; empty To, Cc and Bcc is Request(Malformed). Draft
-saves may remain recipient-free.
+on the resolved document; empty To, Cc and Bcc is Request(Malformed). Raw sends
+parse recipient headers strictly before dispatch, apply the same check, and
+preserve the submitted octets. Stored-draft sends fetch the full draft and
+strictly validate its To, Cc and Bcc before submitting the stored id, without
+rewriting its contents. Users expect missing or unrepresentable recipients to
+fail before submission. Gmail has no conditional draft send, so concurrent edits
+between validation and send remain possible. Draft saves may remain recipient-free.
+
+Mutation progress has one `outcomes_before_stop` projection for shutdown and
+other terminal errors. The shutdown error carries InFlight attempt evidence;
+dispatched ids remain uncertain, while unattempted ids remain available for
+re-issue. Earlier acknowledged bodies retain their separate per-id evidence.
 
 ## Shared entity validators
 

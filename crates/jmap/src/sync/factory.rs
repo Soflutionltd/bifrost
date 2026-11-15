@@ -292,7 +292,7 @@ struct SeededOpenState<Tr: HttpTransport> {
         HashMap<String, Option<crate::core::id::ObjectState<crate::mailbox::Mailbox>>>,
     mailbox_names: HashMap<String, String>,
     primary_id: String,
-    foreign_mail: HashMap<String, JmapMailAccount<Tr>>,
+    foreign_mail: HashMap<crate::core::id::AccountId, JmapMailAccount<Tr>>,
     foreign_submission: HashSet<String>,
     skipped_scopes: Vec<SkippedScope>,
 }
@@ -374,7 +374,7 @@ async fn validate_and_seed<Tr: HttpTransport>(
     // down. And skipping silently would erase the share for the
     // session with no signal anywhere.
     let foreign_ids = foreign_mail_account_ids(&session, &primary_id);
-    let mut foreign_mail: HashMap<String, JmapMailAccount<Tr>> = HashMap::new();
+    let mut foreign_mail: HashMap<crate::core::id::AccountId, JmapMailAccount<Tr>> = HashMap::new();
     let mut foreign_submission = HashSet::new();
     let mut skipped_scopes: Vec<SkippedScope> = Vec::new();
     // Probing the shares concurrently bounds open latency by the
@@ -408,7 +408,7 @@ async fn validate_and_seed<Tr: HttpTransport>(
                 if account_advertises_submission(&session, &foreign_id) {
                     foreign_submission.insert(foreign_id.clone());
                 }
-                foreign_mail.insert(foreign_id, foreign_account);
+                foreign_mail.insert(foreign_id.into(), foreign_account);
             }
             Err(skip) => {
                 // Leave the share out of this session's surface
@@ -695,7 +695,7 @@ fn foreign_mail_account_ids(
                         .any(|uri| uri.as_str() == <capability::Mail as Capability>::URI)
             })
         })
-        .cloned()
+        .map(ToString::to_string)
         .collect();
     ids.sort();
     ids.dedup();
@@ -1069,7 +1069,7 @@ mod tests {
         ///   the final response preserved. When the batch's replay policy
         ///   forbids replay (any write), a retryable status other than 429
         ///   stops at once and arrives wrapped in an empty-attempt
-        ///   `AttemptHistory` with `may_have_committed: true`, as net's
+        ///   `AttemptHistory` with a `MayHaveCommitted` ledger verdict, as net's
         ///   status gate produces it.
         /// - Any other 4xx: terminal `Error::Status`.
         ///
@@ -1108,32 +1108,35 @@ mod tests {
             if policy.statuses.contains(&status) || status.is_server_error() {
                 let retry_after = bifrost_net::request::parse_retry_after_hint(
                     headers.get(reqwest::header::RETRY_AFTER),
-                )
-                .map(|hint| {
-                    hint.min_delay(std::time::SystemTime::now())
-                        .min(policy.honor_retry_after_cap)
-                });
+                );
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     return Err(TransportError::from_net(bifrost_net::Error::RateLimited {
                         retry_after,
                         final_response,
                     }));
                 }
-                let exhausted = bifrost_net::Error::RetryBudgetExhausted {
-                    final_response: Some(final_response),
-                    retry_after_history: retry_after.into_iter().collect(),
-                };
                 let replayable = bifrost_net::request_is_replayable(
                     Some(replay),
                     &reqwest::Method::POST,
                     &reqwest::header::HeaderMap::new(),
                 );
+                let exhausted = bifrost_net::Error::RetryBudgetExhausted {
+                    final_response: Some(final_response),
+                    retry_after_history: retry_after.into_iter().collect(),
+                    stop_reason: if replayable {
+                        bifrost_net::error::RetryStopReason::AttemptBudget
+                    } else {
+                        bifrost_net::error::RetryStopReason::ReplayForbidden
+                    },
+                };
                 if !replayable {
                     return Err(TransportError::from_net(
                         bifrost_net::Error::AttemptHistory {
                             source: Box::new(exhausted),
-                            attempts: Vec::new(),
-                            may_have_committed: true,
+                            evidence: bifrost_net::RequestEvidence::new(
+                                Vec::new(),
+                                bifrost_net::CommitEvidence::MayHaveCommitted,
+                            ),
                         },
                     ));
                 }
@@ -2414,7 +2417,7 @@ mod tests {
             let targets = Box::pin(futures::stream::iter(ids.clone()));
             let stream = crate::sync::mutation::set_flags(
                 primary,
-                Arc::new(HashMap::from([("shared".to_string(), shared)])),
+                Arc::new(HashMap::from([("shared".into(), shared)])),
                 // A batch bound of one forces the per-owner flush path
                 // rather than a single end-of-input drain.
                 super::capabilities::CoreLimits {
@@ -2473,7 +2476,7 @@ mod tests {
         let targets = Box::pin(futures::stream::iter([foreign_id.clone()]));
         let mut stream = crate::sync::mutation::set_flags(
             primary,
-            Arc::new(HashMap::from([("shared".to_string(), shared)])),
+            Arc::new(HashMap::from([("shared".into(), shared)])),
             super::capabilities::CoreLimits {
                 max_objects_in_get: 1,
                 max_objects_in_set: 1,
@@ -2608,7 +2611,7 @@ mod tests {
 
         let mut stream = crate::sync::mutation::move_to(
             primary,
-            Arc::new(HashMap::from([("shared".to_string(), shared)])),
+            Arc::new(HashMap::from([("shared".into(), shared)])),
             super::capabilities::CoreLimits {
                 max_objects_in_get: 1,
                 max_objects_in_set: 1,
@@ -2692,7 +2695,7 @@ mod tests {
 
         let mut stream = crate::sync::mutation::move_to(
             primary,
-            Arc::new(HashMap::from([("shared".to_string(), shared)])),
+            Arc::new(HashMap::from([("shared".into(), shared)])),
             super::capabilities::CoreLimits {
                 max_objects_in_get: 1,
                 max_objects_in_set: 1,
@@ -2786,7 +2789,7 @@ mod tests {
 
         let mut stream = crate::sync::mutation::set_flags(
             primary,
-            Arc::new(HashMap::from([("shared".to_string(), shared)])),
+            Arc::new(HashMap::from([("shared".into(), shared)])),
             super::capabilities::CoreLimits {
                 max_objects_in_get: 1,
                 max_objects_in_set: 2,
@@ -3293,8 +3296,8 @@ mod tests {
     fn foreign_map(
         account_id: &str,
         account: JmapMailAccount<ScriptedTransport>,
-    ) -> Arc<HashMap<String, JmapMailAccount<ScriptedTransport>>> {
-        Arc::new(HashMap::from([(account_id.to_string(), account)]))
+    ) -> Arc<HashMap<crate::core::id::AccountId, JmapMailAccount<ScriptedTransport>>> {
+        Arc::new(HashMap::from([(account_id.into(), account)]))
     }
 
     /// A stale (v1) cursor must be refused at the `changes_stream` DOOR,

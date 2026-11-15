@@ -130,6 +130,10 @@ impl SyncControl {
         )
     }
 
+    pub(crate) fn publication_ledger(&self) -> Arc<crate::cursor::PendingCoverage> {
+        Arc::clone(&self.inner.publications)
+    }
+
     pub(crate) fn new_with_publications(
         account: AccountId,
         boundary: Boundary,
@@ -351,15 +355,16 @@ impl SyncControl {
     }
 
     /// Test shorthand for a boundary registration with no coverage
-    /// claim. Production paths use `publish_checkpoint`, so a
+    /// claim. Production paths use `publish_checkpoint_if_fence`, so a
     /// publication cannot exist with only one of its halves.
     #[cfg(test)]
     pub(crate) fn expect_checkpoint(&self, checkpoint: Checkpoint) -> crate::cursor::PublicationId {
         self.publish_checkpoint_without_report(checkpoint)
     }
 
-    /// Atomically create both halves of a checkpoint publication:
-    /// the coverage claim and the boundary registration.
+    /// Atomically create both halves of a checkpoint publication (the coverage
+    /// claim and the boundary registration), only if the scope's fence still
+    /// equals `expected_fence`, compared atomically with the mint.
     ///
     /// Called BEFORE broadcasting the batch. Quiescence cannot satisfy
     /// a boundary waiter until a matching consumer ack reaches
@@ -369,18 +374,10 @@ impl SyncControl {
     /// and partition count rather than by how many batches a consumer
     /// left unacked: a consumer that persists several batches and acks
     /// only the last checkpoint still reaches a safe boundary.
-    pub(crate) fn publish_checkpoint(
-        &self,
-        checkpoint: Checkpoint,
-        claim: crate::cursor::CoverageClaim,
-    ) -> crate::cursor::PublicationId {
-        self.inner.publications.register(checkpoint, claim)
-    }
-
-    /// Register a checkpoint publication only if its scope's fence still equals
-    /// `expected_fence`, compared atomically with the mint. A refusal mints
-    /// nothing and hands the claim back; the producer must not broadcast, and
-    /// owes the writer the claim's debt (`inventory_walk::record_refused_debt`).
+    ///
+    /// A refusal mints nothing and hands the claim back; the producer must not
+    /// broadcast, and owes the writer the claim's debt
+    /// (`inventory_walk::record_refused_debt`).
     pub(crate) fn publish_checkpoint_if_fence(
         &self,
         checkpoint: Checkpoint,

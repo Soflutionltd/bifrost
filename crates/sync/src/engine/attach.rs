@@ -126,7 +126,7 @@ impl SyncEngine {
         // is what makes "can any live receiver still reach this page" an exact
         // question rather than an approximate one. See
         // `multiplexer::ChangeDelivery`.
-        let delivery = Arc::new(crate::multiplexer::ChangeDelivery::new(changes_tx.clone()));
+        let delivery = Arc::new(crate::multiplexer::ChangeDelivery::new(changes_tx));
 
         // Per-account control broadcast. The engine publishes
         // `AccountControl::Pause(reason)` on this channel when it
@@ -512,7 +512,6 @@ impl SyncEngine {
             factory: Arc::clone(&factory),
             current: Arc::clone(&current),
             cursors: Arc::clone(&cursors),
-            changes_tx: changes_tx.clone(),
             account_id: account_id.clone(),
             control: control.clone(),
             account_control_tx: account_control_tx.clone(),
@@ -547,7 +546,6 @@ impl SyncEngine {
                 .iter()
                 .map(|inventory| inventory.scope().clone())
                 .collect(),
-            changes_tx: Some(changes_tx.clone()),
         };
         let backfill_ctx = ctx.clone();
         spawn(
@@ -735,7 +733,6 @@ impl SyncEngine {
 
         let multiplexer = MultiplexerHandle {
             cancel: multiplexer_cancel,
-            changes_tx: changes_tx.clone(),
         };
         let slot = Arc::new(AccountSlot {
             deferred_schema_reset: Arc::clone(&ctx.deferred_schema_reset),
@@ -1071,26 +1068,18 @@ pub(super) async fn run_deferred_inventory_establishment(
                 expected_fence: inventory.fence,
                 account_id: account_id.clone(),
                 cursors: Arc::clone(&cursors),
-                control: Some(control.clone()),
-                coverage: Some(Arc::clone(&coverage)),
-                writer_tx: Some(writer_tx.clone()),
+                publisher: crate::multiplexer::PagePublisher::new(
+                    Arc::clone(&ctx.delivery),
+                    control.clone(),
+                    writer_tx.clone(),
+                    shutdown.clone(),
+                ),
                 generation: coverage.next_generation(),
-                shutdown: Some(shutdown.clone()),
             };
             let result = match &inventory.kind {
-                DeferredKind::Start(_) => {
-                    fusion
-                        .run_with_broadcast(acc, scope.clone(), Some(Arc::clone(&ctx.delivery)))
-                        .await
-                }
+                DeferredKind::Start(_) => fusion.run_with_broadcast(acc, scope.clone()).await,
                 DeferredKind::Resume(cursor) => {
-                    fusion
-                        .run_resume_with_broadcast(
-                            acc,
-                            cursor.clone(),
-                            Some(Arc::clone(&ctx.delivery)),
-                        )
-                        .await
+                    fusion.run_resume_with_broadcast(acc, cursor.clone()).await
                 }
             };
             drop(admission);

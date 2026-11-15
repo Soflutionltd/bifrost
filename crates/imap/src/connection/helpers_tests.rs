@@ -190,14 +190,14 @@ fn has_quota_resource_matches_case_insensitively() {
 #[test]
 fn search_return_save_detected_on_both_forms() {
     let cmd = Command::SearchReturn {
-        criteria: "ALL".to_owned(),
-        return_opts: vec![" save ".to_owned()],
+        criteria: "ALL".to_owned().into(),
+        return_opts: vec![" save ".into()],
     };
     assert!(ImapConnection::search_return_requests_save(&cmd));
 
     let uid_cmd = Command::UidSearchReturn {
-        criteria: "ALL".to_owned(),
-        return_opts: vec!["MIN".to_owned(), "SAVE".to_owned()],
+        criteria: "ALL".to_owned().into(),
+        return_opts: vec!["MIN".into(), "SAVE".into()],
     };
     assert!(ImapConnection::search_return_requests_save(&uid_cmd));
 }
@@ -205,8 +205,8 @@ fn search_return_save_detected_on_both_forms() {
 #[test]
 fn search_return_save_absent_and_on_other_commands() {
     let cmd = Command::SearchReturn {
-        criteria: "ALL".to_owned(),
-        return_opts: vec!["COUNT".to_owned()],
+        criteria: "ALL".to_owned().into(),
+        return_opts: vec!["COUNT".into()],
     };
     assert!(!ImapConnection::search_return_requests_save(&cmd));
     assert!(!ImapConnection::search_return_requests_save(&Command::Noop));

@@ -2106,7 +2106,7 @@ fn imap_flag_for_keyword(keyword: &str) -> Flag {
 
 #[derive(Debug)]
 struct SearchPlan {
-    criteria: String,
+    criteria: SearchCriteria,
     folder: Option<MailboxName>,
 }
 
@@ -2114,7 +2114,7 @@ fn search_plan(request: &SearchRequest, op: AccountOperation) -> Result<SearchPl
     let mut plan = match &request.filter {
         Some(filter) => criteria_from_filter(filter, op)?,
         None => CriteriaPart {
-            criteria: "ALL".to_owned(),
+            criteria: SearchCriteria::new().all(),
             folder: None,
         },
     };
@@ -2125,14 +2125,15 @@ fn search_plan(request: &SearchRequest, op: AccountOperation) -> Result<SearchPl
     {
         validate_provider_query(raw, op)?;
         if plan.criteria == "ALL" {
-            plan.criteria = raw.trim().to_owned();
+            plan.criteria = SearchCriteria::raw(raw.trim().to_owned(), Vec::new());
         } else {
-            plan.criteria.push(' ');
-            plan.criteria.push_str(raw.trim());
+            plan.criteria = plan
+                .criteria
+                .and(SearchCriteria::raw(raw.trim().to_owned(), Vec::new()));
         }
     }
     if plan.criteria.trim().is_empty() {
-        plan.criteria = "ALL".to_owned();
+        plan.criteria = SearchCriteria::new().all();
     }
     Ok(SearchPlan {
         criteria: plan.criteria,
@@ -2206,7 +2207,7 @@ fn validate_provider_query(raw: &str, op: AccountOperation) -> Result<(), Accoun
 
 #[derive(Debug)]
 struct CriteriaPart {
-    criteria: String,
+    criteria: SearchCriteria,
     folder: Option<MailboxName>,
 }
 
@@ -2229,7 +2230,7 @@ fn criteria_from_filter(
             leaf(SearchCriteria::new().body(value), op)
         }
         SearchFilter::In(container) => Ok(CriteriaPart {
-            criteria: "ALL".to_owned(),
+            criteria: SearchCriteria::new().all(),
             folder: Some(folder_from_container(container, op)?),
         }),
         SearchFilter::Labeled(LabelId(label)) => leaf(SearchCriteria::new().keyword(label), op),
@@ -2246,7 +2247,7 @@ fn criteria_from_filter(
                     .map_err(|e| pim_malformed(op, e.to_string()))?;
             }
             Ok(CriteriaPart {
-                criteria: empty_to_all(criteria.as_str()),
+                criteria: empty_to_all(criteria),
                 folder: None,
             })
         }
@@ -2255,7 +2256,7 @@ fn criteria_from_filter(
         SearchFilter::Not(filter) => {
             let inner = criteria_from_filter(filter, op)?;
             Ok(CriteriaPart {
-                criteria: format!("NOT ({})", inner.criteria),
+                criteria: SearchCriteria::new().not(&SearchCriteria::new().group(inner.criteria)),
                 folder: inner.folder,
             })
         }
@@ -2269,7 +2270,7 @@ fn leaf(
 ) -> Result<CriteriaPart, AccountError> {
     let criteria = result.map_err(|e| pim_malformed(op, e.to_string()))?;
     Ok(CriteriaPart {
-        criteria: empty_to_all(criteria.as_str()),
+        criteria: empty_to_all(criteria),
         folder: None,
     })
 }
@@ -2289,9 +2290,11 @@ fn combine_and(
     }
     Ok(CriteriaPart {
         criteria: if criteria.is_empty() {
-            "ALL".to_owned()
+            SearchCriteria::new().all()
         } else {
-            criteria.join(" ")
+            criteria
+                .into_iter()
+                .fold(SearchCriteria::new(), SearchCriteria::and)
         },
         folder,
     })
@@ -2303,7 +2306,7 @@ fn combine_or(
 ) -> Result<CriteriaPart, AccountError> {
     if filters.is_empty() {
         return Ok(CriteriaPart {
-            criteria: "ALL".to_owned(),
+            criteria: SearchCriteria::new().all(),
             folder: None,
         });
     }
@@ -2325,9 +2328,12 @@ fn combine_or(
     }
     let folder = None;
     let mut iter = parts.into_iter();
-    let mut criteria = iter.next().unwrap_or_else(|| "ALL".to_owned());
+    let mut criteria = iter.next().unwrap_or_else(|| SearchCriteria::new().all());
     for next in iter {
-        criteria = format!("OR ({criteria}) ({next})");
+        criteria = SearchCriteria::new().or(
+            &SearchCriteria::new().group(criteria),
+            &SearchCriteria::new().group(next),
+        );
     }
     Ok(CriteriaPart { criteria, folder })
 }
@@ -2387,12 +2393,11 @@ fn or_folder_restriction_error(op: AccountOperation) -> AccountError {
     .expect("valid account error classification")
 }
 
-fn empty_to_all(criteria: &str) -> String {
-    let trimmed = criteria.trim();
-    if trimmed.is_empty() {
-        "ALL".to_owned()
+fn empty_to_all(criteria: SearchCriteria) -> SearchCriteria {
+    if criteria.trim().is_empty() {
+        SearchCriteria::new().all()
     } else {
-        trimmed.to_owned()
+        criteria
     }
 }
 

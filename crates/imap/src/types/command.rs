@@ -19,7 +19,7 @@ pub(crate) enum Command {
     Login { user: String, pass: SecretString },
     /// AUTHENTICATE command (RFC 3501 Section 6.2.2, RFC 4959 for SASL-IR).
     Authenticate {
-        mechanism: String,
+        mechanism: bifrost_sasl::MechanismName,
         initial_response: Option<SecretString>,
     },
     /// STARTTLS command (RFC 3501 Section 6.2.1).
@@ -50,14 +50,14 @@ pub(crate) enum Command {
     /// mailbox patterns are wrapped in `(<pattern1> <pattern2> ...)`, and
     /// return options are encoded as `RETURN (<opt1> <opt2> ...)`.
     ///
-    /// `selection_options` and `return_options` are raw option tokens or
+    /// `selection_options` and `return_options` retain known options or raw
     /// option phrases (for example `STATUS (MESSAGES UNSEEN)`), already
     /// validated by the connection layer.
     ListExtended {
-        selection_options: Vec<String>,
+        selection_options: Vec<super::command_options::ListSelect>,
         reference: super::MailboxArgument,
         patterns: Vec<super::MailboxArgument>,
-        return_options: Vec<String>,
+        return_options: Vec<super::command_options::ListReturn>,
     },
     /// LIST with STATUS return option (RFC 5819 Section 2).
     ///
@@ -66,7 +66,7 @@ pub(crate) enum Command {
     ListStatus {
         reference: super::MailboxArgument,
         pattern: super::MailboxArgument,
-        status_items: String,
+        status_items: super::command_options::StatusItems,
     },
     /// SELECT command (RFC 3501 Section 6.3.1, RFC 7162 Section 3.1.1/3.2.5.2).
     Select {
@@ -140,7 +140,10 @@ pub(crate) enum Command {
     /// messages  -  unlike CLOSE which implicitly expunges.
     Unselect,
     /// STATUS command (RFC 3501 Section 6.3.10).
-    Status { mailbox: MailboxName, items: String },
+    Status {
+        mailbox: MailboxName,
+        items: super::command_options::StatusItems,
+    },
     /// NAMESPACE command (RFC 2342).
     Namespace,
     /// CHECK command (RFC 3501 Section 6.4.1).
@@ -148,7 +151,7 @@ pub(crate) enum Command {
 
     // --- Message operations  -  UID variants (RFC 3501 Section 6.4) ---
     /// SEARCH command (RFC 3501 Section 6.4.4).
-    Search { criteria: String },
+    Search { criteria: super::SearchCriteria },
     /// SEARCH RETURN (opts) command (RFC 4731 Section 3.2).
     ///
     /// RFC 4731 Section 3.2 / Section 4 ABNF:
@@ -156,17 +159,17 @@ pub(crate) enum Command {
     /// `"SEARCH" [SP "RETURN" SP "(" [search-return-opt *(SP search-return-opt)] ")"]
     ///  SP search-criteria`
     SearchReturn {
-        criteria: String,
-        return_opts: Vec<String>,
+        criteria: super::SearchCriteria,
+        return_opts: Vec<super::command_options::SearchReturn>,
     },
     /// SEARCH RETURN (SAVE) command (RFC 5182 Section 2).
     ///
     /// Saves the search results server-side as `$` for use in subsequent commands.
-    SearchSave { criteria: String },
+    SearchSave { criteria: super::SearchCriteria },
     /// FETCH command (RFC 3501 Section 6.4.5, RFC 7162 Section 3.1.4.1 for CHANGEDSINCE).
     Fetch {
         sequence_set: SequenceSet,
-        items: String,
+        items: super::fetch::FetchItems,
         /// Optional CHANGEDSINCE modifier (RFC 7162 Section 3.1.4.1).
         changed_since: Option<u64>,
     },
@@ -188,7 +191,7 @@ pub(crate) enum Command {
         mailbox: MailboxName,
     },
     /// UID SEARCH command (RFC 3501 Section 6.4.4).
-    UidSearch { criteria: String },
+    UidSearch { criteria: super::SearchCriteria },
     /// UID SEARCH RETURN (opts) command (RFC 4731 Section 3.2).
     ///
     /// RFC 4731 Section 3.2 / Section 4 ABNF:
@@ -196,18 +199,18 @@ pub(crate) enum Command {
     /// `"UID" SP "SEARCH" [SP "RETURN" SP "(" [search-return-opt *(SP search-return-opt)] ")"]
     ///  SP search-criteria`
     UidSearchReturn {
-        criteria: String,
-        return_opts: Vec<String>,
+        criteria: super::SearchCriteria,
+        return_opts: Vec<super::command_options::SearchReturn>,
     },
     /// UID SEARCH RETURN (SAVE) command (RFC 5182 Section 2).
     ///
     /// Saves the search results server-side as `$` for use in subsequent commands.
-    UidSearchSave { criteria: String },
+    UidSearchSave { criteria: super::SearchCriteria },
     /// UID FETCH command (RFC 3501 Section 6.4.5, RFC 7162 Section 3.1.4.1 for CHANGEDSINCE,
     /// RFC 7162 Section 3.2.6 for VANISHED).
     UidFetch {
         sequence_set: SequenceSet,
-        items: String,
+        items: super::fetch::FetchItems,
         /// Optional CHANGEDSINCE modifier (RFC 7162 Section 3.1.4.1).
         changed_since: Option<u64>,
         /// VANISHED modifier for QRESYNC (RFC 7162 Section 3.2.6).
@@ -279,13 +282,13 @@ pub(crate) enum Command {
     Thread {
         algorithm: String,
         charset: String,
-        criteria: String,
+        criteria: super::SearchCriteria,
     },
     /// UID THREAD command (RFC 5256 Section 3).
     UidThread {
         algorithm: String,
         charset: String,
-        criteria: String,
+        criteria: super::SearchCriteria,
     },
 
     // --- SORT (RFC 5256) ---
@@ -295,7 +298,7 @@ pub(crate) enum Command {
         /// `sort-criteria = "(" sort-key *(SP sort-key) ")"`.
         sort_criteria: String,
         charset: String,
-        criteria: String,
+        criteria: super::SearchCriteria,
     },
     /// UID SORT command (RFC 5256 Section 2).
     UidSort {
@@ -303,7 +306,7 @@ pub(crate) enum Command {
         /// `sort-criteria = "(" sort-key *(SP sort-key) ")"`.
         sort_criteria: String,
         charset: String,
-        criteria: String,
+        criteria: super::SearchCriteria,
     },
 
     // --- NOTIFY (RFC 5465) ---

@@ -297,13 +297,13 @@ fn scram_plus_does_not_satisfy_non_plus_scram() {
 #[test]
 fn login_command_is_not_sasl_auth_login() {
     let profile = ServerProfile::new(vec![], vec![]);
-    assert!(profile.supports_auth(AuthMechanism::Login));
+    assert!(profile.supports_auth(AuthMechanism::ImapLogin));
     assert!(profile.supports_login_command());
-    assert!(!profile.supports_sasl_auth(AuthMechanism::Login));
+    assert!(!profile.supports_sasl_auth(AuthMechanism::ImapLogin));
 
     let profile = ServerProfile::new(vec![Capability::LoginDisabled], vec![]);
     assert!(!profile.supports_login_command());
-    assert!(!profile.supports_auth(AuthMechanism::Login));
+    assert!(!profile.supports_auth(AuthMechanism::ImapLogin));
 }
 
 #[test]

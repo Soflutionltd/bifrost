@@ -96,7 +96,7 @@ impl GraphErrorContext {
     ///
     /// Valid only where every request classified under this context is
     /// declared `ReplayPolicy::Idempotent`. Such a request never carries net's
-    /// `may_have_committed`, so the widening can never undo a net narrowing.
+    /// the possible-commit ledger verdict, so the widening can never undo a net narrowing.
     /// The coupling is real: the override survives `into_builder`, and
     /// `apply_idempotency_override` re-applies this `true` after net
     /// translates, so on a request net narrowed it WOULD overwrite net's
@@ -2297,6 +2297,7 @@ mod tests {
                     body: body(r#"{"error":{"code":"AdminConsentRequired"}}"#),
                 }),
                 retry_after_history: Vec::new(),
+                stop_reason: bifrost_net::RetryStopReason::AttemptBudget,
             }),
             graph_ctx(AccountOperation::SyncInventory),
         );

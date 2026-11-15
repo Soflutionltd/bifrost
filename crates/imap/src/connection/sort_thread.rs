@@ -20,16 +20,16 @@ impl ImapConnection {
         &self,
         sort_criteria: &str,
         charset: &str,
-        criteria: impl AsRef<str>,
+        criteria: impl Into<crate::types::SearchCriteria>,
         timeout: Duration,
     ) -> Result<SearchResult, Error> {
-        let criteria = criteria.as_ref();
+        let criteria = criteria.into();
         self.check_utf8_only_enforced()?;
 
         let cmd = Command::Sort {
             sort_criteria: sort_criteria.to_owned(),
             charset: charset.to_owned(),
-            criteria: criteria.to_owned(),
+            criteria,
         };
         self.submit_regular(
             cmd,
@@ -49,16 +49,16 @@ impl ImapConnection {
         &self,
         sort_criteria: &str,
         charset: &str,
-        criteria: impl AsRef<str>,
+        criteria: impl Into<crate::types::SearchCriteria>,
         timeout: Duration,
     ) -> Result<SearchResult, Error> {
-        let criteria = criteria.as_ref();
+        let criteria = criteria.into();
         self.check_utf8_only_enforced()?;
 
         let cmd = Command::UidSort {
             sort_criteria: sort_criteria.to_owned(),
             charset: charset.to_owned(),
-            criteria: criteria.to_owned(),
+            criteria,
         };
         self.submit_regular(
             cmd,
@@ -85,16 +85,16 @@ impl ImapConnection {
         &self,
         algorithm: &str,
         charset: &str,
-        criteria: impl AsRef<str>,
+        criteria: impl Into<crate::types::SearchCriteria>,
         timeout: Duration,
     ) -> Result<Vec<ThreadNode>, Error> {
-        let criteria = criteria.as_ref();
+        let criteria = criteria.into();
         self.check_utf8_only_enforced()?;
 
         let cmd = Command::Thread {
             algorithm: algorithm.to_owned(),
             charset: charset.to_owned(),
-            criteria: criteria.to_owned(),
+            criteria,
         };
         self.submit_regular(
             cmd,
@@ -116,16 +116,16 @@ impl ImapConnection {
         &self,
         algorithm: &str,
         charset: &str,
-        criteria: impl AsRef<str>,
+        criteria: impl Into<crate::types::SearchCriteria>,
         timeout: Duration,
     ) -> Result<Vec<ThreadNode>, Error> {
-        let criteria = criteria.as_ref();
+        let criteria = criteria.into();
         self.check_utf8_only_enforced()?;
 
         let cmd = Command::UidThread {
             algorithm: algorithm.to_owned(),
             charset: charset.to_owned(),
-            criteria: criteria.to_owned(),
+            criteria,
         };
         self.submit_regular(
             cmd,

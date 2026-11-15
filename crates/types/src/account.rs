@@ -28,7 +28,9 @@ use crate::calendar::{
     Calendar, CalendarEvent, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
     RsvpStatus,
 };
-use crate::capabilities::{AccountCapabilities, StarredFlagShape};
+use crate::capabilities::{
+    AccountCapabilities, ForwardedFlagShape, RepliedFlagShape, StarredFlagShape,
+};
 use crate::cloud::{CloudUploadMeta, HostedAttachment};
 use crate::compose::{
     AttachmentHandle, DraftHandle, DraftPatch, IdentityId, SendReceipt, SendRequest,
@@ -1458,53 +1460,41 @@ pub trait Account: Send + Sync {
         }
     }
 
-    /// Mark a message as replied. Default impl dispatches based on
-    /// `capabilities().conveniences.replied_via_keyword` /
-    /// `replied_via_extended_property`; if neither flag is set,
-    /// returns `Err(Unsupported)` (Gmail's case: replied state is
-    /// derived on sync, not a writeable flag).
+    /// Mark a message as replied using the advertised primitive. Gmail derives
+    /// replied state during sync and advertises no writable shape.
     fn mark_replied(&self, message: ObjectId) -> AccountFuture<Result<(), AccountError>> {
-        const ANSWERED_KEYWORD: &str = "$answered";
-        const PR_LAST_VERB_EXECUTED: &str = "PR_LAST_VERB_EXECUTED";
-        const PR_LAST_VERB_REPLIED: &str = "102";
         let target = MutationTarget::Message(message);
-        let conv = self.capabilities().conveniences;
-        if conv.replied_via_keyword {
-            return self.set_keyword(target, ANSWERED_KEYWORD.to_string(), true);
-        }
-        if conv.replied_via_extended_property {
-            return self.set_extended_property(
+        match self.capabilities().conveniences.replied {
+            RepliedFlagShape::Keyword => self.set_keyword(target, "$answered".to_string(), true),
+            RepliedFlagShape::ExtendedProperty => self.set_extended_property(
                 target,
-                PR_LAST_VERB_EXECUTED.to_string(),
-                Some(PR_LAST_VERB_REPLIED.to_string()),
-            );
+                "PR_LAST_VERB_EXECUTED".to_string(),
+                Some("102".to_string()),
+            ),
+            RepliedFlagShape::None => {
+                let error =
+                    AccountError::unsupported(AccountOperation::MarkReplied, self.protocol());
+                Box::pin(async move { Err(error) })
+            }
         }
-
-        let error = AccountError::unsupported(AccountOperation::MarkReplied, self.protocol());
-        Box::pin(async move { Err(error) })
     }
 
-    /// Mark a message as forwarded. Same dispatch shape as
-    /// `mark_replied`.
+    /// Mark a message as forwarded using the advertised primitive.
     fn mark_forwarded(&self, message: ObjectId) -> AccountFuture<Result<(), AccountError>> {
-        const FORWARDED_KEYWORD: &str = "$forwarded";
-        const PR_LAST_VERB_EXECUTED: &str = "PR_LAST_VERB_EXECUTED";
-        const PR_LAST_VERB_FORWARDED: &str = "104";
         let target = MutationTarget::Message(message);
-        let conv = self.capabilities().conveniences;
-        if conv.forwarded_via_keyword {
-            return self.set_keyword(target, FORWARDED_KEYWORD.to_string(), true);
-        }
-        if conv.forwarded_via_extended_property {
-            return self.set_extended_property(
+        match self.capabilities().conveniences.forwarded {
+            ForwardedFlagShape::Keyword => self.set_keyword(target, "$forwarded".to_string(), true),
+            ForwardedFlagShape::ExtendedProperty => self.set_extended_property(
                 target,
-                PR_LAST_VERB_EXECUTED.to_string(),
-                Some(PR_LAST_VERB_FORWARDED.to_string()),
-            );
+                "PR_LAST_VERB_EXECUTED".to_string(),
+                Some("104".to_string()),
+            ),
+            ForwardedFlagShape::None => {
+                let error =
+                    AccountError::unsupported(AccountOperation::MarkForwarded, self.protocol());
+                Box::pin(async move { Err(error) })
+            }
         }
-
-        let error = AccountError::unsupported(AccountOperation::MarkForwarded, self.protocol());
-        Box::pin(async move { Err(error) })
     }
 
     /// Persist that an MDN (read receipt) was dispatched for `message`, by

@@ -67,7 +67,12 @@ pub enum CursorScope {
     Type(ObjectType),
     Query(QueryId),
     Folder(FolderId),
-    FolderType { folder: FolderId, ty: ObjectType },
+    /// A collection qualified by object type. DAV uses Contact and CalendarEvent
+    /// so a collection URL cannot claim an IMAP mailbox or the other dialect.
+    FolderType {
+        folder: FolderId,
+        ty: ObjectType,
+    },
 }
 
 /// Container an object lives in.
@@ -313,6 +318,38 @@ pub enum SyncStrategy {
     ServerCursor,
     Poll,
     None,
+}
+
+impl ObjectType {
+    /// Stable tag in the sync cursor envelope. Append new tags; never renumber.
+    #[must_use]
+    pub const fn cursor_tag(self) -> u8 {
+        match self {
+            Self::Email => 0,
+            Self::Mailbox => 1,
+            Self::Thread => 2,
+            Self::Event => 3,
+            Self::Contact => 4,
+            Self::EmailSubmission => 5,
+            Self::CalendarEvent => 6,
+            Self::ContactGroup => 7,
+        }
+    }
+}
+
+impl ProtocolKind {
+    /// Stable tag in the sync cursor envelope. Append new tags; never renumber.
+    #[must_use]
+    pub const fn cursor_tag(self) -> u8 {
+        match self {
+            Self::Jmap => 0,
+            Self::Imap => 1,
+            Self::Gmail => 2,
+            Self::CardDav => 4,
+            Self::CalDav => 5,
+            Self::Graph => 3,
+        }
+    }
 }
 
 #[cfg(test)]

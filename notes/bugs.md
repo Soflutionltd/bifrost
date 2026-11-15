@@ -103,6 +103,11 @@ count.
 
 **Reported by:** sync-lanes (latent).
 
+Partly fixed in wave 14: the operation, object-type and protocol tag encoders
+moved into bifrost-types as exhaustive matches. Residue: the other
+non-exhaustive ledger vocabulary encoders in `cursor/ledger_envelope.rs` still
+fall back to a panic on an unknown variant. The original account:
+
 `cursor/ledger_envelope.rs::encode_operation` looks the operation up in the
 positional table `OPERATIONS` and panics if it is missing. The table matches
 `bifrost-types` today, but `AccountOperation` is `#[non_exhaustive]` in another
@@ -111,47 +116,6 @@ persisted `last_error` or barrier `evidence` panics the account writer.
 `cursor/envelope.rs` has the same shape for `ObjectType` and `ProtocolKind`
 ("encoding a variant the codec does not know panics"), and that codec runs
 inside consumer stores. The structural cause is STR-045.
-
-## BUG-030 - SASL vocabulary, ladders and policy are split across IMAP, ManageSieve and SMTP
-
-**Reported by:** imap-protocol, imap-connection, imap-account, smtp-sasl.
-
-The payload defects are fixed: bifrost-sasl `plain_payload` (NUL-refusing,
-`Secret`) now serves IMAP and ManageSieve PLAIN, and ManageSieve XOAUTH2 goes
-through `xoauth2_payload`. What remains is the consolidation:
-
-- SMTP still builds its own PLAIN payload in
-  `Mechanism::response_with_token_at_index` rather than `plain_payload`.
-- Mechanism vocabulary is three types: `bifrost-imap::AuthMechanism` (`Login`
-  meaning the IMAP LOGIN command, SCRAM names hard-coded), public
-  `bifrost-smtp::Mechanism` (`Login` meaning SASL LOGIN, no CRAM-MD5), and the
-  SCRAM token in bifrost-sasl. IMAP's edge is stringly (`Capability::Auth(String)`,
-  `Command::Authenticate { mechanism: String }`,
-  `ServerProfile::auth_mechanisms: Vec<String>`), and "is AUTH=X advertised" is
-  answered at several sites with different case rules.
-- Ladders: IMAP `password_mechanism_ladder` (fixed order with CRAM-MD5 and LOGIN,
-  `AuthPolicy`, downgrade skip, fall-through) vs SMTP `password_mechanism`
-  (caller allow-list, single choice); the SCRAM hash mapping is written inline
-  three times in IMAP. SMTP has `PASSWORD_MECHANISMS`, `MECHANISM_PREFERENCE`
-  and `DEFAULT_MECHANISMS`.
-- Cleartext gate has three answers: IMAP per mechanism (SCRAM allowed over
-  plaintext), SMTP refuses all AUTH unencrypted unless
-  `dangerous_allow_insecure_auth`, ManageSieve gates everything and
-  re-implements the `AuthPolicy` gate. ManageSieve supports only PLAIN and
-  XOAUTH2 (no SCRAM, no OAUTHBEARER).
-- Channel-binding resolution is two comment-held copies
-  (`imap::connection::auth::scram_binding_from_der`,
-  `smtp::authentication::resolve_scram_binding`).
-- `SaslError` mapping differs: IMAP maps an unknown variant to an auth failure,
-  SMTP to `invalid_input`.
-- `types/secret.rs::SecretString` is a near-copy of `bifrost_sasl::Secret` with a
-  hand-rolled constant-time `eq`; crate-private, so deletable without a ruling.
-
-Owner: bifrost-sasl gains the mechanism enum, the OAuth preference order, one
-`negotiate(advertised, policy, encrypted, binding)` ladder and one binding
-resolver; IMAP, Sieve and SMTP select from it (owner ruling on what SMTP's public
-`Mechanism` becomes). The SASL client layer this lives in is STR-135; where
-ManageSieve should live is STR-060.
 
 ## BUG-032 - IMAP FETCH merge collapses partial fetches of one section at different origins
 
@@ -398,8 +362,6 @@ SMTP. IMAP's `Error::OAuthToken` no longer carries the SASL mechanism name.
 - bifrost-net `AccountNet::session_request` returns a general
   `RequestBuilder`, which still lets a caller explicitly re-enable redirects;
   the session policy is only documented, not enforced.
-- Google raw and stored-draft sends still delegate recipient validation to
-  Gmail, unlike the shared check in `bifrost_types::compose`.
 - Closed-account guards are not universal across provider methods: the shared
   `AccountClosed` kind replaced existing refusals, but many methods have no
   lifecycle gate at all.
@@ -412,10 +374,6 @@ SMTP. IMAP's `Error::OAuthToken` no longer carries the SASL mechanism name.
   inside a store await could interrupt a multi-statement durable write
   (`reset_account_for_schema_recovery`, `persist_established`). Closing the
   channel and awaiting the writer may be the correct teardown.
-- Google `MutationProgress`: `terminal_outcomes` and `shutdown_outcomes` are
-  identical wrappers over `outcomes_before_stop`; shutdown stays correct only
-  because `shutdown_inflight_error` carries InFlight evidence, which no test
-  pins.
 - dav-core `etag.rs` keeps `normalize_http_etag` and `prepare_if_match`, which
   restate strong/weak classification beside `bifrost_types::EntityTag`.
 - `EntityTag::valid_http(false)` rejects a lowercase `w/` prefix while `parse`
@@ -446,8 +404,6 @@ SMTP. IMAP's `Error::OAuthToken` no longer carries the SASL mechanism name.
 - Sync `backfill/scope_walk.rs`: `ScopeWalkDriver::completed()` returns true
   before enumeration begins, so a caller can mistake eligibility for finished
   enumeration.
-- Graph `pim/messages.rs` `patch_messages` and `move_messages` can build a
-  `$batch` envelope with more than 20 legs, over Graph's per-request limit.
 - IMAP `codec/decode/envelope_fetch.rs::gmail_id` documents unsigned 64-bit
   ids but parses with `number64`, which rejects values above the signed
   63-bit ceiling.
@@ -482,14 +438,60 @@ SMTP. IMAP's `Error::OAuthToken` no longer carries the SASL mechanism name.
   (Acknowledged) on every decode failure at every operation, where only the
   Send boundary did before; this changes retry evidence for reads.
 
-## BUG-167 - IMAP discovery still advertises DAV scopes that were excluded, and namespace-prefix failures use account scope
+## BUG-174 - Small wave 14 lateral findings across sync, Graph, Google, JMAP, IMAP and SMTP
 
-**Reported by:** wave 9 fixer (imap-account, lateral).
+**Reported by:** wave 14 fixers (lateral).
 
-Scopes excluded by a DAV collision are now on the skip lane but are still
-advertised by discovery. Separately, a failed `LIST` under a namespace prefix
-is skipped with an account-level `ErrorScope`, because no scope variant names a
-namespace.
+- Sync `multiplexer/fusion.rs` can retire an undelivered change publication
+  and still install its terminal cursor in memory, a delivery-loss recovery
+  gap.
+- Sync `engine/attach.rs::scope_covers_membership` compares folder strings
+  without object type, so a type-qualified DAV `FolderType` scope can match a
+  same-string mail membership.
+- Graph EWS streaming frame accumulation (`ews/streaming.rs`) has no size cap.
+- Graph `merge_shared_mailboxes` documents exact-string deduplication but
+  compares case-insensitively.
+- Graph `pim/messages.rs::delete_extended_property` builds a `$batch`
+  envelope with no 20-leg bound.
+- Google single-label mutations accept an empty patch before validating the
+  target kind.
+- Google `account/calendar.rs::recurrence_lines` writes RRULE text without the
+  shared `bifrost_types` recurrence validation.
+- JMAP `sync/pim.rs` turns an unrepresentable scheduled-send timestamp into an
+  empty string; JMAP's event end calculation substitutes the start when date
+  addition overflows.
+- IMAP NOTIFY FETCH operands lack FETCH-equivalent capability admission, and
+  `SearchCriteria::mod_seq(u64)` accepts values above the protocol ceiling.
+- SMTP: in both drivers an OAuth mechanism incompatibility falls through to
+  password mechanism selection.
+- JMAP `sync/calendar_ops.rs::event_from_jmap` now fails on a malformed server
+  duration; if list and range reads propagate it, one bad event fails the whole
+  read instead of being skipped. An enterprise user expects the rest of the
+  calendar to show. Check the callers.
+- Sync `cursor/ledger.rs` `ErrorDigest` exposes the complete `DiagnosticInfo`,
+  support-only text included, as public fields reachable through
+  `SyncEngine::debt`; nothing enforces the consent tier before export.
+- IMAP `types/capability.rs` `Capability::Auth` now carries
+  `bifrost_sasl::MechanismName`, a type from the private sasl crate in a public
+  IMAP enum, not re-exported from bifrost-imap.
+- Google `error.rs` `RetryAfter { Delta, At }` is a private copy of
+  `bifrost_types::RetryHint`, converted right after parsing.
+- Sync `PagePublisher::publish_page`, `publish_marker`, `publish_unacked` and
+  the `Arc::ptr_eq` asserts in `BackfillRunner::run_partition` and
+  `emit_backfill_complete` guard wiring mistakes with `assert!`, `expect` and
+  `unreachable!` on production paths; any would take down a sync task, and the
+  lane-coverage identity they assume is not enforced by type.
+- Net `RequestEvidence::from_ledger` overwrites the ledger built from nested
+  histories with the caller's, so a nested MayHaveCommitted verdict missing
+  from the supplied ledger would weaken (latent). `Error::RateLimited` and
+  `RetryBudgetExhausted` take `retry_after_history.last()`, so a final 429
+  without `Retry-After` reports an earlier attempt's hint.
+- IMAP auth ladder rejection list names `LOGIN` twice (SASL LOGIN and the
+  LOGIN command).
+- Graph `calendar/recurrence.rs` keeps three weekday-name maps and
+  re-validates WKST the shared parser already checked;
+  `account/calendar_public.rs` hard-codes an unnamed `chunks(20)` for EWS SOAP
+  batches.
 
 ## BUG-048 - IMAP sync lanes cycle on a `UIDNOTSTICKY` folder
 

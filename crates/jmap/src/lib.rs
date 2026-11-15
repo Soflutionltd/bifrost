@@ -234,14 +234,14 @@ pub(crate) enum PushObject {
     StateChange {
         // Object states are heterogeneous here: DataType is their runtime
         // discriminator. They require explicit decoding before typed requests.
-        changed: HashMap<String, HashMap<DataType, String>>,
+        changed: HashMap<crate::core::id::AccountId, HashMap<DataType, String>>,
         #[serde(rename = "pushState", default)]
         push_state: Option<crate::core::id::PushState>,
     },
     #[cfg(feature = "mail")]
     EmailPush {
         #[serde(rename = "accountId")]
-        account_id: String,
+        account_id: crate::core::id::AccountId,
         email: serde_json::Value,
     },
     #[cfg(feature = "calendars")]
@@ -254,7 +254,7 @@ pub(crate) enum PushObject {
 /// The untagged state payload shared by WebSocket decoding and push blocks.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct PushStateChange {
-    pub(crate) changed: HashMap<String, HashMap<DataType, String>>,
+    pub(crate) changed: HashMap<crate::core::id::AccountId, HashMap<DataType, String>>,
     #[serde(rename = "pushState", default)]
     pub(crate) push_state: Option<crate::core::id::PushState>,
 }
@@ -310,7 +310,7 @@ impl PushObject {
 #[non_exhaustive]
 pub(crate) struct CalendarAlert {
     #[serde(rename = "accountId")]
-    pub(crate) account_id: String,
+    pub(crate) account_id: crate::core::id::AccountId,
     #[serde(rename = "calendarEventId")]
     pub(crate) calendar_event_id: String,
     pub(crate) uid: String,

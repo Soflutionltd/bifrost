@@ -151,3 +151,9 @@ impl<T: ?Sized> PartialEq<Id<T>> for str {
         self == other.as_str()
     }
 }
+
+impl<T: ?Sized> std::borrow::Borrow<str> for Id<T> {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}

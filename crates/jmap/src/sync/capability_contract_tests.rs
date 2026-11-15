@@ -137,16 +137,13 @@ fn account_with(submission_available: bool, foreign_submission_id: Option<&str>)
         )),
     );
 
-    let foreign_mail: HashMap<String, crate::account::Account<ReqwestTransport>> =
-        foreign_submission_id
-            .map(|id| {
-                (
-                    id.to_string(),
-                    crate::account::Account::new(client.clone(), id),
-                )
-            })
-            .into_iter()
-            .collect();
+    let foreign_mail: HashMap<
+        crate::core::id::AccountId,
+        crate::account::Account<ReqwestTransport>,
+    > = foreign_submission_id
+        .map(|id| (id.into(), crate::account::Account::new(client.clone(), id)))
+        .into_iter()
+        .collect();
     let foreign_submission: HashSet<String> = foreign_submission_id
         .map(ToString::to_string)
         .into_iter()

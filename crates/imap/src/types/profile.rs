@@ -35,7 +35,7 @@ pub struct ServerProfile {
     /// True when IMAP4rev2 behavior is active.
     pub imap4rev2: bool,
     /// AUTH mechanisms advertised by the server.
-    pub auth_mechanisms: Vec<String>,
+    pub auth_mechanisms: Vec<bifrost_sasl::MechanismName>,
     /// Server APPENDLIMIT policy advertised in CAPABILITY.
     pub append_limit: AppendLimitPolicy,
     /// Advertised THREAD algorithms.
@@ -50,7 +50,7 @@ impl ServerProfile {
         let auth_mechanisms = capabilities
             .iter()
             .filter_map(|cap| match cap {
-                Capability::Auth(mechanism) => Some(mechanism.to_string()),
+                Capability::Auth(mechanism) => Some(mechanism.clone()),
                 _ => None,
             })
             .collect();
@@ -102,13 +102,13 @@ impl ServerProfile {
 
     /// Return `true` if the server advertises the SASL mechanism.
     ///
-    /// [`AuthMechanism::Login`] represents the legacy IMAP LOGIN command in
+    /// [`AuthMechanism::ImapLogin`] represents the legacy IMAP LOGIN command in
     /// this crate, not the non-standard `AUTH=LOGIN` SASL mechanism. For
     /// clearer call sites, prefer [`supports_sasl_auth`](Self::supports_sasl_auth)
     /// for SASL and [`supports_login_command`](Self::supports_login_command)
     /// for the legacy command.
     pub fn supports_auth(&self, mechanism: AuthMechanism) -> bool {
-        if mechanism == AuthMechanism::Login {
+        if mechanism == AuthMechanism::ImapLogin {
             return self.supports_login_command();
         }
         self.supports_sasl_auth(mechanism)
@@ -116,12 +116,12 @@ impl ServerProfile {
 
     /// Return `true` if the server advertises a SASL AUTH mechanism.
     pub fn supports_sasl_auth(&self, mechanism: AuthMechanism) -> bool {
-        if mechanism == AuthMechanism::Login {
+        if mechanism == AuthMechanism::ImapLogin {
             return false;
         }
         self.auth_mechanisms
             .iter()
-            .any(|m| m.eq_ignore_ascii_case(mechanism.name()))
+            .any(|m| m.known() == Some(mechanism))
     }
 
     /// Return `true` if the legacy IMAP LOGIN command is available.

@@ -24,7 +24,7 @@ The literal marker parser (`connection/literals.rs`, `literal_marker_at`) is sha
 
 FETCH body and binary fields use `bytes::Bytes`. `WireReader` parses responses smaller than 4096 bytes with owned literals and advances a consumed-prefix offset, reusing its read allocation. It compacts the unread suffix in place only after the consumed prefix exceeds half the buffer capacity, so many co-read small responses do not move the suffix once per response. Larger responses transfer their backing to the parser, copying only when capacity exceeds twice the frame length. Co-read suffix bytes move to a separate read buffer with capacity at least 8 KiB. Literals smaller than 4096 bytes or smaller than one quarter of their frame are copied into independent storage; large proportionate literals retain slices without copying the payload. Standalone parser entry points that receive only `&[u8]` copy literal data because they have no owned backing allocation. The response still has to be fully framed and parsed before it is emitted, so this does not stream a literal incrementally. The literal ceiling still counts declarations before reading payload, and non-literal syntax and parser object overhead remain outside it.
 
-SEARCH-family extension criteria contribute requirements through the literal-aware grammar walk in `connection/admission.rs`; the handle checks its snapshot for an early refusal; the driver checks live state before sending, including every command in a pipeline. The walk skips quoted and literal operands, with literal counts parsed by the same marker parser used for framing and criteria validation.
+SEARCH-family commands retain `SearchCriteria` through handle submission, pipelines and encoding. Its `SearchKey` operands retain string values, Boolean groups and raw extension criteria. Typed operands contribute their capability requirements directly; only raw criteria use the literal-aware grammar walk in `codec/search.rs`. The handle checks its snapshot for an early refusal; the driver checks live state before sending, including every command in a pipeline. The raw walk skips quoted and literal operands, with literal counts parsed by the same marker parser used for framing and criteria validation.
 
 Mailbox decoding keeps a lenient display string and the original wire octets plus
 encoding mode in `MailboxName`. Typed mailbox command arguments replay those
@@ -100,7 +100,9 @@ Every IMAP command - APPEND and MULTIAPPEND included - is a `types::Command`, en
 
 `WireCommand` is a list of segments, each a list of `Bytes` chunks. A segment ends exactly on a synchronizing literal marker; the sender writes every chunk of a segment, flushes once, and waits for `+` before the next segment (RFC 3501 Section 4.3). The boundaries are STRUCTURAL: `CommandWriter` records each one as it emits the marker, so no code rescans encoded bytes to rediscover framing, and marker-shaped bytes inside a literal payload cannot be mistaken for a boundary because nothing looks. `CommandWriter` is the one place literal framing is decided: `string(data, utf8)` makes the quoted-versus-literal choice (NUL is rejected when the whole command is finished, so mailbox and metadata identities are never rewritten; printable ASCII is quoted, plus valid UTF-8 in UTF-8 mode, with control characters and DEL always a literal), and `literal` / `literal_bytes` choose the `+` modifier once, from the live `EncodeOptions` - LITERAL+ any size, LITERAL- and rev2 up to 4096 octets (RFC 7888 Sections 4-5, RFC 9051 Section 4.3) - with the literal8 form (`~{n}`) additionally needing an advertised BINARY on a non-rev2 connection (RFC 7888 Section 6, RFC 9051 Section 9). Admission establishes command capability prerequisites, including MULTIAPPEND and BINARY for NUL-bearing APPEND bodies outside the UTF8 wrapper; the encoder chooses body representation; the writer owns literal markers and segment boundaries. `literal_bytes` carries a payload by reference (a reference-count bump), which is how a message body reaches the socket uncopied. `WireCommand`'s `Debug` prints only its shape, and `AppendMessage`'s prints the body's length, so `?cmd` tracing cannot log a message or a credential literal.
 
-Caller-written literals in SEARCH-family criteria are the one place literal syntax enters from outside the encoder. `validate_search_criteria_crlf` judges the caller's ORIGINAL markers first (a `{n+}` the connection cannot take is `MissingCapability`, never silently rewritten); the walk (`write_criteria`) then copies every non-marker byte and every payload verbatim, skipping each payload by its declared length, and re-emits only the marker through the writer - a `~{n}` as literal8, so the literal8 rule applies. Two spellings can therefore differ from the caller's: a count with leading zeros is written canonically, and a `~{n+}` the connection may not send non-synchronizing loses its `+` and becomes a real segment boundary.
+Typed SEARCH string operands use `CommandWriter::string` with the live UTF-8 mode. CR and LF are retained as data and emitted in literals; NUL remains refused. The builder's explicit text view is for callers requesting raw syntax and diagnostics, and does not determine typed command framing. Account filter compilation preserves the operands and Boolean grouping through `SearchPlan`; provider queries enter as raw criteria. Raw criteria retain arbitrary extension grammar, caller-written literals and explicit additional capability requirements, so no existing search expression is removed. An enterprise user searching message text expects the same bytes to be searched regardless of connection encoding.
+
+Caller-written literals in raw SEARCH-family criteria are the one place literal syntax enters from outside the encoder. `validate_search_criteria_crlf` judges the caller's ORIGINAL markers first (a `{n+}` the connection cannot take is `MissingCapability`, never silently rewritten); the walk (`write_criteria`) then copies every non-marker byte and every payload verbatim, skipping each payload by its declared length, and re-emits only the marker through the writer - a `~{n}` as literal8, so the literal8 rule applies. Two spellings can therefore differ from the caller's: a count with leading zeros is written canonically, and a `~{n+}` the connection may not send non-synchronizing loses its `+` and becomes a real segment boundary.
 
 Command admission belongs to `connection/admission.rs`. The handle reports snapshot refusals before submission (`MissingCapability`, worded `<cmd> requires <cap>` for every capability gate; `InvalidState`; `InvalidInput`; ...). The driver reports changed session or capability prerequisites as `StateChangedBeforeSend`. QRESYNC parameters and VANISHED require confirmed `ENABLE QRESYNC`; advertised-but-disabled modes are sequencing errors (`InvalidState`), not unsupported operations. The encoder validates syntax and chooses wire representation without deciding command availability.
 
@@ -573,11 +575,16 @@ constructors. The OAuth variant holds an `Arc<dyn TokenSource>` (bifrost-net's
 trait), read via `current().await` at every connect/reconnect (in
 `authenticate_best` and the ManageSieve auth path), so a rotated token is
 presented fresh on reconnect. Password material stays in the internal
-`SecretString` wrapper (zeroizes + redacts under `Debug`). `Credentials` is
+`SecretString` alias of `bifrost_sasl::Secret` (zeroizes + redacts under `Debug`). `Credentials` is
 `Clone` only (no `PartialEq`/`Eq` - a live token source is not `Eq`), no
 `From<(String, String)>`.
 
-Internal `AuthMechanism`: PLAIN, LOGIN, XOAUTH2, OAUTHBEARER, CRAM-MD5, SCRAM-SHA-1, SCRAM-SHA-256, and the channel-bound SCRAM-SHA-1-PLUS / SCRAM-SHA-256-PLUS. Each variant's `name()` is the wire token; the PLUS variants match the `-PLUS` advertisement and the SASL crate (`ScramHash::mechanism_name`) is the single authority for the token emitted on the socket.
+Internal `AuthMechanism` aliases `bifrost_sasl::Mechanism`; the shared owner
+supplies wire names and SCRAM hash/binding projection. Its `ImapLogin` is the
+legacy command, distinct from SASL `Login`, which IMAP does not auto-select.
+AUTH capabilities, profile advertisements and AUTHENTICATE commands carry the
+shared open `MechanismName`, preserving unknown extensions while recognizing
+known names independently of ASCII case. The encoder validates atom syntax.
 
 The shared OAuth AUTHENTICATE consumer uses `bifrost_sasl::OAuthMechanism`
 to select its error-continuation acknowledgement after the initial payload:
@@ -602,11 +609,18 @@ continuation or a non-`NO` completion after cancellation is a protocol error.
 The driver records the acknowledged cancellation phase without losing the auth
 class, mechanism or response code, and account translation preserves it.
 
-`AuthPolicy` TLS-gates cleartext mechanisms by default: PLAIN/LOGIN refuse over plaintext unless `allow_cleartext_without_tls` is set. CRAM-MD5 is opt-in (`with_cram_md5`) AND TLS-gated (a MITM can pick the challenge and brute-force `HMAC-MD5(password, challenge)` offline). LOGIN-the-IMAP-command is opt-in (`with_login`).
+`AuthPolicy` TLS-gates every automatically selected mechanism, including SCRAM
+(which this crate used to allow over plaintext), unless
+`allow_cleartext_without_tls` is set. The gate is
+`bifrost_sasl::authentication_allowed`, documented in `reference/sasl.md`; per
+the repository owner's ruling, an enterprise client should not send
+credentials or a SCRAM exchange over an unencrypted channel by default, and
+SCRAM cannot protect the mail traffic that follows. CRAM-MD5 remains opt-in (`with_cram_md5`) and the legacy
+IMAP LOGIN command remains opt-in (`with_login`).
 
 `authenticate_best(credentials, policy)` intersects server-advertised, policy-allowed, and credentials-supported mechanisms, then runs the strongest. SASL-IR is used when advertised or implied by IMAP4rev2; malformed mechanism names are rejected before any wire write. `AuthOutcome` carries the selected mechanism.
 
-The password ladder is a pure helper `password_mechanism_ladder(profile, policy, is_encrypted)` returning `PasswordCandidate::{Attempt, Reject}` in the fixed order SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > CRAM-MD5 > LOGIN. RFC 5802 Section 6 downgrade protection: when the server advertises `SCRAM-SHA-N-PLUS`, the matching unbound `SCRAM-SHA-N` rung becomes `Reject(ChannelBindingUnavailable)` so a MITM cannot strip the binding. For a PLUS `Attempt`, `authenticate_best` resolves the `tls-server-end-point` binding once via `resolve_scram_binding(deadline)` (peer-cert DER + `bifrost_sasl::tls_server_end_point`), which delegates the policy to the pure `scram_binding_from_der(Option<&[u8]>)`. The DER lookup is a queued driver request, so it runs under the attempt's own deadline, the same one the AUTHENTICATE exchange then spends; expiry is `Timeout` / `Unsent`, never read as a missing certificate. Only the *absence* of a peer certificate (plaintext, dead driver, no DER from native-tls) is a `ChannelBindingUnavailable` rejection that lets the ladder continue. A certificate that is present but whose binding cannot be computed (EdDSA leaf, unsupported sig-alg, malformed DER) is a hard `Error::Protocol` that aborts the ladder. Likewise, a server rejection of an attempted mechanism is terminal; only `MissingCapability` from live capability skew falls through to a weaker rung, because retrying after an explicit rejection risks a downgrade and another credential attempt. SMTP's `resolve_scram_binding` applies the identical channel-binding rule; the two crates must not diverge here.
+The password ladder adapts SASL-owned `negotiate` through the pure helper `password_mechanism_ladder(profile, policy, is_encrypted)` returning `PasswordCandidate::{Attempt, Reject}` in the fixed order SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > CRAM-MD5 > LOGIN. RFC 5802 Section 6 downgrade protection: when the server advertises `SCRAM-SHA-N-PLUS`, the matching unbound `SCRAM-SHA-N` rung becomes `Reject(ChannelBindingUnavailable)` so a MITM cannot strip the binding. For a PLUS `Attempt`, `authenticate_best` resolves the `tls-server-end-point` binding once via `resolve_scram_binding(deadline)` (peer-cert DER + `bifrost_sasl::binding_from_peer_certificate`), which delegates through the error adapter `scram_binding_from_der(Option<&[u8]>)` to the shared certificate resolver. The DER lookup is a queued driver request, so it runs under the attempt's own deadline, the same one the AUTHENTICATE exchange then spends; expiry is `Timeout` / `Unsent`, never read as a missing certificate. Only the *absence* of a peer certificate (plaintext, dead driver, no DER from native-tls) is a `ChannelBindingUnavailable` rejection that lets the ladder continue. A certificate that is present but whose binding cannot be computed (EdDSA leaf, unsupported sig-alg, malformed DER) is a hard `Error::Protocol` that aborts the ladder. Likewise, a server rejection of an attempted mechanism is terminal; only `MissingCapability` from live capability skew falls through to a weaker rung, because retrying after an explicit rejection risks a downgrade and another credential attempt. SMTP uses that same shared resolver. The resolved opaque `ChannelBindingData` feeds `scram_rung`, which supplies the exchange's actual GS2 input without destructuring an assumed bound enum variant.
 
 ## Typed IDs and sets
 
@@ -844,7 +858,7 @@ Submodules:
 - `pool.rs` - per-folder data checkout under one physical session budget. Every session owns a permit from connector start through driver exit; parked members retain theirs. Checkouts adopt parked members (affinity first) or dial. Returned members go directly to the oldest waiter, parking only when nobody waits, so a re-checkout cannot barge. Fresh acquisition for push and replacement never adopts: it queues once on the session semaphore before retiring its own or a parked member (bounded LOGOUT, then terminate and join) to make room. Both queues are FIFO; a simultaneous member and permit grant keeps the member and releases the permit. The connector seam spawns as its final step, taking the lease handoff without an intervening await and returning immediately, so cancellation cannot leave an unregistered live driver. Every dial receives the account meter and bandwidth budget and is brought to the account's QRESYNC policy before handout; see "CONDSTORE / QRESYNC strategy". At the cap, discarded and non-reusable sessions can delay the next dial through the driver's bounded LOGOUT. Replacement on pre-UNSELECT servers can wait behind older acquisitions; it holds no session while waiting.
 - `folder_registry.rs` - mailbox map plus per-folder cursor and MODSEQ caches (`record_modseq`, `modseq`, `clear_modseqs`, `clear_modseq_ranges`), keyed by `(folder, uidvalidity, uid)`, storing LIST delimiter/attributes and the A5c `shared_owner` tag, clearing on UIDVALIDITY change, delete, or rename.
 - `envelope.rs` - `FolderCursor` (QResync/Condstore/Basic) plus `encode_cursor`/`decode_cursor` over `OpaqueChangeState`.
-- `capabilities.rs`, `inventory.rs`, `changes.rs`, `get.rs`, `blob.rs`, `mutate.rs`, `push.rs`, `close.rs`, `scopes.rs` - one file per `Account` method group. `mod.rs` holds `route_scope`/`ScopeHandler`; typed legacy DAV scopes dispatch by object type, while per-collection DAV folder scopes dispatch through `DavScopeIndex`. `FolderId` carries no protocol namespace and IMAP mailbox names are arbitrary strings, so the index is built once at open and made unambiguous there: a collection href equal to a known IMAP mailbox name is not indexed (the mailbox keeps its scope), and a href claimed by both sub-accounts is not indexed (the tie is never resolved silently in favour of contacts). Both exclusions are reported as classified open-time skips, so a dropped entry routes to IMAP or to `Unsupported` rather than syncing the wrong collection quietly. Push admission consults the same index: an indexed DAV collection scope is a syntactically valid mailbox name but names no mailbox, so it is refused per-item (the DAV sub-accounts have no push lane) instead of being reported as pushed and burning a push slot on a folder no worker can SELECT. `scopes.rs` holds the discovery fan-in.
+- `capabilities.rs`, `inventory.rs`, `changes.rs`, `get.rs`, `blob.rs`, `mutate.rs`, `push.rs`, `close.rs`, `scopes.rs` - one file per `Account` method group. `mod.rs` holds `route_scope`/`ScopeHandler`; DAV type and qualified collection scopes dispatch by object type, while legacy bare collection folder scopes dispatch through `DavScopeIndex`. New DAV discovery uses `FolderType` qualified by Contact or CalendarEvent, so equal mailbox and collection strings remain independent and route by object type. `DavScopeIndex` retains legacy bare-folder routing only: mailbox collisions and cross-dialect collisions remain classified open-time skips, and losing legacy scopes are filtered from discovery. Push admission consults the same index: an indexed DAV collection scope is a syntactically valid mailbox name but names no mailbox, so it is refused per-item (the DAV sub-accounts have no push lane) instead of being reported as pushed and burning a push slot on a folder no worker can SELECT. `scopes.rs` holds the discovery fan-in.
 - `pim.rs` - Stage 1 mail actions: container membership, keyword/read mutations, search, folder CRUD, quota, draft create/discard, message/thread hydration, IMAP-specific thread move/delete conveniences.
 - `sieve.rs` - Stage 2 literal script filter list/create/update/delete/validate adapter for the sibling `crate::sieve` protocol client.
 
@@ -906,7 +920,7 @@ the engine's read-back path.
 - Flag and destroy MODSEQ groups share one checkout. When an earlier group's command leaves it no longer reusable (abandoned by a timeout with the driver still in the exchange, or a dead driver), every later group settles at once as `Unsent` (`Closed` evidence) instead of queuing behind the stalled exchange and withdrawing at its own deadline. No replacement checkout is taken: it would wait on capacity the abandoned member holds until its driver exits, which never happens at `pool_cap = 1` while the checkout is held.
 - `bulk_move` validates the destination mailbox NAME once (syntax via `MailboxName::new`), before any source folder is opened; a syntactically invalid destination fails every target `Request(Malformed)` up front. Existence and selectability are not preflighted: a well-formed but nonexistent destination flows into the per-folder path and surfaces as per-item outcomes from the server's `NO [TRYCREATE]`.
 
-Capabilities advertise `MutationConcurrency::None`: the MODSEQ cache is opportunistic (cold cache = unprotected STORE), so `StateBased` would let the engine assume UNCHANGEDSINCE is always wired. The engine reads back uncertain writes and may reassert declared unversioned targets; this supplies no lost-update guarantee. `mutation.reassertion` declares `set_flags` and `destroy` (see "Flag observation and reassertion capability").
+Capabilities advertise `MutationConcurrency::ExpectedVersion(VersionedDoors)` with the mail flag door when CONDSTORE is available and the composed DAV update/delete doors when present. An empty set advertises no caller-version doors. The internal MODSEQ cache is opportunistic (cold cache = unprotected STORE); it does not itself supply a caller-version guarantee. The engine reads back uncertain writes and may reassert declared unversioned targets; this supplies no lost-update guarantee. `mutation.reassertion` declares `set_flags` and `destroy` (see "Flag observation and reassertion capability").
 
 ### PIM primitives
 
@@ -2005,3 +2019,39 @@ rather than a comparison against invented history.
 
 Raw reads name their UID policy with `blob::UidPersistence`: Session for account
 reads and Sticky for polling references retained across selections.
+
+A failed LIST under a shared namespace prefix reports `ErrorScope::Namespace`
+with that prefix on both the skip and its classified error. Personal mail and
+other prefixes remain available, as an enterprise user expects.
+
+## Typed search and command operands
+
+`types/search.rs` owns the search builder and its operand tree. Typed string
+operands are never scanned for search-key names or literal markers. Raw SEARCH,
+SORT and THREAD operands retain CRLF/literal validation and marker re-emission;
+`connection/search_validation.rs` is now only a test adapter to the codec scanner.
+`as_str` and Display expose an explicit text representation; passing the builder
+itself to a connection preserves its typed operands.
+
+`types/command_options.rs` owns SEARCH RETURN options, LIST selection and return
+options, STATUS request attributes and their raw parsing boundaries. Recognized
+spellings become named variants, including mixed-case and outer-whitespace input.
+Unknown extension options remain available and retain encoder validation.
+LIST-STATUS return options retain parsed STATUS attributes. SAVE admission and
+LIST response selection use the typed option identities.
+
+FETCH commands carry `FetchItems`: typed attribute vectors reach both live and
+queued admission without being flattened. Only the raw extension path uses the
+FETCH grammar scan. Encoding still validates free-form BODY section syntax.
+Raw pipeline FETCH already used live capability admission before this change;
+the retained raw path continues to do so.
+
+NOTIFY groups have immutable filter and event fields. Their constructor owns
+message-event dependencies and filter legality; encoding reports a retained
+construction refusal rather than recomputing that policy. `MessageEvents`
+constructs the MessageNew/MessageExpunge pair together with optional flag and
+annotation changes. The account push registration uses this bundle, and its
+legality test calls the group owner. A bundle alone cannot establish all RFC 5465
+legality: non-selected filters cannot request FETCH payloads and selected filters
+cannot contain extension events. Those checks remain with the group constructor.
+NOTIFY FETCH operands retain typed attributes or explicit raw extension syntax.

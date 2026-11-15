@@ -118,7 +118,7 @@ where
 
 pub(crate) fn stream<T: HttpTransport>(
     mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
+    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
     limits: CoreLimits,
     mut ids: AccountStream<ObjectId>,
     projection: Projection,
@@ -209,14 +209,14 @@ pub(crate) fn stream<T: HttpTransport>(
 /// then reports them as not found).
 async fn fetch_route<T: HttpTransport>(
     mail: &MailAccount<T>,
-    foreign_mail: &HashMap<String, MailAccount<T>>,
+    foreign_mail: &HashMap<crate::core::id::AccountId, MailAccount<T>>,
     route: &HydrationRoute,
     projection: Projection,
     batch: &mut Vec<ObjectId>,
 ) -> crate::Result<Option<Batch<ItemOutcome<HydratedObject>>>> {
     let (handle, owner) = match route {
         HydrationRoute::Primary => (mail, None),
-        HydrationRoute::Foreign(account) => match foreign_mail.get(account) {
+        HydrationRoute::Foreign(account) => match foreign_mail.get(account.as_str()) {
             Some(handle) => (handle, Some(account.as_str())),
             None => {
                 // A route minted while the handle existed, drained after
@@ -672,7 +672,7 @@ mod tests {
         .expect("client builds");
         let mail = crate::account::Account::new(client.clone(), "primary");
         let foreign_mail = Arc::new(HashMap::from([(
-            "shared".to_string(),
+            "shared".into(),
             crate::account::Account::new(client, "shared"),
         )]));
         let foreign_id = ObjectId(super::super::foreign::encode_object("shared", "M1"));

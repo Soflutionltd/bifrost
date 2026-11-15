@@ -1495,23 +1495,33 @@ mod email_query_wire {
             json!({"inMailboxOtherThan": ["a", "b"]})
         );
         assert_eq!(
-            wire(Filter::has_keyword("$seen")),
+            wire(Filter::has_keyword(
+                crate::email::keyword::Keyword::parse("$seen").unwrap()
+            )),
             json!({"hasKeyword": "$seen"})
         );
         assert_eq!(
-            wire(Filter::not_keyword("$seen")),
+            wire(Filter::not_keyword(
+                crate::email::keyword::Keyword::parse("$seen").unwrap()
+            )),
             json!({"notKeyword": "$seen"})
         );
         assert_eq!(
-            wire(Filter::all_in_thread_have_keyword("$seen")),
+            wire(Filter::all_in_thread_have_keyword(
+                crate::email::keyword::Keyword::parse("$seen").unwrap()
+            )),
             json!({"allInThreadHaveKeyword": "$seen"})
         );
         assert_eq!(
-            wire(Filter::some_in_thread_have_keyword("$seen")),
+            wire(Filter::some_in_thread_have_keyword(
+                crate::email::keyword::Keyword::parse("$seen").unwrap()
+            )),
             json!({"someInThreadHaveKeyword": "$seen"})
         );
         assert_eq!(
-            wire(Filter::none_in_thread_have_keyword("$seen")),
+            wire(Filter::none_in_thread_have_keyword(
+                crate::email::keyword::Keyword::parse("$seen").unwrap()
+            )),
             json!({"noneInThreadHaveKeyword": "$seen"})
         );
         assert_eq!(
@@ -1558,11 +1568,13 @@ mod email_query_wire {
         // RFC 8620 s1.4 UTCDate: "YYYY-MM-DDTHH:MM:SSZ", no offset, no
         // fractional seconds for a whole-second instant.
         assert_eq!(
-            wire(Filter::before(0)),
+            wire(Filter::before(jiff::Timestamp::UNIX_EPOCH)),
             json!({"before": "1970-01-01T00:00:00Z"})
         );
         assert_eq!(
-            wire(Filter::after(1_767_323_045)),
+            wire(Filter::after(
+                jiff::Timestamp::from_second(1_767_323_045).unwrap()
+            )),
             json!({"after": "2026-01-02T03:04:05Z"})
         );
     }
@@ -1574,7 +1586,10 @@ mod email_query_wire {
             json!({"isAscending": false, "property": "receivedAt"})
         );
         assert_eq!(
-            serde_json::to_value(Comparator::has_keyword("$flagged")).unwrap(),
+            serde_json::to_value(Comparator::has_keyword(
+                crate::email::keyword::Keyword::parse("$flagged").unwrap()
+            ))
+            .unwrap(),
             json!({"isAscending": true, "property": "hasKeyword", "keyword": "$flagged"})
         );
         assert_eq!(
@@ -1609,8 +1624,9 @@ mod email_query_wire {
     fn filter_operators_nest() {
         use crate::core::query::{Filter as CoreFilter, Operator};
         let in_mailbox: CoreFilter<Filter> = CoreFilter::FilterCondition(Filter::in_mailbox("mb1"));
-        let has_keyword: CoreFilter<Filter> =
-            CoreFilter::FilterCondition(Filter::has_keyword("$seen"));
+        let has_keyword: CoreFilter<Filter> = CoreFilter::FilterCondition(Filter::has_keyword(
+            crate::email::keyword::Keyword::parse("$seen").unwrap(),
+        ));
         let negated: CoreFilter<Filter> = CoreFilter::not([has_keyword]);
         let combined: CoreFilter<Filter> = CoreFilter::and([in_mailbox, negated]);
         let value = serde_json::to_value(&combined).unwrap();
@@ -1645,8 +1661,14 @@ mod email_set_patch_shapes {
     #[test]
     fn dotted_paths_use_null_to_remove_and_true_to_add() {
         let mut patch = EmailPatch::default();
-        patch.keyword("$seen", true);
-        patch.keyword("$flagged", false);
+        patch.keyword(
+            &crate::email::keyword::Keyword::parse("$seen").unwrap(),
+            true,
+        );
+        patch.keyword(
+            &crate::email::keyword::Keyword::parse("$flagged").unwrap(),
+            false,
+        );
         patch.mailbox_id(&MailboxId::new("mb1"), true);
         patch.mailbox_id(&MailboxId::new("mb2"), false);
         let value = serde_json::to_value(&patch).unwrap();
@@ -1667,8 +1689,11 @@ mod email_set_patch_shapes {
         // RFC 8620 s5.3 forbids sending both `keywords` and
         // `keywords/x` in one PatchObject.
         let mut patch = EmailPatch::default();
-        patch.keywords(["$seen"]);
-        patch.keyword("$flagged", true);
+        patch.keywords([crate::email::keyword::Keyword::parse("$seen").unwrap()]);
+        patch.keyword(
+            &crate::email::keyword::Keyword::parse("$flagged").unwrap(),
+            true,
+        );
         let value = serde_json::to_value(&patch).unwrap();
         assert!(value.get("keywords").is_none());
         assert_eq!(value.get("keywords/$flagged"), Some(&json!(true)));
@@ -1677,8 +1702,11 @@ mod email_set_patch_shapes {
     #[test]
     fn wholesale_setters_clear_previously_set_paths() {
         let mut patch = EmailPatch::default();
-        patch.keyword("$flagged", true);
-        patch.keywords(["$seen"]);
+        patch.keyword(
+            &crate::email::keyword::Keyword::parse("$flagged").unwrap(),
+            true,
+        );
+        patch.keywords([crate::email::keyword::Keyword::parse("$seen").unwrap()]);
         patch.mailbox_id(&MailboxId::new("mb1"), true);
         patch.mailbox_ids([MailboxId::new("mb2")]);
         let value = serde_json::to_value(&patch).unwrap();
@@ -1696,7 +1724,7 @@ mod email_set_patch_shapes {
     fn wholesale_setters_clear_a_raw_entry_for_the_same_property() {
         let mut patch = EmailPatch::default();
         patch.null_property("keywords");
-        patch.keywords(["$seen"]);
+        patch.keywords([crate::email::keyword::Keyword::parse("$seen").unwrap()]);
         patch
             .raw_property("mailboxIds", &json!({"mb9": true}))
             .expect("serializable");
@@ -1983,8 +2011,10 @@ mod email_submission_wire {
             create.envelope("me@example.com", ["you@example.com"]);
             create.undo_status(UndoStatus::Pending);
         }
-        set.on_success_update_email("c0")
-            .keyword(crate::email::DRAFT_KEYWORD, false);
+        set.on_success_update_email("c0").keyword(
+            &crate::email::keyword::Keyword::parse(crate::email::DRAFT_KEYWORD).unwrap(),
+            false,
+        );
         let set = set.on_success_destroy_email("c0");
 
         let value = serde_json::to_value(&set).unwrap();
@@ -2259,7 +2289,9 @@ mod patch_defaults {
         );
 
         let mut vacation = crate::vacation_response::VacationResponseCreate::new(None);
-        vacation.from_date(Some(0)).subject(Some(""));
+        vacation
+            .from_date(Some(jiff::Timestamp::UNIX_EPOCH))
+            .subject(Some(""));
         assert_eq!(
             serde_json::to_value(vacation).unwrap(),
             json!({"fromDate": "1970-01-01T00:00:00Z", "subject": ""})
@@ -3276,13 +3308,13 @@ mod calendar_event_patch_nesting {
     fn get_arguments_flatten_into_the_request() {
         let get = crate::calendar_event::CalendarEventGet::new()
             .ids(["ev1"])
-            .recurrence_overrides_after("2026-01-01T00:00:00")
+            .recurrence_overrides_after("2026-01-01T00:00:00Z".parse().unwrap())
             .reduce_participants(true)
             .time_zone("Europe/Oslo");
         let value = serde_json::to_value(&get).unwrap();
         assert_eq!(
             value.get("recurrenceOverridesAfter"),
-            Some(&json!("2026-01-01T00:00:00"))
+            Some(&json!("2026-01-01T00:00:00Z"))
         );
         assert_eq!(value.get("reduceParticipants"), Some(&json!(true)));
         assert_eq!(value.get("timeZone"), Some(&json!("Europe/Oslo")));
@@ -3348,7 +3380,7 @@ mod misc_mail_object_decode {
         {
             let entry = request.email("blob-1");
             entry.mailbox_ids([crate::mailbox::MailboxId::new("mb1")]);
-            entry.keywords(["$seen"]);
+            entry.keywords([crate::email::keyword::Keyword::parse("$seen").unwrap()]);
             assert_eq!(entry.create_id(), "i0");
         }
         let value = serde_json::to_value(&request).unwrap();

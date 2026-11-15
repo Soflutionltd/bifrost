@@ -188,7 +188,7 @@ fn rate_limited_preserves_body_and_headers() {
 
     let err = convert_with_throttle_scope(
         Error::RateLimited {
-            retry_after: Some(Duration::from_secs(30)),
+            retry_after: Some(bifrost_types::RetryHint::After(Duration::from_secs(30))),
             final_response: final_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 headers,
@@ -226,7 +226,8 @@ fn retry_budget_exhausted_preserves_body_and_headers() {
                 headers,
                 b"temporarily unavailable",
             )),
-            retry_after_history: vec![Duration::from_secs(10)],
+            retry_after_history: vec![bifrost_types::RetryHint::After(Duration::from_secs(10))],
+            stop_reason: bifrost_net::error::RetryStopReason::AttemptBudget,
         },
         ctx(AccountOperation::SyncChanges),
     );
@@ -248,6 +249,7 @@ fn retry_budget_none_status_defensive_arm() {
         Error::RetryBudgetExhausted {
             final_response: None,
             retry_after_history: Vec::new(),
+            stop_reason: bifrost_net::error::RetryStopReason::AttemptBudget,
         },
         ctx(AccountOperation::Send),
     );
@@ -503,7 +505,7 @@ fn refresh_failed_with_deadline_propagates_to_recovery() {
         .expect("test deadline in range");
     let err = convert(
         Error::RefreshFailed {
-            retry_after: Some(deadline),
+            retry_after: Some(bifrost_types::RetryHint::At(deadline)),
             source: Arc::new(Error::Status {
                 code: StatusCode::TOO_MANY_REQUESTS,
                 body: Bytes::new(),

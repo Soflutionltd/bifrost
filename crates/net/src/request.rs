@@ -706,7 +706,7 @@ impl RequestBuilder {
     /// An ambiguous terminal outcome retains commit evidence for read-back
     /// instead of authorizing another write: a non-replayable request that
     /// received any non-401 answer, or dropped past `Unsent`, carries
-    /// `may_have_committed`, and `into_account_error` then narrows its
+    /// a possible-commit ledger verdict, and `into_account_error` then narrows its
     /// classification to non-idempotent whatever the operation table says.
     ///
     /// The declaration is dropped when a redirect rewrites the method (a
@@ -954,9 +954,10 @@ pub(crate) struct AttemptEvidence {
 }
 
 impl AttemptEvidence {
-    pub(crate) fn finish(mut self, source: Error) -> Error {
-        self.ledger.record_error(&source, true);
-        let may_have_committed = self.ledger.verdict() == crate::CommitEvidence::MayHaveCommitted;
+    pub(crate) fn finish(self, source: Error) -> Error {
+        // Dispatch records each wire outcome once. The terminal stage remains
+        // separate evidence and must not be counted as another wire attempt.
+        let commit = self.ledger.verdict();
         // A direct terminal status is a complete answer, not an incomplete
         // exchange. Only retry-candidate stops and body/transport failures
         // need reconciliation in the absence of an earlier attempt.
@@ -967,13 +968,14 @@ impl AttemptEvidence {
                 | Error::RateLimited { .. }
                 | Error::LocalHold { .. }
         );
-        if self.attempts.is_empty() && (!may_have_committed || complete_answer) {
+        if self.attempts.is_empty()
+            && (commit != crate::CommitEvidence::MayHaveCommitted || complete_answer)
+        {
             return source;
         }
         Error::AttemptHistory {
             source: Box::new(source),
-            attempts: self.attempts,
-            may_have_committed,
+            evidence: crate::RequestEvidence::from_ledger(self.attempts, self.ledger),
         }
     }
 
@@ -1176,7 +1178,7 @@ pub(crate) async fn send_streaming_inner(
         cost,
     );
 
-    let mut retry_after_history: Vec<Duration> = Vec::new();
+    let mut retry_after_history: Vec<bifrost_types::RetryHint> = Vec::new();
     let mut bytes_out = 0_u64;
     // One counter for the whole request, so error drains, 401 recovery,
     // redirects and retries all contribute. When the caller supplied one
@@ -1321,8 +1323,10 @@ pub(crate) async fn send_streaming_inner(
                 return Err(Error::LocalHold {
                     key: key.as_str().to_owned(),
                     held,
-                    attempts: std::mem::take(&mut prior_attempts),
-                    may_have_committed: ledger.verdict() == crate::CommitEvidence::MayHaveCommitted,
+                    evidence: crate::RequestEvidence::from_ledger(
+                        std::mem::take(&mut prior_attempts),
+                        ledger.clone(),
+                    ),
                 });
             }
 
@@ -1447,11 +1451,7 @@ pub(crate) async fn send_streaming_inner(
                     // wait. An elapsed date means no server-imposed wait;
                     // dropping it as an absent duration would select local
                     // exponential backoff instead.
-                    let retry_after = retry_after_delay(
-                        evidence.headers.get(RETRY_AFTER),
-                        std::time::SystemTime::now(),
-                        policy.honor_retry_after_cap,
-                    );
+                    let retry_after = parse_retry_after_hint(evidence.headers.get(RETRY_AFTER));
                     if let Some(ra) = retry_after {
                         retry_after_history.push(ra);
                     }
@@ -1468,9 +1468,19 @@ pub(crate) async fn send_streaming_inner(
                         return Err(Error::RetryBudgetExhausted {
                             final_response: Some(evidence),
                             retry_after_history,
+                            stop_reason: if !status_error_is_replayable(status, replayable) {
+                                crate::RetryStopReason::ReplayForbidden
+                            } else {
+                                crate::RetryStopReason::AttemptBudget
+                            },
                         });
                     }
-                    let wait = retry_after.unwrap_or_else(|| backoff_for(&policy, attempt));
+                    let wait = retry_after
+                        .map(|hint| {
+                            hint.min_delay(std::time::SystemTime::now())
+                                .min(policy.honor_retry_after_cap)
+                        })
+                        .unwrap_or_else(|| backoff_for(&policy, attempt));
                     prior_attempts.push(status_evidence(&evidence));
                     pending_response = None;
                     if let Some(debit) = rate_debit.as_ref() {
@@ -1802,7 +1812,7 @@ fn status_error_is_replayable(status: StatusCode, replayable: bool) -> bool {
 /// transmitted, or the resolved replay policy says transmitting it again
 /// cannot change server state or the answer. A terminal unreplayable drop
 /// past `Unsent` retains commit evidence (`AttemptHistory` with
-/// `may_have_committed`), so classification requires read-back even under
+/// a possible-commit ledger verdict), so classification requires read-back even under
 /// an idempotent logical operation.
 ///
 /// A variant carrying no transmission evidence is not replayable here:
@@ -2142,6 +2152,7 @@ fn backoff_for(policy: &RetryPolicy, attempt: u32) -> Duration {
     half.saturating_add(jitter).min(policy.max_backoff)
 }
 
+#[cfg(test)]
 fn retry_after_delay(
     value: Option<&HeaderValue>,
     now: std::time::SystemTime,
@@ -3249,6 +3260,7 @@ mod tests {
         let Error::RetryBudgetExhausted {
             final_response: Some(final_response),
             retry_after_history,
+            ..
         } = error.terminal()
         else {
             panic!("expected retry budget evidence");
@@ -3257,7 +3269,10 @@ mod tests {
         assert_eq!(final_response.body, Bytes::from_static(b"final"));
         assert_eq!(
             *retry_after_history,
-            vec![Duration::from_secs(1), Duration::from_secs(2)]
+            vec![
+                bifrost_types::RetryHint::After(Duration::from_secs(1)),
+                bifrost_types::RetryHint::After(Duration::from_secs(2))
+            ]
         );
     }
 
@@ -4319,7 +4334,7 @@ mod tests {
 
     fn assert_commit_envelope(error: &Error) {
         assert!(
-            matches!(error, Error::AttemptHistory { attempts, may_have_committed: true, .. } if attempts.is_empty()),
+            matches!(error, Error::AttemptHistory { evidence, .. } if evidence.verdict() == crate::CommitEvidence::MayHaveCommitted && evidence.attempts().is_empty()),
             "{error:?}"
         );
     }
@@ -4442,7 +4457,7 @@ mod tests {
         assert_eq!(requests[1].body.as_deref(), Some(b"write".as_slice()));
         assert!(matches!(
             error,
-            Error::AttemptHistory { attempts, may_have_committed: true, .. } if attempts.len() == 2
+            Error::AttemptHistory { evidence, .. } if evidence.verdict() == crate::CommitEvidence::MayHaveCommitted && evidence.attempts().len() == 2
         ));
     }
 
@@ -4503,7 +4518,7 @@ mod tests {
         assert_eq!(script.requests().len(), 1, "the refused hop never goes out");
         assert!(matches!(
             &error,
-            Error::AttemptHistory { attempts, may_have_committed: true, .. } if attempts.len() == 1
+            Error::AttemptHistory { evidence, .. } if evidence.verdict() == crate::CommitEvidence::MayHaveCommitted && evidence.attempts().len() == 1
         ));
     }
 
@@ -4617,7 +4632,9 @@ mod tests {
                         let error = result.err().unwrap();
                         assert_commit_envelope(&error);
                         assert!(
-                            matches!(error.terminal(), Error::RetryBudgetExhausted { final_response: Some(r), retry_after_history } if r.status == status && r.body.as_ref() == b"ambiguous" && r.headers["request-id"] == "replay-test" && retry_after_history == &[Duration::from_secs(60)])
+                            matches!(error.terminal(), Error::RetryBudgetExhausted { final_response: Some(r), retry_after_history,
+            ..
+        } if r.status == status && r.body.as_ref() == b"ambiguous" && r.headers["request-id"] == "replay-test" && retry_after_history == &[bifrost_types::RetryHint::After(Duration::from_secs(60))])
                         );
                         assert_eq!(script.requests().len(), 1);
                         assert_eq!(script.remaining(), 1);
@@ -4668,7 +4685,7 @@ mod tests {
             .err()
             .unwrap();
         assert!(
-            matches!(error, Error::RateLimited { retry_after: Some(delay), final_response } if delay == Duration::from_secs(60) && final_response.body.as_ref() == b"rate refusal")
+            matches!(error, Error::RateLimited { retry_after: Some(delay), final_response } if delay == bifrost_types::RetryHint::After(Duration::from_secs(60)) && final_response.body.as_ref() == b"rate refusal")
         );
     }
 
@@ -4820,7 +4837,7 @@ mod tests {
             .err()
             .unwrap();
         assert!(
-            matches!(&error, Error::AttemptHistory { attempts, may_have_committed: true, .. } if matches!(attempts.as_slice(), [Error::Status { code: StatusCode::UNAUTHORIZED, .. }]))
+            matches!(&error, Error::AttemptHistory { evidence, .. } if evidence.verdict() == crate::CommitEvidence::MayHaveCommitted && matches!(evidence.attempts(), [Error::Status { code: StatusCode::UNAUTHORIZED, .. }]))
         );
         assert!(
             matches!(error.terminal(), Error::RetryBudgetExhausted { final_response: Some(r), .. } if r.status == StatusCode::SERVICE_UNAVAILABLE)

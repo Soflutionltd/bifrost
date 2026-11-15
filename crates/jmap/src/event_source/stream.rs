@@ -625,7 +625,7 @@ mod tests {
 
         let mut accounts = changes
             .changed_accounts()
-            .map(String::as_str)
+            .map(crate::core::id::AccountId::as_str)
             .collect::<Vec<_>>();
         accounts.sort_unstable();
         assert_eq!(accounts, vec!["a", "b"]);

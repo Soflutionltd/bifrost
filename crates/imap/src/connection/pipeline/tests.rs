@@ -192,9 +192,9 @@ async fn pipeline_literal_budget_applies_during_responses_and_continuations() {
     for continuation in [false, true] {
         let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 ACL")).await;
         select_inbox(&conn, &mut server).await;
-        let mut batch =
-            conn.pipeline()
-                .fetch(SequenceSet::new("1").unwrap(), "(BODY[])".into(), None);
+        let mut batch = conn
+            .pipeline()
+            .fetch(SequenceSet::new("1").unwrap(), "(BODY[])", None);
         batch.pending[0] = Box::new(dispatch::FetchConsumer::with_limit(3));
         // Dynamic execution deliberately permits replacing the consumer here:
         // its output is Vec<FetchResponse>, with no typed tuple to unfold.

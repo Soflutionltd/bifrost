@@ -106,6 +106,36 @@ reading caller-owned `ServerVersion` values. Push `changed` maps are the
 intentional heterogeneous boundary: each object state retains its runtime
 `DataType` key, while the resumable `pushState` token has its own static type.
 
+## Internal primitive domains
+
+`email/keyword.rs::Keyword` owns the RFC 8621 Section 4.1 keyword grammar
+(1 to 255 ASCII atom characters) and lowercase canonical identity. Email read,
+create, patch, import, filter and comparator fields use it. Caller keywords are
+validated before target lookup or request construction; invalid caller input
+maps to Request(Malformed). Keyword patch paths use the same lowercase spelling
+as whole-set replacement, as an Outlook user expects case variants of one flag
+to edit the same flag.
+
+`core/object_set.rs::ObjectSet<I>` stores memberships as a set and serializes
+the JMAP object encoding with only true values. Email mailbox and keyword fields
+retain it through read and write; calendar and contact membership accessors
+materialize sets of CalendarId and AddressBookId from their extensible JSON
+objects. Their create and patch writers retain the shared IdSet/IdSetPatch
+helpers. False entries from servers remain tolerated as absent, preserving the
+mail reader's existing behavior; they are never re-emitted as memberships.
+
+Session account keys and primary-account values, push changed-map keys,
+EmailPush and CalendarAlert account ids, EventSource Changes keys, and the sync
+foreign-mail handle maps use the protocol AccountId. Borrowed string lookups
+are supported at caller and persisted foreign-id codec boundaries; identity
+remains byte-exact and wire JSON stays unchanged.
+
+`core/query.rs::QueryPosition` owns the signed request position and checked
+conversion from unsigned search cursors. Response positions and positional
+search cursors use u64 end to end; negative response positions fail decoding.
+Anchored contact/calendar validators also retain the unsigned domain. Existing
+search-3 cursor bytes remain readable; no cursor version change is needed.
+
 ## Internal method dispatch
 
 Every JMAP method is a self-describing struct implementing `JmapMethod`:
@@ -505,7 +535,13 @@ Every JMAP object type under `crates/jmap/src/<type>/`:
 
 **Typed structs** (Mailbox, Calendar, AddressBook, etc.): serde derive, `Field<T>` for nullable properties. Their closed property vocabularies are declared through `core::method::define_property_enum!`, one table per enum giving each variant its wire spelling once; serde and `Display` both read that table, so the two cannot drift.
 
-Date setters on `EmailCreate` (`sent_at`, `received_at`) and `EmailImport` (`received_at`) take a `jiff::Timestamp`, never an `i64`: the integer form went through `from_timestamp`, which turns an out-of-range value into the Unix epoch and so silently sends a 1970 date. `from_timestamp` remains only for older integer-taking builders.
+Date setters on `EmailCreate` (`sent_at`, `received_at`) and `EmailImport`
+(`received_at`), Email and EmailSubmission date filters, VacationResponse dates
+and PushSubscription expiry take `jiff::Timestamp`. There is no epoch-substituting
+integer conversion. The sync boundary validates search and vacation `SystemTime`
+values before sending, refusing unrepresentable instants as Request(Malformed).
+An Outlook user expects the requested date to be saved or refused, never changed
+silently to 1970.
 
 **JSON map backing** (CalendarEvent, ContactCard): `serde_json::Map` via `json_object_struct!` macro. Property enums use `core::method::define_open_property_enum!` to derive
 `as_str`, `Display`, serde and `From<&str>` from one wire-name table, retaining
@@ -802,7 +838,7 @@ foreign-account skip lane; see Foreign accounts below).
 
 The batch is conditional on the session's own numbers. `maxCallsInRequest` and `maxSizeRequest` are hard limits (RFC 8620 §2) the server enforces by rejecting the whole request with a request-level `limit` error, and the commonly quoted 16 calls is the minimum a server is *recommended* to support, never a floor a client may assume. So `batched_open_probes` sends the two-call batch only when the advertised call count allows it and `Request::send_methods_within` finds the encoded request inside `maxSizeRequest`; otherwise nothing is sent and the probes go out one request each. `send_methods_within` takes the size limit as a required argument (and returns `Ok(None)` without sending when the batch does not fit) precisely so a future batching call site cannot forget the question.
 
-`JmapAccount` (`pub(crate)`) owns the `Client`, the primary `Mail` `Account` handle, a `foreign_mail: Arc<HashMap<String, MailAccount>>` of shared/delegate-account handles keyed by JMAP `accountId`, optional `Submission`/`VacationResponse`/`Quota`/`Sieve` handles, the built capabilities, per-scope cursor seed states, the `WsState`, a subscription registry, and a per-`accountId` Email guard cache (`StateMap`, holding `StateCell` entries in `state_cache.rs`). Cells hold typed Email object states; the primary account's id is one ordinary key. Unknown and unavailable observations both provide no guard. Each cell owns set continuity, changes continuity, and compare-and-replace probe publication. There is no general Mailbox observation cache: its only reader compared it against itself for publication, and no decision consumed it. Scope lifecycle alone owns primary Mailbox positions, typed as Mailbox object states; delta polling and local `Mailbox/set` cannot consume the lifecycle poller's window. This lifecycle position is open-time process state, not an engine change cursor, so it does not enter the cursor envelope or alter its schema/version. `set_priority`/`set_bandwidth_cap` delegate to `bifrost-net::AccountNet`. The account also holds a shared close completion: the first polled `close()` starts teardown in a spawned task, and all later callers await that same result.
+`JmapAccount` (`pub(crate)`) owns the `Client`, the primary `Mail` `Account` handle, a `foreign_mail: Arc<HashMap<AccountId, MailAccount>>` of shared/delegate-account handles keyed by JMAP `accountId`, optional `Submission`/`VacationResponse`/`Quota`/`Sieve` handles, the built capabilities, per-scope cursor seed states, the `WsState`, a subscription registry, and a per-`accountId` Email guard cache (`StateMap`, holding `StateCell` entries in `state_cache.rs`). Cells hold typed Email object states; the primary account's id is one ordinary key. Unknown and unavailable observations both provide no guard. Each cell owns set continuity, changes continuity, and compare-and-replace probe publication. There is no general Mailbox observation cache: its only reader compared it against itself for publication, and no decision consumed it. Scope lifecycle alone owns primary Mailbox positions, typed as Mailbox object states; delta polling and local `Mailbox/set` cannot consume the lifecycle poller's window. This lifecycle position is open-time process state, not an engine change cursor, so it does not enter the cursor envelope or alter its schema/version. `set_priority`/`set_bandwidth_cap` delegate to `bifrost-net::AccountNet`. The account also holds a shared close completion: the first polled `close()` starts teardown in a spawned task, and all later callers await that same result.
 
 `Client` carries an optional `ByteTally`; `Client::metered()` / `Account::metered()` hand back a handle over the same transport and session state that reports inbound request bytes into a fresh accumulator, which each sync stream takes at construction and each emitted batch `take`s. `Client::metered_into(&tally)` / `Account::metered_into(&tally)` report into an existing accumulator when one batch crosses differently scoped handles. The tally lives outside `ClientInner` deliberately: forking the inner would fork the session-state mutex, and two clients with independent session state is a correctness bug rather than an accounting detail.
 
@@ -1883,3 +1919,24 @@ to rebuild without blaming the provider or silently missing mail.
 Payload versions use `PayloadVersion`; change and backfill outer versions use
 `TraitEnvelopeVersion`. These are separate types with explicit numeric access
 for storage; existing wire values are unchanged.
+
+## JSCalendar scalar and recurrence boundaries
+
+`calendar_event/value.rs` owns validated `LocalDateTime`, `UtcDateTime` and
+unsigned `Duration` values. Event start/duration setters and query bounds take
+these types; recurrence override get bounds take UTCDateTime. Local and UTC
+forms are distinct, and durations enforce unit order and week-only syntax.
+Fractional seconds up to nanosecond precision survive time/duration conversion.
+The Account adapter parses shared times before constructing these wire values.
+A missing inbound duration keeps its PT0S default; malformed or numerically
+unrepresentable duration fails hydration with Protocol(ParseFailed) instead
+of fabricating a zero-length event.
+
+RRULE validity comes from `bifrost_types::RecurrenceRule`, including duplicate
+parts, positive COUNT/INTERVAL, typed BYDAY/UNTIL and frequency constraints.
+Malformed outbound rules are Request(Malformed) naming `recurrence.rrule`;
+valid parts outside the JSCalendar mapping remain Unsupported. Inbound JSON
+rules are checked against the same shared grammar after conversion. Fractional
+JSCalendar UNTIL is refused because RFC 5545 has no fractional UNTIL carrier.
+Raw recurrence text remains an observation carrier; it is parsed when interpreted
+or written rather than making unrelated scalar edits depend on its validity.

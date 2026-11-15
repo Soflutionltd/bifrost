@@ -24,14 +24,36 @@ pub(crate) fn discover_cursor_scopes(
         .map(|entry| folder_scope(&entry.name))
         .collect();
     // The two composable sub-accounts contribute their own typed cursor
-    // collection-folder scopes (legacy typed scopes remain accepted).
+    // collection scopes qualified by object type (legacy scopes remain accepted).
     let subs: Vec<Arc<dyn Account>> = [account.contacts.clone(), account.calendars.clone()]
         .into_iter()
         .flatten()
         .collect();
     // Open-time gaps belong to OpenedAccount, not a second warning lane.
-    fan_in_discovery(folder_scopes, Vec::new(), subs, |sub| {
-        sub.discover_cursor_scopes()
+    let contacts = account.contacts.clone();
+    fan_in_discovery(folder_scopes, Vec::new(), subs, move |sub| {
+        use futures::StreamExt as _;
+        let owner = if contacts
+            .as_ref()
+            .is_some_and(|contacts| Arc::ptr_eq(contacts, sub))
+        {
+            super::DavScopeOwner::Contacts
+        } else {
+            super::DavScopeOwner::Calendars
+        };
+        let account = account.clone();
+        Box::pin(sub.discover_cursor_scopes().map(move |event| match event {
+            SyncEvent::Batch(mut batch) => {
+                // Losing legacy collections remain classified open-time skips.
+                // Advertising them would schedule work against the winning mailbox.
+                batch.items.retain(|scope| match scope {
+                    CursorScope::Folder(folder) => account.dav_scopes.owner(folder) == Some(owner),
+                    _ => true,
+                });
+                SyncEvent::Batch(batch)
+            }
+            event => event,
+        }))
     })
 }
 
@@ -349,6 +371,45 @@ mod tests {
         assert!(saw_done);
         assert_eq!(warnings, 1, "sub failure surfaces as exactly one warning");
         assert_eq!(items, vec![folder], "IMAP folder scopes still flow");
+    }
+
+    #[tokio::test]
+    async fn legacy_collision_is_skipped_without_advertising_the_losing_collection() {
+        use super::super::test_support::scripted_account_parts;
+        use crate::connection::test_support::{driver_pair, preauth_greeting};
+        let (conn, _peer) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+        let mut parts = scripted_account_parts(conn, 1);
+        let folder = FolderId("https://dav.example.test/shared/".into());
+        parts.contacts = Some(stub_arc(StubAccount::new(vec![CursorScope::Folder(
+            folder.clone(),
+        )])));
+        parts.calendars = Some(stub_arc(StubAccount::new(vec![CursorScope::Folder(
+            folder.clone(),
+        )])));
+        let (index, skips) = super::super::DavScopeIndex::build(
+            vec![folder.clone()],
+            vec![folder.clone()],
+            &Default::default(),
+        );
+        assert_eq!(skips.len(), 2);
+        parts.dav_scopes = index;
+        parts.discovery_skips = skips;
+        let account = ImapAccount::new(parts);
+        let mut stream = discover_cursor_scopes(account.clone());
+        while let Some(event) = stream.next().await {
+            if let SyncEvent::Batch(batch) = event {
+                assert!(!batch.items.contains(&CursorScope::Folder(folder.clone())));
+            }
+        }
+        assert_eq!(
+            account
+                .containers_list()
+                .await
+                .unwrap()
+                .skipped_scopes
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

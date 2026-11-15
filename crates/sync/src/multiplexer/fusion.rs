@@ -23,6 +23,7 @@ use bifrost_types::{
 };
 use futures::stream::StreamExt;
 
+#[cfg(test)]
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
 use crate::error::Error;
@@ -55,56 +56,33 @@ pub enum FusionOutcome {
 enum Forwarded {
     /// Sent on the delivery (with its publication, if it carried a checkpoint).
     Published,
-    /// The scope fence had moved: nothing was sent, and the claim comes back
-    /// so its debt can be routed to the writer.
+    /// Registration refused after a reset; the writer must retain this debt.
     Refused(crate::cursor::CoverageClaim),
 }
 
 pub struct InventoryFusion {
-    /// The scope fence this walk's ownership began under, read by the caller
-    /// before any await that a deletion or reset could land in. Every
-    /// checkpoint publication registers only if the fence still equals it,
-    /// checkpoint-less batches (and, with no `control`, every batch and the
-    /// terminal `Done`) are withheld once it has moved, and the terminal cursor
-    /// is installed only under it. Ignored when `coverage` is `None`.
+    /// Snapshot before any await belonging to this walk.
     pub expected_fence: crate::cursor::ScopeFence,
     pub account_id: bifrost_types::AccountId,
     pub cursors: Arc<CursorRegistry>,
-    pub control: Option<SyncControl>,
-    /// Where this walk registers what it proved, so the durable writer can put
-    /// coverage and cursor into one atomic record when the consumer
-    /// acknowledges. `None` in contexts with no writer behind them.
-    pub coverage: Option<Arc<crate::cursor::PendingCoverage>>,
-    /// Durable writer, for barrier incidents. A barrier advances no cursor, so
-    /// it has no checkpoint to ride and cannot reach the store through the
-    /// acknowledgement path like everything else does.
-    pub writer_tx: Option<tokio::sync::mpsc::Sender<super::WriterRequest>>,
-    /// Engine-issued generation for this walk. Orders proof events even when
-    /// two walks produce identical cursor bytes.
+    pub publisher: super::PagePublisher,
     pub generation: crate::cursor::WalkGeneration,
-    /// Cancelled when the walk's owner is tearing down. The walk then stops at
-    /// its next provider poll and returns [`Error::ShuttingDown`], dropping the
-    /// provider stream, instead of waiting on a stream that neither yields nor
-    /// ends until the owner's join deadline aborts it. `None` in contexts that
-    /// have no teardown to answer.
-    pub shutdown: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl InventoryFusion {
     /// Drive an `inventory_stream(scope)` to completion. On the
-    /// terminal `Done`, register the cursor carried in
-    /// its checkpoint. Mid-stream batches are ignored for the purpose
-    /// of cursor establishment, but see `run_with_broadcast` for the
-    /// path that forwards inventory data to subscribers.
+    /// terminal `Done`, register the cursor carried in its checkpoint.
+    /// Every batch is forwarded through the required publisher; mid-stream
+    /// checkpoints do not establish the live change cursor.
     pub async fn run(
         &self,
         account: &dyn Account,
         scope: CursorScope,
     ) -> Result<FusionOutcome, Error> {
-        self.run_with_broadcast(account, scope, None).await
+        self.run_with_broadcast(account, scope).await
     }
 
-    /// Same contract as `run`, but each `Batch` of inventory entries
+    /// Same contract as `run`: each `Batch` of inventory entries
     /// is fanned out on the account's change delivery as
     /// `Change::ObjectChange::Created` events BEFORE the terminal cursor is
     /// acknowledged. This is the only path inventory data flows to consumers
@@ -120,10 +98,9 @@ impl InventoryFusion {
         &self,
         account: &dyn Account,
         scope: CursorScope,
-        delivery: Option<Arc<ChangeDelivery>>,
     ) -> Result<FusionOutcome, Error> {
         let stream = account.inventory_stream(scope.clone());
-        self.run_stream(scope, stream, delivery).await
+        self.run_stream(scope, stream).await
     }
 
     /// Resume a provider-owned inventory page cursor. The account returns
@@ -133,12 +110,11 @@ impl InventoryFusion {
         &self,
         account: &dyn Account,
         cursor: bifrost_types::ChangeCursor,
-        delivery: Option<Arc<ChangeDelivery>>,
     ) -> Result<FusionOutcome, Error> {
         let scope = cursor.scope.clone();
         let classified_as_inventory = account.is_inventory_cursor(&cursor);
         let stream = account.inventory_resume_stream(cursor);
-        self.run_resume_stream_with_broadcast(scope, classified_as_inventory, stream, delivery)
+        self.run_resume_stream_with_broadcast(scope, classified_as_inventory, stream)
             .await
     }
 
@@ -152,7 +128,6 @@ impl InventoryFusion {
         scope: CursorScope,
         classified_as_inventory: bool,
         stream: Option<bifrost_types::AccountStream<bifrost_types::InventoryEvent>>,
-        delivery: Option<Arc<ChangeDelivery>>,
     ) -> Result<FusionOutcome, Error> {
         let stream =
             match inventory_resume_stream_checked(scope.clone(), classified_as_inventory, stream) {
@@ -164,26 +139,27 @@ impl InventoryFusion {
                     return Ok(forward_resume_contract_failure(
                         &scope,
                         error,
-                        delivery.as_ref(),
+                        &self.publisher.delivery,
                     ));
                 }
             };
         let Some(stream) = stream else {
             return Ok(FusionOutcome::NoCursor);
         };
-        self.run_stream(scope, stream, delivery).await
+        self.run_stream(scope, stream).await
     }
 
     async fn run_stream(
         &self,
         scope: CursorScope,
         mut stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent>,
-        changes_tx: Option<Arc<ChangeDelivery>>,
     ) -> Result<FusionOutcome, Error> {
-        let _activity = match &self.control {
-            Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
-            None => None,
-        };
+        let delivery = &self.publisher.delivery;
+        let _activity = self
+            .publisher
+            .control
+            .begin_activity()
+            .ok_or(Error::Paused)?;
         // The last checkpoint this walk published. If a later page turns out to
         // be a barrier, this is the position a future walk resumes from - it
         // certifies a prefix ending before the barrier region begins.
@@ -199,15 +175,10 @@ impl InventoryFusion {
             // An ERROR rather than `NoCursor`, for the same reason the backfill
             // runner returns one: `NoCursor` is a completed walk that yielded no
             // cursor, and callers treat it as a finished establishment.
-            let next = match &self.shutdown {
-                Some(shutdown) => {
-                    tokio::select! {
-                        biased;
-                        () = shutdown.cancelled() => return Err(Error::ShuttingDown),
-                        next = stream.next() => next,
-                    }
-                }
-                None => stream.next().await,
+            let next = tokio::select! {
+                biased;
+                () = self.publisher.shutdown.cancelled() => return Err(Error::ShuttingDown),
+                next = stream.next() => next,
             };
             let Some(event) = next else { break };
             match event {
@@ -222,19 +193,13 @@ impl InventoryFusion {
                             bifrost_types::AccountOperation::SyncInventory,
                             &scope,
                         );
-                        if let Some(tx) = &changes_tx {
-                            let _ = tx.sender().send(MultiplexerEvent {
-                                scope: EventScope::Cursor(scope.clone()),
-                                event: Arc::new(SyncEvent::Terminated(error.clone())),
-                                checkpoint: None,
-                                publication: None,
-                            });
-                        }
+                        delivery
+                            .publish_terminated(EventScope::Cursor(scope.clone()), error.clone());
                         return Ok(FusionOutcome::Terminated(error));
                     }
                     let crossed = if completion.coverage.has_barrier() {
                         crate::inventory_walk::cross_waived_barriers(
-                            self.writer_tx.as_ref(),
+                            Some(&self.publisher.writer_tx),
                             &completion.coverage,
                             self.generation,
                         )
@@ -255,7 +220,7 @@ impl InventoryFusion {
                         // forgets and no operator can act on.
                         self.record_barriers(&scope, &completion.coverage, resume_from)
                             .await?;
-                        Self::warn_degraded(&changes_tx, &scope, &completion.coverage);
+                        Self::warn_degraded(delivery, &scope, &completion.coverage);
                         return Ok(FusionOutcome::NoCursor);
                     }
                     // Past the stop, a barrier can only stand here if the
@@ -264,77 +229,38 @@ impl InventoryFusion {
                     validate_checkpoint_envelope(checkpoint.as_ref())?;
                     let degraded = !completion.coverage.is_complete();
                     if degraded {
-                        Self::warn_degraded(&changes_tx, &scope, &completion.coverage);
+                        Self::warn_degraded(delivery, &scope, &completion.coverage);
                     }
-                    if let (Some(tx), Some(cp)) = (&changes_tx, checkpoint.clone()) {
+                    if let Some(cp) = checkpoint.clone() {
                         // Register the claim BEFORE publishing: a fast consumer
                         // can acknowledge between the send and a later
                         // registration, and the writer would then find no claim
                         // for a checkpoint that carried one.
-                        let publication = if let Some(control) = &self.control {
-                            match control.publish_checkpoint_if_fence(
-                                cp.clone(),
-                                crate::cursor::CoverageClaim::new(
-                                    completion.coverage.clone(),
-                                    self.generation,
-                                ),
-                                self.expected_fence,
-                            ) {
-                                Ok(id) => Some(id),
-                                Err(claim) => {
-                                    return self.refused(&scope, &changes_tx, claim).await;
-                                }
-                            }
-                        } else if self.fence_moved(&scope) {
-                            // No control means no conditional registration, so
-                            // the fence is read here instead: a `Done` whose
-                            // scope was reset or deleted under it is neither
-                            // broadcast nor finalized.
-                            return self
-                                .refused(
-                                    &scope,
-                                    &changes_tx,
-                                    crate::cursor::CoverageClaim::new(
-                                        completion.coverage.clone(),
-                                        self.generation,
-                                    ),
-                                )
-                                .await;
-                        } else {
-                            None
-                        };
                         let me = MultiplexerEvent {
                             scope: EventScope::Cursor(scope.clone()),
                             event: Arc::new(SyncEvent::Done(Some(cp.clone()))),
-                            checkpoint: Some(cp.clone()),
-                            publication: publication.clone(),
+                            checkpoint: Some(cp),
+                            publication: None,
                         };
-                        // Register before publishing so a fast consumer
-                        // ack cannot land before the entry exists and
-                        // leave it outstanding forever.
-                        if !tx.publish_acknowledgeable(me) {
-                            // Nothing can ever acknowledge it, so the claim
-                            // would sit in the registry for the life of the
-                            // attachment.
-                            self.retire_claim(publication);
+                        if let Err(claim) = self.publisher.publish_page(
+                            me,
+                            crate::cursor::CoverageClaim::new(
+                                completion.coverage.clone(),
+                                self.generation,
+                            ),
+                            self.expected_fence,
+                        ) {
+                            return self.refused(&scope, delivery, claim).await;
                         }
                     }
                     let outcome = self.finalize(scope.clone(), checkpoint).await?;
                     if matches!(outcome, FusionOutcome::Invalidated) {
-                        Self::warn_invalidated(&scope, &changes_tx);
+                        Self::warn_invalidated(&scope, delivery);
                     }
                     return Ok(outcome);
                 }
                 bifrost_types::InventoryEvent::Terminated(err) => {
-                    if let Some(tx) = &changes_tx {
-                        let me = MultiplexerEvent {
-                            scope: EventScope::Cursor(scope.clone()),
-                            event: Arc::new(SyncEvent::Terminated(err.clone())),
-                            checkpoint: None,
-                            publication: None,
-                        };
-                        let _ = tx.sender().send(me);
-                    }
+                    delivery.publish_terminated(EventScope::Cursor(scope.clone()), err.clone());
                     return Ok(FusionOutcome::Terminated(err));
                 }
                 bifrost_types::InventoryEvent::Batch(batch) => {
@@ -350,14 +276,8 @@ impl InventoryFusion {
                             bifrost_types::AccountOperation::SyncInventory,
                             &scope,
                         );
-                        if let Some(tx) = &changes_tx {
-                            let _ = tx.sender().send(MultiplexerEvent {
-                                scope: EventScope::Cursor(scope.clone()),
-                                event: Arc::new(SyncEvent::Terminated(error.clone())),
-                                checkpoint: None,
-                                publication: None,
-                            });
-                        }
+                        delivery
+                            .publish_terminated(EventScope::Cursor(scope.clone()), error.clone());
                         return Ok(FusionOutcome::Terminated(error));
                     }
                     // A barrier TAINTS THE WALK. Refusing only this one
@@ -370,7 +290,7 @@ impl InventoryFusion {
                     // certifies a prefix that ends before this region begins.
                     let crossed = if batch.coverage.has_barrier() {
                         crate::inventory_walk::cross_waived_barriers(
-                            self.writer_tx.as_ref(),
+                            Some(&self.publisher.writer_tx),
                             &batch.coverage,
                             self.generation,
                         )
@@ -384,29 +304,25 @@ impl InventoryFusion {
                     {
                         self.record_barriers(&scope, &batch.coverage, resume_from)
                             .await?;
-                        if let Some(tx) = &changes_tx {
-                            match self.forward_inventory_batch(tx, &scope, &batch, None) {
-                                Ok(Forwarded::Published) => {}
-                                Ok(Forwarded::Refused(claim)) => {
-                                    return self.refused(&scope, &changes_tx, claim).await;
-                                }
-                                Err(error) => return Ok(FusionOutcome::Terminated(error)),
+                        match self.forward_inventory_batch(delivery, &scope, &batch, None) {
+                            Ok(Forwarded::Published) => {}
+                            Ok(Forwarded::Refused(claim)) => {
+                                return self.refused(&scope, delivery, claim).await;
                             }
-                            Self::warn_degraded(&changes_tx, &scope, &batch.coverage);
+                            Err(error) => return Ok(FusionOutcome::Terminated(error)),
                         }
+                        Self::warn_degraded(delivery, &scope, &batch.coverage);
                         return Ok(FusionOutcome::NoCursor);
                     }
                     let checkpoint = batch.checkpoint.accepted(crossed).cloned();
                     validate_checkpoint_envelope(checkpoint.as_ref())?;
                     walk.accept(checkpoint.clone());
-                    if let Some(tx) = &changes_tx {
-                        match self.forward_inventory_batch(tx, &scope, &batch, checkpoint) {
-                            Ok(Forwarded::Published) => {}
-                            Ok(Forwarded::Refused(claim)) => {
-                                return self.refused(&scope, &changes_tx, claim).await;
-                            }
-                            Err(error) => return Ok(FusionOutcome::Terminated(error)),
+                    match self.forward_inventory_batch(delivery, &scope, &batch, checkpoint) {
+                        Ok(Forwarded::Published) => {}
+                        Ok(Forwarded::Refused(claim)) => {
+                            return self.refused(&scope, delivery, claim).await;
                         }
+                        Err(error) => return Ok(FusionOutcome::Terminated(error)),
                     }
                 }
                 // A producer-emitted warning is forwarded, not absorbed. Graph
@@ -419,15 +335,7 @@ impl InventoryFusion {
                 // so whichever lane reached it first consumed it, and the
                 // other could never re-emit.
                 bifrost_types::InventoryEvent::Warning(warning) => {
-                    if let Some(tx) = &changes_tx {
-                        let me = MultiplexerEvent {
-                            scope: EventScope::Cursor(scope.clone()),
-                            event: Arc::new(SyncEvent::Warning(warning)),
-                            checkpoint: None,
-                            publication: None,
-                        };
-                        let _ = tx.sender().send(me);
-                    }
+                    delivery.publish_warning(EventScope::Cursor(scope.clone()), warning);
                 }
                 bifrost_types::InventoryEvent::Progress(_) => {}
                 _ => {}
@@ -436,71 +344,42 @@ impl InventoryFusion {
         // The stream ended with neither `Done` nor `Terminated`: a producer
         // breaking its contract. No cursor is established, and the reason is
         // surfaced, the same way the backfill runner surfaces it.
-        if let Some(tx) = &changes_tx {
-            let _ = tx.sender().send(MultiplexerEvent {
-                scope: EventScope::Cursor(scope.clone()),
-                event: Arc::new(SyncEvent::Warning(
-                    crate::inventory_walk::unannounced_end_warning(),
-                )),
-                checkpoint: None,
-                publication: None,
-            });
-        }
+        delivery.publish_warning(
+            EventScope::Cursor(scope.clone()),
+            crate::inventory_walk::unannounced_end_warning(),
+        );
         Ok(FusionOutcome::NoCursor)
     }
 
-    fn warn_invalidated(scope: &CursorScope, delivery: &Option<Arc<ChangeDelivery>>) {
-        if let Some(tx) = delivery {
-            let _ = tx.sender().send(MultiplexerEvent {
-                scope: EventScope::Cursor(scope.clone()),
-                event: Arc::new(SyncEvent::Warning(bifrost_types::Warning::user_safe(
-                    bifrost_types::WarningKind::Other,
-                    "inventory walk superseded by a reset or deletion of its scope",
-                ))),
-                checkpoint: None,
-                publication: None,
-            });
-        }
+    fn warn_invalidated(scope: &CursorScope, delivery: &Arc<ChangeDelivery>) {
+        delivery.publish_warning(
+            EventScope::Cursor(scope.clone()),
+            bifrost_types::Warning::user_safe(
+                bifrost_types::WarningKind::Other,
+                "inventory walk superseded by a reset or deletion of its scope",
+            ),
+        );
     }
 
-    /// Whether the scope fence has moved off `expected_fence`. A point-in-time
-    /// read, for publications the conditional registration does not judge;
-    /// `false` when there is no coverage ledger to read.
+    /// Point-in-time fence check for batches that carry no checkpoint.
+    /// Checkpoint-bearing pages use conditional registration instead.
     fn fence_moved(&self, scope: &CursorScope) -> bool {
-        self.coverage
-            .as_ref()
-            .is_some_and(|coverage| coverage.scope_fence(scope) != self.expected_fence)
+        self.publisher.coverage.scope_fence(scope) != self.expected_fence
     }
 
     async fn refused(
         &self,
         scope: &CursorScope,
-        delivery: &Option<Arc<ChangeDelivery>>,
+        delivery: &Arc<ChangeDelivery>,
         claim: crate::cursor::CoverageClaim,
     ) -> Result<FusionOutcome, Error> {
         if let Err(error) =
-            crate::inventory_walk::record_refused_debt(self.writer_tx.as_ref(), claim).await
+            crate::inventory_walk::record_refused_debt(Some(&self.publisher.writer_tx), claim).await
         {
             tracing::warn!(%error, "could not record refused inventory debt");
         }
         Self::warn_invalidated(scope, delivery);
         Ok(FusionOutcome::Invalidated)
-    }
-
-    /// Release both halves of a publication nothing can ever acknowledge.
-    ///
-    /// Through `control` when there is one, because it also republishes
-    /// generation-specific quiescence. Both retirement doors release the
-    /// boundary registration and preserve debt together.
-    fn retire_claim(&self, publication: Option<crate::cursor::PublicationId>) {
-        let Some(id) = publication else {
-            return;
-        };
-        if let Some(control) = &self.control {
-            control.retire_publication(id);
-        } else if let Some(pending) = &self.coverage {
-            pending.retire(id);
-        }
     }
 
     /// Persist the blocked-progress incidents in `coverage`.
@@ -524,7 +403,7 @@ impl InventoryFusion {
         resume_from: Option<Checkpoint>,
     ) -> Result<(), Error> {
         let result = crate::inventory_walk::record_barriers(
-            self.writer_tx.as_ref(),
+            Some(&self.publisher.writer_tx),
             coverage,
             self.generation,
             resume_from,
@@ -548,7 +427,7 @@ impl InventoryFusion {
     /// and converging, but objects are known-missing and only an operator can
     /// decide whether to repair, wait, or accept the gap.
     fn warn_degraded(
-        changes_tx: &Option<Arc<ChangeDelivery>>,
+        delivery: &Arc<ChangeDelivery>,
         scope: &CursorScope,
         coverage: &bifrost_types::InventoryCoverageReport,
     ) {
@@ -556,7 +435,7 @@ impl InventoryFusion {
             return;
         }
         let obligations = coverage.obligations();
-        let Some(tx) = changes_tx else { return };
+        let tx = delivery;
         let barriers = obligations
             .iter()
             .filter(|obligation| obligation.is_barrier())
@@ -576,12 +455,7 @@ impl InventoryFusion {
                 )
             },
         );
-        let _ = tx.sender().send(MultiplexerEvent {
-            scope: EventScope::Cursor(scope.clone()),
-            event: Arc::new(SyncEvent::Warning(warning)),
-            checkpoint: None,
-            publication: None,
-        });
+        tx.publish_warning(EventScope::Cursor(scope.clone()), warning);
     }
 
     /// Forward a page's entries, publishing `checkpoint` with them.
@@ -596,32 +470,17 @@ impl InventoryFusion {
         batch: &bifrost_types::InventoryBatch,
         checkpoint: Option<Checkpoint>,
     ) -> Result<Forwarded, AccountError> {
-        // Only a checkpoint published through `control` is judged by the
-        // conditional registration, under the coverage lock. Everything else - a
-        // checkpoint-less batch, or any batch of a fusion with no control - mints
-        // nothing, so it is judged here, point-in-time, before anything is sent.
-        // A checkpoint-bearing batch refused here hands back its coverage, as the
-        // conditional registration would, so its debt still reaches the writer.
-        let registers = checkpoint.is_some() && self.control.is_some();
-        if !registers && self.fence_moved(scope) {
-            return Ok(Forwarded::Refused(if checkpoint.is_some() {
-                crate::cursor::CoverageClaim::new(batch.coverage.clone(), self.generation)
-            } else {
-                crate::cursor::CoverageClaim {
-                    reports: Vec::new(),
-                    generation: self.generation,
-                }
+        // Checkpoint-free batches mint no claim, but still belong to the walk.
+        if checkpoint.is_none() && self.fence_moved(scope) {
+            return Ok(Forwarded::Refused(crate::cursor::CoverageClaim {
+                reports: Vec::new(),
+                generation: self.generation,
             }));
         }
         let removals = match crate::inventory_walk::removals(scope, batch.removed.iter()) {
             Ok(removals) => removals,
             Err(error) => {
-                let _ = tx.sender().send(MultiplexerEvent {
-                    scope: EventScope::Cursor(scope.clone()),
-                    event: Arc::new(SyncEvent::Terminated(error.clone())),
-                    checkpoint: None,
-                    publication: None,
-                });
+                tx.publish_terminated(EventScope::Cursor(scope.clone()), error.clone());
                 return Err(error);
             }
         };
@@ -650,25 +509,22 @@ impl InventoryFusion {
         // not just the terminal completion: Graph checkpoints per page, so
         // waiting for `Done` would let a page checkpoint become durable across
         // a gap it never declared.
-        let publication = match (&self.control, &checkpoint) {
-            (Some(control), Some(checkpoint)) => match control.publish_checkpoint_if_fence(
-                checkpoint.clone(),
-                crate::cursor::CoverageClaim::new(batch.coverage.clone(), self.generation),
-                self.expected_fence,
-            ) {
-                Ok(id) => Some(id),
-                Err(claim) => return Ok(Forwarded::Refused(claim)),
-            },
-            _ => None,
-        };
         let me = MultiplexerEvent {
             scope: EventScope::Cursor(scope.clone()),
             event: Arc::new(SyncEvent::Batch(synthetic)),
-            checkpoint,
-            publication: publication.clone(),
+            checkpoint: checkpoint.clone(),
+            publication: None,
         };
-        if !tx.publish_acknowledgeable(me) {
-            self.retire_claim(publication);
+        if checkpoint.is_some() {
+            if let Err(claim) = self.publisher.publish_page(
+                me,
+                crate::cursor::CoverageClaim::new(batch.coverage.clone(), self.generation),
+                self.expected_fence,
+            ) {
+                return Ok(Forwarded::Refused(claim));
+            }
+        } else {
+            tx.publish_unacked(me);
         }
         Ok(Forwarded::Published)
     }
@@ -688,9 +544,7 @@ impl InventoryFusion {
             )));
         }
         if !self.cursors.put_if(cursor, || {
-            self.coverage
-                .as_ref()
-                .is_none_or(|coverage| coverage.scope_fence(&expected_scope) == self.expected_fence)
+            self.publisher.coverage.scope_fence(&expected_scope) == self.expected_fence
         }) {
             return Ok(FusionOutcome::Invalidated);
         }
@@ -702,8 +556,9 @@ impl InventoryFusion {
 ///
 /// A `Change` cursor is the point of the fusion path and is validated. A
 /// `Backfill` checkpoint is REFUSED, and that refusal is the whole reason this
-/// arm exists: fusion registers the publication and then sends on the RAW sender,
-/// so the entry is never stamped with a delivery. A `Lane::Backfill` entry whose
+/// arm exists: fusion is a change-cursor establishment walk and has no backfill
+/// admission. Sending a backfill checkpoint through the unstamped change path
+/// would leave it without a delivery stamp. A `Lane::Backfill` entry whose
 /// `delivered_at` stays `None` for ever is charged against the account's backfill
 /// bound and can be freed only by an acknowledgement, a lag or a reset - the
 /// receiver-drop sweep will not touch it, because an unsent page is deliberately
@@ -743,16 +598,9 @@ fn inventory_cursor_contract_error(scope: CursorScope) -> bifrost_types::Account
 fn forward_resume_contract_failure(
     scope: &CursorScope,
     error: bifrost_types::AccountError,
-    delivery: Option<&Arc<ChangeDelivery>>,
+    delivery: &Arc<ChangeDelivery>,
 ) -> FusionOutcome {
-    if let Some(tx) = delivery {
-        let _ = tx.sender().send(MultiplexerEvent {
-            scope: EventScope::Cursor(scope.clone()),
-            event: Arc::new(SyncEvent::Terminated(error.clone())),
-            checkpoint: None,
-            publication: None,
-        });
-    }
+    delivery.publish_terminated(EventScope::Cursor(scope.clone()), error.clone());
     FusionOutcome::Terminated(error)
 }
 
@@ -802,18 +650,23 @@ mod tests {
             Arc::clone(&coverage),
         );
         let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let delivery = Arc::new(ChangeDelivery::new(tx));
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(4);
+        drop(writer_rx);
         (
             InventoryFusion {
                 expected_fence: crate::cursor::PendingCoverage::initial_fence(),
                 account_id: bifrost_types::AccountId("guarded".into()),
                 cursors: Arc::new(CursorRegistry::new()),
-                control: Some(control),
-                coverage: Some(coverage),
-                writer_tx: None,
+                publisher: super::super::PagePublisher::new(
+                    Arc::clone(&delivery),
+                    control,
+                    writer_tx,
+                    tokio_util::sync::CancellationToken::new(),
+                ),
                 generation: crate::cursor::WalkGeneration::for_test(1),
-                shutdown: None,
             },
-            Arc::new(ChangeDelivery::new(tx)),
+            delivery,
             rx,
             (view, p, b),
         )
@@ -875,9 +728,9 @@ mod tests {
     }
     #[tokio::test]
     async fn a_fusion_page_under_a_moved_fence_is_refused_and_its_debt_recorded() {
-        let (mut fusion, delivery, mut rx, _views) = guarded_fusion();
+        let (mut fusion, _delivery, mut rx, _views) = guarded_fusion();
         let (tx, mut requests) = tokio::sync::mpsc::channel(4);
-        fusion.writer_tx = Some(tx);
+        fusion.publisher.writer_tx = tx;
         let writer = tokio::spawn(async move {
             let mut count = 0;
             while let Some(request) = requests.recv().await {
@@ -892,28 +745,19 @@ mod tests {
             count
         });
         fusion
+            .publisher
             .coverage
-            .as_ref()
-            .expect("coverage")
             .raise_scope_fence(&CursorScope::Account);
         let outcome = fusion
             .run_stream(
                 CursorScope::Account,
                 Box::pin(futures::stream::iter([page(true, true), clean_done()])),
-                Some(delivery),
             )
             .await
             .expect("walk");
         assert!(matches!(outcome, FusionOutcome::Invalidated));
         assert!(fusion.cursors.snapshot(&CursorScope::Account).is_none());
-        assert_eq!(
-            fusion
-                .coverage
-                .as_ref()
-                .expect("coverage")
-                .pending_checkpoints(),
-            0
-        );
+        assert_eq!(fusion.publisher.coverage.pending_checkpoints(), 0);
         while let Ok(event) = rx.try_recv() {
             assert!(matches!(event.event.as_ref(), SyncEvent::Warning(_)));
         }
@@ -922,8 +766,8 @@ mod tests {
     }
     #[tokio::test]
     async fn a_fusion_done_under_a_moved_fence_is_neither_published_nor_installed() {
-        let (fusion, delivery, mut rx, _views) = guarded_fusion();
-        let coverage = fusion.coverage.clone().expect("coverage");
+        let (fusion, _delivery, mut rx, _views) = guarded_fusion();
+        let coverage = Arc::clone(&fusion.publisher.coverage);
         let stream = futures::stream::unfold(0, move |n| {
             let coverage = Arc::clone(&coverage);
             async move {
@@ -939,7 +783,7 @@ mod tests {
         });
         assert!(matches!(
             fusion
-                .run_stream(CursorScope::Account, Box::pin(stream), Some(delivery))
+                .run_stream(CursorScope::Account, Box::pin(stream))
                 .await
                 .expect("walk"),
             FusionOutcome::Invalidated
@@ -953,9 +797,8 @@ mod tests {
     async fn a_fusion_finalize_under_a_moved_fence_installs_nothing() {
         let (fusion, _, _, _views) = guarded_fusion();
         fusion
+            .publisher
             .coverage
-            .as_ref()
-            .expect("coverage")
             .raise_scope_fence(&CursorScope::Account);
         assert!(matches!(
             fusion
@@ -974,18 +817,16 @@ mod tests {
     }
     #[tokio::test]
     async fn a_fusion_forwards_no_batch_once_its_fence_has_moved() {
-        let (fusion, delivery, mut rx, _views) = guarded_fusion();
+        let (fusion, _delivery, mut rx, _views) = guarded_fusion();
         fusion
+            .publisher
             .coverage
-            .as_ref()
-            .expect("coverage")
             .raise_scope_fence(&CursorScope::Account);
         assert!(matches!(
             fusion
                 .run_stream(
                     CursorScope::Account,
-                    Box::pin(futures::stream::iter([page(false, false), clean_done()])),
-                    Some(delivery)
+                    Box::pin(futures::stream::iter([page(false, false), clean_done()]))
                 )
                 .await
                 .expect("walk"),
@@ -997,15 +838,13 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// With no `control` there is no conditional registration to refuse a
-    /// checkpoint-bearing page, so the fence is read before it is sent: a
-    /// moved fence withholds the page and still routes its debt.
+    /// A stub writer exercises the same conditional registration as production:
+    /// a moved fence withholds the page and still routes its debt.
     #[tokio::test]
-    async fn a_controlless_fusion_withholds_a_checkpoint_page_once_its_fence_has_moved() {
-        let (mut fusion, delivery, mut rx, _views) = guarded_fusion();
-        fusion.control = None;
+    async fn a_fusion_with_a_stub_writer_refuses_a_stale_checkpoint_page() {
+        let (mut fusion, _delivery, mut rx, _views) = guarded_fusion();
         let (tx, mut requests) = tokio::sync::mpsc::channel(4);
-        fusion.writer_tx = Some(tx);
+        fusion.publisher.writer_tx = tx;
         let writer = tokio::spawn(async move {
             let mut count = 0;
             while let Some(request) = requests.recv().await {
@@ -1020,15 +859,13 @@ mod tests {
             count
         });
         fusion
+            .publisher
             .coverage
-            .as_ref()
-            .expect("coverage")
             .raise_scope_fence(&CursorScope::Account);
         let outcome = fusion
             .run_stream(
                 CursorScope::Account,
                 Box::pin(futures::stream::iter([page(true, true), clean_done()])),
-                Some(delivery),
             )
             .await
             .expect("walk");
@@ -1041,23 +878,19 @@ mod tests {
         assert_eq!(writer.await.expect("writer"), 1);
     }
 
-    /// The `Done` arm's counterpart: with no `control`, a terminal checkpoint
-    /// under a moved fence is not broadcast, and nothing is installed.
+    /// The terminal checkpoint uses the same fence guard with a stub writer.
     #[tokio::test]
-    async fn a_controlless_fusion_withholds_its_done_once_its_fence_has_moved() {
-        let (mut fusion, delivery, mut rx, _views) = guarded_fusion();
-        fusion.control = None;
+    async fn a_fusion_with_a_stub_writer_refuses_a_stale_done() {
+        let (fusion, _delivery, mut rx, _views) = guarded_fusion();
         fusion
+            .publisher
             .coverage
-            .as_ref()
-            .expect("coverage")
             .raise_scope_fence(&CursorScope::Account);
         assert!(matches!(
             fusion
                 .run_stream(
                     CursorScope::Account,
-                    Box::pin(futures::stream::iter([clean_done()])),
-                    Some(delivery)
+                    Box::pin(futures::stream::iter([clean_done()]))
                 )
                 .await
                 .expect("walk"),
@@ -1176,7 +1009,7 @@ mod tests {
         let delivery = Arc::new(ChangeDelivery::new(sender));
 
         let FusionOutcome::Terminated(outcome_error) =
-            forward_resume_contract_failure(&scope, error, Some(&delivery))
+            forward_resume_contract_failure(&scope, error, &delivery)
         else {
             panic!("a resume disagreement must enter scoped recovery")
         };
@@ -1220,16 +1053,9 @@ mod tests {
     fn fusion_with_writer(
         writer_tx: tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>,
     ) -> InventoryFusion {
-        InventoryFusion {
-            expected_fence: crate::cursor::PendingCoverage::initial_fence(),
-            account_id: bifrost_types::AccountId("fusion-unit".into()),
-            cursors: Arc::new(CursorRegistry::new()),
-            control: None,
-            coverage: None,
-            writer_tx: Some(writer_tx),
-            generation: crate::cursor::WalkGeneration::for_test(1),
-            shutdown: None,
-        }
+        let (mut fusion, _delivery, _receiver, _views) = guarded_fusion();
+        fusion.publisher.writer_tx = writer_tx;
+        fusion
     }
 
     /// A walk parked on a provider stream that neither yields nor ends leaves
@@ -1242,10 +1068,8 @@ mod tests {
     async fn shutdown_cuts_a_walk_parked_on_its_provider_stream() {
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(4);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let fusion = InventoryFusion {
-            shutdown: Some(shutdown.clone()),
-            ..fusion_with_writer(writer_tx)
-        };
+        let mut fusion = fusion_with_writer(writer_tx);
+        fusion.publisher.shutdown = shutdown.clone();
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
         struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
         impl Drop for OnDrop {
@@ -1262,7 +1086,7 @@ mod tests {
                 event
             }));
 
-        let walk = fusion.run_stream(CursorScope::Account, stream, None);
+        let walk = fusion.run_stream(CursorScope::Account, stream);
         tokio::pin!(walk);
         // Poll the walk once, so it is genuinely parked in the provider poll
         // before the cancel lands.
@@ -1300,7 +1124,7 @@ mod tests {
     #[tokio::test]
     async fn an_inventory_warning_reaches_the_change_stream() {
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(4);
-        let fusion = fusion_with_writer(writer_tx);
+        let mut fusion = fusion_with_writer(writer_tx);
         let warning = bifrost_types::Warning::support_only(
             bifrost_types::WarningKind::StrategyDowngraded,
             "QResync->Condstore",
@@ -1314,14 +1138,11 @@ mod tests {
                     bifrost_types::PartitionEnd::Exhausted,
                 )),
             ]));
-        let (changes_tx, mut changes_rx) = tokio::sync::broadcast::channel(8);
+        let (tx, mut changes_rx) = tokio::sync::broadcast::channel(8);
+        fusion.publisher.delivery = Arc::new(ChangeDelivery::new(tx));
 
         fusion
-            .run_stream(
-                CursorScope::Account,
-                stream,
-                Some(Arc::new(ChangeDelivery::new(changes_tx))),
-            )
+            .run_stream(CursorScope::Account, stream)
             .await
             .expect("a clean walk carrying a warning still completes");
 
@@ -1342,17 +1163,14 @@ mod tests {
     #[tokio::test]
     async fn a_walk_that_ends_silently_warns_and_establishes_nothing() {
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(4);
-        let fusion = fusion_with_writer(writer_tx);
+        let mut fusion = fusion_with_writer(writer_tx);
         let stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent> =
             Box::pin(futures::stream::empty());
-        let (changes_tx, mut changes_rx) = tokio::sync::broadcast::channel(8);
+        let (tx, mut changes_rx) = tokio::sync::broadcast::channel(8);
+        fusion.publisher.delivery = Arc::new(ChangeDelivery::new(tx));
 
         let outcome = fusion
-            .run_stream(
-                CursorScope::Account,
-                stream,
-                Some(Arc::new(ChangeDelivery::new(changes_tx))),
-            )
+            .run_stream(CursorScope::Account, stream)
             .await
             .expect("a silent end is not an engine error");
         assert!(matches!(outcome, FusionOutcome::NoCursor), "{outcome:?}");
@@ -1380,7 +1198,7 @@ mod tests {
                 }
             }
         });
-        let fusion = fusion_with_writer(tx);
+        let mut fusion = fusion_with_writer(tx);
         let stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent> =
             Box::pin(futures::stream::iter(vec![
                 bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(
@@ -1389,15 +1207,10 @@ mod tests {
                     bifrost_types::PartitionEnd::Exhausted,
                 )),
             ]));
-        let (changes_tx, mut changes_rx) = tokio::sync::broadcast::channel(8);
+        let (tx, mut changes_rx) = tokio::sync::broadcast::channel(8);
+        fusion.publisher.delivery = Arc::new(ChangeDelivery::new(tx));
 
-        let outcome = fusion
-            .run_stream(
-                CursorScope::Account,
-                stream,
-                Some(Arc::new(ChangeDelivery::new(changes_tx))),
-            )
-            .await;
+        let outcome = fusion.run_stream(CursorScope::Account, stream).await;
         assert!(
             outcome.is_err(),
             "a barrier the store refused must fail the walk, not conclude it"
@@ -1427,7 +1240,7 @@ mod tests {
             ]));
 
         let outcome = fusion
-            .run_stream(CursorScope::Account, stream, None)
+            .run_stream(CursorScope::Account, stream)
             .await
             .expect("a departed writer is not a store failure");
         assert!(matches!(outcome, FusionOutcome::NoCursor));
@@ -1472,7 +1285,7 @@ mod tests {
             let stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent> =
                 Box::pin(futures::stream::iter(vec![event]));
             let outcome = fusion_with_writer(tx)
-                .run_stream(CursorScope::Account, stream, None)
+                .run_stream(CursorScope::Account, stream)
                 .await
                 .expect("a contract violation is an outcome, not an engine error");
             let FusionOutcome::Terminated(error) = outcome else {

@@ -372,6 +372,7 @@ fn problem_details_from_every_body_bearing_transport_error() {
         bifrost_net::Error::RetryBudgetExhausted {
             final_response: Some(final_response(reqwest::StatusCode::SERVICE_UNAVAILABLE)),
             retry_after_history: Vec::new(),
+            stop_reason: bifrost_net::error::RetryStopReason::AttemptBudget,
         },
     ];
 

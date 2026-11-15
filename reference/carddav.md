@@ -648,7 +648,7 @@ form on read and emitting the form matching the card's version on write.
 CardDAV preserves inline PHOTO data on unrelated updates.
 
 Cursor support is contact-only. `discover_cursor_scopes` returns one
-`CursorScope::Folder(FolderId(collection_href))` per discovered address book,
+`CursorScope::FolderType { folder: FolderId(collection_href), ty: ObjectType::Contact }` per discovered address book,
 and NOTHING when the home holds no collections - an empty walk is an empty
 backend, and a fabricated home scope would point every cursor and inventory
 request at a 404. Scope discovery uses cached collection URLs and sends no
@@ -1027,3 +1027,9 @@ to rebuild without blaming the provider or silently missing mail.
 Payload versions use `PayloadVersion`; change and backfill outer versions use
 `TraitEnvelopeVersion`. These are separate types with explicit numeric access
 for storage; existing wire values are unchanged.
+
+DAV discovery qualifies collection scopes with `ObjectType::Contact` using
+`CursorScope::FolderType`. The type separates collections from IMAP mailboxes
+and the other DAV dialect even when their strings match. Legacy bare folder
+and type scopes remain accepted; collection-qualified cursors validate the
+payload URL and report full coverage just like legacy folder cursors.

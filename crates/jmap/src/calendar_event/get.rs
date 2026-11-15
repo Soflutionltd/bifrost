@@ -27,8 +27,10 @@ impl CalendarEvent {
         self.properties.get("uid")?.as_str()
     }
 
-    pub(crate) fn calendar_ids(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
-        self.properties.get("calendarIds")?.as_object()
+    pub(crate) fn calendar_ids(
+        &self,
+    ) -> Option<crate::core::object_set::ObjectSet<crate::calendar::CalendarId>> {
+        serde_json::from_value(self.properties.get("calendarIds")?.clone()).ok()
     }
 
     pub(crate) fn is_draft(&self) -> Option<bool> {

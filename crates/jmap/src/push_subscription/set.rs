@@ -1,4 +1,4 @@
-use crate::{DataType, core::field::Field, core::set::from_timestamp};
+use crate::{DataType, core::field::Field};
 
 use super::{Keys, PushSubscriptionCreate, PushSubscriptionPatch};
 
@@ -23,8 +23,8 @@ impl PushSubscriptionCreate {
         self
     }
 
-    pub(crate) fn expires(&mut self, expires: i64) -> &mut Self {
-        self.expires = Some(from_timestamp(expires));
+    pub(crate) fn expires(&mut self, expires: jiff::Timestamp) -> &mut Self {
+        self.expires = Some(expires);
         self
     }
 
@@ -40,8 +40,8 @@ impl PushSubscriptionPatch {
         self
     }
 
-    pub(crate) fn expires(&mut self, expires: i64) -> &mut Self {
-        self.expires = Some(from_timestamp(expires));
+    pub(crate) fn expires(&mut self, expires: jiff::Timestamp) -> &mut Self {
+        self.expires = Some(expires);
         self
     }
 

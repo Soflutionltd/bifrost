@@ -18,7 +18,8 @@ use super::GraphAccount;
 use super::graph_error::{self, GraphErrorContext};
 
 const DEFAULT_CONTACTS_ID: &str = "contacts";
-const CONTACT_SELECT: &str = "id,displayName,emailAddresses,businessPhones,homePhones,mobilePhone,homeAddress,businessAddress,otherAddress,companyName,jobTitle,personalNotes,parentFolderId";
+// Typed contact reads need detail fields omitted from the sync identity projection.
+const CONTACT_READ_SELECT: &str = "id,displayName,emailAddresses,businessPhones,homePhones,mobilePhone,homeAddress,businessAddress,otherAddress,companyName,jobTitle,personalNotes,parentFolderId";
 
 pub(crate) async fn address_books_list(
     account: GraphAccount,
@@ -117,7 +118,7 @@ pub(crate) async fn get(
     }
     let prefix = account.client.api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&contact.0);
-    let path = format!("{prefix}/contacts/{encoded}?$select={CONTACT_SELECT}");
+    let path = format!("{prefix}/contacts/{encoded}?$select={CONTACT_READ_SELECT}");
     let contact = account
         .client
         .get_json::<GraphContact>(Resource::Outlook, &path)
@@ -834,12 +835,12 @@ fn contact_search_url(
 fn contacts_path(prefix: &str, address_book: Option<&AddressBookId>, top: u32) -> String {
     match address_book.map(|id| id.0.as_str()) {
         Some(DEFAULT_CONTACTS_ID) | None => {
-            format!("{prefix}/contacts?$select={CONTACT_SELECT}&$top={top}")
+            format!("{prefix}/contacts?$select={CONTACT_READ_SELECT}&$top={top}")
         }
         Some(folder) => {
             let encoded = bifrost_net::url::encode_path_component(folder);
             format!(
-                "{prefix}/contactFolders/{encoded}/contacts?$select={CONTACT_SELECT}&$top={top}"
+                "{prefix}/contactFolders/{encoded}/contacts?$select={CONTACT_READ_SELECT}&$top={top}"
             )
         }
     }
@@ -1907,7 +1908,7 @@ mod tests {
     fn contacts_path_uses_requested_page_size() {
         assert_eq!(
             contacts_path("/me", None, 25),
-            format!("/me/contacts?$select={CONTACT_SELECT}&$top=25")
+            format!("/me/contacts?$select={CONTACT_READ_SELECT}&$top=25")
         );
         assert_eq!(
             contacts_path(
@@ -1916,7 +1917,7 @@ mod tests {
                 10
             ),
             format!(
-                "/me/contactFolders/folder%20with%20spaces/contacts?$select={CONTACT_SELECT}&$top=10"
+                "/me/contactFolders/folder%20with%20spaces/contacts?$select={CONTACT_READ_SELECT}&$top=10"
             )
         );
     }
@@ -1926,7 +1927,7 @@ mod tests {
         assert_eq!(
             contact_search_path("/me", None, "ada@example.test", 25),
             format!(
-                "/me/contacts?$select={CONTACT_SELECT}&$top=25&$filter=emailAddresses%2Fany%28a%3Aa%2Faddress%20eq%20%27ada%40example.test%27%29"
+                "/me/contacts?$select={CONTACT_READ_SELECT}&$top=25&$filter=emailAddresses%2Fany%28a%3Aa%2Faddress%20eq%20%27ada%40example.test%27%29"
             )
         );
         assert_eq!(
@@ -1937,7 +1938,7 @@ mod tests {
                 10
             ),
             format!(
-                "/me/contactFolders/folder/contacts?$select={CONTACT_SELECT}&$top=10&$filter=emailAddresses%2Fany%28a%3Aa%2Faddress%20eq%20%27ada%40example.test%27%29"
+                "/me/contactFolders/folder/contacts?$select={CONTACT_READ_SELECT}&$top=10&$filter=emailAddresses%2Fany%28a%3Aa%2Faddress%20eq%20%27ada%40example.test%27%29"
             )
         );
     }
@@ -1946,11 +1947,11 @@ mod tests {
     fn contact_search_path_keeps_local_scan_for_substring_queries() {
         assert_eq!(
             contact_search_path("/me", None, "ada", 25),
-            format!("/me/contacts?$select={CONTACT_SELECT}&$top=25")
+            format!("/me/contacts?$select={CONTACT_READ_SELECT}&$top=25")
         );
         assert_eq!(
             contact_search_path("/me", None, "ada lovelace@example.test", 25),
-            format!("/me/contacts?$select={CONTACT_SELECT}&$top=25")
+            format!("/me/contacts?$select={CONTACT_READ_SELECT}&$top=25")
         );
     }
 

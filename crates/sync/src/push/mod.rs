@@ -108,12 +108,10 @@ impl InvalidationSink for InvalidationSinkInner {
 }
 
 pub(crate) fn broadcast(target: &SinkTarget, event: SyncEvent<bifrost_types::Change>) {
-    let _ = target.delivery.sender().send(MultiplexerEvent {
-        scope: EventScope::Account,
-        event: Arc::new(event),
-        checkpoint: None,
-        publication: None,
-    });
+    target.delivery.publish_unacked(MultiplexerEvent::unacked(
+        EventScope::Account,
+        Arc::new(event),
+    ));
 }
 
 /// The single synchronous handler for a consumer-injected event. Nothing

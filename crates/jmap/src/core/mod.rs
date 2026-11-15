@@ -201,3 +201,5 @@ macro_rules! __json_object_serde {
 pub(crate) use __json_object_serde;
 #[cfg(any(feature = "contacts", feature = "calendars"))]
 pub(crate) use json_object_struct;
+
+pub(crate) mod object_set;

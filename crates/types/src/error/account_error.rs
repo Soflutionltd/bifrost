@@ -322,6 +322,13 @@ impl AccountError {
         self.inner.message_key
     }
 
+    /// Complete diagnostic evidence, including support-only text.
+    /// Apply the caller's consent policy before exporting this information.
+    #[must_use]
+    pub fn diagnostics(&self) -> &DiagnosticInfo {
+        &self.inner.diagnostics
+    }
+
     pub fn user_safe_text(&self) -> impl Iterator<Item = &str> {
         self.inner
             .diagnostics

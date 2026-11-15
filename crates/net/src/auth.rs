@@ -10,7 +10,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(test)]
+use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 use bifrost_types::{AccountFuture, RetryHint};
 use reqwest::header::RETRY_AFTER;
@@ -786,7 +788,7 @@ fn arc_err_to_error(err: Arc<Error>) -> Error {
         };
     }
     Error::RefreshFailed {
-        retry_after: retry_after_deadline(err.as_ref()),
+        retry_after: retry_after_hint(err.as_ref()),
         source: err,
     }
 }
@@ -801,22 +803,14 @@ fn is_terminal_auth_error(err: &Error) -> bool {
         )
 }
 
-fn retry_after_deadline(err: &Error) -> Option<SystemTime> {
-    let hint = match err {
-        Error::AttemptHistory {
-            source, attempts, ..
-        } => {
-            return retry_after_deadline(source)
-                .or_else(|| attempts.iter().rev().find_map(retry_after_deadline));
+fn retry_after_hint(err: &Error) -> Option<RetryHint> {
+    match err {
+        Error::AttemptHistory { source, evidence } => retry_after_hint(source)
+            .or_else(|| evidence.attempts().iter().rev().find_map(retry_after_hint)),
+        Error::LocalHold { evidence, .. } => {
+            evidence.attempts().iter().rev().find_map(retry_after_hint)
         }
-        Error::LocalHold { attempts, .. } => {
-            return attempts.iter().rev().find_map(retry_after_deadline);
-        }
-        Error::RateLimited {
-            retry_after,
-            final_response,
-        } => parse_retry_after_hint(final_response.headers.get(RETRY_AFTER))
-            .or_else(|| retry_after.map(RetryHint::After)),
+        Error::RateLimited { retry_after, .. } => *retry_after,
         Error::Status { code, headers, .. }
             if *code == reqwest::StatusCode::TOO_MANY_REQUESTS
                 || *code == reqwest::StatusCode::SERVICE_UNAVAILABLE =>
@@ -824,23 +818,13 @@ fn retry_after_deadline(err: &Error) -> Option<SystemTime> {
             parse_retry_after_hint(headers.get(RETRY_AFTER))
         }
         Error::RetryBudgetExhausted {
-            final_response: Some(final_response),
             retry_after_history,
-        } if final_response.status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            || final_response.status == reqwest::StatusCode::SERVICE_UNAVAILABLE =>
-        {
-            parse_retry_after_hint(final_response.headers.get(RETRY_AFTER))
-                .or_else(|| retry_after_history.last().copied().map(RetryHint::After))
-        }
+            ..
+        } => retry_after_history.last().copied(),
         Error::RefreshFailed {
             retry_after,
             source,
-        } => return (*retry_after).or_else(|| retry_after_deadline(source)),
-        _ => None,
-    }?;
-    match hint {
-        RetryHint::After(delay) => SystemTime::now().checked_add(delay),
-        RetryHint::At(at) => Some(at),
+        } => (*retry_after).or_else(|| retry_after_hint(source)),
         _ => None,
     }
 }
@@ -1376,30 +1360,20 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_deadline_parses_status_header() {
+    fn retry_after_hint_parses_status_header() {
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, HeaderValue::from_static("30"));
-        let before = SystemTime::now();
-        let deadline = retry_after_deadline(&Error::Status {
+        let hint = retry_after_hint(&Error::Status {
             code: reqwest::StatusCode::TOO_MANY_REQUESTS,
             body: Bytes::new(),
             headers,
         })
-        .expect("retry-after deadline should parse");
-        let after = SystemTime::now();
-
-        let lower = before
-            .checked_add(Duration::from_secs(30))
-            .expect("test lower bound in range");
-        let upper = after
-            .checked_add(Duration::from_secs(30))
-            .expect("test upper bound in range");
-        assert!(deadline >= lower);
-        assert!(deadline <= upper);
+        .expect("retry-after hint should parse");
+        assert_eq!(hint, RetryHint::After(Duration::from_secs(30)));
     }
 
     #[test]
-    fn retry_after_deadline_preserves_an_elapsed_http_date() {
+    fn retry_after_hint_preserves_an_elapsed_http_date() {
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_234);
         let date = httpdate::fmt_http_date(at);
         let mut headers = HeaderMap::new();
@@ -1409,18 +1383,18 @@ mod tests {
         );
 
         assert_eq!(
-            retry_after_deadline(&Error::Status {
+            retry_after_hint(&Error::Status {
                 code: reqwest::StatusCode::TOO_MANY_REQUESTS,
                 body: Bytes::new(),
                 headers,
             }),
-            Some(at),
+            Some(RetryHint::At(at)),
             "an elapsed date is still a retry deadline, not an absent hint"
         );
     }
 
     #[test]
-    fn retry_after_deadline_finds_a_hint_in_prior_attempt_history() {
+    fn retry_after_hint_finds_a_hint_in_prior_attempt_history() {
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_234);
         let date = httpdate::fmt_http_date(at);
         let mut headers = HeaderMap::new();
@@ -1430,18 +1404,20 @@ mod tests {
         );
 
         assert_eq!(
-            retry_after_deadline(&Error::AttemptHistory {
+            retry_after_hint(&Error::AttemptHistory {
                 source: Box::new(Error::Timeout {
                     transmission_state: bifrost_types::TransmissionState::Unsent,
                 }),
-                attempts: vec![Error::Status {
-                    code: reqwest::StatusCode::TOO_MANY_REQUESTS,
-                    body: Bytes::new(),
-                    headers,
-                }],
-                may_have_committed: false,
+                evidence: crate::RequestEvidence::new(
+                    vec![Error::Status {
+                        code: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                        body: Bytes::new(),
+                        headers,
+                    }],
+                    crate::CommitEvidence::Unsent,
+                ),
             }),
-            Some(at),
+            Some(RetryHint::At(at)),
             "a later local failure must retain the last response's retry date"
         );
     }

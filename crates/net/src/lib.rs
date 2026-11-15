@@ -51,7 +51,9 @@ pub mod url;
 pub use account_error::{
     NetErrorContext, into_account_error_with_throttle_scope, token_source_account_error,
 };
-pub use attempt::{AttemptLedger, AttemptOutcome, CommitEvidence, is_proven_refusal};
+pub use attempt::{
+    AttemptLedger, AttemptOutcome, CommitEvidence, RequestEvidence, is_proven_refusal,
+};
 pub use auth::{
     AccessToken, CoordinatedTokenSource, OAuthRefresher, RefreshState, StaticTokenSource,
     TokenSource, coordinate,
@@ -70,10 +72,14 @@ pub use budget::{BandwidthBudget, BandwidthDirection, BandwidthRegistry, Reserva
 // bifrost-types is optional could otherwise construct the error only in the
 // configurations where some other feature happened to pull the spelling in,
 // which is a feature-graph accident rather than a contract.
-pub use bifrost_types::{AccountFuture, AccountId, ByteRange, Priority, TransmissionState};
+pub use bifrost_types::{
+    AccountFuture, AccountId, ByteRange, Priority, RetryHint, TransmissionState,
+};
 pub use concurrency::ConcurrencyLimit;
 pub use config::{DEFAULT_MAX_BUFFERED_RESPONSE, NetConfig};
-pub use error::{Error, FinalResponse, MalformedRedirectKind, RangeFailureKind, STATUS_BODY_CAP};
+pub use error::{
+    Error, FinalResponse, MalformedRedirectKind, RangeFailureKind, RetryStopReason, STATUS_BODY_CAP,
+};
 pub use hold::{Held, HoldDeadline, HoldKind, SharedHold};
 pub use http::Method;
 pub use metered_stream::MeteredStream;

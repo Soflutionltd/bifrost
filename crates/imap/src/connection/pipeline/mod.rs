@@ -158,10 +158,10 @@ impl<'conn, T> Pipeline<'conn, T> {
     /// reclassified as events.
     pub fn list_extended(
         mut self,
-        selection_options: Vec<String>,
+        selection_options: Vec<crate::types::command_options::ListSelect>,
         reference: String,
         patterns: Vec<String>,
-        return_options: Vec<String>,
+        return_options: Vec<crate::types::command_options::ListReturn>,
     ) -> Pipeline<'conn, (Result<Vec<MailboxInfo>, Error>, T)> {
         let consumer = dispatch::ListExtendedConsumer::new(selection_options.clone());
         self.commands.push(Command::ListExtended {
@@ -185,9 +185,9 @@ impl<'conn, T> Pipeline<'conn, T> {
         fn list_status(
             reference: String,
             pattern: String,
-            status_items: String,
+            status_items: impl Into<crate::types::command_options::StatusItems>,
         ) -> Result<Vec<crate::types::ListStatusEntry>, Error>;
-        command = Command::ListStatus { reference: reference.into(), pattern: pattern.into(), status_items };
+        command = Command::ListStatus { reference: reference.into(), pattern: pattern.into(), status_items: status_items.into() };
         consumer = dispatch::ListStatusConsumer::new();
     }
 
@@ -245,8 +245,8 @@ impl<'conn, T> Pipeline<'conn, T> {
 
     pipeline_method! {
         /// STATUS command (RFC 3501 Section6.3.10).
-        fn status(mailbox: MailboxName, items: String) -> StatusResult;
-        command = Command::Status { mailbox, items };
+        fn status(mailbox: MailboxName, items: impl Into<crate::types::command_options::StatusItems>) -> StatusResult;
+        command = Command::Status { mailbox, items: items.into() };
         consumer = dispatch::StatusConsumer::new();
     }
 
@@ -282,25 +282,25 @@ impl<'conn, T> Pipeline<'conn, T> {
 
     pipeline_method! {
         /// SEARCH command (RFC 3501 Section6.4.4).
-        fn search(criteria: String) -> Result<SearchResult, Error>;
-        command = Command::Search { criteria };
+        fn search(criteria: impl Into<crate::types::SearchCriteria>) -> Result<SearchResult, Error>;
+        command = Command::Search { criteria: criteria.into() };
         consumer = dispatch::SearchConsumer::new();
     }
 
     pipeline_method! {
         /// SEARCH RETURN command (RFC 4731 Section3.2).
         fn search_return(
-            criteria: String,
-            return_opts: Vec<String>,
+            criteria: impl Into<crate::types::SearchCriteria>,
+            return_opts: Vec<crate::types::command_options::SearchReturn>,
         ) -> Result<EsearchResponse, Error>;
-        command = Command::SearchReturn { criteria, return_opts };
+        command = Command::SearchReturn { criteria: criteria.into(), return_opts };
         consumer = dispatch::EsearchConsumer::new();
     }
 
     pipeline_method! {
         /// SEARCH RETURN (SAVE) command (RFC 5182 Section2).
-        fn search_save(criteria: String) -> Result<(), Error>;
-        command = Command::SearchSave { criteria };
+        fn search_save(criteria: impl Into<crate::types::SearchCriteria>) -> Result<(), Error>;
+        command = Command::SearchSave { criteria: criteria.into() };
         consumer = dispatch::SearchSaveConsumer::new();
     }
 
@@ -308,10 +308,10 @@ impl<'conn, T> Pipeline<'conn, T> {
         /// FETCH command (RFC 3501 Section6.4.5).
         fn fetch(
             sequence_set: SequenceSet,
-            items: String,
+            items: impl Into<crate::types::fetch::FetchItems>,
             changed_since: Option<u64>,
         ) -> Vec<FetchResponse>;
-        command = Command::Fetch { sequence_set, items, changed_since };
+        command = Command::Fetch { sequence_set, items: items.into(), changed_since };
         consumer = dispatch::FetchConsumer::new();
     }
 
@@ -347,25 +347,25 @@ impl<'conn, T> Pipeline<'conn, T> {
 
     pipeline_method! {
         /// UID SEARCH command (RFC 3501 Section6.4.4).
-        fn uid_search(criteria: String) -> Result<SearchResult, Error>;
-        command = Command::UidSearch { criteria };
+        fn uid_search(criteria: impl Into<crate::types::SearchCriteria>) -> Result<SearchResult, Error>;
+        command = Command::UidSearch { criteria: criteria.into() };
         consumer = dispatch::SearchConsumer::new();
     }
 
     pipeline_method! {
         /// UID SEARCH RETURN command (RFC 4731 Section3.2).
         fn uid_search_return(
-            criteria: String,
-            return_opts: Vec<String>,
+            criteria: impl Into<crate::types::SearchCriteria>,
+            return_opts: Vec<crate::types::command_options::SearchReturn>,
         ) -> Result<EsearchResponse, Error>;
-        command = Command::UidSearchReturn { criteria, return_opts };
+        command = Command::UidSearchReturn { criteria: criteria.into(), return_opts };
         consumer = dispatch::EsearchConsumer::new();
     }
 
     pipeline_method! {
         /// UID SEARCH RETURN (SAVE) command (RFC 5182 Section2).
-        fn uid_search_save(criteria: String) -> Result<(), Error>;
-        command = Command::UidSearchSave { criteria };
+        fn uid_search_save(criteria: impl Into<crate::types::SearchCriteria>) -> Result<(), Error>;
+        command = Command::UidSearchSave { criteria: criteria.into() };
         consumer = dispatch::SearchSaveConsumer::new();
     }
 
@@ -381,7 +381,7 @@ impl<'conn, T> Pipeline<'conn, T> {
     pub fn uid_fetch(
         mut self,
         sequence_set: SequenceSet,
-        items: String,
+        items: impl Into<crate::types::fetch::FetchItems>,
         changed_since: Option<u64>,
         vanished: bool,
     ) -> Pipeline<'conn, ((Vec<FetchResponse>, Vec<UidRange>), T)> {
@@ -389,7 +389,7 @@ impl<'conn, T> Pipeline<'conn, T> {
         let parsed_set = ParsedUidSet::new(&sequence_set);
         self.commands.push(Command::UidFetch {
             sequence_set,
-            items,
+            items: items.into(),
             changed_since,
             vanished,
         });
@@ -485,29 +485,29 @@ impl<'conn, T> Pipeline<'conn, T> {
 
     pipeline_method! {
         /// THREAD command (RFC 5256 Section3).
-        fn thread(algorithm: String, charset: String, criteria: String) -> Vec<ThreadNode>;
-        command = Command::Thread { algorithm, charset, criteria };
+        fn thread(algorithm: String, charset: String, criteria: impl Into<crate::types::SearchCriteria>) -> Vec<ThreadNode>;
+        command = Command::Thread { algorithm, charset, criteria: criteria.into() };
         consumer = dispatch::ThreadConsumer::default();
     }
 
     pipeline_method! {
         /// UID THREAD command (RFC 5256 Section3).
-        fn uid_thread(algorithm: String, charset: String, criteria: String) -> Vec<ThreadNode>;
-        command = Command::UidThread { algorithm, charset, criteria };
+        fn uid_thread(algorithm: String, charset: String, criteria: impl Into<crate::types::SearchCriteria>) -> Vec<ThreadNode>;
+        command = Command::UidThread { algorithm, charset, criteria: criteria.into() };
         consumer = dispatch::ThreadConsumer::default();
     }
 
     pipeline_method! {
         /// SORT command (RFC 5256 Section2).
-        fn sort(sort_criteria: String, charset: String, criteria: String) -> SearchResult;
-        command = Command::Sort { sort_criteria, charset, criteria };
+        fn sort(sort_criteria: String, charset: String, criteria: impl Into<crate::types::SearchCriteria>) -> SearchResult;
+        command = Command::Sort { sort_criteria, charset, criteria: criteria.into() };
         consumer = dispatch::SortConsumer::default();
     }
 
     pipeline_method! {
         /// UID SORT command (RFC 5256 Section2).
-        fn uid_sort(sort_criteria: String, charset: String, criteria: String) -> SearchResult;
-        command = Command::UidSort { sort_criteria, charset, criteria };
+        fn uid_sort(sort_criteria: String, charset: String, criteria: impl Into<crate::types::SearchCriteria>) -> SearchResult;
+        command = Command::UidSort { sort_criteria, charset, criteria: criteria.into() };
         consumer = dispatch::SortConsumer::default();
     }
 

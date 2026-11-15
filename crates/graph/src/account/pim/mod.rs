@@ -21,7 +21,7 @@ pub(crate) use containers::{
     container_create, container_delete, container_move, container_rename, containers_list,
 };
 pub(crate) use drafts::{draft_create, draft_discard, draft_send, draft_update};
-pub(crate) use hydrate::{ews_read_folder, message_hydrate};
+pub(crate) use hydrate::{ews_read_folder, message_hydrate, select_query};
 pub(crate) use identities::{identities_list, vacation_get, vacation_set};
 pub(crate) use messages::{
     add_to_container, message_batch_url, set_category, set_extended_property, set_importance,

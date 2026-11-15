@@ -1313,7 +1313,7 @@ pub(crate) enum DavScopeOwner {
     Calendars,
 }
 
-/// Ownership index for the folder scopes the composed DAV sub-accounts mint.
+/// Ownership index for legacy bare folder scopes from composed DAV accounts.
 ///
 /// `FolderId` carries no protocol namespace and an IMAP mailbox name is an
 /// arbitrary string, so "this folder id appears in the CardDAV href set" is
@@ -1327,10 +1327,8 @@ pub(crate) enum DavScopeOwner {
 /// - an id claimed by both sub-accounts is NOT indexed, so the tie is never
 ///   resolved silently in favour of contacts.
 ///
-/// Both exclusions are reported as open-time warnings, which surface through
-/// the first discovery stream alongside the other DAV degradations. A dropped
-/// entry therefore fails loudly - the scope routes to IMAP or to
-/// `Unsupported` - instead of syncing the wrong collection quietly.
+/// Both exclusions are classified open-time skips. Discovery filters the
+/// losing legacy collections instead of scheduling work against another owner.
 ///
 /// **EVERY `CursorScope::Folder` consumer must consult this index**, not only
 /// the four sync lanes. That is the sharpest lesson this seam has paid for: a
@@ -1342,16 +1340,10 @@ pub(crate) enum DavScopeOwner {
 /// handed a worker a SELECT that can never succeed. A NEW consumer of `Folder`
 /// scopes must be checked against this index before it ships.
 ///
-/// Namespacing `FolderId` instead was considered and rejected: it would force
-/// a rewrite of the scope on delegation and back out of the minted
-/// `ChangeCursor`, and every one of those rewrite points is another place the
-/// fix can open a hole.
-///
-/// Accepted residual: an excluded scope is still ADVERTISED by discovery,
-/// because sub-account scopes pass through `merge_scope_streams` verbatim. A
-/// mailbox collision resolves to the same scope value as the real mailbox, and
-/// a contested id fails loudly at establishment. Judged honest and sufficient,
-/// and recorded as a classified skip at open.
+/// Newly discovered DAV collections use FolderType with Contact or CalendarEvent,
+/// so equal URL strings cannot collide with mail or the other DAV dialect.
+/// This index retains legacy Folder routing. Losing legacy collections are
+/// classified open-time skips and are filtered from cursor discovery.
 #[derive(Debug, Default)]
 pub(crate) struct DavScopeIndex {
     owners: std::collections::HashMap<bifrost_types::FolderId, DavScopeOwner>,
@@ -1463,8 +1455,7 @@ pub(crate) enum ScopeHandler<'a> {
 /// typed scopes IMAP can compose - `Type(Contact)` and
 /// `Type(CalendarEvent)` - route to the matching sub-account when one is
 /// attached, else `Unsupported`. Every other scope (including the
-/// `FolderType` struct variant, which no protocol composed under IMAP
-/// mints today) falls through to `Unsupported`, preserving the
+/// unrelated `FolderType` object types) falls through to `Unsupported`, preserving the
 /// non-exhaustive guarantee.
 pub(crate) fn route_scope<'a>(
     account: &'a ImapAccount,
@@ -1607,6 +1598,7 @@ mod throttle_key_tests {
 #[cfg(test)]
 mod router_tests {
     use bifrost_types::{AccountErrorKind, AccountOperation, CursorScope, FolderId, ObjectType};
+    use std::sync::Arc;
 
     use super::test_support::{StubAccount, stub_arc};
     use super::{DavScopeIndex, DavScopeOwner, ScopeHandler, route_typed_scope};
@@ -1694,6 +1686,44 @@ mod router_tests {
             Some(DavScopeOwner::Contacts)
         );
         assert_eq!(index.owner(&folder("INBOX")), None);
+    }
+
+    #[test]
+    fn equal_strings_keep_mail_contacts_and_calendars_independent() {
+        let contacts = stub_arc(StubAccount::new(Vec::new()));
+        let calendars = stub_arc(StubAccount::new(Vec::new()));
+        let folder = FolderId("https://dav.example.test/shared/".into());
+        for (ty, expected) in [
+            (ObjectType::Contact, &contacts),
+            (ObjectType::CalendarEvent, &calendars),
+        ] {
+            let scope = CursorScope::FolderType {
+                folder: folder.clone(),
+                ty,
+            };
+            let handler = route_typed_scope(
+                &scope,
+                Some(&contacts),
+                Some(&calendars),
+                AccountOperation::SyncChanges,
+            )
+            .unwrap();
+            let ScopeHandler::Delegate(actual) = handler else {
+                panic!("DAV collection must delegate")
+            };
+            assert!(Arc::ptr_eq(actual, expected));
+            assert!(route_typed_scope(&scope, None, None, AccountOperation::SyncChanges).is_err());
+        }
+        assert!(matches!(
+            route_typed_scope(
+                &CursorScope::Folder(folder),
+                Some(&contacts),
+                Some(&calendars),
+                AccountOperation::SyncChanges
+            )
+            .unwrap(),
+            ScopeHandler::Folder(_)
+        ));
     }
 
     #[test]

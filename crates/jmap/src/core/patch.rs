@@ -101,8 +101,10 @@ pub(crate) fn remove<V>(entries: &mut impl PatchEntries<V>, path: &str) {
 pub(crate) struct IdSet;
 
 impl IdSet {
-    pub(crate) fn collect<I: Eq + Hash>(ids: impl IntoIterator<Item = I>) -> HashMap<I, bool> {
-        ids.into_iter().map(|id| (id, true)).collect()
+    pub(crate) fn collect<I: Eq + Hash>(
+        ids: impl IntoIterator<Item = I>,
+    ) -> super::object_set::ObjectSet<I> {
+        ids.into_iter().collect()
     }
 
     pub(crate) fn replace(

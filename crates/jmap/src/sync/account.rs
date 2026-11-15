@@ -85,7 +85,7 @@ pub(crate) struct JmapAccount {
     /// `accountId`. Enumerated at `open` from the session's non-personal
     /// accounts that advertise the mail capability. A foreign `Folder`
     /// scope routes here via `mail_for_scope`.
-    pub(crate) foreign_mail: Arc<HashMap<String, MailAccount>>,
+    pub(crate) foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount>>,
     /// Foreign mail accounts that were successfully seeded and advertise
     /// `urn:ietf:params:jmap:submission`.
     pub(crate) foreign_submission: Arc<HashSet<String>>,
@@ -126,7 +126,7 @@ impl JmapAccount {
     pub(crate) fn new(
         client: Client,
         mail: MailAccount,
-        foreign_mail: HashMap<String, MailAccount>,
+        foreign_mail: HashMap<crate::core::id::AccountId, MailAccount>,
         foreign_submission: HashSet<String>,
         submission: Option<MailAccount>,
         max_delayed_send: usize,
@@ -186,7 +186,7 @@ impl JmapAccount {
         match resolve_foreign_account_id(scope, |id| self.foreign_mail.contains_key(id)) {
             Some(account_id) => self
                 .foreign_mail
-                .get(&account_id)
+                .get(account_id.as_str())
                 .expect("resolve_foreign_account_id only returns a known foreign id"),
             None => &self.mail,
         }
@@ -417,7 +417,11 @@ where
 /// this exact boundary - the one a primary-fallback regression would
 /// cross - is pinned over plain string handles instead. The account
 /// methods above are one-line delegations to keep that pin meaningful.
-fn route_object_id<'a, H>(raw: &str, primary: &'a H, foreign: &'a HashMap<String, H>) -> &'a H {
+fn route_object_id<'a, H>(
+    raw: &str,
+    primary: &'a H,
+    foreign: &'a HashMap<crate::core::id::AccountId, H>,
+) -> &'a H {
     super::foreign::parse_object(raw)
         .and_then(|(account_id, _)| foreign.get(account_id))
         .unwrap_or(primary)
@@ -430,7 +434,7 @@ fn route_object_id<'a, H>(raw: &str, primary: &'a H, foreign: &'a HashMap<String
 fn route_mutation_target<'a, H>(
     target: &MutationTarget,
     primary: &'a H,
-    foreign: &'a HashMap<String, H>,
+    foreign: &'a HashMap<crate::core::id::AccountId, H>,
 ) -> &'a H {
     match target {
         MutationTarget::Message(id) => route_object_id(&id.0, primary, foreign),
@@ -1073,14 +1077,14 @@ impl Account for JmapAccount {
                 send_as,
                 !self.foreign_submission.is_empty(),
                 request.scheduled.is_some(),
-                self.foreign_mail.contains_key(&id),
+                self.foreign_mail.contains_key(id.as_str()),
                 self.foreign_submission.contains(&id),
             ) {
                 return Box::pin(async move { Err(err) });
             }
             let mail = self
                 .foreign_mail
-                .get(&id)
+                .get(id.as_str())
                 .cloned()
                 .expect("route_send_as validated foreign_mail membership");
             let self_address = self
@@ -2198,7 +2202,7 @@ mod tests {
     fn object_and_thread_targets_route_to_the_owning_handle() {
         let primary = "PRIMARY".to_string();
         let foreign_map =
-            std::collections::HashMap::from([("shared".to_string(), "SHARED".to_string())]);
+            std::collections::HashMap::from([("shared".into(), "SHARED".to_string())]);
 
         let foreign_thread = ThreadId(foreign::encode_object("shared", "T1"));
         let foreign_message = ObjectId(foreign::encode_object("shared", "M1"));

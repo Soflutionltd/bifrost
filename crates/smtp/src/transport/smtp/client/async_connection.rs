@@ -836,7 +836,7 @@ impl AsyncSmtpConnection {
         credentials: &Credentials,
     ) -> Result<Response, Error> {
         // OAuth credentials never use SCRAM: select the first advertised
-        // mechanism from the caller's order and run the legacy encoder path.
+        // allowed mechanism in SASL's canonical order, then run the encoder path.
         if let Some(mechanism) = oauth_mechanism(mechanisms, &self.server_info, credentials) {
             return self.auth_legacy(mechanism, credentials).await;
         }
@@ -855,54 +855,20 @@ impl AsyncSmtpConnection {
         } else {
             None
         };
-        let chosen = password_mechanism(mechanisms, &self.server_info, binding.is_some())?;
-        match chosen {
-            Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus => {
-                let binding = binding.expect("PLUS binding resolved above");
-                self.auth_scram(chosen, binding, credentials).await
+        let selected = password_mechanism(mechanisms, &self.server_info, binding.as_ref())?;
+        match selected.scram {
+            Some(rung) => {
+                self.auth_scram(selected.mechanism, rung.binding, credentials)
+                    .await
             }
-            Mechanism::ScramSha1 | Mechanism::ScramSha256 => {
-                self.auth_scram(
-                    chosen,
-                    {
-                        // Preserve the shared GS2 downgrade signal when PLUS was not advertised.
-                        let hash = if chosen == Mechanism::ScramSha1 {
-                            bifrost_sasl::ScramHash::Sha1
-                        } else {
-                            bifrost_sasl::ScramHash::Sha256
-                        };
-                        let data = match &binding {
-                            Some(ScramChannelBinding::TlsServerEndPoint(data)) => {
-                                Some(data.as_slice())
-                            }
-                            _ => None,
-                        };
-                        bifrost_sasl::select_scram_rung(
-                            hash,
-                            false,
-                            |name| {
-                                mechanisms.iter().any(|candidate| {
-                                    candidate.name() == name
-                                        && self.server_info.supports_auth_mechanism(*candidate)
-                                })
-                            },
-                            data,
-                        )
-                        .expect("selected SCRAM rung remains advertised")
-                        .1
-                    },
-                    credentials,
-                )
-                .await
-            }
-            _ => self.auth_legacy(chosen, credentials).await,
+            None => self.auth_legacy(selected.mechanism, credentials).await,
         }
     }
 
     /// Resolve the `tls-server-end-point` channel binding for the live
     /// connection. The DER accessor is sync (cached on the TLS stream), so this
     /// is non-awaiting and the binding-skip decision stays network-free.
-    fn resolve_scram_binding(&self) -> Result<Option<ScramChannelBinding>, Error> {
+    fn resolve_scram_binding(&self) -> Result<Option<bifrost_sasl::ChannelBindingData>, Error> {
         let der = self.peer_certificate_der();
         resolve_scram_binding(der.as_deref())
     }

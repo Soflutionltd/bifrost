@@ -71,7 +71,7 @@ impl ImapConnection {
         // contain no mailbox strings and are valid without ENABLE.
         let has_mailbox_strings = params.event_groups.iter().any(|g| {
             matches!(
-                g.filter,
+                g.filter(),
                 MailboxFilter::Subtree(_) | MailboxFilter::Mailboxes(_)
             )
         });

@@ -23,7 +23,7 @@ impl ImapConnection {
         self.fetch_impl(
             Command::UidFetch {
                 sequence_set: sequence_set.clone(),
-                items: format_fetch_attrs(items),
+                items: items.to_vec().into(),
                 changed_since: None,
                 vanished: false,
             },
@@ -47,7 +47,7 @@ impl ImapConnection {
         self.fetch_impl(
             Command::UidFetch {
                 sequence_set: sequence_set.clone(),
-                items: format_fetch_attrs(items),
+                items: items.to_vec().into(),
                 changed_since: Some(mod_seq),
                 vanished: false,
             },
@@ -75,7 +75,7 @@ impl ImapConnection {
         let (tx, rx) = tokio::sync::mpsc::channel(DEFAULT_FETCH_STREAM_CAPACITY);
         let cmd = Command::UidFetch {
             sequence_set: sequence_set.clone(),
-            items: format_fetch_attrs(items),
+            items: items.to_vec().into(),
             changed_since: Some(mod_seq),
             vanished: false,
         };
@@ -134,7 +134,7 @@ impl ImapConnection {
         let parsed_set = ParsedUidSet::new(sequence_set);
         let cmd = Command::UidFetch {
             sequence_set: sequence_set.clone(),
-            items: format_fetch_attrs(items),
+            items: items.to_vec().into(),
             changed_since: Some(mod_seq),
             vanished: true,
         };
@@ -169,7 +169,7 @@ impl ImapConnection {
         let (tx, rx) = tokio::sync::mpsc::channel(DEFAULT_FETCH_STREAM_CAPACITY);
         let cmd = Command::UidFetch {
             sequence_set: sequence_set.clone(),
-            items: format_fetch_attrs(items),
+            items: items.to_vec().into(),
             changed_since: Some(mod_seq),
             vanished: true,
         };
@@ -250,7 +250,7 @@ impl ImapConnection {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
         let cmd = Command::UidFetch {
             sequence_set: sequence_set.clone(),
-            items: format_fetch_attrs(items),
+            items: items.to_vec().into(),
             changed_since: None,
             vanished: false,
         };
@@ -323,18 +323,12 @@ impl ImapConnection {
     /// `String`, and [`SearchCriteria`](crate::types::SearchCriteria).
     pub async fn uid_search(
         &self,
-        criteria: impl AsRef<str>,
+        criteria: impl Into<crate::types::SearchCriteria>,
         timeout: Duration,
     ) -> Result<SearchResult, Error> {
-        let criteria = criteria.as_ref();
-        self.search_impl(
-            Command::UidSearch {
-                criteria: criteria.to_owned(),
-            },
-            "UID SEARCH",
-            timeout,
-        )
-        .await
+        let criteria = criteria.into();
+        self.search_impl(Command::UidSearch { criteria }, "UID SEARCH", timeout)
+            .await
     }
 
     /// Shared implementation for SEARCH and UID SEARCH (RFC 3501 Section 6.4.4).
@@ -367,15 +361,15 @@ impl ImapConnection {
     /// `String`, and [`SearchCriteria`](crate::types::SearchCriteria).
     pub async fn uid_search_esearch(
         &self,
-        criteria: impl AsRef<str>,
+        criteria: impl Into<crate::types::SearchCriteria>,
         return_opts: &[&str],
         timeout: Duration,
     ) -> Result<EsearchResponse, Error> {
-        let criteria = criteria.as_ref();
+        let criteria = criteria.into();
         self.search_esearch_impl(
             Command::UidSearchReturn {
-                criteria: criteria.to_owned(),
-                return_opts: return_opts.iter().map(|s| (*s).to_owned()).collect(),
+                criteria,
+                return_opts: return_opts.iter().map(|s| (*s).into()).collect(),
             },
             "UID SEARCH RETURN",
             timeout,

@@ -3,7 +3,7 @@ use std::time::Duration;
 use bifrost_types::{
     AccountCapabilities, BatchingPolicy, BlobRangeSupport, CursorFreshness, FilterRuleShape,
     MutationCapabilities, MutationConcurrency, MutationReplaySafety, PimMethodSupport,
-    PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape,
+    PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape, VersionedDoors,
 };
 
 use super::PushConfig;
@@ -44,16 +44,13 @@ pub(crate) fn build_capabilities(
             PushConfig::EwsStreaming => PushCapability::InProcess,
         },
         mutation: MutationCapabilities {
-            concurrency: MutationConcurrency::ExpectedVersion {
-                mail_set_flags: true,
-                mail_move: false,
-                mail_destroy: false,
-                contact_update: true,
-                event_update: true,
-                contact_delete: true,
-                event_delete: true,
-                event_rsvp: false,
-            },
+            concurrency: MutationConcurrency::ExpectedVersion(
+                VersionedDoors::MAIL_SET_FLAGS
+                    .union(VersionedDoors::CONTACT_UPDATE)
+                    .union(VersionedDoors::EVENT_UPDATE)
+                    .union(VersionedDoors::CONTACT_DELETE)
+                    .union(VersionedDoors::EVENT_DELETE),
+            ),
             replay_safety: MutationReplaySafety::None,
             reassertion: bifrost_types::MutationReassertion {
                 set_flags: true,
@@ -140,10 +137,8 @@ pub(crate) fn build_capabilities(
         filter_rule_shape: FilterRuleShape::Rules,
         conveniences: bifrost_types::ConvenienceShape {
             starred: StarredFlagShape::Category,
-            replied_via_keyword: false,
-            replied_via_extended_property: true,
-            forwarded_via_keyword: false,
-            forwarded_via_extended_property: true,
+            replied: bifrost_types::RepliedFlagShape::ExtendedProperty,
+            forwarded: bifrost_types::ForwardedFlagShape::ExtendedProperty,
             // Graph's read-receipt bit (isReadReceiptRequested) is
             // read-only; mark_mdn_sent surfaces Unsupported(MarkMdnSent).
             mdn_sent_via_keyword: false,
@@ -220,16 +215,13 @@ mod tests {
         assert!(!caps.push_in_process());
         assert_eq!(
             caps.mutation.concurrency,
-            MutationConcurrency::ExpectedVersion {
-                mail_set_flags: true,
-                mail_move: false,
-                mail_destroy: false,
-                contact_update: true,
-                event_update: true,
-                contact_delete: true,
-                event_delete: true,
-                event_rsvp: false,
-            }
+            MutationConcurrency::ExpectedVersion(
+                VersionedDoors::MAIL_SET_FLAGS
+                    .union(VersionedDoors::CONTACT_UPDATE)
+                    .union(VersionedDoors::EVENT_UPDATE)
+                    .union(VersionedDoors::CONTACT_DELETE)
+                    .union(VersionedDoors::EVENT_DELETE),
+            )
         );
         assert_eq!(caps.batching_policy.max_items, 20);
         assert!(caps.delta_token_expires_after.is_none());
@@ -310,8 +302,14 @@ mod tests {
         assert!(caps.pim_methods.event_search);
         assert!(caps.pim_methods.event_autocomplete);
         assert_eq!(caps.conveniences.starred, StarredFlagShape::Category);
-        assert!(caps.conveniences.replied_via_extended_property);
-        assert!(caps.conveniences.forwarded_via_extended_property);
+        assert_eq!(
+            caps.conveniences.replied,
+            bifrost_types::RepliedFlagShape::ExtendedProperty
+        );
+        assert_eq!(
+            caps.conveniences.forwarded,
+            bifrost_types::ForwardedFlagShape::ExtendedProperty
+        );
     }
 
     #[test]

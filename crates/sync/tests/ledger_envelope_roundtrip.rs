@@ -137,43 +137,35 @@ fn checkpoint() -> Checkpoint {
 
 // ---------- comparison helpers ----------
 
-fn assert_errors_match(left: &AccountError, right: &AccountError, what: &str) {
-    assert_eq!(left.kind(), right.kind(), "{what}: kind");
+fn assert_errors_match(
+    left: &bifrost_sync::cursor::ErrorDigest,
+    right: &bifrost_sync::cursor::ErrorDigest,
+    what: &str,
+) {
+    assert_eq!(left.kind, right.kind, "{what}: kind");
+    assert_eq!(left.scope, right.scope, "{what}: scope");
+    assert_eq!(left.operation, right.operation, "{what}: operation");
+    assert_eq!(left.provider, right.provider, "{what}: provider");
+    assert_eq!(left.protocol, right.protocol, "{what}: protocol");
     assert_eq!(
-        left.message_key(),
-        right.message_key(),
-        "{what}: message key"
-    );
-    assert_eq!(left.scope(), right.scope(), "{what}: error scope");
-    assert_eq!(left.operation(), right.operation(), "{what}: operation");
-    assert_eq!(left.provider(), right.provider(), "{what}: provider");
-    assert_eq!(left.protocol(), right.protocol(), "{what}: protocol");
-
-    let left_export = left.support_consented();
-    let right_export = right.support_consented();
-    assert_eq!(
-        left_export.telemetry.status, right_export.telemetry.status,
+        left.diagnostics.status, right.diagnostics.status,
         "{what}: status"
     );
     assert_eq!(
-        left_export.telemetry.request_id, right_export.telemetry.request_id,
+        left.diagnostics.request_id, right.diagnostics.request_id,
         "{what}: request id"
     );
     assert_eq!(
-        left_export.telemetry.trace_id, right_export.telemetry.trace_id,
+        left.diagnostics.trace_id, right.diagnostics.trace_id,
         "{what}: trace id"
     );
     assert_eq!(
-        left_export.telemetry.native_code, right_export.telemetry.native_code,
+        left.diagnostics.native_code, right.diagnostics.native_code,
         "{what}: native code"
     );
     assert_eq!(
-        left_export.user_safe_text, right_export.user_safe_text,
-        "{what}: user-safe text"
-    );
-    assert_eq!(
-        left_export.support_text, right_export.support_text,
-        "{what}: support text"
+        left.diagnostics.text, right.diagnostics.text,
+        "{what}: text"
     );
 }
 
@@ -380,7 +372,7 @@ fn exhaustive_ledger() -> DebtLedger {
         domain: CoverageDomain::full(scope()),
         generation: walk_generation(7),
         failure_label: "unidentifiable-value".into(),
-        evidence: auth_error(),
+        evidence: auth_error().into(),
         policy: PolicyStatus::Retrying { attempts: 0 },
         resume_from: None,
     });
@@ -394,7 +386,7 @@ fn exhaustive_ledger() -> DebtLedger {
         domain: time_domain(0, 500),
         generation: walk_generation(8),
         failure_label: "page-boundary-lost".into(),
-        evidence: decorated_error(),
+        evidence: decorated_error().into(),
         policy: PolicyStatus::Retrying { attempts: 3 },
         resume_from: Some(checkpoint()),
     });
@@ -403,7 +395,7 @@ fn exhaustive_ledger() -> DebtLedger {
         domain: CoverageDomain::full(scope()),
         generation: walk_generation(8),
         failure_label: "unidentifiable-value".into(),
-        evidence: auth_error(),
+        evidence: auth_error().into(),
         policy: PolicyStatus::Retrying { attempts: 0 },
         resume_from: None,
     });

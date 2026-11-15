@@ -31,11 +31,37 @@ impl HoldDeadline {
 }
 
 /// Provider classification belonging to the winning deadline.
+/// This restricted set deliberately excludes generic server errors: only rate
+/// and quota refusals establish timed holds. Using ServerErrorKind directly
+/// would admit Unavailable and Error without defined hold or tie semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum HoldKind {
     RateLimited,
     QuotaExhausted,
+}
+
+impl HoldKind {
+    /// Project the restricted hold classification into the shared error model.
+    #[must_use]
+    pub fn server_kind(self) -> bifrost_types::ServerErrorKind {
+        match self {
+            Self::RateLimited => bifrost_types::ServerErrorKind::RateLimited,
+            Self::QuotaExhausted => bifrost_types::ServerErrorKind::QuotaExhausted,
+        }
+    }
+
+    #[must_use]
+    pub fn server_cause(self, retry_hint: bifrost_types::RetryHint) -> bifrost_types::ServerCause {
+        match self {
+            Self::RateLimited => bifrost_types::ServerCause::RateLimited {
+                retry_hint: Some(retry_hint),
+            },
+            Self::QuotaExhausted => bifrost_types::ServerCause::QuotaExhausted {
+                retry_hint: Some(retry_hint),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,7 +164,7 @@ mod tests {
             .err()
             .expect("held request fails");
         assert!(
-            matches!(error, Error::LocalHold { held, attempts, .. } if held.deadline == end && attempts.is_empty())
+            matches!(error, Error::LocalHold { held, evidence, .. } if held.deadline == end && evidence.attempts().is_empty())
         );
         assert!(script.requests().is_empty());
     }
@@ -312,13 +338,13 @@ mod tests {
             .await
             .err()
             .expect("held request fails");
-        let Error::LocalHold { attempts, held, .. } = &error else {
+        let Error::LocalHold { evidence, held, .. } = &error else {
             panic!("local refusal: {error:?}")
         };
         assert_eq!(held.deadline, end);
-        assert_eq!(attempts.len(), 1);
+        assert_eq!(evidence.attempts().len(), 1);
         assert!(
-            matches!(&attempts[0], Error::Status { code, body, .. } if *code == status && body.as_ref() == b"provider quota")
+            matches!(&evidence.attempts()[0], Error::Status { code, body, .. } if *code == status && body.as_ref() == b"provider quota")
         );
         let error = crate::into_account_error_with_throttle_scope(
             error,
@@ -483,11 +509,11 @@ mod tests {
             .await
             .err()
             .expect("retry refused");
-        let Error::LocalHold { attempts, .. } = &error else {
+        let Error::LocalHold { evidence, .. } = &error else {
             panic!("local refusal")
         };
         assert!(
-            matches!(attempts.as_slice(), [Error::Network { transmission_state: TransmissionState::InFlight, message, .. }] if message == "earlier inflight reset")
+            matches!(evidence.attempts(), [Error::Network { transmission_state: TransmissionState::InFlight, message, .. }] if message == "earlier inflight reset")
         );
         let error = crate::into_account_error_with_throttle_scope(
             error,
@@ -606,7 +632,7 @@ mod tests {
             .expect("the committed mutation must not succeed through a replacement attempt");
         if status == StatusCode::FORBIDDEN {
             assert!(
-                matches!(&error, Error::AttemptHistory { attempts, may_have_committed: true, .. } if attempts.is_empty())
+                matches!(&error, Error::AttemptHistory { evidence, .. } if evidence.verdict() == crate::CommitEvidence::MayHaveCommitted && evidence.attempts().is_empty())
             );
             assert!(matches!(
                 error.terminal(),
@@ -614,7 +640,9 @@ mod tests {
             ));
             assert!(net.shared_hold("committed").current().is_some());
         } else {
-            assert!(matches!(&error, Error::LocalHold { attempts, .. } if attempts.len() == 1));
+            assert!(
+                matches!(&error, Error::LocalHold { evidence, .. } if evidence.attempts().len() == 1)
+            );
         }
         let error = crate::into_account_error_with_throttle_scope(
             error,
@@ -1044,10 +1072,8 @@ mod tests {
             .await
             .err()
             .expect("auth failure");
-        assert!(
-            matches!(&error, Error::AttemptHistory { attempts, may_have_committed: false, .. }
-            if matches!(attempts.as_slice(), [Error::Network { transmission_state: TransmissionState::Unsent, .. }]))
-        );
+        assert!(matches!(&error, Error::AttemptHistory { evidence, .. }
+            if evidence.verdict() != crate::CommitEvidence::MayHaveCommitted && matches!(evidence.attempts(), [Error::Network { transmission_state: TransmissionState::Unsent, .. }])));
         let classified = crate::into_account_error_with_throttle_scope(
             error,
             crate::NetErrorContext {

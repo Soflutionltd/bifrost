@@ -35,7 +35,7 @@ pub(crate) struct EmailImport {
 
     #[serde(rename = "mailboxIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    mailbox_ids: Option<HashMap<MailboxId, bool>>,
+    mailbox_ids: Option<crate::core::object_set::ObjectSet<MailboxId>>,
 
     #[serde(rename = "#mailboxIds")]
     #[serde(skip_deserializing)]
@@ -43,7 +43,7 @@ pub(crate) struct EmailImport {
     mailbox_ids_ref: Option<ResultReference>,
 
     #[serde(rename = "keywords")]
-    keywords: HashMap<String, bool>,
+    keywords: crate::core::object_set::ObjectSet<super::keyword::Keyword>,
 
     #[serde(rename = "receivedAt")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,7 +134,7 @@ impl EmailImport {
             blob_id,
             mailbox_ids: None,
             mailbox_ids_ref: None,
-            keywords: HashMap::new(),
+            keywords: Default::default(),
             received_at: None,
         }
     }
@@ -144,7 +144,7 @@ impl EmailImport {
         T: IntoIterator<Item = U>,
         U: Into<MailboxId>,
     {
-        self.mailbox_ids = Some(mailbox_ids.into_iter().map(|s| (s.into(), true)).collect());
+        self.mailbox_ids = Some(mailbox_ids.into_iter().map(Into::into).collect());
         self.mailbox_ids_ref = None;
         self
     }
@@ -158,9 +158,9 @@ impl EmailImport {
     pub(crate) fn keywords<T, U>(&mut self, keywords: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
-        U: Into<String>,
+        U: Into<super::keyword::Keyword>,
     {
-        self.keywords = keywords.into_iter().map(|s| (s.into(), true)).collect();
+        self.keywords = keywords.into_iter().map(Into::into).collect();
         self
     }
 

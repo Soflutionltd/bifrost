@@ -1,10 +1,8 @@
+use super::keyword::Keyword;
 use jiff::Timestamp;
 use serde::Serialize;
 
-use crate::core::{
-    query::{self, QueryObject},
-    set::from_timestamp,
-};
+use crate::core::query::{self, QueryObject};
 use crate::mailbox::MailboxId;
 use crate::thread::ThreadId;
 
@@ -40,23 +38,23 @@ pub(crate) enum Filter {
     },
     AllInThreadHaveKeyword {
         #[serde(rename = "allInThreadHaveKeyword")]
-        value: String,
+        value: Keyword,
     },
     SomeInThreadHaveKeyword {
         #[serde(rename = "someInThreadHaveKeyword")]
-        value: String,
+        value: Keyword,
     },
     NoneInThreadHaveKeyword {
         #[serde(rename = "noneInThreadHaveKeyword")]
-        value: String,
+        value: Keyword,
     },
     HasKeyword {
         #[serde(rename = "hasKeyword")]
-        value: String,
+        value: Keyword,
     },
     NotKeyword {
         #[serde(rename = "notKeyword")]
-        value: String,
+        value: Keyword,
     },
     HasAttachment {
         #[serde(rename = "hasAttachment")]
@@ -131,11 +129,11 @@ pub(crate) enum Comparator {
     #[serde(rename = "sentAt")]
     SentAt,
     #[serde(rename = "hasKeyword")]
-    HasKeyword { keyword: String },
+    HasKeyword { keyword: Keyword },
     #[serde(rename = "allInThreadHaveKeyword")]
-    AllInThreadHaveKeyword { keyword: String },
+    AllInThreadHaveKeyword { keyword: Keyword },
     #[serde(rename = "someInThreadHaveKeyword")]
-    SomeInThreadHaveKeyword { keyword: String },
+    SomeInThreadHaveKeyword { keyword: Keyword },
 
     // Non-standard
     #[serde(rename = "cc")]
@@ -159,16 +157,12 @@ impl Filter {
         }
     }
 
-    pub(crate) fn before(value: i64) -> Self {
-        Filter::Before {
-            value: from_timestamp(value),
-        }
+    pub(crate) fn before(value: Timestamp) -> Self {
+        Filter::Before { value }
     }
 
-    pub(crate) fn after(value: i64) -> Self {
-        Filter::After {
-            value: from_timestamp(value),
-        }
+    pub(crate) fn after(value: Timestamp) -> Self {
+        Filter::After { value }
     }
 
     pub(crate) fn min_size(value: u32) -> Self {
@@ -179,34 +173,24 @@ impl Filter {
         Filter::MaxSize { value }
     }
 
-    pub(crate) fn all_in_thread_have_keyword(value: impl Into<String>) -> Self {
-        Filter::AllInThreadHaveKeyword {
-            value: value.into(),
-        }
+    pub(crate) fn all_in_thread_have_keyword(value: Keyword) -> Self {
+        Filter::AllInThreadHaveKeyword { value }
     }
 
-    pub(crate) fn some_in_thread_have_keyword(value: impl Into<String>) -> Self {
-        Filter::SomeInThreadHaveKeyword {
-            value: value.into(),
-        }
+    pub(crate) fn some_in_thread_have_keyword(value: Keyword) -> Self {
+        Filter::SomeInThreadHaveKeyword { value }
     }
 
-    pub(crate) fn none_in_thread_have_keyword(value: impl Into<String>) -> Self {
-        Filter::NoneInThreadHaveKeyword {
-            value: value.into(),
-        }
+    pub(crate) fn none_in_thread_have_keyword(value: Keyword) -> Self {
+        Filter::NoneInThreadHaveKeyword { value }
     }
 
-    pub(crate) fn has_keyword(value: impl Into<String>) -> Self {
-        Filter::HasKeyword {
-            value: value.into(),
-        }
+    pub(crate) fn has_keyword(value: Keyword) -> Self {
+        Filter::HasKeyword { value }
     }
 
-    pub(crate) fn not_keyword(value: impl Into<String>) -> Self {
-        Filter::NotKeyword {
-            value: value.into(),
-        }
+    pub(crate) fn not_keyword(value: Keyword) -> Self {
+        Filter::NotKeyword { value }
     }
 
     pub(crate) fn has_attachment(value: bool) -> Self {
@@ -275,16 +259,12 @@ impl Filter {
         }
     }
 
-    pub(crate) fn sent_before(value: i64) -> Self {
-        Filter::SentBefore {
-            value: from_timestamp(value),
-        }
+    pub(crate) fn sent_before(value: Timestamp) -> Self {
+        Filter::SentBefore { value }
     }
 
-    pub(crate) fn sent_after(value: i64) -> Self {
-        Filter::SentAfter {
-            value: from_timestamp(value),
-        }
+    pub(crate) fn sent_after(value: Timestamp) -> Self {
+        Filter::SentAfter { value }
     }
 
     pub(crate) fn in_thread(value: impl Into<ThreadId>) -> Self {
@@ -323,26 +303,16 @@ impl Comparator {
         query::Comparator::new(Comparator::SentAt)
     }
 
-    pub(crate) fn has_keyword(keyword: impl Into<String>) -> query::Comparator<Comparator> {
-        query::Comparator::new(Comparator::HasKeyword {
-            keyword: keyword.into(),
-        })
+    pub(crate) fn has_keyword(keyword: Keyword) -> query::Comparator<Comparator> {
+        query::Comparator::new(Comparator::HasKeyword { keyword })
     }
 
-    pub(crate) fn all_in_thread_have_keyword(
-        keyword: impl Into<String>,
-    ) -> query::Comparator<Comparator> {
-        query::Comparator::new(Comparator::AllInThreadHaveKeyword {
-            keyword: keyword.into(),
-        })
+    pub(crate) fn all_in_thread_have_keyword(keyword: Keyword) -> query::Comparator<Comparator> {
+        query::Comparator::new(Comparator::AllInThreadHaveKeyword { keyword })
     }
 
-    pub(crate) fn some_in_thread_have_keyword(
-        keyword: impl Into<String>,
-    ) -> query::Comparator<Comparator> {
-        query::Comparator::new(Comparator::SomeInThreadHaveKeyword {
-            keyword: keyword.into(),
-        })
+    pub(crate) fn some_in_thread_have_keyword(keyword: Keyword) -> query::Comparator<Comparator> {
+        query::Comparator::new(Comparator::SomeInThreadHaveKeyword { keyword })
     }
 }
 

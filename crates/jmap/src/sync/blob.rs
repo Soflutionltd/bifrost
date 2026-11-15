@@ -38,7 +38,7 @@ where
 pub(crate) fn open<T: BlobTransport>(
     client: Client<T>,
     account_id: AccountId,
-    foreign_accounts: Arc<HashMap<String, MailAccount<T>>>,
+    foreign_accounts: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
     handle: BlobHandle,
 ) -> AccountStream<SyncEvent<bytes::Bytes>> {
     Box::pin(async_stream::stream! {
@@ -89,7 +89,7 @@ pub(crate) fn open_raw_rfc822<T: BlobTransport>(
     client: Client<T>,
     account_id: AccountId,
     mail: MailAccount<T>,
-    foreign_accounts: Arc<HashMap<String, MailAccount<T>>>,
+    foreign_accounts: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
     message: ObjectId,
 ) -> AccountStream<SyncEvent<bytes::Bytes>> {
     Box::pin(async_stream::stream! {

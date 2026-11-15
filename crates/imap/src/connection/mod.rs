@@ -18,7 +18,7 @@ use crate::types::{
     MailboxInfo, MailboxName, MetadataResult, MoveResult, NamespaceResponse, NotifySetParams,
     QresyncParams, QuotaResource, QuotaRootResponse, Response, ResponseCode, SelectOptions,
     SelectedMailbox, SequenceSet, StatusItem, StatusResult, StoreOperation, StoreResult,
-    ThreadNode, UidRange, format_fetch_attrs,
+    ThreadNode, UidRange,
 };
 
 #[cfg(test)]
@@ -694,13 +694,16 @@ fn expand_uid_ranges(ranges: &[UidRange]) -> Result<Vec<u32>, Error> {
 /// but lack the attributes required by the selection options (SUBSCRIBED,
 /// REMOTE, SPECIAL-USE). Returns `true` if the response does NOT satisfy
 /// the selection criteria and should be treated as a NOTIFY event.
-pub(super) fn is_notify_selection_mismatch(info: &MailboxInfo, selection_options: &[&str]) -> bool {
+pub(super) fn is_notify_selection_mismatch(
+    info: &MailboxInfo,
+    selection_options: &[crate::types::command_options::ListSelect],
+) -> bool {
     let has_recursivematch = selection_options
         .iter()
-        .any(|o| o.eq_ignore_ascii_case("RECURSIVEMATCH"));
+        .any(|o| matches!(o, crate::types::command_options::ListSelect::RecursiveMatch));
 
     for opt in selection_options {
-        if opt.eq_ignore_ascii_case("SUBSCRIBED") {
+        if matches!(opt, crate::types::command_options::ListSelect::Subscribed) {
             let has_subscribed = info
                 .attributes
                 .iter()
@@ -713,7 +716,7 @@ pub(super) fn is_notify_selection_mismatch(info: &MailboxInfo, selection_options
                 return true;
             }
         }
-        if opt.eq_ignore_ascii_case("REMOTE")
+        if matches!(opt, crate::types::command_options::ListSelect::Remote)
             && !info
                 .attributes
                 .iter()
@@ -723,7 +726,7 @@ pub(super) fn is_notify_selection_mismatch(info: &MailboxInfo, selection_options
         }
         // RFC 6154 Section 3: SPECIAL-USE requests only mailboxes with
         // a special-use attribute.
-        if opt.eq_ignore_ascii_case("SPECIAL-USE")
+        if matches!(opt, crate::types::command_options::ListSelect::SpecialUse)
             && !info.attributes.iter().any(MailboxAttribute::is_special_use)
         {
             return true;

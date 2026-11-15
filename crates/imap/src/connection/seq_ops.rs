@@ -20,7 +20,7 @@ impl ImapConnection {
         self.fetch_impl(
             Command::Fetch {
                 sequence_set: sequence_set.clone(),
-                items: format_fetch_attrs(items),
+                items: items.to_vec().into(),
                 changed_since: None,
             },
             None,
@@ -45,7 +45,7 @@ impl ImapConnection {
         self.fetch_impl(
             Command::Fetch {
                 sequence_set: sequence_set.clone(),
-                items: format_fetch_attrs(items),
+                items: items.to_vec().into(),
                 changed_since: Some(mod_seq),
             },
             Some(mod_seq),
@@ -92,7 +92,7 @@ impl ImapConnection {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
         let cmd = Command::Fetch {
             sequence_set: sequence_set.clone(),
-            items: format_fetch_attrs(items),
+            items: items.to_vec().into(),
             changed_since: None,
         };
         self.admit_command(&cmd)?;
@@ -137,18 +137,12 @@ impl ImapConnection {
     /// `String`, and [`SearchCriteria`](crate::types::SearchCriteria).
     pub async fn search(
         &self,
-        criteria: impl AsRef<str>,
+        criteria: impl Into<crate::types::SearchCriteria>,
         timeout: Duration,
     ) -> Result<SearchResult, Error> {
-        let criteria = criteria.as_ref();
-        self.search_impl(
-            Command::Search {
-                criteria: criteria.to_owned(),
-            },
-            "SEARCH",
-            timeout,
-        )
-        .await
+        let criteria = criteria.into();
+        self.search_impl(Command::Search { criteria }, "SEARCH", timeout)
+            .await
     }
 
     /// SEARCH with RETURN options (RFC 4731 Section 3.2).
@@ -163,15 +157,15 @@ impl ImapConnection {
     /// `String`, and [`SearchCriteria`](crate::types::SearchCriteria).
     pub async fn search_esearch(
         &self,
-        criteria: impl AsRef<str>,
+        criteria: impl Into<crate::types::SearchCriteria>,
         return_opts: &[&str],
         timeout: Duration,
     ) -> Result<EsearchResponse, Error> {
-        let criteria = criteria.as_ref();
+        let criteria = criteria.into();
         self.search_esearch_impl(
             Command::SearchReturn {
-                criteria: criteria.to_owned(),
-                return_opts: return_opts.iter().map(|s| (*s).to_owned()).collect(),
+                criteria,
+                return_opts: return_opts.iter().map(|s| (*s).into()).collect(),
             },
             "SEARCH RETURN",
             timeout,
@@ -188,18 +182,12 @@ impl ImapConnection {
     /// `String`, and [`SearchCriteria`](crate::types::SearchCriteria).
     pub async fn search_save(
         &self,
-        criteria: impl AsRef<str>,
+        criteria: impl Into<crate::types::SearchCriteria>,
         timeout: Duration,
     ) -> Result<(), Error> {
-        let criteria = criteria.as_ref();
-        self.search_save_impl(
-            criteria,
-            Command::SearchSave {
-                criteria: criteria.to_owned(),
-            },
-            timeout,
-        )
-        .await
+        let criteria = criteria.into();
+        self.search_save_impl(Command::SearchSave { criteria }, timeout)
+            .await
     }
 
     /// UID SEARCH RETURN (SAVE) (RFC 5182 Section 2).
@@ -211,25 +199,18 @@ impl ImapConnection {
     /// `String`, and [`SearchCriteria`](crate::types::SearchCriteria).
     pub async fn uid_search_save(
         &self,
-        criteria: impl AsRef<str>,
+        criteria: impl Into<crate::types::SearchCriteria>,
         timeout: Duration,
     ) -> Result<(), Error> {
-        let criteria = criteria.as_ref();
-        self.search_save_impl(
-            criteria,
-            Command::UidSearchSave {
-                criteria: criteria.to_owned(),
-            },
-            timeout,
-        )
-        .await
+        let criteria = criteria.into();
+        self.search_save_impl(Command::UidSearchSave { criteria }, timeout)
+            .await
     }
 
     /// Shared implementation for SEARCH RETURN (SAVE) and UID SEARCH RETURN (SAVE)
     /// (RFC 5182 Section 2).
     pub(super) async fn search_save_impl(
         &self,
-        _criteria: &str,
         cmd: Command,
         timeout: Duration,
     ) -> Result<(), Error> {

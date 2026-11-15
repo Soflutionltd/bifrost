@@ -5,7 +5,7 @@ use bifrost_types::{
     BatchingPolicy, BlobRangeSupport, Cause, ConvenienceShape, CursorFreshness, DiagnosticText,
     FilterRuleShape, MutationCapabilities, MutationConcurrency, MutationReplaySafety,
     PimMethodSupport, Protocol, ProtocolErrorKind, PushCapability, QuotaSignal, RateLimitClass,
-    StarredFlagShape, StateCause, SyncStateErrorKind, WireCause,
+    StarredFlagShape, StateCause, SyncStateErrorKind, VersionedDoors, WireCause,
 };
 
 /// Session document does not advertise the `urn:ietf:params:jmap:core`
@@ -245,16 +245,16 @@ pub(crate) fn build(
             PushCapability::None
         },
         mutation: MutationCapabilities {
-            concurrency: MutationConcurrency::ExpectedVersion {
-                mail_set_flags: true,
-                mail_move: true,
-                mail_destroy: true,
-                contact_update: support.contacts,
-                event_update: support.calendar,
-                contact_delete: support.contacts,
-                event_delete: support.calendar,
-                event_rsvp: support.calendar,
-            },
+            concurrency: MutationConcurrency::ExpectedVersion(
+                VersionedDoors::MAIL_SET_FLAGS
+                    .union(VersionedDoors::MAIL_MOVE)
+                    .union(VersionedDoors::MAIL_DESTROY)
+                    .with(VersionedDoors::CONTACT_UPDATE, support.contacts)
+                    .with(VersionedDoors::EVENT_UPDATE, support.calendar)
+                    .with(VersionedDoors::CONTACT_DELETE, support.contacts)
+                    .with(VersionedDoors::EVENT_DELETE, support.calendar)
+                    .with(VersionedDoors::EVENT_RSVP, support.calendar),
+            ),
             replay_safety: MutationReplaySafety::None,
             reassertion: bifrost_types::MutationReassertion {
                 set_flags: true,
@@ -340,10 +340,8 @@ pub(crate) fn build(
         },
         conveniences: ConvenienceShape {
             starred: StarredFlagShape::Keyword,
-            replied_via_keyword: true,
-            replied_via_extended_property: false,
-            forwarded_via_keyword: true,
-            forwarded_via_extended_property: false,
+            replied: bifrost_types::RepliedFlagShape::Keyword,
+            forwarded: bifrost_types::ForwardedFlagShape::Keyword,
             mdn_sent_via_keyword: true,
         },
         // JMAP seeds foreign account scopes from the session during open
@@ -424,16 +422,13 @@ mod tests {
         assert_eq!(caps.blob_range, BlobRangeSupport::No);
         assert_eq!(
             caps.mutation.concurrency,
-            MutationConcurrency::ExpectedVersion {
-                mail_set_flags: true,
-                mail_move: true,
-                mail_destroy: true,
-                contact_update: true,
-                event_update: false,
-                contact_delete: true,
-                event_delete: false,
-                event_rsvp: false,
-            }
+            MutationConcurrency::ExpectedVersion(
+                VersionedDoors::MAIL_SET_FLAGS
+                    .union(VersionedDoors::MAIL_MOVE)
+                    .union(VersionedDoors::MAIL_DESTROY)
+                    .union(VersionedDoors::CONTACT_UPDATE)
+                    .union(VersionedDoors::CONTACT_DELETE),
+            )
         );
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
         assert_eq!(
@@ -452,8 +447,14 @@ mod tests {
         assert!(caps.pim_methods.filters_list);
         assert!(caps.pim_methods.filter_validate);
         assert_eq!(caps.conveniences.starred, StarredFlagShape::Keyword);
-        assert!(caps.conveniences.replied_via_keyword);
-        assert!(caps.conveniences.forwarded_via_keyword);
+        assert_eq!(
+            caps.conveniences.replied,
+            bifrost_types::RepliedFlagShape::Keyword
+        );
+        assert_eq!(
+            caps.conveniences.forwarded,
+            bifrost_types::ForwardedFlagShape::Keyword
+        );
         assert!(caps.conveniences.mdn_sent_via_keyword);
         assert!(caps.pim_methods.set_importance);
         assert!(caps.discovers_foreign_namespaces_on_rediscovery);
@@ -1048,16 +1049,11 @@ mod tests {
         assert_eq!(caps.delta_token_expires_after, None);
         assert_eq!(
             caps.mutation.concurrency,
-            MutationConcurrency::ExpectedVersion {
-                mail_set_flags: true,
-                mail_move: true,
-                mail_destroy: true,
-                contact_update: false,
-                event_update: false,
-                contact_delete: false,
-                event_delete: false,
-                event_rsvp: false,
-            }
+            MutationConcurrency::ExpectedVersion(
+                VersionedDoors::MAIL_SET_FLAGS
+                    .union(VersionedDoors::MAIL_MOVE)
+                    .union(VersionedDoors::MAIL_DESTROY),
+            )
         );
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
         assert_eq!(caps.blob_range, BlobRangeSupport::No);

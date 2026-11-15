@@ -193,7 +193,8 @@ pub(super) fn ews_address(recipient: &crate::ews::EwsRecipient) -> Address {
     }
 }
 
-pub(super) fn select_query(select: &str) -> String {
+/// Some typed reads supply an expand clause as well as a select list.
+pub(crate) fn select_query(select: &str) -> String {
     if select.contains("$expand") {
         select.to_string()
     } else {

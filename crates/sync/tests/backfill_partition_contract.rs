@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use bifrost_sync::Error;
 use bifrost_sync::backfill::{BackfillRunner, LiveSupersedes};
-use bifrost_sync::multiplexer::ChangeDelivery;
+use bifrost_sync::multiplexer::{ChangeDelivery, PagePublisher};
 use bifrost_types::{
     Account, AccountErrorBuilder, AccountErrorKind, Cause, Checkpoint, CoverageDomain, CursorScope,
     DiagnosticText, InternalErrorKind, InventoryBatch, InventoryCompletion,
@@ -46,6 +46,26 @@ fn barrier(scope: &CursorScope) -> InventoryCoverageReport {
     )
 }
 
+fn publisher(delivery: ChangeDelivery) -> PagePublisher {
+    let (boundary, _view) = bifrost_sync::Boundary::new();
+    let (priority, _p) = tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+    let (bandwidth, _b) = tokio::sync::watch::channel(None);
+    let control = bifrost_sync::SyncControl::new(
+        bifrost_types::AccountId("partition-contract".into()),
+        boundary,
+        priority,
+        bandwidth,
+    );
+    let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(4);
+    drop(writer_rx);
+    PagePublisher::new(
+        Arc::new(delivery),
+        control,
+        writer_tx,
+        tokio_util::sync::CancellationToken::new(),
+    )
+}
+
 /// Run one partition against a stub whose partition stream yields `events`.
 async fn run(
     events: Vec<InventoryEvent>,
@@ -63,21 +83,18 @@ async fn run(
     let account: Arc<dyn Account> = Arc::new(stub);
     let (tx, _rx) = tokio::sync::broadcast::channel(16);
     let delivery = ChangeDelivery::new(tx);
+    let publisher = publisher(delivery);
     let live = LiveSupersedes::new();
     BackfillRunner::run_partition(
         account.as_ref(),
         scope,
         InventoryPartition::Full,
         &live,
-        None,
         bifrost_types::TraitEnvelopeVersion::new(1),
-        None,
-        None,
-        None,
+        &publisher,
         walk_generation(0),
         None,
         bifrost_sync::cursor::PendingCoverage::initial_fence(),
-        &delivery,
     )
     .await
 }
@@ -103,21 +120,18 @@ async fn run_observed(
     let account: Arc<dyn Account> = Arc::new(stub);
     let (tx, mut rx) = tokio::sync::broadcast::channel(16);
     let delivery = ChangeDelivery::new(tx.clone());
+    let publisher = publisher(delivery);
     let live = LiveSupersedes::new();
     let outcome = BackfillRunner::run_partition(
         account.as_ref(),
         scope,
         InventoryPartition::Full,
         &live,
-        Some(tx),
         bifrost_types::TraitEnvelopeVersion::new(1),
-        None,
-        None,
-        None,
+        &publisher,
         walk_generation(0),
         None,
         bifrost_sync::cursor::PendingCoverage::initial_fence(),
-        &delivery,
     )
     .await
     .expect("the partition runs");

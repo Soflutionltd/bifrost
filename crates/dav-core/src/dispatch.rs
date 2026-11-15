@@ -618,7 +618,7 @@ impl DavDispatch {
                 // after the request's own committed first attempt can answer
                 // 412 (conditional PUT/DELETE, create-PUT) or 404 (versioned
                 // DELETE, MOVE whose source already moved), so those go to the
-                // shared classifier, whose `may_have_committed` path
+                // shared classifier, whose possible-commit ledger path
                 // reconciles. A 405/501 denies the method itself, which no
                 // earlier commit can cause, and is the one status DAV needs as
                 // data after a refusal (the MOVE fallback).
@@ -627,7 +627,8 @@ impl DavDispatch {
                 // Such a proven refusal permits DAV to consume the terminal
                 // status as data without losing earlier commit uncertainty.
                 let refused_only = match &error {
-                    NetError::AttemptHistory { attempts, .. } => {
+                    NetError::AttemptHistory { evidence, .. } => {
+                        let attempts = evidence.attempts();
                         let status_is = |attempt: &NetError, codes: &[u16]| {
                             matches!(attempt, NetError::Status { code, .. }
                                 if codes.contains(&code.as_u16()))
@@ -1577,8 +1578,10 @@ mod tests {
                 operation,
                 Err(NetError::AttemptHistory {
                     source: Box::new(status(code)),
-                    attempts: vec![status(503)],
-                    may_have_committed: true,
+                    evidence: bifrost_net::RequestEvidence::new(
+                        vec![status(503)],
+                        bifrost_net::CommitEvidence::MayHaveCommitted,
+                    ),
                 }),
             );
             if code == 405 {
@@ -1602,9 +1605,12 @@ mod tests {
                         body: Bytes::new(),
                     }),
                     retry_after_history: vec![],
+                    stop_reason: bifrost_net::RetryStopReason::AttemptBudget,
                 }),
-                attempts: vec![],
-                may_have_committed: true,
+                evidence: bifrost_net::RequestEvidence::new(
+                    vec![],
+                    bifrost_net::CommitEvidence::MayHaveCommitted,
+                ),
             }),
         );
         assert_eq!(result.unwrap().status, StatusCode::NOT_IMPLEMENTED);
@@ -2084,12 +2090,14 @@ mod tests {
                         headers: HeaderMap::new(),
                         body: Bytes::new(),
                     }),
-                    attempts: vec![NetError::Network {
-                        message: "lost response".into(),
-                        transmission_state: TransmissionState::InFlight,
-                        source: None,
-                    }],
-                    may_have_committed: true,
+                    evidence: bifrost_net::RequestEvidence::new(
+                        vec![NetError::Network {
+                            message: "lost response".into(),
+                            transmission_state: TransmissionState::InFlight,
+                            source: None,
+                        }],
+                        bifrost_net::CommitEvidence::MayHaveCommitted,
+                    ),
                 }),
             )
             .expect_err("an ambiguous create must reconcile");
@@ -2298,7 +2306,10 @@ mod tests {
                         headers: HeaderMap::new(),
                         body: Bytes::new(),
                     }),
-                    retry_after_history: vec![std::time::Duration::from_secs(300)],
+                    retry_after_history: vec![bifrost_types::RetryHint::After(
+                        std::time::Duration::from_secs(300),
+                    )],
+                    stop_reason: bifrost_net::RetryStopReason::AttemptBudget,
                 }),
             )
             .expect_err("exhaustion keeps its retry history");

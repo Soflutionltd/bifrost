@@ -72,49 +72,25 @@
 //!
 //! # Why the error is a digest and not a reconstruction
 //!
-//! `LedgerEntry::last_error` and `BarrierIncident::evidence` are the one part
-//! of the ledger that does not round-trip byte-for-byte, and the reason is
-//! structural rather than expedient. `AccountError` carries a `Cause` chain
-//! whose payloads include `&'static str` fields (`AccessCause::InsufficientScope
-//! { needed }`, `RequestCause::InvalidArgument { field }`); a decoder holding
-//! bytes cannot produce a `&'static str` without leaking, so an exact
-//! reconstruction is not merely large, it is unrepresentable.
+//! `LedgerEntry::last_error` and `BarrierIncident::evidence` contain
+//! `ErrorDigest`: kind, scope, operation, provider, protocol and diagnostics.
+//! They are historical operator evidence, not live `AccountError` values.
+//! No cause, recovery advice, message key, throttle override or partial-commit
+//! record is reconstructed. Repair uses the separately retained target.
 //!
-//! So this codec persists the CLASSIFICATION exactly - `AccountErrorKind`,
-//! `ErrorScope`, operation, provider, protocol and the full `DiagnosticInfo` -
-//! and rebuilds the error through `AccountErrorBuilder` with the canonical
-//! `Cause` its kind demands. The structured payloads of any secondary causes do
-//! not survive as typed values.
-//!
-//! That loss is affordable because nothing decides anything on these fields.
-//! Every ledger predicate - `blocks_completion`, `completion_permitted`,
-//! `repairable`, `lineage_root`, `record_attempt`, discharge - reads proof,
-//! policy, domain, generation, target, parent and the lineage budgets, never
-//! the error; `LedgerEntry::target`
-//! exists precisely so a repair descriptor is never taken from the error, whose
-//! classifications and messages change between revisions. The error is operator
-//! evidence, and operator evidence is what a digest preserves.
-//!
-//! What is NOT preserved, stated so a later reader does not assume otherwise:
-//! secondary `Cause` payloads, `idempotency_override`, `throttle_scope`, and
-//! the partial-commit record. `idempotency_override` and `throttle_scope` are
-//! overrides for deriving `RecoveryClass` on a live retry decision, and a
-//! restored ledger error is never retried through - it is read by an operator
-//! or an audit. The partial-commit record is dropped for the same reason and
-//! one more: ledger rows record sync coverage and repair failures, never write
-//! failures, and attaching a record to a digest's synthesized cause would
-//! validate invented evidence.
+//! The digest representation did not change the byte layout of the error
+//! record; every version in `[MIN_MIGRATABLE_LEDGER, LEDGER_ENVELOPE_VERSION]`
+//! reads through the existing migrations. Diagnostic text keeps its
+//! visibility; malformed diagnostic tokens are rejected as corrupt input.
 
 use std::collections::BTreeMap;
 
 use bifrost_types::{
-    AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, CoverageCoordinate,
-    CoverageDomain, CursorScope, DetailVisibility, DiagnosticText, ErrorScope, InternalCause,
+    AccessErrorKind, AccountErrorKind, AccountOperation, AuthErrorKind, CoverageCoordinate,
+    CoverageDomain, DetailVisibility, DiagnosticInfo, DiagnosticText, ErrorScope,
     InternalErrorKind, MailboxUnavailableKind, ObjectId, ObligationKey, Protocol,
-    ProtocolErrorKind, Provider, RequestCause, RequestErrorKind, ResourceKind, ServerCause,
-    ServerErrorKind, SnapshotIdentity, StateCause, StrategyDowngrade, SyncStateErrorKind,
-    TransportCause, TransportErrorKind, TransportKind,
+    ProtocolErrorKind, Provider, RequestErrorKind, ResourceKind, ServerErrorKind, SnapshotIdentity,
+    SyncStateErrorKind, TelemetryToken, TransportErrorKind,
 };
 
 use super::envelope::{
@@ -122,15 +98,16 @@ use super::envelope::{
     write_bytes, write_string,
 };
 use super::ledger::{
-    BarrierIncident, DebtLedger, DischargeAudit, DischargeEvidence, LedgerEntry, LineageBudget,
-    PolicyStatus, ProofStatus,
+    BarrierIncident, DebtLedger, DischargeAudit, DischargeEvidence, ErrorDigest, LedgerEntry,
+    LineageBudget, PolicyStatus, ProofStatus,
 };
 use crate::error::Error;
 
 /// Current ledger envelope version. Bumped whenever the layout below changes
 /// in a way an older decoder would misread, including a new tag in a
 /// vocabulary an older decoder would refuse.
-pub const LEDGER_ENVELOPE_VERSION: u32 = 10;
+// Version 11 adds the IMAP namespace error scope (tag 14).
+pub const LEDGER_ENVELOPE_VERSION: u32 = 11;
 
 /// Lowest ledger envelope version still readable by this engine.
 ///
@@ -650,7 +627,7 @@ fn decode_domain(reader: &mut Reader<'_>) -> Result<CoverageDomain, Error> {
 
 // ---------- account error digest ----------
 
-fn encode_error(out: &mut Vec<u8>, error: &AccountError) {
+fn encode_error(out: &mut Vec<u8>, error: &ErrorDigest) {
     encode_error_kind(out, error.kind());
     match error.scope() {
         None => out.push(0),
@@ -681,33 +658,30 @@ fn encode_error(out: &mut Vec<u8>, error: &AccountError) {
         }
     }
 
-    // Diagnostics. `support_consented` is the widest tier that still returns
-    // the free-form text, and `telemetry_fields` carries the bounded tokens;
-    // together they are every diagnostic field the builder can put back.
-    let consented = error.support_consented();
-    let telemetry = &consented.telemetry;
-    write_opt_u16(out, telemetry.status);
-    write_opt_str(out, telemetry.request_id);
-    write_opt_str(out, telemetry.trace_id);
-    write_opt_str(out, telemetry.native_code);
-    write_count(
+    let diagnostics = &error.diagnostics;
+    write_opt_u16(out, diagnostics.status);
+    write_opt_str(
         out,
-        consented.user_safe_text.len() + consented.support_text.len(),
-        "diagnostic text",
+        diagnostics.request_id.as_ref().map(TelemetryToken::as_str),
     );
-    for text in &consented.user_safe_text {
-        out.push(0);
-        write_string(out, text);
-    }
-    for text in &consented.support_text {
-        out.push(1);
-        write_string(out, text);
+    write_opt_str(
+        out,
+        diagnostics.trace_id.as_ref().map(TelemetryToken::as_str),
+    );
+    write_opt_str(
+        out,
+        diagnostics.native_code.as_ref().map(TelemetryToken::as_str),
+    );
+    write_count(out, diagnostics.text.len(), "diagnostic text");
+    for text in &diagnostics.text {
+        out.push(u8::from(!text.is_user_safe()));
+        write_string(out, text.as_str());
     }
 }
 
-fn decode_error(reader: &mut Reader<'_>) -> Result<AccountError, Error> {
+fn decode_error(reader: &mut Reader<'_>) -> Result<ErrorDigest, Error> {
     let kind = decode_error_kind(reader)?;
-    let mut scope = match reader.u8()? {
+    let scope = match reader.u8()? {
         0 => None,
         1 => Some(decode_error_scope(reader)?),
         other => {
@@ -762,144 +736,34 @@ fn decode_error(reader: &mut Reader<'_>) -> Result<AccountError, Error> {
         text.push((visibility, reader.string()?));
     }
 
-    // `SyncState(CursorInvalid)` without an `ErrorScope::Cursor` is a builder
-    // rejection, and a decoder must not fail on state the engine legitimately
-    // held: a producer can attach a non-cursor scope, or none. Substituting the
-    // account-wide cursor scope keeps the classification readable rather than
-    // turning an operator's audit record into a decode error.
-    if matches!(
-        kind,
-        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
-    ) && !matches!(scope, Some(ErrorScope::Cursor(_)))
-    {
-        scope = Some(ErrorScope::Cursor(CursorScope::Account));
-    }
-
-    let mut builder = AccountErrorBuilder::new(kind.clone(), canonical_cause(&kind));
-    if let Some(scope) = scope {
-        builder = builder.scope(scope);
-    }
-    if let Some(operation) = operation {
-        builder = builder.operation(operation);
-    }
-    if let Some(provider) = provider {
-        builder = builder.provider(provider);
-    }
-    if let Some(protocol) = protocol {
-        builder = builder.protocol(protocol);
-    }
-    builder = builder.status(status);
-    if let Some(request_id) = request_id {
-        builder = builder.request_id(request_id);
-    }
-    if let Some(trace_id) = trace_id {
-        builder = builder.trace_id(trace_id);
-    }
-    if let Some(native_code) = native_code {
-        builder = builder.native_code(native_code);
-    }
-    for (visibility, value) in text {
-        builder = builder.text(match visibility {
+    let mut diagnostics = DiagnosticInfo::default();
+    diagnostics.status = status;
+    let token = |value: Option<String>| -> Result<Option<TelemetryToken>, Error> {
+        value
+            .map(|value| {
+                TelemetryToken::new(value)
+                    .ok_or_else(|| Error::Other("ledger envelope: invalid diagnostic token".into()))
+            })
+            .transpose()
+    };
+    diagnostics.request_id = token(request_id)?;
+    diagnostics.trace_id = token(trace_id)?;
+    diagnostics.native_code = token(native_code)?;
+    diagnostics.text = text
+        .into_iter()
+        .map(|(visibility, value)| match visibility {
             DetailVisibility::UserSafe => DiagnosticText::user_safe(value),
             _ => DiagnosticText::support_only(value),
-        });
-    }
-    builder.try_build().map_err(|err| {
-        // A codec bug, not corrupt input - but decode never panics, because a
-        // panic here would take down a consumer loading its own durable rows.
-        Error::Other(format!(
-            "ledger envelope: restored error failed classification: {err}"
-        ))
+        })
+        .collect();
+    Ok(ErrorDigest {
+        kind,
+        scope,
+        operation,
+        provider,
+        protocol,
+        diagnostics,
     })
-}
-
-/// The `Cause` a kind demands, per `kind_matches_cause`.
-///
-/// Synthesized rather than decoded, because a `Cause` payload can hold a
-/// `&'static str` no decoder can produce. Where the cause carries a field the
-/// kind does not determine, this picks a neutral value; the real payload
-/// survives in the diagnostic text the digest carries, which is where an
-/// operator reads it anyway.
-fn canonical_cause(kind: &AccountErrorKind) -> Cause {
-    match kind {
-        AccountErrorKind::Transport(kind) => Cause::Transport(TransportCause::new(
-            match kind {
-                TransportErrorKind::Timeout => TransportKind::Timeout,
-                TransportErrorKind::Tls => TransportKind::Tls,
-                _ => TransportKind::Network,
-            },
-            None,
-        )),
-        AccountErrorKind::Authentication(kind) => Cause::Auth(match kind {
-            AuthErrorKind::RefreshTransient => AuthCause::RefreshTransient,
-            AuthErrorKind::Revoked => AuthCause::Revoked,
-            AuthErrorKind::ReauthorizationRequired => AuthCause::ReauthorizationRequired,
-            _ => AuthCause::Expired,
-        }),
-        AccountErrorKind::Authorization(kind) => Cause::Access(match kind {
-            AccessErrorKind::AdminConsentRequired => {
-                AccessCause::AdminConsentRequired { needed: "unknown" }
-            }
-            AccessErrorKind::ConditionalAccessBlocked => AccessCause::ConditionalAccessBlocked,
-            AccessErrorKind::PolicyBlocked => AccessCause::PolicyBlocked,
-            AccessErrorKind::InsufficientScope => {
-                AccessCause::InsufficientScope { needed: "unknown" }
-            }
-            AccessErrorKind::AccountDisabled => AccessCause::AccountDisabled,
-            AccessErrorKind::MailboxUnavailable { kind } => {
-                AccessCause::MailboxUnavailable { kind: *kind }
-            }
-            AccessErrorKind::MailboxNotLicensed => AccessCause::MailboxNotLicensed,
-            _ => AccessCause::PermissionDenied { resource: None },
-        }),
-        AccountErrorKind::Server(kind) => Cause::Server(match kind {
-            ServerErrorKind::Unavailable => ServerCause::Unavailable { retry_hint: None },
-            ServerErrorKind::RateLimited => ServerCause::RateLimited { retry_hint: None },
-            ServerErrorKind::QuotaExhausted => ServerCause::QuotaExhausted { retry_hint: None },
-            ServerErrorKind::Error { status } => ServerCause::Error { status: *status },
-            _ => ServerCause::Error { status: None },
-        }),
-        AccountErrorKind::SyncState(kind) => Cause::State(match kind {
-            SyncStateErrorKind::StrategyFailure => StateCause::StrategyFailure {
-                downgrade: StrategyDowngrade::QResyncToCondstore,
-            },
-            SyncStateErrorKind::ScopeCapabilityLost => StateCause::ScopeCapabilityLost,
-            SyncStateErrorKind::SchemaIncompatible => StateCause::SchemaIncompatible,
-            SyncStateErrorKind::CapabilityChanged => StateCause::CapabilityChanged { delta: None },
-            SyncStateErrorKind::OperatorOverrideNeeded => StateCause::OperatorOverrideNeeded {
-                reason: String::new(),
-            },
-            SyncStateErrorKind::ScopeRevoked => StateCause::ScopeRevoked,
-            _ => StateCause::CursorInvalid,
-        }),
-        AccountErrorKind::AccountClosed => Cause::State(StateCause::AccountClosed),
-        AccountErrorKind::ConcurrencyConflict => Cause::State(StateCause::ConcurrencyConflict),
-        AccountErrorKind::ControlWaitEnded => Cause::State(StateCause::ControlWaitEnded {
-            detail: DiagnosticText::support_only(""),
-        }),
-        AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid) => {
-            Cause::Request(RequestCause::BatchInputEmpty)
-        }
-        AccountErrorKind::Request(_) => Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(""),
-        }),
-        AccountErrorKind::NotFound(what) => Cause::Request(RequestCause::NotFound {
-            what: *what,
-            id: None,
-        }),
-        AccountErrorKind::Unsupported(operation) => Cause::Request(RequestCause::Unsupported {
-            operation: *operation,
-        }),
-        AccountErrorKind::Protocol(_) => Cause::Wire(bifrost_types::WireCause::MalformedResponse {
-            protocol: Protocol::Unknown,
-            detail: None,
-        }),
-        AccountErrorKind::Internal(kind) => Cause::Internal(InternalCause::new(*kind, None)),
-        // `AccountErrorKind` is `#[non_exhaustive]`; unreachable, because
-        // `decode_error_kind` only produces tags this codec wrote. Kept so the
-        // match is total without pretending a future kind is a request error.
-        _ => Cause::Attempt(AttemptCause::new(bifrost_types::TransmissionState::Unsent)),
-    }
 }
 
 fn encode_error_kind(out: &mut Vec<u8>, kind: &AccountErrorKind) {
@@ -1114,6 +978,10 @@ fn encode_error_scope(out: &mut Vec<u8>, scope: &ErrorScope) {
         }
         ErrorScope::UploadSession => out.push(13),
         ErrorScope::Account => out.push(0),
+        ErrorScope::Namespace { prefix } => {
+            out.push(14);
+            write_string(out, prefix);
+        }
         ErrorScope::Cursor(cursor) => {
             out.push(1);
             write_bytes(out, &encode_scope(cursor));
@@ -1187,6 +1055,9 @@ fn decode_error_scope(reader: &mut Reader<'_>) -> Result<ErrorScope, Error> {
             id: reader.string()?,
         },
         13 if reader.version >= 7 => ErrorScope::UploadSession,
+        14 if reader.version >= 11 => ErrorScope::Namespace {
+            prefix: reader.string()?,
+        },
         other => return Err(unknown_tag("error scope", other)),
     })
 }
@@ -1291,13 +1162,10 @@ fn decode_resource(tag: u8, version: u32) -> Result<ResourceKind, Error> {
     })
 }
 
-/// Tag table for `AccountOperation`, in declaration order.
+/// Historical decode table for `AccountOperation`, in wire-tag order.
 ///
-/// A table rather than two hand-written matches, because 85 variants written
-/// twice is 85 chances to transpose a pair - and a transposed pair here does
-/// not fail to compile, it silently relabels an operation in a durable record.
-/// The `encode`/`decode` pair below is derived from this one list, so the two
-/// directions cannot disagree.
+/// Encoding is an exhaustive types-owned match. The round-trip test pins this
+/// decode table against those tags, preserving old rows when variants grow.
 const OPERATIONS: &[AccountOperation] = &[
     AccountOperation::CategoryDefinitionsList,
     AccountOperation::MessageReactionsRead,
@@ -1385,14 +1253,7 @@ const OPERATIONS: &[AccountOperation] = &[
 ];
 
 fn encode_operation(operation: AccountOperation) -> u8 {
-    let index = OPERATIONS
-        .iter()
-        .position(|candidate| *candidate == operation)
-        // `AccountOperation` is `#[non_exhaustive]`; an operation missing from
-        // the table is one this codec has not learned, and writing a durable
-        // row that mislabels it is worse than refusing.
-        .unwrap_or_else(|| panic!("ledger envelope: unknown account operation {operation:?}"));
-    u8::try_from(index).expect("ledger envelope: operation table exceeds u8 tag space")
+    operation.ledger_tag()
 }
 
 fn decode_operation(tag: u8) -> Result<AccountOperation, Error> {
@@ -1560,10 +1421,10 @@ impl<'a> Reader<'a> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use bifrost_types::{AccountErrorBuilder, AccountErrorKind, CursorScope};
+    use bifrost_types::{AccountErrorKind, CursorScope};
 
     use super::{LEDGER_ENVELOPE_VERSION, decode_ledger, encode_ledger};
-    use crate::cursor::ledger::{DebtLedger, DischargeAudit, DischargeEvidence};
+    use crate::cursor::ledger::{DebtLedger, DischargeAudit, DischargeEvidence, ErrorDigest};
     use crate::error::Error;
 
     /// The empty ledger is the state every account starts in, so a consumer
@@ -1785,6 +1646,42 @@ mod tests {
         assert!(super::decode_operation(past_end).is_err());
     }
 
+    // Literal historical digest bytes, rather than a round trip through the
+    // current encoder, pin the readable window and absence of invented scope.
+    #[test]
+    fn legacy_cursor_invalid_digest_keeps_absent_scope() {
+        let bytes = [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        for version in super::MIN_MIGRATABLE_LEDGER..=LEDGER_ENVELOPE_VERSION {
+            let mut reader = super::Reader::new(&bytes, version);
+            let digest = super::decode_error(&mut reader).expect("historical digest");
+            assert_eq!(
+                digest.kind,
+                AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CursorInvalid)
+            );
+            assert!(
+                digest.scope.is_none(),
+                "audit evidence must not acquire a scope"
+            );
+            let mut encoded = Vec::new();
+            super::encode_error(&mut encoded, &digest);
+            assert_eq!(encoded, bytes);
+        }
+    }
+
+    #[test]
+    fn namespace_scope_requires_version_eleven() {
+        let scope = bifrost_types::ErrorScope::Namespace {
+            prefix: "Shared/".into(),
+        };
+        let mut bytes = Vec::new();
+        super::encode_error_scope(&mut bytes, &scope);
+        assert_eq!(
+            super::decode_error_scope(&mut super::Reader::new(&bytes, 11)).unwrap(),
+            scope
+        );
+        assert!(super::decode_error_scope(&mut super::Reader::new(&bytes, 10)).is_err());
+    }
+
     #[test]
     fn directory_gateway_scope_digest_round_trips_and_requires_version_six() {
         assert_eq!(
@@ -1826,7 +1723,7 @@ mod tests {
         .try_build()
         .expect("valid error");
         let mut bytes = Vec::new();
-        super::encode_error(&mut bytes, &error);
+        super::encode_error(&mut bytes, &ErrorDigest::from(&error));
         let restored =
             super::decode_error(&mut super::Reader::new(&bytes, 5)).expect("event digest");
         assert_eq!(restored.kind(), error.kind());
@@ -1874,14 +1771,6 @@ mod tests {
                 kind
             );
             assert!(super::decode_error_kind(&mut super::Reader::new(&bytes, 3)).is_err());
-            // The restored digest re-derives a valid classification.
-            let restored = AccountErrorBuilder::new(kind.clone(), super::canonical_cause(&kind))
-                .try_build()
-                .expect("canonical cause matches the kind");
-            assert_eq!(
-                restored.recovery(),
-                &bifrost_types::RecoveryClass::InternalFailure
-            );
         }
     }
 }
@@ -1889,6 +1778,7 @@ mod tests {
 #[cfg(test)]
 mod partial_commit_scope_tests {
     use super::*;
+    use bifrost_types::AccountError;
     #[test]
     fn google_api_error_digests_require_version_nine() {
         const { assert!(LEDGER_ENVELOPE_VERSION >= 9) };
@@ -1904,12 +1794,16 @@ mod partial_commit_scope_tests {
                 .try_build()
                 .unwrap();
             let mut bytes = Vec::new();
-            encode_error(&mut bytes, &error);
+            encode_error(&mut bytes, &ErrorDigest::from(&error));
             let restored = decode_error(&mut Reader::new(&bytes, 9)).unwrap();
             assert_eq!(restored.provider(), Some(Provider::Google));
             assert_eq!(restored.protocol(), Some(protocol));
             assert_eq!(
-                restored.telemetry_fields().request_id,
+                restored
+                    .diagnostics
+                    .request_id
+                    .as_ref()
+                    .map(TelemetryToken::as_str),
                 Some("google-request")
             );
             for version in MIN_MIGRATABLE_LEDGER..9 {
@@ -1935,15 +1829,6 @@ mod partial_commit_scope_tests {
         for version in MIN_MIGRATABLE_LEDGER..10 {
             assert!(decode_error_kind(&mut Reader::new(&bytes, version)).is_err());
         }
-        let restored = AccountErrorBuilder::new(kind.clone(), canonical_cause(&kind))
-            .try_build()
-            .expect("canonical cause matches the kind");
-        assert_eq!(
-            restored.recovery(),
-            &bifrost_types::RecoveryClass::Cancelled
-        );
-        assert_eq!(restored.message_key(), "account.closed");
-        assert!(restored.suggested_remediation().is_none());
     }
 
     #[test]
@@ -1957,13 +1842,6 @@ mod partial_commit_scope_tests {
             kind
         );
         assert!(decode_error_kind(&mut Reader::new(&bytes, 7)).is_err());
-        let restored = AccountErrorBuilder::new(kind.clone(), canonical_cause(&kind))
-            .try_build()
-            .expect("canonical cause matches the kind");
-        assert_eq!(
-            restored.recovery(),
-            &bifrost_types::RecoveryClass::Cancelled
-        );
     }
 
     #[test]

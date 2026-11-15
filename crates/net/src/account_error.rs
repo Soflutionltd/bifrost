@@ -6,6 +6,7 @@
 //! true of `trace.rs` beyond its construction-level invariants. Listed so a
 //! future auditor knows where that sweep's coverage stopped.
 
+#[cfg(test)]
 use std::time::{Duration, SystemTime};
 
 use bifrost_types::{
@@ -72,17 +73,10 @@ pub fn into_account_error_with_throttle_scope(
 ) -> AccountError {
     match error {
         Error::HopPolicy(error) => *error,
-        Error::AttemptHistory {
-            source,
-            attempts,
-            may_have_committed,
-        } => {
-            let mut ledger = crate::AttemptLedger::default();
-            for attempt in &attempts {
-                ledger.record_error(attempt, true);
-            }
+        Error::AttemptHistory { source, evidence } => {
+            let commit = evidence.verdict();
+            let (attempts, mut ledger) = evidence.into_parts();
             ledger.record_error(&source, true);
-            ledger.retain_possible_commit(may_have_committed);
             let lone_transport = attempts.is_empty()
                 && matches!(
                     source.as_ref(),
@@ -152,33 +146,17 @@ pub fn into_account_error_with_throttle_scope(
             // A blind same-request retry of the logical operation would replay
             // it, so derive must see it as non-idempotent whatever the
             // operation table says. The override only ever narrows.
-            if may_have_committed {
+            if commit == crate::CommitEvidence::MayHaveCommitted {
                 builder = builder.idempotency_override(false);
             }
             finish(builder, &ctx)
         }
-        Error::LocalHold {
-            held,
-            attempts,
-            may_have_committed,
-            ..
-        } => {
-            let hint = Some(RetryHint::After(held.deadline.remaining()));
-            let (kind, cause) = match held.kind {
-                crate::HoldKind::RateLimited => (
-                    ServerErrorKind::RateLimited,
-                    ServerCause::RateLimited { retry_hint: hint },
-                ),
-                crate::HoldKind::QuotaExhausted => (
-                    ServerErrorKind::QuotaExhausted,
-                    ServerCause::QuotaExhausted { retry_hint: hint },
-                ),
-            };
-            let mut ledger = crate::AttemptLedger::default();
-            for attempt in &attempts {
-                ledger.record_error(attempt, true);
-            }
-            ledger.retain_possible_commit(may_have_committed);
+        Error::LocalHold { held, evidence, .. } => {
+            let hint = RetryHint::After(held.deadline.remaining());
+            let kind = held.kind.server_kind();
+            let cause = held.kind.server_cause(hint);
+            let commit = evidence.verdict();
+            let (attempts, ledger) = evidence.into_parts();
             let diagnostics = format!("prior attempts: {attempts:?}");
             let evidence: Vec<_> = attempts
                 .into_iter()
@@ -196,7 +174,7 @@ pub fn into_account_error_with_throttle_scope(
                     builder = builder.push_cause(cause.clone());
                 }
             }
-            if may_have_committed {
+            if commit == crate::CommitEvidence::MayHaveCommitted {
                 builder = builder.idempotency_override(false);
             }
             builder = builder.text(DiagnosticText::support_only(diagnostics));
@@ -240,10 +218,18 @@ pub fn into_account_error_with_throttle_scope(
             code,
             body,
             headers,
-        } => status_error(&ctx, code, &headers, &body, None, throttle_scope),
+        } => status_error(
+            &ctx,
+            code,
+            &headers,
+            &body,
+            parse_retry_after_hint(headers.get(RETRY_AFTER)),
+            throttle_scope,
+        ),
         Error::RetryBudgetExhausted {
             final_response,
             retry_after_history,
+            ..
         } => match final_response {
             Some(response) => status_error(
                 &ctx,
@@ -452,7 +438,7 @@ fn auth_lost(
 /// agreed fidelity - do not re-raise.
 fn refresh_failed(
     ctx: &NetErrorContext,
-    retry_after: Option<SystemTime>,
+    retry_after: Option<RetryHint>,
     source: &Error,
 ) -> AccountError {
     let mut builder = base_builder(
@@ -464,13 +450,14 @@ fn refresh_failed(
         "OAuth refresh failed: {source}"
     )));
 
-    if let Some(cause) = support_cause_from_source(source) {
-        builder = builder.push_cause(cause);
-    }
-    // Keep the issuer's typed hint when present. The outer quiet deadline
+    let cause = match source.terminal() {
+        Error::Status { code, .. } => server_cause_from_status(code.as_u16(), retry_after),
+        _ => support_cause_from_source(source),
+    };
+    // Keep the issuer's typed hint when present. The outer quiet hint
     // also matters for transport failures whose cause has no server hint.
     let has_hint = matches!(
-        support_cause_from_source(source),
+        cause.as_ref(),
         Some(Cause::Server(
             ServerCause::Unavailable {
                 retry_hint: Some(_)
@@ -481,9 +468,12 @@ fn refresh_failed(
             }
         ))
     );
+    if let Some(cause) = cause {
+        builder = builder.push_cause(cause);
+    }
     if !has_hint && let Some(at) = retry_after {
         builder = builder.push_cause(Cause::Server(ServerCause::Unavailable {
-            retry_hint: Some(RetryHint::At(at)),
+            retry_hint: Some(at),
         }));
     }
     finish(builder, ctx)
@@ -491,12 +481,11 @@ fn refresh_failed(
 
 fn rate_limited(
     ctx: &NetErrorContext,
-    retry_after: Option<Duration>,
+    retry_after: Option<RetryHint>,
     final_response: &FinalResponse,
     throttle_scope: Option<ThrottleScope>,
 ) -> AccountError {
-    let retry_hint = parse_retry_after_hint(final_response.headers.get(RETRY_AFTER))
-        .or_else(|| retry_after.map(RetryHint::After));
+    let retry_hint = retry_after;
     let mut builder = base_builder(
         ctx,
         AccountErrorKind::Server(ServerErrorKind::RateLimited),
@@ -520,12 +509,11 @@ fn status_error(
     status: StatusCode,
     headers: &HeaderMap,
     body: &Bytes,
-    retry_hint_param: Option<Duration>,
+    retry_hint_param: Option<RetryHint>,
     throttle_scope: Option<ThrottleScope>,
 ) -> AccountError {
     let code = status.as_u16();
-    let retry_hint = parse_retry_after_hint(headers.get(RETRY_AFTER))
-        .or_else(|| retry_hint_param.map(RetryHint::After));
+    let retry_hint = retry_hint_param;
     let (kind, cause, throttle) = status_kind_cause(ctx, code, body, retry_hint);
     let mut builder = base_builder(ctx, kind, cause);
     builder = push_attempt(builder, TransmissionState::Acknowledged);
@@ -846,7 +834,7 @@ fn maybe_support_text_from_option(value: Option<String>) -> Option<DiagnosticTex
     value.and_then(maybe_support_text)
 }
 
-fn retry_history_text(history: &[Duration]) -> Option<DiagnosticText> {
+fn retry_history_text(history: &[RetryHint]) -> Option<DiagnosticText> {
     if history.is_empty() {
         None
     } else {
@@ -873,19 +861,15 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
         ))),
         Error::AuthLost { .. } => Some(Cause::Auth(AuthCause::ReauthorizationRequired)),
         Error::RefreshFailed { .. } => Some(Cause::Auth(AuthCause::RefreshTransient)),
-        Error::RateLimited {
-            retry_after,
-            final_response,
-        } => Some(Cause::Server(ServerCause::RateLimited {
-            retry_hint: parse_retry_after_hint(final_response.headers.get(RETRY_AFTER))
-                .or_else(|| retry_after.map(RetryHint::After)),
+        Error::RateLimited { retry_after, .. } => Some(Cause::Server(ServerCause::RateLimited {
+            retry_hint: *retry_after,
         })),
         Error::RetryBudgetExhausted {
             final_response: Some(response),
             retry_after_history,
+            ..
         } => server_cause_from_status(
             response.status.as_u16(),
-            response.headers.get(RETRY_AFTER),
             retry_after_history.last().copied(),
         ),
         Error::RetryBudgetExhausted {
@@ -895,9 +879,10 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
             TransportKind::Network,
             Some(DiagnosticText::support_only("retry budget exhausted")),
         ))),
-        Error::Status { code, headers, .. } => {
-            server_cause_from_status(code.as_u16(), headers.get(RETRY_AFTER), None)
-        }
+        Error::Status { code, headers, .. } => server_cause_from_status(
+            code.as_u16(),
+            parse_retry_after_hint(headers.get(RETRY_AFTER)),
+        ),
         Error::Cancelled => Some(Cause::Transport(TransportCause::new(
             TransportKind::Network,
             Some(DiagnosticText::support_only("request cancelled")),
@@ -918,13 +903,8 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
     }
 }
 
-fn server_cause_from_status(
-    code: u16,
-    retry_after_header: Option<&reqwest::header::HeaderValue>,
-    retry_hint_param: Option<Duration>,
-) -> Option<Cause> {
-    let retry_hint = parse_retry_after_hint(retry_after_header)
-        .or_else(|| retry_hint_param.map(RetryHint::After));
+fn server_cause_from_status(code: u16, retry_hint_param: Option<RetryHint>) -> Option<Cause> {
+    let retry_hint = retry_hint_param;
     match code {
         408 | 502 | 503 | 504 => Some(Cause::Server(ServerCause::Unavailable { retry_hint })),
         429 => Some(Cause::Server(ServerCause::RateLimited { retry_hint })),
@@ -983,12 +963,13 @@ mod retry_hint_tests {
                 body: Bytes::new(),
             },
             Error::RateLimited {
-                retry_after: Some(Duration::from_secs(1)),
+                retry_after: Some(RetryHint::At(at)),
                 final_response: response.clone(),
             },
             Error::RetryBudgetExhausted {
-                retry_after_history: vec![Duration::from_secs(1)],
+                retry_after_history: vec![RetryHint::At(at)],
                 final_response: Some(response),
+                stop_reason: crate::RetryStopReason::AttemptBudget,
             },
         ];
         for error in errors {
@@ -1019,7 +1000,7 @@ mod refresh_deadline_tests {
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1234);
         let error = into_account_error_with_throttle_scope(
             Error::RefreshFailed {
-                retry_after: Some(at),
+                retry_after: Some(RetryHint::At(at)),
                 source: std::sync::Arc::new(Error::Timeout {
                     transmission_state: TransmissionState::Unsent,
                 }),

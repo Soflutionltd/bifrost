@@ -1,7 +1,7 @@
 use bifrost_types::{
     AccountCapabilities, BatchingPolicy, BlobRangeSupport, ConvenienceShape, CursorFreshness,
     FilterRuleShape, MutationCapabilities, MutationConcurrency, MutationReplaySafety,
-    PimMethodSupport, PushCapability, QuotaSignal, RateLimitClass,
+    PimMethodSupport, PushCapability, QuotaSignal, RateLimitClass, VersionedDoors,
 };
 
 /// True when the server advertises enough RFC 6638 scheduling for the
@@ -45,16 +45,9 @@ pub(crate) fn caldav_capabilities(event_rsvp: bool) -> AccountCapabilities {
         blob_digest_pre_download: false,
         push: PushCapability::None,
         mutation: MutationCapabilities {
-            concurrency: MutationConcurrency::ExpectedVersion {
-                mail_set_flags: false,
-                mail_move: false,
-                mail_destroy: false,
-                contact_update: false,
-                event_update: true,
-                contact_delete: false,
-                event_delete: true,
-                event_rsvp: false,
-            },
+            concurrency: MutationConcurrency::ExpectedVersion(
+                VersionedDoors::EVENT_UPDATE.union(VersionedDoors::EVENT_DELETE),
+            ),
             replay_safety: MutationReplaySafety::None,
             reassertion: bifrost_types::MutationReassertion::NONE,
         },

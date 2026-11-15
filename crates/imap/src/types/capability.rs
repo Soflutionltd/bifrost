@@ -165,7 +165,7 @@ pub enum Capability {
     /// Gmail extension capability for `X-GM-*` FETCH attributes.
     XGmExt1,
     /// `AUTH=<mechanism>` (e.g. `AUTH=PLAIN`, `AUTH=XOAUTH2`) (RFC 3501 Section 7.2.1).
-    Auth(CapabilitySuffix),
+    Auth(bifrost_sasl::MechanismName),
     /// Unrecognized capability  -  preserved verbatim.
     // Only the parser mints unknown tokens; known spellings use known variants.
     Other(UnknownCapability),
@@ -241,7 +241,7 @@ impl Capability {
                     if mechanism.is_empty() {
                         Self::Other(UnknownCapability(s.to_owned()))
                     } else {
-                        Self::Auth(CapabilitySuffix(mechanism.to_owned()))
+                        Self::Auth(mechanism.into())
                     }
                 } else if upper == "SORT=DISPLAY" {
                     // RFC 5957 defines the dedicated SORT=DISPLAY capability.
@@ -377,8 +377,8 @@ impl PartialEq for Capability {
             | (Self::Utf8Only, Self::Utf8Only)
             | (Self::SortDisplay, Self::SortDisplay) => true,
             (Self::AppendLimit(a), Self::AppendLimit(b)) => a == b,
-            (Self::Auth(a), Self::Auth(b))
-            | (Self::Thread(a), Self::Thread(b))
+            (Self::Auth(a), Self::Auth(b)) => a == b,
+            (Self::Thread(a), Self::Thread(b))
             | (Self::QuotaResource(a), Self::QuotaResource(b))
             | (Self::Rights(a), Self::Rights(b)) => a.eq_ignore_ascii_case(b),
             (Self::Other(a), Self::Other(b)) => a.eq_ignore_ascii_case(b),

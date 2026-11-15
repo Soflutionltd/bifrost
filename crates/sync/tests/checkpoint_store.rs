@@ -373,7 +373,8 @@ async fn clear_account_checkpoints_drops_every_row_of_the_account_and_only_that_
         evidence: bifrost_types::AccountError::unsupported(
             bifrost_types::AccountOperation::SyncInventory,
             bifrost_types::Protocol::Unknown,
-        ),
+        )
+        .into(),
         policy: bifrost_sync::cursor::PolicyStatus::Retrying { attempts: 0 },
         resume_from: None,
     });

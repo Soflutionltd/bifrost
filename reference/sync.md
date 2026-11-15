@@ -264,10 +264,10 @@ admission waits.
 
 **Stop at the next poll boundary, but on different signals.**
 `BackfillRunner::run_partition` selects the account shutdown token at its
-`inventory_partition_stream` poll (through `LaneGate::shutdown`) and returns
+`inventory_partition_stream` poll (through its required `PagePublisher`) and returns
 `Error::ShuttingDown`, which withholds both the partition outcome and the scope
 completion marker. `InventoryFusion::run_stream` does the same with its own
-`shutdown` field at its provider poll - the slot's shutdown token for the
+publisher shutdown token at its provider poll - the slot's shutdown token for the
 deferred-inventory worker, the recovery context's for re-establishment - and
 also returns `Error::ShuttingDown` rather than `NoCursor`, which callers would
 read as a finished walk. `drive_changes_stream` selects the account BOUNDARY at its
@@ -721,7 +721,7 @@ the action uses, and must fail closed on error.
 touch `CheckpointStore` directly: it persists freshly created cursors and rolls
 them back through the same `WriterRequest` channel the ack writer serves.
 Direct writes raced acknowledged ones, and not hypothetically - `run_establish`
-hands `changes_tx` to `InventoryFusion`, so a replacement's inventory pass
+supplies the account publisher to `InventoryFusion`, so a replacement's inventory pass
 broadcasts checkpoint-bearing batches BEFORE the cutover, a consumer can
 acknowledge one, and the abort path then deleted the row that acknowledgement
 had just committed.
@@ -792,9 +792,9 @@ fails, flushing them when a later request loads the ledger successfully.
 The backfill runner receives the walk's fence rather than adopting a new one
 at partition entry. Completion markers register conditionally too. Inventory
 fusion carries `expected_fence` through pages, `Done`, and `put_if` finalization;
-checkpoint-less batches check before forwarding, as does every batch and the
-`Done` of a fusion built without a control handle, which has no conditional
-registration to judge them. A superseded fusion emits a
+checkpoint-less batches check before forwarding. Every checkpoint-bearing
+publication uses the same conditional registration, including test fixtures.
+A superseded fusion emits a
 scoped warning and returns `Invalidated`; establishment returns
 `Error::Superseded`, which stops scoped retries and skips that scope during
 reattach. `run_establish` receives its caller's fence, captured before awaited
@@ -931,7 +931,7 @@ carries no tag yields `Protocol::Unknown` rather than a guess.
 
 **Both inventory front ends and the live driver refuse a BACKFILL checkpoint
 outright**, and the reason is about the bound rather than about envelopes. Both
-register the publication and then send on the RAW sender, so an entry created
+register the publication and then use the unstamped change delivery, so an entry created
 there is never stamped with a delivery, and an unsent stamp is deliberately
 never swept. A `Lane::Backfill` entry minted that way would sit charged against
 the account's backfill bound until an acknowledgement, a lag or a reset freed
@@ -1482,6 +1482,27 @@ acknowledger falls `changes_capacity` events behind and lags, `on_lag`
 abandons the walk's pages and withholds its marker, and the cycle repeats for
 the life of the attachment.
 
+`ChangeDelivery` privately owns the raw broadcast sender. Slot, recovery,
+multiplexer and backfill wiring carry no parallel sender. Status publishers use
+`publish_warning`, `publish_terminated` or `publish_unacked`; the last refuses
+checkpoint-bearing events. Observers subscribe through `observe`.
+
+`PagePublisher` supplies each inventory walk with required delivery, control,
+writer and shutdown services. It obtains coverage from the control's own ledger,
+so retirement, boundary tracking and delivery stamping share that owner.
+`publish_page` conditionally registers under the original walk fence, sends and
+stamps backfill pages, and retires unreachable claims synchronously. A backfill
+page that reaches no numbered reader advances the undelivered watermark.
+`publish_marker` applies the same delivery and retirement rule to completion;
+an unreachable marker returns `Withheld`, never `Published`. A user must get a
+retry rather than a completed folder whose inventory reached nobody.
+
+A runner's optional lane controls capacity and scheduler admission only. Fence
+registration, removal validation, debt routing and poll cancellation do not
+change when it is omitted. Fusion has no optional safety services or broadcast
+mode. Tests can serve the required writer channel with an in-process double and
+feed a stub Account; they exercise the same publication path as production.
+
 An observer counts for nothing, and each of the three places that used to read
 a raw receiver count now asks the gate instead. The subscriber gate
 (`wait_for_real_subscriber`) asks `ChangeDelivery::has_numbered_subscriber`,
@@ -1673,7 +1694,7 @@ delivery then coverage, never the reverse. Live-lane publications are never
 stamped or swept, but one that expects an acknowledgement still goes through
 the gate (`publish_acknowledgeable`), which takes the same lock only to answer
 whether a numbered receiver was live at the send; only events nobody
-acknowledges - warnings, terminations, barrier pages - send on the raw sender.
+acknowledges - warnings, terminations, barrier pages - use `publish_unacked`.
 The receiver holds a weak handle to the gate,
 so a receiver retained across `detach` sees `Closed` rather than keeping the
 sender alive itself. The acknowledgeability question cannot be answered by the
@@ -3388,13 +3409,10 @@ propagate as an ordinary establish failure - three burnt reopen
 attempts, a broadcast `Terminated`, and the undecodable row still on
 disk for the next attach to trip over identically.
 
-Encoding an `ObjectType` or `ProtocolKind` variant the codec does not
-know panics, the same rule `encode_scope` already applied to unknown
-`CursorScope` variants. Writing a placeholder tag instead would
-persist a durable row nothing can decode, and the account would then
-re-establish, re-encode the same unreadable value, and re-poison the
-row on every attach. Decoding the reserved tag `0xFF` (written by an
-engine revision that did exactly that) yields
+`ObjectType` and `ProtocolKind` tags are encoded by exhaustive methods in
+bifrost-types. A new variant requires a storage tag at compile time. Unknown
+`CursorScope` variants still panic in `encode_scope` and need a codec update.
+Decoding the reserved tag `0xFF`, written by an older engine revision, yields
 `Error::SchemaIncompatible` so those rows still heal.
 
 Every encoded length is checked against `u32::MAX`. An impossible
@@ -3515,7 +3533,11 @@ by older readers. Version 8 adds the `ControlWaitEnded` account error kind
 (tag 6) and GoogleCalendar, GooglePeople and GoogleDrive protocols (tags 10-12).
 Versions 3 through 8 remain readable, but reject these new tags as corruption.
 Version 10 adds `AccountClosed` (kind tag 12), rejected in older-version rows.
-Versions 3 through 9 remain readable without that tag.
+Versions 3 through 9 remain readable without that tag. Version 11 adds the
+`Namespace { prefix }` error scope (tag 14, carrying the IMAP namespace
+prefix), rejected in older-version rows; versions 3 through 10 remain readable
+without it. The cursor envelope needed no bump for qualified DAV collections:
+its existing `FolderType` encoding already represents them.
 Existing tags and layouts are unchanged; the readable minimum remains 3.
 
 Decode VALIDATES, never heals: a duplicated entry, barrier or lineage key,
@@ -3538,26 +3560,29 @@ A `BarrierIncident::resume_from` nests a whole cursor envelope through
 `encode_envelope` rather than re-deriving the layout, so the two codecs compose
 instead of drifting.
 
-`AccountError` is the one field that does not round-trip as a typed value, and
-the reason is structural: the `Cause` chain holds `&'static str` payloads
-(`AccessCause::InsufficientScope { needed }`,
-`RequestCause::InvalidArgument { field }`) that no decoder can produce from
-bytes without leaking. So `last_error` and `BarrierIncident::evidence` persist
-as a digest - the exact classification (`AccountErrorKind`, `ErrorScope`,
-operation, provider, protocol) plus the whole `DiagnosticInfo` - rebuilt through
-`AccountErrorBuilder` with the canonical `Cause` its kind demands. Secondary
-cause payloads, the retained original error source, `idempotency_override`,
-`throttle_scope` and the partial-commit
-record do not survive. Ledger errors are coverage/repair evidence, never write
-replay inputs; synthesized causes cannot validate a historical write record.
+`LedgerEntry::last_error` and `BarrierIncident::evidence` hold the public
+`cursor::ErrorDigest`, also reachable through `SyncEngine::debt`. It retains
+kind, scope, operation, provider, protocol and the complete `DiagnosticInfo`,
+including text visibility. These fields are historical operator evidence; the
+engine does not reconstruct a cause or expose invented recovery advice or
+message keys. Enterprise users inspecting incomplete synchronization need the
+observed classification and diagnostics. Recovery, secondary causes, original
+error sources, idempotency and throttle overrides and partial-commit records
+are not persisted. Repair uses the independently retained target.
 
-That is affordable because no ledger predicate reads these fields.
-`blocks_completion`, `completion_permitted`, `repairable`, `lineage_root`,
-`record_attempt` and every discharge path read proof, policy, domain, generation,
-target, parent and the lineage budgets; `LedgerEntry::target` exists precisely so a repair descriptor is
-never taken from an error whose classifications change between revisions. The
-error is operator evidence, and a digest preserves operator evidence. Anything
-that starts DECIDING on a restored error has to promote the field first.
+The move to `ErrorDigest` left the error record's byte layout unchanged and
+took no version bump. Every version in the readable window decodes through the
+existing migration chain; versions outside the readable window return `Error::SchemaIncompatible`. Invalid tags,
+malformed diagnostic tokens and contradictory ledger state return `Error::Other`.
+No cursor scope is invented while decoding an error digest. Diagnostics still
+require the caller's consent policy before export.
+
+The `AccountOperation::ledger_tag`, `ObjectType::cursor_tag` and
+`ProtocolKind::cursor_tag` encoders live in bifrost-types, with exhaustive
+matches so a new variant cannot silently acquire a panic in the writer or
+consumer store. Existing numeric tags remain unchanged; sync retains the
+version-aware decoders. Other vocabulary codecs still require explicit updates
+when bifrost-types grows a variant.
 
 `DebtLedger::from_parts` is the only door into the private maps that is not
 `ingest`, and it is crate-private for the reason the fields are: no protocol

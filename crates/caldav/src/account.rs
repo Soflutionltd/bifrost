@@ -468,7 +468,10 @@ impl Account for CalDavAccount {
             .calendar_urls
             .iter()
             .cloned()
-            .map(|url| CursorScope::Folder(FolderId(url)))
+            .map(|url| CursorScope::FolderType {
+                folder: bifrost_types::FolderId(url),
+                ty: ObjectType::CalendarEvent,
+            })
             .collect();
         Box::pin(stream::iter([
             SyncEvent::Batch(Batch {
@@ -1892,7 +1895,12 @@ fn validate_event_scope(
 ) -> Result<(), AccountError> {
     if matches!(
         scope,
-        CursorScope::Type(ObjectType::CalendarEvent) | CursorScope::Folder(_)
+        CursorScope::Type(ObjectType::CalendarEvent)
+            | CursorScope::Folder(_)
+            | CursorScope::FolderType {
+                ty: ObjectType::CalendarEvent,
+                ..
+            }
     ) {
         Ok(())
     } else {
@@ -1959,7 +1967,11 @@ fn collection_url_for_scope(
         CursorScope::Type(ObjectType::CalendarEvent) => default_url
             .map(str::to_string)
             .ok_or_else(|| no_default_calendar(operation)),
-        CursorScope::Folder(folder) if collection_urls.contains(&folder.0) => Ok(folder.0.clone()),
+        CursorScope::Folder(folder)
+        | CursorScope::FolderType {
+            folder,
+            ty: ObjectType::CalendarEvent,
+        } if collection_urls.contains(&folder.0) => Ok(folder.0.clone()),
         _ => Err(local_error(
             operation,
             "CalDAV cursor scope does not name a discovered calendar",
@@ -1972,14 +1984,22 @@ fn scope_collection_url<'a>(
     default_url: Option<&'a str>,
 ) -> Option<&'a str> {
     match scope {
-        CursorScope::Folder(folder) => Some(&folder.0),
+        CursorScope::Folder(folder)
+        | CursorScope::FolderType {
+            folder,
+            ty: ObjectType::CalendarEvent,
+        } => Some(&folder.0),
         _ => default_url,
     }
 }
 
 fn collection_coverage_domain(scope: CursorScope, collection_url: Option<&str>) -> CoverageDomain {
     match scope {
-        CursorScope::Folder(_) => CoverageDomain::full(scope),
+        CursorScope::Folder(_)
+        | CursorScope::FolderType {
+            ty: ObjectType::CalendarEvent,
+            ..
+        } => CoverageDomain::full(scope),
         // An unroutable legacy scope still needs a domain to carry the
         // terminating stream; the walk fails before the region is read.
         _ => CoverageDomain {
@@ -2048,7 +2068,11 @@ fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<EventSnapshot, Accoun
         })?;
     // Fixed, valid classification: try_build cannot fail.
     #[allow(clippy::unwrap_in_result)]
-    if let CursorScope::Folder(folder) = &cursor.scope
+    if let CursorScope::Folder(folder)
+    | CursorScope::FolderType {
+        folder,
+        ty: ObjectType::CalendarEvent,
+    } = &cursor.scope
         && !same_dav_url(&folder.0, &decoded.collection_url)
     {
         return Err(bifrost_types::CursorDecodeFault::ScopeMismatch
@@ -2694,7 +2718,10 @@ mod tests {
     }
 
     fn folder_scope() -> CursorScope {
-        CursorScope::Folder(FolderId("https://dav.example.test/cal/".to_string()))
+        CursorScope::FolderType {
+            folder: FolderId("https://dav.example.test/cal/".to_string()),
+            ty: ObjectType::CalendarEvent,
+        }
     }
 
     /// caldav-F1: a VTODO or VJOURNAL sharing the collection must not occupy

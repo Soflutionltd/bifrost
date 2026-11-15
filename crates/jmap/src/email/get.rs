@@ -34,7 +34,7 @@ impl Email {
     pub(crate) fn mailbox_ids(&self) -> Vec<&MailboxId> {
         self.mailbox_ids
             .as_ref()
-            .map(|m| m.iter().filter(|(_, v)| **v).map(|(k, _)| k).collect())
+            .map(|m| m.iter().collect())
             .unwrap_or_default()
     }
 
@@ -45,12 +45,7 @@ impl Email {
     pub(crate) fn keywords(&self) -> Vec<&str> {
         self.keywords
             .as_ref()
-            .map(|k| {
-                k.iter()
-                    .filter(|(_, v)| **v)
-                    .map(|(k, _)| k.as_str())
-                    .collect()
-            })
+            .map(|k| k.iter().map(super::keyword::Keyword::as_str).collect())
             .unwrap_or_default()
     }
 

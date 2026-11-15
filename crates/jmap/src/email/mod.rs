@@ -5,12 +5,15 @@
 
 pub(crate) mod get;
 pub(crate) mod import;
+pub(crate) mod keyword;
 pub(crate) mod parse;
 pub(crate) mod query;
 pub(crate) mod search_snippet;
 pub(crate) mod set;
 
+use crate::core::object_set::ObjectSet;
 use jiff::Timestamp;
+use keyword::Keyword;
 use serde::{
     Deserialize, Serialize,
     de::{IgnoredAny, MapAccess, Visitor},
@@ -50,14 +53,13 @@ pub(crate) struct Email {
 
     #[serde(rename = "mailboxIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mailbox_ids: Option<HashMap<MailboxId, bool>>,
+    pub(super) mailbox_ids: Option<ObjectSet<MailboxId>>,
 
-    // Keyword identity is ASCII-case-insensitive at the account boundary.
-    // A validated key type must preserve the original spelling for wire
-    // patches while sharing that identity with the flag judge and writers.
+    // Canonical keyword spelling makes set identity and patch paths agree
+    // with the account flag judge, including mixed-case caller input.
     #[serde(rename = "keywords")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) keywords: Option<HashMap<String, bool>>,
+    pub(super) keywords: Option<ObjectSet<Keyword>>,
 
     #[serde(rename = "size")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -202,7 +204,7 @@ pub(crate) struct EmailCreate {
 
     #[serde(rename = "mailboxIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mailbox_ids: Option<HashMap<MailboxId, bool>>,
+    pub(super) mailbox_ids: Option<ObjectSet<MailboxId>>,
 
     #[serde(rename = "#mailboxIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,7 +212,7 @@ pub(crate) struct EmailCreate {
 
     #[serde(rename = "keywords")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) keywords: Option<HashMap<String, bool>>,
+    pub(super) keywords: Option<ObjectSet<Keyword>>,
 
     #[serde(rename = "receivedAt")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -289,11 +291,11 @@ pub(crate) struct EmailCreate {
 pub(crate) struct EmailPatch {
     #[serde(rename = "mailboxIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mailbox_ids: Option<HashMap<MailboxId, bool>>,
+    pub(super) mailbox_ids: Option<ObjectSet<MailboxId>>,
 
     #[serde(rename = "keywords")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) keywords: Option<HashMap<String, bool>>,
+    pub(super) keywords: Option<ObjectSet<Keyword>>,
 
     #[serde(rename = "subject")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1093,10 +1095,13 @@ impl From<Email> for TestEmail {
         TestEmail {
             mailbox_ids: email
                 .mailbox_ids
-                .map(|ids| ids.into_iter().map(|(k, v)| (k.to_string(), v)).collect()),
-            keywords: email
-                .keywords
-                .map(|keywords| keywords.into_iter().collect()),
+                .map(|ids| ids.iter().map(|k| (k.to_string(), true)).collect()),
+            keywords: email.keywords.map(|keywords| {
+                keywords
+                    .iter()
+                    .map(|k| (k.as_str().to_owned(), true))
+                    .collect()
+            }),
             size: email.size,
             received_at: email.received_at,
             message_id: email.message_id,

@@ -948,13 +948,7 @@ impl SyncEngine {
                                         bifrost_types::WarningKind::OperatorAttentionNeeded,
                                         "reconcile requested dedupe-by-client-id; consumer must dedupe",
                                     );
-                                    let me = MultiplexerEvent {
-                                        scope: EventScope::Account,
-                                        event: Arc::new(SyncEvent::Warning(warning)),
-                                        checkpoint: None,
-                                        publication: None,
-                                    };
-                                    let _ = slot.multiplexer.changes_tx.send(me);
+                                    slot.delivery.publish_warning(EventScope::Account, warning);
                                 }
                                 break;
                             }
@@ -996,13 +990,7 @@ impl SyncEngine {
                     // rather than the only one - but a lane the producer
                     // deliberately wrote to should not dead-end in the engine.
                     bifrost_types::SyncEvent::Warning(warning) => {
-                        let me = MultiplexerEvent {
-                            scope: EventScope::Account,
-                            event: Arc::new(SyncEvent::Warning(warning)),
-                            checkpoint: None,
-                            publication: None,
-                        };
-                        let _ = slot.multiplexer.changes_tx.send(me);
+                        slot.delivery.publish_warning(EventScope::Account, warning);
                     }
                     bifrost_types::SyncEvent::Progress(_) => {}
                     _ => {}

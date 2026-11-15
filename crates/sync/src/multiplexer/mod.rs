@@ -49,7 +49,6 @@ pub use poll::{AdaptiveCadence, PollSchedule};
 #[derive(Debug)]
 pub struct MultiplexerHandle {
     pub cancel: CancellationToken,
-    pub changes_tx: broadcast::Sender<MultiplexerEvent>,
 }
 
 /// Whether an event concerns the whole attachment or one real cursor.
@@ -253,12 +252,116 @@ impl Drop for ChangesReceiver {
 /// publication that expects an ACKNOWLEDGEMENT still goes through
 /// [`Self::publish_acknowledgeable`], which takes the lock only to read the live
 /// numbered set at the send; events nobody acknowledges - warnings,
-/// terminations, barrier pages - send on [`Self::sender`] directly and take no
+/// terminations, barrier pages - send on [`Self::publish_unacked`] directly and take no
 /// lock.
+///
+/// The raw broadcast sender is deliberately not exposed (no `sender()` accessor,
+/// no `changes_tx` on the handle): a raw send bypasses the numbered-receiver
+/// delivery guarantee and checkpoint registration. Consumers subscribe through
+/// [`ChangeDelivery::observe`]; engine code publishes through `PagePublisher`
+/// or [`Self::publish_unacked`].
 #[derive(Debug)]
 pub struct ChangeDelivery {
     tx: broadcast::Sender<MultiplexerEvent>,
     state: StdMutex<SubscriberState>,
+}
+
+/// Required safety services for an inventory walk. The writer channel can be
+/// served by an in-process test double; omission never selects weaker safety.
+#[derive(Debug, Clone)]
+pub struct PagePublisher {
+    pub(crate) delivery: Arc<ChangeDelivery>,
+    pub(crate) control: crate::control::SyncControl,
+    pub(crate) coverage: Arc<crate::cursor::PendingCoverage>,
+    pub(crate) writer_tx: mpsc::Sender<WriterRequest>,
+    pub(crate) shutdown: CancellationToken,
+}
+
+impl PagePublisher {
+    #[must_use]
+    pub fn new(
+        delivery: Arc<ChangeDelivery>,
+        control: crate::control::SyncControl,
+        writer_tx: mpsc::Sender<WriterRequest>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        let coverage = control.publication_ledger();
+        Self {
+            delivery,
+            control,
+            coverage,
+            writer_tx,
+            shutdown,
+        }
+    }
+
+    #[must_use]
+    pub fn coverage(&self) -> &Arc<crate::cursor::PendingCoverage> {
+        &self.coverage
+    }
+
+    pub(crate) fn publish_marker(
+        &self,
+        mut event: MultiplexerEvent,
+        watermark: crate::cursor::UndeliveredMark,
+        fence: crate::cursor::ScopeFence,
+    ) -> bool {
+        let checkpoint = event.checkpoint.clone().expect("marker checkpoint");
+        let scope = match &checkpoint {
+            bifrost_types::Checkpoint::Backfill(cursor) => cursor.scope.clone(),
+            _ => unreachable!("backfill marker checkpoint"),
+        };
+        let Ok(id) = self
+            .control
+            .publish_walk_marker_if_fence(checkpoint, watermark, fence)
+        else {
+            return false;
+        };
+        event.publication = Some(id.clone());
+        let reached = self
+            .delivery
+            .publish_backfill(event, &self.coverage, Some(&id));
+        if !reached {
+            self.coverage.note_undelivered(&scope, 1);
+            self.control.retire_publication(id);
+        }
+        reached
+    }
+
+    /// Register against the walk's original fence, then send and retire an
+    /// unreachable publication synchronously. Cancellation cannot split these
+    /// steps. A mail user must get a retry rather than a completed empty folder.
+    pub fn publish_page(
+        &self,
+        mut event: MultiplexerEvent,
+        claim: crate::cursor::CoverageClaim,
+        fence: crate::cursor::ScopeFence,
+    ) -> Result<bool, crate::cursor::CoverageClaim> {
+        let checkpoint = event.checkpoint.clone().expect("page checkpoint");
+        let backfill = matches!(checkpoint, bifrost_types::Checkpoint::Backfill(_));
+        let scope = match &checkpoint {
+            bifrost_types::Checkpoint::Backfill(cursor) => cursor.scope.clone(),
+            bifrost_types::Checkpoint::Change(cursor) => cursor.scope.clone(),
+            _ => unreachable!("unsupported checkpoint"),
+        };
+        let id = self
+            .control
+            .publish_checkpoint_if_fence(checkpoint, claim, fence)?;
+        event.publication = Some(id.clone());
+        let reached = if backfill {
+            self.delivery
+                .publish_backfill(event, &self.coverage, Some(&id))
+        } else {
+            self.delivery.publish_acknowledgeable(event)
+        };
+        if !reached {
+            if backfill {
+                self.coverage.note_undelivered(&scope, 1);
+            }
+            self.control.retire_publication(id);
+        }
+        Ok(reached)
+    }
 }
 
 /// Sequence in one delivery gate's subscriber set. Only subscription admission
@@ -317,10 +420,35 @@ impl ChangeDelivery {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The raw sender, for publications that consume no backfill capacity.
-    #[must_use]
-    pub fn sender(&self) -> &broadcast::Sender<MultiplexerEvent> {
-        &self.tx
+    /// Publish data or status that carries no acknowledgement obligation.
+    /// A producer cannot bypass registration by smuggling a checkpoint here.
+    pub fn publish_unacked(&self, event: MultiplexerEvent) {
+        let payload_unacked = match event.event.as_ref() {
+            SyncEvent::Batch(batch) => batch.checkpoint.is_none(),
+            SyncEvent::Done(checkpoint) => checkpoint.is_none(),
+            _ => true,
+        };
+        assert!(
+            event.checkpoint.is_none() && event.publication.is_none() && payload_unacked,
+            "unacknowledged events cannot carry a checkpoint or publication"
+        );
+        let _ = self.tx.send(event);
+    }
+
+    /// Announce a warning without an acknowledgement obligation.
+    pub fn publish_warning(&self, scope: EventScope, warning: bifrost_types::Warning) {
+        self.publish_unacked(MultiplexerEvent::unacked(
+            scope,
+            Arc::new(SyncEvent::Warning(warning)),
+        ));
+    }
+
+    /// Announce termination without an acknowledgement obligation.
+    pub fn publish_terminated(&self, scope: EventScope, error: bifrost_types::AccountError) {
+        self.publish_unacked(MultiplexerEvent::unacked(
+            scope,
+            Arc::new(SyncEvent::Terminated(error)),
+        ));
     }
 
     /// Broadcast a backfill batch and stamp its publication with the receiver
@@ -371,7 +499,7 @@ impl ChangeDelivery {
     /// reached nobody who can acknowledge, whatever else it reached.
     ///
     /// Events that expect no acknowledgement - warnings, terminations, barrier
-    /// pages - go on [`Self::sender`] directly and take no lock.
+    /// pages - go on [`Self::publish_unacked`] directly and take no lock.
     pub fn publish_acknowledgeable(&self, event: MultiplexerEvent) -> bool {
         let state = self.guard();
         let _ = self.tx.send(event);
@@ -1033,7 +1161,7 @@ impl Multiplexer {
         let lifecycle_control = control.clone();
         let lifecycle_tokens = Arc::clone(&scope_tokens);
         let lifecycle_reopen = reopen_tx.clone();
-        let lifecycle_changes = delivery.sender().clone();
+        let lifecycle_changes = Arc::clone(&delivery);
         let mut lifecycle_generation = account_generation;
         let lifecycle_throttles = Arc::clone(&throttles);
         let lifecycle_account_id = account_id.clone();
@@ -1157,12 +1285,7 @@ impl Multiplexer {
                                             // Do not retry this failed handle. An explicit
                                             // reattach can repair credentials or policy, so
                                             // keep the reader alive to observe its generation.
-                                            let _ = lifecycle_changes.send(MultiplexerEvent {
-                                                scope: EventScope::Account,
-                                                event: Arc::new(SyncEvent::Terminated(err)),
-                                                checkpoint: None,
-                                                publication: None,
-                                            });
+                                            lifecycle_changes.publish_terminated(EventScope::Account, err);
                                             tokio::select! {
                                                 () = lifecycle_shutdown.cancelled() => return,
                                                 changed = lifecycle_generation.changed() => {
@@ -3009,6 +3132,54 @@ mod tests {
     }
 
     #[test]
+    fn an_unreachable_page_is_retired_and_records_the_walk_loss() {
+        let h = delivery_harness(4);
+        let mut observer = h.delivery.observe();
+        let (writer_tx, writer_rx) = mpsc::channel(4);
+        drop(writer_rx);
+        let publisher = PagePublisher::new(
+            Arc::clone(&h.delivery),
+            h.control.clone(),
+            writer_tx,
+            CancellationToken::new(),
+        );
+        let checkpoint = Delivery::backfill_page("page:0:10");
+        let before = h.coverage.undelivered_watermark(&CursorScope::Account);
+        let event = MultiplexerEvent {
+            scope: EventScope::Cursor(CursorScope::Account),
+            event: Arc::new(SyncEvent::Done(Some(checkpoint.clone()))),
+            checkpoint: Some(checkpoint),
+            publication: None,
+        };
+        assert!(
+            !publisher
+                .publish_page(
+                    event,
+                    crate::cursor::CoverageClaim::new(
+                        bifrost_types::InventoryCoverageReport::complete(
+                            bifrost_types::CoverageDomain::full(CursorScope::Account),
+                        ),
+                        h.coverage.next_generation(),
+                    ),
+                    h.coverage.scope_fence(&CursorScope::Account),
+                )
+                .expect("current fence")
+        );
+        assert!(
+            observer
+                .try_recv()
+                .expect("observer delivery")
+                .publication
+                .is_some()
+        );
+        assert_eq!(h.coverage.pending_checkpoints(), 0);
+        assert_ne!(
+            h.coverage.undelivered_watermark(&CursorScope::Account),
+            before
+        );
+    }
+
+    #[test]
     #[should_panic(expected = "delivery coverage ledger changed")]
     fn numbered_subscribers_cannot_split_between_coverage_ledgers() {
         let h = delivery_harness(4);
@@ -3252,11 +3423,7 @@ mod tests {
         let h = delivery_harness(8);
         // The acknowledger, numbered 0, which reads nothing yet.
         let mut acker = h.subscribe();
-        let mut observer = ChangesReceiver::new(
-            h.delivery.sender().subscribe(),
-            Some(h.control.clone()),
-            Some(Arc::clone(&h.coverage)),
-        );
+        let mut observer = h.delivery.observe();
         h.publish("page:0:10");
         assert_eq!(h.coverage.backfill_in_flight(), 1);
 
@@ -3377,7 +3544,7 @@ mod tests {
 
         // Overflow the one-slot ring under both receivers.
         for text in ["overwritten", "retained"] {
-            let _ = h.delivery.sender().send(warning_event(text));
+            h.delivery.publish_unacked(warning_event(text));
         }
 
         let lag = observer.try_recv().expect("lag becomes an event");

@@ -2055,6 +2055,7 @@ mod tests {
         let err = Error::Net(bifrost_net::Error::RetryBudgetExhausted {
             final_response: Some(final_response(403, &body_with_reason("forbidden"))),
             retry_after_history: Vec::new(),
+            stop_reason: bifrost_net::error::RetryStopReason::AttemptBudget,
         });
         assert!(is_batch_delete_scope_failure(&err));
     }

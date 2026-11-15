@@ -3,6 +3,25 @@ use serde::{Deserialize, Serialize};
 use super::Object;
 use super::id::{AccountId, QueryState};
 
+/// Signed request offset, including offsets relative to the end of a query.
+/// Responses use u64 instead: a served index can never be negative.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(transparent)]
+pub(crate) struct QueryPosition(i64);
+
+impl From<i32> for QueryPosition {
+    fn from(value: i32) -> Self {
+        Self(i64::from(value))
+    }
+}
+
+impl TryFrom<u64> for QueryPosition {
+    type Error = std::num::TryFromIntError;
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        i64::try_from(value).map(Self)
+    }
+}
+
 pub(crate) trait QueryObject: Object {
     type QueryArguments: Default + Serialize;
     type Filter: Serialize;
@@ -24,7 +43,7 @@ pub(crate) struct QueryRequest<O: QueryObject> {
 
     #[serde(rename = "position")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    position: Option<i32>,
+    position: Option<QueryPosition>,
 
     #[serde(rename = "anchor")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -94,11 +113,9 @@ pub(crate) struct QueryResponse<O: Object> {
     #[serde(rename = "canCalculateChanges")]
     can_calculate_changes: Option<bool>,
 
-    // The wire response is UnsignedInt, unlike the signed request offset.
-    // Widening this must also widen the anchored-page and search-cursor
-    // validators; a narrowing accessor would hide valid large result positions.
+    // Decode UnsignedInt at the wire boundary, before any paging arithmetic.
     #[serde(rename = "position")]
-    position: i32,
+    position: u64,
 
     #[serde(rename = "ids")]
     ids: Vec<O::Id>,
@@ -147,8 +164,8 @@ impl<O: QueryObject> QueryRequest<O> {
         self
     }
 
-    pub(crate) fn position(&mut self, position: i32) -> &mut Self {
-        self.position = position.into();
+    pub(crate) fn position(&mut self, position: impl Into<QueryPosition>) -> &mut Self {
+        self.position = Some(position.into());
         self
     }
 
@@ -208,7 +225,7 @@ impl<O: Object> QueryResponse<O> {
         self.limit
     }
 
-    pub(crate) fn position(&self) -> i32 {
+    pub(crate) fn position(&self) -> u64 {
         self.position
     }
 
@@ -315,5 +332,22 @@ impl<T> Filter<T> {
                 .map(std::convert::Into::into)
                 .collect(),
         })
+    }
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::{QueryPosition, QueryResponse};
+
+    #[test]
+    fn response_positions_preserve_the_unsigned_domain() {
+        let response: QueryResponse<crate::principal::Principal> =
+            serde_json::from_value(serde_json::json!({
+                "accountId": "a", "queryState": "q", "position": u64::from(u32::MAX) + 1, "ids": []
+            }))
+            .unwrap();
+        assert_eq!(response.position(), u64::from(u32::MAX) + 1);
+        assert_eq!(serde_json::to_value(QueryPosition::from(-1)).unwrap(), -1);
+        assert!(QueryPosition::try_from(u64::MAX).is_err());
     }
 }

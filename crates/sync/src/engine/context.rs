@@ -25,7 +25,6 @@ pub(super) struct SlotContext {
     /// immediately.
     pub current: Arc<ArcSwap<crate::types::Incarnation>>,
     pub cursors: Arc<CursorRegistry>,
-    pub changes_tx: broadcast::Sender<MultiplexerEvent>,
     pub account_id: AccountId,
     pub control: SyncControl,
     pub account_control_tx: broadcast::Sender<AccountControl>,
@@ -167,7 +166,6 @@ impl SlotContext {
             factory: &self.factory,
             current: &self.current,
             cursors: &self.cursors,
-            changes_tx: &self.changes_tx,
             account_id: &self.account_id,
             control: &self.control,
             account_control_tx: &self.account_control_tx,

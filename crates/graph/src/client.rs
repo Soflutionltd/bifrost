@@ -2995,7 +2995,12 @@ mod tests {
                     retry_after,
                     final_response,
                 }) => {
-                    assert_eq!(retry_after, Some(std::time::Duration::from_secs(5)));
+                    assert_eq!(
+                        retry_after,
+                        Some(bifrost_types::RetryHint::After(
+                            std::time::Duration::from_secs(5)
+                        ))
+                    );
                     assert_eq!(final_response.status, StatusCode::TOO_MANY_REQUESTS);
                 }
                 _ => panic!("429 past the budget is Error::RateLimited"),

@@ -1,8 +1,7 @@
 //! THREAD and SORT command encoder (RFC 5256).
 
 use super::{
-    CommandWriter, validate_atom, validate_non_empty_search_criteria,
-    validate_search_criteria_crlf, validate_sort_thread_charset, write_criteria,
+    CommandWriter, validate_atom, validate_non_empty_search_criteria, validate_sort_thread_charset,
 };
 
 /// Encode a THREAD or SORT command (RFC 5256 Sections 2-3).
@@ -17,7 +16,7 @@ pub(in crate::codec::encode) fn encode_thread_or_sort_cmd(
     cmd: &str,
     algorithm: &str,
     charset: &str,
-    criteria: &str,
+    criteria: &crate::types::SearchCriteria,
     parenthesize_algo: bool,
 ) -> Result<(), crate::Error> {
     if parenthesize_algo {
@@ -32,11 +31,7 @@ pub(in crate::codec::encode) fn encode_thread_or_sort_cmd(
     }
     // RFC 5256 Section 5: charset = atom / quoted.
     validate_sort_thread_charset(charset)?;
-    validate_search_criteria_crlf(
-        criteria,
-        &format!("{cmd} criteria"),
-        super::super::LiteralMode::LiteralPlus,
-    )?;
+    criteria.validate_raw(super::super::LiteralMode::LiteralPlus)?;
     validate_non_empty_search_criteria(criteria, cmd)?;
 
     w.raw(tag.as_bytes());
@@ -55,7 +50,7 @@ pub(in crate::codec::encode) fn encode_thread_or_sort_cmd(
     }
     w.raw(charset.as_bytes());
     w.raw(b" ");
-    write_criteria(w, criteria);
+    super::super::write_search(w, criteria, false);
     w.raw(b"\r\n");
     Ok(())
 }

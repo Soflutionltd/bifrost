@@ -290,12 +290,12 @@ fn sort_and_thread_inherit_the_search_criteria_gates() {
         Command::Sort {
             sort_criteria: "DATE".to_owned(),
             charset: "UTF-8".to_owned(),
-            criteria: "MODSEQ 5".to_owned(),
+            criteria: "MODSEQ 5".to_owned().into(),
         },
         Command::Thread {
             algorithm: "ORDEREDSUBJECT".to_owned(),
             charset: "UTF-8".to_owned(),
-            criteria: "MODSEQ 5".to_owned(),
+            criteria: "MODSEQ 5".to_owned().into(),
         },
     ] {
         assert!(matches!(

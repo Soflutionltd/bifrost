@@ -128,7 +128,7 @@ impl GraphScope {
             MESSAGE_SYNC_SELECT, calendar_view_bound, calendar_view_timestamp,
             format_calendar_timestamp,
         };
-        use crate::types::CONTACT_SELECT;
+        use crate::types::CONTACT_SYNC_SELECT;
         let prefix = self
             .client(account)
             .map_err(super::cursor::routing_error)?
@@ -154,7 +154,7 @@ impl GraphScope {
             }
             GraphScope::Contacts { .. } => Ok((
                 format!(
-                    "{prefix}/contactFolders/{encoded}/contacts/delta?$select={CONTACT_SELECT}&$top=250"
+                    "{prefix}/contactFolders/{encoded}/contacts/delta?$select={CONTACT_SYNC_SELECT}&$top=250"
                 ),
                 None,
             )),

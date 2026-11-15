@@ -152,7 +152,7 @@ pub(crate) struct ListExtendedConsumer {
     /// `true` when SUBSCRIBED is NOT in selection options.
     filter_extended: bool,
     /// Selection options for mismatch detection (owned copies).
-    selection_options: Vec<String>,
+    selection_options: Vec<crate::types::command_options::ListSelect>,
     /// Solicited LIST entries.
     mailboxes: Vec<MailboxInfo>,
     /// NOTIFY marker-bearing LIST entries.
@@ -165,13 +165,16 @@ pub(crate) struct ListExtendedConsumer {
 }
 
 impl ListExtendedConsumer {
-    pub(crate) fn new(selection_options: Vec<String>) -> Self {
+    pub(crate) fn new(selection_options: Vec<crate::types::command_options::ListSelect>) -> Self {
         // SUBSCRIBED can legitimately return deleted or inaccessible mailboxes.
         // In other requests those attributes identify NOTIFY events. Derive
         // this policy here so the queued and direct paths cannot disagree.
-        let filter_extended = !selection_options
-            .iter()
-            .any(|option| option.eq_ignore_ascii_case("SUBSCRIBED"));
+        let filter_extended = !selection_options.iter().any(|option| {
+            matches!(
+                option,
+                crate::types::command_options::ListSelect::Subscribed
+            )
+        });
         Self {
             filter_extended,
             selection_options,
@@ -200,11 +203,8 @@ impl Consumer for ListExtendedConsumer {
                         self.marker_events.push(UntaggedResponse::List(info));
                         return;
                     }
-                    // RFC 5258 Section3: check selection-option mismatch. Build
-                    // a temporary &[&str] view for the helper function.
-                    let opts: Vec<&str> =
-                        self.selection_options.iter().map(String::as_str).collect();
-                    if is_notify_selection_mismatch(&info, &opts) {
+                    // Selection keeps its typed identity through response routing.
+                    if is_notify_selection_mismatch(&info, &self.selection_options) {
                         self.mismatch_events.push(UntaggedResponse::List(info));
                         return;
                     }

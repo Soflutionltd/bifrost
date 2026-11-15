@@ -251,20 +251,6 @@ ETag checks, Graph's ETag paths) with no read-side mint naming the door it is va
 for. Owner: `bifrost-types`, a version minted by the read path with its object type
 (and, for JMAP, owner) inside it.
 
-## STR-009 - Bool clusters that are enums
-
-**Reported by:** types.
-
-- `ConvenienceShape::{replied_via_keyword, replied_via_extended_property}` and
-  the forwarded pair may both be `true`; `mark_replied` resolves it by `if`
-  order. `starred` is already an enum (`StarredFlagShape`); the other two
-  should be.
-- `MutationConcurrency::ExpectedVersion { 8 bools }` plus `None`: "no door" has
-  two representations (`None` and all-false; IMAP's `build_capabilities`
-  normalizes with an `if` chain, others need not). A `VersionedDoors` bitset
-  with `is_empty()` is the whole axis. (`StateBased` is already an owner-ruling
-  item in `notes/todo.md`.)
-
 ## STR-010 - Classified failures flattened to prose at degradation seams
 
 **Reported by:** types.
@@ -774,53 +760,6 @@ StoppedAtBarrier }` beside the counts; `fold` becomes a match and
 - `WorkSet::hold: Option<(u64, Instant)>` is a bare tuple of account generation
   and deadline.
 
-## STR-039 - `Option` parameters as hidden mode switches that change safety semantics
-
-**Reported by:** sync-lanes.
-
-`BackfillRunner::run_partition` takes thirteen parameters, including
-`changes_tx: Option<broadcast::Sender>`, `control: Option<&SyncControl>`,
-`coverage: Option<&Arc<PendingCoverage>>`, `writer_tx:
-Option<&mpsc::Sender<WriterRequest>>`, `lane: Option<&LaneGate>` and a
-non-optional `delivery`. Which are `Some` silently selects behaviour:
-`lane.is_some()` picks fence-conditional registration over unconditional (so
-the reset-fence guarantee depends on whether a flow-control gate was passed)
-and also arms the shutdown select; `(control, coverage, publication)` chooses
-which retirement function runs (BUG-020); `writer_tx: None` makes
-`record_barriers` succeed and `cross_waived_barriers` answer "not waived";
-`changes_tx.is_none()` publishes nothing and skips the removal projection - and
-`emit_backfill_complete` answers `if changes_tx.is_none() { return
-MarkerOutcome::Published; }`, so the orchestrator settles the incarnation
-although nothing was broadcast or made durable. `InventoryFusion` repeats the
-pattern with `control`, `coverage`, `writer_tx` and `shutdown`, including a
-`fence_moved` branch that exists only for `control: None`. Production passes
-`Some` for all; the `None` combinations are a test convenience the safety logic
-must stay correct under. Proposal: one `WalkContext` / `PagePublisher` value
-(CON-019) built once per walk in production, plus a test double implementing
-the same trait.
-
-## STR-040 - Persisted ledger errors are fabricated `AccountError`s
-
-**Reported by:** sync-lanes (owner ruling: field type change).
-
-`LedgerEntry::last_error` and `BarrierIncident::evidence` are `AccountError`, but
-the codec persists only a digest. On decode, `canonical_cause` synthesizes a
-cause the original never had: every `StrategyFailure` comes back as
-`QResyncToCondstore`, every `RateLimited` with `retry_hint: None`, every
-`InsufficientScope` with `needed: "unknown"`, and `CursorInvalid` without a
-cursor scope gets `CursorScope::Account` invented. The restored value then
-answers `recovery()`, `message_key()`, `retry_hint()` from causes nobody
-observed. The reference says no ledger predicate reads these, but
-`SyncEngine::debt` hands the entries to consumers, and nothing stops one
-branching on `last_error.recovery()`. Also, `canonical_cause` restates
-`bifrost-types`' `kind_matches_cause` (CON-002) as its own table, and the
-`CursorInvalid` scope patch restates another builder rule; they stay in step
-only because `try_build` fails at decode time with "restored error failed
-classification", surfacing as a ledger decode error the writer treats as an
-unreadable ledger. Proposal: `ErrorDigest { kind, scope, operation, provider,
-protocol, diagnostics }` as the field type, with no `recovery()`; it removes
-`canonical_cause`.
-
 ## STR-041 - `PolicyStatus::Retrying { attempts }` is a mirrored view; barriers reuse a policy that means nothing for them
 
 **Reported by:** sync-lanes.
@@ -1085,53 +1024,6 @@ string goes - `imap1`/`imap2` object ids, `imapthread1`/`2`, `imapsearch1`
 cursors, `imappart2`/`3` part handles, the `imapmsgid1` correlation token,
 `DraftHandle` ("an object id in a costume"), `imap-idle-N` subscription handles;
 `ImapMessageRef` a thin public wrapper over it; `FolderCursor` fields typed.
-
-## STR-053 - IMAP `Command` is stringly typed, so the encoder re-parses the builder's output
-
-**Reported by:** imap-protocol.
-
-`Fetch { items: String }`, `Status { items: String }`, `ListStatus {
-status_items: String }`, `Search { criteria: String }`, `SearchReturn {
-return_opts: Vec<String> }` (SAVE detected by `trim().eq_ignore_ascii_case`),
-`Enable { capabilities: Vec<String> }`, `Authenticate { mechanism: String }`,
-`ListExtended { selection_options, return_options: Vec<String> }`, `GetMetadata
-{ depth: Option<String> }`, `SetAcl { rights: String }`, `Sort { sort_criteria,
-charset }`, `Thread { algorithm, charset }`, `NotifyEvent::MessageNew {
-fetch_attrs: Vec<String> }`, `AppendMessage { date: Option<String> }` - though
-typed sources exist for most. The sharpest cost: `SearchCriteria` is a `String`
-builder, so deciding which capability a SEARCH needs requires
-`ImapConnection::search_criteria_contains_atom`, a hand-written SEARCH grammar
-walker (`connection/search_validation.rs`) the ENCODER calls through
-`crate::connection` to rediscover whether the builder wrote `MODSEQ`, `OLDER`,
-`SAVEDBEFORE`, `EMAILID` or `$`. Quoting is decided twice:
-`search_helpers::quote_imap_string` always quotes and rejects CR/LF at build
-time (before the UTF-8 mode is known), while `CommandWriter::string` chooses
-quoted-vs-literal from the live mode. Proposal: `SearchKey` as an enum AST (with
-an explicit `Raw { text, requires: Vec<Capability> }` escape hatch), rendered
-through `CommandWriter::string`, with `SearchKey::required_capabilities()`; the
-grammar walker, `validate_search_criteria_crlf` and `write_criteria`'s literal
-re-emission go for typed criteria. NOTIFY event-group legality is the same
-shape: RFC 5465's dependency rules are checked by
-`encode::commands::notify::validate_notify_event_group` and asserted again in
-`account/push.rs` tests; `MessageEvents { new_fetch: Vec<FetchAttr>,
-flag_change: bool, annotation_change: bool }` makes the illegal group
-unrepresentable.
-
-The imap-connection hunter adds: handle methods take `&[FetchAttr]` and validate
-them (`validate_requested_fetch_items`), then `format_fetch_attrs` flattens them
-to `items: String`, and the `Pipeline` builder takes the `String` directly,
-bypassing validation (BUG-029) - keep `Vec<FetchAttr>` in the command. STATUS
-items are `status_items: String` / `items: &str`, tokenized by
-`status_item_tokens` and matched as strings in `validate_requested_status_items`.
-LIST-EXTENDED `selection_options` / `return_options: Vec<String>`: "is SUBSCRIBED
-selected" is a string scan in `mailbox::list_extended_names`,
-`pipeline::list_extended` and `is_notify_selection_mismatch` (which also scans
-RECURSIVEMATCH, REMOTE, SPECIAL-USE), and `validate_list_extended_request` scans
-SPECIAL-USE, RECURSIVEMATCH and REMOTE again; typed `ListSelect` / `ListReturn`
-enums remove five spellings. SEARCH RETURN options (`search_return_requests_save`
-scans for `SAVE`) likewise. The `search_validation.rs` lexer is hung off
-`ImapConnection` as associated functions used only by the codec encoder (and a
-`#[cfg(test)]` adapter); it belongs in `codec/` or disappears with `SearchKey`.
 
 ## STR-055 - IMAP ENABLEd extensions are `Vec<String>` and the UTF-8 mode is a bool
 
@@ -1528,39 +1420,6 @@ open): completing this needs capability-typed sync fields, factory and helper
 signatures, and checked cross-capability views for foreign submission and core
 methods. A wave of one owning both halves of `crates/jmap`.
 
-## STR-089 - Smaller JMAP axes travelling as primitives
-
-**Reported by:** jmap-protocol.
-
-The HTTP method enum, typed `Blob/lookup` names with automatic capabilities,
-and `Timestamp` Email date setters landed. What remains needs coordinated
-edits in `crates/jmap/src/sync/` (account maps and push routing, mutation
-writers, `page_cursor.rs` and `pim.rs` search cursors, `calendar_ops.rs`), so
-it wants a fixer owning both halves of the crate:
-
-- Keywords as `String`, membership as `HashMap<MailboxId, bool>`: keywords have a
-  grammar (IMAP atom, length bound) and the workspace treats flag identity as
-  ASCII-case-insensitive (STR-004); a `Keyword` newtype in `email/` would own
-  both. `mailboxIds` / `keywords` / `calendarIds` / `addressBookIds` values are
-  always `true`; they are sets.
-- Account ids as `String` past the request boundary: `Session::accounts`,
-  `primary_accounts`, `PushObject::StateChange::changed`, `Changes`,
-  `EmailPush::account_id`, `CalendarAlert::account_id`, and on the sync side
-  `foreign_mail: HashMap<String, MailAccount>`. `AccountId` exists and is used
-  only inside method structs.
-- Query position is `i32` on the request and the response (RFC: response
-  `position` is `UnsignedInt`), with `i32::try_from` at the sync call sites; a
-  `QueryPosition` owning the conversion ends the ceremony.
-- JSCalendar values as `String` (`CalendarEventCreate::start`, `duration`,
-  `GetArguments::recurrence_overrides_before`, filter bounds), with the
-  LocalDateTime / UTCDateTime / Duration grammar as `strftime`/`strptime` format
-  strings and a hand parser in `sync/calendar_ops.rs` (BUG-060); they belong as
-  types in `calendar_event/`.
-- `from_timestamp(i64) -> Timestamp` (`core/set.rs`) still returns `UNIX_EPOCH`
-  for an out-of-range input; the Email setters no longer use it, but filters,
-  vacation dates and push-subscription expiry still do and can fabricate a
-  1970 date.
-
 ## STR-091 - Delete JMAP's `HttpTransport` generic; it is a test seam above `AccountNet`
 
 **Reported by:** jmap-protocol (its top-ranked move; "the largest single simplification available in the crate").
@@ -1688,21 +1547,6 @@ mapping module, and the parts restating shared-vocabulary rules (window overlap,
 recurrence validation) belong in `bifrost-types` (BUG-001). Same question for IMAP:
 STR-079.
 
-## STR-112 - The recurrence rule is a `String` that three crates each parse
-
-**Reported by:** graph (cross-crate).
-
-`bifrost_types::EventRecurrence { rrule: Option<String>, rdate: Vec<String>,
-exdate: Vec<String>, .. }`. Graph (`calendar::graph_recurrence_rule`, `ParsedRRule`,
-`RRULE_MAPPED_PARTS` / `RRULE_UNMAPPED_PARTS`), JMAP
-(`calendar_ops::jmap_recurrence_rule_from_rrule`, `validate_shared_recurrence`)
-and CalDAV (`rrule_until`) each parse it and decide which RRULE parts are valid and
-supported. Validity is protocol-neutral (RFC 5545 grammar); expressibility is per
-provider. Proposal: `RecurrenceRule` parsed at the `bifrost-types` boundary with
-`UNTIL`/`COUNT` and `BYDAY` typed, each provider answering only "can I express this
-parsed rule". Today a rule JMAP accepts and Graph refuses is refused for different
-stated reasons, and nothing compares the parsers. Related: STR-003.
-
 ## STR-115 - `GraphAccount` is a bag of about twenty-five shared fields with no owners
 
 **Reported by:** graph (the hunter says this is where concentrating invariants pays most, given the standing lesson that teardown and lifetime fixes move holes).
@@ -1725,29 +1569,6 @@ methods owning their locks); `EwsRegistry` (subscriptions, topology watch, relea
 ledger); `EtagIndex` (BUG-076's API) and the trash cache. `GraphAccount` composes
 them, and invariants stated in comments become private to the type holding the
 lock. The JMAP twin is STR-097.
-
-## STR-117 - Graph wire codecs live in the account layer
-
-**Reported by:** graph.
-
-- `account/ews_stream.rs` mixes the push session driver with a byte-level frame
-  decoder (`StreamingFrameDecoder`, `find_frame_start` and friends) and the
-  Subscribe, GetStreamingEvents and Unsubscribe XML build and parse; the codec
-  half belongs in `ews/` beside `ops.rs` and `parse.rs`.
-- `account/autodiscover.rs` (about 2,400 lines) is an XML protocol codec (SOAP
-  `GetUserSettings`, POX, redirect walk) plus `impl GraphAccount` methods; the
-  codec and redirect walk are a sibling of `ews/`.
-- The XML text unescape helper `push_text` exists four times
-  (`ews/xml_helpers.rs`, `ews/parse.rs`, `account/ews_stream.rs`,
-  `account/autodiscover.rs`) - identical and harmless, but showing the missing
-  shared XML layer.
-- `account/calendar.rs` (about 4,300 lines) holds the typed calendar operations,
-  an RRULE codec of about 800 lines, a Windows time-zone table, and its own wire
-  DTOs; `GraphRecipient` and `GraphEmailAddress` are defined both here and in
-  `types.rs` with different field shapes. The RRULE codec moves to types under
-  STR-112, or to its own module if not.
-- `types.rs` and `contacts.rs` each define a `CONTACT_SELECT` constant with
-  different values (the sync select and the typed-read select).
 
 ## STR-118 - Graph test layout mirrors the order the code was written
 
@@ -1813,43 +1634,6 @@ Blocked on bifrost-net: its hold and concurrency registries cannot store
 arbitrary provider state, and `AccountNet` exposes no Net-owned slot for it. The
 move needs a Net-scoped provider-state store (a typed, keyed slot owned by the
 `Net` and reachable through `AccountNet`) first; the registry site records this.
-
-## STR-130 - Google `pim.rs` does several unrelated jobs
-
-**Reported by:** google.
-
-Single-object label mutations; send; the draft read-modify-write; MIME body
-selection (`body_parts`, `collect_body_parts`, a re-implementation of
-`mime::select_body`, BUG-095); search translation; container CRUD; identities;
-vacation; thread and message hydration; `MailDocument`. Suggested split:
-`labels_single.rs` (or fold into `mutation.rs` with the shared move rule, BUG-089),
-`compose.rs` (send, drafts, `MailDocument`), `hydrate.rs` (Message and Thread over
-the shared MIME selector), `search.rs` (with one query encoder, CON-053),
-`settings.rs`. The same shape in IMAP and JMAP is STR-079 and STR-104.
-
-## STR-134 - `select_scram_rung` answers three questions through one signature
-
-**Reported by:** smtp-sasl.
-
-`select_scram_rung(hash, plus: bool, advertised: impl Fn(&str) -> bool,
-binding_data: Option<&[u8]>) -> Option<(ScramHash, ScramChannelBinding)>` is called
-four ways, each decoded differently: SMTP `password_mechanism` passes
-`binding_available.then_some(&[][..])` - a fake empty binding - only to learn
-whether a rung is eligible; IMAP `password_mechanism_ladder` passes `None` and
-`plus = false` to ask a different question ("is the unbound rung
-downgrade-forbidden"); IMAP `authenticate_best` destructures its own resolved
-binding with `_ => unreachable!("certificate resolver returns bound data")` to feed
-the bytes back in; SMTP `SmtpConnection::auth` (and the async twin) calls it again
-after selection with `.expect("selected SCRAM rung remains advertised")`. The echoed
-`ScramHash` never differs from the input; `plus: bool` duplicates `ChannelBinding`;
-the binding bytes are a bare `Vec<u8>` / `&[u8]` anything can mint. Proposal: a
-`ChannelBindingData` newtype only `tls_server_end_point` constructs,
-`binding_from_peer_certificate(Option<&[u8]>) -> Result<Option<ChannelBindingData>>`
-(replacing the two comment-held copies in BUG-030), and `scram_rungs(advertised:
-&dyn Fn(&str) -> bool, binding: Option<&ChannelBindingData>) -> Vec<Result<ScramRung,
-ScramSkip>>` with `ScramSkip::{NotAdvertised, PlusWithoutBinding,
-DowngradeForbidden}`; IMAP's `AuthMechanismRejectionReason::ChannelBindingUnavailable`
-and SMTP's `skipped_plus_for_binding` both fall out of `ScramSkip`.
 
 ## STR-135 - bifrost-sasl should own the SASL client, not only the arithmetic
 
@@ -1994,27 +1778,6 @@ any future account crate composing SMTP (a CalDAV-only or JMAP-without-submissio
 deployment) rather than copying IMAP's file; IMAP keeps only the decision to own
 one.
 
-## STR-144 - bifrost-net's error evidence fields need a typed ledger
-
-**Reported by:** net-dav.
-
-The typed `AttemptLedger` (`crates/net/src/attempt.rs`) now owns the internal
-evidence and the proven-refusal rule, and net and DAV feed it. Residue: the
-public error-envelope fields (`may_have_committed: bool`, `attempts: Vec<Error>`
-with nested `AttemptHistory`) were kept so consumers compile unchanged; move the
-public surface onto the ledger's verdict and migrate the consumers.
-`RetryBudgetExhausted` means two things - "the attempt budget is spent" and "the
-replay policy forbade another attempt" (its doc says so) - so a caller cannot branch
-on which happened, though the second is the commit-ambiguity case; split it or add a
-`StopReason`. The server's retry hint has four representations:
-`RateLimited.retry_after: Option<Duration>`,
-`RetryBudgetExhausted.retry_after_history: Vec<Duration>` (capped and resolved, so
-lossy), `RefreshFailed.retry_after: Option<SystemTime>`, and
-`bifrost_types::RetryHint`; `account_error` re-parses the `Retry-After` header because
-the stored durations lost the HTTP-date form. Store `RetryHint` at observation time
-and derive the capped wait from it. `HoldKind { RateLimited, QuotaExhausted }` also
-restates two `ServerErrorKind` variants that the `LocalHold` arm re-maps.
-
 ## STR-146 - URLs travel as `String` through every net and DAV layer
 
 **Reported by:** net-dav.
@@ -2026,17 +1789,6 @@ redirect classification), `redirect_guard: Fn(&str, &str)`,
 and every DAV native id. `reqwest::Url` is already a dependency; with an `Origin` and
 a `DavHref` on top (BUG-112), several of the CON-060 and BUG-112 disagreements become
 unrepresentable. Related: CON-047.
-
-## STR-150 - A DAV collection is a `CursorScope::Folder`, so IMAP resolves ownership by string collision
-
-**Reported by:** net-dav.
-
-When DAV is composed into IMAP, `DavScopeIndex` decides which sub-account owns a
-scope by comparing `FolderId` strings with IMAP mailbox names and the other
-dialect's collections, and on a collision emits a prose `Warning` ("... this
-collection will not sync", also BUG-045). A typed provenance makes the collision
-impossible to express: a dedicated scope variant for a DAV collection, or a
-`FolderId` carrying its namespace. Related: STR-001, BUG-052.
 
 ## STR-151 - bifrost-net needs a public exchange core; `send_streaming_inner` does five jobs
 

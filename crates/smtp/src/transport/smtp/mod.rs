@@ -426,7 +426,7 @@ impl SmtpInfo {
     }
 
     fn ensure_can_authenticate(&self, encrypted: bool) -> Result<(), Error> {
-        if encrypted || self.allow_insecure_auth {
+        if bifrost_sasl::authentication_allowed(encrypted, self.allow_insecure_auth) {
             Ok(())
         } else {
             let protocol = match self.protocol {

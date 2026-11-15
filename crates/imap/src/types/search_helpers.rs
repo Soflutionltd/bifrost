@@ -1,56 +1,28 @@
-/// Append a DQUOTE-quoted IMAP string to `buf`, escaping backslash and
-/// double-quote per RFC 3501 Section 9: `quoted-specials = DQUOTE / "\"`.
-///
-/// This always uses the quoted form. The SEARCH criteria ABNF uses
-/// `astring` for string arguments (RFC 3501 Section 6.4.4), and quoted
-/// strings are always valid `astring` values (RFC 3501 Section 9:
-/// `astring = 1*ASTRING-CHAR / string`, `string = quoted / literal`).
-///
-/// Returns an error if `value` contains bytes that cannot appear in an
-/// IMAP quoted string:
-/// - NUL (`\0`): not a valid CHAR per RFC 3501 Section 9
-///   (`CHAR = <any 7-bit US-ASCII character except NUL>`)
-/// - CR (`\r`) and LF (`\n`): not TEXT-CHAR per RFC 3501 Section 9
-///   (`TEXT-CHAR = <any CHAR except CR and LF>`,
-///   `QUOTED-CHAR = TEXT-CHAR / quoted-specials`)
-pub(super) fn quote_imap_string(buf: &mut String, value: &str) -> Result<(), crate::Error> {
-    // RFC 3501 Section 9: QUOTED-CHAR = TEXT-CHAR / quoted-specials,
-    // TEXT-CHAR = <any CHAR except CR and LF>,
-    // CHAR = <any 7-bit US-ASCII except NUL, 0x01 - 0x7F>.
-    // NUL, CR, and LF cannot appear in a quoted string.
-    for &b in value.as_bytes() {
-        if b == 0 {
-            return Err(crate::Error::InvalidInput(
-                "quoted string must not contain NUL  -  NUL is not a valid CHAR \
-                 (RFC 3501 Section 9: CHAR = <any 7-bit US-ASCII except NUL>)"
-                    .into(),
-            ));
-        }
-        if b == b'\r' {
-            return Err(crate::Error::InvalidInput(
-                "quoted string must not contain CR  -  CR is not a TEXT-CHAR \
-                 (RFC 3501 Section 9: TEXT-CHAR = <any CHAR except CR and LF>)"
-                    .into(),
-            ));
-        }
-        if b == b'\n' {
-            return Err(crate::Error::InvalidInput(
-                "quoted string must not contain LF  -  LF is not a TEXT-CHAR \
-                 (RFC 3501 Section 9: TEXT-CHAR = <any CHAR except CR and LF>)"
-                    .into(),
-            ));
-        }
+/// Build the explicit text view of a search string. Typed command encoding
+/// retains the original operand and lets CommandWriter choose its live form.
+/// Control-bearing text uses a synchronizing literal in this diagnostic view.
+pub(super) fn append_search_string(buf: &mut String, value: &str) -> Result<(), crate::Error> {
+    if value.as_bytes().contains(&0) {
+        return Err(crate::Error::InvalidInput(
+            "search string must not contain NUL".into(),
+        ));
     }
-    buf.push('"');
-    for ch in value.chars() {
-        // RFC 3501 Section 9: quoted-specials (backslash, double-quote)
-        // must be escaped with a preceding backslash.
-        if ch == '\\' || ch == '"' {
-            buf.push('\\');
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte == 127)
+    {
+        use std::fmt::Write;
+        let _ = write!(buf, "{{{}}}\r\n{value}", value.len());
+    } else {
+        buf.push('"');
+        for ch in value.chars() {
+            if ch == '\\' || ch == '"' {
+                buf.push('\\');
+            }
+            buf.push(ch);
         }
-        buf.push(ch);
+        buf.push('"');
     }
-    buf.push('"');
     Ok(())
 }
 

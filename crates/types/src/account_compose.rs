@@ -41,8 +41,8 @@ pub enum ScopeTarget<'a> {
 /// Route a `CursorScope` to its servicing target without naming any
 /// protocol specifics.
 ///
-/// - `Type(Contact)` -> the `contacts` sub-account when present.
-/// - `Type(CalendarEvent)` -> the `calendars` sub-account when present.
+/// - `Type(Contact)` and `FolderType { ty: Contact, .. }` -> the `contacts` sub-account when present.
+/// - `Type(CalendarEvent)` and `FolderType { ty: CalendarEvent, .. }` -> the `calendars` sub-account when present.
 /// - every other scope -> [`ScopeTarget::This`] (the composing account
 ///   handles or rejects it in its own vocabulary).
 ///
@@ -56,8 +56,16 @@ pub fn route_typed_scope<'a>(
     calendars: Option<&'a Arc<dyn Account>>,
 ) -> Option<ScopeTarget<'a>> {
     match scope {
-        CursorScope::Type(ObjectType::Contact) => contacts.map(ScopeTarget::Delegate),
-        CursorScope::Type(ObjectType::CalendarEvent) => calendars.map(ScopeTarget::Delegate),
+        CursorScope::Type(ObjectType::Contact)
+        | CursorScope::FolderType {
+            ty: ObjectType::Contact,
+            ..
+        } => contacts.map(ScopeTarget::Delegate),
+        CursorScope::Type(ObjectType::CalendarEvent)
+        | CursorScope::FolderType {
+            ty: ObjectType::CalendarEvent,
+            ..
+        } => calendars.map(ScopeTarget::Delegate),
         _ => Some(ScopeTarget::This),
     }
 }

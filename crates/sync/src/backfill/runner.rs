@@ -52,9 +52,7 @@ use bifrost_types::{
     InventoryEntry, InventoryPartition, ObjectChange, ObjectChangeKind, ObjectId, SyncEvent,
 };
 use futures::stream::StreamExt;
-use tokio::sync::broadcast;
 
-use crate::control::SyncControl;
 use crate::error::Error;
 use crate::inventory_walk::{InventoryWalk, WalkDecision, cross_waived_barriers, record_barriers};
 use crate::multiplexer::{EventScope, MultiplexerEvent};
@@ -357,20 +355,22 @@ impl BackfillRunner {
         scope: CursorScope,
         partition: InventoryPartition,
         live: &LiveSupersedes,
-        changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
         envelope_version: bifrost_types::TraitEnvelopeVersion,
-        control: Option<&SyncControl>,
-        coverage: Option<&Arc<crate::cursor::PendingCoverage>>,
-        writer_tx: Option<&tokio::sync::mpsc::Sender<crate::multiplexer::WriterRequest>>,
+        publisher: &crate::multiplexer::PagePublisher,
         generation: crate::cursor::WalkGeneration,
         lane: Option<&crate::engine::lane::LaneGate>,
         walk_fence: crate::cursor::ScopeFence,
-        delivery: &crate::multiplexer::ChangeDelivery,
     ) -> Result<BackfillPartitionOutcome, Error> {
-        let _activity = match control {
-            Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
-            None => None,
-        };
+        if let Some(gate) = lane {
+            assert!(
+                Arc::ptr_eq(publisher.coverage(), gate.coverage()),
+                "backfill lane ledger changed"
+            );
+        }
+        let control = &publisher.control;
+        let writer_tx = &publisher.writer_tx;
+        let delivery = &publisher.delivery;
+        let _activity = control.begin_activity().ok_or(Error::Paused)?;
         let partition_key = partition_key(&partition);
         let mut stream = account.inventory_partition_stream(scope.clone(), partition);
         let mut seen_total: u64 = 0;
@@ -412,18 +412,11 @@ impl BackfillRunner {
             // orchestrator already routes it to `driver.fail()`, which
             // withholds the completion marker.
             //
-            // Only armed when a lane is present. Production always passes one;
-            // a `lane: None` caller has no token, so the guarantee is about
-            // engine-driven partition walks rather than about this function.
-            let next = match lane {
-                Some(gate) => {
-                    tokio::select! {
-                        biased;
-                        () = gate.shutdown().cancelled() => return Err(Error::ShuttingDown),
-                        next = stream.next() => next,
-                    }
-                }
-                None => stream.next().await,
+            // Teardown belongs to the walk, independently of flow control.
+            let next = tokio::select! {
+                biased;
+                () = publisher.shutdown.cancelled() => return Err(Error::ShuttingDown),
+                next = stream.next() => next,
             };
             let Some(event) = next else { break };
             match event {
@@ -435,12 +428,8 @@ impl BackfillRunner {
                             bifrost_types::AccountOperation::SyncInventory,
                             &scope,
                         );
-                        if let Some(tx) = &changes_tx {
-                            let _ = tx.send(MultiplexerEvent::unacked(
-                                EventScope::Cursor(scope.clone()),
-                                Arc::new(SyncEvent::Terminated(error.clone())),
-                            ));
-                        }
+                        delivery
+                            .publish_terminated(EventScope::Cursor(scope.clone()), error.clone());
                         return Err(Error::Account(error));
                     }
                     let seen = u64::try_from(batch.items.len().saturating_add(batch.removed.len()))
@@ -450,26 +439,21 @@ impl BackfillRunner {
                         filter_inventory_supersedes(&batch.items, &batch.removed, live);
                     let kept_count = u64::try_from(kept.len()).unwrap_or(u64::MAX);
                     kept_total = kept_total.saturating_add(kept_count);
-                    let projected_removals = if changes_tx.is_some() {
+                    let projected_removals =
                         match crate::inventory_walk::removals(&scope, kept_removed.iter().copied())
                         {
                             Ok(removals) => removals,
                             Err(error) => {
-                                if let Some(tx) = &changes_tx {
-                                    let _ = tx.send(MultiplexerEvent::unacked(
-                                        EventScope::Cursor(scope.clone()),
-                                        Arc::new(SyncEvent::Terminated(error.clone())),
-                                    ));
-                                }
+                                delivery.publish_terminated(
+                                    EventScope::Cursor(scope.clone()),
+                                    error.clone(),
+                                );
                                 return Err(Error::Account(error));
                             }
-                        }
-                    } else {
-                        Vec::new()
-                    };
+                        };
 
                     let crossed = if batch.coverage.has_barrier() {
-                        cross_waived_barriers(writer_tx, &batch.coverage, generation).await?
+                        cross_waived_barriers(Some(writer_tx), &batch.coverage, generation).await?
                     } else {
                         false
                     };
@@ -485,32 +469,30 @@ impl BackfillRunner {
                         // restart forgets and no operator can act on. Failing
                         // the partition instead leaves the scope Pending and
                         // re-walks it, which is recoverable.
-                        record_barriers(writer_tx, &batch.coverage, generation, resume_from)
+                        record_barriers(Some(writer_tx), &batch.coverage, generation, resume_from)
                             .await?;
-                        if let Some(tx) = &changes_tx {
-                            let changes = kept
-                                .into_iter()
-                                .map(|entry| {
-                                    Change::ObjectChange(ObjectChange {
-                                        id: entry.id.clone(),
-                                        kind: ObjectChangeKind::Created,
-                                    })
+                        let changes = kept
+                            .into_iter()
+                            .map(|entry| {
+                                Change::ObjectChange(ObjectChange {
+                                    id: entry.id.clone(),
+                                    kind: ObjectChangeKind::Created,
                                 })
-                                .chain(projected_removals)
-                                .collect();
-                            let synthetic = Batch {
-                                items: changes,
-                                page_boundary: batch.page_boundary,
-                                server_latency: batch.server_latency,
-                                bytes_in: batch.bytes_in,
-                                checkpoint: None,
-                            };
-                            let _ = tx.send(MultiplexerEvent::unacked(
-                                EventScope::Cursor(scope.clone()),
-                                Arc::new(SyncEvent::Batch(synthetic)),
-                            ));
-                            warn_barrier(tx, &scope, &batch.coverage);
-                        }
+                            })
+                            .chain(projected_removals)
+                            .collect();
+                        let synthetic = Batch {
+                            items: changes,
+                            page_boundary: batch.page_boundary,
+                            server_latency: batch.server_latency,
+                            bytes_in: batch.bytes_in,
+                            checkpoint: None,
+                        };
+                        delivery.publish_unacked(MultiplexerEvent::unacked(
+                            EventScope::Cursor(scope.clone()),
+                            Arc::new(SyncEvent::Batch(synthetic)),
+                        ));
+                        warn_barrier(delivery, &scope, &batch.coverage);
                         return Ok(BackfillPartitionOutcome {
                             seen: seen_total,
                             kept: kept_total,
@@ -520,19 +502,15 @@ impl BackfillRunner {
                         });
                     }
 
-                    if !crossed
-                        && !warned_incomplete
-                        && !batch.coverage.is_complete()
-                        && let Some(tx) = &changes_tx
-                    {
-                        warn_incomplete(tx, &scope, &batch.coverage);
+                    if !crossed && !warned_incomplete && !batch.coverage.is_complete() {
+                        warn_incomplete(delivery, &scope, &batch.coverage);
                         warned_incomplete = true;
                     }
                     // Forward the page as a synthetic Batch carrying a
                     // BackfillCheckpoint. Durable persistence awaits the
                     // consumer ack (see module docs); the runner never
                     // writes to CheckpointStore.
-                    if changes_tx.is_some() {
+                    {
                         // FLOW CONTROL, and it belongs exactly here: after the
                         // page has been read off the provider stream and BEFORE
                         // it is registered. Parking here stops the stream being
@@ -605,71 +583,24 @@ impl BackfillRunner {
                         // persisted under partition A's acknowledgement.
                         let expected = Checkpoint::Backfill(bf);
                         walk.accept(Some(expected.clone()));
-                        let publication = if let Some(control) = control {
-                            let claim = crate::cursor::CoverageClaim::new(
-                                batch.coverage.clone(),
-                                generation,
-                            );
-                            if lane.is_some() {
-                                match control.publish_checkpoint_if_fence(
-                                    expected.clone(),
-                                    claim,
-                                    walk_fence,
-                                ) {
-                                    Ok(id) => Some(id),
-                                    Err(claim) => {
-                                        if let Err(error) =
-                                            crate::inventory_walk::record_refused_debt(
-                                                writer_tx, claim,
-                                            )
-                                            .await
-                                        {
-                                            tracing::warn!(%error, "could not record refused page debt");
-                                        }
-                                        return Err(Error::Superseded);
-                                    }
-                                }
-                            } else {
-                                Some(control.publish_checkpoint(expected.clone(), claim))
-                            }
-                        } else {
-                            None
-                        };
                         let me = MultiplexerEvent {
                             scope: EventScope::Cursor(scope.clone()),
                             event: Arc::new(SyncEvent::Batch(synthetic)),
-                            checkpoint: Some(expected.clone()),
-                            publication: publication.clone(),
+                            checkpoint: Some(expected),
+                            publication: None,
                         };
-                        // Send and stamp as ONE step, under the delivery lock.
-                        // The stamp says which receivers could possibly hold this
-                        // batch, and that is only true if no subscribe and no
-                        // departing receiver's sweep can interleave between the
-                        // two - see `ChangeDelivery`.
-                        let reached = match lane {
-                            Some(gate) => {
-                                delivery.publish_backfill(me, gate.coverage(), publication.as_ref())
+                        if let Err(claim) = publisher.publish_page(
+                            me,
+                            crate::cursor::CoverageClaim::new(batch.coverage.clone(), generation),
+                            walk_fence,
+                        ) {
+                            if let Err(error) =
+                                crate::inventory_walk::record_refused_debt(Some(writer_tx), claim)
+                                    .await
+                            {
+                                tracing::warn!(%error, "could not record refused page debt");
                             }
-                            None => delivery.publish_acknowledgeable(me),
-                        };
-                        if !reached {
-                            // This page reached nobody. Record it against the
-                            // account's undelivered watermark so the enclosing
-                            // walk cannot later settle the scope on the strength
-                            // of a subscriber who was not there for this page.
-                            if let Some(gate) = lane {
-                                gate.coverage().note_undelivered(&scope, 1);
-                            }
-                            match (control, coverage, publication) {
-                                // Through control when there is one: it
-                                // releases the boundary registration and the
-                                // claim together, which are one publication.
-                                (Some(control), _, Some(id)) => {
-                                    control.retire_publication(id);
-                                }
-                                (None, Some(pending), Some(id)) => pending.retire(id),
-                                _ => {}
-                            }
+                            return Err(Error::Superseded);
                         }
                     }
                 }
@@ -687,17 +618,14 @@ impl BackfillRunner {
                             bifrost_types::AccountOperation::SyncInventory,
                             &scope,
                         );
-                        if let Some(tx) = &changes_tx {
-                            let _ = tx.send(MultiplexerEvent::unacked(
-                                EventScope::Cursor(scope.clone()),
-                                Arc::new(SyncEvent::Terminated(error.clone())),
-                            ));
-                        }
+                        delivery
+                            .publish_terminated(EventScope::Cursor(scope.clone()), error.clone());
                         return Err(Error::Account(error));
                     }
                     end = Some(completion.end);
                     let crossed = if completion.coverage.has_barrier() {
-                        cross_waived_barriers(writer_tx, &completion.coverage, generation).await?
+                        cross_waived_barriers(Some(writer_tx), &completion.coverage, generation)
+                            .await?
                     } else {
                         false
                     };
@@ -707,17 +635,18 @@ impl BackfillRunner {
                     {
                         complete = false;
                         scope_walk = ScopeWalkStep::StopScopeWalk;
-                        record_barriers(writer_tx, &completion.coverage, generation, resume_from)
-                            .await?;
-                        if let Some(tx) = &changes_tx {
-                            warn_barrier(tx, &scope, &completion.coverage);
-                        }
+                        record_barriers(
+                            Some(writer_tx),
+                            &completion.coverage,
+                            generation,
+                            resume_from,
+                        )
+                        .await?;
+                        warn_barrier(delivery, &scope, &completion.coverage);
                         break;
                     }
                     if !completion.coverage.is_complete() && !crossed {
-                        if let Some(tx) = &changes_tx {
-                            warn_incomplete(tx, &scope, &completion.coverage);
-                        }
+                        warn_incomplete(delivery, &scope, &completion.coverage);
                         complete = false;
                         // The terminal summary has no checkpoint of its own to
                         // ride, so its obligations reach the ledger directly -
@@ -728,7 +657,8 @@ impl BackfillRunner {
                         // is idempotent and preserves its history. Relying on
                         // that cumulativeness instead would be an assumption
                         // about every future provider.
-                        if let Some(writer) = writer_tx {
+                        {
+                            let writer = writer_tx;
                             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
                             if writer
                                 .send(crate::multiplexer::WriterRequest::RecordDebt {
@@ -751,15 +681,7 @@ impl BackfillRunner {
                     break;
                 }
                 bifrost_types::InventoryEvent::Terminated(err) => {
-                    if let Some(tx) = &changes_tx {
-                        let me = MultiplexerEvent {
-                            scope: EventScope::Cursor(scope.clone()),
-                            event: Arc::new(SyncEvent::Terminated(err.clone())),
-                            checkpoint: None,
-                            publication: None,
-                        };
-                        let _ = tx.send(me);
-                    }
+                    delivery.publish_terminated(EventScope::Cursor(scope.clone()), err.clone());
                     return Err(Error::Account(err));
                 }
                 // Forwarded for the same reason the fusion walk forwards it:
@@ -769,15 +691,7 @@ impl BackfillRunner {
                 // CONDSTORE downgrade), and the IMAP one is a one-shot that
                 // cannot be re-emitted once a lane has consumed it.
                 bifrost_types::InventoryEvent::Warning(warning) => {
-                    if let Some(tx) = &changes_tx {
-                        let me = MultiplexerEvent {
-                            scope: EventScope::Cursor(scope.clone()),
-                            event: Arc::new(SyncEvent::Warning(warning)),
-                            checkpoint: None,
-                            publication: None,
-                        };
-                        let _ = tx.send(me);
-                    }
+                    delivery.publish_warning(EventScope::Cursor(scope.clone()), warning);
                 }
                 bifrost_types::InventoryEvent::Progress(_) => {}
                 _ => {}
@@ -791,14 +705,10 @@ impl BackfillRunner {
         // next attach skip the walk for good.
         if end.is_none() {
             complete = false;
-            if let Some(tx) = &changes_tx {
-                let _ = tx.send(MultiplexerEvent::unacked(
-                    EventScope::Cursor(scope.clone()),
-                    Arc::new(SyncEvent::Warning(
-                        crate::inventory_walk::unannounced_end_warning(),
-                    )),
-                ));
-            }
+            delivery.publish_warning(
+                EventScope::Cursor(scope.clone()),
+                crate::inventory_walk::unannounced_end_warning(),
+            );
         }
         Ok(BackfillPartitionOutcome {
             seen: seen_total,
@@ -816,7 +726,7 @@ impl BackfillRunner {
 // summary) and the terminal summary itself, but not every page: one warning
 // per page of a large degraded folder is noise the user cannot act on.
 fn warn_incomplete(
-    tx: &broadcast::Sender<MultiplexerEvent>,
+    tx: &crate::multiplexer::ChangeDelivery,
     scope: &CursorScope,
     coverage: &bifrost_types::InventoryCoverageReport,
 ) {
@@ -831,14 +741,11 @@ fn warn_incomplete(
             coverage.obligations().len()
         ),
     );
-    let _ = tx.send(MultiplexerEvent::unacked(
-        EventScope::Cursor(scope.clone()),
-        Arc::new(SyncEvent::Warning(warning)),
-    ));
+    tx.publish_warning(EventScope::Cursor(scope.clone()), warning);
 }
 
 fn warn_barrier(
-    tx: &broadcast::Sender<MultiplexerEvent>,
+    tx: &crate::multiplexer::ChangeDelivery,
     scope: &CursorScope,
     coverage: &bifrost_types::InventoryCoverageReport,
 ) {
@@ -854,10 +761,7 @@ fn warn_barrier(
              the scope cannot advance past them until an operator waives them"
         ),
     );
-    let _ = tx.send(MultiplexerEvent::unacked(
-        EventScope::Cursor(scope.clone()),
-        Arc::new(SyncEvent::Warning(warning)),
-    ));
+    tx.publish_warning(EventScope::Cursor(scope.clone()), warning);
 }
 
 fn filter_inventory_supersedes<'a>(

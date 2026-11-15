@@ -99,17 +99,17 @@ impl ImapConnection {
         let cmd = Command::ListExtended {
             selection_options: selection_options
                 .iter()
-                .map(|option| (*option).to_owned())
+                .map(|option| (*option).into())
                 .collect(),
             reference: reference.mailbox_name()?.into(),
             patterns: names.into_iter().map(Into::into).collect(),
             return_options: return_options
                 .iter()
-                .map(|option| (*option).to_owned())
+                .map(|option| (*option).into())
                 .collect(),
         };
         let consumer =
-            ListExtendedConsumer::new(selection_options.iter().map(|o| (*o).to_owned()).collect());
+            ListExtendedConsumer::new(selection_options.iter().map(|o| (*o).into()).collect());
         self.submit_regular(cmd, consumer, Some(tokio::time::Instant::now() + timeout))
             .await
     }
@@ -138,7 +138,7 @@ impl ImapConnection {
         let cmd = Command::ListStatus {
             reference: reference.mailbox_name()?.into(),
             pattern: pattern.mailbox_name()?.into(),
-            status_items: status_items.to_owned(),
+            status_items: status_items.into(),
         };
         self.submit_regular(
             cmd,
@@ -547,7 +547,7 @@ impl ImapConnection {
         self.validate_requested_status_items(items)?;
         let cmd = Command::Status {
             mailbox: mailbox.mailbox_name()?,
-            items: items.to_owned(),
+            items: items.into(),
         };
         self.submit_regular(
             cmd,

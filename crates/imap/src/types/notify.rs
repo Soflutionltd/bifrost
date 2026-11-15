@@ -95,9 +95,9 @@ pub enum NotifyEvent {
     MessageNew {
         /// Optional FETCH attributes to include with new-message notifications
         /// (RFC 5465 Section 5.2). Only valid for `selected`/`selected-delayed`.
-        /// Each string is a raw FETCH attribute (e.g. `"UID"`, `"FLAGS"`,
-        /// `"BODY.PEEK[HEADER.FIELDS (From To Subject)]"`).
-        fetch_attrs: Vec<String>,
+        /// Typed attributes remain typed; raw extension attributes retain their
+        /// own syntax validation at encoding.
+        fetch_attrs: Vec<NotifyFetchAttribute>,
     },
 
     /// `MessageExpunge`  -  message expunged or expired
@@ -168,18 +168,62 @@ pub enum NotifyEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NotifyEventGroup {
     /// Which mailboxes this event group applies to (RFC 5465 Section 6).
-    pub filter: MailboxFilter,
+    filter: MailboxFilter,
 
     /// Events to monitor. An empty Vec means `NONE`  -  no events for this
     /// filter (RFC 5465 Section 8).
-    pub events: Vec<NotifyEvent>,
+    events: Vec<NotifyEvent>,
+    validation_error: Option<NotifyGroupFault>,
 }
 
 impl NotifyEventGroup {
     /// Create a new event group for the given mailbox filter and events
     /// (RFC 5465 Section 8).
     pub fn new(filter: MailboxFilter, events: Vec<NotifyEvent>) -> Self {
-        Self { filter, events }
+        let mut group = Self {
+            filter,
+            events,
+            validation_error: None,
+        };
+        group.validation_error = validate_notify_event_group(&group).err();
+        group
+    }
+
+    pub(crate) fn filter(&self) -> &MailboxFilter {
+        &self.filter
+    }
+
+    pub(crate) fn events(&self) -> &[NotifyEvent] {
+        &self.events
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), crate::Error> {
+        match &self.validation_error {
+            Some(error) => Err(crate::Error::InvalidInput(error.message().into())),
+            None => Ok(()),
+        }
+    }
+
+    /// MessageNew and MessageExpunge are always registered together. Optional
+    /// flag and annotation observations cannot omit that dependency pair.
+    // The dependency bundle alone cannot guarantee filter legality: a mailbox
+    // filter outside Selected/SelectedDelayed cannot request FETCH attributes,
+    // and extension events cannot enter a selected group. Keep that admission
+    // at the immutable group constructor rather than duplicating it in codec.
+    pub(crate) fn messages(filter: MailboxFilter, messages: MessageEvents) -> Self {
+        let mut events = vec![
+            NotifyEvent::MessageNew {
+                fetch_attrs: messages.new_fetch.into_iter().map(Into::into).collect(),
+            },
+            NotifyEvent::MessageExpunge,
+        ];
+        if messages.flag_change {
+            events.push(NotifyEvent::FlagChange);
+        }
+        if messages.annotation_change {
+            events.push(NotifyEvent::AnnotationChange);
+        }
+        Self::new(filter, events)
     }
 }
 
@@ -319,5 +363,146 @@ impl From<&NotifySetParams> for NotifyFlags {
             status,
             metadata,
         }
+    }
+}
+
+/// One legal message-event dependency group. Filter-specific legality is checked
+/// once by NotifyEventGroup construction, before the group enters a command.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct MessageEvents {
+    pub(crate) new_fetch: Vec<super::FetchAttr>,
+    pub(crate) flag_change: bool,
+    pub(crate) annotation_change: bool,
+}
+
+/// Validate a single NOTIFY event group's semantic constraints
+/// (RFC 5465 Sections 5.1-5.4, 6.1).
+fn validate_notify_event_group(group: &NotifyEventGroup) -> Result<(), NotifyGroupFault> {
+    let selected = matches!(
+        group.filter,
+        MailboxFilter::Selected | MailboxFilter::SelectedDelayed
+    );
+    let mut new = false;
+    let mut expunge = false;
+    let mut flag = false;
+    let mut annotation = false;
+    for event in &group.events {
+        if selected && !is_message_event(event) {
+            return Err(NotifyGroupFault::SelectedEvent);
+        }
+        match event {
+            NotifyEvent::MessageNew { fetch_attrs } => {
+                if !selected && !fetch_attrs.is_empty() {
+                    return Err(NotifyGroupFault::NonSelectedFetch);
+                }
+                new = true;
+            }
+            NotifyEvent::MessageExpunge => expunge = true,
+            NotifyEvent::FlagChange => flag = true,
+            NotifyEvent::AnnotationChange => annotation = true,
+            _ => {}
+        }
+    }
+    if new && !expunge {
+        return Err(NotifyGroupFault::NewWithoutExpunge);
+    }
+    if expunge && !new {
+        return Err(NotifyGroupFault::ExpungeWithoutNew);
+    }
+    if flag && (!new || !expunge) {
+        return Err(NotifyGroupFault::FlagWithoutMessages);
+    }
+    if annotation && (!new || !expunge) {
+        return Err(NotifyGroupFault::AnnotationWithoutMessages);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum NotifyGroupFault {
+    SelectedEvent,
+    NonSelectedFetch,
+    NewWithoutExpunge,
+    ExpungeWithoutNew,
+    FlagWithoutMessages,
+    AnnotationWithoutMessages,
+}
+impl NotifyGroupFault {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::SelectedEvent => {
+                "selected/selected-delayed filters only accept message events (RFC 5465 Section 6.1)"
+            }
+            Self::NonSelectedFetch => {
+                "MessageNew fetch attributes are only valid with selected/selected-delayed filters (RFC 5465 Section 8)"
+            }
+            Self::NewWithoutExpunge => {
+                "MessageNew requires MessageExpunge to also be specified (RFC 5465 Section 5)"
+            }
+            Self::ExpungeWithoutNew => {
+                "MessageExpunge requires MessageNew to also be specified (RFC 5465 Section 5)"
+            }
+            Self::FlagWithoutMessages => {
+                "FlagChange requires both MessageNew and MessageExpunge to also be specified (RFC 5465 Section 5)"
+            }
+            Self::AnnotationWithoutMessages => {
+                "AnnotationChange requires both MessageNew and MessageExpunge to also be specified (RFC 5465 Section 5)"
+            }
+        }
+    }
+}
+
+/// Returns `true` if the event is a message event (RFC 5465 Sections 5.1-5.3).
+///
+/// Message events are `FlagChange`/`AnnotationChange` (RFC 5465 Section 5.1),
+/// `MessageNew` (RFC 5465 Section 5.2), and `MessageExpunge` (RFC 5465
+/// Section 5.3). Extension events (`Other(...)`) are NOT message events;
+/// RFC 5465 Section 8 defines `event-ext` as a separate ABNF production
+/// from `message-event`, so they must be rejected for selected /
+/// selected-delayed filters (Section 6.1). Mailbox events (`MailboxName`,
+/// `SubscriptionChange`) and metadata events are also excluded.
+fn is_message_event(event: &NotifyEvent) -> bool {
+    // RFC 5465 Section 8 ABNF: `message-event` is MessageNew /
+    // MessageExpunge / FlagChange / AnnotationChange. `event-ext`
+    // (modelled as `Other(...)`) is a separate production and MUST NOT
+    // be accepted under selected / selected-delayed filters (Section 6.1).
+    matches!(
+        event,
+        NotifyEvent::MessageNew { .. }
+            | NotifyEvent::MessageExpunge
+            | NotifyEvent::FlagChange
+            | NotifyEvent::AnnotationChange
+    )
+}
+
+/// A NOTIFY fetch operand keeps typed attributes intact. Raw extension operands
+/// remain possible because servers can advertise attributes beyond FetchAttr.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NotifyFetchAttribute {
+    Attribute(super::FetchAttr),
+    Raw(String),
+}
+impl NotifyFetchAttribute {
+    pub(crate) fn wire(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Attribute(attr) => attr.to_imap_string().into(),
+            Self::Raw(text) => text.as_str().into(),
+        }
+    }
+}
+impl From<super::FetchAttr> for NotifyFetchAttribute {
+    fn from(attr: super::FetchAttr) -> Self {
+        Self::Attribute(attr)
+    }
+}
+impl From<String> for NotifyFetchAttribute {
+    fn from(text: String) -> Self {
+        Self::Raw(text)
+    }
+}
+impl From<&str> for NotifyFetchAttribute {
+    fn from(text: &str) -> Self {
+        Self::Raw(text.to_owned())
     }
 }

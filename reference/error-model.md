@@ -217,7 +217,11 @@ Retry timing is a single **`RetryHint` enum**, not split fields:
 the convergence rewrite eliminated). `disposition` is
 `RetryDisposition::{SameRequest, AfterStateRefresh, AfterAuthRefresh}`;
 `reason` is `RetryReason::{Transport, ServerUnavailable, RateLimited,
-QuotaExhausted, ConcurrencyConflict, RefreshTransient}`.
+QuotaExhausted, ConcurrencyConflict, RefreshTransient}`. Net's rate-limit,
+retry-stop and refresh-failure envelopes store this same `RetryHint` type.
+Transport wait caps never rewrite the stored server hint. Public net request
+evidence couples its private diagnostic history to `AttemptLedger`; consumers
+read its typed commit verdict rather than a separate possible-commit flag.
 
 `ReconcileAdvice { reason, guidance, retry_hint, throttle_scope }`:
 `ReconcileReason::{TransportDropAfterSend, PartialCompletionSignal,
@@ -638,8 +642,9 @@ reason/actions/throttle for reconcile, none for terminal) via the
 `scope.rs`. `ErrorScope` (`#[non_exhaustive]`, custom `Serialize`)
 locates the failure: `Account`, `Cursor(CursorScope)`, and id-bearing
 `Mailbox` / `Message` / `Thread` / `Calendar` / `Event` / `Contact` plus the
-collection variants, `Submission`, `CloudFile`, `UploadSession`, plus `DirectoryGateway { url }` for a read-only directory
-endpoint that a multi-gateway lookup skipped. The id-bearing variants use the same typed ids as
+collection variants, `Submission`, `CloudFile`, `UploadSession`, `Namespace { prefix }` for an IMAP namespace prefix that is
+not itself a selectable mailbox, plus `DirectoryGateway { url }` for a
+read-only directory endpoint that a multi-gateway lookup skipped. The id-bearing variants use the same typed ids as
 the account surface (`MailboxId`, `ObjectId`, `ThreadId`, `CalendarId`,
 `EventId`, `ContactId`) and serialize their inner strings for support exports.
 `ErrorScope::resource()` and `object_id()` centralize the exhaustive resource and borrowed-id projections: Event maps to Event; `CalendarCollection` and `ContactCollection` map to Calendar and Contact with no id, so a collection-scoped not-found or permission refusal stays typed in every crate; cursor scopes have neither; and Submission/CloudFile retain ids without a matching resource kind.

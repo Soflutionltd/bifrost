@@ -365,6 +365,63 @@ impl PolicyStatus {
     }
 }
 
+/// Historical error evidence exposed by debt inspection.
+///
+/// A digest retains what an operator can inspect, without inventing causes or
+/// live recovery advice after restart. Enterprise users need the recorded
+/// failure, not a retry policy derived from a cause that was never observed.
+#[derive(Debug, Clone)]
+pub struct ErrorDigest {
+    pub kind: bifrost_types::AccountErrorKind,
+    pub scope: Option<bifrost_types::ErrorScope>,
+    pub operation: Option<bifrost_types::AccountOperation>,
+    pub provider: Option<bifrost_types::Provider>,
+    pub protocol: Option<bifrost_types::Protocol>,
+    pub diagnostics: bifrost_types::DiagnosticInfo,
+}
+
+impl From<&AccountError> for ErrorDigest {
+    fn from(error: &AccountError) -> Self {
+        Self {
+            kind: error.kind().clone(),
+            scope: error.scope().cloned(),
+            operation: error.operation(),
+            provider: error.provider(),
+            protocol: error.protocol(),
+            diagnostics: error.diagnostics().clone(),
+        }
+    }
+}
+
+impl From<AccountError> for ErrorDigest {
+    fn from(error: AccountError) -> Self {
+        Self::from(&error)
+    }
+}
+
+impl ErrorDigest {
+    #[must_use]
+    pub fn kind(&self) -> &bifrost_types::AccountErrorKind {
+        &self.kind
+    }
+    #[must_use]
+    pub fn scope(&self) -> Option<&bifrost_types::ErrorScope> {
+        self.scope.as_ref()
+    }
+    #[must_use]
+    pub fn operation(&self) -> Option<bifrost_types::AccountOperation> {
+        self.operation
+    }
+    #[must_use]
+    pub fn provider(&self) -> Option<bifrost_types::Provider> {
+        self.provider
+    }
+    #[must_use]
+    pub fn protocol(&self) -> Option<bifrost_types::Protocol> {
+        self.protocol
+    }
+}
+
 /// One obligation as the engine tracks it over time.
 #[derive(Debug, Clone)]
 pub struct LedgerEntry {
@@ -394,7 +451,7 @@ pub struct LedgerEntry {
     /// anything dereferences.
     pub parent: Option<ObligationKey>,
     pub first_seen_unix_seconds: i64,
-    pub last_error: AccountError,
+    pub last_error: ErrorDigest,
 }
 
 impl LedgerEntry {
@@ -436,7 +493,7 @@ pub struct BarrierIncident {
     pub domain: CoverageDomain,
     pub generation: crate::cursor::WalkGeneration,
     pub failure_label: String,
-    pub evidence: AccountError,
+    pub evidence: ErrorDigest,
     pub policy: PolicyStatus,
     /// The last checkpoint proved to precede the whole barrier region, if the
     /// walk accepted one. Where a later walk resumes from.
@@ -777,7 +834,7 @@ impl DebtLedger {
                         target: None,
                         parent: None,
                         first_seen_unix_seconds: now,
-                        last_error: obligation.error().clone(),
+                        last_error: ErrorDigest::from(obligation.error()),
                     },
                 );
             } else if let Some(entry) = self.entries.get_mut(&key) {
@@ -789,7 +846,7 @@ impl DebtLedger {
                 entry.generation = generation;
                 entry.proof = ProofStatus::Unresolved;
                 entry.target = None;
-                entry.last_error = obligation.error().clone();
+                entry.last_error = ErrorDigest::from(obligation.error());
             }
         }
         self.settle_lineages();
@@ -1035,7 +1092,7 @@ impl DebtLedger {
                 // a gap observed by a newer walk.
                 existing.generation = existing.generation.max(generation);
                 existing.domain = domain.clone();
-                existing.last_error = obligation.error().clone();
+                existing.last_error = ErrorDigest::from(obligation.error());
                 // The token may legitimately rotate while naming the same gap,
                 // so the descriptor refreshes even though identity does not.
                 existing.target = InventoryRepairTarget::from_obligation(obligation);
@@ -1067,7 +1124,7 @@ impl DebtLedger {
                         target: InventoryRepairTarget::from_obligation(obligation),
                         parent: None,
                         first_seen_unix_seconds: now,
-                        last_error: obligation.error().clone(),
+                        last_error: ErrorDigest::from(obligation.error()),
                     },
                 );
             }
@@ -1802,7 +1859,7 @@ mod tests {
             domain: CoverageDomain::full(scope()),
             generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
-            evidence: error(),
+            evidence: error().into(),
             policy: PolicyStatus::Retrying { attempts: 0 },
             resume_from: None,
         });
@@ -1835,7 +1892,7 @@ mod tests {
             domain: report.domain.clone(),
             generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
-            evidence: error(),
+            evidence: error().into(),
             policy: PolicyStatus::Retrying { attempts: 0 },
             resume_from: None,
         });
@@ -1868,7 +1925,7 @@ mod tests {
             domain: CoverageDomain::full(scope()),
             generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
-            evidence: error(),
+            evidence: error().into(),
             policy: PolicyStatus::Retrying { attempts: 0 },
             resume_from: None,
         });
@@ -1895,7 +1952,7 @@ mod tests {
             domain: CoverageDomain::full(scope()),
             generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
-            evidence: error(),
+            evidence: error().into(),
             policy: PolicyStatus::Retrying { attempts: 0 },
             resume_from: None,
         });
@@ -2844,7 +2901,7 @@ mod tests {
             target: None,
             parent: parent.map(|key| ObligationKey(key.as_bytes().to_vec())),
             first_seen_unix_seconds: 100,
-            last_error: error(),
+            last_error: error().into(),
         }
     }
 
@@ -3181,7 +3238,7 @@ mod tests {
             domain: CoverageDomain::full(scope()),
             generation: crate::cursor::WalkGeneration::for_test(1),
             failure_label: "unidentifiable-value".into(),
-            evidence: error(),
+            evidence: error().into(),
             policy: PolicyStatus::Retrying { attempts: 0 },
             resume_from: None,
         };

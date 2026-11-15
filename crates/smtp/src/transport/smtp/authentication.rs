@@ -97,23 +97,20 @@ impl Mechanism {
     /// auth-phase error stamp carries into support diagnostics, so the name
     /// an operator reads is the name that went out on the wire.
     pub(crate) fn name(self) -> &'static str {
+        self.shared().name()
+    }
+
+    /// Adapt the published SMTP allow-list to the shared vocabulary.
+    pub(crate) const fn shared(self) -> bifrost_sasl::Mechanism {
         match self {
-            Mechanism::Plain => "PLAIN",
-            Mechanism::Login => "LOGIN",
-            Mechanism::Xoauth2 => "XOAUTH2",
-            Mechanism::OAuthBearer => "OAUTHBEARER",
-            Mechanism::ScramSha1 => {
-                ScramHash::Sha1.mechanism_name(bifrost_sasl::ChannelBinding::None)
-            }
-            Mechanism::ScramSha256 => {
-                ScramHash::Sha256.mechanism_name(bifrost_sasl::ChannelBinding::None)
-            }
-            Mechanism::ScramSha1Plus => {
-                ScramHash::Sha1.mechanism_name(bifrost_sasl::ChannelBinding::TlsServerEndPoint)
-            }
-            Mechanism::ScramSha256Plus => {
-                ScramHash::Sha256.mechanism_name(bifrost_sasl::ChannelBinding::TlsServerEndPoint)
-            }
+            Self::Plain => bifrost_sasl::Mechanism::Plain,
+            Self::Login => bifrost_sasl::Mechanism::Login,
+            Self::Xoauth2 => bifrost_sasl::Mechanism::Xoauth2,
+            Self::OAuthBearer => bifrost_sasl::Mechanism::OAuthBearer,
+            Self::ScramSha1 => bifrost_sasl::Mechanism::ScramSha1,
+            Self::ScramSha256 => bifrost_sasl::Mechanism::ScramSha256,
+            Self::ScramSha1Plus => bifrost_sasl::Mechanism::ScramSha1Plus,
+            Self::ScramSha256Plus => bifrost_sasl::Mechanism::ScramSha256Plus,
         }
     }
 
@@ -166,17 +163,7 @@ impl Mechanism {
                 Some(_) => Err(error::parse("This mechanism does not expect a challenge")),
                 None => {
                     let (username, password) = credentials.password_parts()?;
-                    // RFC 4616 forbids NUL inside authzid/authcid/passwd: NUL is
-                    // the field separator. A username carrying one splits into
-                    // an extra field, so `authzid\0authcid` in the username slot
-                    // is an authorization-identity injection, not merely a
-                    // malformed message. Refuse rather than format it.
-                    if username.contains('\u{0}') || password.contains('\u{0}') {
-                        return Err(error::invalid_input(
-                            "PLAIN credentials must not contain a NUL byte",
-                        ));
-                    }
-                    Ok(Secret::from(format!("\u{0}{username}\u{0}{password}")))
+                    bifrost_sasl::plain_payload("", username, password).map_err(Error::from)
                 }
             },
             Mechanism::Login => {
@@ -245,81 +232,86 @@ impl From<bifrost_sasl::SaslError> for Error {
                     .with_phase(SmtpCommandPhase::Auth { mechanism: None })
             }
             // `SaslError` is `#[non_exhaustive]`; any future variant is an
-            // client mapping gap until it is handled explicitly.
+            // client mapping gap until it is handled explicitly; it is not
+            // evidence that the user must replace credentials.
             other => error::internal(other.to_string())
                 .with_phase(SmtpCommandPhase::Auth { mechanism: None }),
         }
     }
 }
 
-/// Fixed SCRAM-aware preference order, strongest first.
-const MECHANISM_PREFERENCE: &[Mechanism] = &[
-    Mechanism::ScramSha256Plus,
-    Mechanism::ScramSha1Plus,
-    Mechanism::ScramSha256,
-    Mechanism::ScramSha1,
-    Mechanism::Plain,
-    Mechanism::Login,
-];
+/// Selection carries the actual GS2 input through to the exchange.
+#[derive(Debug)]
+pub(crate) struct PasswordSelection {
+    pub(crate) mechanism: Mechanism,
+    pub(crate) scram: Option<bifrost_sasl::ScramRung>,
+}
 
-/// Select the strongest attemptable password mechanism, with RFC 5802 Section
-/// 6 downgrade protection.
-///
-/// `allowed` is the configured/default preference set (the existing
-/// `authentication` Vec). `advertised` is the server's EHLO `AUTH` set.
-/// A rejected authentication is final. This function does not return a retry
-/// ladder because walking from PLUS to an unbound mechanism or PLAIN after a
-/// 535 would be a silent security downgrade.
+/// Select once from the SASL-owned ladder. A wire rejection is final.
 pub(crate) fn password_mechanism(
     allowed: &[Mechanism],
     advertised: &ServerInfo,
-    binding_available: bool,
-) -> Result<Mechanism, Error> {
+    binding: Option<&bifrost_sasl::ChannelBindingData>,
+) -> Result<PasswordSelection, Error> {
+    let shared = allowed.iter().map(|m| m.shared()).collect::<Vec<_>>();
     let mut skipped_plus_for_binding = false;
-    for &mechanism in MECHANISM_PREFERENCE {
-        if !allowed.contains(&mechanism) {
-            continue;
-        }
-        if !advertised.supports_auth_mechanism(mechanism) {
-            continue;
-        }
-        if let Some(hash) = scram_hash(mechanism) {
-            let plus = matches!(
-                mechanism,
-                Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus
-            );
-            if bifrost_sasl::select_scram_rung(
-                hash,
-                plus,
-                |name| {
-                    MECHANISM_PREFERENCE.iter().any(|candidate| {
-                        candidate.name() == name && advertised.supports_auth_mechanism(*candidate)
-                    })
-                },
-                binding_available.then_some(&[][..]),
-            )
-            .is_none()
-            {
-                skipped_plus_for_binding |= plus && !binding_available;
-                continue;
+    for (mechanism, result) in bifrost_sasl::negotiate(
+        |m| {
+            SMTP_MECHANISMS.iter().any(|candidate| {
+                candidate.shared() == m && advertised.supports_auth_mechanism(*candidate)
+            })
+        },
+        &bifrost_sasl::NegotiationPolicy {
+            allowed: &shared,
+            allow_insecure: false,
+            oauth: false,
+        },
+        // The transport checks the shared TLS gate before resolving credentials.
+        true,
+        binding,
+    ) {
+        match result {
+            Ok(selected) => {
+                if let Some(mechanism) = allowed.iter().copied().find(|m| m.shared() == mechanism) {
+                    return Ok(PasswordSelection {
+                        mechanism,
+                        scram: selected.scram,
+                    });
+                }
             }
+            Err(bifrost_sasl::NegotiationSkip::Scram(
+                bifrost_sasl::ScramSkip::PlusWithoutBinding,
+            )) => {
+                skipped_plus_for_binding |= shared.contains(&mechanism);
+            }
+            Err(_) => {}
         }
-        return Ok(mechanism);
     }
     let message = if skipped_plus_for_binding {
         "channel binding required but unavailable"
     } else {
         "no compatible authentication mechanism"
     };
-    // A mailbox user must change the authentication policy, rather than
-    // re-enter a password that the server has never evaluated.
     Err(error::policy(message).with_phase(SmtpCommandPhase::Auth { mechanism: None }))
 }
 
-/// First advertised OAuth mechanism in the caller's order, or `None`.
+// Support set, not preference order. Advertised PLUS suppresses unbound SCRAM
+// even when the caller excludes PLUS from its allow-list.
+const SMTP_MECHANISMS: &[Mechanism] = &[
+    Mechanism::Plain,
+    Mechanism::Login,
+    Mechanism::Xoauth2,
+    Mechanism::OAuthBearer,
+    Mechanism::ScramSha1,
+    Mechanism::ScramSha256,
+    Mechanism::ScramSha1Plus,
+    Mechanism::ScramSha256Plus,
+];
+
+/// First allowed, advertised OAuth mechanism in the shared preference order.
 ///
 /// OAuth credentials never flow through the SCRAM/password ladder; they pick
-/// the first advertised `OAUTHBEARER` / `XOAUTH2` rung in caller order and run
+/// the first allowed `OAUTHBEARER` / `XOAUTH2` rung in shared order and run
 /// the legacy stateless encoder. Returns `None` for password credentials so
 /// the caller falls through to [`password_mechanism`].
 pub(crate) fn oauth_mechanism(
@@ -330,9 +322,11 @@ pub(crate) fn oauth_mechanism(
     if !matches!(credentials, Credentials::OAuth2 { .. }) {
         return None;
     }
-    mechanisms.iter().copied().find(|&m| {
-        matches!(m, Mechanism::OAuthBearer | Mechanism::Xoauth2)
-            && advertised.supports_auth_mechanism(m)
+    bifrost_sasl::OAUTH_PREFERENCE.iter().find_map(|preferred| {
+        mechanisms
+            .iter()
+            .copied()
+            .find(|m| m.shared() == *preferred && advertised.supports_auth_mechanism(*m))
     })
 }
 
@@ -340,12 +334,8 @@ pub(crate) fn oauth_mechanism(
 /// the only skip signal; a present but unusable certificate remains an error.
 pub(crate) fn resolve_scram_binding(
     peer_certificate_der: Option<&[u8]>,
-) -> Result<Option<ScramChannelBinding>, Error> {
-    let Some(der) = peer_certificate_der else {
-        return Ok(None);
-    };
-    let bytes = bifrost_sasl::tls_server_end_point(der)?;
-    Ok(Some(ScramChannelBinding::TlsServerEndPoint(bytes)))
+) -> Result<Option<bifrost_sasl::ChannelBindingData>, Error> {
+    bifrost_sasl::binding_from_peer_certificate(peer_certificate_der).map_err(Error::from)
 }
 
 /// Next client line a [`ScramExchange::step`] produces.
@@ -482,11 +472,7 @@ impl ScramExchange {
 
 /// `ScramHash` for a SCRAM `Mechanism` variant (bound or unbound).
 pub(crate) fn scram_hash(mechanism: Mechanism) -> Option<ScramHash> {
-    match mechanism {
-        Mechanism::ScramSha1 | Mechanism::ScramSha1Plus => Some(ScramHash::Sha1),
-        Mechanism::ScramSha256 | Mechanism::ScramSha256Plus => Some(ScramHash::Sha256),
-        _ => None,
-    }
+    mechanism.shared().scram().map(|(hash, _)| hash)
 }
 
 /// 18-byte URL-safe-no-pad base64 client nonce.
@@ -510,8 +496,18 @@ fn generate_scram_nonce_with<E: std::fmt::Display>(
 }
 
 #[cfg(all(test, feature = "account-error"))]
+#[allow(clippy::expect_used)]
+fn test_binding() -> Option<bifrost_sasl::ChannelBindingData> {
+    let der = [
+        0x30, 0x14, 0x30, 0x00, 0x30, 0x0b, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01,
+        0x01, 0x0b, 0x03, 0x03, 0x00, 0x01, 0x02,
+    ];
+    bifrost_sasl::binding_from_peer_certificate(Some(&der)).expect("fixture certificate")
+}
+
+#[cfg(all(test, feature = "account-error"))]
 mod test {
-    use super::{Credentials, Mechanism};
+    use super::{Credentials, Mechanism, test_binding};
     use bifrost_net::auth::TokenSnapshot;
     use bifrost_net::{AccessToken, StaticTokenSource, TokenSource};
     use std::sync::Arc;
@@ -788,7 +784,7 @@ mod test {
     /// RFC 5802 Section 6. The single-selection API can only express this drop
     /// when channel binding is *unavailable*: with binding available the PLUS
     /// rung outranks its unbound twin regardless, so every assertion here uses
-    /// `binding_available: false`. That is exactly the MITM shape the rule
+    /// absent binding data. That is exactly the MITM shape the rule
     /// exists for - a peer that strips the certificate must not be handed the
     /// unbound SCRAM rung as a consolation prize.
     #[test]
@@ -806,7 +802,9 @@ mod test {
             Mechanism::Plain,
         ]);
         assert_eq!(
-            password_mechanism(PASSWORD_MECHANISMS, &advertised, false).unwrap(),
+            password_mechanism(PASSWORD_MECHANISMS, &advertised, None)
+                .unwrap()
+                .mechanism,
             Mechanism::Plain
         );
 
@@ -819,7 +817,9 @@ mod test {
             Mechanism::Plain,
         ]);
         assert_eq!(
-            password_mechanism(PASSWORD_MECHANISMS, &advertised, false).unwrap(),
+            password_mechanism(PASSWORD_MECHANISMS, &advertised, None)
+                .unwrap()
+                .mechanism,
             Mechanism::ScramSha1
         );
 
@@ -828,7 +828,7 @@ mod test {
         // diagnosed as a channel-binding problem - never an unbound success.
         let advertised =
             ServerInfo::with_auth_mechanisms(&[Mechanism::ScramSha256Plus, Mechanism::ScramSha256]);
-        let err = password_mechanism(PASSWORD_MECHANISMS, &advertised, false).unwrap_err();
+        let err = password_mechanism(PASSWORD_MECHANISMS, &advertised, None).unwrap_err();
         assert!(err.is_policy());
         assert_eq!(
             err.to_string(),
@@ -853,7 +853,9 @@ mod test {
         // drop on its own - the PLUS rung outranks the unbound one anyway; see
         // `unbound_scram_is_never_selected_when_its_plus_variant_is_advertised`.)
         assert_eq!(
-            password_mechanism(PASSWORD_MECHANISMS, &advertised, true).unwrap(),
+            password_mechanism(PASSWORD_MECHANISMS, &advertised, test_binding().as_ref())
+                .unwrap()
+                .mechanism,
             Mechanism::ScramSha256Plus
         );
 
@@ -861,7 +863,9 @@ mod test {
         let advertised =
             ServerInfo::with_auth_mechanisms(&[Mechanism::ScramSha256Plus, Mechanism::ScramSha256]);
         assert_eq!(
-            password_mechanism(PASSWORD_MECHANISMS, &advertised, true).unwrap(),
+            password_mechanism(PASSWORD_MECHANISMS, &advertised, test_binding().as_ref())
+                .unwrap()
+                .mechanism,
             Mechanism::ScramSha256Plus
         );
 
@@ -872,7 +876,9 @@ mod test {
             Mechanism::Plain,
         ]);
         assert_eq!(
-            password_mechanism(PASSWORD_MECHANISMS, &advertised, false).unwrap(),
+            password_mechanism(PASSWORD_MECHANISMS, &advertised, None)
+                .unwrap()
+                .mechanism,
             Mechanism::ScramSha256
         );
 
@@ -880,14 +886,16 @@ mod test {
         let allowed = [Mechanism::Plain, Mechanism::Login];
         let advertised = ServerInfo::with_auth_mechanisms(&[Mechanism::Login, Mechanism::Plain]);
         assert_eq!(
-            password_mechanism(&allowed, &advertised, false).unwrap(),
+            password_mechanism(&allowed, &advertised, None)
+                .unwrap()
+                .mechanism,
             Mechanism::Plain
         );
 
         // LOGIN-only server under the default `PASSWORD_MECHANISMS` (LOGIN not
         // allowed): empty order. Pins the migration-note regression.
         let advertised = ServerInfo::with_auth_mechanisms(&[Mechanism::Login]);
-        assert!(password_mechanism(PASSWORD_MECHANISMS, &advertised, false).is_err());
+        assert!(password_mechanism(PASSWORD_MECHANISMS, &advertised, None).is_err());
     }
 
     #[test]
@@ -922,15 +930,21 @@ mod test {
             Mechanism::Plain,
         ];
         assert_eq!(
-            password_mechanism(&allowed, &ServerInfo::with_auth_mechanisms(&allowed), false,)
-                .unwrap(),
+            password_mechanism(&allowed, &ServerInfo::with_auth_mechanisms(&allowed), None,)
+                .unwrap()
+                .mechanism,
             Mechanism::Plain
         );
 
         // A PLUS rung whose binding *is* available is chosen.
         assert_eq!(
-            password_mechanism(&allowed, &ServerInfo::with_auth_mechanisms(&allowed), true,)
-                .unwrap(),
+            password_mechanism(
+                &allowed,
+                &ServerInfo::with_auth_mechanisms(&allowed),
+                test_binding().as_ref(),
+            )
+            .unwrap()
+            .mechanism,
             Mechanism::ScramSha256Plus
         );
 
@@ -941,7 +955,7 @@ mod test {
         let err = password_mechanism(
             &all_plus,
             &ServerInfo::with_auth_mechanisms(&all_plus),
-            false,
+            None,
         )
         .unwrap_err();
         assert!(err.is_policy());
@@ -957,7 +971,8 @@ mod test {
         // Empty order -> same routing (Auth-phase policy) but the
         // no-compatible-mechanism diagnostic, not the channel-binding one (no
         // PLUS rung was skipped).
-        let err = password_mechanism(&[], &ServerInfo::default(), true).unwrap_err();
+        let err =
+            password_mechanism(&[], &ServerInfo::default(), test_binding().as_ref()).unwrap_err();
         assert!(err.is_policy());
         assert_eq!(
             err.phase(),
@@ -1616,7 +1631,7 @@ mod standalone_tests {
     #[test]
     fn direct_authentication_preserves_policy_and_protocol_errors_without_account_types() {
         let refused =
-            password_mechanism(PASSWORD_MECHANISMS, &ServerInfo::default(), false).unwrap_err();
+            password_mechanism(PASSWORD_MECHANISMS, &ServerInfo::default(), None).unwrap_err();
         assert!(refused.is_policy());
         let credentials = Credentials::password("user", "password");
         let malformed = Mechanism::Plain

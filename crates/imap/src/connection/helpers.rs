@@ -121,7 +121,7 @@ impl ImapConnection {
             Command::SearchReturn { return_opts, .. }
             | Command::UidSearchReturn { return_opts, .. } => return_opts
                 .iter()
-                .any(|opt| opt.trim().eq_ignore_ascii_case("SAVE")),
+                .any(|opt| matches!(opt, crate::types::command_options::SearchReturn::Save)),
             _ => false,
         }
     }
@@ -161,7 +161,17 @@ impl ImapConnection {
             snapshot: &self.state_rx.borrow(),
             tls_active: self.is_encrypted(),
         }
-        .validate_list_extended_request(patterns, selection_options, return_options)
+        .validate_list_extended_request(
+            patterns,
+            &selection_options
+                .iter()
+                .map(|option| (*option).into())
+                .collect::<Vec<_>>(),
+            &return_options
+                .iter()
+                .map(|option| (*option).into())
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// RFC 5819 Section 2 adds the reserved `STATUS (<items>)` return option
@@ -193,7 +203,7 @@ impl ImapConnection {
             snapshot: &self.state_rx.borrow(),
             tls_active: self.is_encrypted(),
         }
-        .validate_requested_status_items(items)
+        .validate_requested_status_items(&items.into())
     }
 
     /// Validate requested FETCH data items against negotiated extensions
@@ -216,7 +226,7 @@ impl ImapConnection {
             snapshot: &self.state_rx.borrow(),
             tls_active: self.is_encrypted(),
         }
-        .validate_fetch_wire(&format_fetch_attrs(items))
+        .validate_fetch_items(&crate::types::fetch::FetchItems::Attributes(items.to_vec()))
     }
 
     /// Parse a STATUS data item list into individual item atoms.
@@ -226,63 +236,7 @@ impl ImapConnection {
     /// contain at least one item, and nested or unbalanced parentheses are
     /// rejected per RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11.
     pub(super) fn status_item_tokens(items: &str) -> Result<Vec<&str>, Error> {
-        let trimmed = items.trim();
-        if trimmed.is_empty() {
-            return Err(Error::InvalidInput(
-                "STATUS item list must contain at least one data item \
-                 (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                    .into(),
-            ));
-        }
-
-        let body = match (trimmed.strip_prefix('('), trimmed.strip_suffix(')')) {
-            (Some(without_open), Some(_)) => {
-                let inner = without_open
-                    .strip_suffix(')')
-                    .ok_or_else(|| {
-                        Error::InvalidInput(
-                            "STATUS item list must use balanced parentheses \
-                             (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                                .into(),
-                        )
-                    })?
-                    .trim();
-                if inner.is_empty() {
-                    return Err(Error::InvalidInput(
-                        "STATUS item list must contain at least one data item \
-                         (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                            .into(),
-                    ));
-                }
-                inner
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                return Err(Error::InvalidInput(
-                    "STATUS item list must use balanced parentheses \
-                     (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                        .into(),
-                ));
-            }
-            (None, None) => trimmed,
-        };
-
-        if body.contains('(') || body.contains(')') {
-            return Err(Error::InvalidInput(
-                "STATUS item list must be flat and must not contain nested parentheses \
-                 (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                    .into(),
-            ));
-        }
-
-        let tokens: Vec<&str> = body.split_ascii_whitespace().collect();
-        if tokens.is_empty() {
-            return Err(Error::InvalidInput(
-                "STATUS item list must contain at least one data item \
-                 (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                    .into(),
-            ));
-        }
-        Ok(tokens)
+        crate::types::command_options::status_item_tokens(items)
     }
 
     /// Whether `UTF8=ACCEPT` has been enabled (RFC 6855 Section 3).

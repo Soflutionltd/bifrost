@@ -377,48 +377,55 @@ async fn authenticate(
     tls_active: bool,
 ) -> Result<(), Error> {
     let offered = capabilities.sasl.clone();
-    let (mechanism, payload) = match credentials.kind() {
-        CredentialsKind::Password { username, password } => {
-            if !supports_mechanism(&offered, "PLAIN") {
-                return Err(Error::AuthPolicy(AuthPolicyFailure::new(
-                    offered,
-                    Vec::new(),
-                )));
+    // ManageSieve's exchange currently supports PLAIN and XOAUTH2. Its support
+    // set filters the common ladder; wire sequencing remains protocol-owned.
+    let (allowed, oauth): (&[_], _) = match credentials.kind() {
+        CredentialsKind::Password { .. } => (&[AuthMechanism::Plain], false),
+        CredentialsKind::OAuth2 { .. } => (&[AuthMechanism::Xoauth2], true),
+    };
+    let mut rejected = Vec::new();
+    let mut selected = None;
+    for (mechanism, result) in bifrost_sasl::negotiate(
+        |m| allowed.contains(&m) && supports_mechanism(&offered, m.name()),
+        &bifrost_sasl::NegotiationPolicy {
+            allowed,
+            allow_insecure: policy.allow_cleartext_without_tls,
+            oauth,
+        },
+        tls_active,
+        None,
+    ) {
+        match result {
+            Ok(_) => {
+                selected = Some(mechanism);
+                break;
             }
-            (
-                AuthMechanism::Plain,
-                bifrost_sasl::plain_payload("", username, password.as_str())?,
-            )
+            Err(reason) => rejected.push(AuthMechanismRejection::new(
+                mechanism,
+                match reason {
+                    bifrost_sasl::NegotiationSkip::TlsRequired => {
+                        AuthMechanismRejectionReason::CleartextWithoutTls
+                    }
+                    _ => AuthMechanismRejectionReason::DisabledByPolicy,
+                },
+            )),
+        }
+    }
+    let mechanism =
+        selected.ok_or_else(|| Error::AuthPolicy(AuthPolicyFailure::new(offered, rejected)))?;
+    // Resolve tokens only after policy admission, as for IMAP and SMTP.
+    let payload = match credentials.kind() {
+        CredentialsKind::Password { username, password } => {
+            bifrost_sasl::plain_payload("", username, password.as_str())?
         }
         CredentialsKind::OAuth2 {
             identity,
             token_source,
         } => {
-            if !supports_mechanism(&offered, "XOAUTH2") {
-                return Err(Error::AuthPolicy(AuthPolicyFailure::new(
-                    offered,
-                    Vec::new(),
-                )));
-            }
-            // Read the current token from the shared source at auth time,
-            // mirroring the IMAP connect path, so a rotated token is
-            // presented on every ManageSieve (re)authentication.
-            let access_token = token_source.current().await.map_err(Error::OAuthToken)?;
-            (
-                AuthMechanism::XOAuth2,
-                bifrost_sasl::xoauth2_payload(identity, access_token.as_str()),
-            )
+            let token = token_source.current().await.map_err(Error::OAuthToken)?;
+            bifrost_sasl::xoauth2_payload(identity, token.as_str())
         }
     };
-    if !tls_active && !policy.allow_cleartext_without_tls {
-        return Err(Error::AuthPolicy(AuthPolicyFailure::new(
-            offered,
-            vec![AuthMechanismRejection::new(
-                mechanism,
-                AuthMechanismRejectionReason::CleartextWithoutTls,
-            )],
-        )));
-    }
     let command = authentication_command(mechanism, &payload);
     write_command(stream, timeout, command.as_bytes()).await?;
     match read_response(stream, timeout).await?.status {

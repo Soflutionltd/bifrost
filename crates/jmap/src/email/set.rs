@@ -29,7 +29,7 @@ impl EmailCreate {
     pub(crate) fn keywords<T, U>(&mut self, keywords: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
-        U: Into<String>,
+        U: Into<super::keyword::Keyword>,
     {
         self.keywords = Some(IdSet::collect(keywords.into_iter().map(Into::into)));
         self
@@ -216,13 +216,13 @@ impl EmailPatch {
     }
 
     /// Set/clear a single keyword via dotted-path patch.
-    pub(crate) fn keyword(&mut self, keyword: &str, set: bool) -> &mut Self {
+    pub(crate) fn keyword(&mut self, keyword: &super::keyword::Keyword, set: bool) -> &mut Self {
         self.keywords = None;
         self.remove_patch_property("keywords");
         IdSetPatch::member_entries(
             self.patch.get_or_insert_with(HashMap::new),
             "keywords",
-            keyword,
+            keyword.as_str(),
             set,
         );
         self
@@ -231,7 +231,7 @@ impl EmailPatch {
     pub(crate) fn keywords<T, U>(&mut self, keywords: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
-        U: Into<String>,
+        U: Into<super::keyword::Keyword>,
     {
         self.keywords = Some(IdSet::collect(keywords.into_iter().map(Into::into)));
         self.remove_patch_entries("keywords");
@@ -329,7 +329,10 @@ impl EmailPatch {
             self.mailbox_id(drafts, false);
         }
         self.mailbox_id(sent, true);
-        self.keyword(super::DRAFT_KEYWORD, false)
+        self.keyword(
+            &super::keyword::Keyword::parse(super::DRAFT_KEYWORD).expect("valid standard keyword"),
+            false,
+        )
     }
 }
 
@@ -523,7 +526,10 @@ mod tests {
     #[test]
     fn keyword_and_mailbox_patch_paths_escape_json_pointer_tokens() {
         let mut patch = EmailPatch::default();
-        patch.keyword("work/urgent", true);
+        patch.keyword(
+            &crate::email::keyword::Keyword::parse("work/urgent").unwrap(),
+            true,
+        );
         let json = serde_json::to_value(&patch).expect("serializable patch");
         assert_eq!(
             json.get("keywords/work~1urgent"),
@@ -531,7 +537,10 @@ mod tests {
         );
 
         let mut patch = EmailPatch::default();
-        patch.keyword("odd~flag", false);
+        patch.keyword(
+            &crate::email::keyword::Keyword::parse("odd~flag").unwrap(),
+            false,
+        );
         let json = serde_json::to_value(&patch).expect("serializable patch");
         assert_eq!(
             json.get("keywords/odd~0flag"),

@@ -54,12 +54,7 @@ impl ScramHash {
     /// The SASL mechanism name advertised on the wire, including the `-PLUS`
     /// suffix when the exchange binds to the channel.
     pub fn mechanism_name(self, binding: ChannelBinding) -> &'static str {
-        match (self, binding) {
-            (Self::Sha1, ChannelBinding::None) => "SCRAM-SHA-1",
-            (Self::Sha256, ChannelBinding::None) => "SCRAM-SHA-256",
-            (Self::Sha1, ChannelBinding::TlsServerEndPoint) => "SCRAM-SHA-1-PLUS",
-            (Self::Sha256, ChannelBinding::TlsServerEndPoint) => "SCRAM-SHA-256-PLUS",
-        }
+        crate::Mechanism::from_scram(self, binding).name()
     }
 }
 
@@ -105,39 +100,6 @@ impl ScramChannelBinding {
             Self::TlsServerEndPoint(_) => ChannelBinding::TlsServerEndPoint,
         }
     }
-}
-
-/// Select one advertised SCRAM rung and its GS2 input (RFC 5802 section 6).
-///
-/// Call in preference order; `plus` identifies the requested rung. An advertised
-/// PLUS suppresses its unbound counterpart even if local binding is unavailable.
-/// `binding_data` is present only when binding is usable on this connection.
-/// Certificate parsing errors must be propagated before calling this helper.
-pub fn select_scram_rung(
-    hash: ScramHash,
-    plus: bool,
-    advertised: impl Fn(&str) -> bool,
-    binding_data: Option<&[u8]>,
-) -> Option<(ScramHash, ScramChannelBinding)> {
-    let offers_plus = advertised(hash.mechanism_name(ChannelBinding::TlsServerEndPoint));
-    let binding = if plus {
-        if !offers_plus {
-            return None;
-        }
-        ScramChannelBinding::TlsServerEndPoint(binding_data?.to_vec())
-    } else {
-        if offers_plus || !advertised(hash.mechanism_name(ChannelBinding::None)) {
-            return None;
-        }
-        // RFC 5802 section 6: `n` would conceal a stripped PLUS advertisement.
-        // `y` lets a binding-capable server detect it; no binding bytes accompany y.
-        if binding_data.is_some() {
-            ScramChannelBinding::SupportedButNotAdvertised
-        } else {
-            ScramChannelBinding::None
-        }
-    };
-    Some((hash, binding))
 }
 
 /// base64-decode a SASL continuation payload to its UTF-8 text form.
@@ -457,14 +419,22 @@ mod tests {
                         || (offers_plus
                             && name == hash.mechanism_name(ChannelBinding::TlsServerEndPoint))
                 };
-                let (selected, binding) = select_scram_rung(
-                    hash,
-                    plus,
-                    advertised,
-                    available.then_some(b"data".as_slice()),
-                )
+                let mechanism = crate::Mechanism::from_name(hash.mechanism_name(if plus {
+                    ChannelBinding::TlsServerEndPoint
+                } else {
+                    ChannelBinding::None
+                }))
                 .unwrap();
-                assert_eq!(selected, hash);
+                let der = [
+                    0x30, 0x0f, 0x30, 0x00, 0x30, 0x0b, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7,
+                    0x0d, 0x01, 0x01, 0x0b,
+                ];
+                let data =
+                    crate::binding_from_peer_certificate(available.then_some(der.as_slice()))
+                        .unwrap();
+                let rung =
+                    crate::scram_rung(mechanism, &|m| advertised(m.name()), data.as_ref()).unwrap();
+                let binding = rung.binding;
                 assert_eq!(binding.gs2_header(), header);
                 let (message, _) = scram_client_final(
                     hash,
@@ -479,6 +449,17 @@ mod tests {
                     .decode(message.as_str())
                     .unwrap();
                 let decoded = String::from_utf8(decoded).unwrap();
+                let plus_input;
+                let c_input = if plus {
+                    plus_input = [
+                        b"p=tls-server-end-point,,".as_slice(),
+                        &crate::tls_server_end_point(&der).unwrap(),
+                    ]
+                    .concat();
+                    plus_input.as_slice()
+                } else {
+                    c_input
+                };
                 assert_eq!(
                     decoded.split(',').next().unwrap(),
                     format!(
@@ -487,16 +468,23 @@ mod tests {
                     )
                 );
             }
-            for available in [false, true] {
-                let advertised = |name: &str| name.starts_with("SCRAM-");
-                assert!(
-                    select_scram_rung(hash, false, advertised, available.then_some(&[][..]))
-                        .is_none()
-                );
-            }
-            assert!(select_scram_rung(hash, true, |_| true, None).is_none());
-            assert!(select_scram_rung(hash, true, |_| false, Some(&[])).is_none());
-            assert!(select_scram_rung(hash, false, |_| false, Some(&[])).is_none());
+            let mechanism =
+                crate::Mechanism::from_name(hash.mechanism_name(ChannelBinding::None)).unwrap();
+            assert!(matches!(
+                crate::scram_rung(mechanism, &|_| true, None),
+                Err(crate::ScramSkip::DowngradeForbidden)
+            ));
+            let mechanism =
+                crate::Mechanism::from_name(hash.mechanism_name(ChannelBinding::TlsServerEndPoint))
+                    .unwrap();
+            assert!(matches!(
+                crate::scram_rung(mechanism, &|_| true, None),
+                Err(crate::ScramSkip::PlusWithoutBinding)
+            ));
+            assert!(matches!(
+                crate::scram_rung(mechanism, &|_| false, None),
+                Err(crate::ScramSkip::NotAdvertised)
+            ));
         }
     }
 

@@ -1,5 +1,5 @@
 use crate::core::field::Field;
-use crate::core::set::from_timestamp;
+use jiff::Timestamp;
 
 use super::{VacationResponseCreate, VacationResponsePatch};
 
@@ -11,13 +11,13 @@ macro_rules! vacation_setters {
                 self
             }
 
-            pub(crate) fn from_date(&mut self, from_date: Option<i64>) -> &mut Self {
-                self.from_date = Field::from(from_date.map(from_timestamp));
+            pub(crate) fn from_date(&mut self, from_date: Option<Timestamp>) -> &mut Self {
+                self.from_date = Field::from(from_date);
                 self
             }
 
-            pub(crate) fn to_date(&mut self, to_date: Option<i64>) -> &mut Self {
-                self.to_date = Field::from(to_date.map(from_timestamp));
+            pub(crate) fn to_date(&mut self, to_date: Option<Timestamp>) -> &mut Self {
+                self.to_date = Field::from(to_date);
                 self
             }
 
@@ -47,17 +47,17 @@ impl VacationResponsePatch {
         self
     }
 
-    pub(crate) fn from_date(&mut self, from_date: Option<i64>) -> &mut Self {
+    pub(crate) fn from_date(&mut self, from_date: Option<Timestamp>) -> &mut Self {
         self.from_date = match from_date {
-            Some(from_date) => Field::Value(from_timestamp(from_date)),
+            Some(from_date) => Field::Value(from_date),
             None => Field::Null,
         };
         self
     }
 
-    pub(crate) fn to_date(&mut self, to_date: Option<i64>) -> &mut Self {
+    pub(crate) fn to_date(&mut self, to_date: Option<Timestamp>) -> &mut Self {
         self.to_date = match to_date {
-            Some(to_date) => Field::Value(from_timestamp(to_date)),
+            Some(to_date) => Field::Value(to_date),
             None => Field::Null,
         };
         self

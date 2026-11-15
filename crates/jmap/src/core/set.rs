@@ -1,4 +1,3 @@
-use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
@@ -501,11 +500,4 @@ impl Display for SetErrorType {
             SetErrorType::Other(code) => write!(f, "{code}"),
         }
     }
-}
-
-// Legacy integer-taking filters, vacation dates and push expiry still use
-// this conversion. New builders should accept Timestamp directly: silently
-// replacing an invalid date with the epoch changes the user's requested date.
-pub(crate) fn from_timestamp(timestamp: i64) -> Timestamp {
-    Timestamp::from_second(timestamp).unwrap_or(Timestamp::UNIX_EPOCH)
 }

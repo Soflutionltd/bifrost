@@ -3,7 +3,7 @@
 //! RFC 3501 Section 6.4.4 (`IMAP4rev1` SEARCH command) and
 //! RFC 9051 Section 6.4.4 (`IMAP4rev2` SEARCH command).
 //!
-//! The [`SearchCriteria`] builder produces valid IMAP SEARCH criteria strings
+//! The [`SearchCriteria`] builder retains structured IMAP SEARCH operands
 //! by construction. Individual criteria are AND-combined by chaining method
 //! calls, matching IMAP's implicit conjunction semantics (RFC 3501 Section
 //! 6.4.4: "When multiple keys are specified, the result is the intersection
@@ -20,13 +20,13 @@ use super::validated::{is_valid_sequence_set, validate_atom_bytes};
 #[path = "search_helpers.rs"]
 mod search_helpers;
 
+use search_helpers::{append_search_string, push_parenthesized_if_compound, validate_imap_date};
 #[cfg(test)]
 use search_helpers::{count_top_level_tokens, is_compound};
-use search_helpers::{push_parenthesized_if_compound, quote_imap_string, validate_imap_date};
 
 /// A builder for type-safe IMAP SEARCH criteria (RFC 3501 Section 6.4.4).
 ///
-/// Produces a valid IMAP SEARCH command string. Compound criteria are
+/// Retains typed operands until command encoding. Compound criteria are
 /// built by chaining method calls -- each call adds an AND condition,
 /// matching IMAP's implicit conjunction semantics (RFC 3501 Section 6.4.4).
 ///
@@ -36,8 +36,41 @@ use search_helpers::{push_parenthesized_if_compound, quote_imap_string, validate
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SearchCriteria {
-    /// The accumulated criteria string.
+    /// Explicit text view for diagnostics and callers requesting raw syntax.
     buf: String,
+    keys: Vec<SearchKey>,
+}
+
+/// A structured search operand. The builder validates dates, flags and sets;
+/// caller-provided extension grammar stays explicitly raw.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum SearchKey {
+    Keyword(&'static str),
+    Date {
+        key: &'static str,
+        value: String,
+    },
+    Number {
+        key: &'static str,
+        value: u64,
+    },
+    Flag {
+        excluded: bool,
+        value: String,
+    },
+    Uid(String),
+    Sequence(String),
+    String {
+        prefix: String,
+        value: String,
+    },
+    Not(Box<SearchCriteria>),
+    Or(Box<SearchCriteria>, Box<SearchCriteria>),
+    Group(SearchCriteria),
+    Raw {
+        text: String,
+        requires: Vec<super::Capability>,
+    },
 }
 
 impl SearchCriteria {
@@ -50,10 +83,14 @@ impl SearchCriteria {
     /// RFC 3501 Section 6.4.4 (SEARCH command)
     #[must_use]
     pub fn new() -> Self {
-        Self { buf: String::new() }
+        Self {
+            buf: String::new(),
+            keys: Vec::new(),
+        }
     }
 
-    /// Return the criteria as a string slice, suitable for passing to
+    /// Return an explicit raw syntax view. Pass the builder itself to preserve
+    /// typed operands when calling
     /// `ImapConnection::search`,
     /// `ImapConnection::uid_search`,
     /// `ImapConnection::sort`, and similar methods.
@@ -62,6 +99,111 @@ impl SearchCriteria {
     /// RFC 3501 Section 6.4.4 (SEARCH command)
     pub fn as_str(&self) -> &str {
         &self.buf
+    }
+
+    /// Preserve arbitrary extension grammar, including caller-written literals.
+    /// Declared requirements supplement the standard raw grammar scanner.
+    pub(crate) fn raw(text: String, requires: Vec<super::Capability>) -> Self {
+        Self {
+            buf: text.clone(),
+            keys: vec![SearchKey::Raw { text, requires }],
+        }
+    }
+
+    pub(crate) fn keys(&self) -> &[SearchKey] {
+        &self.keys
+    }
+
+    pub(crate) fn and(mut self, other: Self) -> Self {
+        if !other.buf.is_empty() {
+            self.sep();
+            self.buf.push_str(&other.buf);
+            self.keys.extend(other.keys);
+        }
+        self
+    }
+
+    /// Keep an explicit group when compiling account-level Boolean filters.
+    pub(crate) fn group(mut self, other: Self) -> Self {
+        self.sep();
+        self.buf.push('(');
+        self.buf.push_str(other.as_str());
+        self.buf.push(')');
+        self.keys.push(SearchKey::Group(other));
+        self
+    }
+
+    pub(crate) fn required_capabilities(&self) -> Vec<super::Capability> {
+        use super::Capability;
+        let mut result = Vec::new();
+        for key in &self.keys {
+            match key {
+                SearchKey::Number { key: "MODSEQ", .. } => result.push(Capability::Condstore),
+                SearchKey::Number { .. }
+                | SearchKey::Keyword(_)
+                | SearchKey::Date { .. }
+                | SearchKey::Flag { .. }
+                | SearchKey::Uid(_)
+                | SearchKey::Sequence(_)
+                | SearchKey::String { .. } => {}
+                SearchKey::Not(inner) => result.extend(inner.required_capabilities()),
+                SearchKey::Group(inner) => result.extend(inner.required_capabilities()),
+                SearchKey::Or(a, b) => {
+                    result.extend(a.required_capabilities());
+                    result.extend(b.required_capabilities());
+                }
+                SearchKey::Raw { text, requires } => {
+                    result.extend(requires.iter().cloned());
+                    for (atoms, capability) in [
+                        (&["MODSEQ"][..], Capability::Condstore),
+                        (&["OLDER", "YOUNGER"][..], Capability::Within),
+                        (
+                            &["SAVEDBEFORE", "SAVEDON", "SAVEDSINCE", "SAVEDATESUPPORTED"][..],
+                            Capability::SaveDate,
+                        ),
+                        (&["EMAILID", "THREADID"][..], Capability::ObjectId),
+                        (&["$"][..], Capability::SearchRes),
+                    ] {
+                        if atoms
+                            .iter()
+                            .any(|atom| crate::codec::search::contains_atom(text, atom))
+                        {
+                            result.push(capability);
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    pub(crate) fn validate_raw(
+        &self,
+        mode: crate::codec::encode::LiteralMode,
+    ) -> Result<(), crate::Error> {
+        for key in &self.keys {
+            match key {
+                SearchKey::Raw { text, .. } => crate::codec::encode::validate_search_criteria_crlf(
+                    text,
+                    "SEARCH criteria",
+                    mode,
+                )?,
+                SearchKey::Not(inner) => inner.validate_raw(mode)?,
+                SearchKey::Group(inner) => inner.validate_raw(mode)?,
+                SearchKey::Or(a, b) => {
+                    a.validate_raw(mode)?;
+                    b.validate_raw(mode)?;
+                }
+                SearchKey::Keyword(_)
+                | SearchKey::Date { .. }
+                | SearchKey::Number { .. }
+                | SearchKey::Flag { .. }
+                | SearchKey::Uid(_)
+                | SearchKey::Sequence(_)
+                | SearchKey::String { .. } => {}
+            }
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -76,9 +218,10 @@ impl SearchCriteria {
     }
 
     /// Append a bare keyword criterion (e.g. `UNSEEN`, `ALL`).
-    fn push_keyword(mut self, keyword: &str) -> Self {
+    fn push_keyword(mut self, keyword: &'static str) -> Self {
         self.sep();
         self.buf.push_str(keyword);
+        self.keys.push(SearchKey::Keyword(keyword));
         self
     }
 
@@ -89,38 +232,47 @@ impl SearchCriteria {
     /// The date is written as a bare token (not quoted) per the ABNF.
     ///
     /// Returns an error if the date string does not match the expected format.
-    fn push_date(mut self, key: &str, date: &str) -> Result<Self, crate::Error> {
+    fn push_date(mut self, key: &'static str, date: &str) -> Result<Self, crate::Error> {
         validate_imap_date(date)?;
         self.sep();
         self.buf.push_str(key);
         self.buf.push(' ');
         self.buf.push_str(date);
+        self.keys.push(SearchKey::Date {
+            key,
+            value: date.to_owned(),
+        });
         Ok(self)
     }
 
     /// Append a criterion with a string argument.
     ///
-    /// The string value is always DQUOTE-quoted per RFC 3501 Section 9
+    /// The string value is retained until command encoding per RFC 3501 Section 9
     /// (`astring = 1*ASTRING-CHAR / string`, `string = quoted / literal`).
     /// Backslash and double-quote within the value are escaped per
     /// RFC 3501 Section 9: `quoted-specials = DQUOTE / "\"`.
     ///
-    /// Returns an error if the value contains NUL, CR, or LF  -  bytes that
+    /// Returns an error if the value contains NUL  -  bytes that
     /// cannot appear in an IMAP quoted string (RFC 3501 Section 9).
     fn push_string(mut self, key: &str, value: &str) -> Result<Self, crate::Error> {
         self.sep();
         self.buf.push_str(key);
         self.buf.push(' ');
-        quote_imap_string(&mut self.buf, value)?;
+        append_search_string(&mut self.buf, value)?;
+        self.keys.push(SearchKey::String {
+            prefix: key.to_owned(),
+            value: value.to_owned(),
+        });
         Ok(self)
     }
 
     /// Append a criterion with a numeric argument.
-    fn push_number(mut self, key: &str, n: u64) -> Self {
+    fn push_number(mut self, key: &'static str, n: u64) -> Self {
         self.sep();
         self.buf.push_str(key);
         self.buf.push(' ');
         self.buf.push_str(&n.to_string());
+        self.keys.push(SearchKey::Number { key, value: n });
         self
     }
 
@@ -265,6 +417,10 @@ impl SearchCriteria {
         self.sep();
         self.buf.push_str("KEYWORD ");
         self.buf.push_str(flag);
+        self.keys.push(SearchKey::Flag {
+            excluded: false,
+            value: flag.to_owned(),
+        });
         Ok(self)
     }
 
@@ -281,6 +437,10 @@ impl SearchCriteria {
         self.sep();
         self.buf.push_str("UNKEYWORD ");
         self.buf.push_str(flag);
+        self.keys.push(SearchKey::Flag {
+            excluded: true,
+            value: flag.to_owned(),
+        });
         Ok(self)
     }
 
@@ -293,7 +453,7 @@ impl SearchCriteria {
     /// RFC 3501 Section 6.4.4 / RFC 9051 Section 6.4.4:
     /// `"BCC" SP astring`.
     ///
-    /// Returns an error if `s` contains NUL, CR, or LF (RFC 3501 Section 9).
+    /// Returns an error if `s` contains NUL (RFC 3501 Section 9).
     pub fn bcc(self, s: &str) -> Result<Self, crate::Error> {
         self.push_string("BCC", s)
     }
@@ -303,7 +463,7 @@ impl SearchCriteria {
     /// RFC 3501 Section 6.4.4 / RFC 9051 Section 6.4.4:
     /// `"CC" SP astring`.
     ///
-    /// Returns an error if `s` contains NUL, CR, or LF (RFC 3501 Section 9).
+    /// Returns an error if `s` contains NUL (RFC 3501 Section 9).
     pub fn cc(self, s: &str) -> Result<Self, crate::Error> {
         self.push_string("CC", s)
     }
@@ -313,7 +473,7 @@ impl SearchCriteria {
     /// RFC 3501 Section 6.4.4 / RFC 9051 Section 6.4.4:
     /// `"FROM" SP astring`.
     ///
-    /// Returns an error if `s` contains NUL, CR, or LF (RFC 3501 Section 9).
+    /// Returns an error if `s` contains NUL (RFC 3501 Section 9).
     pub fn from(self, s: &str) -> Result<Self, crate::Error> {
         self.push_string("FROM", s)
     }
@@ -323,7 +483,7 @@ impl SearchCriteria {
     /// RFC 3501 Section 6.4.4 / RFC 9051 Section 6.4.4:
     /// `"TO" SP astring`.
     ///
-    /// Returns an error if `s` contains NUL, CR, or LF (RFC 3501 Section 9).
+    /// Returns an error if `s` contains NUL (RFC 3501 Section 9).
     pub fn to(self, s: &str) -> Result<Self, crate::Error> {
         self.push_string("TO", s)
     }
@@ -333,7 +493,7 @@ impl SearchCriteria {
     /// RFC 3501 Section 6.4.4 / RFC 9051 Section 6.4.4:
     /// `"SUBJECT" SP astring`.
     ///
-    /// Returns an error if `s` contains NUL, CR, or LF (RFC 3501 Section 9).
+    /// Returns an error if `s` contains NUL (RFC 3501 Section 9).
     pub fn subject(self, s: &str) -> Result<Self, crate::Error> {
         self.push_string("SUBJECT", s)
     }
@@ -345,14 +505,18 @@ impl SearchCriteria {
     /// `"HEADER" SP header-fld-name SP astring`.
     ///
     /// Returns an error if `name` is not an IMAP atom or `value` contains
-    /// NUL, CR, or LF (RFC 3501 Section 9).
+    /// NUL (RFC 3501 Section 9).
     pub fn header(mut self, name: &str, value: &str) -> Result<Self, crate::Error> {
         validate_atom_bytes(name.as_bytes(), "HEADER field name")?;
         self.sep();
         self.buf.push_str("HEADER ");
         self.buf.push_str(name);
         self.buf.push(' ');
-        quote_imap_string(&mut self.buf, value)?;
+        append_search_string(&mut self.buf, value)?;
+        self.keys.push(SearchKey::String {
+            prefix: format!("HEADER {name}"),
+            value: value.to_owned(),
+        });
         Ok(self)
     }
 
@@ -361,7 +525,7 @@ impl SearchCriteria {
     /// RFC 3501 Section 6.4.4 / RFC 9051 Section 6.4.4:
     /// `"BODY" SP astring`.
     ///
-    /// Returns an error if `s` contains NUL, CR, or LF (RFC 3501 Section 9).
+    /// Returns an error if `s` contains NUL (RFC 3501 Section 9).
     pub fn body(self, s: &str) -> Result<Self, crate::Error> {
         self.push_string("BODY", s)
     }
@@ -371,7 +535,7 @@ impl SearchCriteria {
     /// RFC 3501 Section 6.4.4 / RFC 9051 Section 6.4.4:
     /// `"TEXT" SP astring`.
     ///
-    /// Returns an error if `s` contains NUL, CR, or LF (RFC 3501 Section 9).
+    /// Returns an error if `s` contains NUL (RFC 3501 Section 9).
     pub fn text(self, s: &str) -> Result<Self, crate::Error> {
         self.push_string("TEXT", s)
     }
@@ -504,6 +668,7 @@ impl SearchCriteria {
         self.sep();
         self.buf.push_str("UID ");
         self.buf.push_str(set);
+        self.keys.push(SearchKey::Uid(set.to_owned()));
         Ok(self)
     }
 
@@ -525,6 +690,7 @@ impl SearchCriteria {
         }
         self.sep();
         self.buf.push_str(set);
+        self.keys.push(SearchKey::Sequence(set.to_owned()));
         Ok(self)
     }
 
@@ -564,6 +730,7 @@ impl SearchCriteria {
         self.sep();
         self.buf.push_str("NOT ");
         push_parenthesized_if_compound(&mut self.buf, criteria.as_str());
+        self.keys.push(SearchKey::Not(Box::new(criteria.clone())));
         self
     }
 
@@ -579,6 +746,8 @@ impl SearchCriteria {
         push_parenthesized_if_compound(&mut self.buf, a.as_str());
         self.buf.push(' ');
         push_parenthesized_if_compound(&mut self.buf, b.as_str());
+        self.keys
+            .push(SearchKey::Or(Box::new(a.clone()), Box::new(b.clone())));
         self
     }
 }
@@ -610,3 +779,40 @@ impl AsRef<str> for SearchCriteria {
 #[cfg(test)]
 #[path = "search_tests.rs"]
 mod tests;
+
+impl From<String> for SearchCriteria {
+    fn from(text: String) -> Self {
+        Self::raw(text, Vec::new())
+    }
+}
+impl From<&str> for SearchCriteria {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+impl From<&String> for SearchCriteria {
+    fn from(text: &String) -> Self {
+        text.as_str().into()
+    }
+}
+impl From<&SearchCriteria> for SearchCriteria {
+    fn from(criteria: &SearchCriteria) -> Self {
+        criteria.clone()
+    }
+}
+impl std::ops::Deref for SearchCriteria {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.buf
+    }
+}
+impl PartialEq<str> for SearchCriteria {
+    fn eq(&self, other: &str) -> bool {
+        self.buf == other
+    }
+}
+impl PartialEq<&str> for SearchCriteria {
+    fn eq(&self, other: &&str) -> bool {
+        self.buf == *other
+    }
+}

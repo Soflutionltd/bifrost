@@ -3,6 +3,7 @@ mod client;
 pub(crate) mod contacts;
 mod ops;
 mod parse;
+pub(crate) mod streaming;
 mod xml_helpers;
 
 use bifrost_net::AccountNet;

@@ -744,16 +744,18 @@ pub(crate) async fn discover_shared_folders(
                     error = %err,
                     "LIST under shared namespace prefix failed; skipping prefix"
                 );
-                // The skip names ONE shared-namespace prefix, not the account:
-                // the prefix is not a mailbox and bifrost-types has no
-                // namespace scope, so it rides `ErrorScope::Account`. Other
-                // prefixes and the personal namespace keep syncing; no
-                // in-workspace reader treats an Account-scoped skip as the
-                // whole account skipped. The classified provider failure is
-                // retained.
+                // Enterprise users expect the failed share prefix to remain visible
+                // while personal mail and other shared prefixes keep syncing.
+                let scope = bifrost_types::ErrorScope::Namespace {
+                    prefix: descriptor.prefix.clone(),
+                };
                 skipped_scopes.push(SkippedScope {
-                    scope: bifrost_types::ErrorScope::Account,
-                    error: discover_err(err),
+                    scope: scope.clone(),
+                    error: super::account_error_with(
+                        err,
+                        super::error::ImapErrorContext::operation(AccountOperation::Discover)
+                            .with_scope(scope),
+                    ),
                 });
                 continue;
             }
@@ -1317,6 +1319,14 @@ mod tests {
             discovery.skipped_scopes[0].error.operation(),
             Some(AccountOperation::Discover)
         );
+        let skip = &discovery.skipped_scopes[0];
+        assert_eq!(
+            skip.scope,
+            bifrost_types::ErrorScope::Namespace {
+                prefix: "Shared/".into()
+            }
+        );
+        assert_eq!(skip.error.scope(), Some(&skip.scope));
         server.await.unwrap();
     }
 

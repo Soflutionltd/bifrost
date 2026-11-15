@@ -1496,6 +1496,10 @@ fn push_recurrence(
     recurrence: &EventRecurrence,
 ) -> Result<(), WriteError> {
     if let Some(rrule) = &recurrence.rrule {
+        recurrence.parsed_rule().map_err(|_| WriteError {
+            field: "recurrence rrule",
+            reason: "is not a valid recurrence rule",
+        })?;
         lines.push(format!("RRULE:{}", plain_value("recurrence rrule", rrule)?));
     }
     for rdate in &recurrence.rdate {
@@ -3795,5 +3799,21 @@ mod tests {
             split_event_id("https://h/cal/a.ics#2026#odd"),
             ("https://h/cal/a.ics", Some("2026#odd"))
         );
+    }
+    #[test]
+    fn recurrence_writer_uses_shared_validity() {
+        let recurrence = EventRecurrence {
+            rrule: Some("FREQ=DAILY;COUNT=0".into()),
+            ..Default::default()
+        };
+        let error = push_recurrence(&mut Vec::new(), &recurrence).unwrap_err();
+        assert_eq!(error.field, "recurrence rrule");
+        let recurrence = EventRecurrence {
+            rrule: Some("FREQ=DAILY;BYHOUR=9".into()),
+            ..Default::default()
+        };
+        let mut lines = Vec::new();
+        push_recurrence(&mut lines, &recurrence).unwrap();
+        assert_eq!(lines, ["RRULE:FREQ=DAILY;BYHOUR=9"]);
     }
 }

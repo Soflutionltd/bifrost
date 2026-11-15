@@ -64,7 +64,7 @@ pub(crate) enum PushNotification {
     /// token cannot silently bury a push object that will never be replayed.
     #[cfg(feature = "mail")]
     EmailPush {
-        account_id: String,
+        account_id: crate::core::id::AccountId,
         email: serde_json::Value,
     },
 }
@@ -72,13 +72,13 @@ pub(crate) enum PushNotification {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Changes {
     id: Option<String>,
-    changes: HashMap<String, HashMap<DataType, String>>,
+    changes: HashMap<crate::core::id::AccountId, HashMap<DataType, String>>,
 }
 
 impl Changes {
     pub(crate) fn new(
         id: Option<String>,
-        changes: HashMap<String, HashMap<DataType, String>>,
+        changes: HashMap<crate::core::id::AccountId, HashMap<DataType, String>>,
     ) -> Self {
         Self { id, changes }
     }
@@ -94,7 +94,7 @@ impl Changes {
         self.changes.remove(account_id)
     }
 
-    pub(crate) fn changed_accounts(&self) -> impl Iterator<Item = &String> {
+    pub(crate) fn changed_accounts(&self) -> impl Iterator<Item = &crate::core::id::AccountId> {
         self.changes.keys()
     }
 
@@ -111,7 +111,9 @@ impl Changes {
             .any(|changes| changes.contains_key(&type_))
     }
 
-    pub(crate) fn into_inner(self) -> HashMap<String, HashMap<DataType, String>> {
+    pub(crate) fn into_inner(
+        self,
+    ) -> HashMap<crate::core::id::AccountId, HashMap<DataType, String>> {
         self.changes
     }
 

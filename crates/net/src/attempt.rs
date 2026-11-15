@@ -81,30 +81,18 @@ impl AttemptLedger {
     // Read raw transport evidence, never the account-error diagnostic chain.
     pub(crate) fn record_error(&mut self, error: &Error, replayable: bool) {
         match error {
-            Error::AttemptHistory {
-                source,
-                attempts,
-                may_have_committed,
-            } => {
-                for attempt in attempts {
+            Error::AttemptHistory { source, evidence } => {
+                for attempt in evidence.attempts() {
                     self.record_error(attempt, replayable);
                 }
                 self.record_error(source, replayable);
-                if *may_have_committed {
-                    self.verdict = CommitEvidence::MayHaveCommitted;
-                }
+                self.retain_commit(evidence.verdict());
             }
-            Error::LocalHold {
-                attempts,
-                may_have_committed,
-                ..
-            } => {
-                for attempt in attempts {
+            Error::LocalHold { evidence, .. } => {
+                for attempt in evidence.attempts() {
                     self.record_error(attempt, replayable);
                 }
-                if *may_have_committed {
-                    self.verdict = CommitEvidence::MayHaveCommitted;
-                }
+                self.retain_commit(evidence.verdict());
             }
             Error::Network {
                 transmission_state, ..
@@ -143,9 +131,88 @@ impl AttemptLedger {
         }
     }
 
-    pub(crate) fn retain_possible_commit(&mut self, possible: bool) {
-        if possible {
-            self.verdict = CommitEvidence::MayHaveCommitted;
+    pub(crate) fn retain_commit(&mut self, commit: CommitEvidence) {
+        if commit == CommitEvidence::MayHaveCommitted
+            || (self.verdict == CommitEvidence::Unsent && commit == CommitEvidence::Acknowledged)
+        {
+            self.verdict = commit;
+        }
+    }
+}
+
+/// Owned diagnostic history coupled to the ledger that classifies it.
+/// Callers can inspect outcomes but cannot mutate evidence independently of
+/// its verdict. Nested historical envelopes are flattened at this boundary.
+#[derive(Debug, Default)]
+pub struct RequestEvidence {
+    attempts: Vec<Error>,
+    ledger: AttemptLedger,
+}
+
+impl RequestEvidence {
+    /// Admit diagnostics and a typed verdict, retaining the strongest evidence.
+    #[must_use]
+    pub fn new(attempts: Vec<Error>, commit: CommitEvidence) -> Self {
+        let mut evidence = Self::default();
+        for attempt in attempts {
+            evidence.push(attempt);
+        }
+        evidence.ledger.retain_commit(commit);
+        evidence
+    }
+
+    pub(crate) fn from_ledger(attempts: Vec<Error>, ledger: AttemptLedger) -> Self {
+        let mut evidence = Self::new(attempts, ledger.verdict());
+        evidence.ledger = ledger;
+        evidence
+    }
+
+    /// The ordered wire observations and their sticky verdict.
+    #[must_use]
+    pub fn ledger(&self) -> &AttemptLedger {
+        &self.ledger
+    }
+
+    fn push(&mut self, error: Error) {
+        match error {
+            Error::AttemptHistory { source, evidence } => {
+                self.ledger.retain_commit(evidence.verdict());
+                for attempt in evidence.attempts {
+                    self.push(attempt);
+                }
+                self.push(*source);
+            }
+            error => {
+                self.ledger.record_error(&error, true);
+                self.attempts.push(error);
+            }
+        }
+    }
+
+    /// Earlier diagnostic outcomes in wire order, without nested histories.
+    #[must_use]
+    pub fn attempts(&self) -> &[Error] {
+        &self.attempts
+    }
+
+    /// The ledger's authoritative logical-request verdict.
+    #[must_use]
+    pub fn verdict(&self) -> CommitEvidence {
+        self.ledger.verdict()
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<Error>, AttemptLedger) {
+        (self.attempts, self.ledger)
+    }
+
+    pub(crate) fn redact_request_text(self) -> Self {
+        Self {
+            attempts: self
+                .attempts
+                .into_iter()
+                .map(Error::redact_request_text)
+                .collect(),
+            ledger: self.ledger,
         }
     }
 }
@@ -153,6 +220,42 @@ impl AttemptLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_evidence_flattens_history_without_weakening_its_verdict() {
+        let inner = RequestEvidence::new(
+            vec![Error::Status {
+                code: StatusCode::SERVICE_UNAVAILABLE,
+                headers: Default::default(),
+                body: Default::default(),
+            }],
+            CommitEvidence::MayHaveCommitted,
+        );
+        let evidence = RequestEvidence::new(
+            vec![Error::AttemptHistory {
+                source: Box::new(Error::Timeout {
+                    transmission_state: TransmissionState::Unsent,
+                }),
+                evidence: inner,
+            }],
+            CommitEvidence::Unsent,
+        );
+        assert_eq!(evidence.verdict(), CommitEvidence::MayHaveCommitted);
+        assert!(matches!(
+            evidence.attempts(),
+            [Error::Status { .. }, Error::Timeout { .. }]
+        ));
+        assert_eq!(evidence.ledger().outcomes().len(), 2);
+    }
+
+    #[test]
+    fn public_evidence_retains_acknowledgement_without_diagnostic_attempts() {
+        let evidence = RequestEvidence::new(Vec::new(), CommitEvidence::Acknowledged);
+        assert_eq!(
+            evidence.ledger().transmission_state(),
+            TransmissionState::Acknowledged
+        );
+    }
 
     #[test]
     fn refusal_and_replay_policy_decide_commit_evidence() {

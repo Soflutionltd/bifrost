@@ -158,7 +158,7 @@ Moves have no field and are never reasserted.
 - Gmail: `Account`;
 - JMAP: commonly `Type(ObjectType)` or `Query(QueryId)`;
 - IMAP: `Folder(FolderId)`;
-- Graph: `FolderType { folder, ty }`.
+- Graph and DAV collections: `FolderType { folder, ty }`.
 
 `MembershipScope` answers where an object belongs:
 `Folder`, `Mailbox`, `Label`, or `Query`. The two enums must not be
@@ -499,8 +499,13 @@ backpressure; callers that do not need preconditions can retain bulk batching
 through the existing methods. Each pulled target gets its own outcome, local
 refusals do not poison siblings, and a terminal error stops further admission.
 
-`MutationConcurrency::ExpectedVersion` names `mail_set_flags`, `mail_move` and
-`mail_destroy` separately from contact and event update/delete and event RSVP. A true door may
+`MutationConcurrency::ExpectedVersion(VersionedDoors)` names `MAIL_SET_FLAGS`,
+`MAIL_MOVE` and `MAIL_DESTROY` separately from contact and event update/delete
+and event RSVP. `VersionedDoors` is a private-bit set built from named constants
+with `union`, queried with `contains` and `is_empty`. `VersionedDoors::NONE` is
+the sole no-door value; there is no separate concurrency `None` variant.
+`StateBased` remains pending the owner decision on legacy provider-observed
+guards and does not advertise caller-version doors. An advertised door may
 still refuse a compound form that cannot preserve one native atomic guard.
 Unsupported version kinds are refused; a stale supported version is a
 `ConcurrencyConflict`. No supplied version is refreshed and retried silently.
@@ -612,3 +617,49 @@ original token bytes. `ServerVersion::ETag`, `ContactCard.etag` and
 `CalendarEvent.etag` carry this type. HTTP caller-token validation lives on the
 shared type; a token without a weak marker still needs syntax validation before
 it is accepted as an HTTP precondition. `StrongTag` has a private field.
+
+## Durable evidence and tag ownership
+
+`AccountError::diagnostics` borrows the complete `DiagnosticInfo`, including
+support-only text. Callers must apply consent policy before exporting it. The
+sync ledger clones this into its historical `ErrorDigest`, without reconstructing
+causes or recovery advice on load.
+
+`AccountOperation::ledger_tag`, `ObjectType::cursor_tag` and
+`ProtocolKind::cursor_tag` own the stable encoding tags used by the sync ledger
+and cursor envelopes. Their matches are exhaustive inside this crate. Preserve
+existing tags and append new ones; coordinate new tags with sync's versioned
+decoders and readable window. New enum variants must therefore make an explicit
+storage choice at compile time rather than panicking when a store encodes one.
+
+`ConvenienceShape::replied` and `forwarded` use `RepliedFlagShape` and
+`ForwardedFlagShape`, each selecting `Keyword`, `ExtendedProperty` or `None`.
+Their defaults match on that single choice, so contradictory dispatch hints
+cannot be constructed. `starred` retains `StarredFlagShape` with keyword,
+label membership, category and unsupported choices; `set_starred` reads it.
+
+DAV collection cursors use `FolderType` with Contact or CalendarEvent.
+Composition routes those scopes by object type without rewriting cursor state.
+`ErrorScope::Namespace { prefix }` names an unavailable IMAP namespace prefix;
+it carries no object resource identity.
+
+## Recurrence syntax and observations
+
+`calendar::recurrence` owns `RecurrenceRule`, `RecurrenceUntil`,
+`RecurrenceDay` and `RecurrenceRuleError`, also exported at the crate root.
+The private parsed rule validates RFC 5545 parts, numeric bounds, duplicates,
+COUNT/UNTIL exclusion and frequency-dependent BY constraints. UNTIL retains
+DATE, floating DATE-TIME and UTC DATE-TIME separately; BYDAY carries a weekday
+and optional ordinal. RFC 7529 scale/skip and leap-month syntax and opaque
+X- parts are retained, leaving scale support to providers. The parser preserves
+original text and part order. DTSTART-dependent constraints, such as matching
+UNTIL's value shape and timezone to the event start, remain at the event adapter.
+
+`EventRecurrence::rrule` deliberately retains observed text, including malformed
+server text. Replacing the observation with an infallibly valid value would
+make a malformed rule erase a meeting or block an unrelated scalar edit.
+`parsed_rule()` is the interpretation boundary. Graph and JMAP project the
+shared parsed rule into their supported provider vocabulary; CalDAV validates
+it before writing RECUR text. Malformed caller rules are request faults;
+valid rules a provider cannot express remain Unsupported. This does not change
+`EventRange::admits`, which retains recurring masters without expanding them.

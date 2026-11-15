@@ -635,10 +635,13 @@ fn a_plain_list_response_is_not_a_notify_event() {
 #[test]
 fn selection_mismatch_detects_missing_subscribed() {
     let plain = mailbox_info(Vec::new());
-    assert!(is_notify_selection_mismatch(&plain, &["SUBSCRIBED"]));
+    assert!(is_notify_selection_mismatch(&plain, &["SUBSCRIBED".into()]));
 
     let subscribed = mailbox_info(vec![MailboxAttribute::Subscribed]);
-    assert!(!is_notify_selection_mismatch(&subscribed, &["SUBSCRIBED"]));
+    assert!(!is_notify_selection_mismatch(
+        &subscribed,
+        &["SUBSCRIBED".into()]
+    ));
 }
 
 #[test]
@@ -649,10 +652,10 @@ fn selection_mismatch_accepts_childinfo_under_recursivematch() {
     info.child_info = vec!["SUBSCRIBED".to_owned()];
     assert!(!is_notify_selection_mismatch(
         &info,
-        &["SUBSCRIBED", "RECURSIVEMATCH"]
+        &["SUBSCRIBED".into(), "RECURSIVEMATCH".into()]
     ));
     assert!(
-        is_notify_selection_mismatch(&info, &["SUBSCRIBED"]),
+        is_notify_selection_mismatch(&info, &["SUBSCRIBED".into()]),
         "CHILDINFO only excuses the missing attribute under RECURSIVEMATCH"
     );
 }
@@ -660,14 +663,20 @@ fn selection_mismatch_accepts_childinfo_under_recursivematch() {
 #[test]
 fn selection_mismatch_checks_remote_and_special_use() {
     let plain = mailbox_info(Vec::new());
-    assert!(is_notify_selection_mismatch(&plain, &["REMOTE"]));
-    assert!(is_notify_selection_mismatch(&plain, &["SPECIAL-USE"]));
+    assert!(is_notify_selection_mismatch(&plain, &["REMOTE".into()]));
+    assert!(is_notify_selection_mismatch(
+        &plain,
+        &["SPECIAL-USE".into()]
+    ));
 
     let remote = mailbox_info(vec![MailboxAttribute::Remote]);
-    assert!(!is_notify_selection_mismatch(&remote, &["remote"]));
+    assert!(!is_notify_selection_mismatch(&remote, &["remote".into()]));
 
     let archive = mailbox_info(vec![MailboxAttribute::Archive]);
-    assert!(!is_notify_selection_mismatch(&archive, &["SPECIAL-USE"]));
+    assert!(!is_notify_selection_mismatch(
+        &archive,
+        &["SPECIAL-USE".into()]
+    ));
 }
 
 #[test]
@@ -960,7 +969,7 @@ async fn a_scram_binding_lookup_behind_a_stalled_command_honours_the_auth_deadli
         Duration::from_secs(60),
         conn.authenticate_best(
             &crate::types::Credentials::password("user", "pass"),
-            &crate::types::AuthPolicy::default(),
+            &crate::types::AuthPolicy::default().allow_cleartext_without_tls(),
             Duration::from_secs(1),
         ),
     )
@@ -997,7 +1006,7 @@ async fn a_scram_server_final_error_cancels_and_leaves_the_connection_reusable()
     )
     .unwrap();
     let command = Command::Authenticate {
-        mechanism: "SCRAM-SHA-256".to_owned(),
+        mechanism: "SCRAM-SHA-256".into(),
         initial_response: None,
     };
 

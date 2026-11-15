@@ -110,7 +110,7 @@ async fn directory_discovery_admits_only_gateways_and_excludes_them_from_persona
             panic!("scope batch");
         };
         assert_eq!(batch.items.len(), listed.len());
-        assert!(batch.items.iter().all(|scope| matches!(scope, CursorScope::Folder(id) if !account.client.is_directory_url(&id.0))));
+        assert!(batch.items.iter().all(|scope| matches!(scope, CursorScope::FolderType { folder, ty: bifrost_types::ObjectType::Contact } if !account.client.is_directory_url(&folder.0))));
 
         let requests = transcripts(&script);
         assert!(requests[1].body.contains("<C:directory-gateway/>"));

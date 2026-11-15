@@ -1,7 +1,7 @@
 use bifrost_types::{
     AccountCapabilities, BatchingPolicy, BlobRangeSupport, ConvenienceShape, CursorFreshness,
     FilterRuleShape, MutationCapabilities, MutationConcurrency, MutationReplaySafety,
-    PimMethodSupport, PushCapability, QuotaSignal, RateLimitClass,
+    PimMethodSupport, PushCapability, QuotaSignal, RateLimitClass, VersionedDoors,
 };
 
 pub(crate) fn carddav_capabilities() -> AccountCapabilities {
@@ -11,16 +11,9 @@ pub(crate) fn carddav_capabilities() -> AccountCapabilities {
         blob_digest_pre_download: false,
         push: PushCapability::None,
         mutation: MutationCapabilities {
-            concurrency: MutationConcurrency::ExpectedVersion {
-                mail_set_flags: false,
-                mail_move: false,
-                mail_destroy: false,
-                contact_update: true,
-                event_update: false,
-                contact_delete: true,
-                event_delete: false,
-                event_rsvp: false,
-            },
+            concurrency: MutationConcurrency::ExpectedVersion(
+                VersionedDoors::CONTACT_UPDATE.union(VersionedDoors::CONTACT_DELETE),
+            ),
             replay_safety: MutationReplaySafety::None,
             reassertion: bifrost_types::MutationReassertion::NONE,
         },
@@ -75,16 +68,9 @@ mod tests {
         assert!(!caps.push_in_process());
         assert_eq!(
             caps.mutation.concurrency,
-            MutationConcurrency::ExpectedVersion {
-                mail_set_flags: false,
-                mail_move: false,
-                mail_destroy: false,
-                contact_update: true,
-                event_update: false,
-                contact_delete: true,
-                event_delete: false,
-                event_rsvp: false,
-            }
+            MutationConcurrency::ExpectedVersion(
+                VersionedDoors::CONTACT_UPDATE.union(VersionedDoors::CONTACT_DELETE),
+            )
         );
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
         assert_eq!(

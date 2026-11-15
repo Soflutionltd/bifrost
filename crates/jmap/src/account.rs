@@ -146,6 +146,6 @@ impl<Tr: HttpTransport> Client<Tr> {
             .map(|(_, id)| id.clone())
             .ok_or(crate::Error::NoPrimaryAccount { capability: C::URI })?;
 
-        Ok(Account::new(self.clone(), AccountId::new(&account_id)))
+        Ok(Account::new(self.clone(), account_id))
     }
 }

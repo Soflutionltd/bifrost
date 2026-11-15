@@ -14,6 +14,8 @@
 // pub: sync-engine conformance and consumers register Graph accounts through this module.
 pub mod account;
 mod api;
+mod autodiscover;
+mod calendar;
 mod client;
 mod error;
 mod etag;

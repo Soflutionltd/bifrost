@@ -10,8 +10,7 @@ use super::{
     CommandWriter, QresyncParams, encode_changedsince_modifier,
     search_criteria_starts_with_charset, validate_and_filter_flags, validate_append_datetime,
     validate_atom, validate_login_credential_ascii, validate_mod_sequence_valzer, validate_no_crlf,
-    validate_sasl_initial_response, validate_search_criteria_crlf, validate_sort_thread_charset,
-    write_criteria,
+    validate_sasl_initial_response, validate_sort_thread_charset, write_search,
 };
 use crate::types::validated::MailboxName;
 
@@ -107,19 +106,17 @@ pub(super) fn encode_status(
     w: &mut CommandWriter,
     tag: &str,
     mailbox: impl AsRef<[u8]>,
-    items: &str,
+    items: &crate::types::command_options::StatusItems,
     utf8: bool,
 ) -> Result<(), crate::Error> {
-    // Reject CRLF in status items to prevent command injection (RFC 3501 Section 2.2).
-    validate_no_crlf(items, "STATUS items")?;
-    let status_items = normalize_status_items(items, "STATUS items")?;
+    let status_items = items.body("STATUS items")?;
     w.raw(tag.as_bytes());
     w.raw(b" STATUS ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
     w.string(mailbox.as_ref(), utf8);
-    w.raw(b" ");
+    w.raw(b" (");
     w.raw(status_items.as_bytes());
-    w.raw(b"\r\n");
+    w.raw(b")\r\n");
     Ok(())
 }
 
@@ -134,11 +131,11 @@ pub(super) fn encode_search(
     w: &mut CommandWriter,
     tag: &str,
     cmd: &str,
-    criteria: &str,
-    return_opts: Option<&[String]>,
+    criteria: &crate::types::SearchCriteria,
+    return_opts: Option<&[crate::types::command_options::SearchReturn]>,
     utf8: bool,
 ) -> Result<(), crate::Error> {
-    validate_search_criteria_crlf(criteria, "SEARCH criteria", super::LiteralMode::LiteralPlus)?;
+    criteria.validate_raw(super::LiteralMode::LiteralPlus)?;
     validate_non_empty_search_criteria(criteria, cmd)?;
     // RFC 6855 Section 3: after ENABLE UTF8=ACCEPT, clients MUST NOT issue a
     // SEARCH command that contains a charset specification.
@@ -177,7 +174,7 @@ pub(super) fn encode_search(
         w.raw(b")");
     }
     w.raw(b" ");
-    write_criteria(w, criteria);
+    write_search(w, criteria, utf8);
     w.raw(b"\r\n");
     Ok(())
 }
@@ -191,9 +188,11 @@ pub(super) fn encode_fetch(
     w: &mut CommandWriter,
     tag: &str,
     sequence_set: &str,
-    items: &str,
+    items: &crate::types::fetch::FetchItems,
     changed_since: Option<u64>,
 ) -> Result<(), crate::Error> {
+    let wire = items.wire();
+    let items = wire.as_ref();
     // Reject CRLF in raw parameters to prevent command injection (RFC 3501 Section 2.2).
     validate_no_crlf(sequence_set, "FETCH sequence set")?;
     validate_no_crlf(items, "FETCH items")?;
@@ -299,83 +298,9 @@ pub(super) fn encode_two_quoted_args(
     w.raw(b"\r\n");
 }
 
-/// Normalize STATUS data items to the on-wire `(<items>)` form.
-///
-/// RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11 require the STATUS
-/// command to carry a parenthesized `status-att-list`. For ergonomics, the
-/// encoder accepts either a raw item list (`"MESSAGES UNSEEN"`) or an already
-/// parenthesized list (`"(MESSAGES UNSEEN)"`) and canonicalizes both forms to
-/// the required wire syntax.
-fn normalize_status_items(items: &str, context: &str) -> Result<String, crate::Error> {
-    let body = normalize_status_items_body(items, context)?;
-    Ok(format!("({body})"))
-}
-
-/// Normalize the body of a STATUS data item list.
-///
-/// Accepts either a raw space-separated item list or a parenthesized
-/// `status-att-list` and returns only the inner items. The list must contain
-/// at least one atom (RFC 3501 Section 6.3.10 / RFC 5819 Section 2).
+/// Validate the raw STATUS extension boundary through the request owner.
 fn normalize_status_items_body(items: &str, context: &str) -> Result<String, crate::Error> {
-    let trimmed = items.trim();
-    if trimmed.is_empty() {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "{context} must contain at least one status data item \
-             (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-            )
-            .into(),
-        ));
-    }
-
-    let body = match (trimmed.strip_prefix('('), trimmed.strip_suffix(')')) {
-        (Some(without_open), Some(_)) => {
-            let inner = without_open
-                .strip_suffix(')')
-                .ok_or_else(|| {
-                    crate::Error::InvalidInput(
-                        format!(
-                            "{context} must be a single parenthesized status-att-list \
-                         (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                        )
-                        .into(),
-                    )
-                })?
-                .trim();
-            if inner.is_empty() {
-                return Err(crate::Error::InvalidInput(
-                    format!(
-                        "{context} must contain at least one status data item \
-                     (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                    )
-                    .into(),
-                ));
-            }
-            inner
-        }
-        (Some(_), None) | (None, Some(_)) => {
-            return Err(crate::Error::InvalidInput(
-                format!(
-                    "{context} must use balanced parentheses for status-att-list \
-                 syntax (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-                )
-                .into(),
-            ));
-        }
-        (None, None) => trimmed,
-    };
-
-    if body.contains('(') || body.contains(')') {
-        return Err(crate::Error::InvalidInput(
-            format!(
-                "{context} must be a flat status-att-list without nested parentheses \
-             (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
-            )
-            .into(),
-        ));
-    }
-
-    Ok(body.to_owned())
+    crate::types::command_options::StatusItems::from(items).body(context)
 }
 
 /// Validate that a SEARCH-family command has at least one search criterion.
@@ -694,10 +619,12 @@ pub(super) fn encode_uid_fetch(
     w: &mut CommandWriter,
     tag: &str,
     sequence_set: &str,
-    items: &str,
+    items: &crate::types::fetch::FetchItems,
     changed_since: Option<u64>,
     vanished: bool,
 ) -> Result<(), crate::Error> {
+    let wire = items.wire();
+    let items = wire.as_ref();
     // RFC 7162 Section 3.2.6: VANISHED requires CHANGEDSINCE in the same
     // fetch modifier list.
     if vanished && changed_since.is_none() {

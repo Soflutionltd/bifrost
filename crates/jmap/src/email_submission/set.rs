@@ -194,12 +194,22 @@ mod repeated_patch_tests {
     #[test]
     fn repeated_submission_references_accumulate_email_patches() {
         let mut args = SetArguments::default();
-        args.on_success_update_email("c0").keyword("$draft", false);
-        args.on_success_update_email("c0").keyword("$seen", true);
-        args.on_success_update_email_id("sub-1")
-            .keyword("$draft", false);
-        args.on_success_update_email_id("sub-1")
-            .keyword("$seen", true);
+        args.on_success_update_email("c0").keyword(
+            &crate::email::keyword::Keyword::parse("$draft").unwrap(),
+            false,
+        );
+        args.on_success_update_email("c0").keyword(
+            &crate::email::keyword::Keyword::parse("$seen").unwrap(),
+            true,
+        );
+        args.on_success_update_email_id("sub-1").keyword(
+            &crate::email::keyword::Keyword::parse("$draft").unwrap(),
+            false,
+        );
+        args.on_success_update_email_id("sub-1").keyword(
+            &crate::email::keyword::Keyword::parse("$seen").unwrap(),
+            true,
+        );
         assert_eq!(
             serde_json::to_value(args).unwrap(),
             json!({"onSuccessUpdateEmail": {

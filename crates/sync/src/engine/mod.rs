@@ -386,6 +386,8 @@ impl SyncEngine {
 
     /// Everything this account still owes: obligations no walk has resolved and
     /// regions its cursor cannot cross.
+    /// Error evidence is retained as `crate::cursor::ErrorDigest`: classification,
+    /// scope, operation, provider, protocol and diagnostics, without live recovery advice.
     ///
     /// The enumeration surface. `get_backfill` cannot serve it - that returns
     /// one selected row, so it could never list what a scope owes across all
@@ -1050,7 +1052,6 @@ impl SyncEngine {
             factory: &slot.factory,
             current: &slot.current,
             cursors: &slot.cursors,
-            changes_tx: &slot.multiplexer.changes_tx,
             account_id,
             control: &slot.control,
             account_control_tx: &slot.account_control_tx,

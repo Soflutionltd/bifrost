@@ -653,7 +653,7 @@ fn count_tokens_escaped_quote_in_string() {
 }
 
 // ---------------------------------------------------------------------------
-// IMAP-001: quote_imap_string must reject NUL/CR/LF (RFC 3501 Section 9)
+// SEARCH strings reject NUL and retain controls for literal encoding.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -669,33 +669,20 @@ fn quote_imap_string_rejects_nul() {
 }
 
 #[test]
-fn quote_imap_string_rejects_cr() {
-    // CR (\r) is not a TEXT-CHAR per RFC 3501 Section 9:
-    // TEXT-CHAR = <any CHAR except CR and LF>
-    // QUOTED-CHAR = TEXT-CHAR / quoted-specials
-    // A quoted string cannot contain bare CR.
-    let result = SearchCriteria::new().from("hello\rworld");
-    assert!(
-        result.is_err(),
-        "CR byte must be rejected in quoted strings"
-    );
+fn search_string_retains_cr_for_literal_encoding() {
+    let criteria = SearchCriteria::new().from("hello\rworld").unwrap();
+    assert_eq!(criteria.as_str(), "FROM {11}\r\nhello\rworld");
 }
 
 #[test]
-fn quote_imap_string_rejects_lf() {
-    // LF (\n) is not a TEXT-CHAR per RFC 3501 Section 9:
-    // TEXT-CHAR = <any CHAR except CR and LF>
-    // A quoted string cannot contain bare LF.
-    let result = SearchCriteria::new().from("hello\nworld");
-    assert!(
-        result.is_err(),
-        "LF byte must be rejected in quoted strings"
-    );
+fn search_string_retains_lf_for_literal_encoding() {
+    let criteria = SearchCriteria::new().from("hello\nworld").unwrap();
+    assert_eq!(criteria.as_str(), "FROM {11}\r\nhello\nworld");
 }
 
 #[test]
 fn quote_imap_string_rejects_nul_in_header_value() {
-    // The header() method also uses quote_imap_string for the value argument.
+    // The header() method also validates its search string for the value argument.
     let result = SearchCriteria::new().header("X-Test", "val\0ue");
     assert!(result.is_err(), "NUL in header value must be rejected");
 }

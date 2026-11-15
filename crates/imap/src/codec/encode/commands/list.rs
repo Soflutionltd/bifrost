@@ -14,12 +14,10 @@ pub(in crate::codec::encode) fn encode_list_status(
     tag: &str,
     reference: &crate::types::MailboxArgument,
     pattern: &crate::types::MailboxArgument,
-    status_items: &str,
+    status_items: &crate::types::command_options::StatusItems,
     utf8: bool,
 ) -> Result<(), crate::Error> {
-    // Reject CRLF in status items to prevent command injection (RFC 3501 Section 2.2).
-    validate_no_crlf(status_items, "LIST-STATUS status items")?;
-    let status_items = normalize_status_items_body(status_items, "LIST-STATUS status items")?;
+    let status_items = status_items.body("LIST-STATUS status items")?;
     // RFC 3501 Section 5.1.3 / RFC 9051 Section 5.1: encode reference and
     // pattern with INBOX normalization and MUTF-7 when not in UTF-8 mode.
     let wire_ref = encode_mailbox_argument(reference, utf8)?;
@@ -49,10 +47,10 @@ pub(in crate::codec::encode) fn encode_list_status(
 pub(in crate::codec::encode) fn encode_list_extended(
     w: &mut CommandWriter,
     tag: &str,
-    selection_options: &[String],
+    selection_options: &[crate::types::command_options::ListSelect],
     reference: &crate::types::MailboxArgument,
     patterns: &[crate::types::MailboxArgument],
-    return_options: &[String],
+    return_options: &[crate::types::command_options::ListReturn],
     utf8: bool,
 ) -> Result<(), crate::Error> {
     if patterns.is_empty() {
@@ -129,18 +127,24 @@ pub(in crate::codec::encode) fn encode_list_extended(
 /// Section 4 / RFC 9051 Section 7 reserve the exact `STATUS SP "("
 /// status-att *(SP status-att) ")"` return-option form.
 fn validate_list_extended_option_syntax(
-    selection_options: &[String],
-    return_options: &[String],
+    selection_options: &[crate::types::command_options::ListSelect],
+    return_options: &[crate::types::command_options::ListReturn],
 ) -> Result<(), crate::Error> {
-    let has_recursivematch = selection_options
-        .iter()
-        .any(|option| option.trim().eq_ignore_ascii_case("RECURSIVEMATCH"));
+    let has_recursivematch = selection_options.iter().any(|option| {
+        matches!(
+            option,
+            crate::types::command_options::ListSelect::RecursiveMatch
+        )
+    });
     if has_recursivematch
         && !selection_options.iter().any(|option| {
             let trimmed = option.trim();
             !trimmed.is_empty()
-                && !trimmed.eq_ignore_ascii_case("RECURSIVEMATCH")
-                && !trimmed.eq_ignore_ascii_case("REMOTE")
+                && !matches!(
+                    option,
+                    crate::types::command_options::ListSelect::RecursiveMatch
+                        | crate::types::command_options::ListSelect::Remote
+                )
         })
     {
         return Err(crate::Error::InvalidInput(
@@ -192,37 +196,7 @@ fn validate_list_extended_option_syntax(
 /// `option` must already be trimmed. This is the single implementation: the
 /// connection layer's pre-encode capability check calls it too, so the two
 /// paths cannot disagree about what counts as LIST-STATUS.
-pub(crate) fn list_status_return_option_items(option: &str) -> Option<Result<&str, crate::Error>> {
-    if !option
-        .get(..6)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("STATUS"))
-    {
-        return None;
-    }
-
-    match option.as_bytes().get(6).copied() {
-        Some(next) if next != b' ' && !next.is_ascii_whitespace() && next != b'(' => return None,
-        _ => {}
-    }
-
-    Some(if let Some(suffix) = option[6..].strip_prefix(" (") {
-        if let Some(items) = suffix.strip_suffix(')') {
-            Ok(items)
-        } else {
-            Err(crate::Error::InvalidInput(
-                "LIST-EXTENDED STATUS return option must be STATUS (<items>) \
-                 per RFC 5819 Section 4 / RFC 9051 Section 7"
-                    .into(),
-            ))
-        }
-    } else {
-        Err(crate::Error::InvalidInput(
-            "LIST-EXTENDED STATUS return option must be STATUS (<items>) \
-             per RFC 5819 Section 4 / RFC 9051 Section 7"
-                .into(),
-        ))
-    })
-}
+pub(crate) use crate::types::command_options::list_status_return_option_items;
 
 /// Encode CREATE with USE special-use attributes (RFC 6154 Section 3).
 ///

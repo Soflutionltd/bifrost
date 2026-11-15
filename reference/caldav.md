@@ -885,7 +885,7 @@ Supported calendar primitives:
   page that spends no multiget at all.
 
 Cursor support is calendar-event only. `discover_cursor_scopes` returns one
-`CursorScope::Folder(FolderId(collection_href))` per discovered calendar, and
+`CursorScope::FolderType { folder: FolderId(collection_href), ty: ObjectType::CalendarEvent }` per discovered calendar, and
 NOTHING when the calendar home holds no collections - the collection walk
 already returns the home itself when the home is a calendar, so an empty walk
 is an empty backend and fabricating a home scope would point every cursor and
@@ -1581,3 +1581,20 @@ to rebuild without blaming the provider or silently missing mail.
 Payload versions use `PayloadVersion`; change and backfill outer versions use
 `TraitEnvelopeVersion`. These are separate types with explicit numeric access
 for storage; existing wire values are unchanged.
+
+DAV discovery qualifies collection scopes with `ObjectType::CalendarEvent` using
+`CursorScope::FolderType`. The type separates collections from IMAP mailboxes
+and the other DAV dialect even when their strings match. Legacy bare folder
+and type scopes remain accepted; collection-qualified cursors validate the
+payload URL and report full coverage just like legacy folder cursors.
+
+## Recurrence syntax ownership
+
+The RECUR writer validates `EventRecurrence::parsed_rule()` using the shared
+RFC 5545 grammar before emitting RRULE, reporting malformed text as a write
+request fault. Valid rules beyond Graph or JMAP's supported vocabulary still
+write unchanged through CalDAV. Read projection preserves the server's raw
+RRULE text so malformed provider data need not erase a user's meeting.
+There is no separate UNTIL range parser: `EventRange::admits` retains recurring
+masters, including rules bounded by UNTIL, because occurrence starts do not
+bound their ends and RDATE can extend a series.

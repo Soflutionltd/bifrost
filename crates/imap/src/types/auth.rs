@@ -117,51 +117,8 @@ impl fmt::Debug for Credentials {
     }
 }
 
-/// SASL or legacy authentication mechanism selected by the client.
-///
-/// The `*-PLUS` variants are the SCRAM channel-binding mechanisms. They are
-/// channel-bound via RFC 5929 `tls-server-end-point` and are selected only
-/// when the peer certificate yields a binding value; `authenticate_best`
-/// prefers them over their non-PLUS counterparts and enforces RFC 5802
-/// Section 6 downgrade protection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum AuthMechanism {
-    /// SASL OAUTHBEARER bearer-token authentication (RFC 7628).
-    OAuthBearer,
-    /// SASL XOAUTH2 bearer-token authentication.
-    XOAuth2,
-    /// SASL SCRAM-SHA-256-PLUS (channel-bound).
-    ScramSha256Plus,
-    /// SASL SCRAM-SHA-1-PLUS (channel-bound).
-    ScramSha1Plus,
-    /// SASL SCRAM-SHA-256.
-    ScramSha256,
-    /// SASL SCRAM-SHA-1.
-    ScramSha1,
-    /// SASL PLAIN.
-    Plain,
-    /// SASL CRAM-MD5.
-    CramMd5,
-    /// Legacy IMAP LOGIN command.
-    Login,
-}
-
-impl AuthMechanism {
-    /// Return the advertised SASL mechanism name, or `LOGIN` for the legacy command.
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::OAuthBearer => "OAUTHBEARER",
-            Self::XOAuth2 => "XOAUTH2",
-            Self::ScramSha256Plus => "SCRAM-SHA-256-PLUS",
-            Self::ScramSha1Plus => "SCRAM-SHA-1-PLUS",
-            Self::ScramSha256 => "SCRAM-SHA-256",
-            Self::ScramSha1 => "SCRAM-SHA-1",
-            Self::Plain => "PLAIN",
-            Self::CramMd5 => "CRAM-MD5",
-            Self::Login => "LOGIN",
-        }
-    }
-}
+/// Shared vocabulary distinguishes IMAP LOGIN from SASL LOGIN.
+pub(crate) use bifrost_sasl::Mechanism as AuthMechanism;
 
 /// Policy for automatic authentication mechanism selection.
 #[non_exhaustive]
@@ -173,9 +130,8 @@ pub struct AuthPolicy {
     pub allow_login: bool,
     /// Allow credential-bearing mechanisms on a connection that is not encrypted.
     ///
-    /// This includes PLAIN, XOAUTH2, CRAM-MD5, and LOGIN. SCRAM mechanisms
-    /// remain allowed because they do not send reusable credentials or bearer
-    /// tokens directly.
+    /// This gates every mechanism, including SCRAM: authentication proofs do
+    /// not protect subsequent mail traffic on an unauthenticated channel.
     ///
     /// Default: `false`.
     pub allow_cleartext_without_tls: bool,

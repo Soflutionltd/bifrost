@@ -1,3 +1,5 @@
+use super::value::{Duration, LocalDateTime};
+
 use serde_json::json;
 
 use super::{CalendarEventCreate, CalendarEventPatch};
@@ -87,13 +89,13 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub(crate) fn start(&mut self, start: impl Into<String>) -> &mut Self {
+            pub(crate) fn start(&mut self, start: LocalDateTime) -> &mut Self {
                 self.properties
                     .insert("start".into(), serde_json::Value::String(start.into()));
                 self
             }
 
-            pub(crate) fn duration(&mut self, duration: impl Into<String>) -> &mut Self {
+            pub(crate) fn duration(&mut self, duration: Duration) -> &mut Self {
                 self.properties.insert(
                     "duration".into(),
                     serde_json::Value::String(duration.into()),

@@ -434,7 +434,7 @@ fn unclassifiable_detail(element: &str, response_code: &str) -> String {
 
 /// Append one unescaped text run. A run that does not unescape is `Err` with
 /// the reason, never dropped.
-fn push_text(e: &BytesText<'_>, buf: &mut String) -> Result<(), String> {
+pub(crate) fn push_text(e: &BytesText<'_>, buf: &mut String) -> Result<(), String> {
     let text = unescape(e.as_ref()).map_err(|error| format!("malformed XML text: {error}"))?;
     buf.push_str(&text);
     Ok(())

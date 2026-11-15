@@ -465,8 +465,8 @@ fn contact_from_jmap(
         .unwrap_or_default();
     let address_book_id = card
         .address_book_ids()
-        .and_then(|ids| ids.keys().next().cloned())
-        .map(SharedAddressBookId);
+        .and_then(|ids| ids.into_iter().min_by(|a, b| a.as_str().cmp(b.as_str())))
+        .map(|id| SharedAddressBookId(id.into_string()));
     let addresses =
         addresses(card.addresses()).map_err(|message| unsupported(operation, message))?;
     Ok(ContactCard {
@@ -1156,7 +1156,7 @@ mod tests {
     #[derive(Clone)]
     struct ScriptedPage {
         ids: Vec<&'static str>,
-        position: i32,
+        position: u64,
         total: usize,
         query_state: &'static str,
     }

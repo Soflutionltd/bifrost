@@ -14,9 +14,8 @@
 //! these in opaque newtypes if the surface fans out further.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
-use bifrost_types::TransmissionState;
+use bifrost_types::{RetryHint, TransmissionState};
 use bytes::Bytes;
 use reqwest::{StatusCode, header::HeaderMap};
 use thiserror::Error;
@@ -83,6 +82,14 @@ pub fn cap_status_body(body: Bytes) -> Bytes {
     Bytes::from(buf)
 }
 
+/// Why the transport stopped retrying a response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RetryStopReason {
+    AttemptBudget,
+    ReplayForbidden,
+}
+
 /// Errors returned by `Net`, `AccountNet`, and `RequestBuilder`.
 ///
 /// Marked `#[non_exhaustive]` to allow new variants without breaking
@@ -101,24 +108,20 @@ pub enum Error {
     LocalHold {
         key: String,
         held: crate::Held,
-        attempts: Vec<Error>,
-        /// A prior acknowledged non-idempotent attempt may have committed.
-        /// The logical operation must reconcile even if a later GET was held.
-        may_have_committed: bool,
+        evidence: crate::RequestEvidence,
     },
 
     /// A later stage failed after earlier wire attempts. The terminal error
     /// describes that stage; earlier outcomes remain ordered and must be
     /// considered before deciding whether the logical operation is replayable.
-    /// `may_have_committed` is also set when a request that was not replayable
-    /// ended in a transport failure past `Unsent` or a retryable status that
-    /// may follow a commit; `attempts` may then be empty.
+    /// The evidence ledger retains MayHaveCommitted when a non-replayable
+    /// request passed Unsent or received a status that may follow a commit.
+    /// Its diagnostic history may be empty in that case.
     #[error("logical request failed after earlier attempts: {source}")]
     AttemptHistory {
         #[source]
         source: Box<Error>,
-        attempts: Vec<Error>,
-        may_have_committed: bool,
+        evidence: crate::RequestEvidence,
     },
 
     /// Connect, reset, DNS, TLS handshake, or other transport-level
@@ -182,8 +185,10 @@ pub enum Error {
     RetryBudgetExhausted {
         /// Preserved final response when one was received.
         final_response: Option<FinalResponse>,
-        /// `Retry-After` durations honored across attempts, in order.
-        retry_after_history: Vec<Duration>,
+        /// Lossless server `Retry-After` hints observed across attempts, in order.
+        retry_after_history: Vec<RetryHint>,
+        /// Why another wire attempt was refused.
+        stop_reason: RetryStopReason,
     },
 
     /// OAuth token refresh failed or the server returned 401 after a
@@ -201,7 +206,7 @@ pub enum Error {
     #[error("rate limited")]
     RateLimited {
         /// Server-supplied retry hint from `Retry-After`, if present.
-        retry_after: Option<Duration>,
+        retry_after: Option<RetryHint>,
         /// Preserved 429 response evidence.
         final_response: FinalResponse,
     },
@@ -281,9 +286,9 @@ pub enum Error {
     /// permanent distinction.
     #[error("OAuth refresh failed: {source}")]
     RefreshFailed {
-        /// Provider-supplied retry deadline parsed by the auth layer,
+        /// Provider-supplied retry hint parsed by the auth layer,
         /// when the token endpoint returned a `Retry-After` hint.
-        retry_after: Option<SystemTime>,
+        retry_after: Option<RetryHint>,
         /// Underlying error from the token source. Shared with any
         /// concurrent waiters that were single-flighted onto the same
         /// refresh attempt.
@@ -378,32 +383,19 @@ impl Error {
     #[must_use]
     pub fn redact_request_text(self) -> Self {
         const REDACTED: &str = "detail withheld: the request URL is a credential";
-        let all = |attempts: Vec<Self>| {
-            attempts
-                .into_iter()
-                .map(Self::redact_request_text)
-                .collect::<Vec<_>>()
-        };
         match self {
             Self::LocalHold {
                 key,
                 held,
-                attempts,
-                may_have_committed,
+                evidence,
             } => Self::LocalHold {
                 key,
                 held,
-                attempts: all(attempts),
-                may_have_committed,
+                evidence: evidence.redact_request_text(),
             },
-            Self::AttemptHistory {
-                source,
-                attempts,
-                may_have_committed,
-            } => Self::AttemptHistory {
+            Self::AttemptHistory { source, evidence } => Self::AttemptHistory {
                 source: Box::new(source.redact_request_text()),
-                attempts: all(attempts),
-                may_have_committed,
+                evidence: evidence.redact_request_text(),
             },
             Self::Network {
                 transmission_state, ..
@@ -523,27 +515,24 @@ mod tests {
         };
         let error = Error::AttemptHistory {
             source: Box::new(network(TransmissionState::InFlight)),
-            attempts: vec![
-                network(TransmissionState::Unsent),
-                Error::Tls {
-                    message: URL.to_owned(),
-                    transmission_state: TransmissionState::Unsent,
-                },
-                Error::InvalidRequest {
-                    field: "request",
-                    detail: URL.to_owned(),
-                },
-            ],
-            may_have_committed: true,
+            evidence: crate::RequestEvidence::new(
+                vec![
+                    network(TransmissionState::Unsent),
+                    Error::Tls {
+                        message: URL.to_owned(),
+                        transmission_state: TransmissionState::Unsent,
+                    },
+                    Error::InvalidRequest {
+                        field: "request",
+                        detail: URL.to_owned(),
+                    },
+                ],
+                crate::CommitEvidence::MayHaveCommitted,
+            ),
         }
         .redact_request_text();
         assert!(!format!("{error:?} {error}").contains("upload.example"));
-        let Error::AttemptHistory {
-            source,
-            attempts,
-            may_have_committed: true,
-        } = error
-        else {
+        let Error::AttemptHistory { source, evidence } = error else {
             panic!("the envelope survives");
         };
         assert!(matches!(
@@ -554,8 +543,9 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(evidence.verdict(), crate::CommitEvidence::MayHaveCommitted);
         assert!(matches!(
-            attempts.as_slice(),
+            evidence.attempts(),
             [
                 Error::Network {
                     transmission_state: TransmissionState::Unsent,

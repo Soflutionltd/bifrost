@@ -1308,25 +1308,15 @@ fn status_from_net(net: Option<&bifrost_net::Error>) -> Option<u32> {
     }
 }
 
-/// The server's retry hint for a problem-details response.
-///
-/// Read the final response first: transport durations may be capped or
-/// originate from an earlier attempt and cannot preserve an absolute date.
+/// The server's lossless retry hint for a problem-details response.
 fn retry_after_from_net(net: Option<&bifrost_net::Error>) -> Option<RetryHint> {
     match net?.terminal() {
         bifrost_net::Error::Status { headers, .. } => retry_after_header(headers),
-        bifrost_net::Error::RateLimited {
-            retry_after,
-            final_response,
-        } => retry_after_header(&final_response.headers)
-            .or_else(|| retry_after.map(RetryHint::After)),
+        bifrost_net::Error::RateLimited { retry_after, .. } => *retry_after,
         bifrost_net::Error::RetryBudgetExhausted {
-            final_response,
             retry_after_history,
-        } => final_response
-            .as_ref()
-            .and_then(|response| retry_after_header(&response.headers))
-            .or_else(|| retry_after_history.last().copied().map(RetryHint::After)),
+            ..
+        } => retry_after_history.last().copied(),
         _ => None,
     }
 }
@@ -2101,7 +2091,7 @@ mod tests {
     fn a_retried_429_still_reaches_the_problem_details_mapping() {
         let err = into_account_error(
             from_net(bifrost_net::Error::RateLimited {
-                retry_after: Some(Duration::from_secs(30)),
+                retry_after: Some(bifrost_types::RetryHint::After(Duration::from_secs(30))),
                 final_response: bifrost_net::FinalResponse {
                     status: reqwest::StatusCode::TOO_MANY_REQUESTS,
                     headers: reqwest::header::HeaderMap::new(),
@@ -2139,7 +2129,8 @@ mod tests {
                     headers: retry_after_headers("45"),
                     body: bytes::Bytes::from_static(br#"{"type":"about:blank"}"#),
                 }),
-                retry_after_history: vec![Duration::from_secs(45)],
+                retry_after_history: vec![bifrost_types::RetryHint::After(Duration::from_secs(45))],
+                stop_reason: bifrost_net::RetryStopReason::AttemptBudget,
             }),
             JmapErrorContext::new(AccountOperation::SyncChanges),
         );

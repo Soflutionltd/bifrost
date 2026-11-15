@@ -343,38 +343,6 @@ Owner: one `PriorityLanes<T>` with a pluggable overflow policy owning the floor
 rule once; the published, engine-unused work-item path stays as a thin user of
 it.
 
-## CON-019 - Who publishes on the change stream, and through which door?
-
-**Reported by:** sync-engine.
-
-`changes_tx: broadcast::Sender<MultiplexerEvent>` is threaded alongside
-`delivery: Arc<ChangeDelivery>`, which wraps the same sender, into
-`AccountSlot`, `MultiplexerHandle`, `SlotContext`, `RecoveryContext` and
-`BackfillWiring`. Each call site picks a door: `publish_backfill`,
-`publish_acknowledgeable`, `delivery.sender().send`, or `changes_tx.send`
-(reattach, bulk, push). The "numbered receiver took delivery" invariant is
-enforced only for callers that pick the right one, and hand-built
-`MultiplexerEvent { scope: CursorScope::Account, checkpoint: None, publication:
-None, .. }` literals appear in at least six places. Owner: the raw sender private
-to `ChangeDelivery`, which gains `publish_warning(EventScope, Warning)` and
-`publish_terminated(EventScope, AccountError)`; no context carries `changes_tx`.
-
-The sync-lanes hunter reported it from the producer side: a backfill page is
-published by threading `changes_tx`, `delivery: &ChangeDelivery`,
-`control: &SyncControl` (wrapping the publication ledger) and
-`coverage: &Arc<PendingCoverage>` (the same ledger again) into `run_partition`,
-and fusion does the same with `Option<Arc<ChangeDelivery>>`, `control` and
-`coverage`. Each call site then picks raw sender vs gate ("events nobody
-acknowledges send on the raw sender" is a convention the runner's barrier page
-and both front ends' terminations follow by hand), control vs coverage
-("Through control when there is one"), and fenced registration or not
-(STR-039). Its proposal: one per-account `Publisher` owning the broadcast
-sender privately with the ledger and the delivery gate, offering
-`publish_page(page, claim, fence) -> PageOutcome`, `publish_marker(..)`,
-`publish_unacked(event)` and `announce(attention)`; producers get a `Publisher`
-and nothing else, so "did this reach a numbered receiver, and if not, retire and
-record" is decided once inside `publish_page`.
-
 ## CON-020 - What does a push teardown refusal mean?
 
 **Reported by:** sync-engine.
@@ -461,27 +429,6 @@ guarded only by `translate_exchange_ids_is_declared_idempotent`. Owner: the
 declaration. net already carries the declared policy into the error
 (`may_have_committed`), so a `ReplayPolicy::Idempotent` request could widen
 recovery itself, with no classification-site override.
-
-## CON-050 - Graph's two mail write pipelines each re-decide the same rules
-
-**Reported by:** graph.
-
-`mutate.rs` (bulk doors) and `pim/messages.rs` (typed doors) each build If-Match
-PATCH, move and delete legs, submit `$batch` and reconcile. Decided twice:
-cross-mailbox move refusal (`request_for_mutation` returns `None` and the caller
-files `invalid_item_error`; `move_messages` checks it explicitly, its comment
-saying "exactly as the bulk-move path in `mutate.rs` refuses the same condition");
-public-folder write refusal (`mutate` partitions with `ews_read_folder` plus
-`is_known_public_folder` on the destination; `pim` uses `refuse_public_write` per
-id in `resolve_target_ids`, again in `move_messages`, and again in
-`message_batch_url`, so on `add_to_container` the move-into-public-folder check
-runs twice); "move carries the observed etag as a legacy guard"; and the etag
-preflight (`refresh_missing_etags` in mutate; `fetch_message_value` and
-`message_values_for_ids` in pim). Owner: one write planner,
-`plan_message_write(target, effect) -> Result<BatchLeg, ItemRefusal>`, used by both
-doors, which then differ only in reporting (streaming `ItemOutcome` vs
-`PartialCommit`). The same two-pipeline shape is STR-080 (IMAP) and BUG-071
-(JMAP).
 
 ## CON-052 - Is a Gmail `NotFound` dischargeable under the cursor bridge?
 

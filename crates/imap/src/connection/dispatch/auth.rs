@@ -29,7 +29,8 @@ impl From<bifrost_sasl::SaslError> for Error {
                 attempt: None,
             },
             // `SaslError` is `#[non_exhaustive]`; any future variant is an
-            // mapping gap until it is handled explicitly.
+            // mapping gap until it is handled explicitly; it is not evidence
+            // that the user must replace credentials.
             other => Error::Internal(other.to_string()),
         }
     }
@@ -86,7 +87,7 @@ impl Consumer for LoginConsumer {
         // `buffered` is `Either`-classified data whose only carrier is the
         // event stream, so a rejected LOGIN surrenders it rather than
         // dropping it with the consumer.
-        if let Err(e) = require_ok_auth(tagged, AuthMechanism::Login) {
+        if let Err(e) = require_ok_auth(tagged, AuthMechanism::ImapLogin) {
             return Finalized::failure(e, self.buffered);
         }
         Finalized::success((), self.buffered)
@@ -209,7 +210,7 @@ impl Consumer for AuthenticateXoauth2Consumer {
         if let Err(e) = require_ok_auth(
             tagged,
             match self.mechanism {
-                bifrost_sasl::OAuthMechanism::Xoauth2 => AuthMechanism::XOAuth2,
+                bifrost_sasl::OAuthMechanism::Xoauth2 => AuthMechanism::Xoauth2,
                 bifrost_sasl::OAuthMechanism::OAuthBearer => AuthMechanism::OAuthBearer,
                 _ => {
                     return Finalized::failure(
@@ -365,13 +366,7 @@ impl AuthenticateScramConsumer {
 
     /// Derive the diagnostic rung from the exchange hash and binding.
     fn mechanism(&self) -> AuthMechanism {
-        match (self.mechanism, self.binding.binding()) {
-            (ScramHash::Sha1, bifrost_sasl::ChannelBinding::None) => AuthMechanism::ScramSha1,
-            (ScramHash::Sha256, bifrost_sasl::ChannelBinding::None) => AuthMechanism::ScramSha256,
-            (ScramHash::Sha1, _) => AuthMechanism::ScramSha1Plus,
-            (ScramHash::Sha256, _) => AuthMechanism::ScramSha256Plus,
-            _ => unreachable!("unsupported SCRAM hash"),
-        }
+        AuthMechanism::from_scram(self.mechanism, self.binding.binding())
     }
 
     /// Classify through the shared owner before adding the selected rung.
@@ -698,7 +693,7 @@ mod tests {
                     .err()
                     .unwrap()
             ),
-            Some(AuthMechanism::Login),
+            Some(AuthMechanism::ImapLogin),
         );
 
         // The XOAUTH2 consumer is shared by two mechanisms, so its token is
@@ -718,7 +713,7 @@ mod tests {
                         .unwrap()
                 ),
                 Some(match mechanism {
-                    bifrost_sasl::OAuthMechanism::Xoauth2 => AuthMechanism::XOAuth2,
+                    bifrost_sasl::OAuthMechanism::Xoauth2 => AuthMechanism::Xoauth2,
                     _ => AuthMechanism::OAuthBearer,
                 }),
             );

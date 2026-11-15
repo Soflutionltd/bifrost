@@ -34,14 +34,15 @@ pub(crate) use auth::{AuthMechanism, AuthOutcome, CredentialsKind};
 pub use auth::{AuthPolicy, Credentials};
 pub(crate) use body::BodyStructure;
 pub(crate) use envelope::{Envelope, EnvelopeAddress};
-pub(crate) use fetch::format_fetch_attrs;
 pub(crate) use fetch::{AppendMessage, FetchAttr, FetchResponse, StoreOperation, StoreResult};
 pub(crate) use flag::Flag;
 pub(crate) use ids::{ModSeq, ModSeqValzer, SeqSet, Uid, UidSet, UidValidity};
 pub(crate) use mailbox::{
     MailboxAttribute, MailboxInfo, SelectedMailbox, StatusItem, StatusResult,
 };
-pub(crate) use notify::{MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetParams};
+#[cfg(test)]
+pub(crate) use notify::NotifyEvent;
+pub(crate) use notify::{MailboxFilter, NotifyEventGroup, NotifySetParams};
 pub(crate) use profile::ServerProfile;
 pub(crate) use response::{
     AclEntry, Capability, CopyResult, EsearchResponse, ExpungeResult, ListRightsResponse,
@@ -63,3 +64,5 @@ pub(crate) use command::{Command, CommandKind};
 pub(crate) use request::{
     FetchChanges, QresyncParams, SelectAccess, SelectOptions, SyncFetchRequest,
 };
+
+pub(crate) mod command_options;

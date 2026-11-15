@@ -5,6 +5,9 @@
 //! etags, recurrence text, and provenance while keeping the shared
 //! Account surface small.
 
+pub mod recurrence;
+pub use recurrence::{RecurrenceDay, RecurrenceRule, RecurrenceRuleError, RecurrenceUntil};
+
 use crate::cursor::ProtocolKind;
 
 /// Engine-facing calendar identifier.
@@ -190,6 +193,16 @@ pub struct EventRecurrence {
     pub rdate: Vec<String>,
     pub exdate: Vec<String>,
     pub recurrence_id: Option<String>,
+}
+
+impl EventRecurrence {
+    /// Parse the rule before interpreting or writing it. Raw text stays at the
+    /// observation boundary so a malformed server rule does not erase a user's
+    /// meeting or prevent unrelated scalar edits. Providers must not implement
+    /// separate validity grammars over this retained text.
+    pub fn parsed_rule(&self) -> Result<Option<RecurrenceRule>, RecurrenceRuleError> {
+        self.rrule.as_deref().map(str::parse).transpose()
+    }
 }
 
 /// Unified calendar event returned by calendar primitives.

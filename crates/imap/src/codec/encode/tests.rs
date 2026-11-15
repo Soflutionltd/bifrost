@@ -577,7 +577,7 @@ fn encode_authenticate_rejects_invalid_mechanism() {
 
     let mut buf = BytesMut::new();
     let cmd = Command::Authenticate {
-        mechanism: String::new(),
+        mechanism: String::new().into(),
         initial_response: None,
     };
     assert!(
@@ -5729,7 +5729,7 @@ fn uid_search(criteria: &str, opts: &EncodeOptions) -> Result<WireCommand, crate
     admit_and_encode(
         "A001",
         &Command::UidSearch {
-            criteria: criteria.to_owned(),
+            criteria: criteria.into(),
         },
         opts,
     )
@@ -6361,7 +6361,7 @@ fn search_rejects_non_synchronizing_literal_without_extension() {
 #[test]
 fn an_encoder_validation_refusal_arrives_as_invalid_input() {
     let cmd = Command::Search {
-        criteria: String::new(),
+        criteria: String::new().into(),
     };
     let mut buf = BytesMut::new();
     let err = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts())
@@ -6479,7 +6479,7 @@ fn list_status_rejects_empty_status_items() {
     let cmd = Command::ListStatus {
         reference: String::new().into(),
         pattern: "*".into(),
-        status_items: String::new(),
+        status_items: String::new().into(),
     };
     let mut buf = BytesMut::new();
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
@@ -6493,7 +6493,7 @@ fn list_status_rejects_empty_status_items() {
 #[test]
 fn search_rejects_empty_criteria() {
     let cmd = Command::Search {
-        criteria: String::new(),
+        criteria: String::new().into(),
     };
     let mut buf = BytesMut::new();
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
@@ -6527,7 +6527,7 @@ fn sort_rejects_empty_criteria() {
     let cmd = Command::Sort {
         sort_criteria: "DATE".into(),
         charset: "UTF-8".into(),
-        criteria: String::new(),
+        criteria: String::new().into(),
     };
     let mut buf = BytesMut::new();
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
@@ -6546,7 +6546,7 @@ fn thread_rejects_oversized_non_synchronizing_literal_in_literal_minus_mode() {
     let cmd = Command::Thread {
         algorithm: "REFERENCES".into(),
         charset: "UTF-8".into(),
-        criteria: format!("TEXT {{4097+}}\r\n{oversized}"),
+        criteria: format!("TEXT {{4097+}}\r\n{oversized}").into(),
     };
     let mut buf = BytesMut::new();
     let result = admit_and_encode_to_buf(
@@ -7174,15 +7174,15 @@ fn encode_notify_set_selected_basic() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Selected,
-            events: vec![
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::Selected,
+            vec![
                 NotifyEvent::MessageNew {
                     fetch_attrs: vec![],
                 },
                 NotifyEvent::MessageExpunge,
             ],
-        }],
+        )],
     });
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
     assert_eq!(
@@ -7197,9 +7197,9 @@ fn encode_notify_set_with_fetch_attrs() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Selected,
-            events: vec![
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::Selected,
+            vec![
                 NotifyEvent::MessageNew {
                     fetch_attrs: vec![
                         "uid".into(),
@@ -7208,7 +7208,7 @@ fn encode_notify_set_with_fetch_attrs() {
                 },
                 NotifyEvent::MessageExpunge,
             ],
-        }],
+        )],
     });
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
     assert_eq!(
@@ -7225,24 +7225,24 @@ fn encode_notify_set_with_status_indicator() {
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: true,
         event_groups: vec![
-            NotifyEventGroup {
-                filter: MailboxFilter::Selected,
-                events: vec![
+            NotifyEventGroup::new(
+                MailboxFilter::Selected,
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec![],
                     },
                     NotifyEvent::MessageExpunge,
                 ],
-            },
-            NotifyEventGroup {
-                filter: MailboxFilter::Subtree(vec!["Lists".into()]),
-                events: vec![
+            ),
+            NotifyEventGroup::new(
+                MailboxFilter::Subtree(vec!["Lists".into()]),
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec![],
                     },
                     NotifyEvent::MessageExpunge,
                 ],
-            },
+            ),
         ],
     });
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
@@ -7262,16 +7262,16 @@ fn encode_notify_set_selected_delayed() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::SelectedDelayed,
-            events: vec![
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::SelectedDelayed,
+            vec![
                 NotifyEvent::MessageNew {
                     fetch_attrs: vec![],
                 },
                 NotifyEvent::MessageExpunge,
                 NotifyEvent::FlagChange,
             ],
-        }],
+        )],
     });
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
     assert_eq!(
@@ -7291,10 +7291,10 @@ fn encode_notify_set_simple_filters() {
         let mut buf = BytesMut::new();
         let cmd = crate::types::Command::NotifySet(NotifySetParams {
             status: false,
-            event_groups: vec![NotifyEventGroup {
+            event_groups: vec![NotifyEventGroup::new(
                 filter,
-                events: vec![NotifyEvent::MailboxName],
-            }],
+                vec![NotifyEvent::MailboxName],
+            )],
         });
         encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
         let expected_str = format!("A001 NOTIFY SET ({expected} (MailboxName))\r\n");
@@ -7308,15 +7308,15 @@ fn encode_notify_set_mailboxes_multiple() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Mailboxes(vec!["INBOX".into(), "Sent Items".into()]),
-            events: vec![
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::Mailboxes(vec!["INBOX".into(), "Sent Items".into()]),
+            vec![
                 NotifyEvent::MessageNew {
                     fetch_attrs: vec![],
                 },
                 NotifyEvent::MessageExpunge,
             ],
-        }],
+        )],
     });
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
     assert_eq!(
@@ -7331,15 +7331,15 @@ fn encode_notify_set_subtree_single() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Subtree(vec!["Lists".into()]),
-            events: vec![
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::Subtree(vec!["Lists".into()]),
+            vec![
                 NotifyEvent::MessageNew {
                     fetch_attrs: vec![],
                 },
                 NotifyEvent::MessageExpunge,
             ],
-        }],
+        )],
     });
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
     assert_eq!(
@@ -7354,10 +7354,7 @@ fn encode_notify_set_events_none() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Selected,
-            events: vec![],
-        }],
+        event_groups: vec![NotifyEventGroup::new(MailboxFilter::Selected, vec![])],
     });
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
     assert_eq!(&buf[..], b"A001 NOTIFY SET (selected NONE)\r\n");
@@ -7370,9 +7367,9 @@ fn encode_notify_set_all_event_types() {
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
         event_groups: vec![
-            NotifyEventGroup {
-                filter: MailboxFilter::Selected,
-                events: vec![
+            NotifyEventGroup::new(
+                MailboxFilter::Selected,
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec![],
                     },
@@ -7380,10 +7377,10 @@ fn encode_notify_set_all_event_types() {
                     NotifyEvent::FlagChange,
                     NotifyEvent::AnnotationChange,
                 ],
-            },
-            NotifyEventGroup {
-                filter: MailboxFilter::Personal,
-                events: vec![
+            ),
+            NotifyEventGroup::new(
+                MailboxFilter::Personal,
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec![],
                     },
@@ -7393,7 +7390,7 @@ fn encode_notify_set_all_event_types() {
                     NotifyEvent::MailboxMetadataChange,
                     NotifyEvent::ServerMetadataChange,
                 ],
-            },
+            ),
         ],
     });
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
@@ -7412,10 +7409,10 @@ fn encode_notify_set_extension_event() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Personal,
-            events: vec![NotifyEvent::Other("VendorSpecificEvent".into())],
-        }],
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::Personal,
+            vec![NotifyEvent::Other("VendorSpecificEvent".into())],
+        )],
     });
     encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
     assert_eq!(
@@ -7447,15 +7444,15 @@ fn encode_notify_set_subtree_empty_mailboxes_returns_error() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Subtree(vec![]),
-            events: vec![
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::Subtree(vec![]),
+            vec![
                 NotifyEvent::MessageNew {
                     fetch_attrs: vec![],
                 },
                 NotifyEvent::MessageExpunge,
             ],
-        }],
+        )],
     });
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
@@ -7471,15 +7468,15 @@ fn encode_notify_set_mailboxes_empty_returns_error() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Mailboxes(vec![]),
-            events: vec![
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::Mailboxes(vec![]),
+            vec![
                 NotifyEvent::MessageNew {
                     fetch_attrs: vec![],
                 },
                 NotifyEvent::MessageExpunge,
             ],
-        }],
+        )],
     });
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
@@ -7502,10 +7499,10 @@ fn encode_notify_set_rejects_invalid_other_event() {
         let mut buf = BytesMut::new();
         let cmd = crate::types::Command::NotifySet(NotifySetParams {
             status: false,
-            event_groups: vec![NotifyEventGroup {
-                filter: MailboxFilter::Personal,
-                events: vec![NotifyEvent::Other(invalid.into())],
-            }],
+            event_groups: vec![NotifyEventGroup::new(
+                MailboxFilter::Personal,
+                vec![NotifyEvent::Other(invalid.into())],
+            )],
         });
         let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
         assert!(
@@ -7523,15 +7520,15 @@ fn encode_notify_set_rejects_crlf_in_fetch_attrs() {
         let mut buf = BytesMut::new();
         let cmd = crate::types::Command::NotifySet(NotifySetParams {
             status: false,
-            event_groups: vec![NotifyEventGroup {
-                filter: MailboxFilter::Selected,
-                events: vec![
+            event_groups: vec![NotifyEventGroup::new(
+                MailboxFilter::Selected,
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec![payload.into()],
                     },
                     NotifyEvent::MessageExpunge,
                 ],
-            }],
+            )],
         });
         let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
         assert!(
@@ -7556,15 +7553,15 @@ fn encode_notify_set_rejects_malformed_fetch_attrs() {
         let mut buf = BytesMut::new();
         let cmd = crate::types::Command::NotifySet(NotifySetParams {
             status: false,
-            event_groups: vec![NotifyEventGroup {
-                filter: MailboxFilter::Selected,
-                events: vec![
+            event_groups: vec![NotifyEventGroup::new(
+                MailboxFilter::Selected,
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec![malformed.into()],
                     },
                     NotifyEvent::MessageExpunge,
                 ],
-            }],
+            )],
         });
         let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
         assert!(
@@ -7588,15 +7585,15 @@ fn encode_notify_set_accepts_valid_fetch_attrs() {
         let mut buf = BytesMut::new();
         let cmd = crate::types::Command::NotifySet(NotifySetParams {
             status: false,
-            event_groups: vec![NotifyEventGroup {
-                filter: MailboxFilter::Selected,
-                events: vec![
+            event_groups: vec![NotifyEventGroup::new(
+                MailboxFilter::Selected,
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec![valid.into()],
                     },
                     NotifyEvent::MessageExpunge,
                 ],
-            }],
+            )],
         });
         let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
         assert!(
@@ -7622,16 +7619,16 @@ fn encode_notify_set_rejects_non_message_event_on_selected() {
             let mut buf = BytesMut::new();
             let cmd = crate::types::Command::NotifySet(NotifySetParams {
                 status: false,
-                event_groups: vec![NotifyEventGroup {
-                    filter: filter.clone(),
-                    events: vec![
+                event_groups: vec![NotifyEventGroup::new(
+                    filter.clone(),
+                    vec![
                         NotifyEvent::MessageNew {
                             fetch_attrs: vec![],
                         },
                         NotifyEvent::MessageExpunge,
                         non_msg_event.clone(),
                     ],
-                }],
+                )],
             });
             let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
             assert!(
@@ -7648,10 +7645,10 @@ fn encode_notify_set_rejects_expunge_without_new() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Personal,
-            events: vec![NotifyEvent::MessageExpunge],
-        }],
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::Personal,
+            vec![NotifyEvent::MessageExpunge],
+        )],
     });
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
@@ -7667,12 +7664,12 @@ fn encode_notify_set_rejects_new_without_expunge_on_selected() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Selected,
-            events: vec![NotifyEvent::MessageNew {
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::Selected,
+            vec![NotifyEvent::MessageNew {
                 fetch_attrs: vec![],
             }],
-        }],
+        )],
     });
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
@@ -7690,16 +7687,16 @@ fn encode_notify_set_rejects_new_without_expunge_on_non_selected() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Personal,
-            events: vec![
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::Personal,
+            vec![
                 NotifyEvent::MailboxName,
                 NotifyEvent::SubscriptionChange,
                 NotifyEvent::MessageNew {
                     fetch_attrs: vec![],
                 },
             ],
-        }],
+        )],
     });
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
@@ -7714,15 +7711,15 @@ fn encode_notify_set_rejects_empty_fetch_attr() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Selected,
-            events: vec![
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::Selected,
+            vec![
                 NotifyEvent::MessageNew {
-                    fetch_attrs: vec!["UID".into(), String::new()],
+                    fetch_attrs: vec!["UID".into(), String::new().into()],
                 },
                 NotifyEvent::MessageExpunge,
             ],
-        }],
+        )],
     });
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
@@ -7738,15 +7735,15 @@ fn encode_notify_set_rejects_flag_change_without_new_and_expunge() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Personal,
-            events: vec![
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::Personal,
+            vec![
                 NotifyEvent::MessageNew {
                     fetch_attrs: vec![],
                 },
                 NotifyEvent::FlagChange,
             ],
-        }],
+        )],
     });
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
@@ -7758,10 +7755,10 @@ fn encode_notify_set_rejects_flag_change_without_new_and_expunge() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Personal,
-            events: vec![NotifyEvent::FlagChange],
-        }],
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::Personal,
+            vec![NotifyEvent::FlagChange],
+        )],
     });
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
@@ -7777,15 +7774,15 @@ fn encode_notify_set_rejects_annotation_change_without_new_and_expunge() {
     let mut buf = BytesMut::new();
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
-        event_groups: vec![NotifyEventGroup {
-            filter: MailboxFilter::Personal,
-            events: vec![
+        event_groups: vec![NotifyEventGroup::new(
+            MailboxFilter::Personal,
+            vec![
                 NotifyEvent::MessageNew {
                     fetch_attrs: vec![],
                 },
                 NotifyEvent::AnnotationChange,
             ],
-        }],
+        )],
     });
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
@@ -7802,24 +7799,24 @@ fn encode_notify_set_rejects_both_selected_and_selected_delayed() {
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
         event_groups: vec![
-            NotifyEventGroup {
-                filter: MailboxFilter::Selected,
-                events: vec![
+            NotifyEventGroup::new(
+                MailboxFilter::Selected,
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec![],
                     },
                     NotifyEvent::MessageExpunge,
                 ],
-            },
-            NotifyEventGroup {
-                filter: MailboxFilter::SelectedDelayed,
-                events: vec![
+            ),
+            NotifyEventGroup::new(
+                MailboxFilter::SelectedDelayed,
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec![],
                     },
                     NotifyEvent::MessageExpunge,
                 ],
-            },
+            ),
         ],
     });
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
@@ -7837,25 +7834,25 @@ fn encode_notify_set_rejects_duplicate_selected() {
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
         event_groups: vec![
-            NotifyEventGroup {
-                filter: MailboxFilter::Selected,
-                events: vec![
+            NotifyEventGroup::new(
+                MailboxFilter::Selected,
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec![],
                     },
                     NotifyEvent::MessageExpunge,
                 ],
-            },
-            NotifyEventGroup {
-                filter: MailboxFilter::Selected,
-                events: vec![
+            ),
+            NotifyEventGroup::new(
+                MailboxFilter::Selected,
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec![],
                     },
                     NotifyEvent::MessageExpunge,
                     NotifyEvent::FlagChange,
                 ],
-            },
+            ),
         ],
     });
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
@@ -7873,25 +7870,25 @@ fn encode_notify_set_rejects_duplicate_selected_delayed() {
     let cmd = crate::types::Command::NotifySet(NotifySetParams {
         status: false,
         event_groups: vec![
-            NotifyEventGroup {
-                filter: MailboxFilter::SelectedDelayed,
-                events: vec![
+            NotifyEventGroup::new(
+                MailboxFilter::SelectedDelayed,
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec![],
                     },
                     NotifyEvent::MessageExpunge,
                 ],
-            },
-            NotifyEventGroup {
-                filter: MailboxFilter::SelectedDelayed,
-                events: vec![
+            ),
+            NotifyEventGroup::new(
+                MailboxFilter::SelectedDelayed,
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec![],
                     },
                     NotifyEvent::MessageExpunge,
                     NotifyEvent::FlagChange,
                 ],
-            },
+            ),
         ],
     });
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
@@ -7915,15 +7912,15 @@ fn encode_notify_set_rejects_fetch_attrs_on_non_selected_filter() {
         let mut buf = BytesMut::new();
         let cmd = crate::types::Command::NotifySet(NotifySetParams {
             status: false,
-            event_groups: vec![NotifyEventGroup {
+            event_groups: vec![NotifyEventGroup::new(
                 filter,
-                events: vec![
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec!["UID".into()],
                     },
                     NotifyEvent::MessageExpunge,
                 ],
-            }],
+            )],
         });
         let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
         assert!(
@@ -7946,16 +7943,16 @@ fn encode_notify_set_rejects_extension_event_on_selected() {
         let mut buf = BytesMut::new();
         let cmd = crate::types::Command::NotifySet(NotifySetParams {
             status: false,
-            event_groups: vec![NotifyEventGroup {
-                filter: filter.clone(),
-                events: vec![
+            event_groups: vec![NotifyEventGroup::new(
+                filter.clone(),
+                vec![
                     NotifyEvent::MessageNew {
                         fetch_attrs: vec![],
                     },
                     NotifyEvent::MessageExpunge,
                     NotifyEvent::Other("X-CUSTOM".into()),
                 ],
-            }],
+            )],
         });
         let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
         assert!(
@@ -8323,4 +8320,84 @@ fn mailbox_encoding_preserves_inbox_children_and_correlation() {
             ));
         }
     }
+}
+
+#[test]
+fn typed_search_string_uses_live_mode_and_structural_literals() {
+    let criteria = crate::types::SearchCriteria::new()
+        .subject("caf\u{e9}")
+        .unwrap();
+    let cmd = Command::Search { criteria };
+    let ascii = encode_command("A001", &cmd, &default_opts()).unwrap();
+    assert_eq!(
+        ascii.to_vec(),
+        b"A001 SEARCH SUBJECT {5}\r\ncaf\xc3\xa9\r\n"
+    );
+    let utf8 = encode_command("A001", &cmd, &opts(LiteralMode::Synchronizing, true)).unwrap();
+    assert_eq!(utf8.to_vec(), b"A001 SEARCH SUBJECT \"caf\xc3\xa9\"\r\n");
+}
+
+#[test]
+fn typed_search_control_and_marker_bytes_remain_operand_data() {
+    let criteria = crate::types::SearchCriteria::new()
+        .body("x\r\n{3}\r\nabc")
+        .unwrap();
+    let cmd = Command::Search { criteria };
+    let wire = encode_command("A001", &cmd, &default_opts()).unwrap();
+    assert_eq!(
+        wire.to_vec(),
+        b"A001 SEARCH BODY {11}\r\nx\r\n{3}\r\nabc\r\n"
+    );
+    assert_eq!(wire.segments().len(), 2);
+}
+
+#[test]
+fn typed_search_capability_requirements_follow_keys_and_raw_declarations() {
+    let mut options = default_opts();
+    options.capabilities = vec![Capability::Imap4Rev1];
+    let body = crate::types::SearchCriteria::new()
+        .body("MODSEQ OLDER $")
+        .unwrap();
+    let criteria = crate::types::SearchCriteria::new().not(&body);
+    assert!(admit_and_encode("A001", &Command::Search { criteria }, &options).is_ok());
+    let criteria = crate::types::SearchCriteria::new()
+        .or(&body, &crate::types::SearchCriteria::new().mod_seq(4));
+    assert!(matches!(
+        admit_and_encode("A001", &Command::Search { criteria }, &options),
+        Err(crate::Error::MissingCapability(_))
+    ));
+    let criteria =
+        crate::types::SearchCriteria::raw("X-LOCAL value".to_owned(), vec![Capability::Within]);
+    assert!(matches!(
+        admit_and_encode("A001", &Command::Search { criteria }, &options),
+        Err(crate::Error::MissingCapability(_))
+    ));
+}
+
+#[test]
+fn typed_fetch_preserves_header_operands_during_admission() {
+    let mut options = default_opts();
+    options.capabilities = vec![Capability::Imap4Rev1];
+    let cmd = Command::UidFetch {
+        sequence_set: SequenceSet::new("1").unwrap(),
+        items: vec![crate::types::FetchAttr::BodySection {
+            peek: true,
+            section: Some("HEADER.FIELDS (MODSEQ PREVIEW)".to_owned()),
+            partial: None,
+        }]
+        .into(),
+        changed_since: None,
+        vanished: false,
+    };
+    assert!(admit_and_encode("A001", &cmd, &options).is_ok());
+    let cmd = Command::UidFetch {
+        sequence_set: SequenceSet::new("1").unwrap(),
+        items: vec![crate::types::FetchAttr::PreviewLazy].into(),
+        changed_since: None,
+        vanished: false,
+    };
+    assert!(matches!(
+        admit_and_encode("A001", &cmd, &options),
+        Err(crate::Error::MissingCapability(_))
+    ));
 }

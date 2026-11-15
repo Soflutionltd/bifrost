@@ -13,7 +13,6 @@ pub(crate) struct RecoveryContext<'a> {
     pub factory: &'a Arc<dyn AccountFactory>,
     pub current: &'a Arc<ArcSwap<crate::types::Incarnation>>,
     pub cursors: &'a Arc<CursorRegistry>,
-    pub changes_tx: &'a broadcast::Sender<MultiplexerEvent>,
     pub account_id: &'a AccountId,
     pub control: &'a SyncControl,
     pub account_control_tx: &'a broadcast::Sender<AccountControl>,
@@ -239,7 +238,7 @@ async fn handle_engine_directive(
                 return RecoveryFollowUp::None;
             };
             broadcast_warning(
-                ctx.changes_tx,
+                ctx.delivery,
                 Some(directive_scope.clone()),
                 bifrost_types::Warning::user_safe(
                     bifrost_types::WarningKind::Other,
@@ -268,7 +267,7 @@ async fn handle_engine_directive(
                 _ => fallback_scope.clone(),
             };
             broadcast_warning(
-                ctx.changes_tx,
+                ctx.delivery,
                 warning_scope,
                 bifrost_types::Warning::user_safe(
                     bifrost_types::WarningKind::StrategyDowngraded,
@@ -331,7 +330,7 @@ async fn handle_engine_directive(
             // routing the warning to one folder's scope would misfile
             // an account-wide condition.
             broadcast_warning(
-                ctx.changes_tx,
+                ctx.delivery,
                 None,
                 bifrost_types::Warning::user_safe(
                     bifrost_types::WarningKind::OperatorAttentionNeeded,
@@ -783,7 +782,7 @@ async fn handle_schema_incompatible(
     }
     let detail = last.map_or_else(String::new, |error| error.to_string());
     broadcast_warning(
-        ctx.changes_tx,
+        ctx.delivery,
         None,
         bifrost_types::Warning::user_safe(
             bifrost_types::WarningKind::OperatorAttentionNeeded,
@@ -918,7 +917,7 @@ impl RepairPacing {
 
 fn warn_wait_budget(ctx: &RecoveryContext<'_>, scope: CursorScope) {
     broadcast_warning(
-        ctx.changes_tx,
+        ctx.delivery,
         Some(scope),
         bifrost_types::Warning::user_safe(
             bifrost_types::WarningKind::OperatorAttentionNeeded,
@@ -1020,7 +1019,7 @@ async fn disable_scope(ctx: &RecoveryContext<'_>, scope: CursorScope) {
         );
     }
     broadcast_warning(
-        ctx.changes_tx,
+        ctx.delivery,
         Some(scope.clone()),
         bifrost_types::Warning::user_safe(
             bifrost_types::WarningKind::OperatorAttentionNeeded,
@@ -1061,7 +1060,7 @@ async fn re_establish_scope_with_backoff(
             Arc::clone(ctx.cursors),
             ctx.writer,
             Arc::clone(ctx.delivery),
-            Some(control),
+            control,
             Arc::clone(ctx.coverage),
             true,
             ctx.shutdown,
@@ -1158,7 +1157,7 @@ async fn re_establish_scope_with_backoff(
     // unestablished.
     if let Some(err) = last_account_error {
         broadcast_terminated(
-            ctx.changes_tx,
+            ctx.delivery,
             EventScope::Cursor(scope.clone()),
             crate::recovery::recovery_exhaustion_error(
                 err,
@@ -1168,7 +1167,7 @@ async fn re_establish_scope_with_backoff(
         );
     }
     broadcast_warning(
-        ctx.changes_tx,
+        ctx.delivery,
         Some(scope.clone()),
         bifrost_types::Warning::user_safe(
             bifrost_types::WarningKind::OperatorAttentionNeeded,
@@ -1803,7 +1802,7 @@ async fn reattach_account_paced(
                 Arc::clone(&staged),
                 ctx.writer,
                 Arc::clone(ctx.delivery),
-                Some(&admitted),
+                &admitted,
                 Arc::clone(ctx.coverage),
                 false,
                 ctx.shutdown,
@@ -2357,7 +2356,7 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
     // as operator attention before pausing all scopes with the account.
     if let Some(err) = last_error {
         broadcast_terminated(
-            ctx.changes_tx,
+            ctx.delivery,
             EventScope::Account,
             crate::recovery::recovery_exhaustion_error(
                 err,
@@ -2399,18 +2398,8 @@ pub(super) fn log_open_skips(account_id: &AccountId, skips: &[SkippedScope], pha
     }
 }
 
-fn broadcast_terminated(
-    changes_tx: &broadcast::Sender<MultiplexerEvent>,
-    scope: EventScope,
-    error: AccountError,
-) {
-    let me = MultiplexerEvent {
-        scope,
-        event: Arc::new(SyncEvent::Terminated(error)),
-        checkpoint: None,
-        publication: None,
-    };
-    let _ = changes_tx.send(me);
+fn broadcast_terminated(delivery: &ChangeDelivery, scope: EventScope, error: AccountError) {
+    delivery.publish_terminated(scope, error);
 }
 
 /// Broadcast a `Warning` on the per-account changes channel. The
@@ -2420,17 +2409,14 @@ fn broadcast_terminated(
 /// account cursor: an enterprise user needs to distinguish a stopped account
 /// from one cursor's failure.
 fn broadcast_warning(
-    changes_tx: &broadcast::Sender<MultiplexerEvent>,
+    delivery: &ChangeDelivery,
     scope: Option<CursorScope>,
     warning: bifrost_types::Warning,
 ) {
-    let me = MultiplexerEvent {
-        scope: scope.map_or(EventScope::Account, EventScope::Cursor),
-        event: Arc::new(SyncEvent::Warning(warning)),
-        checkpoint: None,
-        publication: None,
-    };
-    let _ = changes_tx.send(me);
+    delivery.publish_warning(
+        scope.map_or(EventScope::Account, EventScope::Cursor),
+        warning,
+    );
 }
 
 /// How `run_establish` obtained a scope's cursor. Reattach uses this to
@@ -2564,7 +2550,7 @@ async fn run_establish(
     cursors: Arc<CursorRegistry>,
     writer: &WriterHandle,
     delivery: Arc<crate::multiplexer::ChangeDelivery>,
-    control: Option<&SyncControl>,
+    control: &SyncControl,
     coverage: Arc<PendingCoverage>,
     persist_ready: bool,
     shutdown: &CancellationToken,
@@ -2581,10 +2567,7 @@ async fn run_establish(
     );
     pacing.local_deadline = None;
     let result = async {
-        let _activity = match control {
-            Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
-            None => None,
-        };
+        let _activity = control.begin_activity().ok_or(Error::Paused)?;
         // Only a reattach passes an attempt. Its resume read claims a still
         // provisional row through the writer. An ordinary read (the live
         // scope's recovery) is shown a still-provisional row as absent and
@@ -2635,28 +2618,21 @@ async fn run_establish(
             expected_fence: walk_fence,
             account_id: account_id.clone(),
             cursors: Arc::clone(&cursors),
-            control: control.cloned(),
-            coverage: Some(Arc::clone(&coverage)),
-            writer_tx: Some(writer.sender()),
+            publisher: crate::multiplexer::PagePublisher::new(
+                delivery,
+                control.clone(),
+                writer.sender(),
+                shutdown.clone(),
+            ),
             generation: coverage.next_generation(),
-            shutdown: Some(shutdown.clone()),
         };
         let outcome = match classified_as_inventory {
             Some(classified) => {
                 fusion
-                    .run_resume_stream_with_broadcast(
-                        scope.clone(),
-                        classified,
-                        resume_stream,
-                        Some(delivery),
-                    )
+                    .run_resume_stream_with_broadcast(scope.clone(), classified, resume_stream)
                     .await?
             }
-            None => {
-                fusion
-                    .run_with_broadcast(account, scope, Some(delivery))
-                    .await?
-            }
+            None => fusion.run_with_broadcast(account, scope).await?,
         };
         match outcome {
             crate::multiplexer::FusionOutcome::Established

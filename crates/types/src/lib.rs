@@ -55,9 +55,10 @@ pub use blob::{BlobCapabilities, BlobEncoding, BlobHandle, ByteRange, Digest, Di
 // Capability snapshot + per-method support flags.
 pub use capabilities::{
     AccountCapabilities, BatchingPolicy, BlobRangeSupport, CapabilityChange, CapabilityDelta,
-    CapabilityKey, CapabilityValue, ConvenienceShape, CursorFreshness, MutationCapabilities,
-    MutationConcurrency, MutationReassertion, MutationReplaySafety, PimMethodSupport,
-    PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape,
+    CapabilityKey, CapabilityValue, ConvenienceShape, CursorFreshness, ForwardedFlagShape,
+    MutationCapabilities, MutationConcurrency, MutationReassertion, MutationReplaySafety,
+    PimMethodSupport, PushCapability, QuotaSignal, RateLimitClass, RepliedFlagShape,
+    StarredFlagShape, VersionedDoors,
 };
 
 // Calendar primitives.
@@ -65,7 +66,8 @@ pub use calendar::{
     AttendeeRole, Calendar, CalendarEvent, CalendarId, CalendarProvenance, EventAttendee,
     EventAvailability, EventCreate, EventId, EventOrganizer, EventPatch, EventRange,
     EventRecurrence, EventReminder, EventSearchRequest, EventStatus, EventTime, EventVisibility,
-    ReminderRelativeTo, ReminderTrigger, RsvpStatus,
+    RecurrenceDay, RecurrenceRule, RecurrenceRuleError, RecurrenceUntil, ReminderRelativeTo,
+    ReminderTrigger, RsvpStatus,
 };
 
 // Cloud-storage attachment hosting.
@@ -142,9 +144,9 @@ pub use error::{
     ReconcileReason, RecoveryClass, RemediationAction, RequestCause, RequestErrorKind,
     ResourceKind, RetryAdvice, RetryDisposition, RetryHint, RetryReason, ServerCause,
     ServerErrorKind, StateCause, StrategyDowngrade, SupportExportConsented, SupportExportInternal,
-    SupportExportMinimal, SyncStateErrorKind, TelemetryView, ThrottleBudget, ThrottleKey,
-    ThrottleScope, ThrottleWork, TransmissionState, TransportCause, TransportErrorKind,
-    TransportKind, Warning, WarningKind, WireCause, validate_batch_input,
+    SupportExportMinimal, SyncStateErrorKind, TelemetryToken, TelemetryView, ThrottleBudget,
+    ThrottleKey, ThrottleScope, ThrottleWork, TransmissionState, TransportCause,
+    TransportErrorKind, TransportKind, Warning, WarningKind, WireCause, validate_batch_input,
 };
 
 // Stream-event types.

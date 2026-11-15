@@ -850,7 +850,7 @@ mod tests {
         let mut changed = HashMap::new();
         let mut by_type = HashMap::new();
         by_type.insert(data_type, state.to_string());
-        changed.insert(account_id.to_string(), by_type);
+        changed.insert(account_id.into(), by_type);
         PushObject::StateChange {
             changed,
             push_state: None,
@@ -945,7 +945,7 @@ mod tests {
         by_type.insert(DataType::Email, "e2".to_string());
         by_type.insert(DataType::EmailDelivery, "d2".to_string());
         let mut changed = HashMap::new();
-        changed.insert("acct-primary".to_string(), by_type);
+        changed.insert("acct-primary".into(), by_type);
 
         emit_push(
             PushObject::StateChange {
@@ -1077,7 +1077,7 @@ mod tests {
     #[test]
     fn an_email_push_routes_narrowly_and_dedups_against_its_block_state() {
         let push = || PushObject::EmailPush {
-            account_id: "acct-foreign".to_string(),
+            account_id: "acct-foreign".into(),
             email: serde_json::Value::Null,
         };
         let (tx, mut rx) = broadcast::channel(8);

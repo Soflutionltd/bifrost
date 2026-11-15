@@ -180,8 +180,7 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
 - `push_stream.rs` - lane declarations and session dispatch by push mode.
 - `push_tasks.rs` - tracks account-owned effects that survive session drop.
 - `ews_stream.rs` - EWS Streaming Notifications fallback:
-  Subscribe / GetStreamingEvents / Unsubscribe XML, scope
-  recovery, sessions and release ledger - generic over the crate-private
+  scope recovery, sessions and release ledger - generic over the crate-private
   `EwsExecute` transport seam (`EwsClient` in production, a scripted
   double in tests). One-shot SOAP calls use the buffered `execute` funnel;
   `GetStreamingEvents` uses its separate chunked response seam and frames
@@ -204,7 +203,8 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
 - `public_folder.rs` - no-delta-token public-folder sync: the
   watermark + throttled deletion-scan poll, inventory/changes streams,
   `EwsItem` -> entry/change projectors, hierarchy discovery driver.
-- `autodiscover.rs` - Exchange Autodiscover: `GetUserSettings`
+- `account/autodiscover.rs` - Account routing projections over the sibling
+  `src/autodiscover.rs` protocol owner: `GetUserSettings`
   (public-folder routing, content-mailbox SMTP) and the POX
   `alternativeMailboxes` delegate lookup, wired into `open` via
   `with_delegate_discovery()`, over `AccountNet`. Both lookups follow in-body
@@ -216,6 +216,26 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
 `get_folder` / `find_items` / `get_item` + pure body builders),
 `parse.rs` (quick-xml parsers returning `EwsError`, `decode_replica_list`),
 `mod.rs` (`EwsError`, `SoapFaultCode`, `EwsHeaders` routing pair).
+`streaming.rs` owns Subscribe, GetStreamingEvents and Unsubscribe body builders,
+subscription and notification parsing, and byte framing. Its Subscribe builder
+accepts EWS folder ids without account subscription records. Session lifetime,
+release ownership and invalidation routing remain in `account/ews_stream.rs`.
+
+`src/autodiscover.rs`, beside `ews/`, owns SOAP and POX encoding, decoding,
+redirect walking and the Outlook-authenticated transport calls on `GraphClient`.
+The account adapter retains public-folder routing projections. Redirect admission
+and `AuxTarget::Bearer` continue to use the configured Outlook origin and
+Outlook-audience token. All XML text runs use `ews/xml_helpers.rs::push_text`;
+callers retain their own error classification wrappers.
+
+`types.rs` names the contact projections separately: `CONTACT_SYNC_SELECT`
+contains sync identity fields, while `account/contacts.rs::CONTACT_READ_SELECT`
+contains typed contact detail fields. Their different values are intentional.
+Rule `GraphRecipient` / `GraphEmailAddress` require an address; calendar
+`CalendarRecipient` / `CalendarEmailAddress` in `types.rs` retain optional
+recipient and address fields. Combining their requiredness would either reject
+sparse calendar reads or weaken rule decoding. Calendar account code imports
+that explicit sparse projection.
 - `mutate.rs` - `bulk_set_flags` / `bulk_move` / `bulk_destroy` over
   `$batch` with `If-Match` and a `Retry-After`-aware throttle path.
 - `pim/` - Stage 1 PIM primitives and Graph conveniences, split by topic.
@@ -1284,7 +1304,8 @@ Supported scopes:
   defines the UTC timezone preference.
 - `FolderType { folder, Contact }` -> initial URL
   `/{prefix}/contactFolders/{folder}/contacts/delta?$select=...&$top=250`
-  (`CONTACT_SELECT`).
+  (`CONTACT_SYNC_SELECT`, the identity projection; typed contact reads use
+  their own detail projection in `account/contacts.rs`).
 - `Folder(folder)` in the public-folder routing map -> the
   `public_folder.rs` poll strategy (see "Public-folder cursor"); a
   `Folder` absent from the map stays `Unsupported`.
@@ -2503,9 +2524,9 @@ on a code that was never sent, and a success body carrying a bad reference
 passed the scan. The two whole-response scans apply it to fault text,
 `ResponseCode` and `MessageText`, and unescape `ResponseClass` before comparing
 it, so `&#69;rror` still reads as an error class. The per-operation parsers and
-the streaming parsers in `ews_stream.rs` (subscribe and notification, whose
+the streaming parsers in `ews/streaming.rs` (subscribe and notification, whose
 item, folder and subscription ids are unescaped rather than returned raw) do
-the same, and there is no lenient variant left: `ews_stream.rs` uses the shared
+the same, and there is no lenient variant left: `ews/streaming.rs` uses the shared
 `xml_escape` rather than a private copy.
 
 The single-result `EwsClient::execute` scan is whole-response. It and the
@@ -3067,3 +3088,42 @@ for storage; existing wire values are unchanged.
 stamps from that identity. Registry keys and budget keys are constructed at
 that same identity boundary; neither error translation nor account declaration
 reconstructs a mailbox budget string.
+
+## Mail write planning
+
+`account/mutate.rs` owns `MessageWrite` and `plan_message_write`, shared by
+bulk mutation and typed PIM PATCH/move writes. It constructs owner-routed
+message URLs, native move destinations and observed If-Match headers.
+`same_mailbox_destination` owns the cross-mailbox rule; `refuse_message_write`
+and `public_write_destination` own public item/destination admission. Callers
+admit public targets before preflight. Destination admission remains before
+thread expansion and at the direct move door: either entry point must refuse
+without contacting a public folder through REST.
+
+`fetch_message_observation` owns routed message GETs and owner-qualified etag
+cache admission for both preflights. Bulk writes retain cache-or-GET behavior
+and caller-version precedence. Typed read-modify-write retains fresh selected
+fields; a cached validator cannot substitute for the category body being edited.
+These observation policies remain separate to preserve consumer behavior.
+
+Typed PATCH and move operations submit envelopes of at most `batch::LIMIT`
+(20) legs, renumber each envelope locally and accumulate progress against the
+full target list. A subrequest failure stops later envelopes after draining its
+siblings. A whole-envelope failure retains earlier commits, including the
+owner-qualified destination ids returned by moves. Moves without returned ids
+retain incomplete target evidence. An enterprise Outlook user expects earlier
+successful edits to remain visible when a later part of a large action fails.
+The shared batch transport still owns replay policy and absence semantics;
+chunking and partial-commit reporting remain with the write operation.
+
+## Calendar wire ownership
+
+`calendar/wire.rs` owns the calendar JSON DTOs, `calendar/time_zone.rs` owns
+the Windows/IANA table and zone lookup, and `calendar/recurrence.rs` owns the
+patternedRecurrence projection. The Account calendar module owns operations,
+shared-event projection and classified account errors. Recipient DTOs stay in
+`types.rs`. The recurrence codec consumes `bifrost_types::RecurrenceRule` for
+validity and typed BYDAY/UNTIL; it decides only Graph expressibility and
+DTSTART anchoring. A trailing empty RRULE part is malformed, consistently with
+the shared grammar. Leap-second UNTIL is valid shared syntax but Unsupported
+by the Graph date-time projection.

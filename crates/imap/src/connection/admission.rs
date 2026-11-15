@@ -93,25 +93,9 @@ pub(super) fn admit(command: &Command, session: &SessionView<'_>) -> Result<(), 
         | Command::UidSort { criteria, .. }
         | Command::Thread { criteria, .. }
         | Command::UidThread { criteria, .. } => {
-            crate::codec::encode::validate_search_criteria_crlf(
-                criteria,
-                "SEARCH criteria",
-                opts.literal_mode,
-            )?;
-            for (atoms, capability) in [
-                (&["MODSEQ"][..], Capability::Condstore),
-                (&["OLDER", "YOUNGER"][..], Capability::Within),
-                (
-                    &["SAVEDBEFORE", "SAVEDON", "SAVEDSINCE", "SAVEDATESUPPORTED"][..],
-                    Capability::SaveDate,
-                ),
-                (&["EMAILID", "THREADID"][..], Capability::ObjectId),
-                (&["$"][..], Capability::SearchRes),
-            ] {
-                if atoms.iter().any(|atom| {
-                    crate::connection::ImapConnection::search_criteria_contains_atom(criteria, atom)
-                }) && !session.supports(&capability)
-                {
+            criteria.validate_raw(opts.literal_mode)?;
+            for capability in criteria.required_capabilities() {
+                if !session.supports(&capability) {
                     return Err(crate::Error::MissingCapability(
                         capability.to_string().into(),
                     ));
@@ -448,8 +432,8 @@ impl SessionView<'_> {
     pub(super) fn validate_list_extended_request(
         &self,
         patterns: &[&str],
-        selection_options: &[&str],
-        return_options: &[&str],
+        selection_options: &[crate::types::command_options::ListSelect],
+        return_options: &[crate::types::command_options::ListReturn],
     ) -> Result<(), Error> {
         if patterns.is_empty() {
             return Err(Error::InvalidInput(
@@ -497,21 +481,25 @@ impl SessionView<'_> {
                             .into(),
                     ));
                 }
-                if trimmed.eq_ignore_ascii_case("SPECIAL-USE")
-                    && !crate::types::profile::supports(
-                        &snap.capabilities,
-                        &snap.enabled,
-                        &Capability::SpecialUse,
-                    )
-                {
+                if matches!(
+                    option,
+                    crate::types::command_options::ListSelect::SpecialUse
+                ) && !crate::types::profile::supports(
+                    &snap.capabilities,
+                    &snap.enabled,
+                    &Capability::SpecialUse,
+                ) {
                     return Err(Error::MissingCapability("SPECIAL-USE".into()));
                 }
             }
         }
 
-        let has_recursivematch = selection_options
-            .iter()
-            .any(|option| option.trim().eq_ignore_ascii_case("RECURSIVEMATCH"));
+        let has_recursivematch = selection_options.iter().any(|option| {
+            matches!(
+                option,
+                crate::types::command_options::ListSelect::RecursiveMatch
+            )
+        });
         for option in return_options {
             let trimmed = option.trim();
             if trimmed.is_empty() {
@@ -524,31 +512,28 @@ impl SessionView<'_> {
 
             {
                 let snap = self.snapshot;
-                if trimmed.eq_ignore_ascii_case("SPECIAL-USE")
-                    && !crate::types::profile::supports(
-                        &snap.capabilities,
-                        &snap.enabled,
-                        &Capability::SpecialUse,
-                    )
-                {
+                if matches!(
+                    option,
+                    crate::types::command_options::ListReturn::SpecialUse
+                ) && !crate::types::profile::supports(
+                    &snap.capabilities,
+                    &snap.enabled,
+                    &Capability::SpecialUse,
+                ) {
                     return Err(Error::MissingCapability("SPECIAL-USE".into()));
                 }
             }
 
-            if let Some(status_items) =
+            if let Some(status_items) = option.status_items() {
+                self.require(Capability::ListStatus)?;
+                self.validate_requested_status_items(status_items)?;
+            } else if let Some(status_items) =
                 ImapConnection::list_status_return_option_items(trimmed).transpose()?
             {
-                {
-                    let snap = self.snapshot;
-                    if !crate::types::profile::supports(
-                        &snap.capabilities,
-                        &snap.enabled,
-                        &Capability::ListStatus,
-                    ) {
-                        return Err(Error::MissingCapability("LIST-STATUS".into()));
-                    }
-                }
-                self.validate_requested_status_items(status_items)?;
+                // Malformed raw extension syntax still receives the existing
+                // STATUS-specific refusal; recognized valid options are typed.
+                self.require(Capability::ListStatus)?;
+                self.validate_requested_status_items(&status_items.into())?;
             }
         }
 
@@ -556,8 +541,11 @@ impl SessionView<'_> {
             && !selection_options.iter().any(|option| {
                 let trimmed = option.trim();
                 !trimmed.is_empty()
-                    && !trimmed.eq_ignore_ascii_case("RECURSIVEMATCH")
-                    && !trimmed.eq_ignore_ascii_case("REMOTE")
+                    && !matches!(
+                        option,
+                        crate::types::command_options::ListSelect::RecursiveMatch
+                            | crate::types::command_options::ListSelect::Remote
+                    )
             })
         {
             return Err(Error::InvalidInput(
@@ -570,10 +558,13 @@ impl SessionView<'_> {
 
         Ok(())
     }
-    pub(super) fn validate_requested_status_items(&self, items: &str) -> Result<(), Error> {
-        for item in ImapConnection::status_item_tokens(items)? {
-            match item.to_ascii_uppercase().as_str() {
-                "RECENT" => {
+    pub(super) fn validate_requested_status_items(
+        &self,
+        items: &crate::types::command_options::StatusItems,
+    ) -> Result<(), Error> {
+        for item in items.attributes()? {
+            match item {
+                crate::types::command_options::StatusAttribute::Recent => {
                     if self.is_rev2() {
                         return Err(Error::MissingCapability(
                             crate::error::CapabilityFailure::new(
@@ -585,7 +576,7 @@ impl SessionView<'_> {
                         ));
                     }
                 }
-                "DELETED" => {
+                crate::types::command_options::StatusAttribute::Deleted => {
                     // Deliberately NOT `snapshot_supports(StatusDeleted)`. The
                     // two agree under active rev2; they differ only on rev1,
                     // where the authority would also accept an advertised
@@ -608,12 +599,12 @@ impl SessionView<'_> {
                         ));
                     }
                 }
-                "DELETED-STORAGE" => {
+                crate::types::command_options::StatusAttribute::DeletedStorage => {
                     if !self.has_quota_resource("STORAGE") {
                         return Err(Error::MissingCapability("QUOTA=RES-STORAGE".into()));
                     }
                 }
-                "SIZE" => {
+                crate::types::command_options::StatusAttribute::Size => {
                     let snap = self.snapshot;
                     if !crate::types::profile::supports(
                         &snap.capabilities,
@@ -623,8 +614,10 @@ impl SessionView<'_> {
                         return Err(Error::MissingCapability("STATUS=SIZE".into()));
                     }
                 }
-                "HIGHESTMODSEQ" => self.require_condstore()?,
-                "APPENDLIMIT" => {
+                crate::types::command_options::StatusAttribute::HighestModSeq => {
+                    self.require_condstore()?;
+                }
+                crate::types::command_options::StatusAttribute::AppendLimit => {
                     let has_appendlimit = !matches!(
                         crate::types::ServerProfile::new(
                             self.snapshot.capabilities.clone(),
@@ -637,7 +630,7 @@ impl SessionView<'_> {
                         return Err(Error::MissingCapability("APPENDLIMIT".into()));
                     }
                 }
-                "MAILBOXID" => {
+                crate::types::command_options::StatusAttribute::MailboxId => {
                     let snap = self.snapshot;
                     if !crate::types::profile::supports(
                         &snap.capabilities,
@@ -713,7 +706,7 @@ fn admit_arguments(command: &Command, session: &SessionView<'_>) -> Result<(), E
             ..
         } => {
             session.validate_sequence_set(sequence_set)?;
-            session.validate_fetch_wire(items)?;
+            session.validate_fetch_items(items)?;
         }
         Command::Store { sequence_set, .. }
         | Command::UidStore { sequence_set, .. }
@@ -792,20 +785,12 @@ fn admit_arguments(command: &Command, session: &SessionView<'_>) -> Result<(), E
             // Only the pattern count enters admission; their wire identities
             // remain typed until encoding.
             let patterns = vec![""; patterns.len()];
-            let selection = selection_options
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>();
-            let returns = return_options
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>();
-            session.validate_list_extended_request(&patterns, &selection, &returns)?;
+            session.validate_list_extended_request(&patterns, selection_options, return_options)?;
         }
         Command::NotifySet(params) => {
             if params.event_groups.iter().any(|group| {
                 matches!(
-                    &group.filter,
+                    group.filter(),
                     crate::types::MailboxFilter::Mailboxes(_)
                         | crate::types::MailboxFilter::Subtree(_)
                 )
@@ -869,10 +854,55 @@ impl SessionView<'_> {
         Ok(())
     }
 
+    pub(super) fn validate_fetch_items(
+        &self,
+        items: &crate::types::fetch::FetchItems,
+    ) -> Result<(), Error> {
+        use crate::types::{FetchAttr, fetch::FetchItems};
+        let FetchItems::Attributes(attrs) = items else {
+            return self.validate_fetch_wire(&items.wire());
+        };
+        for attr in attrs {
+            let capability = match attr {
+                FetchAttr::ModSeq => Some(Capability::Condstore),
+                FetchAttr::Preview | FetchAttr::PreviewLazy => Some(Capability::Preview),
+                FetchAttr::SaveDate => Some(Capability::SaveDate),
+                FetchAttr::EmailId | FetchAttr::ThreadId => Some(Capability::ObjectId),
+                FetchAttr::GmailMsgId | FetchAttr::GmailThreadId | FetchAttr::GmailLabels => {
+                    Some(Capability::XGmExt1)
+                }
+                FetchAttr::Binary { .. } | FetchAttr::BinarySize { .. } => {
+                    if !crate::types::profile::binary_fetch_usable(
+                        &self.snapshot.capabilities,
+                        &self.snapshot.enabled,
+                    ) {
+                        return Err(missing("FETCH", "BINARY"));
+                    }
+                    None
+                }
+                FetchAttr::Uid
+                | FetchAttr::Flags
+                | FetchAttr::Envelope
+                | FetchAttr::BodyStructure
+                | FetchAttr::Rfc822Size
+                | FetchAttr::InternalDate
+                | FetchAttr::Rfc822
+                | FetchAttr::Rfc822Header
+                | FetchAttr::Rfc822Text
+                | FetchAttr::BodySection { .. } => None,
+            };
+            if let Some(capability) = capability {
+                self.require(capability)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_fetch_wire(&self, items: &str) -> Result<(), Error> {
         // Walk top-level FETCH item names only. Header field names inside a
         // BODY section are data, even when named MODSEQ, PREVIEW or SAVEDATE.
-        // Both typed helpers and the raw pipeline builder enter this walk.
+        // Only raw extension operands enter this walk. Typed handles and typed
+        // pipeline operands use validate_fetch_items instead.
         let mut section_depth = 0usize;
         let mut quoted = false;
         let mut escaped = false;

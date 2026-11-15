@@ -7,6 +7,8 @@ pub(crate) mod get;
 pub(crate) mod parse;
 pub(crate) mod query;
 pub(crate) mod set;
+pub(crate) mod value;
+use value::UtcDateTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -93,14 +95,11 @@ pub(crate) enum RelativeTo {
 pub(crate) struct GetArguments {
     #[serde(rename = "recurrenceOverridesBefore")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    // This is UTCDateTime, whereas event start is LocalDateTime and duration
-    // is an RFC 5545 duration. Their typed migration must include the account
-    // conversion layer so validation does not diverge between reads and writes.
-    pub(crate) recurrence_overrides_before: Option<String>,
+    pub(crate) recurrence_overrides_before: Option<UtcDateTime>,
 
     #[serde(rename = "recurrenceOverridesAfter")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) recurrence_overrides_after: Option<String>,
+    pub(crate) recurrence_overrides_after: Option<UtcDateTime>,
 
     #[serde(rename = "reduceParticipants")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,13 +111,13 @@ pub(crate) struct GetArguments {
 }
 
 impl GetArguments {
-    pub(crate) fn recurrence_overrides_before(&mut self, before: impl Into<String>) -> &mut Self {
-        self.recurrence_overrides_before = Some(before.into());
+    pub(crate) fn recurrence_overrides_before(&mut self, before: UtcDateTime) -> &mut Self {
+        self.recurrence_overrides_before = Some(before);
         self
     }
 
-    pub(crate) fn recurrence_overrides_after(&mut self, after: impl Into<String>) -> &mut Self {
-        self.recurrence_overrides_after = Some(after.into());
+    pub(crate) fn recurrence_overrides_after(&mut self, after: UtcDateTime) -> &mut Self {
+        self.recurrence_overrides_after = Some(after);
         self
     }
 
@@ -247,13 +246,13 @@ crate::define_copy_method!(CalendarEventCopy, CalendarEvent);
 
 impl CalendarEventGet {
     #[must_use]
-    pub(crate) fn recurrence_overrides_before(mut self, before: impl Into<String>) -> Self {
+    pub(crate) fn recurrence_overrides_before(mut self, before: UtcDateTime) -> Self {
         self.arguments().recurrence_overrides_before(before);
         self
     }
 
     #[must_use]
-    pub(crate) fn recurrence_overrides_after(mut self, after: impl Into<String>) -> Self {
+    pub(crate) fn recurrence_overrides_after(mut self, after: UtcDateTime) -> Self {
         self.arguments().recurrence_overrides_after(after);
         self
     }

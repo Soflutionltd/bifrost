@@ -118,6 +118,8 @@ pub(crate) fn set_keyword<T: HttpTransport>(
     value: bool,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        let keyword = crate::email::keyword::Keyword::parse(keyword)
+            .map_err(to_acct_err(AccountOperation::SetKeyword))?;
         let owner = target_owner(&target);
         let ids = resolve_target(&mail, target, AccountOperation::SetKeyword).await?;
         let batch_size = super::capabilities::max_objects_in_set(&mail.client().session());
@@ -968,7 +970,8 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
         let import_create_id = {
             let entry = import_req.email(blob.blob_id);
             entry.mailbox_ids([draft_mailbox.clone()]);
-            entry.keywords([DRAFT_KEYWORD]);
+            entry.keywords([crate::email::keyword::Keyword::parse(DRAFT_KEYWORD)
+                .expect("valid standard keyword")]);
             entry.create_id()
         };
 
@@ -1411,14 +1414,14 @@ fn search_owner(
 /// as an empty page rather than a miss.
 fn route_search<'a, T: HttpTransport>(
     primary: &'a MailAccount<T>,
-    foreign_mail: &'a HashMap<String, MailAccount<T>>,
+    foreign_mail: &'a HashMap<crate::core::id::AccountId, MailAccount<T>>,
     filter: Option<&SearchFilter>,
     op: AccountOperation,
 ) -> Result<(&'a MailAccount<T>, Option<String>), AccountError> {
     let owner = search_owner(filter, op)?;
     match owner {
         None => Ok((primary, None)),
-        Some(account_id) => match foreign_mail.get(&account_id) {
+        Some(account_id) => match foreign_mail.get(account_id.as_str()) {
             Some(handle) => Ok((handle, Some(account_id))),
             None => Err(super::error::search_unknown_account(
                 op,
@@ -1462,7 +1465,7 @@ fn qualify(owner: Option<&str>, native: String) -> String {
 
 pub(crate) fn search<T: HttpTransport>(
     mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
+    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
     request: SearchRequest,
 ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
     Box::pin(async move {
@@ -1583,7 +1586,7 @@ fn reconcile_search_threads(
 
 pub(crate) fn search_messages<T: HttpTransport>(
     mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
+    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
     request: SearchRequest,
 ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
     Box::pin(async move {
@@ -1618,7 +1621,7 @@ pub(crate) fn search_messages<T: HttpTransport>(
 /// failure still fails the call.
 pub(crate) fn containers_list<T: HttpTransport>(
     mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
+    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
 ) -> AccountFuture<Result<ContainerList, AccountError>> {
     Box::pin(async move {
         let mut containers = fetch_containers(&mail, AccountOperation::ContainersList).await?;
@@ -2024,8 +2027,18 @@ pub(crate) fn vacation_set<T: HttpTransport>(
         patch.subject(config.subject);
         patch.text_body(config.body_text);
         patch.html_body(config.body_html);
-        patch.from_date(config.starts_at.map(system_time_to_unix));
-        patch.to_date(config.ends_at.map(system_time_to_unix));
+        patch.from_date(
+            config
+                .starts_at
+                .map(|time| checked_timestamp(time, AccountOperation::VacationSet))
+                .transpose()?,
+        );
+        patch.to_date(
+            config
+                .ends_at
+                .map(|time| checked_timestamp(time, AccountOperation::VacationSet))
+                .transpose()?,
+        );
         let mut response = account
             .call(set)
             .await
@@ -2097,7 +2110,7 @@ where
 
 pub(crate) fn thread_hydrate<T: HttpTransport>(
     mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
+    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
     thread: ThreadId,
 ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
     Box::pin(async move {
@@ -2232,7 +2245,7 @@ fn qualify_foreign_message_ids(
 
 pub(crate) fn message_hydrate<T: HttpTransport>(
     mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
+    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
     message: ObjectId,
     projection: HydrationProjection,
 ) -> AccountFuture<Result<Message, AccountError>> {
@@ -3008,7 +3021,7 @@ fn owner_email_plans(
 /// key (fail-soft, mandatory - see `containers_list`).
 async fn resolve_owner_emails<T: HttpTransport>(
     mail: &MailAccount<T>,
-    foreign_mail: &HashMap<String, MailAccount<T>>,
+    foreign_mail: &HashMap<crate::core::id::AccountId, MailAccount<T>>,
 ) -> HashMap<String, String> {
     let mut resolved = HashMap::new();
     if foreign_mail.is_empty() {
@@ -3017,8 +3030,9 @@ async fn resolve_owner_emails<T: HttpTransport>(
     let session = mail.client().session();
     // Deterministic order so the resolution (and its logging, if any is
     // ever added) is stable across calls.
-    let mut foreign_ids: Vec<&String> = foreign_mail.keys().collect();
+    let mut foreign_ids: Vec<String> = foreign_mail.keys().map(ToString::to_string).collect();
     foreign_ids.sort();
+    let foreign_ids: Vec<&String> = foreign_ids.iter().collect();
     let principals_account_id = session
         .principals_capabilities()
         .and_then(|capabilities| capabilities.account_id_for_principal())
@@ -3129,18 +3143,18 @@ async fn fetch_principal_email<T: HttpTransport>(
 /// matching the shape open-time seeding uses for an unreachable share.
 /// One unreachable share must not blank the whole sidebar.
 async fn fetch_foreign_containers<T: HttpTransport>(
-    foreign_mail: &HashMap<String, MailAccount<T>>,
+    foreign_mail: &HashMap<crate::core::id::AccountId, MailAccount<T>>,
     owner_emails: &HashMap<String, String>,
     op: AccountOperation,
 ) -> (Vec<Container>, Vec<SkippedScope>) {
     let mut containers = Vec::new();
     let mut skipped = Vec::new();
     // Deterministic order so the projection is stable across calls.
-    let mut account_ids: Vec<&String> = foreign_mail.keys().collect();
-    account_ids.sort();
+    let mut account_ids: Vec<_> = foreign_mail.keys().collect();
+    account_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     for account_id in account_ids {
         let mail = &foreign_mail[account_id];
-        let owner_email = owner_emails.get(account_id).map(String::as_str);
+        let owner_email = owner_emails.get(account_id.as_str()).map(String::as_str);
         match fetch_mailboxes(mail, op).await {
             Ok(mailboxes) => {
                 for mailbox in mailboxes {
@@ -3167,7 +3181,7 @@ async fn fetch_foreign_containers<T: HttpTransport>(
             }
             Err(error) => skipped.push(SkippedScope {
                 scope: bifrost_types::ErrorScope::Mailbox {
-                    id: (account_id.clone()).into(),
+                    id: account_id.to_string().into(),
                 },
                 error,
             }),
@@ -3392,12 +3406,8 @@ async fn search_email_ids<T: HttpTransport>(
     let more = if ids.is_empty() {
         false
     } else if let Some(total) = total {
-        // `next_position` is non-negative (`validate_search_page` refused a
-        // negative echo), so `unsigned_abs` is an exact widening and the
-        // comparison happens in a domain that holds both sides. The previous
-        // `i64::try_from(total).unwrap_or(i64::MAX)` substituted a sentinel
-        // for an unrepresentable total instead of comparing it.
-        u64::from(next_position.unsigned_abs()) < total
+        // Both the served position and total retain the unsigned wire domain.
+        next_position < total
     } else {
         true
     };
@@ -3451,24 +3461,17 @@ async fn search_email_ids<T: HttpTransport>(
 /// finite for the length of the walk; a walk that does not advance under an
 /// unmoved state is a server contract violation, not a long list.
 ///
-/// A count or sum that does not fit the cursor's `i32` position is
+/// A count or sum that does not fit the cursor's `u64` position is
 /// `Request(Malformed)`: it is the CURSOR representation that
 /// cannot carry the value, and the caller's answer is to restart the search
 /// rather than to conclude anything about the server.
 fn validate_search_page(
-    requested: i32,
-    served_from: i32,
+    requested: u64,
+    served_from: u64,
     served: usize,
     total: Option<u64>,
     op: AccountOperation,
-) -> Result<i32, AccountError> {
-    if served_from < 0 {
-        return Err(super::error::contract_violation(
-            op,
-            None,
-            format!("Email/query answered with a negative position ({served_from})"),
-        ));
-    }
+) -> Result<u64, AccountError> {
     if served > 0 && requested > 0 && served_from != requested {
         return Err(super::error::contract_violation(
             op,
@@ -3479,13 +3482,13 @@ fn validate_search_page(
             ),
         ));
     }
-    let served_i32 = i32::try_from(served).map_err(|_| invalid_search_cursor(op))?;
+    let served_count = u64::try_from(served).map_err(|_| invalid_search_cursor(op))?;
     let next_position = served_from
-        .checked_add(served_i32)
+        .checked_add(served_count)
         .ok_or_else(|| invalid_search_cursor(op))?;
     if served > 0 {
         if let Some(total) = total
-            && u64::from(next_position.unsigned_abs()) > total
+            && next_position > total
         {
             return Err(super::error::contract_violation(
                 op,
@@ -3514,7 +3517,7 @@ fn validate_search_page(
 /// starts, plus the `queryState` that order belonged to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SearchCursor {
-    position: i32,
+    position: u64,
     /// `None` only for the synthetic first page (no cursor supplied).
     query_state: Option<String>,
 }
@@ -3532,13 +3535,16 @@ struct SearchCursor {
 fn build_search_query(
     request: SearchRequest,
     collapse_threads: bool,
-    position: i32,
+    position: u64,
     limit: u32,
 ) -> Result<crate::email::EmailQuery, AccountError> {
     let mut query_request = crate::email::EmailQuery::new()
         .collapse_threads(collapse_threads)
         .sort([query::Comparator::new(crate::email::query::Comparator::ReceivedAt).descending()])
-        .position(position)
+        .position(
+            query::QueryPosition::try_from(position)
+                .map_err(|_| invalid_search_cursor(AccountOperation::Search))?,
+        )
         .limit(usize::try_from(limit).unwrap_or(usize::MAX))
         .calculate_total(true);
     if let Some(filter) = build_search_filter(request.filter, request.provider_query)? {
@@ -3548,7 +3554,7 @@ fn build_search_query(
 }
 
 /// Search and anchored walks share the persisted cursor codec.
-fn encode_position(position: i32, query_state: &str, owner: Option<&str>) -> Vec<u8> {
+fn encode_position(position: u64, query_state: &str, owner: Option<&str>) -> Vec<u8> {
     super::page_cursor::encode_search(position, query_state, owner)
 }
 
@@ -3616,19 +3622,29 @@ fn search_filter_to_jmap(
             super::foreign::native_object(&container.0).to_string(),
         ))
         .into(),
-        SearchFilter::Labeled(LabelId(label)) => {
-            crate::email::query::Filter::has_keyword(label).into()
-        }
+        SearchFilter::Labeled(LabelId(label)) => crate::email::query::Filter::has_keyword(
+            crate::email::keyword::Keyword::parse(label)
+                .map_err(to_acct_err(AccountOperation::Search))?,
+        )
+        .into(),
         SearchFilter::DateRange { after, before } => {
             let mut filters: Vec<query::Filter<crate::email::query::Filter>> = Vec::new();
             if let Some(after) = after {
                 filters.push(
-                    crate::email::query::Filter::sent_after(system_time_to_unix(after)).into(),
+                    crate::email::query::Filter::sent_after(checked_timestamp(
+                        after,
+                        AccountOperation::Search,
+                    )?)
+                    .into(),
                 );
             }
             if let Some(before) = before {
                 filters.push(
-                    crate::email::query::Filter::sent_before(system_time_to_unix(before)).into(),
+                    crate::email::query::Filter::sent_before(checked_timestamp(
+                        before,
+                        AccountOperation::Search,
+                    )?)
+                    .into(),
                 );
             }
             query::Filter::and(filters)
@@ -3707,7 +3723,9 @@ async fn build_email_create_from_draft<T: HttpTransport>(
     let mut create = crate::email::EmailCreate::new(None);
     let body_patch = patch.clone();
     create.mailbox_ids([mailbox]);
-    create.keywords([DRAFT_KEYWORD]);
+    create.keywords([
+        crate::email::keyword::Keyword::parse(DRAFT_KEYWORD).expect("valid standard keyword")
+    ]);
     if let Some(from) = patch.from.flatten() {
         create.from([address_to_jmap(from)]);
     }
@@ -4501,11 +4519,24 @@ fn attachment_from_part(part: &EmailBodyPart) -> Option<MessageAttachment> {
     })
 }
 
-fn system_time_to_unix(time: SystemTime) -> i64 {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
-        Err(err) => -i64::try_from(err.duration().as_secs()).unwrap_or(i64::MAX),
-    }
+// Validate at the caller boundary: an Outlook user's requested instant must
+// never become the epoch or a saturated date when it cannot be represented.
+fn checked_timestamp(
+    time: SystemTime,
+    operation: AccountOperation,
+) -> Result<jiff::Timestamp, AccountError> {
+    jiff::Timestamp::try_from(time).map_err(|error| {
+        bifrost_types::AccountErrorBuilder::new(
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+            bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
+                detail: bifrost_types::DiagnosticText::user_safe(error.to_string()),
+            }),
+        )
+        .protocol(bifrost_types::Protocol::Jmap)
+        .operation(operation)
+        .try_build()
+        .expect("valid timestamp refusal")
+    })
 }
 
 fn unix_to_system_time(timestamp: i64) -> Option<SystemTime> {
@@ -5024,7 +5055,7 @@ mod tests {
         .expect("client builds");
         let mut foreign = HashMap::new();
         foreign.insert(
-            "shared".to_string(),
+            "shared".into(),
             crate::account::Account::new(client, "shared"),
         );
 
@@ -5427,7 +5458,7 @@ mod tests {
     /// backing both.
     type SearchHandles = (
         MailAccount<SearchTransport>,
-        Arc<HashMap<String, MailAccount<SearchTransport>>>,
+        Arc<HashMap<crate::core::id::AccountId, MailAccount<SearchTransport>>>,
         SearchTransport,
     );
 
@@ -5444,7 +5475,7 @@ mod tests {
         let primary = crate::account::Account::new(client.clone(), "primary");
         let mut foreign = HashMap::new();
         foreign.insert(
-            "shared".to_string(),
+            "shared".into(),
             crate::account::Account::new(client, "shared"),
         );
         (primary, Arc::new(foreign), transport)
@@ -5755,7 +5786,7 @@ mod tests {
 
     type PagingHandles = (
         MailAccount<PagingTransport>,
-        Arc<HashMap<String, MailAccount<PagingTransport>>>,
+        Arc<HashMap<crate::core::id::AccountId, MailAccount<PagingTransport>>>,
         PagingTransport,
     );
 
@@ -5940,8 +5971,6 @@ mod tests {
     /// Bite check per row, against the code this replaced (`served_from`
     /// trusted verbatim, `next_position >= total` the only test):
     ///
-    /// - negative echo: `-4 + 2 = -2`, which compares below every total, so
-    ///   the walk minted `2:-2:q-1` and paged on from a nonsense base.
     /// - `2 + 2 > 3`: `4 >= 3` ended the walk and reported it complete.
     /// - echo 0 for a page requested at 2: accepted silently, and since the
     ///   successor is `0 + 2 = 2` the walk re-requests position 2 forever.
@@ -5959,8 +5988,6 @@ mod tests {
     fn a_search_page_envelope_is_validated_before_it_can_end_the_walk() {
         let op = AccountOperation::Search;
         for (case, requested, served_from, served, total) in [
-            ("a negative position echo", 0, -4, 2, Some(50_u64)),
-            ("a negative position echo, no total", 0, -4, 2, None),
             ("served past the reported total", 0, 2, 2, Some(3)),
             ("served past a zero total", 0, 0, 1, Some(0)),
             ("an echo that ignores the request", 2, 0, 2, None),

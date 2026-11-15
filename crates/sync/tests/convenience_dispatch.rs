@@ -49,7 +49,7 @@ fn caps_with(conveniences: ConvenienceShape) -> AccountCapabilities {
         blob_digest_pre_download: false,
         push: PushCapability::None,
         mutation: MutationCapabilities {
-            concurrency: MutationConcurrency::None,
+            concurrency: MutationConcurrency::ExpectedVersion(bifrost_types::VersionedDoors::NONE),
             replay_safety: MutationReplaySafety::None,
             reassertion: bifrost_types::MutationReassertion::NONE,
         },
@@ -724,7 +724,7 @@ async fn set_starred_none_shape_is_unsupported() {
 #[tokio::test]
 async fn mark_replied_keyword_path_flips_dollar_answered() {
     let account = RecorderAccount::with_conveniences(ConvenienceShape {
-        replied_via_keyword: true,
+        replied: bifrost_types::RepliedFlagShape::Keyword,
         ..ConvenienceShape::default()
     });
     account
@@ -740,7 +740,7 @@ async fn mark_replied_keyword_path_flips_dollar_answered() {
 #[tokio::test]
 async fn mark_replied_extended_property_path_writes_last_verb_102() {
     let account = RecorderAccount::with_conveniences(ConvenienceShape {
-        replied_via_extended_property: true,
+        replied: bifrost_types::RepliedFlagShape::ExtendedProperty,
         ..ConvenienceShape::default()
     });
     account
@@ -757,22 +757,6 @@ async fn mark_replied_extended_property_path_writes_last_verb_102() {
 }
 
 #[tokio::test]
-async fn mark_replied_prefers_keyword_when_both_flags_are_set() {
-    let account = RecorderAccount::with_conveniences(ConvenienceShape {
-        replied_via_keyword: true,
-        replied_via_extended_property: true,
-        ..ConvenienceShape::default()
-    });
-    account
-        .mark_replied(ObjectId("m-1".into()))
-        .await
-        .expect("ok");
-    let calls = account.calls();
-    assert_eq!(calls.len(), 1);
-    assert!(calls[0].starts_with("set_keyword:"));
-}
-
-#[tokio::test]
 async fn mark_replied_with_no_shape_is_unsupported() {
     let account = RecorderAccount::with_conveniences(ConvenienceShape::default());
     let err = account
@@ -785,7 +769,7 @@ async fn mark_replied_with_no_shape_is_unsupported() {
 #[tokio::test]
 async fn mark_forwarded_paths_mirror_replied_with_forwarded_values() {
     let keyword_account = RecorderAccount::with_conveniences(ConvenienceShape {
-        forwarded_via_keyword: true,
+        forwarded: bifrost_types::ForwardedFlagShape::Keyword,
         ..ConvenienceShape::default()
     });
     keyword_account
@@ -805,7 +789,7 @@ async fn mark_forwarded_paths_mirror_replied_with_forwarded_values() {
     assert_unsupported(&err, AccountOperation::MarkForwarded);
 
     let ext_account = RecorderAccount::with_conveniences(ConvenienceShape {
-        forwarded_via_extended_property: true,
+        forwarded: bifrost_types::ForwardedFlagShape::ExtendedProperty,
         ..ConvenienceShape::default()
     });
     ext_account

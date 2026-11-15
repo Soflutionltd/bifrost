@@ -16,6 +16,10 @@ pub enum ErrorScope {
     },
     UploadSession,
     Account,
+    /// An IMAP namespace prefix, not a selectable mailbox.
+    Namespace {
+        prefix: String,
+    },
     Cursor(CursorScope),
     Mailbox {
         id: MailboxId,
@@ -64,6 +68,7 @@ impl ErrorScope {
             | Self::CloudFile { .. }
             | Self::UploadSession
             | Self::Account
+            | Self::Namespace { .. }
             | Self::Cursor(_)
             | Self::DirectoryGateway { .. } => None,
         }
@@ -85,6 +90,7 @@ impl ErrorScope {
             Self::Contact { id } => Some(&id.0),
             Self::UploadSession
             | Self::Account
+            | Self::Namespace { .. }
             | Self::Cursor(_)
             | Self::CalendarCollection
             | Self::ContactCollection
@@ -137,6 +143,7 @@ fn scope_fields(scope: &ErrorScope) -> ScopeFields<'_> {
         ErrorScope::CloudFile { id } => fields.push("kind", "cloud_file").push("id", id),
         ErrorScope::UploadSession => fields.push("kind", "upload_session"),
         ErrorScope::Account => fields.push("kind", "account"),
+        ErrorScope::Namespace { prefix } => fields.push("kind", "namespace").push("prefix", prefix),
         ErrorScope::Cursor(cursor) => cursor_scope_fields(fields.push("kind", "cursor"), cursor),
         ErrorScope::Mailbox { id } => fields.push("kind", "mailbox").push("id", &id.0),
         ErrorScope::Message { id } => fields.push("kind", "message").push("id", &id.0),
@@ -398,6 +405,98 @@ pub enum Protocol {
     Unknown,
 }
 
+impl AccountOperation {
+    /// Stable tag in the sync ledger error digest. Append new tags; never renumber.
+    #[must_use]
+    pub const fn ledger_tag(self) -> u8 {
+        match self {
+            Self::CategoryDefinitionsList => 0,
+            Self::MessageReactionsRead => 1,
+            Self::Discover => 2,
+            Self::EstablishCursor => 3,
+            Self::DiscoverCursorScopes => 4,
+            Self::DiscoverMemberships => 5,
+            Self::ScopeLifecycle => 6,
+            Self::SyncInventory => 7,
+            Self::SyncChanges => 8,
+            Self::Hydrate => 9,
+            Self::HydrateThread => 10,
+            Self::HydrateMessage => 11,
+            Self::OpenBlob => 12,
+            Self::OpenBlobRange => 13,
+            Self::OpenRawRfc822 => 14,
+            Self::PushSubscribe => 15,
+            Self::PushUnsubscribe => 16,
+            Self::PushStream => 17,
+            Self::UpdateFlags => 18,
+            Self::SetStarred => 19,
+            Self::MarkReplied => 20,
+            Self::MarkForwarded => 21,
+            Self::MarkMdnSent => 22,
+            Self::BulkMove => 23,
+            Self::BulkDestroy => 24,
+            Self::MoveThread => 25,
+            Self::DeleteThread => 26,
+            Self::AddToContainer => 27,
+            Self::RemoveFromContainer => 28,
+            Self::SetKeyword => 29,
+            Self::SetLabelMembership => 30,
+            Self::SetCategory => 31,
+            Self::SetExtendedProperty => 32,
+            Self::SetImportance => 33,
+            Self::SetIsRead => 34,
+            Self::Send => 35,
+            Self::AttachmentUpload => 36,
+            Self::HostAttachment => 37,
+            Self::DraftCreate => 38,
+            Self::DraftUpdate => 39,
+            Self::DraftDiscard => 40,
+            Self::DraftSend => 41,
+            Self::CancelScheduledSend => 42,
+            Self::RescheduleSend => 43,
+            Self::Search => 44,
+            Self::SearchMessages => 45,
+            Self::ContainersList => 46,
+            Self::ContainerCreate => 47,
+            Self::ContainerRename => 48,
+            Self::ContainerMove => 49,
+            Self::ContainerDelete => 50,
+            Self::IdentitiesList => 51,
+            Self::IdentityUpdate => 52,
+            Self::VacationGet => 53,
+            Self::VacationSet => 54,
+            Self::QuotaGet => 55,
+            Self::FiltersList => 56,
+            Self::FilterCreate => 57,
+            Self::FilterUpdate => 58,
+            Self::FilterDelete => 59,
+            Self::FilterValidate => 60,
+            Self::AddressBooksList => 61,
+            Self::ContactsList => 62,
+            Self::ContactGet => 63,
+            Self::ContactCreate => 64,
+            Self::ContactUpdate => 65,
+            Self::ContactDelete => 66,
+            Self::ContactSearch => 67,
+            Self::ContactAutocomplete => 68,
+            Self::DirectorySearch => 69,
+            Self::DirectoryGroupsList => 70,
+            Self::DirectoryGroupExpand => 71,
+            Self::CalendarsList => 72,
+            Self::EventsInRange => 73,
+            Self::EventGet => 74,
+            Self::EventCreate => 75,
+            Self::EventUpdate => 76,
+            Self::EventDelete => 77,
+            Self::EventRsvp => 78,
+            Self::EventSearch => 79,
+            Self::EventAutocomplete => 80,
+            Self::Close => 81,
+            Self::Expunge => 82,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AccountOperation, ErrorScope, scope_fields};
@@ -483,6 +582,12 @@ mod tests {
     fn scope_fields_pin_the_serialized_shape() {
         let cases: Vec<(ErrorScope, Vec<(&str, &str)>)> = vec![
             (ErrorScope::Account, vec![("kind", "account")]),
+            (
+                ErrorScope::Namespace {
+                    prefix: "Shared/".into(),
+                },
+                vec![("kind", "namespace"), ("prefix", "Shared/")],
+            ),
             (
                 ErrorScope::Submission { id: "s".into() },
                 vec![("kind", "submission"), ("id", "s")],

@@ -408,3 +408,34 @@ impl std::fmt::Debug for AppendMessage {
 #[cfg(test)]
 #[path = "fetch_tests.rs"]
 mod tests;
+
+/// Preserve typed attributes until encoding. Raw operands remain available for
+/// extension FETCH grammar that the built-in attribute enum cannot express.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum FetchItems {
+    Attributes(Vec<FetchAttr>),
+    Raw(String),
+}
+impl FetchItems {
+    pub(crate) fn wire(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Attributes(attrs) => format_fetch_attrs(attrs).into(),
+            Self::Raw(text) => text.as_str().into(),
+        }
+    }
+}
+impl From<Vec<FetchAttr>> for FetchItems {
+    fn from(attrs: Vec<FetchAttr>) -> Self {
+        Self::Attributes(attrs)
+    }
+}
+impl From<String> for FetchItems {
+    fn from(text: String) -> Self {
+        Self::Raw(text)
+    }
+}
+impl From<&str> for FetchItems {
+    fn from(text: &str) -> Self {
+        Self::Raw(text.to_owned())
+    }
+}

@@ -107,7 +107,7 @@ pub(crate) fn stub_capabilities() -> AccountCapabilities {
         blob_digest_pre_download: false,
         push: PushCapability::None,
         mutation: MutationCapabilities {
-            concurrency: MutationConcurrency::None,
+            concurrency: MutationConcurrency::ExpectedVersion(bifrost_types::VersionedDoors::NONE),
             replay_safety: MutationReplaySafety::None,
             reassertion: bifrost_types::MutationReassertion::NONE,
         },

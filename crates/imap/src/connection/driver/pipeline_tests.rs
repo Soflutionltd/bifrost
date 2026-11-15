@@ -386,7 +386,7 @@ async fn two_pipelined_searches_run_as_sequential_sub_batches() {
     let task = tokio::spawn(async move {
         conn.pipeline()
             .uid_search("ALL".to_owned())
-            .uid_search_return("ALL".to_owned(), vec!["ALL".to_owned()])
+            .uid_search_return("ALL".to_owned(), vec!["ALL".into()])
             .execute_dynamic(std::time::Duration::from_secs(30))
             .await
     });
@@ -452,7 +452,7 @@ async fn a_surplus_esearch_for_a_finalized_search_is_dropped_not_published() {
     let task = tokio::spawn(async move {
         let results = conn
             .pipeline()
-            .uid_search_return("ALL".to_owned(), vec!["ALL".to_owned()])
+            .uid_search_return("ALL".to_owned(), vec!["ALL".into()])
             .noop()
             .execute_dynamic(std::time::Duration::from_secs(30))
             .await;

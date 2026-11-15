@@ -20,10 +20,8 @@ use bifrost_types::{
     TargetRole,
 };
 use serde_json::{Value, json};
-use std::collections::HashMap;
 
 use super::common::*;
-use super::hydrate::*;
 use super::threads::*;
 
 #[cfg(test)]
@@ -40,9 +38,11 @@ pub(crate) async fn add_to_container(
     container: ContainerId,
 ) -> Result<(), AccountError> {
     // Refused before thread expansion, which is itself a Graph REST read.
-    if account
-        .is_known_public_folder(&bifrost_types::FolderId(container.0.clone()))
-        .await
+    if crate::account::mutate::public_write_destination(
+        &account,
+        &bifrost_types::FolderId(container.0.clone()),
+    )
+    .await
     {
         return Err(crate::account::graph_error::unsupported_account_error(
             AccountOperation::AddToContainer,
@@ -374,15 +374,7 @@ pub(crate) fn refuse_public_write(
     id: &ObjectId,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
-    if super::hydrate::ews_read_folder(id).is_some() {
-        return Err(crate::account::graph_error::unsupported_item_error(
-            operation,
-            ErrorScope::Message {
-                id: id.0.clone().into(),
-            },
-        ));
-    }
-    Ok(())
+    crate::account::mutate::refuse_message_write(id, operation)
 }
 
 pub(super) async fn resolve_target_values(
@@ -422,35 +414,13 @@ pub(super) async fn fetch_message_value(
     id: &ObjectId,
     select: &str,
 ) -> Result<Value, AccountError> {
-    // Decode the (possibly foreign-encoded) id so a shared-mailbox
-    // message reads from `/users/{owner}/messages/{native}`; a primary
-    // (bare) id stays on `/me`. This makes the typed `message_hydrate`
-    // and every pim read-modify-write that starts from `fetch_message_value`
-    // mailbox-correct.
-    let parsed = crate::account::foreign::parse_message_id(id);
-    let client = account.client_for_owner(parsed.owner()).map_err(|error| {
-        into_account_error(
-            error,
-            GraphErrorContext::graph(AccountOperation::Hydrate).with_scope(ErrorScope::Message {
-                id: id.0.clone().into(),
-            }),
-        )
-    })?;
-    let path = format!(
-        "{}/messages/{}?{}",
-        client.api_path_prefix(),
-        bifrost_net::url::encode_path_component(parsed.native_id()),
-        select_query(select)
-    );
-    let value = client
-        .get_json(Resource::Outlook, &path)
-        .await
-        .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::Hydrate)))?;
-    // Cache the etag under the encoded id (the key the mutation paths
-    // look up), preserving the owner so the conditioned write routes
-    // back to the same mailbox.
-    cache_etag_for(account, id, &value).await;
-    Ok(value)
+    crate::account::mutate::fetch_message_observation(
+        account,
+        id,
+        select,
+        AccountOperation::Hydrate,
+    )
+    .await
 }
 
 pub(super) async fn fetch_paged_values(
@@ -521,26 +491,25 @@ pub(super) async fn patch_messages(
     patches: Vec<MessagePatch>,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
+    let targets: Vec<_> = patches.iter().map(|patch| patch.id.clone()).collect();
     let mut requests = Vec::new();
-    let mut targets = Vec::new();
-    for (index, patch) in patches.iter().enumerate() {
-        let mut headers = HashMap::new();
-        headers.insert("If-Match".to_string(), patch.etag.clone().into_string());
-        requests.push(BatchRequestItem {
-            id: index.to_string(),
-            method: "PATCH".to_string(),
-            url: message_batch_url(account, &patch.id, "", operation)?,
-            body: Some(patch.body.clone()),
-            headers: Some(headers),
-        });
-        targets.push(patch.id.clone());
+    for patch in patches {
+        refuse_public_write(&patch.id, operation)?;
+        requests.push(planned_message_write(
+            account,
+            &patch.id,
+            crate::account::mutate::MessageWrite::Patch(patch.body),
+            &patch.etag,
+            operation,
+        )?);
     }
-    let progress = submit_write_batch_with_targets(
+    let progress = submit_message_write_chunks(
         account,
         requests,
         &targets,
-        crate::account::batch::AbsentMeans::Failure,
         operation,
+        StepEffect::Updated,
+        StepReplay::Repeatable,
     )
     .await?;
     // Repeatable: each public call refetches the etag it patches under.
@@ -564,7 +533,10 @@ pub(super) async fn move_messages(
     let dest_folder = bifrost_types::FolderId(destination.to_string());
     // A discovered public folder is a bare EWS `FolderId`, which
     // `parse_folder` reads as primary; Graph REST cannot move into it.
-    if account.is_known_public_folder(&dest_folder).await {
+    // Keep admission here too: this door is also called without thread
+    // expansion. The earlier check protects expansion reads, this one protects
+    // direct move callers; neither can replace the other.
+    if crate::account::mutate::public_write_destination(account, &dest_folder).await {
         return Err(crate::account::graph_error::unsupported_account_error(
             operation,
         ));
@@ -572,28 +544,14 @@ pub(super) async fn move_messages(
     for id in ids {
         refuse_public_write(id, operation)?;
     }
-    let dest = crate::account::foreign::parse_folder(&dest_folder);
-    // A cross-mailbox move is not expressible against one endpoint. Decided
-    // from the ids alone, so it is refused BEFORE the etag GET - a local
-    // refusal of the caller's request, `Request(Malformed)`, exactly as the
-    // bulk-move path in `mutate.rs` refuses the same condition.
+    // Refuse from routing identities before an etag GET can contact the
+    // wrong mailbox. Both write doors use the planner's owner rule.
     for id in ids {
-        let source_owner = crate::account::foreign::parse_message_id(id)
-            .owner()
-            .map(str::to_string);
-        if !crate::account::foreign::same_owner(
-            dest.foreign().map(|f| f.mailbox.as_str()),
-            source_owner.as_deref(),
-        ) {
+        if !crate::account::mutate::same_mailbox_destination(id, &dest_folder) {
             return Err(crate::account::graph_error::invalid_item_error(
                 operation,
-                ErrorScope::Message {
-                    id: id.0.clone().into(),
-                },
-                format!(
-                    "Graph move for {} targets a folder in a different mailbox than the message",
-                    id.0
-                ),
+                ErrorScope::Message { id: id.clone() },
+                "Graph move requires a same-mailbox folder destination",
             ));
         }
     }
@@ -604,7 +562,7 @@ pub(super) async fn move_messages(
     // id; `values[i]` is its fetched value (etag). Route the request by
     // the routing id so a shared-mailbox message moves under
     // `/users/{owner}`.
-    for (index, (id, value)) in ids.iter().zip(values.iter()).enumerate() {
+    for (id, value) in ids.iter().zip(values.iter()) {
         let etag = graph_etag(value).ok_or_else(|| {
             pim_protocol_error(
                 operation,
@@ -614,28 +572,98 @@ pub(super) async fn move_messages(
                 format!("Graph message {} did not expose an etag", id.0),
             )
         })?;
-        let mut headers = HashMap::new();
-        headers.insert("If-Match".to_string(), etag.into_string());
-        requests.push(BatchRequestItem {
-            id: index.to_string(),
-            method: "POST".to_string(),
-            url: message_batch_url(account, id, "/move", operation)?,
-            body: Some(json!({ "destinationId": dest.native_id() })),
-            headers: Some(headers),
-        });
+        requests.push(planned_message_write(
+            account,
+            id,
+            crate::account::mutate::MessageWrite::Move(dest_folder.clone()),
+            &etag,
+            operation,
+        )?);
         targets.push(id.clone());
     }
-    let progress = submit_write_batch_with_targets(
+    let progress = submit_message_write_chunks(
         account,
         requests,
         &targets,
-        crate::account::batch::AbsentMeans::Failure,
         operation,
+        StepEffect::Moved,
+        StepReplay::Blocking,
     )
     .await?;
     // Blocking: Graph assigns a moved message a new id, so a replay addresses
     // a source id that no longer exists.
     batch_progress_error(progress, &targets, StepEffect::Moved, StepReplay::Blocking)
+}
+
+fn planned_message_write(
+    account: &GraphAccount,
+    id: &ObjectId,
+    effect: crate::account::mutate::MessageWrite,
+    etag: &GraphETag,
+    operation: AccountOperation,
+) -> Result<BatchRequestItem, AccountError> {
+    crate::account::mutate::plan_message_write(account, id, effect, Some(etag))
+        .map_err(|error| {
+            into_account_error(
+                error,
+                GraphErrorContext::graph(operation)
+                    .with_scope(ErrorScope::Message { id: id.clone() }),
+            )
+        })?
+        .ok_or_else(|| {
+            crate::account::graph_error::invalid_item_error(
+                operation,
+                ErrorScope::Message { id: id.clone() },
+                "Graph write requires a validator and a same-mailbox destination",
+            )
+        })
+}
+
+/// Chunk at the operation owner, where earlier commits can be retained if a
+/// later envelope fails. The transport must never hide those commits.
+async fn submit_message_write_chunks(
+    account: &GraphAccount,
+    requests: Vec<BatchRequestItem>,
+    targets: &[ObjectId],
+    operation: AccountOperation,
+    effect: StepEffect,
+    replay: StepReplay,
+) -> Result<BatchProgress, AccountError> {
+    let mut progress = BatchProgress::default();
+    for (chunk_index, chunk) in requests.chunks(crate::account::batch::LIMIT).enumerate() {
+        let offset = chunk_index * crate::account::batch::LIMIT;
+        let chunk_targets = &targets[offset..offset + chunk.len()];
+        let mut chunk = chunk.to_vec();
+        crate::account::mutate::assign_batch_ids(&mut chunk);
+        match submit_write_batch_with_targets(
+            account,
+            chunk,
+            chunk_targets,
+            crate::account::batch::AbsentMeans::Failure,
+            operation,
+        )
+        .await
+        {
+            Ok(next) => {
+                let failed = !next.failed.is_empty();
+                progress.append(next, offset);
+                if failed {
+                    break;
+                }
+            }
+            Err(error) => {
+                return Err(batch_call_error(
+                    progress,
+                    targets,
+                    chunk_targets,
+                    error,
+                    effect,
+                    replay,
+                ));
+            }
+        }
+    }
+    Ok(progress)
 }
 
 pub(super) async fn message_values_for_ids(
@@ -844,19 +872,6 @@ async fn submit_write_batch_resource(
     Ok(progress)
 }
 
-/// Cache the message etag under the caller-supplied (possibly
-/// foreign-encoded) id - the same key the mutation paths look up - so a
-/// conditioned write on a shared-mailbox message finds its etag and
-/// routes back to the owning mailbox. Keying by the native id from the
-/// response body instead would lose the owner and orphan the cache entry.
-pub(super) async fn cache_etag_for(account: &GraphAccount, id: &ObjectId, value: &Value) {
-    let Some(etag) = graph_etag(value) else {
-        return;
-    };
-    let mut cache = account.etag_index.write().await;
-    cache.insert(id.0.clone(), etag);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,6 +954,107 @@ mod replay_tests {
         assert_eq!(body["requests"][0]["headers"]["If-Match"], "v1");
         (error, client)
     }
+    #[tokio::test]
+    async fn typed_writes_chunk_twenty_legs_and_keep_prior_commits() {
+        for moving in [false, true] {
+            for fail_later in [false, true] {
+                let client = GraphClient::new("token");
+                let ids: Vec<_> = (0..21).map(|i| ObjectId(format!("m{i}"))).collect();
+                let mut replies = Vec::new();
+                if moving {
+                    for id in &ids {
+                        let body = serde_json::to_vec(&json!({
+                            "id": id.0, "@odata.etag": "v1"
+                        }))
+                        .unwrap();
+                        replies.push(bifrost_net::test_support::Canned::Response {
+                            status: reqwest::StatusCode::OK,
+                            headers: reqwest::header::HeaderMap::new(),
+                            body: bytes::Bytes::from(body),
+                        });
+                    }
+                }
+                let body = serde_json::to_vec(&json!({"responses":
+                    (0..20).map(|i| json!({
+                        "id": i.to_string(), "status": 200,
+                        "body": {"id": format!("new{i}")}
+                    })).collect::<Vec<_>>()
+                }))
+                .unwrap();
+                replies.push(bifrost_net::test_support::Canned::Response {
+                    status: reqwest::StatusCode::OK,
+                    headers: reqwest::header::HeaderMap::new(),
+                    body: bytes::Bytes::from(body),
+                });
+                if fail_later {
+                    replies.push(canned(
+                        reqwest::StatusCode::FORBIDDEN,
+                        br#"{"error":{"code":"ErrorAccessDenied","message":"denied"}}"#,
+                    ));
+                } else {
+                    replies.push(canned(
+                        reqwest::StatusCode::OK,
+                        br#"{"responses":[{"id":"0","status":200,"body":{"id":"new20"}}]}"#,
+                    ));
+                }
+                client.script_wire(replies, bifrost_net::RetryPolicy::default());
+                let account = GraphAccount::new_for_tests_with_shared(
+                    client.clone(),
+                    crate::account::PushMode::GraphSubscriptions,
+                    &[],
+                );
+                let result = if moving {
+                    move_messages(&account, &ids, "archive", AccountOperation::AddToContainer).await
+                } else {
+                    patch_messages(
+                        &account,
+                        ids.iter()
+                            .map(|id| MessagePatch {
+                                id: id.clone(),
+                                etag: GraphETag::from_odata_annotation("v1"),
+                                body: json!({"isRead": true}),
+                            })
+                            .collect(),
+                        AccountOperation::SetIsRead,
+                    )
+                    .await
+                };
+                if fail_later {
+                    let error = result.unwrap_err();
+                    let record = error.partial_commit().expect("earlier envelope committed");
+                    assert_eq!(record.steps().len(), 20);
+                    if moving {
+                        assert_eq!(
+                            record.steps()[0].targets().refs[1].scope,
+                            ErrorScope::Message {
+                                id: ObjectId("new0".into())
+                            }
+                        );
+                    }
+                } else {
+                    result.unwrap();
+                }
+                let requests = client.rest_requests();
+                let envelopes: Vec<Value> = requests
+                    .iter()
+                    .filter_map(|request| request.body.as_ref())
+                    .map(|body| serde_json::from_slice(body).unwrap())
+                    .collect();
+                assert_eq!(envelopes.len(), 2);
+                assert_eq!(envelopes[0]["requests"].as_array().unwrap().len(), 20);
+                assert_eq!(envelopes[1]["requests"].as_array().unwrap().len(), 1);
+                assert_eq!(envelopes[1]["requests"][0]["id"], "0");
+                assert!(
+                    envelopes[1]["requests"][0]["url"]
+                        .as_str()
+                        .unwrap()
+                        .contains("m20")
+                );
+                assert_eq!(envelopes[1]["requests"][0]["headers"]["If-Match"], "v1");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn write_answers_ignore_unsubmitted_ids_and_invalidate_stale_versions() {
         for status in [204, 404, 412] {
@@ -1140,12 +1256,33 @@ pub(super) fn batch_call_error(
         replay,
         Application::from_leaf(&error),
     ));
-    for (index, _) in progress.committed {
-        let targets = all_targets
-            .get(index)
-            .map_or_else(StepTargets::unknown, |id| {
-                StepTargets::complete(vec![subject(id)])
-            });
+    for (index, new_id) in progress.committed {
+        let targets = if effect == StepEffect::Moved {
+            let refs = all_targets
+                .get(index)
+                .map(|id| {
+                    TargetRef::new(TargetRole::Source, ErrorScope::Message { id: id.clone() })
+                })
+                .into_iter()
+                .chain(new_id.as_ref().map(|id| {
+                    TargetRef::new(
+                        TargetRole::Destination,
+                        ErrorScope::Message { id: id.clone() },
+                    )
+                }))
+                .collect();
+            if new_id.is_some() {
+                StepTargets::complete(refs)
+            } else {
+                StepTargets::at_least(refs)
+            }
+        } else {
+            all_targets
+                .get(index)
+                .map_or_else(StepTargets::unknown, |id| {
+                    StepTargets::complete(vec![subject(id)])
+                })
+        };
         record.committed(effect, targets, replay);
     }
     finish_partial(error, record)

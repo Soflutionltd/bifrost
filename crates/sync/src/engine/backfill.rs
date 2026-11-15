@@ -12,10 +12,6 @@ pub(super) struct BackfillWiring {
     /// Scope incarnations whose cold-start inventory the fusion worker
     /// owns; the orchestrator must not double-publish them.
     pub fusion_owned_scopes: HashSet<CursorScope>,
-    /// Where inventory pages are published. `None` runs the walk with no
-    /// broadcast at all, which is why this is not simply the context's
-    /// `changes_tx`.
-    pub changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
 }
 
 /// Backfill orchestrator. Walks the registered cursor scopes and runs
@@ -56,8 +52,13 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
         registry,
         config,
         fusion_owned_scopes,
-        changes_tx,
     } = wiring;
+    let publisher = crate::multiplexer::PagePublisher::new(
+        Arc::clone(&delivery),
+        control.clone(),
+        writer_tx.clone(),
+        shutdown.clone(),
+    );
     let mut scan = BackfillScan::default();
     scan.publish(
         &registry,
@@ -79,9 +80,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
     // real subscriber arrives, exactly as
     // `run_deferred_inventory_establishment` does for the fusion path,
     // so the first page is observed rather than raced away. (sync-N3)
-    if changes_tx.is_some()
-        && !wait_for_real_subscriber(&delivery, &subscriber_notify, &shutdown).await
-    {
+    if !wait_for_real_subscriber(&delivery, &subscriber_notify, &shutdown).await {
         return;
     }
     // Fusion-owned scopes are excluded by identity, not by whether the
@@ -111,9 +110,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             // reattaches gets no inventory and no retry, and no amount of waiting
             // helps. Parking here is the same answer the first gate gives, for
             // the same reason.
-            if changes_tx.is_some()
-                && !wait_for_real_subscriber(&delivery, &subscriber_notify, &shutdown).await
-            {
+            if !wait_for_real_subscriber(&delivery, &subscriber_notify, &shutdown).await {
                 return;
             }
             let incarnation_key = (scope.clone(), incarnation);
@@ -395,7 +392,6 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     scope.clone(),
                     partition.clone(),
                     &live,
-                    changes_tx.clone(),
                     &control,
                     &shutdown,
                     &throttles,
@@ -502,13 +498,10 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             let mut settle = completed && every_page_reached_someone;
             if settle {
                 match emit_backfill_complete(
-                    changes_tx.as_ref(),
                     &scope,
                     driver.total_seen(),
-                    &control,
-                    &shutdown,
+                    &publisher,
                     &lane_gate,
-                    &delivery,
                     undelivered_before,
                     fence_at_walk_start,
                 )
@@ -962,14 +955,13 @@ async fn run_backfill_partition_at_boundary(
     scope: CursorScope,
     partition: InventoryPartition,
     live: &Arc<LiveSupersedes>,
-    changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
     control: &SyncControl,
     shutdown: &CancellationToken,
     throttles: &crate::recovery::ThrottleBucket,
     coverage: &Arc<PendingCoverage>,
     writer_tx: &mpsc::Sender<WriterRequest>,
     lane: &LaneGate,
-    delivery: &crate::multiplexer::ChangeDelivery,
+    delivery: &Arc<crate::multiplexer::ChangeDelivery>,
     fence_at_walk_start: crate::cursor::ScopeFence,
     cursors: &CursorRegistry,
     incarnation: crate::cursor::ScopeIncarnation,
@@ -1079,20 +1071,22 @@ async fn run_backfill_partition_at_boundary(
                 "scope reset between two partitions of the backfill walk".into(),
             )));
         }
+        let publisher = crate::multiplexer::PagePublisher::new(
+            Arc::clone(delivery),
+            control.clone(),
+            writer_tx.clone(),
+            shutdown.clone(),
+        );
         let result = BackfillRunner::run_partition(
             current.as_ref().as_ref(),
             scope.clone(),
             partition.clone(),
             live.as_ref(),
-            changes_tx.clone(),
             bifrost_types::TraitEnvelopeVersion::new(crate::cursor::ENGINE_VERSION),
-            Some(control),
-            Some(coverage),
-            Some(writer_tx),
+            &publisher,
             generation,
             Some(lane),
             fence_at_walk_start,
-            delivery,
         )
         .await;
         lane.release_admission();
@@ -1176,19 +1170,19 @@ pub(super) fn open_pages_resume(checkpoint: Option<&BackfillCheckpoint>) -> Open
 /// attach. The honest total rides in `items_estimated`.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn emit_backfill_complete(
-    changes_tx: Option<&broadcast::Sender<MultiplexerEvent>>,
     scope: &CursorScope,
     total_seen: crate::backfill::scope_walk::WalkTotal,
-    control: &SyncControl,
-    shutdown: &CancellationToken,
+    publisher: &crate::multiplexer::PagePublisher,
     lane: &LaneGate,
-    delivery: &crate::multiplexer::ChangeDelivery,
     undelivered_before: crate::cursor::UndeliveredMark,
     fence_at_walk_start: crate::cursor::ScopeFence,
 ) -> MarkerOutcome {
-    if changes_tx.is_none() {
-        return MarkerOutcome::Published;
-    }
+    let control = &publisher.control;
+    let shutdown = &publisher.shutdown;
+    assert!(
+        Arc::ptr_eq(publisher.coverage(), lane.coverage()),
+        "backfill lane ledger changed"
+    );
     let _activity = loop {
         if !control.wait_until_running(shutdown).await {
             return MarkerOutcome::ShuttingDown;
@@ -1277,36 +1271,35 @@ pub(super) async fn emit_backfill_complete(
     // afterwards - the sweep retires that page while a replacement, which had
     // the marker in its ring all along, acknowledges it. The writer compares
     // this reading against the scope's watermark again before it writes.
-    let publication = match control.publish_walk_marker_if_fence(
-        expected.clone(),
-        undelivered_before,
-        fence_at_walk_start,
-    ) {
-        Ok(id) => id,
-        // The fence moved after the last point-in-time check above: the
-        // comparison under the coverage lock is the one that cannot race. The
-        // marker's claim is empty, so there is no debt to route.
-        Err(_) => {
-            tracing::warn!(
-                target: "bifrost.sync.backfill",
-                scope = ?scope,
-                "scope was reset or deleted before its completion marker could be \
-                 registered; withholding the marker"
-            );
-            return MarkerOutcome::Withheld;
-        }
-    };
     let event = MultiplexerEvent {
         scope: EventScope::Cursor(scope.clone()),
         event: Arc::new(SyncEvent::Batch(batch)),
-        checkpoint: Some(expected.clone()),
-        publication: Some(publication.clone()),
+        checkpoint: Some(expected),
+        publication: None,
     };
-    // Send and stamp as one step, exactly as the page path does.
-    if !delivery.publish_backfill(event, lane.coverage(), Some(&publication)) {
-        lane.coverage().note_undelivered(scope, 1);
-        control.retire_publication(publication);
+    if !publisher.publish_marker(event, undelivered_before, fence_at_walk_start) {
+        // `publish_marker` answers false both for a fence refusal at the mint
+        // and for a marker that reached no receiver. A fence that no longer
+        // equals the walk's is the refusal (the fence only moves forward, so
+        // the mint cannot have passed); otherwise the marker reached nobody.
+        if lane.coverage().scope_fence(scope) != fence_before {
+            tracing::warn!(
+                target: "bifrost.sync.backfill",
+                scope = ?scope,
+                "the scope fence moved before its completion marker could be registered; \
+                 withholding the marker"
+            );
+        } else {
+            tracing::warn!(
+                target: "bifrost.sync.backfill",
+                scope = ?scope,
+                "its completion marker reached no consumer; withholding it so the scope \
+                 is re-walked"
+            );
+        }
+        return MarkerOutcome::Withheld;
     }
+
     MarkerOutcome::Published
 }
 
@@ -1320,7 +1313,7 @@ pub(super) async fn emit_backfill_complete(
 /// later rescan until the account was reattached.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum MarkerOutcome {
-    /// Published, or there was no channel to publish on.
+    /// Published to a numbered receiver.
     Published,
     /// Deliberately not published: the scope was reset, or a page of this walk
     /// reached nobody, while the marker waited. The scope is left unsettled and

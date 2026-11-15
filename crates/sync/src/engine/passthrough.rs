@@ -92,13 +92,7 @@ impl SyncEngine {
             "inspect Page::skipped_scopes and Page::failed_ids; results from a \
              skipped scope are missing, not absent",
         ));
-        let event = MultiplexerEvent {
-            scope: EventScope::Account,
-            event: Arc::new(SyncEvent::Warning(warning)),
-            checkpoint: None,
-            publication: None,
-        };
-        let _ = slot.multiplexer.changes_tx.send(event);
+        slot.delivery.publish_warning(EventScope::Account, warning);
     }
 
     /// Resolve the live `Account` handle for an attached account.

@@ -3,7 +3,7 @@ use std::time::Duration;
 use bifrost_types::{
     AccountCapabilities, BatchingPolicy, BlobRangeSupport, CursorFreshness, FilterRuleShape,
     MutationCapabilities, MutationConcurrency, MutationReplaySafety, PimMethodSupport,
-    PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape,
+    PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape, VersionedDoors,
 };
 
 pub(crate) const GMAIL_BATCH_MODIFY_LIMIT: usize = 1000;
@@ -35,16 +35,12 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
         blob_digest_pre_download: false,
         push: PushCapability::OutOfProcessPubsub,
         mutation: MutationCapabilities {
-            concurrency: MutationConcurrency::ExpectedVersion {
-                mail_set_flags: false,
-                mail_move: false,
-                mail_destroy: false,
-                contact_update: true,
-                event_update: true,
-                contact_delete: false,
-                event_delete: true,
-                event_rsvp: true,
-            },
+            concurrency: MutationConcurrency::ExpectedVersion(
+                VersionedDoors::CONTACT_UPDATE
+                    .union(VersionedDoors::EVENT_UPDATE)
+                    .union(VersionedDoors::EVENT_DELETE)
+                    .union(VersionedDoors::EVENT_RSVP),
+            ),
             replay_safety: MutationReplaySafety::None,
             reassertion: bifrost_types::MutationReassertion {
                 set_flags: true,
@@ -134,10 +130,8 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
         filter_rule_shape: FilterRuleShape::Rules,
         conveniences: bifrost_types::ConvenienceShape {
             starred: StarredFlagShape::LabelMembership,
-            replied_via_keyword: false,
-            replied_via_extended_property: false,
-            forwarded_via_keyword: false,
-            forwarded_via_extended_property: false,
+            replied: bifrost_types::RepliedFlagShape::None,
+            forwarded: bifrost_types::ForwardedFlagShape::None,
             // Gmail's read-receipt model is read-only.
             mdn_sent_via_keyword: false,
         },
@@ -169,16 +163,12 @@ mod tests {
         assert!(!caps.push_in_process());
         assert_eq!(
             caps.mutation.concurrency,
-            MutationConcurrency::ExpectedVersion {
-                mail_set_flags: false,
-                mail_move: false,
-                mail_destroy: false,
-                contact_update: true,
-                event_update: true,
-                contact_delete: false,
-                event_delete: true,
-                event_rsvp: true,
-            }
+            MutationConcurrency::ExpectedVersion(
+                VersionedDoors::CONTACT_UPDATE
+                    .union(VersionedDoors::EVENT_UPDATE)
+                    .union(VersionedDoors::EVENT_DELETE)
+                    .union(VersionedDoors::EVENT_RSVP),
+            )
         );
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
         assert_eq!(
@@ -256,10 +246,14 @@ mod tests {
     fn convenience_shape_uses_gmail_starred_label() {
         let caps = gmail_capabilities();
         assert_eq!(caps.conveniences.starred, StarredFlagShape::LabelMembership);
-        assert!(!caps.conveniences.replied_via_keyword);
-        assert!(!caps.conveniences.replied_via_extended_property);
-        assert!(!caps.conveniences.forwarded_via_keyword);
-        assert!(!caps.conveniences.forwarded_via_extended_property);
+        assert_eq!(
+            caps.conveniences.replied,
+            bifrost_types::RepliedFlagShape::None
+        );
+        assert_eq!(
+            caps.conveniences.forwarded,
+            bifrost_types::ForwardedFlagShape::None
+        );
     }
 
     #[test]

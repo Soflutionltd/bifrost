@@ -383,6 +383,10 @@ pub(crate) struct AccountSlot {
     pub push_retired_tx: watch::Sender<crate::types::AccountGeneration>,
     pub reopen_lock: Arc<tokio::sync::Mutex<()>>,
     pub capabilities: Arc<std::sync::RwLock<AccountCapabilities>>,
+    /// Held for the slot's lifetime so the handle's owned resources are
+    /// released with the slot; engine code reaches the multiplexer through
+    /// `ChangeDelivery` and `PagePublisher`, not through this field.
+    #[allow(dead_code)]
     pub multiplexer: MultiplexerHandle,
     pub cursors: Arc<CursorRegistry>,
     /// What each scope's latest enumeration proved, pending the

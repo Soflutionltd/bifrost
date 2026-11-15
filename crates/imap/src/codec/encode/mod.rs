@@ -174,6 +174,66 @@ pub(crate) fn validate_search_criteria_crlf(
     Ok(())
 }
 
+/// Write typed SEARCH-family criteria. Strings go through the writer's
+/// quoting/literal rule; a `Raw` escape is written by [`write_criteria`].
+fn write_search(w: &mut CommandWriter, criteria: &crate::types::SearchCriteria, utf8: bool) {
+    use crate::types::search::SearchKey;
+    for (index, key) in criteria.keys().iter().enumerate() {
+        if index != 0 {
+            w.raw(b" ");
+        }
+        match key {
+            SearchKey::Keyword(keyword) => w.raw(keyword.as_bytes()),
+            SearchKey::Date { key, value } => {
+                w.raw(key.as_bytes());
+                w.raw(b" ");
+                w.raw(value.as_bytes());
+            }
+            SearchKey::Number { key, value } => {
+                w.raw(key.as_bytes());
+                w.raw(b" ");
+                w.raw(value.to_string().as_bytes());
+            }
+            SearchKey::Flag { excluded, value } => {
+                w.raw(if *excluded {
+                    b"UNKEYWORD "
+                } else {
+                    b"KEYWORD "
+                });
+                w.raw(value.as_bytes());
+            }
+            SearchKey::Uid(set) => {
+                w.raw(b"UID ");
+                w.raw(set.as_bytes());
+            }
+            SearchKey::Sequence(set) => w.raw(set.as_bytes()),
+            SearchKey::String { prefix, value } => {
+                w.raw(prefix.as_bytes());
+                w.raw(b" ");
+                w.string(value.as_bytes(), utf8);
+            }
+            SearchKey::Not(inner) => {
+                w.raw(b"NOT (");
+                write_search(w, inner, utf8);
+                w.raw(b")");
+            }
+            SearchKey::Or(a, b) => {
+                w.raw(b"OR (");
+                write_search(w, a, utf8);
+                w.raw(b") (");
+                write_search(w, b, utf8);
+                w.raw(b")");
+            }
+            SearchKey::Group(inner) => {
+                w.raw(b"(");
+                write_search(w, inner, utf8);
+                w.raw(b")");
+            }
+            SearchKey::Raw { text, .. } => write_criteria(w, text),
+        }
+    }
+}
+
 /// Write caller-supplied SEARCH-family criteria, re-emitting every counted
 /// literal the caller wrote through the writer.
 ///

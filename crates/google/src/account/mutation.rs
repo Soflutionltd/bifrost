@@ -339,7 +339,7 @@ fn mutation_stream(
                 let accounted = mutation_progress
                     .lock()
                     .expect("mutation progress lock poisoned")
-                    .shutdown_outcomes(&error);
+                    .outcomes_before_stop(&error);
                 MutationApply::Terminate {
                     accounted,
                     error,
@@ -643,14 +643,6 @@ impl MutationProgress {
             .collect()
     }
 
-    fn terminal_outcomes(&self, error: &AccountError) -> Vec<ItemOutcome<MutationSuccess>> {
-        self.outcomes_before_stop(error)
-    }
-
-    fn shutdown_outcomes(&self, error: &AccountError) -> Vec<ItemOutcome<MutationSuccess>> {
-        self.outcomes_before_stop(error)
-    }
-
     fn outcomes_before_stop(&self, error: &AccountError) -> Vec<ItemOutcome<MutationSuccess>> {
         self.ids
             .iter()
@@ -775,7 +767,7 @@ async fn apply_label_patch_tracked(
                 let accounted = progress
                     .lock()
                     .expect("mutation progress lock poisoned")
-                    .terminal_outcomes(&error);
+                    .outcomes_before_stop(&error);
                 return MutationApply::Terminate { accounted, error };
             }
         }
@@ -1110,7 +1102,7 @@ async fn apply_destroy(
                     let accounted = progress
                         .lock()
                         .expect("mutation progress lock poisoned")
-                        .terminal_outcomes(&error);
+                        .outcomes_before_stop(&error);
                     MutationApply::Terminate { accounted, error }
                 }
             }
@@ -1224,6 +1216,24 @@ mod tests {
             headers: reqwest::header::HeaderMap::new(),
             body: Bytes::from_static(body),
         }
+    }
+
+    #[test]
+    fn shutdown_evidence_preserves_dispatched_and_unattempted_lanes() {
+        let ids = [ObjectId("sent".into()), ObjectId("pending".into())];
+        let mut progress = MutationProgress::new(&ids, 1);
+        progress.begin(&ids[..1]);
+        let error = account_error::shutdown_inflight_error(AccountOperation::BulkDestroy);
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Attempt(attempt)
+                if attempt.transmission_state == bifrost_types::TransmissionState::InFlight
+        )));
+        let outcomes = progress.outcomes_before_stop(&error);
+        assert!(
+            matches!(outcomes.as_slice(), [ItemOutcome::Uncertain(entry)]
+            if entry.item.0 == "sent")
+        );
     }
 
     /// A batch already on the wire when `close()` fires must not vanish.
@@ -1586,7 +1596,7 @@ mod tests {
         let accounted = progress
             .lock()
             .expect("mutation progress lock poisoned")
-            .terminal_outcomes(&error);
+            .outcomes_before_stop(&error);
         assert!(matches!(
             accounted.as_slice(),
             [ItemOutcome::Failed(failure)] if failure.item.0 == "absent"

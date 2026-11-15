@@ -2003,7 +2003,7 @@ fn setting_an_ordinary_category_is_a_read_modify_write_over_the_existing_array()
 
 #[test]
 fn last_verb_executed_aliases_map_onto_the_graph_proptag() {
-    // `replied_via_extended_property` / `forwarded_via_extended_property`
+    // Replied and forwarded shapes select `ExtendedProperty`
     // are advertised true, and the convenience layer passes the MAPI
     // alias; Graph only accepts the proptag form.
     for alias in [

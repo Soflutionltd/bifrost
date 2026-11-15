@@ -4,6 +4,7 @@ use bifrost_types::{
     AccountCapabilities, BatchingPolicy, BlobRangeSupport, ConvenienceShape, CursorFreshness,
     FilterRuleShape, MutationCapabilities, MutationConcurrency, MutationReplaySafety,
     PimMethodSupport, PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape,
+    VersionedDoors,
 };
 
 use crate::types::{Capability, ServerProfile};
@@ -70,40 +71,28 @@ pub(crate) fn build_capabilities_for_registry(
         |cap| matches!(cap, Capability::Thread(alg) if alg.eq_ignore_ascii_case("REFERENCES")),
     );
     let contact_update = contacts.is_some_and(|caps| {
-        matches!(
-            caps.mutation.concurrency,
-            MutationConcurrency::ExpectedVersion {
-                contact_update: true,
-                ..
-            }
-        )
+        caps.mutation
+            .concurrency
+            .versioned_doors()
+            .contains(VersionedDoors::CONTACT_UPDATE)
     });
     let event_update = calendars.is_some_and(|caps| {
-        matches!(
-            caps.mutation.concurrency,
-            MutationConcurrency::ExpectedVersion {
-                event_update: true,
-                ..
-            }
-        )
+        caps.mutation
+            .concurrency
+            .versioned_doors()
+            .contains(VersionedDoors::EVENT_UPDATE)
     });
     let contact_delete = contacts.is_some_and(|caps| {
-        matches!(
-            caps.mutation.concurrency,
-            MutationConcurrency::ExpectedVersion {
-                contact_delete: true,
-                ..
-            }
-        )
+        caps.mutation
+            .concurrency
+            .versioned_doors()
+            .contains(VersionedDoors::CONTACT_DELETE)
     });
     let event_delete = calendars.is_some_and(|caps| {
-        matches!(
-            caps.mutation.concurrency,
-            MutationConcurrency::ExpectedVersion {
-                event_delete: true,
-                ..
-            }
-        )
+        caps.mutation
+            .concurrency
+            .versioned_doors()
+            .contains(VersionedDoors::EVENT_DELETE)
     });
     AccountCapabilities {
         cursor_freshness: CursorFreshness::Hybrid,
@@ -123,25 +112,14 @@ pub(crate) fn build_capabilities_for_registry(
             PushCapability::None
         },
         mutation: MutationCapabilities {
-            concurrency: if mail_set_flags
-                || contact_update
-                || event_update
-                || contact_delete
-                || event_delete
-            {
-                MutationConcurrency::ExpectedVersion {
-                    mail_set_flags,
-                    mail_move: false,
-                    mail_destroy: false,
-                    contact_update,
-                    event_update,
-                    contact_delete,
-                    event_delete,
-                    event_rsvp: false,
-                }
-            } else {
-                MutationConcurrency::None
-            },
+            concurrency: MutationConcurrency::ExpectedVersion(
+                VersionedDoors::NONE
+                    .with(VersionedDoors::MAIL_SET_FLAGS, mail_set_flags)
+                    .with(VersionedDoors::CONTACT_UPDATE, contact_update)
+                    .with(VersionedDoors::EVENT_UPDATE, event_update)
+                    .with(VersionedDoors::CONTACT_DELETE, contact_delete)
+                    .with(VersionedDoors::EVENT_DELETE, event_delete),
+            ),
             replay_safety: MutationReplaySafety::None,
             reassertion: bifrost_types::MutationReassertion {
                 set_flags: true,
@@ -243,10 +221,8 @@ pub(crate) fn build_capabilities_for_registry(
         },
         conveniences: ConvenienceShape {
             starred: StarredFlagShape::Keyword,
-            replied_via_keyword: true,
-            replied_via_extended_property: false,
-            forwarded_via_keyword: true,
-            forwarded_via_extended_property: false,
+            replied: bifrost_types::RepliedFlagShape::Keyword,
+            forwarded: bifrost_types::ForwardedFlagShape::Keyword,
             mdn_sent_via_keyword: true,
         },
         // From the open-time NAMESPACE response: IMAP discovers shared /
@@ -269,27 +245,15 @@ mod tests {
             [(false, false), (true, false), (false, true), (true, true)]
         {
             let mut contacts = crate::account::test_support::stub_capabilities();
-            contacts.mutation.concurrency = MutationConcurrency::ExpectedVersion {
-                mail_set_flags: false,
-                mail_move: false,
-                mail_destroy: false,
-                contact_update: false,
-                event_update: false,
-                contact_delete,
-                event_delete: true,
-                event_rsvp: false,
-            };
+            contacts.mutation.concurrency = MutationConcurrency::ExpectedVersion(
+                VersionedDoors::NONE
+                    .with(VersionedDoors::CONTACT_DELETE, contact_delete)
+                    .union(VersionedDoors::EVENT_DELETE),
+            );
             let mut calendars = crate::account::test_support::stub_capabilities();
-            calendars.mutation.concurrency = MutationConcurrency::ExpectedVersion {
-                mail_set_flags: false,
-                mail_move: false,
-                mail_destroy: false,
-                contact_update: false,
-                event_update: false,
-                contact_delete: true,
-                event_delete,
-                event_rsvp: false,
-            };
+            calendars.mutation.concurrency = MutationConcurrency::ExpectedVersion(
+                VersionedDoors::CONTACT_DELETE.with(VersionedDoors::EVENT_DELETE, event_delete),
+            );
             let caps = build_capabilities(
                 &profile,
                 &[],
@@ -301,18 +265,13 @@ mod tests {
                 1,
             );
             let expected = if contact_delete || event_delete {
-                MutationConcurrency::ExpectedVersion {
-                    mail_set_flags: false,
-                    mail_move: false,
-                    mail_destroy: false,
-                    contact_update: false,
-                    event_update: false,
-                    contact_delete,
-                    event_delete,
-                    event_rsvp: false,
-                }
+                MutationConcurrency::ExpectedVersion(
+                    VersionedDoors::NONE
+                        .with(VersionedDoors::CONTACT_DELETE, contact_delete)
+                        .with(VersionedDoors::EVENT_DELETE, event_delete),
+                )
             } else {
-                MutationConcurrency::None
+                MutationConcurrency::ExpectedVersion(VersionedDoors::NONE)
             };
             assert_eq!(caps.mutation.concurrency, expected);
         }
@@ -323,27 +282,13 @@ mod tests {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
         for (contact_update, event_update) in [(true, false), (false, true), (true, true)] {
             let mut contacts = crate::account::test_support::stub_capabilities();
-            contacts.mutation.concurrency = MutationConcurrency::ExpectedVersion {
-                mail_set_flags: false,
-                mail_move: false,
-                mail_destroy: false,
-                contact_update,
-                event_update: false,
-                contact_delete: false,
-                event_delete: false,
-                event_rsvp: false,
-            };
+            contacts.mutation.concurrency = MutationConcurrency::ExpectedVersion(
+                VersionedDoors::NONE.with(VersionedDoors::CONTACT_UPDATE, contact_update),
+            );
             let mut calendars = crate::account::test_support::stub_capabilities();
-            calendars.mutation.concurrency = MutationConcurrency::ExpectedVersion {
-                mail_set_flags: false,
-                mail_move: false,
-                mail_destroy: false,
-                contact_update: false,
-                event_update,
-                contact_delete: false,
-                event_delete: false,
-                event_rsvp: false,
-            };
+            calendars.mutation.concurrency = MutationConcurrency::ExpectedVersion(
+                VersionedDoors::NONE.with(VersionedDoors::EVENT_UPDATE, event_update),
+            );
             let caps = build_capabilities(
                 &profile,
                 &[],
@@ -356,16 +301,11 @@ mod tests {
             );
             assert_eq!(
                 caps.mutation.concurrency,
-                MutationConcurrency::ExpectedVersion {
-                    mail_set_flags: false,
-                    mail_move: false,
-                    mail_destroy: false,
-                    contact_update,
-                    event_update,
-                    contact_delete: false,
-                    event_delete: false,
-                    event_rsvp: false,
-                }
+                MutationConcurrency::ExpectedVersion(
+                    VersionedDoors::NONE
+                        .with(VersionedDoors::CONTACT_UPDATE, contact_update)
+                        .with(VersionedDoors::EVENT_UPDATE, event_update),
+                )
             );
         }
     }
@@ -382,16 +322,7 @@ mod tests {
         assert_eq!(caps.push, PushCapability::InProcess);
         assert_eq!(
             caps.mutation.concurrency,
-            MutationConcurrency::ExpectedVersion {
-                mail_set_flags: true,
-                mail_move: false,
-                mail_destroy: false,
-                contact_update: false,
-                event_update: false,
-                contact_delete: false,
-                event_delete: false,
-                event_rsvp: false,
-            }
+            MutationConcurrency::ExpectedVersion(VersionedDoors::MAIL_SET_FLAGS)
         );
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
         assert_eq!(
@@ -421,7 +352,10 @@ mod tests {
     fn capability_builder_leaves_mutation_concurrency_none_without_condstore() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
         let caps = build_capabilities(&profile, &[], false, None, None, false, false, 1);
-        assert_eq!(caps.mutation.concurrency, MutationConcurrency::None);
+        assert_eq!(
+            caps.mutation.concurrency,
+            MutationConcurrency::ExpectedVersion(VersionedDoors::NONE)
+        );
     }
 
     #[test]

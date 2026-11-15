@@ -160,16 +160,16 @@ rate deadline cannot weaken a longer quota hold.
 `RequestBuilder::hold_gate(key)` checks that registry immediately before every
 wire attempt, after concurrency admission, rate admission and token lookup or
 refresh. This includes net-internal retries and redirect hops. A held gate
-returns `Error::LocalHold { key, held, attempts, may_have_committed }` without dispatching or
+returns `Error::LocalHold { key, held, evidence }` without dispatching or
 recording anything back into the hold. Already dispatched attempts finish.
 Rate admission is refunded by the existing debit guard on a local refusal.
 
-`attempts` retains the earlier outcomes in order, including transport state and
+`evidence.attempts()` retains the earlier diagnostics in order, including transport state and
 response status, headers and capped diagnostic body. An initial refusal has no
 earlier attempts and translates with `Attempt(Unsent)`. A refusal between
 attempts preserves those causes and outcome diagnostics; the effective state
 is `InFlight` if a non-replayable attempt may have committed, otherwise `Acknowledged` if a
-response arrived, otherwise `Unsent`. The `may_have_committed` flag survives
+response arrived, otherwise `Unsent`. The ledger verdict survives
 redirect method rewrites: a committed POST answered by 303 followed by a held
 GET reconciles as `ThrottledMidFlight` for a non-idempotent operation, rather
 than replaying the POST. The original acknowledged response remains in the
@@ -179,7 +179,7 @@ hold's server kind and a `RetryHint::After` from the remaining monotonic
 duration; the protocol crate stamps its own budget identity.
 
 All other error exits after earlier wire attempts carry
-`Error::AttemptHistory { source, attempts, may_have_committed }`. A single
+`Error::AttemptHistory { source, evidence }`. A single
 completion boundary covers deadline checks, retry sleeps, rate admission,
 token lookup and refresh, cancellation errors, redirect classification and
 hop limits, and diagnostic drains. The evidence also travels with a successful
@@ -475,8 +475,8 @@ parser: delta-seconds produce `RetryHint::After`, and HTTP-dates produce
 `RetryHint::At`, including elapsed deadlines. Net, Graph, JMAP, Google and DAV use
 this parser for error evidence. The `retry_hint` fields on
 `ServerCause::{Unavailable, RateLimited, QuotaExhausted}` and `RetryAdvice`
-carry the hint. Error classification prefers the final response header over
-the transport's capped duration history. Google resolves deltas once when
+carry the hint. Retry envelopes store these same lossless hints at observation;
+classification reads the stored hints without reparsing their response headers. Google resolves deltas once when
 observing the response for its provider hold.
 
 Retry waits apply `honor_retry_after_cap` after parsing; that cap does not
@@ -526,7 +526,7 @@ An allowed retry refunds its quota slot; a policy-stopped attempt neither waits
 nor refunds for a retry that never happens.
 
 An unreplayable terminal transport failure past Unsent, or an ambiguous
-retryable status, carries `AttemptHistory` with `may_have_committed: true`,
+retryable status, carries `AttemptHistory` with a `MayHaveCommitted` ledger verdict,
 even with no earlier attempts. A lone RateLimited or terminal Status is not
 newly wrapped. Net narrows classification with `idempotency_override(false)`.
 An empty transport history preserves the terminal transport kind; an ambiguous
@@ -578,10 +578,9 @@ the driver fans `Arc<Error>` clones to every waiter (because
 transient-vs-permanent: `Network`/`Timeout` survive as themselves;
 true auth failures (token-endpoint 401/403) map to `AuthLost`.
 OAuth 429/503 `Retry-After` values are parsed as `RetryHint` before the auth
-wrapper stores an absolute deadline. An HTTP-date stays an absolute deadline
-even when it has elapsed, so account-error translation can still report
-`RetryHint::At` instead of losing the issuer's hint. Delta-seconds are resolved
-against the current time when stored.
+wrapper stores that same hint. HTTP-dates remain `At`, including elapsed dates,
+and delta-seconds remain `After`. Only actual transport waits resolve and cap
+hints; the stored server evidence is never capped.
 
 A waiter whose driver drops the sender without answering - task
 cancelled, panicked, or the runtime shutting down - also gets
@@ -1423,14 +1422,14 @@ Full trace propagation (reading trace_id from the current
 `Error` is `#[non_exhaustive]` and `thiserror`-derived. Notable
 variants:
 
-- `AttemptHistory { source, attempts, may_have_committed }` - terminal
+- `AttemptHistory { source, evidence }` - terminal
   stage failure together with earlier wire outcomes. The complete error feeds
   classification; `terminal()` is a diagnostic view of the failing stage.
-  `attempts` may be empty: an unreplayable request whose only attempt ended in
+  `evidence.attempts()` may be empty: an unreplayable request whose only attempt ended in
   a transport failure past `Unsent` or an ambiguous retryable status is
-  wrapped with `may_have_committed: true`, which translation turns into an
+  wrapped with a `MayHaveCommitted` ledger verdict, which translation turns into an
   `idempotency_override(false)` narrowing.
-- `LocalHold { key, held, attempts, may_have_committed }` - registry gate
+- `LocalHold { key, held, evidence }` - registry gate
   refusal with the same accumulated transmission evidence.
 - `Network { message, transmission_state, source }` - transport-level
   failures (DNS, TCP reset, generic transport). `transmission_state`
@@ -1446,7 +1445,7 @@ variants:
 - `Status { code, body, headers }` - terminal non-retryable HTTP
   status. `body` is capped at 4 KB via `cap_status_body` with a
   truncation marker.
-- `RetryBudgetExhausted { final_response, retry_after_history }` -
+- `RetryBudgetExhausted { final_response, retry_after_history, stop_reason }` -
   retrying stopped because the attempt budget was spent or the request's
   replay policy forbids another attempt (the latter can happen with budget
   left). `final_response` preserves the last status, headers, and capped body
@@ -1462,8 +1461,7 @@ variants:
   unset because it is not evidence for the target request.
 - `RefreshFailed { retry_after, source: Arc<Error> }` - transient
   refresh failure preserving the original. OAuth `Retry-After`
-  deadlines are stored on the wrapper for the account-error
-  conversion.
+  hints are stored losslessly on the wrapper for account-error conversion.
 - `ResponseTooLarge { limit }` - a buffered body exceeded
   `AccountSpec::max_buffered_response`. Maps to
   `Protocol(ContractViolation)`, not a transport class: the server
@@ -1684,11 +1682,23 @@ the terminal retry classification remains intact. Non-replayable uncertainty
 survives later local, credential and unsent failures and requires reconciliation.
 A direct terminal status remains a complete answer with its normal classification.
 
-The existing `AttemptHistory` and `LocalHold` public fields remain the transport
-and diagnostic envelope for consumers that construct or inspect them. Internally,
-`AttemptEvidence` carries the ledger instead of separate commit booleans.
-Account-error translation reads raw evidence into the ledger and consumes its
-verdict; translated diagnostic cause chains do not decide replay safety.
+`AttemptHistory` and `LocalHold` carry `RequestEvidence`, whose private ledger
+and diagnostic history are exposed through `ledger()`, `verdict()` and
+`attempts()`. Construction flattens nested historical envelopes, and redaction
+preserves the ledger. The send loop transfers its ledger without recording the
+terminal response twice. Account-error translation consumes this ledger;
+translated diagnostic cause chains do not decide replay safety.
+`RequestEvidence::new` admits synthetic history with a typed commit verdict and
+never weakens evidence discovered in that history.
+
+`RetryStopReason::{AttemptBudget, ReplayForbidden}` distinguishes exhausted
+attempts from replay-policy refusal; replay refusal wins when both apply.
+`RateLimited.retry_after`, `RetryBudgetExhausted.retry_after_history` and
+`RefreshFailed.retry_after` all store `RetryHint`. The transport caps only the
+wait it performs, preserving uncapped server advice for consumers.
+`HoldKind` deliberately remains a restricted rate/quota classification because
+generic unavailable/server errors cannot create timed holds. Its `server_kind`
+and `server_cause` projections own conversion into the shared error model.
 
 Graph selects its separately configured Outlook token source through `HopPolicy`
 for EWS and Autodiscover, retaining the account transport's accounting, request

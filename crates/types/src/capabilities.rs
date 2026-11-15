@@ -68,23 +68,62 @@ pub enum PushCapability {
 #[non_exhaustive]
 pub enum MutationConcurrency {
     /// Legacy provider-observed state guards, without a caller-version guarantee.
+    // Retained pending the owner decision on provider-observed state guards.
     StateBased,
     /// Caller versions are enforced for the named doors. Other doors
     /// have no caller-version guarantee. DAV relocation with a version is
     /// refused because its multi-request fallback cannot preserve the guard.
-    ExpectedVersion {
-        /// Mail flag writes. IMAP refuses a versioned two-sided patch.
-        mail_set_flags: bool,
-        mail_move: bool,
-        mail_destroy: bool,
-        contact_update: bool,
-        event_update: bool,
-        contact_delete: bool,
-        event_delete: bool,
-        event_rsvp: bool,
-    },
-    /// No caller-version concurrency control. Supplied versions are refused.
-    None,
+    ExpectedVersion(VersionedDoors),
+}
+
+/// Doors that enforce a caller-supplied version with a native atomic guard.
+/// The empty set is the sole representation of no caller-version support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VersionedDoors(u8);
+
+impl VersionedDoors {
+    pub const NONE: Self = Self(0);
+    /// Mail flag writes. IMAP refuses a versioned two-sided patch.
+    pub const MAIL_SET_FLAGS: Self = Self(1);
+    pub const MAIL_MOVE: Self = Self(1 << 1);
+    pub const MAIL_DESTROY: Self = Self(1 << 2);
+    pub const CONTACT_UPDATE: Self = Self(1 << 3);
+    pub const EVENT_UPDATE: Self = Self(1 << 4);
+    pub const CONTACT_DELETE: Self = Self(1 << 5);
+    pub const EVENT_DELETE: Self = Self(1 << 6);
+    pub const EVENT_RSVP: Self = Self(1 << 7);
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Include a door when its negotiated prerequisite is present.
+    #[must_use]
+    pub const fn with(self, doors: Self, enabled: bool) -> Self {
+        if enabled { self.union(doors) } else { self }
+    }
+
+    #[must_use]
+    pub const fn contains(self, doors: Self) -> bool {
+        self.0 & doors.0 == doors.0
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl MutationConcurrency {
+    /// Legacy state guards do not promise any caller-version door.
+    #[must_use]
+    pub const fn versioned_doors(self) -> VersionedDoors {
+        match self {
+            Self::ExpectedVersion(doors) => doors,
+            Self::StateBased => VersionedDoors::NONE,
+        }
+    }
 }
 
 /// Client-mintable wire dedup token availability.
@@ -385,22 +424,36 @@ pub enum StarredFlagShape {
     None,
 }
 
+/// Primitive used to persist replied state. Gmail derives it during sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RepliedFlagShape {
+    /// Set `$answered` via `set_keyword`.
+    Keyword,
+    /// Set Graph PR_LAST_VERB_EXECUTED via `set_extended_property`.
+    ExtendedProperty,
+    None,
+}
+
+/// Primitive used to persist forwarded state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ForwardedFlagShape {
+    /// Set `$forwarded` via `set_keyword`.
+    Keyword,
+    /// Set Graph PR_LAST_VERB_EXECUTED via `set_extended_property`.
+    ExtendedProperty,
+    None,
+}
+
 /// Per-convenience dispatch hints. The convenience default impls
 /// read these to pick the right primitive without doing a runtime
 /// `match` on protocol kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConvenienceShape {
     pub starred: StarredFlagShape,
-    /// True iff `mark_replied` should flip `$answered` via
-    /// `set_keyword`. Gmail accounts set this `false` because the
-    /// flag is derived on sync.
-    pub replied_via_keyword: bool,
-    /// True iff `mark_replied` should set Graph's
-    /// PR_LAST_VERB_EXECUTED via `set_extended_property`.
-    pub replied_via_extended_property: bool,
-    /// Same shape for the `$forwarded` flag.
-    pub forwarded_via_keyword: bool,
-    pub forwarded_via_extended_property: bool,
+    pub replied: RepliedFlagShape,
+    pub forwarded: ForwardedFlagShape,
     /// True iff `mark_mdn_sent` should flip the `$MDNSent` keyword via
     /// `set_keyword`. `true` on JMAP and IMAP. `false` on Gmail and Graph:
     /// their read-receipt model (Graph `isReadReceiptRequested`) is
@@ -412,10 +465,8 @@ impl Default for ConvenienceShape {
     fn default() -> Self {
         Self {
             starred: StarredFlagShape::None,
-            replied_via_keyword: false,
-            replied_via_extended_property: false,
-            forwarded_via_keyword: false,
-            forwarded_via_extended_property: false,
+            replied: RepliedFlagShape::None,
+            forwarded: ForwardedFlagShape::None,
             mdn_sent_via_keyword: false,
         }
     }

@@ -17,7 +17,6 @@
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use bifrost_types::DiagnosticText;
 use quick_xml::Reader;
-use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 
 use super::EwsError;
@@ -213,7 +212,8 @@ pub(crate) fn parse_find_folder_response(xml: &str) -> Result<Vec<EwsFolder>, Ew
                     folder_id = attribute(e, "Id")?;
                 }
             }
-            Ok(Event::Text(ref e)) => push_text(e, &mut buf)?,
+            Ok(Event::Text(ref e)) => super::push_text(e, &mut buf)
+                .map_err(|reason| malformed(format!("EWS text: {reason}")))?,
             Ok(Event::GeneralRef(ref e)) => push_ref(e, &mut buf)?,
             Ok(Event::End(ref e)) => {
                 let name = e.name().as_ref().to_owned();
@@ -323,7 +323,8 @@ pub(crate) fn parse_get_folder_response(xml: &str) -> Result<EwsFolder, EwsError
                     current_property_tag = attribute(e, "PropertyTag")?;
                 }
             }
-            Ok(Event::Text(ref e)) => push_text(e, &mut buf)?,
+            Ok(Event::Text(ref e)) => super::push_text(e, &mut buf)
+                .map_err(|reason| malformed(format!("EWS text: {reason}")))?,
             Ok(Event::GeneralRef(ref e)) => push_ref(e, &mut buf)?,
             Ok(Event::End(ref e)) => {
                 let name = e.name().as_ref().to_owned();
@@ -513,7 +514,8 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                     next_offset = attribute(e, "IndexedPagingOffset")?.parse().ok();
                 }
             }
-            Ok(Event::Text(ref e)) => push_text(e, &mut buf)?,
+            Ok(Event::Text(ref e)) => super::push_text(e, &mut buf)
+                .map_err(|reason| malformed(format!("EWS text: {reason}")))?,
             Ok(Event::GeneralRef(ref e)) => push_ref(e, &mut buf)?,
             Ok(Event::End(ref e)) => {
                 let name = e.name().as_ref().to_owned();
@@ -718,7 +720,8 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                     change_key = Some(attribute(e, "ChangeKey")?).filter(|s| !s.is_empty());
                 }
             }
-            Ok(Event::Text(ref e)) => push_text(e, &mut buf)?,
+            Ok(Event::Text(ref e)) => super::push_text(e, &mut buf)
+                .map_err(|reason| malformed(format!("EWS text: {reason}")))?,
             Ok(Event::GeneralRef(ref e)) => push_ref(e, &mut buf)?,
             Ok(Event::End(ref e)) => {
                 let name = e.name().as_ref().to_owned();
@@ -880,7 +883,8 @@ pub(crate) fn parse_get_attachment_response(xml: &str) -> Result<EwsAttachmentCo
                     attachment_id = attribute(e, "Id")?;
                 }
             }
-            Ok(Event::Text(ref e)) => push_text(e, &mut buf)?,
+            Ok(Event::Text(ref e)) => super::push_text(e, &mut buf)
+                .map_err(|reason| malformed(format!("EWS text: {reason}")))?,
             Ok(Event::GeneralRef(ref e)) => push_ref(e, &mut buf)?,
             Ok(Event::End(ref e)) => {
                 let name_bytes = e.name().as_ref().to_owned();
@@ -1002,15 +1006,6 @@ impl EwsItem {
                     | "PostItem"
             )
     }
-}
-
-/// A text run that does not unescape is a malformed response, not an empty
-/// run: dropping it would splice the text on either side into a different
-/// value (a subject, an address, an id).
-fn push_text(e: &quick_xml::events::BytesText<'_>, buf: &mut String) -> Result<(), EwsError> {
-    let text = unescape(e.as_ref()).map_err(|error| malformed(format!("EWS text: {error}")))?;
-    buf.push_str(&text);
-    Ok(())
 }
 
 /// A named attribute, unescaped (empty when absent); one that does not

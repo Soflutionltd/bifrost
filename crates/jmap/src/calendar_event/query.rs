@@ -1,3 +1,5 @@
+use super::value::LocalDateTime;
+
 use serde::Serialize;
 
 use crate::core::query::{self, QueryObject};
@@ -25,11 +27,11 @@ pub(crate) enum Filter {
     },
     After {
         #[serde(rename = "after")]
-        value: String,
+        value: LocalDateTime,
     },
     Before {
         #[serde(rename = "before")]
-        value: String,
+        value: LocalDateTime,
     },
     Text {
         #[serde(rename = "text")]
@@ -98,16 +100,12 @@ impl Filter {
         }
     }
 
-    pub(crate) fn after(value: impl Into<String>) -> Self {
-        Filter::After {
-            value: value.into(),
-        }
+    pub(crate) fn after(value: LocalDateTime) -> Self {
+        Filter::After { value }
     }
 
-    pub(crate) fn before(value: impl Into<String>) -> Self {
-        Filter::Before {
-            value: value.into(),
-        }
+    pub(crate) fn before(value: LocalDateTime) -> Self {
+        Filter::Before { value }
     }
 
     pub(crate) fn text(value: impl Into<String>) -> Self {

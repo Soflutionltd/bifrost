@@ -94,7 +94,7 @@ impl Harness {
             Arc::<PendingCoverage>::clone(&coverage),
         );
         let (changes_tx, _) = broadcast::channel(64);
-        let delivery = Arc::new(ChangeDelivery::new(changes_tx.clone()));
+        let delivery = Arc::new(ChangeDelivery::new(changes_tx));
         let gate =
             crate::scheduler::BudgetGate::new(crate::scheduler::ConcurrencyBudget::default());
         gate.register(account_id.clone());
@@ -125,7 +125,6 @@ impl Harness {
                 crate::types::Incarnation::initial_generation(),
             ))),
             cursors,
-            changes_tx,
             account_id,
             control,
             account_control_tx: broadcast::channel(8).0,
@@ -162,7 +161,6 @@ impl Harness {
                 registry: Arc::clone(&registry),
                 config: BackfillConfig::default(),
                 fusion_owned_scopes: HashSet::new(),
-                changes_tx: Some(ctx.changes_tx.clone()),
             },
         ));
         drain().await;

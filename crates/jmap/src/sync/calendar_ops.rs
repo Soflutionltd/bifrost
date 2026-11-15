@@ -12,6 +12,8 @@
 //! that settles it is a real server's response, and that evidence has to be
 //! gathered downstream.
 
+use crate::calendar_event::value::{Duration as CalendarDuration, LocalDateTime};
+
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountFuture, AccountOperation,
     AttendeeRole, Calendar, CalendarEvent, CalendarId, CalendarProvenance, Cause, DiagnosticText,
@@ -550,13 +552,24 @@ fn event_from_jmap(
         .unwrap_or_default();
     let calendar_id = event
         .calendar_ids()
-        .and_then(|ids| ids.keys().next().cloned())
-        .map(CalendarId)
+        .and_then(|ids| ids.into_iter().min_by(|a, b| a.as_str().cmp(b.as_str())))
+        .map(|id| CalendarId(id.into_string()))
         .unwrap_or_else(|| CalendarId(String::new()));
     let is_all_day = event.show_without_time().unwrap_or(false);
     let raw_start = event.start().unwrap_or_default();
-    let raw_end =
-        end_from_start_duration(raw_start, event.duration().unwrap_or_default(), is_all_day);
+    // Missing duration means PT0S. Malformed or unrepresentable duration is
+    // not zero: users must not see a different end silently fabricated.
+    let duration = event
+        .duration()
+        .unwrap_or("PT0S")
+        .parse::<CalendarDuration>()
+        .map_err(|message| to_acct_err(operation)(crate::Error::NotParsable(message.into())))?;
+    if duration.signed().is_none() {
+        return Err(to_acct_err(operation)(crate::Error::NotParsable(
+            "JSCalendar duration is outside the representable range".into(),
+        )));
+    }
+    let raw_end = end_from_start_duration(raw_start, duration.as_str(), is_all_day);
     let timezone = event.time_zone().as_value().map(ToString::to_string);
     let start = EventTime {
         value: shared_time_from_jmap(raw_start, is_all_day),
@@ -833,6 +846,9 @@ fn jmap_patch_from_event_patch(
         ));
     }
     if let Some(recurrence) = &patch.recurrence {
+        recurrence
+            .parsed_rule()
+            .map_err(|error| malformed_time(operation, "recurrence.rrule", error.to_string()))?;
         match recurrence.rrule.as_deref() {
             // No rule in the shared recurrence means "no recurrence rule":
             // clear whatever the server holds.
@@ -1042,6 +1058,13 @@ fn write_event_create(
     // `create` validates first, but the builder must not depend on that
     // call order: a future caller that skipped validation would otherwise
     // create the event with its recurrence quietly dropped.
+    event.recurrence.parsed_rule().map_err(|error| {
+        malformed_time(
+            AccountOperation::EventCreate,
+            "recurrence.rrule",
+            error.to_string(),
+        )
+    })?;
     if let Some(rrule) = event.recurrence.rrule.as_deref() {
         let rule = jmap_recurrence_rule_from_rrule(rrule, Some(&event.start), event.is_all_day)
             .ok_or_else(|| {
@@ -1106,6 +1129,9 @@ fn validate_shared_recurrence(
     is_all_day: bool,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
+    recurrence
+        .parsed_rule()
+        .map_err(|error| malformed_time(operation, "recurrence.rrule", error.to_string()))?;
     if recurrence
         .rrule
         .as_deref()
@@ -1139,18 +1165,13 @@ fn jmap_recurrence_rule_from_rrule(
 ) -> Option<Value> {
     let mut object = Map::new();
     object.insert("@type".to_string(), json!("RecurrenceRule"));
-    for part in rrule.split(';') {
-        let (key, value) = part.split_once('=')?;
+    let parsed = rrule
+        .parse::<bifrost_types::calendar::RecurrenceRule>()
+        .ok()?;
+    for (key, value) in parsed.parts() {
         match key.to_ascii_uppercase().as_str() {
             "FREQ" => {
                 let frequency = value.to_ascii_lowercase();
-                if ![
-                    "yearly", "monthly", "weekly", "daily", "hourly", "minutely", "secondly",
-                ]
-                .contains(&frequency.as_str())
-                {
-                    return None;
-                }
                 object.insert("frequency".to_string(), Value::String(frequency));
             }
             "INTERVAL" => {
@@ -1162,11 +1183,14 @@ fn jmap_recurrence_rule_from_rrule(
             "UNTIL" => {
                 object.insert(
                     "until".to_string(),
-                    Value::String(jmap_until_from_ical(value, start, is_all_day)?),
+                    Value::String(jmap_until_from_ical(parsed.until()?, start, is_all_day)?),
                 );
             }
             "BYDAY" => {
-                object.insert("byDay".to_string(), Value::Array(jmap_by_day(value)?));
+                object.insert(
+                    "byDay".to_string(),
+                    Value::Array(jmap_by_day(parsed.by_day())),
+                );
             }
             "BYMONTH" => {
                 // RFC 8984 section 4.3.3 types byMonth as String[] (month
@@ -1216,13 +1240,6 @@ fn rrule_from_jmap_recurrence_rule(
         .get("frequency")
         .and_then(Value::as_str)
         .ok_or("JMAP recurrence frequency is missing or invalid")?;
-    if ![
-        "yearly", "monthly", "weekly", "daily", "hourly", "minutely", "secondly",
-    ]
-    .contains(&frequency)
-    {
-        return Err("JMAP recurrence frequency is unsupported");
-    }
     parts.push(format!("FREQ={}", frequency.to_ascii_uppercase()));
     if let Some(interval) = object.get("interval") {
         parts.push(format!(
@@ -1272,33 +1289,46 @@ fn rrule_from_jmap_recurrence_rule(
             rrule_integer_list(by_month_day).ok_or("JMAP recurrence byMonthDay is invalid")?
         ));
     }
-    Ok(Some(parts.join(";")))
+    let text = parts.join(";");
+    text.parse::<bifrost_types::calendar::RecurrenceRule>()
+        .map_err(|_| "JMAP recurrence rule is invalid")?;
+    Ok(Some(text))
 }
 
 fn jmap_until_from_ical(
-    value: &str,
+    until: bifrost_types::calendar::RecurrenceUntil,
     start: Option<&EventTime>,
     is_all_day: bool,
 ) -> Option<String> {
-    if is_all_day {
-        let date = civil::Date::strptime("%Y%m%d", value).ok()?;
-        return Some(date.strftime("%Y-%m-%dT00:00:00").to_string());
+    use bifrost_types::calendar::RecurrenceUntil;
+    match until {
+        RecurrenceUntil::Date(date) if is_all_day => Some(format!("{date}T00:00:00")),
+        RecurrenceUntil::DateTime {
+            date,
+            hour,
+            minute,
+            second,
+            utc,
+        } if !is_all_day => {
+            let time = civil::Time::new(
+                i8::try_from(hour).ok()?,
+                i8::try_from(minute).ok()?,
+                i8::try_from(second).ok()?,
+                0,
+            )
+            .ok()?;
+            let datetime = date.to_datetime(time);
+            if utc {
+                let timezone = TimeZone::get(start?.timezone.as_deref()?).ok()?;
+                let instant = Offset::UTC.to_timestamp(datetime).ok()?;
+                Some(timezone.to_datetime(instant).to_string())
+            } else {
+                start.filter(|start| start.timezone.is_none())?;
+                Some(datetime.to_string())
+            }
+        }
+        _ => None,
     }
-    let raw = value.trim_end_matches(['Z', 'z']);
-    let datetime = civil::DateTime::strptime("%Y%m%dT%H%M%S", raw).ok()?;
-    if value.ends_with(['Z', 'z']) {
-        let start = start?;
-        let timezone = TimeZone::get(start.timezone.as_deref()?).ok()?;
-        let instant = Offset::UTC.to_timestamp(datetime).ok()?;
-        return Some(
-            timezone
-                .to_datetime(instant)
-                .strftime("%Y-%m-%dT%H:%M:%S")
-                .to_string(),
-        );
-    }
-    start.filter(|start| start.timezone.is_none())?;
-    Some(datetime.strftime("%Y-%m-%dT%H:%M:%S").to_string())
 }
 
 fn ical_until_from_jmap(
@@ -1307,8 +1337,13 @@ fn ical_until_from_jmap(
     is_all_day: bool,
     timezone: Option<&str>,
 ) -> Result<String, &'static str> {
-    let until = civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", value)
-        .map_err(|_| "JMAP recurrence until is not a LocalDateTime")?;
+    let until = value
+        .parse::<LocalDateTime>()
+        .map_err(|_| "JMAP recurrence until is not a LocalDateTime")?
+        .civil();
+    if until.subsec_nanosecond() != 0 {
+        return Err("an RFC 5545 UNTIL cannot express fractional seconds");
+    }
     if is_all_day || start.len() == 10 {
         if until.time() != civil::Time::MIN {
             return Err("an all-day JMAP recurrence until must be midnight");
@@ -1329,34 +1364,28 @@ fn ical_until_from_jmap(
     Ok(until.strftime("%Y%m%dT%H%M%S").to_string())
 }
 
-fn jmap_by_day(value: &str) -> Option<Vec<Value>> {
-    value
-        .split(',')
+fn jmap_by_day(days: &[bifrost_types::calendar::RecurrenceDay]) -> Vec<Value> {
+    days.iter()
         .map(|day| {
-            let (nth, day) = split_by_day(day)?;
+            use jiff::civil::Weekday::*;
+            let name = match day.weekday {
+                Monday => "mo",
+                Tuesday => "tu",
+                Wednesday => "we",
+                Thursday => "th",
+                Friday => "fr",
+                Saturday => "sa",
+                Sunday => "su",
+            };
             let mut object = Map::new();
-            object.insert("@type".to_string(), json!("NDay"));
-            object.insert("day".to_string(), Value::String(day.to_ascii_lowercase()));
-            if let Some(nth) = nth {
-                object.insert("nthOfPeriod".to_string(), json!(nth));
+            object.insert("@type".into(), json!("NDay"));
+            object.insert("day".into(), json!(name));
+            if let Some(ordinal) = day.ordinal {
+                object.insert("nthOfPeriod".into(), json!(ordinal));
             }
-            Some(Value::Object(object))
+            Value::Object(object)
         })
         .collect()
-}
-
-fn split_by_day(value: &str) -> Option<(Option<i64>, &str)> {
-    if value.len() == 2 {
-        return ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
-            .contains(&value.to_ascii_uppercase().as_str())
-            .then_some((None, value));
-    }
-    let split = value.len().checked_sub(2)?;
-    let nth = value[..split].parse::<i64>().ok()?;
-    let day = &value[split..];
-    ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
-        .contains(&day.to_ascii_uppercase().as_str())
-        .then_some((Some(nth), day))
 }
 
 fn integer_list(value: &str) -> Option<Vec<Value>> {
@@ -1409,12 +1438,13 @@ fn rrule_by_day(value: &Value) -> Option<String> {
                 return None;
             }
             let day = object.get("day")?.as_str()?;
-            split_by_day(day)?;
-            let prefix = object
-                .get("nthOfPeriod")
-                .and_then(Value::as_i64)
-                .map(|nth| nth.to_string())
-                .unwrap_or_default();
+            if day.len() != 2 {
+                return None;
+            }
+            let prefix = match object.get("nthOfPeriod") {
+                Some(nth) => nth.as_i64()?.to_string(),
+                None => String::new(),
+            };
             Some(format!("{}{}", prefix, day.to_ascii_uppercase()))
         })
         .collect::<Option<Vec<_>>>()
@@ -1737,7 +1767,7 @@ fn event_duration(
     end: &EventTime,
     is_all_day: bool,
     operation: AccountOperation,
-) -> Result<String, AccountError> {
+) -> Result<CalendarDuration, AccountError> {
     let start = parse_time(start, "start", is_all_day, operation)?;
     let end = parse_time(end, "end", is_all_day, operation)?;
     let before_start = || {
@@ -1755,14 +1785,24 @@ fn event_duration(
         // `EventTime`'s all-day end is exclusive, so the JSCalendar
         // duration is exactly end - start days (a single all-day event,
         // start D / end D+1, is P1D).
-        Ok(format!("P{days}D"))
+        format!("P{days}D")
+            .parse::<CalendarDuration>()
+            .map_err(|error| malformed_time(operation, "end", error.into()))
     };
     let seconds = |start: Timestamp, end: Timestamp| {
-        let seconds = end.duration_since(start).as_secs();
-        if seconds < 0 {
+        let elapsed = end.duration_since(start);
+        if elapsed.is_negative() {
             return Err(before_start());
         }
-        Ok(format!("PT{seconds}S"))
+        let seconds = elapsed.as_secs();
+        let fraction = elapsed.subsec_nanos();
+        let text = if fraction == 0 {
+            format!("PT{seconds}S")
+        } else {
+            format!("PT{seconds}.{fraction:09}S")
+        };
+        text.parse::<CalendarDuration>()
+            .map_err(|error| malformed_time(operation, "end", error.into()))
     };
     let local = |datetime: civil::DateTime| {
         Offset::UTC.to_timestamp(datetime).map_err(|_| {
@@ -1816,7 +1856,7 @@ fn jmap_time_from_shared(
     time: &EventTime,
     is_all_day: bool,
     operation: AccountOperation,
-) -> Result<String, AccountError> {
+) -> Result<LocalDateTime, AccountError> {
     let wall = match parse_time(time, "start", is_all_day, operation)? {
         // JSCalendar has no DATE type: RFC 8984 `start` is always a
         // LocalDateTime, and an all-day event is midnight on its date with
@@ -1837,7 +1877,8 @@ fn jmap_time_from_shared(
             .parse::<civil::DateTime>()
             .unwrap_or_else(|_| Offset::UTC.to_datetime(instant)),
     };
-    Ok(wall.strftime("%Y-%m-%dT%H:%M:%S").to_string())
+    LocalDateTime::from_civil(wall)
+        .map_err(|error| malformed_time(operation, "start", error.into()))
 }
 
 // The JSCalendar event-query `after`/`before` filter conditions are
@@ -1849,13 +1890,17 @@ fn jmap_time_from_shared(
 // date-time is already a LocalDateTime. An empty or unparseable bound is
 // `Request(Malformed)` naming `field`, refused before any request as the
 // google and caldav range reads refuse theirs, never sent to the server raw.
-fn jmap_utc_filter_time(time: &EventTime, field: &'static str) -> Result<String, AccountError> {
+fn jmap_utc_filter_time(
+    time: &EventTime,
+    field: &'static str,
+) -> Result<LocalDateTime, AccountError> {
     let wall = match parse_time(time, field, false, AccountOperation::EventsInRange)? {
         Moment::Date(date) => date.to_datetime(civil::Time::MIN),
         Moment::Local(datetime) => datetime,
         Moment::Instant(instant) => Offset::UTC.to_datetime(instant),
     };
-    Ok(wall.strftime("%Y-%m-%dT%H:%M:%S").to_string())
+    LocalDateTime::from_civil(wall)
+        .map_err(|error| malformed_time(AccountOperation::EventsInRange, field, error.into()))
 }
 
 #[cfg(test)]
@@ -1873,82 +1918,51 @@ fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> 
 /// Render an instant for the shared `EventTime` layer, which spells the
 /// UTC offset out as `+00:00` rather than `Z`.
 fn shared_rfc3339(at: Timestamp) -> String {
-    Offset::UTC
-        .to_datetime(at)
-        .strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        .to_string()
+    format!("{}+00:00", Offset::UTC.to_datetime(at))
 }
 
 /// A zoneless JSCalendar LocalDateTime, anchored at UTC so two of them
 /// compare against each other and against offset-bearing values on one
 /// consistent scale.
 fn local_datetime(value: &str) -> Option<Timestamp> {
-    let naive = civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", value).ok()?;
+    let naive = value.parse::<LocalDateTime>().ok()?.civil();
     Offset::UTC.to_timestamp(naive).ok()
 }
 
 fn end_from_start_duration(start: &str, duration: &str, is_all_day: bool) -> String {
-    let seconds = parse_duration_seconds(duration).unwrap_or(0);
+    let offset = duration
+        .parse::<CalendarDuration>()
+        .ok()
+        .and_then(|duration| duration.signed())
+        .unwrap_or(SignedDuration::ZERO);
     if (is_all_day || start.len() == 10)
         && let Ok(date) =
             civil::Date::strptime("%Y-%m-%d", start.split('T').next().unwrap_or(start))
     {
         // `EventTime`'s all-day end is exclusive: end = start + duration
         // days (a P1D JSCalendar all-day event, start D, ends D+1).
-        let days = seconds.div_ceil(86_400);
+        let nanos = offset.as_nanos();
+        let nanos_per_day = 86_400_i128 * 1_000_000_000;
+        let days = nanos / nanos_per_day + i128::from(nanos % nanos_per_day != 0);
         let end = Span::new()
             .try_days(i64::try_from(days).unwrap_or(i64::MAX))
             .and_then(|span| date.checked_add(span))
             .unwrap_or(date);
         return end.strftime("%Y-%m-%d").to_string();
     }
-    let offset = SignedDuration::from_secs(i64::try_from(seconds).unwrap_or(i64::MAX));
     if let Ok(start) = start.parse::<Timestamp>() {
         return shared_rfc3339(start.checked_add(offset).unwrap_or(start));
     }
     if let Some(start) = local_datetime(start) {
         let end = start.checked_add(offset).unwrap_or(start);
-        return Offset::UTC
-            .to_datetime(end)
-            .strftime("%Y-%m-%dT%H:%M:%S")
-            .to_string();
+        return Offset::UTC.to_datetime(end).to_string();
     }
     start.to_string()
 }
 
+#[cfg(test)]
 fn parse_duration_seconds(value: &str) -> Option<u64> {
-    let value = value.strip_prefix('P')?;
-    let mut seconds = 0_u64;
-    let mut number = String::new();
-    let mut in_time = false;
-    for ch in value.chars() {
-        match ch {
-            'T' => in_time = true,
-            'W' if !in_time => {
-                seconds = seconds.checked_add(number.parse::<u64>().ok()?.checked_mul(604_800)?)?;
-                number.clear();
-            }
-            'D' => {
-                seconds = seconds.checked_add(number.parse::<u64>().ok()?.checked_mul(86_400)?)?;
-                number.clear();
-            }
-            'H' if in_time => {
-                seconds = seconds.checked_add(number.parse::<u64>().ok()?.checked_mul(3_600)?)?;
-                number.clear();
-            }
-            'M' if in_time => {
-                seconds = seconds.checked_add(number.parse::<u64>().ok()?.checked_mul(60)?)?;
-                number.clear();
-            }
-            'S' if in_time => {
-                seconds = seconds.checked_add(number.parse::<u64>().ok()?)?;
-                number.clear();
-            }
-            digit if digit.is_ascii_digit() => number.push(digit),
-            _ => return None,
-        }
-    }
-    number.is_empty().then_some(seconds)
+    value.parse::<CalendarDuration>().ok()?.whole_seconds()
 }
 
 fn rights_can_write(rights: Option<&CalendarRights>) -> bool {
@@ -2945,7 +2959,7 @@ mod tests {
     #[derive(Clone)]
     struct ScriptedPage {
         ids: Vec<&'static str>,
-        position: i32,
+        position: u64,
         total: usize,
         query_state: &'static str,
     }
@@ -3594,13 +3608,13 @@ mod tests {
     #[test]
     fn recurrence_rule_writes_jscalendar_object() {
         let rule = jmap_recurrence_rule_from_rrule(
-            "FREQ=WEEKLY;INTERVAL=2;COUNT=5;BYDAY=MO,WE;BYMONTH=6;BYMONTHDAY=2",
+            "FREQ=MONTHLY;INTERVAL=2;COUNT=5;BYDAY=MO,WE;BYMONTH=6;BYMONTHDAY=2",
             None,
             false,
         )
         .expect("rrule should convert");
 
-        assert_eq!(rule["frequency"].as_str(), Some("weekly"));
+        assert_eq!(rule["frequency"].as_str(), Some("monthly"));
         assert_eq!(rule["interval"].as_u64(), Some(2));
         assert_eq!(rule["count"].as_u64(), Some(5));
         assert_eq!(rule["byDay"][0]["day"].as_str(), Some("mo"));
@@ -4584,5 +4598,52 @@ mod tests {
         };
         assert!(rights_can_write(Some(&rights)));
         assert!(!rights_can_delete(Some(&rights)));
+    }
+    #[test]
+    fn invalid_recurrence_is_malformed_before_provider_projection() {
+        for text in [
+            "FREQ=DAILY;COUNT=0",
+            "FREQ=DAILY;INTERVAL=0",
+            "FREQ=DAILY;FREQ=WEEKLY",
+            "FREQ=DAILY;BYDAY=1MO",
+        ] {
+            let recurrence = EventRecurrence {
+                rrule: Some(text.into()),
+                ..Default::default()
+            };
+            let error =
+                validate_shared_recurrence(&recurrence, None, false, AccountOperation::EventCreate)
+                    .expect_err("shared grammar must refuse malformed rules");
+            assert_malformed_field(&error, "recurrence.rrule");
+        }
+    }
+
+    #[test]
+    fn fractional_duration_survives_the_conversion_boundary() {
+        let duration = event_duration(
+            &time("2026-06-02T12:00:00Z"),
+            &time("2026-06-02T12:00:00.125Z"),
+            false,
+            AccountOperation::EventCreate,
+        )
+        .unwrap();
+        assert_eq!(duration, "PT0.125000000S");
+        assert_eq!(
+            end_from_start_duration("2026-06-02T12:00:00", duration.as_str(), false),
+            "2026-06-02T12:00:00.125"
+        );
+    }
+
+    #[test]
+    fn malformed_server_duration_is_not_a_zero_length_event() {
+        let raw: JmapCalendarEvent = serde_json::from_value(json!({
+            "id": "e1", "start": "2026-06-02T12:00:00", "duration": "PT1H2H"
+        }))
+        .unwrap();
+        let error = event_from_jmap(raw, AccountOperation::EventGet).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ParseFailed)
+        ));
     }
 }

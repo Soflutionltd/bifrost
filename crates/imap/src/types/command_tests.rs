@@ -98,7 +98,13 @@ fn command_list_extended() {
             patterns,
             return_options,
         } => {
-            assert_eq!(selection_options, &["SUBSCRIBED", "RECURSIVEMATCH"]);
+            assert_eq!(
+                selection_options
+                    .iter()
+                    .map(crate::types::command_options::ListSelect::as_str)
+                    .collect::<Vec<_>>(),
+                ["SUBSCRIBED", "RECURSIVEMATCH"]
+            );
             assert!(reference.as_str().is_empty());
             assert_eq!(
                 patterns
@@ -107,7 +113,13 @@ fn command_list_extended() {
                     .collect::<Vec<_>>(),
                 ["*", "%"]
             );
-            assert_eq!(return_options, &["CHILDREN", "STATUS (MESSAGES UNSEEN)"]);
+            assert_eq!(
+                return_options
+                    .iter()
+                    .map(crate::types::command_options::ListReturn::as_str)
+                    .collect::<Vec<_>>(),
+                ["CHILDREN", "STATUS (MESSAGES UNSEEN)"]
+            );
         }
         _ => panic!("expected ListExtended"),
     }
@@ -128,7 +140,7 @@ fn command_list_status() {
         } => {
             assert!(reference.as_str().is_empty());
             assert_eq!(pattern.as_str(), "*");
-            assert_eq!(status_items, "MESSAGES UNSEEN");
+            assert_eq!(status_items.body("STATUS").unwrap(), "MESSAGES UNSEEN");
         }
         _ => panic!("expected ListStatus"),
     }
@@ -279,7 +291,7 @@ fn command_status() {
     match &cmd {
         Command::Status { mailbox, items } => {
             assert_eq!(mailbox.as_str(), "INBOX");
-            assert!(items.contains("MESSAGES"));
+            assert!(items.body("STATUS").unwrap().contains("MESSAGES"));
         }
         _ => panic!("expected Status"),
     }
@@ -331,7 +343,7 @@ fn command_search_return() {
         } => {
             assert_eq!(criteria, "UNSEEN");
             assert_eq!(return_opts.len(), 3);
-            assert_eq!(return_opts[0], "MIN");
+            assert_eq!(&*return_opts[0], "MIN");
         }
         _ => panic!("expected SearchReturn"),
     }
@@ -369,7 +381,7 @@ fn command_fetch() {
             changed_since,
         } => {
             assert_eq!(sequence_set.as_str(), "1:*");
-            assert_eq!(items, "(UID FLAGS)");
+            assert_eq!(items.wire(), "(UID FLAGS)");
             assert!(changed_since.is_none());
         }
         _ => panic!("expected Fetch"),

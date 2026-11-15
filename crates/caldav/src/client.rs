@@ -2197,12 +2197,13 @@ mod tests {
             panic!("expected scope batch");
         };
         assert_eq!(batch.items.len(), 3);
-        assert!(
-            batch
-                .items
-                .iter()
-                .all(|scope| matches!(scope, CursorScope::Folder(_)))
-        );
+        assert!(batch.items.iter().all(|scope| matches!(
+            scope,
+            CursorScope::FolderType {
+                ty: bifrost_types::ObjectType::CalendarEvent,
+                ..
+            }
+        )));
     }
 
     #[tokio::test]

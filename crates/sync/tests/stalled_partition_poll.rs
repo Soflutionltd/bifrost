@@ -1,7 +1,7 @@
 //! A wedged `inventory_partition_stream` must not park the backfill runner.
 //!
 //! Same shape as the changes-drive wedge, different signal: the runner selects
-//! the account shutdown token it already reaches through its `LaneGate`, rather
+//! the required publisher shutdown token independently of a capacity gate, rather
 //! than the boundary. What makes this one delicate is not the arm but the
 //! OUTCOME. A cancelled partition must never report `complete: true` or
 //! `RequestNextPartition`, because the orchestrator would then write a
@@ -15,9 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bifrost_sync::backfill::{BackfillRunner, LiveSupersedes};
-use bifrost_sync::cursor::PendingCoverage;
 use bifrost_sync::engine::lane::LaneGate;
-use bifrost_sync::multiplexer::ChangeDelivery;
+use bifrost_sync::multiplexer::{ChangeDelivery, PagePublisher};
 use bifrost_sync::{Boundary, Error, SyncControl};
 use bifrost_sync::{BudgetGate, ConcurrencyBudget, Scheduler, SchedulerConfig};
 use bifrost_types::{Account, AccountId, CursorScope, InventoryPartition, Priority};
@@ -37,6 +36,15 @@ const PROMPT: Duration = Duration::from_secs(5);
 /// that was never walked.
 #[tokio::test]
 async fn a_cancelled_partition_walk_fails_rather_than_reporting_completion() {
+    cancelled_partition(true).await;
+}
+
+#[tokio::test]
+async fn a_cancelled_partition_walk_without_a_lane_fails_rather_than_reporting_completion() {
+    cancelled_partition(false).await;
+}
+
+async fn cancelled_partition(with_lane: bool) {
     let scope = CursorScope::Account;
     let mut stub = StubAccount::new(vec![scope.clone()]);
     let release = Arc::new(tokio::sync::Notify::new());
@@ -45,6 +53,20 @@ async fn a_cancelled_partition_walk_fails_rather_than_reporting_completion() {
 
     let account_id = AccountId("stalled-partition".to_owned());
     let shutdown = CancellationToken::new();
+    let (boundary, view) = Boundary::new();
+    let (priority, p) = tokio::sync::watch::channel(Priority::Normal);
+    let (bandwidth, b) = tokio::sync::watch::channel(None);
+    std::mem::forget((view, p, b));
+    let control = SyncControl::new(account_id.clone(), boundary, priority, bandwidth);
+    let (tx, _rx) = tokio::sync::broadcast::channel(16);
+    let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(4);
+    drop(writer_rx);
+    let publisher = PagePublisher::new(
+        Arc::new(ChangeDelivery::new(tx)),
+        control.clone(),
+        writer_tx,
+        shutdown.clone(),
+    );
     let scheduler = Scheduler::new(
         SchedulerConfig::default(),
         BudgetGate::new(ConcurrencyBudget {
@@ -55,21 +77,14 @@ async fn a_cancelled_partition_walk_fails_rather_than_reporting_completion() {
         }),
     );
     scheduler.budget().register(account_id.clone());
-    let (boundary, view) = Boundary::new();
-    let (priority, p) = tokio::sync::watch::channel(Priority::Normal);
-    let (bandwidth, b) = tokio::sync::watch::channel(None);
-    std::mem::forget((view, p, b));
-    let control = SyncControl::new(account_id.clone(), boundary, priority, bandwidth);
     let gate = LaneGate::new(
-        Arc::new(PendingCoverage::new()),
+        Arc::clone(publisher.coverage()),
         4,
         shutdown.clone(),
         scheduler,
         account_id,
-        control.clone(),
+        control,
     );
-    let (tx, _rx) = tokio::sync::broadcast::channel(16);
-    let delivery = ChangeDelivery::new(tx);
     let live = LiveSupersedes::new();
 
     let walk = async {
@@ -78,15 +93,11 @@ async fn a_cancelled_partition_walk_fails_rather_than_reporting_completion() {
             scope,
             InventoryPartition::Full,
             &live,
-            None,
             bifrost_types::TraitEnvelopeVersion::new(1),
-            Some(&control),
-            None,
-            None,
+            &publisher,
             walk_generation(0),
-            Some(&gate),
+            with_lane.then_some(&gate),
             bifrost_sync::cursor::PendingCoverage::initial_fence(),
-            &delivery,
         )
         .await
     };

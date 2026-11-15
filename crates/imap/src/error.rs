@@ -1032,19 +1032,8 @@ impl From<String> for OfferedAuthentication {
             return Self::LoginCommand;
         }
         let name = value.strip_prefix("AUTH=").unwrap_or(&value);
-        for mechanism in [
-            AuthMechanism::OAuthBearer,
-            AuthMechanism::XOAuth2,
-            AuthMechanism::ScramSha256Plus,
-            AuthMechanism::ScramSha1Plus,
-            AuthMechanism::ScramSha256,
-            AuthMechanism::ScramSha1,
-            AuthMechanism::Plain,
-            AuthMechanism::CramMd5,
-        ] {
-            if name.eq_ignore_ascii_case(mechanism.name()) {
-                return Self::Sasl(mechanism);
-            }
+        if let Some(mechanism) = AuthMechanism::from_name(name) {
+            return Self::Sasl(mechanism);
         }
         Self::OtherSasl(name.to_owned())
     }

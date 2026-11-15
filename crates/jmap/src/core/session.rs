@@ -11,14 +11,13 @@ pub(crate) struct Session {
     #[serde(deserialize_with = "deserialize_session_capabilities_map")]
     capabilities: HashMap<String, Capabilities>,
 
-    // Account identity must remain byte-exact across session lookup, push
-    // routing and foreign-account cursors. A typed-key migration must include
-    // those readers rather than introduce a second, string-keyed identity map.
+    // Keep account identities typed through session lookup and push routing;
+    // string conversion belongs at persisted foreign-account codec boundaries.
     #[serde(rename = "accounts")]
-    accounts: HashMap<String, Account>,
+    accounts: HashMap<crate::core::id::AccountId, Account>,
 
     #[serde(rename = "primaryAccounts")]
-    primary_accounts: HashMap<String, String>,
+    primary_accounts: HashMap<String, crate::core::id::AccountId>,
 
     #[serde(rename = "username")]
     username: String,
@@ -660,7 +659,7 @@ impl Session {
             }))
     }
 
-    pub(crate) fn accounts(&self) -> impl Iterator<Item = &String> {
+    pub(crate) fn accounts(&self) -> impl Iterator<Item = &crate::core::id::AccountId> {
         self.accounts.keys()
     }
 
@@ -668,7 +667,9 @@ impl Session {
         self.accounts.get(account)
     }
 
-    pub(crate) fn primary_accounts(&self) -> impl Iterator<Item = (&String, &String)> {
+    pub(crate) fn primary_accounts(
+        &self,
+    ) -> impl Iterator<Item = (&String, &crate::core::id::AccountId)> {
         self.primary_accounts.iter()
     }
 

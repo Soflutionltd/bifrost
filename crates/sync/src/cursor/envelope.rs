@@ -38,8 +38,8 @@ const MAGIC: u8 = 0xB5;
 
 /// Enum tag this codec will never write. Earlier revisions encoded
 /// unknown `ObjectType` / `ProtocolKind` variants as this value, which
-/// persisted rows nothing could decode; encoding now panics instead
-/// (see `encode_obj_type`). Decoding still maps the tag to
+/// persisted rows nothing could decode. Encoding now uses exhaustive
+/// types-owned tag methods. Decoding still maps the tag to
 /// `Error::SchemaIncompatible` so rows written by such a revision heal
 /// through the schema-clear path rather than stranding the account.
 const TAG_RESERVED: u8 = 0xFF;
@@ -88,8 +88,7 @@ pub struct CursorEnvelope {
 /// # Panics
 ///
 /// Panics on a `Checkpoint` this revision cannot represent on disk: an
-/// unknown `Checkpoint` variant, an unknown `ObjectType` / `ProtocolKind`,
-/// or a `Checkpoint::Change` whose `ChangeCursor::envelope_version` is not
+/// unknown `Checkpoint` variant, or a `Checkpoint::Change` whose `ChangeCursor::envelope_version` is not
 /// `CHANGE_CURSOR_ENVELOPE_VERSION`. Refusing loudly is deliberate and
 /// matches the rest of this codec: the alternative is writing a durable row
 /// whose own decoder rejects it, which strands the account instead of
@@ -326,22 +325,7 @@ pub(super) fn decode_scope(bytes: &[u8]) -> Result<CursorScope, Error> {
 }
 
 fn encode_obj_type(ty: ObjectType) -> u8 {
-    match ty {
-        ObjectType::Email => OBJTYPE_EMAIL,
-        ObjectType::Mailbox => OBJTYPE_MAILBOX,
-        ObjectType::Thread => OBJTYPE_THREAD,
-        ObjectType::Event => OBJTYPE_EVENT,
-        ObjectType::Contact => OBJTYPE_CONTACT,
-        ObjectType::EmailSubmission => OBJTYPE_EMAIL_SUBMISSION,
-        ObjectType::CalendarEvent => OBJTYPE_CALENDAR_EVENT,
-        ObjectType::ContactGroup => OBJTYPE_CONTACT_GROUP,
-        // `ObjectType` is `#[non_exhaustive]`; panic rather than
-        // writing the reserved tag, which would persist a durable row
-        // this engine can never decode. Same rule as `encode_scope`:
-        // the codec must learn a variant before a cursor carrying it
-        // can be stored.
-        _ => panic!("cursor envelope: unknown object type variant"),
-    }
+    ty.cursor_tag()
 }
 
 fn decode_obj_type(tag: u8) -> Result<ObjectType, Error> {
@@ -373,17 +357,7 @@ const PROTOCOL_CARDDAV: u8 = 4;
 const PROTOCOL_CALDAV: u8 = 5;
 
 fn encode_protocol(p: ProtocolKind) -> u8 {
-    match p {
-        ProtocolKind::Jmap => PROTOCOL_JMAP,
-        ProtocolKind::Imap => PROTOCOL_IMAP,
-        ProtocolKind::Gmail => PROTOCOL_GMAIL,
-        ProtocolKind::CardDav => PROTOCOL_CARDDAV,
-        ProtocolKind::CalDav => PROTOCOL_CALDAV,
-        ProtocolKind::Graph => PROTOCOL_GRAPH,
-        // `ProtocolKind` is `#[non_exhaustive]`; see `encode_obj_type`
-        // for why an unknown variant is a panic and not a reserved tag.
-        _ => panic!("cursor envelope: unknown protocol variant"),
-    }
+    p.cursor_tag()
 }
 
 fn decode_protocol(tag: u8) -> Result<ProtocolKind, Error> {

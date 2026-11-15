@@ -260,15 +260,15 @@ async fn submit_batch_with_version(
     // of the chunk still go to `$batch`.
     let destination_is_public = match kind {
         MutationKind::Move(destination) => match folder_destination(destination.clone()) {
-            Some(folder) => account.is_known_public_folder(&folder).await,
+            Some(folder) => public_write_destination(account, &folder).await,
             None => false,
         },
         _ => false,
     };
-    let (supported, refused): (Vec<ObjectId>, Vec<ObjectId>) = ids
-        .iter()
-        .cloned()
-        .partition(|id| !destination_is_public && super::pim::ews_read_folder(id).is_none());
+    let (supported, refused): (Vec<ObjectId>, Vec<ObjectId>) =
+        ids.iter().cloned().partition(|id| {
+            !destination_is_public && refuse_message_write(id, operation_for_kind(kind)).is_ok()
+        });
     let refused_outcomes: Vec<ItemOutcome<MutationSuccess>> = refused
         .into_iter()
         .map(|id| {
@@ -621,40 +621,12 @@ async fn refresh_missing_etags(
         return Vec::new();
     }
 
-    let mut refreshed = Vec::new();
     let mut failed = Vec::new();
     for id in missing {
-        // Decode the (possibly foreign-encoded) id so the etag refresh
-        // hits the owning mailbox: a shared-mailbox message lives under
-        // `/users/{owner}/messages/{native}`, not `/me`. The cache key
-        // stays the encoded `id.0` (F1's etag_index keying), only the
-        // request URL uses the native id + owner prefix.
-        let parsed = super::foreign::parse_message_id(&id);
-        let client = match account.client_for_owner(parsed.owner()) {
-            Ok(client) => client,
-            Err(error) => {
-                failed.push(ItemOutcome::Failed(BatchFailure::new(
-                    BatchItemId(id.0.clone()),
-                    into_account_error(
-                        error,
-                        GraphErrorContext::graph(operation_for_kind(kind)).with_scope(
-                            ErrorScope::Message {
-                                id: (id.0.clone()).into(),
-                            },
-                        ),
-                    ),
-                )));
-                continue;
-            }
-        };
-        let prefix = client.api_path_prefix();
-        let enc_id = bifrost_net::url::encode_path_component(parsed.native_id());
-        let path = format!("{prefix}/messages/{enc_id}?$select=id");
-        match client.get_json::<Value>(Resource::Outlook, &path).await {
+        match fetch_message_observation(account, &id, "id", operation_for_kind(kind)).await {
             Ok(value) => {
                 if let Some(etag) = graph_etag(&value) {
                     etags.insert(id.0.clone(), etag.clone());
-                    refreshed.push((id.0.clone(), etag));
                 } else {
                     // Missing etag after a refresh is a Graph
                     // contract violation (`Protocol(MissingField)`),
@@ -678,25 +650,14 @@ async fn refresh_missing_etags(
                 }
             }
             Err(error) => {
-                let ctx = GraphErrorContext::graph(operation_for_kind(kind)).with_scope(
-                    ErrorScope::Message {
-                        id: (id.0.clone()).into(),
-                    },
-                );
                 failed.push(ItemOutcome::Failed(BatchFailure::new(
                     BatchItemId(id.0.clone()),
-                    into_account_error(error, ctx),
+                    error,
                 )));
             }
         }
     }
 
-    if !refreshed.is_empty() {
-        let mut cache = account.etag_index.write().await;
-        for (id, etag) in refreshed {
-            cache.insert(id, etag);
-        }
-    }
     failed
 }
 
@@ -710,88 +671,130 @@ fn request_for_mutation(
     kind: &MutationKind,
     etags: &HashMap<String, GraphETag>,
 ) -> Result<Option<BatchRequestItem>, crate::error::GraphError> {
-    // Decode the (possibly foreign-encoded) id and route to the owning
-    // mailbox: a shared-mailbox item builds `/users/{owner}/messages/{native}`,
-    // a primary item `/me/messages/{id}`. The etag cache is keyed by the
-    // encoded `id.0` (F1's etag_index), so the lookups below use `id.0`;
-    // only the URL is built from the decoded native id + owner prefix.
-    let parsed = super::foreign::parse_message_id(id);
-    let prefix = account.client_for_owner(parsed.owner())?.api_path_prefix();
-    let enc_id = bifrost_net::url::encode_path_component(parsed.native_id());
-    let mut headers = HashMap::new();
-    match kind {
-        MutationKind::SetFlags(op) => {
-            let Some(etag) = etags.get(&id.0) else {
-                return Ok(None);
-            };
-            headers.insert("If-Match".to_string(), etag.clone().into_string());
-            Ok(Some(BatchRequestItem {
-                id: "0".to_string(),
-                method: "PATCH".to_string(),
-                url: format!("{prefix}/messages/{enc_id}"),
-                body: Some(patch_for_flags(op)),
-                headers: Some(headers),
-            }))
-        }
+    let effect = match kind {
+        MutationKind::SetFlags(op) => MessageWrite::Patch(patch_for_flags(op)),
         MutationKind::Move(destination) => {
-            // The move action documents Authorization and Content-Type only,
-            // with no If-Match precondition contract:
-            // https://learn.microsoft.com/en-us/graph/api/message-move
-            // Keep the legacy observed guard, but the inherited versioned
-            // door refuses caller versions and mail_move stays false. Merely
-            // sending this header cannot establish atomic caller enforcement.
-            let Some(etag) = etags.get(&id.0) else {
-                return Ok(None);
-            };
             let Some(folder) = folder_destination(destination.clone()) else {
                 return Ok(None);
             };
-            // The destination folder id is itself a (possibly
-            // foreign-encoded) FolderId. Decode it: `destinationId` must
-            // carry the native folder id (a `\u{1f}`-bearing id is not a
-            // valid Graph folder id), and the destination must belong to
-            // the same mailbox as the source. A cross-mailbox move is not
-            // expressible against one `/users/{owner}` (or `/me`) endpoint,
-            // so reject it as a malformed request rather than emit a wrong
-            // one - returning `None` routes through the caller's
-            // `Request(Malformed)` lane.
-            let dest = super::foreign::parse_folder(&folder);
-            if !super::foreign::same_owner(
-                dest.foreign().map(|f| f.mailbox.as_str()),
-                parsed.owner(),
-            ) {
+            MessageWrite::Move(folder)
+        }
+        MutationKind::Destroy => MessageWrite::Destroy,
+    };
+    plan_message_write(account, id, effect, etags.get(&id.0))
+}
+
+pub(crate) async fn public_write_destination(
+    account: &GraphAccount,
+    folder: &bifrost_types::FolderId,
+) -> bool {
+    account.is_known_public_folder(folder).await
+}
+
+/// Admission is shared by both write doors before any preflight request.
+pub(crate) fn refuse_message_write(
+    id: &ObjectId,
+    operation: AccountOperation,
+) -> Result<(), bifrost_types::AccountError> {
+    if super::pim::ews_read_folder(id).is_some() {
+        return Err(super::graph_error::unsupported_item_error(
+            operation,
+            ErrorScope::Message { id: id.clone() },
+        ));
+    }
+    Ok(())
+}
+
+/// A shared routed observation, cached under the durable owner-qualified id.
+/// Bulk preflight may use a prior cache observation; typed read-modify-write
+/// must fetch the fields it edits. Collapsing those policies would either add
+/// reads or let category edits overwrite changes since a stale cached body.
+pub(crate) async fn fetch_message_observation(
+    account: &GraphAccount,
+    id: &ObjectId,
+    select: &str,
+    operation: AccountOperation,
+) -> Result<Value, bifrost_types::AccountError> {
+    let context =
+        GraphErrorContext::graph(operation).with_scope(ErrorScope::Message { id: id.clone() });
+    let parsed = super::foreign::parse_message_id(id);
+    let client = account
+        .client_for_owner(parsed.owner())
+        .map_err(|error| into_account_error(error, context.clone()))?;
+    let query = super::pim::select_query(select);
+    let path = format!(
+        "{}/messages/{}?{query}",
+        client.api_path_prefix(),
+        bifrost_net::url::encode_path_component(parsed.native_id()),
+    );
+    let value = client
+        .get_json(Resource::Outlook, &path)
+        .await
+        .map_err(|error| into_account_error(error, context))?;
+    if let Some(etag) = graph_etag(&value) {
+        account.etag_index.write().await.insert(id.0.clone(), etag);
+    }
+    Ok(value)
+}
+
+/// The shared mail write planner. Reporting and observation ownership stay at
+/// the two public doors; wire routing and legacy observed guards do not.
+pub(crate) enum MessageWrite {
+    Patch(Value),
+    Move(bifrost_types::FolderId),
+    Destroy,
+}
+
+pub(crate) fn same_mailbox_destination(id: &ObjectId, folder: &bifrost_types::FolderId) -> bool {
+    let source = super::foreign::parse_message_id(id);
+    let destination = super::foreign::parse_folder(folder);
+    super::foreign::same_owner(
+        destination.foreign().map(|f| f.mailbox.as_str()),
+        source.owner(),
+    )
+}
+
+pub(crate) fn plan_message_write(
+    account: &GraphAccount,
+    id: &ObjectId,
+    effect: MessageWrite,
+    etag: Option<&GraphETag>,
+) -> Result<Option<BatchRequestItem>, crate::error::GraphError> {
+    let parsed = super::foreign::parse_message_id(id);
+    let prefix = account.client_for_owner(parsed.owner())?.api_path_prefix();
+    let native = bifrost_net::url::encode_path_component(parsed.native_id());
+    let (method, suffix, body) = match effect {
+        MessageWrite::Patch(body) => {
+            if etag.is_none() {
                 return Ok(None);
             }
-            headers.insert("If-Match".to_string(), etag.clone().into_string());
-            Ok(Some(BatchRequestItem {
-                id: "0".to_string(),
-                method: "POST".to_string(),
-                url: format!("{prefix}/messages/{enc_id}/move"),
-                body: Some(json!({ "destinationId": dest.native_id() })),
-                headers: Some(headers),
-            }))
+            ("PATCH", "", Some(body))
         }
-        MutationKind::Destroy => {
-            // permanentDelete is a POST action with no documented conditional
-            // header (https://learn.microsoft.com/en-us/graph/api/message-permanentdelete).
-            // Do not infer If-Match support from PATCH or DELETE semantics.
-            // The inherited versioned door refuses caller versions before I/O;
-            // mail_destroy stays false, while unversioned behavior is retained.
-            if let Some(etag) = etags.get(&id.0) {
-                headers.insert("If-Match".to_string(), etag.clone().into_string());
+        MessageWrite::Move(folder) => {
+            if etag.is_none() || !same_mailbox_destination(id, &folder) {
+                return Ok(None);
             }
-            Ok(Some(BatchRequestItem {
-                id: "0".to_string(),
-                // DELETE moves mail to Deleted Items (or recoverable storage).
-                // permanentDelete removes it from the normal mailbox inventory;
-                // retention can still keep it in Purges on the server.
-                method: "POST".to_string(),
-                url: format!("{prefix}/messages/{enc_id}/permanentDelete"),
-                body: None,
-                headers: (!headers.is_empty()).then_some(headers),
-            }))
+            let destination = super::foreign::parse_folder(&folder);
+            (
+                "POST",
+                "/move",
+                Some(json!({"destinationId": destination.native_id()})),
+            )
         }
-    }
+        MessageWrite::Destroy => ("POST", "/permanentDelete", None),
+    };
+    // Move and permanentDelete do not document atomic If-Match enforcement.
+    // Retain their legacy observed headers without advertising caller-version
+    // support. An Outlook user must not be promised a guard the action lacks.
+    let headers =
+        etag.map(|etag| HashMap::from([("If-Match".to_string(), etag.clone().into_string())]));
+    Ok(Some(BatchRequestItem {
+        id: "0".to_string(),
+        method: method.to_string(),
+        url: format!("{prefix}/messages/{native}{suffix}"),
+        body,
+        headers,
+    }))
 }
 
 pub(crate) fn assign_batch_ids(requests: &mut [BatchRequestItem]) {

@@ -592,19 +592,18 @@ fn subscribed_idle_folders(
 /// through the changes stream, so a payload here would be wasted bandwidth
 /// on every flag flip.
 fn notify_params(others: Vec<crate::types::MailboxArgument>) -> crate::types::NotifySetParams {
-    let events = || {
-        vec![
-            crate::types::NotifyEvent::MessageNew {
-                fetch_attrs: Vec::new(),
-            },
-            crate::types::NotifyEvent::MessageExpunge,
-            crate::types::NotifyEvent::FlagChange,
-        ]
+    let events = || crate::types::notify::MessageEvents {
+        new_fetch: Vec::new(),
+        flag_change: true,
+        annotation_change: false,
     };
     crate::types::NotifySetParams::new(
         vec![
-            crate::types::NotifyEventGroup::new(crate::types::MailboxFilter::Selected, events()),
-            crate::types::NotifyEventGroup::new(
+            crate::types::NotifyEventGroup::messages(
+                crate::types::MailboxFilter::Selected,
+                events(),
+            ),
+            crate::types::NotifyEventGroup::messages(
                 crate::types::MailboxFilter::Mailboxes(others),
                 events(),
             ),
@@ -948,32 +947,22 @@ mod tests {
         );
         assert_eq!(params.event_groups.len(), 2);
         assert_eq!(
-            params.event_groups[0].filter,
-            crate::types::MailboxFilter::Selected
+            params.event_groups[0].filter(),
+            &crate::types::MailboxFilter::Selected
         );
         assert_eq!(
-            params.event_groups[1].filter,
-            crate::types::MailboxFilter::Mailboxes(vec![
+            params.event_groups[1].filter(),
+            &crate::types::MailboxFilter::Mailboxes(vec![
                 crate::types::MailboxArgument::from("Archive"),
                 crate::types::MailboxArgument::from("Zebra"),
             ])
         );
         for group in &params.event_groups {
+            group
+                .validate()
+                .expect("the account registration must be legal");
             assert!(
-                group
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, crate::types::NotifyEvent::MessageNew { .. }))
-            );
-            assert!(
-                group
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, crate::types::NotifyEvent::MessageExpunge)),
-                "FlagChange requires MessageExpunge alongside it",
-            );
-            assert!(
-                group.events.iter().all(|event| !matches!(
+                group.events().iter().all(|event| !matches!(
                     event,
                     crate::types::NotifyEvent::MessageNew { fetch_attrs } if !fetch_attrs.is_empty()
                 )),

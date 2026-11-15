@@ -1,4 +1,4 @@
-mod autodiscover;
+pub(crate) mod autodiscover;
 mod batch;
 mod batch_routing;
 mod blob;

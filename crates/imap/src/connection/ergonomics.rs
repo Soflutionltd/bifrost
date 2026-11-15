@@ -178,7 +178,7 @@ impl ImapConnection {
         self.submit_regular(
             Command::UidFetch {
                 sequence_set: uids.as_sequence_set().clone(),
-                items: format_fetch_attrs(attrs),
+                items: attrs.to_vec().into(),
                 changed_since: None,
                 vanished: false,
             },

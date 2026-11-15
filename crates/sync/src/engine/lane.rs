@@ -272,20 +272,6 @@ impl LaneGate {
         self.capacity
     }
 
-    /// The account's shutdown token, for arming a provider-stream poll.
-    ///
-    /// Crate-internal on purpose. It is here so `BackfillRunner::run_partition`
-    /// can select its `inventory_partition_stream` poll against cancellation
-    /// without taking a token parameter that only the engine could supply;
-    /// every other wait in this gate already selects the same token. That makes
-    /// the cancellation guarantee a property of ENGINE-DRIVEN partition walks
-    /// rather than of `run_partition` itself, since a caller passing
-    /// `lane: None` has no token to be armed against.
-    #[must_use]
-    pub(crate) fn shutdown(&self) -> &CancellationToken {
-        &self.shutdown
-    }
-
     /// Take the account's sync admission for a partition pass.
     pub async fn admit(&self) -> Result<(), WaitFailed> {
         self.admission.acquire(&self.shutdown).await
@@ -508,8 +494,7 @@ mod tests {
     struct MarkerHarness {
         lane: Harness,
         control: SyncControl,
-        delivery: crate::multiplexer::ChangeDelivery,
-        tx: tokio::sync::broadcast::Sender<crate::multiplexer::MultiplexerEvent>,
+        delivery: Arc<crate::multiplexer::ChangeDelivery>,
         rx: std::sync::Mutex<
             tokio::sync::broadcast::Receiver<crate::multiplexer::MultiplexerEvent>,
         >,
@@ -540,8 +525,7 @@ mod tests {
                 scheduler,
             },
             control,
-            delivery: crate::multiplexer::ChangeDelivery::new(tx.clone()),
-            tx,
+            delivery: Arc::new(crate::multiplexer::ChangeDelivery::new(tx)),
             rx: std::sync::Mutex::new(rx),
         }
     }
@@ -568,24 +552,45 @@ mod tests {
         }));
         let old = h.lane.coverage.scope_fence(&scope);
         h.lane.coverage.raise_scope_fence(&scope);
-        let result = crate::backfill::runner::BackfillRunner::run_partition(
-            &account,
-            scope,
-            bifrost_types::InventoryPartition::Full,
-            &crate::backfill::runner::LiveSupersedes::default(),
-            Some(h.tx.clone()),
-            bifrost_types::TraitEnvelopeVersion::new(1),
-            Some(&h.control),
-            Some(&h.lane.coverage),
-            None,
-            crate::cursor::WalkGeneration::for_test(1),
-            Some(&h.lane.gate),
-            old,
-            &h.delivery,
-        )
-        .await;
-        assert!(matches!(result, Err(Error::Superseded)));
-        assert_eq!(h.received(), 0);
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(4);
+        drop(writer_rx);
+        let publisher = crate::multiplexer::PagePublisher::new(
+            Arc::clone(&h.delivery),
+            h.control.clone(),
+            writer_tx,
+            h.lane.shutdown.clone(),
+        );
+        for lane in [Some(&h.lane.gate), None] {
+            let result = crate::backfill::runner::BackfillRunner::run_partition(
+                &account,
+                scope.clone(),
+                bifrost_types::InventoryPartition::Full,
+                &crate::backfill::runner::LiveSupersedes::default(),
+                bifrost_types::TraitEnvelopeVersion::new(1),
+                &publisher,
+                crate::cursor::WalkGeneration::for_test(1),
+                lane,
+                old,
+            )
+            .await;
+            assert!(matches!(result, Err(Error::Superseded)));
+            assert_eq!(h.received(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_completion_reaching_only_an_observer_is_withheld() {
+        let h = marker_harness(4);
+        let scope = scope_a();
+        let before = h.lane.coverage.undelivered_watermark(&scope);
+        assert_eq!(h.emit_marker(&scope, before).await, MarkerOutcome::Withheld);
+        assert_eq!(h.lane.coverage.pending_checkpoints(), 0);
+        assert_ne!(h.lane.coverage.undelivered_watermark(&scope), before);
+        assert_eq!(
+            h.received(),
+            1,
+            "the unnumbered observer still sees the marker"
+        );
     }
 
     impl MarkerHarness {
@@ -602,23 +607,29 @@ mod tests {
         /// The production emission, exactly as the orchestrator calls it -
         /// including the fence the WALK started under, which is not necessarily
         /// the fence at the moment of emission.
-        fn emit_marker_for_walk<'a>(
-            &'a self,
-            scope: &'a CursorScope,
+        async fn emit_marker_for_walk(
+            &self,
+            scope: &CursorScope,
             undelivered_before: crate::cursor::UndeliveredMark,
             fence_at_walk_start: crate::cursor::ScopeFence,
-        ) -> impl std::future::Future<Output = MarkerOutcome> + 'a {
+        ) -> MarkerOutcome {
+            let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(4);
+            drop(writer_rx);
+            let publisher = crate::multiplexer::PagePublisher::new(
+                Arc::clone(&self.delivery),
+                self.control.clone(),
+                writer_tx,
+                self.lane.shutdown.clone(),
+            );
             crate::engine::backfill::emit_backfill_complete(
-                Some(&self.tx),
                 scope,
                 crate::backfill::ScopeWalkDriver::fixed(Vec::new()).total_seen(),
-                &self.control,
-                &self.lane.shutdown,
+                &publisher,
                 &self.lane.gate,
-                &self.delivery,
                 undelivered_before,
                 fence_at_walk_start,
             )
+            .await
         }
 
         /// How many events reached the retained receiver.

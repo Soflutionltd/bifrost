@@ -122,6 +122,8 @@ impl GraphMessageRuleActions {
     }
 }
 
+// Rule recipients require both the recipient object and its address. Calendar
+// projections permit either to be absent, so they use separate sparse DTOs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GraphRecipient {
@@ -134,6 +136,23 @@ pub(crate) struct GraphEmailAddress {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) name: Option<String>,
     pub(crate) address: String,
+}
+
+// Calendar reads accept sparse organizer/address projections. The rule-recipient
+// DTOs require these fields; sharing those would reject otherwise usable events.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CalendarRecipient {
+    pub(crate) email_address: Option<CalendarEmailAddress>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CalendarEmailAddress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -153,8 +172,9 @@ receivedDateTime,sentDateTime,isRead,isDraft,hasAttachments,\
 importance,parentFolderId,categories,flag,changeKey,\
 inferenceClassification,isReadReceiptRequested,internetMessageHeaders,internetMessageId";
 
-/// The `$select` fields we request for contact sync.
-pub(crate) const CONTACT_SELECT: &str = "id,displayName,emailAddresses,parentFolderId";
+/// Identity projection for contact sync. Typed reads select detail fields
+/// separately rather than making every delta page carry the full contact.
+pub(crate) const CONTACT_SYNC_SELECT: &str = "id,displayName,emailAddresses,parentFolderId";
 
 // These are wire DTOs, not replay declarations. account::batch decodes typed
 // method/header evidence and owns the envelope policy. URLs are built by the

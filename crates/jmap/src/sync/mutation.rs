@@ -21,7 +21,7 @@ type MailAccount<T> = crate::account::Account<T>;
 
 pub(crate) fn set_flags<T: HttpTransport>(
     mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
+    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
     limits: CoreLimits,
     email_states: StateMap,
     targets: AccountStream<ObjectId>,
@@ -59,7 +59,7 @@ pub(crate) fn set_flags<T: HttpTransport>(
 
 pub(crate) fn move_to<T: HttpTransport>(
     mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
+    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
     limits: CoreLimits,
     email_states: StateMap,
     targets: AccountStream<ObjectId>,
@@ -83,7 +83,7 @@ pub(crate) fn move_to<T: HttpTransport>(
 
 pub(crate) fn destroy<T: HttpTransport>(
     mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
+    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
     limits: CoreLimits,
     email_states: StateMap,
     targets: AccountStream<ObjectId>,
@@ -125,7 +125,7 @@ pub(super) fn caller_state(
 
 pub(super) fn versioned_stream<T: HttpTransport>(
     mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
+    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
     limits: CoreLimits,
     email_states: StateMap,
     targets: AccountStream<bifrost_types::MailMutationTarget>,
@@ -365,7 +365,7 @@ impl RouteBuffers {
 
 fn mutation_stream<T: HttpTransport>(
     mail: MailAccount<T>,
-    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
+    foreign_mail: Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
     limits: CoreLimits,
     email_states: StateMap,
     mut targets: AccountStream<ObjectId>,
@@ -493,7 +493,7 @@ fn destination_rejection(
 fn account_id_for_target<T: HttpTransport>(
     target: &ObjectId,
     primary_account_id: &str,
-    foreign_mail: &HashMap<String, MailAccount<T>>,
+    foreign_mail: &HashMap<crate::core::id::AccountId, MailAccount<T>>,
 ) -> String {
     super::foreign::parse_object(&target.0)
         .filter(|(account_id, _)| foreign_mail.contains_key(*account_id))
@@ -505,7 +505,7 @@ fn account_id_for_target<T: HttpTransport>(
 
 fn mail_for_account<'a, T: HttpTransport>(
     primary: &'a MailAccount<T>,
-    foreign_mail: &'a HashMap<String, MailAccount<T>>,
+    foreign_mail: &'a HashMap<crate::core::id::AccountId, MailAccount<T>>,
     account_id: &str,
 ) -> &'a MailAccount<T> {
     foreign_mail.get(account_id).unwrap_or(primary)
@@ -724,23 +724,28 @@ fn apply_flags(patch: &mut EmailPatch, op: &FlagOp) -> crate::Result<()> {
     match op {
         FlagOp::Add(flags) => {
             for flag in flags {
-                patch.keyword(flag, true);
+                patch.keyword(&crate::email::keyword::Keyword::parse(flag)?, true);
             }
         }
         FlagOp::Remove(flags) => {
             for flag in flags {
-                patch.keyword(flag, false);
+                patch.keyword(&crate::email::keyword::Keyword::parse(flag)?, false);
             }
         }
         FlagOp::Set(flags) => {
-            patch.keywords(flags.iter().cloned());
+            patch.keywords(
+                flags
+                    .iter()
+                    .map(crate::email::keyword::Keyword::parse)
+                    .collect::<crate::Result<Vec<_>>>()?,
+            );
         }
         FlagOp::Patch { add, remove } => {
             for flag in add {
-                patch.keyword(flag, true);
+                patch.keyword(&crate::email::keyword::Keyword::parse(flag)?, true);
             }
             for flag in remove {
-                patch.keyword(flag, false);
+                patch.keyword(&crate::email::keyword::Keyword::parse(flag)?, false);
             }
         }
         // `set_flags` refuses unknown variants before building the
@@ -903,7 +908,10 @@ mod tests {
 
     fn mutation_accounts<T: HttpTransport>(
         transport: T,
-    ) -> (MailAccount<T>, Arc<HashMap<String, MailAccount<T>>>) {
+    ) -> (
+        MailAccount<T>,
+        Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
+    ) {
         let session = serde_json::from_value(serde_json::json!({
             "capabilities": {
                 "urn:ietf:params:jmap:core": {
@@ -943,7 +951,7 @@ mod tests {
         let shared = crate::account::Account::new(client, "shared");
         (
             primary,
-            Arc::new(HashMap::from([("shared".to_string(), shared)])),
+            Arc::new(HashMap::from([("shared".into(), shared)])),
         )
     }
 

@@ -35,7 +35,7 @@ enum CursorPayload {
         query_state: String,
     },
     Search {
-        position: i32,
+        position: u64,
         query_state: String,
     },
 }
@@ -74,8 +74,7 @@ impl CursorPayload {
             }
         } else if let Some(payload) = text.strip_prefix("search-3:")
             && let Some((position, query_state)) = payload.split_once(':')
-            && let Ok(position) = position.parse::<i32>()
-            && position >= 0
+            && let Ok(position) = position.parse::<u64>()
         {
             return Ok(Self::Search {
                 position,
@@ -90,7 +89,7 @@ impl CursorPayload {
     }
 }
 
-pub(super) fn encode_search(position: i32, query_state: &str, owner: Option<&str>) -> Vec<u8> {
+pub(super) fn encode_search(position: u64, query_state: &str, owner: Option<&str>) -> Vec<u8> {
     let payload = CursorPayload::Search {
         position,
         query_state: query_state.to_owned(),
@@ -107,7 +106,7 @@ pub(super) fn decode_search(
     cursor: Option<&[u8]>,
     owner: Option<&str>,
     operation: AccountOperation,
-) -> Result<(i32, Option<String>), AccountError> {
+) -> Result<(u64, Option<String>), AccountError> {
     let Some(bytes) = cursor else {
         return Ok((0, None));
     };
@@ -360,30 +359,19 @@ pub(super) trait PageKind {
     /// first observation (on a first page).
     fn next_cursor(
         cursor: Option<&PageCursor>,
-        position: i32,
+        position: u64,
         ids: &[Self::ItemId],
         total: Option<u64>,
         query_state: &str,
         operation: AccountOperation,
     ) -> Result<Option<Vec<u8>>, AccountError> {
-        let base = u64::try_from(position).map_err(|_| {
-            page_envelope_violation(
-                operation,
-                format!(
-                    "{} answered with a negative position ({position})",
-                    Self::METHOD
-                ),
-            )
+        let base = position;
+        let served = u64::try_from(ids.len()).map_err(|_| {
+            page_envelope_violation(operation, "query page length exceeds UnsignedInt".into())
         })?;
-        // The comparison happens in `u64` deliberately: narrowing either side
-        // to `i32` first turned an out-of-range `total` into an ABSENT one and
-        // silently switched termination modes, and a saturating
-        // `position + served` hid an overflowing position instead of catching
-        // it. Both saturations below are unreachable on a 64-bit target, and
-        // where they are reachable they saturate toward `next > total`, which
-        // is a REFUSAL - never toward a false completion.
-        let served = u64::try_from(ids.len()).unwrap_or(u64::MAX);
-        let next = base.saturating_add(served);
+        let next = base.checked_add(served).ok_or_else(|| {
+            page_envelope_violation(operation, "query page end exceeds UnsignedInt".into())
+        })?;
         if let Some(cursor) = cursor
             && ids.iter().any(|id| id.page_str() == cursor.anchor)
         {
@@ -670,7 +658,7 @@ mod tests {
     /// `next_cursor` for a FIRST page (no incoming anchor), which is what
     /// most of these cases exercise.
     fn mint(
-        position: i32,
+        position: u64,
         page: &[Id<TestMarker>],
         total: Option<u64>,
         query_state: &str,
@@ -808,7 +796,7 @@ mod tests {
             (0, ids(&["c1", "c2"]), 1_u64),
             (5, ids(&["c1"]), 5),
             (0, ids(&["c1"]), 0),
-            (i32::MAX, ids(&["c1"]), 9),
+            (u64::MAX, ids(&["c1"]), 9),
         ] {
             let error = mint(position, &page, Some(total), "q1")
                 .expect_err("a contradictory envelope is not a completed walk");
@@ -824,19 +812,12 @@ mod tests {
         );
     }
 
-    /// BITES. A negative `position` indexes nothing (RFC 8620 s5.5 types the
-    /// response field as an UnsignedInt). Under the old saturating `i32`
-    /// arithmetic `-5 + 2 = -3` compared BELOW every total, so this envelope
-    /// minted a successor and the walk carried on from a base that means
-    /// nothing; with no total it did the same. Deleting the `u64::try_from`
-    /// guard restores that and both `expect_err`s fail.
     #[test]
-    fn a_negative_position_is_a_contract_violation() {
-        for total in [Some(50_u64), None] {
-            let error = mint(-5, &ids(&["c1", "c2"]), total, "q1")
-                .expect_err("a negative position is not a base to page from");
-            assert!(is_contract_violation(&error));
-        }
+    fn a_negative_wire_position_is_rejected_before_paging() {
+        let value = serde_json::json!({
+            "accountId": "a", "queryState": "q", "position": -5, "ids": []
+        });
+        assert!(serde_json::from_value::<crate::core::query::QueryResponse<crate::principal::Principal>>(value).is_err());
     }
 
     /// BITES the non-termination detection. `anchorOffset: 1` resumes
@@ -875,27 +856,12 @@ mod tests {
         assert!(is_contract_violation(&error));
     }
 
-    /// CHARACTERISES ONLY - deliberately, and the reason is worth writing
-    /// down because it contradicts part of the finding this batch came from.
-    ///
-    /// The old code narrowed `total` to `i32` and treated a failed conversion
-    /// exactly like an ABSENT total. That reads as a silent mode switch, but
-    /// at THIS seam it cannot be observed: `position` is an `i32`, so
-    /// `position + served` can never reach a total above `i32::MAX`, and both
-    /// the exact test and the absent-total rule therefore say "keep walking"
-    /// for every such envelope. No input distinguishes the two, so no test
-    /// can bite on the total conversion alone.
-    ///
-    /// What WAS observable is the other half - the saturating `i32` addition,
-    /// which turned an overflowing position into `next == i32::MAX` and so
-    /// into a silent completion against any total. That case bites, and it is
-    /// the `i32::MAX` row of
-    /// `an_envelope_that_contradicts_its_own_total_is_a_contract_violation`.
+    /// Large totals and positions remain unsigned through page termination.
     #[test]
     fn a_total_above_i32_max_is_not_read_as_an_absent_total() {
         let total = u64::from(u32::MAX) + 7;
         assert!(
-            mint(0, &ids(&["c1", "c2"]), Some(total), "q1")
+            mint(u64::from(u32::MAX), &ids(&["c1", "c2"]), Some(total), "q1")
                 .expect("valid envelope")
                 .is_some(),
             "two ids out of four billion is not the end of the list"

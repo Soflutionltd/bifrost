@@ -22,8 +22,10 @@ impl ContactCard {
         self.properties.get("uid")?.as_str()
     }
 
-    pub(crate) fn address_book_ids(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
-        self.properties.get("addressBookIds")?.as_object()
+    pub(crate) fn address_book_ids(
+        &self,
+    ) -> Option<crate::core::object_set::ObjectSet<crate::address_book::AddressBookId>> {
+        serde_json::from_value(self.properties.get("addressBookIds")?.clone()).ok()
     }
 
     pub(crate) fn kind(&self) -> Option<&str> {

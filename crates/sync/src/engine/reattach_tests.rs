@@ -60,7 +60,6 @@ impl Fixture {
             factory: &slot.factory,
             current: &slot.current,
             cursors: &slot.cursors,
-            changes_tx: &slot.multiplexer.changes_tx,
             account_id: &self.id,
             control: &slot.control,
             account_control_tx: &slot.account_control_tx,
@@ -250,7 +249,7 @@ async fn repair_wait_allowance_expires_without_provider_call() {
     fixture.hold(600);
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let mut events = ctx.changes_tx.subscribe();
+    let mut events = ctx.delivery.observe();
     let repair = re_establish_scope_with_backoff(
         &ctx,
         SCOPE,
@@ -349,7 +348,7 @@ async fn account_restart_exhaustion_reclassifies_retryable_last_error() {
     let fixture = Fixture::new(factory_trait).await;
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let mut changes = ctx.changes_tx.subscribe();
+    let mut changes = ctx.delivery.observe();
 
     assert!(!restart_account(&ctx).await);
 
@@ -533,7 +532,7 @@ async fn writer_boundary_case(stored_inventory: bool, exhaust: bool) {
         Arc::clone(ctx.cursors),
         &writer,
         Arc::clone(ctx.delivery),
-        Some(ctx.control),
+        ctx.control,
         Arc::clone(ctx.coverage),
         false,
         ctx.shutdown,
@@ -602,7 +601,7 @@ async fn unreadable_stored_envelope_returns_error_without_reset_request() {
         Arc::clone(ctx.cursors),
         &writer,
         Arc::clone(ctx.delivery),
-        Some(ctx.control),
+        ctx.control,
         Arc::clone(ctx.coverage),
         false,
         ctx.shutdown,
@@ -1032,7 +1031,7 @@ async fn round2_scope_membership_refresh_records_hold_and_remains_best_effort() 
         Some(teardown_throttle(30, Some("memberships")));
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let mut events = ctx.changes_tx.subscribe();
+    let mut events = ctx.delivery.observe();
     re_establish_scope_with_backoff(
         &ctx,
         SCOPE,
@@ -1330,7 +1329,7 @@ async fn run_establish_judges_its_installs_against_the_fence_it_was_given() {
         let ctx = fixture.ctx(&writer);
         let old = ctx.coverage.scope_fence(&SCOPE);
         ctx.coverage.raise_scope_fence(&SCOPE);
-        let mut receiver = ctx.delivery.sender().subscribe();
+        let mut receiver = ctx.delivery.observe();
         let result = run_establish(
             &fixture.id,
             account.as_ref(),
@@ -1338,7 +1337,7 @@ async fn run_establish_judges_its_installs_against_the_fence_it_was_given() {
             Arc::clone(ctx.cursors),
             &writer,
             Arc::clone(ctx.delivery),
-            Some(ctx.control),
+            ctx.control,
             Arc::clone(ctx.coverage),
             false,
             ctx.shutdown,

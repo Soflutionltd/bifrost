@@ -365,7 +365,10 @@ macro_rules! define_query_method {
             }
 
             #[must_use]
-            pub(crate) fn position(mut self, position: i32) -> Self {
+            pub(crate) fn position(
+                mut self,
+                position: impl Into<$crate::core::query::QueryPosition>,
+            ) -> Self {
                 self.inner.position(position);
                 self
             }

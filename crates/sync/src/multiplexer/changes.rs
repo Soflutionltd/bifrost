@@ -397,12 +397,7 @@ fn publish_contract_termination(
     error: &AccountError,
 ) -> bool {
     let publish = || {
-        let _ = delivery.sender().send(MultiplexerEvent {
-            scope: EventScope::Cursor(scope.clone()),
-            event: Arc::new(SyncEvent::Terminated(error.clone())),
-            checkpoint: None,
-            publication: None,
-        });
+        delivery.publish_terminated(EventScope::Cursor(scope.clone()), error.clone());
     };
     match generation {
         Some(generation) => cursors
@@ -484,6 +479,9 @@ impl std::fmt::Debug for AckRequest {
 /// then destroy it. The writer therefore tracks which scopes are still
 /// provisional - see `ReattachInsert`.
 #[non_exhaustive]
+// A short-lived channel message, moved once from producer to writer; boxing
+// the largest variant would add an allocation per acknowledgement for no gain.
+#[allow(clippy::large_enum_variant)]
 pub enum WriterRequest {
     /// Persist an acknowledged checkpoint. Also DISCHARGES any provisional
     /// mark on its scope: an acknowledgement is real committed consumer

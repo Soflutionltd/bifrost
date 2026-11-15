@@ -4,7 +4,7 @@ use super::{
     CommandWriter, encode_mailbox_argument, validate_atom, validate_no_crlf,
     validate_single_fetch_att,
 };
-use crate::types::notify::{MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetParams};
+use crate::types::notify::{MailboxFilter, NotifyEvent, NotifySetParams};
 
 /// Encode a `NOTIFY SET` command (RFC 5465 Section 3).
 ///
@@ -36,7 +36,7 @@ pub(in crate::codec::encode) fn encode_notify_set(
         .iter()
         .filter(|g| {
             matches!(
-                g.filter,
+                g.filter(),
                 MailboxFilter::Selected | MailboxFilter::SelectedDelayed
             )
         })
@@ -50,7 +50,7 @@ pub(in crate::codec::encode) fn encode_notify_set(
     }
 
     for group in &params.event_groups {
-        validate_notify_event_group(group)?;
+        group.validate()?;
     }
 
     w.raw(tag.as_bytes());
@@ -63,136 +63,14 @@ pub(in crate::codec::encode) fn encode_notify_set(
 
     for group in &params.event_groups {
         w.raw(b" (");
-        encode_mailbox_filter(w, &group.filter, utf8)?;
+        encode_mailbox_filter(w, group.filter(), utf8)?;
         w.raw(b" ");
-        encode_events(w, &group.events)?;
+        encode_events(w, group.events())?;
         w.raw(b")");
     }
 
     w.raw(b"\r\n");
     Ok(())
-}
-
-/// Validate a single NOTIFY event group's semantic constraints
-/// (RFC 5465 Sections 5.1-5.4, 6.1).
-fn validate_notify_event_group(group: &NotifyEventGroup) -> Result<(), crate::Error> {
-    let is_selected_filter = matches!(
-        group.filter,
-        MailboxFilter::Selected | MailboxFilter::SelectedDelayed
-    );
-
-    // RFC 5465 Section 6.1: selected/selected-delayed filters only accept
-    // message events (MessageNew, MessageExpunge, FlagChange, AnnotationChange).
-    if is_selected_filter {
-        for event in &group.events {
-            if !is_message_event(event) {
-                return Err(crate::Error::InvalidInput(
-                    format!(
-                        "selected/selected-delayed filters only accept message events \
-                     (MessageNew, MessageExpunge, FlagChange, AnnotationChange), \
-                     got {event:?} (RFC 5465 Section 6.1)"
-                    )
-                    .into(),
-                ));
-            }
-        }
-    }
-
-    // RFC 5465 Section 8 ABNF: fetch attributes in MessageNew are only
-    // valid with selected/selected-delayed filters per the message-event
-    // production comment.
-    if !is_selected_filter {
-        for event in &group.events {
-            if let NotifyEvent::MessageNew { fetch_attrs } = event
-                && !fetch_attrs.is_empty()
-            {
-                return Err(crate::Error::InvalidInput(
-                    "MessageNew fetch attributes are only valid with \
-                     selected/selected-delayed filters (RFC 5465 Section 8)"
-                        .into(),
-                ));
-            }
-        }
-    }
-
-    // RFC 5465 Section 5: event dependency constraints:
-    // - MessageExpunge requires MessageNew (and vice versa).
-    // - FlagChange requires both MessageNew and MessageExpunge.
-    // - AnnotationChange requires both MessageNew and MessageExpunge.
-    let has_new = group
-        .events
-        .iter()
-        .any(|e| matches!(e, NotifyEvent::MessageNew { .. }));
-    let has_expunge = group
-        .events
-        .iter()
-        .any(|e| matches!(e, NotifyEvent::MessageExpunge));
-    let has_flag_change = group
-        .events
-        .iter()
-        .any(|e| matches!(e, NotifyEvent::FlagChange));
-    let has_annotation_change = group
-        .events
-        .iter()
-        .any(|e| matches!(e, NotifyEvent::AnnotationChange));
-
-    // RFC 5465 Section 5: "If one of MessageNew or MessageExpunge is
-    // specified, then both events MUST be specified."
-    if has_new && !has_expunge {
-        return Err(crate::Error::InvalidInput(
-            "MessageNew requires MessageExpunge to also be specified \
-             (RFC 5465 Section 5)"
-                .into(),
-        ));
-    }
-    if has_expunge && !has_new {
-        return Err(crate::Error::InvalidInput(
-            "MessageExpunge requires MessageNew to also be specified \
-             (RFC 5465 Section 5)"
-                .into(),
-        ));
-    }
-    // RFC 5465 Section 5: "If the FlagChange and/or AnnotationChange events
-    // are specified, MessageNew and MessageExpunge MUST also be specified
-    // by the client."
-    if has_flag_change && (!has_new || !has_expunge) {
-        return Err(crate::Error::InvalidInput(
-            "FlagChange requires both MessageNew and MessageExpunge to also \
-             be specified (RFC 5465 Section 5)"
-                .into(),
-        ));
-    }
-    if has_annotation_change && (!has_new || !has_expunge) {
-        return Err(crate::Error::InvalidInput(
-            "AnnotationChange requires both MessageNew and MessageExpunge to \
-             also be specified (RFC 5465 Section 5)"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Returns `true` if the event is a message event (RFC 5465 Sections 5.1-5.3).
-///
-/// Message events are `FlagChange`/`AnnotationChange` (RFC 5465 Section 5.1),
-/// `MessageNew` (RFC 5465 Section 5.2), and `MessageExpunge` (RFC 5465
-/// Section 5.3). Extension events (`Other(...)`) are NOT message events;
-/// RFC 5465 Section 8 defines `event-ext` as a separate ABNF production
-/// from `message-event`, so they must be rejected for selected /
-/// selected-delayed filters (Section 6.1). Mailbox events (`MailboxName`,
-/// `SubscriptionChange`) and metadata events are also excluded.
-fn is_message_event(event: &NotifyEvent) -> bool {
-    // RFC 5465 Section 8 ABNF: `message-event` is MessageNew /
-    // MessageExpunge / FlagChange / AnnotationChange. `event-ext`
-    // (modelled as `Other(...)`) is a separate production and MUST NOT
-    // be accepted under selected / selected-delayed filters (Section 6.1).
-    matches!(
-        event,
-        NotifyEvent::MessageNew { .. }
-            | NotifyEvent::MessageExpunge
-            | NotifyEvent::FlagChange
-            | NotifyEvent::AnnotationChange
-    )
 }
 
 /// Encode a mailbox filter for a NOTIFY event group (RFC 5465 Section 6).
@@ -319,6 +197,8 @@ fn encode_single_event(w: &mut CommandWriter, event: &NotifyEvent) -> Result<(),
                     if i > 0 {
                         w.raw(b" ");
                     }
+                    let wire = attr.wire();
+                    let attr = wire.as_ref();
                     // Reject CRLF in fetch attributes to prevent command injection
                     // (RFC 3501 Section 2.2).
                     validate_no_crlf(attr, "NOTIFY fetch-att")?;
