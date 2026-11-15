@@ -36,12 +36,12 @@ pub(in crate::engine) async fn open_replacement(
     ctx: &RecoveryContext<'_>,
 ) -> Result<(OwnedMutexGuard<()>, SyncActivityGuard, Replacement), ReplacementOpen> {
     let gate = crate::engine::drive_start::DriveStart {
-        current: ctx.current,
-        control: ctx.control,
-        scheduler: ctx.scheduler,
-        throttles: ctx.throttles,
-        account_id: ctx.account_id,
-        shutdown: ctx.shutdown,
+        current: &ctx.current,
+        control: &ctx.control,
+        scheduler: &ctx.scheduler,
+        throttles: &ctx.throttles,
+        account_id: &ctx.account_id,
+        shutdown: &ctx.shutdown,
     };
     loop {
         let activity = ctx
@@ -56,7 +56,7 @@ pub(in crate::engine) async fn open_replacement(
             biased;
             () = ctx.shutdown.cancelled() => return Err(ReplacementOpen::Detached),
             _ = boundary.changed() => return Err(ReplacementOpen::Paused),
-            guard = Arc::clone(ctx.reopen_lock).lock_owned() => guard,
+            guard = Arc::clone(&ctx.reopen_lock).lock_owned() => guard,
         };
         // Lock before budget, matching scope recovery. A factory open has no
         // scope declaration yet; establishment asks the replacement itself.
@@ -106,7 +106,7 @@ pub(in crate::engine) async fn open_replacement_admitted(
     if ctx.shutdown.is_cancelled() {
         return Err(ReplacementOpen::Detached);
     }
-    if let Some(budget) = ctx.bandwidth_budget {
+    if let Some(budget) = ctx.bandwidth_budget.as_ref() {
         ctx.control.apply_bandwidth_budget(budget);
     }
     match ctx.factory.open(ctx.account_id.clone()).await {
@@ -215,16 +215,16 @@ pub(in crate::engine) async fn reattach_account_paced(
             guard.rollback_owed = true;
             let walk_fence = ctx.coverage.scope_fence(scope);
             let result = run_establish(
-                ctx.account_id,
+                &ctx.account_id,
                 next.as_ref(),
                 scope.clone(),
                 Arc::clone(&staged),
                 ctx.writer,
-                Arc::clone(ctx.delivery),
+                Arc::clone(&ctx.delivery),
                 &admitted,
-                Arc::clone(ctx.coverage),
+                Arc::clone(&ctx.coverage),
                 false,
-                ctx.shutdown,
+                &ctx.shutdown,
                 Some(guard.attempt),
                 ctx,
                 pacing,
@@ -241,7 +241,7 @@ pub(in crate::engine) async fn reattach_account_paced(
                 (ReattachScopeStep::Skip, Err(error)) => {
                     tracing::warn!(
                         target: "bifrost.sync.reopen",
-                        account = ?ctx.account_id,
+                        account = ?&ctx.account_id,
                         scope = ?scope,
                         error = %error,
                         "scope-local establishment failure or superseded scope during reopen; \
@@ -264,7 +264,7 @@ pub(in crate::engine) async fn reattach_account_paced(
             .filter(|scope| !discovered_set.contains(scope))
             .collect();
 
-        let previous_subscriptions = ctx.subscriptions.snapshot(ctx.account_id);
+        let previous_subscriptions = ctx.subscriptions.snapshot();
         let next_has_push = !bifrost_types::effective_push_lanes(next.as_ref()).is_empty();
         for record in previous_subscriptions.iter().filter(|record| {
             // Recreate what the consumer still WANTS, whatever the state of
@@ -411,8 +411,7 @@ pub(in crate::engine) async fn reattach_account_paced(
                     // returning and the registry write, so an abort later in
                     // this pass (or this future being dropped) cannot leave a
                     // deleted handle registered as live for the next attempt.
-                    ctx.subscriptions
-                        .mark_torn_down(ctx.account_id, &record.handle);
+                    ctx.subscriptions.mark_torn_down(&record.handle);
                 }
                 Err(error) if record.teardown_unconfirmed() => {
                     // Its teardown already failed once. The handle may belong
@@ -429,7 +428,7 @@ pub(in crate::engine) async fn reattach_account_paced(
                     // here as well would make the next reopen subscribe twice.
                     tracing::warn!(
                         target: "bifrost.sync.reopen",
-                        account = ?ctx.account_id,
+                        account = ?&ctx.account_id,
                         error = %error,
                         "carrying push subscription whose teardown is still unconfirmed"
                     );
@@ -439,8 +438,7 @@ pub(in crate::engine) async fn reattach_account_paced(
                     // Still live and wanted on the old account, which stays
                     // installed if this pass aborts: flag it so the retry
                     // carries it instead of aborting on it again.
-                    ctx.subscriptions
-                        .mark_unconfirmed(ctx.account_id, &record.handle);
+                    ctx.subscriptions.mark_unconfirmed(&record.handle);
                     first_refusal.get_or_insert(error);
                 }
             }
@@ -512,11 +510,7 @@ pub(in crate::engine) async fn reattach_account_paced(
         // old handles were already torn down above. The reattach still returns
         // `Ok`, since the swap committed before detach ended the account.
         let mut refused_install = 0_usize;
-        if let Err(refused) = ctx.subscriptions.replace(
-            ctx.account_id.clone(),
-            installed_subscriptions,
-            ctx.shutdown,
-        ) {
+        if let Err(refused) = ctx.subscriptions.replace(installed_subscriptions) {
             for record in refused {
                 if record.desired() {
                     guard.push(record);
@@ -528,7 +522,7 @@ pub(in crate::engine) async fn reattach_account_paced(
         // The replacement open's skip lane supersedes the previous
         // one: a healed namespace disappears from it, a still-degraded
         // one reappears with a fresh classification.
-        log_open_skips(ctx.account_id, &next_skips, "reopen");
+        log_open_skips(&ctx.account_id, &next_skips, "reopen");
         {
             let mut skips = ctx
                 .open_skips
@@ -559,7 +553,7 @@ pub(in crate::engine) async fn reattach_account_paced(
             if let Err(error) = ctx.writer.reset_scope_for_disable(scope.clone()).await {
                 tracing::warn!(
                     target: "bifrost.sync.reopen",
-                    account = ?ctx.account_id,
+                    account = ?&ctx.account_id,
                     scope = ?scope,
                     error = %error,
                     "failed to delete vanished-scope cursor after reopen cutover"
@@ -576,7 +570,7 @@ pub(in crate::engine) async fn reattach_account_paced(
         if !guard.live.is_empty() || refused_install > 0 {
             tracing::warn!(
                 target: "bifrost.sync.reopen",
-                account = ?ctx.account_id,
+                account = ?&ctx.account_id,
                 handles = guard.live.len(),
                 carried_orphans = refused_install,
                 "slot detached during reattach; tearing down the replacement's push \
@@ -588,7 +582,7 @@ pub(in crate::engine) async fn reattach_account_paced(
         // Through the guard, which owes this close until it returns: a drop
         // parked here (or before it) closes the old connection instead of
         // leaking it.
-        let mut retired = ctx.push_retired.subscribe();
+        let mut retired = ctx.push_retired_tx.subscribe();
         let drained = async {
             loop {
                 if *retired.borrow_and_update() > retiring_generation {
@@ -605,7 +599,7 @@ pub(in crate::engine) async fn reattach_account_paced(
         {
             tracing::warn!(
                 target: "bifrost.sync.recovery",
-                account = ?ctx.account_id,
+                account = ?&ctx.account_id,
                 retiring_generation = ?retiring_generation,
                 "push lanes did not drain within the bound; closing the old account anyway"
             );
@@ -614,7 +608,7 @@ pub(in crate::engine) async fn reattach_account_paced(
             pacing.record_holds(ctx, &error);
             tracing::warn!(
                 target: "bifrost.sync.reopen",
-                account = ?ctx.account_id,
+                account = ?&ctx.account_id,
                 error = %error,
                 "old account close failed during reopen"
             );
@@ -635,7 +629,7 @@ pub(in crate::engine) async fn reattach_account_paced(
         pacing.record_holds(ctx, &error);
         tracing::warn!(
             target: "bifrost.sync.reopen",
-            account = ?ctx.account_id,
+            account = ?&ctx.account_id,
             error = %error,
             "replacement account close failed while unwinding reopen"
         );
@@ -676,12 +670,12 @@ pub(in crate::engine) async fn restart_account(ctx: &RecoveryContext<'_>) -> boo
         // A consumer pause is a quiescence boundary. Keep this recovery
         // request queued until resume instead of opening a replacement while
         // the account has promised to be idle.
-        if !ctx.control.wait_until_running(ctx.shutdown).await {
+        if !ctx.control.wait_until_running(&ctx.shutdown).await {
             return false;
         }
         if attempt > 0 && pacing.local_deadline.is_none() {
             let sleep_for = backoff.record_failure(crate::backoff::jitter_seed());
-            if !sleep_unless_shutdown(sleep_for, ctx.shutdown).await {
+            if !sleep_unless_shutdown(sleep_for, &ctx.shutdown).await {
                 return false;
             }
         }
@@ -703,18 +697,18 @@ pub(in crate::engine) async fn restart_account(ctx: &RecoveryContext<'_>) -> boo
             biased;
             () = ctx.shutdown.cancelled() => return false,
             _ = boundary.changed() => continue 'restart,
-            guard = Arc::clone(ctx.reopen_lock).lock_owned() => guard,
+            guard = Arc::clone(&ctx.reopen_lock).lock_owned() => guard,
         };
         if stale_generation(ctx) {
             return false;
         }
         let gate = crate::engine::drive_start::DriveStart {
-            current: ctx.current,
-            control: ctx.control,
-            scheduler: ctx.scheduler,
-            throttles: ctx.throttles,
-            account_id: ctx.account_id,
-            shutdown: ctx.shutdown,
+            current: &ctx.current,
+            control: &ctx.control,
+            scheduler: &ctx.scheduler,
+            throttles: &ctx.throttles,
+            account_id: &ctx.account_id,
+            shutdown: &ctx.shutdown,
         };
         // The reopen lock is another internal wait. Release every owner before
         // paying a hold; the next pass charges it to RepairPacing's allowance.
@@ -762,7 +756,7 @@ pub(in crate::engine) async fn restart_account(ctx: &RecoveryContext<'_>) -> boo
                     Err(Error::Account(error) | Error::EstablishCursorTerminated(error)) => {
                         tracing::warn!(
                             target: "bifrost.sync.changes",
-                            account = ?ctx.account_id,
+                            account = ?&ctx.account_id,
                             attempt,
                             kind = ?error.kind(),
                             message_key = error.message_key(),
@@ -780,7 +774,7 @@ pub(in crate::engine) async fn restart_account(ctx: &RecoveryContext<'_>) -> boo
                         pacing.local_deadline = None;
                         tracing::warn!(
                             target: "bifrost.sync.changes",
-                            account = ?ctx.account_id,
+                            account = ?&ctx.account_id,
                             attempt,
                             error = %error,
                             "RestartAccount: replacement attach failed"
@@ -796,7 +790,7 @@ pub(in crate::engine) async fn restart_account(ctx: &RecoveryContext<'_>) -> boo
             Err(ReplacementOpen::Failed(err)) => {
                 tracing::warn!(
                     target: "bifrost.sync.changes",
-                    account = ?ctx.account_id,
+                    account = ?&ctx.account_id,
                     attempt,
                     kind = ?err.kind(),
                     message_key = err.message_key(),
@@ -815,7 +809,7 @@ pub(in crate::engine) async fn restart_account(ctx: &RecoveryContext<'_>) -> boo
     // as operator attention before pausing all scopes with the account.
     if let Some(err) = last_error {
         broadcast_terminated(
-            ctx.delivery,
+            &ctx.delivery,
             EventScope::Account,
             crate::engine_errors::recovery_exhaustion_error(
                 err,

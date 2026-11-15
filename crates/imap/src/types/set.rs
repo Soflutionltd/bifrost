@@ -119,7 +119,7 @@ impl<I: SetId> NumberSet<I> {
         self.ranges.iter().map(|range| range.lo..=range.hi)
     }
 
-    pub(crate) fn expression(&self) -> Option<SequenceSet> {
+    pub(crate) fn expression(&self) -> Option<SequenceSet<I>> {
         if self.is_empty() {
             None
         } else {
@@ -129,7 +129,7 @@ impl<I: SetId> NumberSet<I> {
 
     /// Client-side filtering envelope. Saved results cannot be resolved here.
     /// Wildcards require mailbox state and cannot supply a finite filter.
-    pub(crate) fn from_expression(expr: &SequenceSet) -> Option<Self> {
+    pub(crate) fn from_expression(expr: &SequenceSet<I>) -> Option<Self> {
         let ranges = expr.ranges()?;
         // The mailbox maximum can be below either numeric endpoint. An
         // enterprise user expects every reported deletion to be reconciled;

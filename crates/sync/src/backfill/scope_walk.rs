@@ -18,7 +18,7 @@
 
 use bifrost_types::InventoryPartition;
 
-use super::runner::{BackfillPartitionOutcome, BackfillScopeWalk, ScopeWalkStep};
+use super::runner::{BackfillPartitionOutcome, PartitionVerdict, ScopeWalkStep};
 
 /// How the remaining partitions of a scope are produced.
 enum PartitionSource {
@@ -57,7 +57,7 @@ impl WalkTotal {
 /// Drives one scope's partition sequence and carries the walk's verdict.
 pub struct ScopeWalkDriver {
     source: PartitionSource,
-    walk: BackfillScopeWalk,
+    stopped_at_barrier: bool,
     // These verdicts are not interchangeable with the scan's settled state:
     // a failed or incomplete partition can end enumeration without proving
     // completion, and a barrier stop remains separately observable to callers.
@@ -96,7 +96,7 @@ impl ScopeWalkDriver {
     fn with_source(source: PartitionSource) -> Self {
         Self {
             source,
-            walk: BackfillScopeWalk::new(),
+            stopped_at_barrier: false,
             exhausted: false,
             awaiting_outcome: false,
             completed: true,
@@ -108,7 +108,7 @@ impl ScopeWalkDriver {
     /// The next partition to walk, or `None` if the scope must not be walked
     /// any further in this pass.
     pub fn next_partition(&mut self) -> Option<InventoryPartition> {
-        if self.exhausted || self.walk.stopped() || self.awaiting_outcome {
+        if self.exhausted || self.stopped_at_barrier || self.awaiting_outcome {
             return None;
         }
         let next = match &mut self.source {
@@ -146,44 +146,30 @@ impl ScopeWalkDriver {
     pub fn fold(&mut self, outcome: &BackfillPartitionOutcome) -> ScopeWalkStep {
         self.awaiting_outcome = false;
         self.total_seen.observe(outcome);
-        if !outcome.complete {
-            // The partition finished but left coverage obligations open.
-            // Completion is about the enumeration space being exhausted, and it
-            // was not: writing the sentinel would make the next attach skip the
-            // walk and turn a declared gap into a permanent one.
+        if !outcome.verdict.complete() {
             self.completed = false;
         }
-        let step = self.walk.admit(outcome);
-        if step == ScopeWalkStep::StopScopeWalk {
+        if outcome.verdict == PartitionVerdict::StoppedAtBarrier {
+            self.stopped_at_barrier = true;
+        }
+        if self.stopped_at_barrier {
             self.completed = false;
             self.exhausted = true;
-            return step;
+            return ScopeWalkStep::StopScopeWalk;
         }
         if let PartitionSource::OpenPages { from, .. } = &mut self.source {
-            // The walk ends where the producer DECLARES its listing ran dry,
-            // and the entry count is never read as that declaration: a server
-            // capping a page below the window returns a short page with more
-            // behind it, and a window whose ids all vanished before hydration
-            // is empty with more behind it.
-            match outcome.end {
-                Some(bifrost_types::PartitionEnd::Exhausted) => self.exhausted = true,
-                Some(_) => {
+            match outcome.verdict {
+                PartitionVerdict::Exhausted { .. } => self.exhausted = true,
+                PartitionVerdict::MoreBeyond { .. } => {
                     if let Some(to) = self.pending_to.take() {
                         *from = to;
                     }
                 }
-                // No completion at all: the stream ended without saying
-                // where the enumeration stands. Walking on could ask for
-                // windows forever, and completing would write a sentinel over
-                // ground nothing proved, so the walk ends with the scope
-                // still Pending.
-                None => {
-                    self.completed = false;
-                    self.exhausted = true;
-                }
+                PartitionVerdict::EndedUnannounced => self.exhausted = true,
+                PartitionVerdict::StoppedAtBarrier => unreachable!("handled above"),
             }
         }
-        step
+        ScopeWalkStep::RequestNextPartition
     }
 
     /// A partition failed outright. The scope stays Pending and the walk ends.
@@ -201,7 +187,7 @@ impl ScopeWalkDriver {
     /// Whether the walk ended because a barrier stopped the scope.
     #[must_use]
     pub fn stopped_at_barrier(&self) -> bool {
-        self.walk.stopped()
+        self.stopped_at_barrier
     }
 
     /// Inventory entries and explicit removals observed across every
@@ -216,21 +202,17 @@ impl ScopeWalkDriver {
 mod tests {
     use super::*;
 
-    use bifrost_types::PartitionEnd;
-
     fn clean(seen: u64) -> BackfillPartitionOutcome {
         BackfillPartitionOutcome {
             seen,
             kept: seen,
-            complete: true,
-            scope_walk: ScopeWalkStep::RequestNextPartition,
-            end: Some(PartitionEnd::MoreBeyond),
+            verdict: PartitionVerdict::MoreBeyond { degraded: false },
         }
     }
 
     fn exhausted(seen: u64) -> BackfillPartitionOutcome {
         BackfillPartitionOutcome {
-            end: Some(PartitionEnd::Exhausted),
+            verdict: PartitionVerdict::Exhausted { degraded: false },
             ..clean(seen)
         }
     }
@@ -239,9 +221,7 @@ mod tests {
         BackfillPartitionOutcome {
             seen,
             kept: seen,
-            complete: false,
-            scope_walk: ScopeWalkStep::StopScopeWalk,
-            end: None,
+            verdict: PartitionVerdict::StoppedAtBarrier,
         }
     }
 
@@ -249,9 +229,7 @@ mod tests {
         BackfillPartitionOutcome {
             seen,
             kept: seen,
-            complete: false,
-            scope_walk: ScopeWalkStep::RequestNextPartition,
-            end: Some(PartitionEnd::MoreBeyond),
+            verdict: PartitionVerdict::MoreBeyond { degraded: true },
         }
     }
 
@@ -425,7 +403,7 @@ mod tests {
         let mut driver = ScopeWalkDriver::open_pages(0, 50);
         driver.next_partition().expect("first window");
         let _ = driver.fold(&BackfillPartitionOutcome {
-            end: None,
+            verdict: PartitionVerdict::EndedUnannounced,
             ..clean(0)
         });
         assert!(driver.next_partition().is_none());

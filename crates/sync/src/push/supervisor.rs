@@ -44,6 +44,18 @@ pub(crate) struct PushSupervisor {
     /// bound still finishes inside detach's worker deadline.
     pub drain_bound: Duration,
 }
+struct LaneDisposition {
+    delay: Duration,
+    action: LaneAction,
+}
+
+#[derive(PartialEq, Eq)]
+enum LaneAction {
+    Retry,
+    Terminal,
+    Restart,
+}
+
 impl PushSupervisor {
     pub async fn run(mut self) {
         let mut carried = HashMap::new();
@@ -167,21 +179,23 @@ impl PushSupervisor {
         error: AccountError,
         generation: crate::types::AccountGeneration,
         pending: &mut VecDeque<ReopenRequest>,
-    ) -> (Duration, bool, bool) {
+    ) -> LaneDisposition {
         // Name the same hintless floor as other recovery owners. The lane
         // takes the maximum with reconnect backoff, so this is not an extra
         // sleep and does not reset consecutive-failure pacing.
         match recovery::dispatch_stream_failure(error.clone(), &self.throttles, &self.account_id) {
-            RecoveryPlan::Retry(a) => (
-                recovery::retry_delay(&a, SystemTime::now(), recovery::HINTLESS_RETRY_WAIT),
-                false,
-                false,
-            ),
-            RecoveryPlan::Reconcile(a) => (
-                recovery::reconcile_delay(&a, SystemTime::now(), recovery::HINTLESS_RETRY_WAIT),
-                false,
-                false,
-            ),
+            RecoveryPlan::Retry(a) => LaneDisposition {
+                delay: recovery::retry_delay(&a, SystemTime::now(), recovery::HINTLESS_RETRY_WAIT),
+                action: LaneAction::Retry,
+            },
+            RecoveryPlan::Reconcile(a) => LaneDisposition {
+                delay: recovery::reconcile_delay(
+                    &a,
+                    SystemTime::now(),
+                    recovery::HINTLESS_RETRY_WAIT,
+                ),
+                action: LaneAction::Retry,
+            },
             RecoveryPlan::Engine(d) => {
                 let restart = matches!(d, EngineDirective::RestartAccount);
                 pending.push_back(ReopenRequest::PushRecovery {
@@ -189,11 +203,21 @@ impl PushSupervisor {
                     error,
                     generation,
                 });
-                (Duration::ZERO, false, restart)
+                LaneDisposition {
+                    delay: Duration::ZERO,
+                    action: if restart {
+                        LaneAction::Restart
+                    } else {
+                        LaneAction::Retry
+                    },
+                }
             }
             RecoveryPlan::Terminal(f) => {
                 broadcast(&self.target(), SyncEvent::Terminated(f.into_inner()));
-                (Duration::ZERO, true, false)
+                LaneDisposition {
+                    delay: Duration::ZERO,
+                    action: LaneAction::Terminal,
+                }
             }
         }
     }
@@ -346,7 +370,7 @@ impl PushSupervisor {
                         Some(PushSessionEvent::Warning(w)) => broadcast(&self.target(), SyncEvent::Warning(w)),
                         Some(PushSessionEvent::UnitFailed(e)) => {
                             last_error = Some(e.clone());
-                            max_hint = max_hint.max(self.failure(e, generation, &mut pending).0);
+                            max_hint = max_hint.max(self.failure(e, generation, &mut pending).delay);
                         }
                         Some(e @ (PushSessionEvent::Failed(_) | PushSessionEvent::Ended(_))) => break e,
                         None => {
@@ -383,12 +407,14 @@ impl PushSupervisor {
                 }
                 PushSessionEvent::Failed(e) => {
                     last_error = Some(e.clone());
-                    let (hint, terminal, restart) =
-                        self.failure(e.clone(), generation, &mut pending);
+                    let LaneDisposition {
+                        delay: hint,
+                        action,
+                    } = self.failure(e.clone(), generation, &mut pending);
                     if connection {
                         owe = true;
                     }
-                    if terminal && connection {
+                    if action == LaneAction::Terminal && connection {
                         self.state(index, PushLaneState::Parked { error: e });
                         if *topology.borrow_and_update() == topo_seen {
                             tokio::select! {
@@ -404,7 +430,7 @@ impl PushSupervisor {
                         continue;
                     }
                     let delay = self.down(index, &mut backoff, &last_error).max(hint);
-                    if restart {
+                    if action == LaneAction::Restart {
                         if !self
                             .wait(Duration::ZERO, &mut pending, &stop, &mut boundary)
                             .await

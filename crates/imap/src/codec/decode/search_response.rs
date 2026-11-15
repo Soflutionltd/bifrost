@@ -15,7 +15,7 @@ pub(super) fn parse_untagged_search(input: &[u8]) -> IResult<&[u8], UntaggedResp
     Ok((
         input,
         UntaggedResponse::Search {
-            uids: nums,
+            numbers: nums,
             mod_seq,
         },
     ))
@@ -124,10 +124,12 @@ pub(super) fn parse_untagged_esearch(input: &[u8]) -> IResult<&[u8], UntaggedRes
 
     let mut esearch = EsearchResponse {
         tag: tag_val.map(|v| String::from_utf8_lossy(&v).into_owned()),
-        uid: uid_indicator.is_some(),
         ..EsearchResponse::default()
     };
 
+    let mut min = None;
+    let mut max = None;
+    let mut all = Vec::new();
     // Result data: space-separated key-value pairs until CRLF.
     let mut input = input;
 
@@ -145,19 +147,19 @@ pub(super) fn parse_untagged_esearch(input: &[u8]) -> IResult<&[u8], UntaggedRes
                 // RFC 4731 Section 3.1: "ALL SP sequence-set"
                 let (rest2, _) = sp(rest)?;
                 let (rest2, set) = sequence_set(rest2)?;
-                esearch.all = set;
+                all = set;
                 input = rest2;
             }
             "MIN" => {
                 let (rest2, _) = sp(rest)?;
                 let (rest2, val) = nz_number(rest2)?;
-                esearch.min = Some(val);
+                min = Some(val);
                 input = rest2;
             }
             "MAX" => {
                 let (rest2, _) = sp(rest)?;
                 let (rest2, val) = nz_number(rest2)?;
-                esearch.max = Some(val);
+                max = Some(val);
                 input = rest2;
             }
             "COUNT" => {
@@ -206,5 +208,7 @@ pub(super) fn parse_untagged_esearch(input: &[u8]) -> IResult<&[u8], UntaggedRes
     }
 
     let (input, _) = crlf(input)?;
+    esearch.numbers =
+        crate::types::response::EsearchNumbers::from_wire(uid_indicator.is_some(), min, max, all);
     Ok((input, UntaggedResponse::Esearch(esearch)))
 }

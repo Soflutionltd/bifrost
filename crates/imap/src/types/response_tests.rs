@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
+type ThreadNode = super::ThreadNode<u32>;
 use crate::types::validated::MailboxName;
 use crate::types::{FetchResponse, Flag, MailboxInfo, StatusItem};
 
@@ -193,17 +194,17 @@ fn response_code_append_uid() {
 
 #[test]
 fn response_code_copy_uid() {
-    let code = ResponseCode::CopyUid {
+    let code = ResponseCode::CopyUid(crate::types::response::CopyUid {
         uid_validity: 100,
         source_uids: vec![UidRange::single(1), UidRange::range(3, 5)],
         dest_uids: vec![UidRange::single(10)],
-    };
+    });
     match &code {
-        ResponseCode::CopyUid {
+        ResponseCode::CopyUid(crate::types::response::CopyUid {
             uid_validity,
             source_uids,
             dest_uids,
-        } => {
+        }) => {
             assert_eq!(*uid_validity, 100);
             assert_eq!(source_uids.len(), 2);
             assert_eq!(dest_uids.len(), 1);
@@ -398,11 +399,14 @@ fn untagged_flags() {
 #[test]
 fn untagged_search() {
     let resp = UntaggedResponse::Search {
-        uids: vec![1, 5, 10, 42],
+        numbers: vec![1, 5, 10, 42],
         mod_seq: None,
     };
     match &resp {
-        UntaggedResponse::Search { uids, mod_seq } => {
+        UntaggedResponse::Search {
+            numbers: uids,
+            mod_seq,
+        } => {
             assert_eq!(uids, &[1, 5, 10, 42]);
             assert!(mod_seq.is_none());
         }
@@ -413,11 +417,11 @@ fn untagged_search() {
 #[test]
 fn untagged_search_empty() {
     let resp = UntaggedResponse::Search {
-        uids: vec![],
+        numbers: vec![],
         mod_seq: None,
     };
     match &resp {
-        UntaggedResponse::Search { uids, .. } => assert!(uids.is_empty()),
+        UntaggedResponse::Search { numbers: uids, .. } => assert!(uids.is_empty()),
         _ => panic!("expected Search"),
     }
 }
@@ -698,22 +702,13 @@ fn untagged_metadata() {
 
 #[test]
 fn untagged_thread() {
-    let resp = UntaggedResponse::Thread(vec![ThreadNode {
-        id: Some(1),
-        children: vec![
-            ThreadNode {
-                id: Some(2),
-                children: vec![],
-            },
-            ThreadNode {
-                id: Some(3),
-                children: vec![ThreadNode {
-                    id: Some(4),
-                    children: vec![],
-                }],
-            },
+    let resp = UntaggedResponse::Thread(vec![ThreadNode::new(
+        Some(1),
+        vec![
+            ThreadNode::new(Some(2), vec![]),
+            ThreadNode::new(Some(3), vec![ThreadNode::new(Some(4), vec![])]),
         ],
-    }]);
+    )]);
     match &resp {
         UntaggedResponse::Thread(nodes) => {
             assert_eq!(nodes.len(), 1);
@@ -959,23 +954,14 @@ fn metadata_entry_nil_value() {
 
 #[test]
 fn thread_node_leaf() {
-    let node = ThreadNode {
-        id: Some(5),
-        children: vec![],
-    };
+    let node = ThreadNode::new(Some(5), vec![]);
     assert_eq!(node.id, Some(5));
     assert!(node.children.is_empty());
 }
 
 #[test]
 fn thread_node_dummy_parent() {
-    let node = ThreadNode {
-        id: None,
-        children: vec![ThreadNode {
-            id: Some(1),
-            children: vec![],
-        }],
-    };
+    let node = ThreadNode::new(None, vec![ThreadNode::new(Some(1), vec![])]);
     assert_eq!(node.id, None);
     assert_eq!(node.children.len(), 1);
 }
@@ -1000,22 +986,24 @@ fn response_untagged_boxed() {
 fn esearch_response_default() {
     let esearch = EsearchResponse::default();
     assert_eq!(esearch.tag, None);
-    assert!(!esearch.uid);
-    assert_eq!(esearch.min, None);
-    assert_eq!(esearch.max, None);
+    assert!(!esearch.is_uid());
+    assert_eq!(esearch.min(), None);
+    assert_eq!(esearch.max(), None);
     assert_eq!(esearch.count, None);
-    assert!(esearch.all.is_empty());
+    assert!(esearch.all().is_empty());
 }
 
 #[test]
 fn esearch_response_clone_eq() {
     let esearch = EsearchResponse {
         tag: Some("A001".into()),
-        uid: true,
-        min: Some(1),
-        max: Some(100),
+        numbers: crate::types::response::EsearchNumbers::from_wire(
+            true,
+            Some(1),
+            Some(100),
+            vec![UidRange::range(1, 50), UidRange::range(51, 100)],
+        ),
         count: Some(50),
-        all: vec![UidRange::range(1, 50), UidRange::range(51, 100)],
         mod_seq: None,
     };
     let cloned = esearch.clone();
@@ -1025,11 +1013,11 @@ fn esearch_response_clone_eq() {
 #[test]
 fn esearch_response_ne() {
     let a = EsearchResponse {
-        min: Some(1),
+        numbers: crate::types::response::EsearchNumbers::from_wire(false, Some(1), None, vec![]),
         ..EsearchResponse::default()
     };
     let b = EsearchResponse {
-        min: Some(2),
+        numbers: crate::types::response::EsearchNumbers::from_wire(false, Some(2), None, vec![]),
         ..EsearchResponse::default()
     };
     assert_ne!(a, b);
@@ -1561,4 +1549,25 @@ fn capability_parser_canonicalizes_suffixes() {
         Capability::from_imap_str("thread=references"),
         Capability::Thread(value) if value == "REFERENCES"
     ));
+}
+
+#[test]
+fn thread_addressing_handles_long_linear_chains_without_recursion() {
+    let length = 50_000u32;
+    let mut raw = ThreadNode::new(Some(length), Vec::new());
+    for number in (1..length).rev() {
+        raw = ThreadNode::new(Some(number), vec![raw]);
+    }
+    let mut addressed = raw.addressed::<crate::types::Uid>();
+    // Consume the tree iteratively as well: this test pins conversion, not
+    // the recursive drop glue of an arbitrary-depth nested Vec value.
+    for number in 1..=length {
+        assert_eq!(addressed.id, Some(number));
+        if number == length {
+            assert!(addressed.children.is_empty());
+        } else {
+            assert_eq!(addressed.children.len(), 1);
+            addressed = addressed.children.pop().unwrap();
+        }
+    }
 }

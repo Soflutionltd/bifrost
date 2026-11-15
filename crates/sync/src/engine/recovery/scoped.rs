@@ -34,7 +34,7 @@ pub(crate) async fn establish_if_absent(
     if let Err(err) = ctx.writer.reset_scope_for_restart(scope.clone()).await {
         tracing::warn!(
             target: "bifrost.sync.changes",
-            account = ?ctx.account_id,
+            account = ?&ctx.account_id,
             scope = ?scope,
             error = %err,
             "EstablishIfAbsent: durable scope reset failed"
@@ -97,7 +97,7 @@ pub(in crate::engine) fn begin_scope_repair(
     if activity.is_none() {
         tracing::debug!(
             target: "bifrost.sync.changes",
-            account = ?ctx.account_id,
+            account = ?&ctx.account_id,
             scope = ?scope,
             "scope repair deferred: the account is paused; a registered failing cursor \
              raises the directive again after resume, and a cursorless scope is parked"
@@ -115,7 +115,7 @@ pub(in crate::engine) async fn restart_scope_admitted(
     if let Err(err) = ctx.writer.reset_scope_for_restart(scope.clone()).await {
         tracing::warn!(
             target: "bifrost.sync.changes",
-            account = ?ctx.account_id,
+            account = ?&ctx.account_id,
             scope = ?scope,
             error = %err,
             "RestartScope: durable scope reset failed"
@@ -145,14 +145,14 @@ pub(in crate::engine) async fn disable_scope(
     if let Err(err) = ctx.writer.reset_scope_for_disable(scope.clone()).await {
         tracing::warn!(
             target: "bifrost.sync.changes",
-            account = ?ctx.account_id,
+            account = ?&ctx.account_id,
             scope = ?scope,
             error = %err,
             "DisableScope: durable scope reset failed"
         );
     }
     broadcast_warning(
-        ctx.delivery,
+        &ctx.delivery,
         Some(scope.clone()),
         bifrost_types::Warning::user_safe(
             bifrost_types::WarningKind::Engine(bifrost_types::EngineNotice::ScopeDisabled),
@@ -182,23 +182,23 @@ pub(in crate::engine) async fn re_establish_scope_with_backoff(
     for attempt in 0..REOPEN_RETRY_BUDGET.0 {
         if attempt > 0 && pacing.local_deadline.is_none() {
             let sleep_for = backoff.record_failure(crate::backoff::jitter_seed());
-            if !sleep_unless_shutdown(sleep_for, ctx.shutdown).await {
+            if !sleep_unless_shutdown(sleep_for, &ctx.shutdown).await {
                 return;
             }
         }
         let acc_arc = ctx.current.load_full();
         let acc: &dyn Account = acc_arc.as_ref().as_ref();
         match run_establish(
-            ctx.account_id,
+            &ctx.account_id,
             acc,
             scope.clone(),
-            Arc::clone(ctx.cursors),
+            Arc::clone(&ctx.cursors),
             ctx.writer,
-            Arc::clone(ctx.delivery),
+            Arc::clone(&ctx.delivery),
             control,
-            Arc::clone(ctx.coverage),
+            Arc::clone(&ctx.coverage),
             true,
-            ctx.shutdown,
+            &ctx.shutdown,
             None,
             ctx,
             &mut pacing,
@@ -207,13 +207,13 @@ pub(in crate::engine) async fn re_establish_scope_with_backoff(
         .await
         {
             Ok(_) => {
-                if let Err(err) = link_discovered_memberships(acc, ctx.cursors).await {
+                if let Err(err) = link_discovered_memberships(acc, &ctx.cursors).await {
                     if let Error::Account(error) = &err {
                         pacing.observe(ctx, error);
                     }
                     tracing::warn!(
                         target: "bifrost.sync.changes",
-                        account = ?ctx.account_id,
+                        account = ?&ctx.account_id,
                         scope = ?scope,
                         error = %err,
                         "scope re-establishment: membership refresh failed"
@@ -225,7 +225,7 @@ pub(in crate::engine) async fn re_establish_scope_with_backoff(
             Err(Error::Account(err) | Error::EstablishCursorTerminated(err)) => {
                 tracing::warn!(
                     target: "bifrost.sync.changes",
-                    account = ?ctx.account_id,
+                    account = ?&ctx.account_id,
                     scope = ?scope,
                     attempt,
                     kind = ?err.kind(),
@@ -242,8 +242,8 @@ pub(in crate::engine) async fn re_establish_scope_with_backoff(
                 use crate::recovery::RecoveryPlan;
                 match crate::recovery::dispatch_stream_failure(
                     err.clone(),
-                    ctx.throttles,
-                    ctx.account_id,
+                    &ctx.throttles,
+                    &ctx.account_id,
                 ) {
                     RecoveryPlan::Engine(EngineDirective::DisableScope(quarantined)) => {
                         disable_scope(ctx, quarantined, err.clone()).await;
@@ -265,7 +265,7 @@ pub(in crate::engine) async fn re_establish_scope_with_backoff(
             Err(err) => {
                 tracing::warn!(
                     target: "bifrost.sync.changes",
-                    account = ?ctx.account_id,
+                    account = ?&ctx.account_id,
                     scope = ?scope,
                     attempt,
                     error = %err,
@@ -293,7 +293,7 @@ pub(in crate::engine) async fn re_establish_scope_with_backoff(
     let warning_error = last_account_error.clone();
     if let Some(err) = last_account_error {
         broadcast_terminated(
-            ctx.delivery,
+            &ctx.delivery,
             EventScope::Cursor(scope.clone()),
             crate::engine_errors::recovery_exhaustion_error(
                 err,
@@ -303,7 +303,7 @@ pub(in crate::engine) async fn re_establish_scope_with_backoff(
         );
     }
     broadcast_warning(
-        ctx.delivery,
+        &ctx.delivery,
         Some(scope.clone()),
         bifrost_types::Warning::user_safe(
             bifrost_types::WarningKind::Engine(

@@ -429,11 +429,11 @@ fn destination_rejection(
     let MutationKind::Move(destination) = kind else {
         return None;
     };
-    let target_owner = super::foreign::owner_of(&target.0);
-    let destination_owner = super::foreign::owner_of(destination.as_str());
-    if super::foreign::JmapRef::parse(&target.0)
-        .same_owner(super::foreign::JmapRef::parse(destination.as_str()))
-    {
+    let target_ref = super::foreign::JmapRef::parse(&target.0);
+    let destination_ref = super::foreign::JmapRef::parse(destination.as_str());
+    let target_owner = target_ref.owner.shared();
+    let destination_owner = destination_ref.owner.shared();
+    if target_ref.same_owner(destination_ref) {
         return None;
     }
     Some(ItemOutcome::Failed(BatchFailure::new(

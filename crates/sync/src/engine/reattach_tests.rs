@@ -51,41 +51,10 @@ impl Fixture {
         Self { engine, slot, id }
     }
     fn writer(&self) -> WriterHandle {
-        WriterHandle::new(
-            self.engine
-                .ack_senders
-                .get(&self.id)
-                .expect("writer")
-                .value()
-                .clone(),
-        )
+        self.slot.writer()
     }
     fn ctx<'a>(&'a self, writer: &'a WriterHandle) -> RecoveryContext<'a> {
-        let slot = &self.slot;
-        RecoveryContext {
-            scheduler: &slot.scheduler,
-            deferred_schema_reset: &slot.deferred_schema_reset,
-            bandwidth_budget: slot.bandwidth_budget.as_ref(),
-            factory: &slot.factory,
-            current: &slot.current,
-            cursors: &slot.cursors,
-            account_id: &self.id,
-            control: &slot.control,
-            account_control_tx: &slot.account_control_tx,
-            throttles: &slot.throttles,
-            capabilities: &slot.capabilities,
-            subscriptions: &self.engine.subscriptions,
-            account_generation_tx: &slot.account_generation_tx,
-            push_retired: &slot.push_retired_tx,
-            push_drain_wait: Duration::from_secs(30),
-            expected_generation: None,
-            reopen_lock: &slot.reopen_lock,
-            open_skips: &slot.open_skips,
-            shutdown: &slot.shutdown,
-            writer,
-            coverage: &slot.coverage,
-            delivery: &slot.delivery,
-        }
+        self.slot.recovery(writer)
     }
     fn hold(&self, seconds: u64) {
         self.slot.throttles.record(
@@ -108,11 +77,11 @@ async fn engine_auto_pause_preserves_stop_before_a_waiter_observes_it() {
     .await;
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
-    let mut boundary = Boundary::from(fixture.slot.boundary_tx.clone()).subscribe();
+    let mut boundary = fixture.slot.boundary.clone().subscribe();
 
     engine_pause(&ctx, PauseReason::RetryBudgetExhausted);
     assert_eq!(boundary.peek(), BoundaryRequest::Pause);
-    fixture.slot.boundary_tx.send_replace(BoundaryRequest::Stop);
+    fixture.slot.boundary.set(BoundaryRequest::Stop);
     // Recovery finishes after detach, before the watcher consumes Stop.
     // Watch updates coalesce, so a blind Pause would erase its only exit signal.
     engine_pause(&ctx, PauseReason::OperatorOverrideRequired);
@@ -128,9 +97,9 @@ async fn engine_resume_preserves_stop_before_slot_removal() {
     .await;
     // Exercise the write itself while the slot is still reachable. Detach
     // normally removes it first, but Stop must not depend on that lookup order.
-    fixture.slot.boundary_tx.send_replace(BoundaryRequest::Stop);
+    fixture.slot.boundary.set(BoundaryRequest::Stop);
     fixture.engine.resume_account(&fixture.id).expect("resume");
-    assert_eq!(*fixture.slot.boundary_tx.borrow(), BoundaryRequest::Stop);
+    assert_eq!(fixture.slot.boundary.snapshot(), BoundaryRequest::Stop);
 }
 
 async fn turns() {
@@ -161,7 +130,7 @@ async fn repair_declared_hold_blocks_first_attempt_and_clears() {
     let repair = re_establish_scope_with_backoff(
         &ctx,
         SCOPE,
-        ctx.control,
+        &ctx.control,
         crate::cursor::ScopeFence::for_test(0),
     );
     tokio::pin!(repair);
@@ -203,14 +172,14 @@ async fn repair_429_is_recorded_for_another_lane() {
     let repair = re_establish_scope_with_backoff(
         &ctx,
         SCOPE,
-        ctx.control,
+        &ctx.control,
         crate::cursor::ScopeFence::for_test(0),
     );
     tokio::pin!(repair);
     tokio::select! { biased; () = &mut repair => panic!("repair finished"), () = turns() => {} }
     assert_eq!(calls(&account), 1);
     assert_eq!(
-        crate::throttle::throttle_wait(ctx.throttles, &AccountId("peer".into()), &[key()]),
+        crate::throttle::throttle_wait(&ctx.throttles, &AccountId("peer".into()), &[key()]),
         Some(Duration::from_secs(20))
     );
 }
@@ -229,7 +198,7 @@ async fn repair_throttle_wait_replaces_jitter_without_spending_attempts() {
     let repair = re_establish_scope_with_backoff(
         &ctx,
         SCOPE,
-        ctx.control,
+        &ctx.control,
         crate::cursor::ScopeFence::for_test(0),
     );
     tokio::pin!(repair);
@@ -262,7 +231,7 @@ async fn repair_wait_allowance_expires_without_provider_call() {
     let repair = re_establish_scope_with_backoff(
         &ctx,
         SCOPE,
-        ctx.control,
+        &ctx.control,
         crate::cursor::ScopeFence::for_test(0),
     );
     tokio::pin!(repair);
@@ -429,7 +398,7 @@ async fn repair_first_attempt_honours_hold_recorded_by_another_lane() {
     let repair = re_establish_scope_with_backoff(
         &ctx,
         SCOPE,
-        ctx.control,
+        &ctx.control,
         crate::cursor::ScopeFence::for_test(0),
     );
     tokio::pin!(repair);
@@ -455,7 +424,7 @@ async fn repair_wait_allowance_is_cumulative_across_hold_extensions() {
     let repair = re_establish_scope_with_backoff(
         &ctx,
         SCOPE,
-        ctx.control,
+        &ctx.control,
         crate::cursor::ScopeFence::for_test(0),
     );
     tokio::pin!(repair);
@@ -538,13 +507,13 @@ async fn writer_boundary_case(stored_inventory: bool, exhaust: bool) {
         &fixture.id,
         account.as_ref(),
         SCOPE,
-        Arc::clone(ctx.cursors),
+        Arc::clone(&ctx.cursors),
         &writer,
-        Arc::clone(ctx.delivery),
-        ctx.control,
-        Arc::clone(ctx.coverage),
+        Arc::clone(&ctx.delivery),
+        &ctx.control,
+        Arc::clone(&ctx.coverage),
         false,
-        ctx.shutdown,
+        &ctx.shutdown,
         None,
         &ctx,
         &mut pacing,
@@ -611,13 +580,13 @@ async fn unreadable_stored_envelope_returns_error_without_reset_request() {
         &fixture.id,
         account.as_ref(),
         SCOPE,
-        Arc::clone(ctx.cursors),
+        Arc::clone(&ctx.cursors),
         &writer,
-        Arc::clone(ctx.delivery),
-        ctx.control,
-        Arc::clone(ctx.coverage),
+        Arc::clone(&ctx.delivery),
+        &ctx.control,
+        Arc::clone(&ctx.coverage),
         false,
-        ctx.shutdown,
+        &ctx.shutdown,
         Some(crate::engine::ReattachAttempt::for_test(44)),
         &ctx,
         &mut pacing,
@@ -793,18 +762,14 @@ async fn round1_teardown_records_every_refusal_before_next_call() {
     let fixture = Fixture::new(factory).await;
     *bucket.lock().expect("install bucket") = Some(Arc::clone(&fixture.slot.throttles));
     fixture
-        .engine
+        .slot
         .subscriptions
-        .replace(
-            fixture.id.clone(),
-            vec![
-                subscription("first", false),
-                subscription("second", false),
-                subscription("third", true),
-                subscription("fourth", true),
-            ],
-            &fixture.slot.shutdown,
-        )
+        .replace(vec![
+            subscription("first", false),
+            subscription("second", false),
+            subscription("third", true),
+            subscription("fourth", true),
+        ])
         .expect("install subscriptions");
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
@@ -834,13 +799,9 @@ async fn round1_teardown_records_unconfirmed_refusal_even_when_swap_succeeds() {
     ])))
     .await;
     fixture
-        .engine
+        .slot
         .subscriptions
-        .replace(
-            fixture.id.clone(),
-            vec![subscription("orphan", true)],
-            &fixture.slot.shutdown,
-        )
+        .replace(vec![subscription("orphan", true)])
         .expect("subscriptions");
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
@@ -855,7 +816,7 @@ async fn round1_teardown_records_unconfirmed_refusal_even_when_swap_succeeds() {
     );
     assert_eq!(
         crate::throttle::throttle_wait(
-            ctx.throttles,
+            &ctx.throttles,
             &AccountId("peer".into()),
             &[ThrottleKey::Budget(ThrottleBudget::new("orphan"))]
         ),
@@ -888,7 +849,7 @@ async fn round1_local_deadline_keeps_longest_across_shorter_and_unthrottled_fail
 
 fn peer_hold(ctx: &RecoveryContext<'_>, budget: &str) -> Option<Duration> {
     crate::throttle::throttle_wait(
-        ctx.throttles,
+        &ctx.throttles,
         &AccountId("peer".into()),
         &[ThrottleKey::Budget(ThrottleBudget::new(budget))],
     )
@@ -941,9 +902,9 @@ async fn round2_unwind_records_every_refusal_and_preserves_original_error() {
         })
         .collect();
     fixture
-        .engine
+        .slot
         .subscriptions
-        .replace(fixture.id.clone(), records, &fixture.slot.shutdown)
+        .replace(records)
         .expect("subscriptions");
     let writer = fixture.writer();
     let ctx = fixture.ctx(&writer);
@@ -1049,7 +1010,7 @@ async fn round2_scope_membership_refresh_records_hold_and_remains_best_effort() 
     re_establish_scope_with_backoff(
         &ctx,
         SCOPE,
-        ctx.control,
+        &ctx.control,
         crate::cursor::ScopeFence::for_test(0),
     )
     .await;
@@ -1331,13 +1292,13 @@ async fn run_establish_judges_its_installs_against_the_fence_it_was_given() {
             &fixture.id,
             account.as_ref(),
             SCOPE,
-            Arc::clone(ctx.cursors),
+            Arc::clone(&ctx.cursors),
             &writer,
-            Arc::clone(ctx.delivery),
-            ctx.control,
-            Arc::clone(ctx.coverage),
+            Arc::clone(&ctx.delivery),
+            &ctx.control,
+            Arc::clone(&ctx.coverage),
             false,
-            ctx.shutdown,
+            &ctx.shutdown,
             None,
             &ctx,
             &mut RepairPacing::default(),

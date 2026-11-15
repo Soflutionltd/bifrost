@@ -1434,12 +1434,8 @@ fn move_fallback_record(
             ErrorScope::Cursor(super::folder_scope(destination)),
         ),
     ];
-    if let Some(ResponseCode::CopyUid {
-        uid_validity,
-        dest_uids,
-        ..
-    }) = &copy.copy_uid
-        && *uid_validity != 0
+    if let Some(mapping) = &copy.copy_uid
+        && let Some(validity) = mapping.validity()
     {
         // A zero epoch cannot identify a message. Keep the known folder
         // effect but omit unusable message detail: users need truthful
@@ -1448,7 +1444,7 @@ fn move_fallback_record(
         // numeric span. The folder target still identifies every copied item
         // when message detail is truncated (StepTargets::at_least).
         let mut remaining = 256usize;
-        for range in dest_uids {
+        for range in &mapping.dest_uids {
             for uid in (range.start()..=range.end().unwrap_or(range.start())).take(remaining) {
                 remaining -= 1;
                 if uid == 0 {
@@ -1459,8 +1455,7 @@ fn move_fallback_record(
                     ErrorScope::Message {
                         id: super::encode_object_id(
                             destination,
-                            crate::types::UidValidity::new(*uid_validity)
-                                .expect("nonzero COPYUID epoch"),
+                            validity,
                             crate::types::Uid::new(uid).expect("nonzero COPYUID UID"),
                         ),
                     },
@@ -2270,7 +2265,7 @@ mod tests {
         for (uid_validity, uid, expected_refs) in [(0, 1, 2), (9, 1, 3)] {
             let copy = crate::types::CopyResult {
                 code: None,
-                copy_uid: Some(ResponseCode::CopyUid {
+                copy_uid: Some(crate::types::response::CopyUid {
                     uid_validity,
                     source_uids: vec![crate::types::UidRange::single(1)],
                     dest_uids: vec![crate::types::UidRange::single(uid)],
@@ -2299,7 +2294,7 @@ mod tests {
     fn copyuid_diagnostic_detail_is_bounded_across_ranges() {
         let copy = crate::types::CopyResult {
             code: None,
-            copy_uid: Some(ResponseCode::CopyUid {
+            copy_uid: Some(crate::types::response::CopyUid {
                 uid_validity: 9,
                 source_uids: vec![crate::types::UidRange::single(1)],
                 dest_uids: vec![

@@ -45,12 +45,6 @@ happen, plus one surface gap that matters if the consumer relies on it.
   `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
   An omission only if the engine is meant to be the consumer's single door
   for calendar, as it is for contacts.
-- **An expired CalDAV sync token fails every poll.** `cursor_invalid_error` in
-  `crates/caldav/src/client.rs` scopes the error to `CursorScope::Folder(url)`,
-  but live CalDAV cursors are `CursorScope::FolderType`, so the engine's
-  exact-match `RestartScope` misses the cursor and the stale token is replayed
-  on every poll. `reference/caldav.md` documents the wrong scope too. Scope it
-  to the live cursor's shape and pin it with a restart test.
 
 ## 2. Blocked on a live probe
 
@@ -286,6 +280,35 @@ face.
 ## 5. Low priority
 
 Narrow edge cases, audits with no known defect, and design work.
+
+- **IMAP THREAD trees still recurse on deep replies (priority-low, real
+  stack-overflow surface).** `ThreadNode::addressed` is now iterative, but
+  `flatten_thread` and the drop glue of the nested `ThreadNode` tree still
+  recurse, so a long linear reply chain within the parser's nesting cap can
+  still overflow the stack downstream of the conversion, which makes the
+  iterative conversion pointless on its own. Ablation confirmed the recursive
+  conversion overflows a 50,000-deep chain in a debug test thread.
+- **Lateral findings from the review of the November 2026 resolution batch.**
+  - IMAP: an ESEARCH answer without the UID indicator to a UID SEARCH is now a
+    hard protocol error; a lenient server that omits the indicator fails every
+    search. No fixed-value test pins the escaped `~imap-wire:` mailbox id form.
+  - JMAP: one server-minted id containing the owner separator now fails the
+    whole response; needs a ruling on dropping that item versus failing all.
+    Shared-account contacts and calendars have no routing door: the optional
+    families live once on `Registry::families` and select the primary account
+    (capability question).
+  - DAV: the dispatcher tests now call `send_raw_request` directly, so a crate
+    verb that bypassed the dispatcher would go unnoticed. The admitted-https
+    redirect test does not assert that no credential reached the wire on the
+    refused hops.
+  - sync: engine-wide `AccountId`-keyed throttles can receive late holds from a
+    retired slot, which a reattach of the same id inherits. `MaintenanceGate`
+    still exposes the raw boundary sender. A retained slot `Arc` keeps its
+    watch and broadcast channels open past detach. The integration test
+    `an_orphan_restored_after_detachs_take_is_not_inherited_by_the_next_attach`
+    no longer bites on removing the shutdown check in
+    `SubscriptionRegistry::restore_orphans` (only the unit test does), since
+    the registry is now per-slot; its doc still claims that ablation.
 
 - **Lateral findings from the review of the design-hunt batch, unverified.**
   Each wants its own check and, where marked, a ruling.

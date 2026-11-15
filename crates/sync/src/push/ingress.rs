@@ -4,27 +4,44 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// A full sweep or specific invalidation targets, never both.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum InvalidationIntent<T> {
+    Full,
+    Specific(T),
+}
+
+impl<T: Default> Default for InvalidationIntent<T> {
+    fn default() -> Self {
+        Self::Specific(T::default())
+    }
+}
+
+impl<T> InvalidationIntent<T> {
+    /// Only newly merged hints are bounded, never a resolved full sweep.
+    pub(crate) fn bound(&mut self, capacity: usize, count: impl FnOnce(&T) -> usize) -> bool {
+        if matches!(self, Self::Specific(targets) if count(targets) > capacity) {
+            *self = Self::Full;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Specific hints waiting to be resolved against current cursor topology.
+#[derive(Debug, Default, Clone)]
+pub struct PushHints {
+    pub scopes: HashSet<CursorScope>,
+    pub memberships: HashSet<MembershipScope>,
+}
+
 /// Pending invalidation intent moved out of a [`PushIngress`] by `take`.
 #[derive(Debug, Default, Clone)]
 pub struct PendingPush {
-    pub full: bool,
-    pub scopes: HashSet<CursorScope>,
-    pub memberships: HashSet<MembershipScope>,
+    pub intent: InvalidationIntent<PushHints>,
     pub closed: bool,
-}
-
-impl PendingPush {
-    /// Apply the bound only to newly merged hints, never to a resolved full
-    /// sweep. Returns whether this transition coarsened distinct intent.
-    pub(crate) fn bound(&mut self, capacity: usize) -> bool {
-        let coarsened = !self.full && self.scopes.len() + self.memberships.len() > capacity;
-        self.full |= coarsened;
-        if self.full {
-            self.scopes.clear();
-            self.memberships.clear();
-        }
-        coarsened
-    }
 }
 
 /// One account's pending push invalidations: distinct hinted scopes and
@@ -64,19 +81,19 @@ impl PushIngress {
         if state.closed {
             return;
         }
-        if !state.full {
+        if let InvalidationIntent::Specific(hints) = &mut state.intent {
             match payload {
                 HintPayload::SpecificCursorScope(scope) => {
-                    state.scopes.insert(scope.clone());
+                    hints.scopes.insert(scope.clone());
                 }
                 HintPayload::SpecificMembership(scope) => {
-                    state.memberships.insert(scope.clone());
+                    hints.memberships.insert(scope.clone());
                 }
-                _ => {
-                    state.full = true;
-                }
+                _ => state.intent = InvalidationIntent::Full,
             }
-            if state.bound(self.capacity) {
+            if state.intent.bound(self.capacity, |hints| {
+                hints.scopes.len() + hints.memberships.len()
+            }) {
                 self.count_coarsening();
             }
         }
@@ -141,13 +158,12 @@ mod tests {
             bifrost_types::FolderId("one".into()),
         )));
         let pending = ingress.take();
-        assert!(pending.full);
-        assert!(pending.scopes.is_empty() && pending.memberships.is_empty());
+        assert!(matches!(pending.intent, InvalidationIntent::Full));
         assert_eq!(ingress.coarsened(), 1);
         for _ in 0..100 {
             ingress.request_full();
         }
-        assert!(ingress.take().full);
+        assert!(matches!(ingress.take().intent, InvalidationIntent::Full));
         assert_eq!(ingress.coarsened(), 1);
     }
     #[tokio::test(start_paused = true)]
@@ -161,17 +177,20 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
             .await
             .expect("thread wake");
-        assert!(ingress.take().full);
+        assert!(matches!(ingress.take().intent, InvalidationIntent::Full));
     }
     #[tokio::test(start_paused = true)]
     async fn push_ingress_keeps_a_push_landing_between_take_and_wait() {
         let ingress = PushIngress::new(1);
-        assert!(!ingress.take().full);
+        assert!(matches!(
+            ingress.take().intent,
+            InvalidationIntent::Specific(_)
+        ));
         ingress.request_full();
         tokio::time::timeout(std::time::Duration::from_secs(1), ingress.changed())
             .await
             .expect("latched wake");
-        assert!(ingress.take().full);
+        assert!(matches!(ingress.take().intent, InvalidationIntent::Full));
     }
     #[tokio::test(start_paused = true)]
     async fn push_ingress_ignores_pushes_after_close() {
@@ -183,7 +202,7 @@ mod tests {
             .expect("latched wake");
         let pending = ingress.take();
         assert!(pending.closed);
-        assert!(!pending.full);
+        assert!(matches!(pending.intent, InvalidationIntent::Specific(_)));
         assert!(ingress.take().closed);
     }
 }

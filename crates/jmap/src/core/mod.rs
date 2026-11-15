@@ -176,6 +176,13 @@ macro_rules! __json_object_serde {
                         {
                             properties.insert(key, value);
                         }
+                        // Map-backed objects mint the same native identities as
+                        // typed wire objects. Check before accessors can turn
+                        // their raw id into a routable consumer identity.
+                        if let Some(id) = properties.get("id").and_then(serde_json::Value::as_str) {
+                            $crate::core::id::validate_native(id)
+                                .map_err(serde::de::Error::custom)?;
+                        }
                         Ok($name { properties })
                     }
                 }

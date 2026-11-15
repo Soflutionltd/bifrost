@@ -1,12 +1,7 @@
-//! Push subscription tracking.
-//!
-//! `Account::push_subscribe` returns a `SubscriptionHandle` the engine
-//! stashes here so the consumer can `unsubscribe_push(account_id)`
-//! later. The registry is per-engine, not per-account.
+//! Subscription handles owned by one account attachment.
 
-use bifrost_types::{AccountId, CursorScope, SubscriptionHandle};
-use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
+use bifrost_types::{CursorScope, SubscriptionHandle};
+use std::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
@@ -50,43 +45,36 @@ impl RegisteredSubscription {
     }
 }
 
-/// Per-engine subscription handle registry.
+/// Subscription handles for one attachment. A later attachment always gets a
+/// fresh registry, even when it uses the same account id.
 #[derive(Debug, Default)]
 pub struct SubscriptionRegistry {
-    inner: DashMap<AccountId, Vec<RegisteredSubscription>>,
+    inner: Mutex<Vec<RegisteredSubscription>>,
+    shutdown: CancellationToken,
 }
 
 impl SubscriptionRegistry {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(shutdown: CancellationToken) -> Self {
+        Self {
+            inner: Mutex::new(Vec::new()),
+            shutdown,
+        }
     }
 
-    /// Record a handle for an account, unless the owning slot is being torn
-    /// down. Returns whether the record was written; `false` means the slot's
-    /// `shutdown` token was already cancelled and nothing was registered, so the
-    /// caller still owns a live subscription the registry will never hold.
-    ///
-    /// The token is read inside the entry's shard lock, for the reason
-    /// [`Self::restore_orphans`] gives: detach cancels the token before it takes
-    /// the account's records, so a write that reads the token here is either
-    /// ordered before the take (which discards it with the rest of the
-    /// incarnation) or after it, where the cancellation is visible and the write
-    /// is refused. A record landing after the take would sit under an id a later
-    /// attach of the same `AccountId` inherits.
+    /// Refuse a late transfer so its caller can tear down the server handle.
+    /// Slot ownership prevents cross-attachment reuse; this check additionally
+    /// prevents accepting an obligation after detach's final drain.
     #[must_use]
-    pub fn record(
-        &self,
-        account: AccountId,
-        handle: SubscriptionHandle,
-        scopes: Vec<CursorScope>,
-        shutdown: &CancellationToken,
-    ) -> bool {
-        let entry = self.inner.entry(account);
-        if shutdown.is_cancelled() {
+    pub fn record(&self, handle: SubscriptionHandle, scopes: Vec<CursorScope>) -> bool {
+        let mut records = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.shutdown.is_cancelled() {
             return false;
         }
-        entry.or_default().push(RegisteredSubscription {
+        records.push(RegisteredSubscription {
             handle,
             scopes,
             state: SubscriptionState::Live,
@@ -94,89 +82,50 @@ impl SubscriptionRegistry {
         true
     }
 
-    /// Take all records registered for an account that still have a
-    /// server-side handle to tear down. Returns an empty vec if none. Callers
-    /// that cannot tear down a handle restore its record so the same
-    /// account-side handle remains retryable. A `torn_down` record is dropped
-    /// here: its server side is already gone and the caller taking the
-    /// registry (a consumer unsubscribe, a detach) is ending the desire it
-    /// carried.
     #[must_use]
-    pub(crate) fn take(&self, account: &AccountId) -> Vec<RegisteredSubscription> {
-        match self.inner.remove(account) {
-            Some((_, mut v)) => {
-                v.retain(|record| !record.torn_down());
-                v
-            }
-            None => Vec::new(),
-        }
+    pub(crate) fn take(&self) -> Vec<RegisteredSubscription> {
+        let mut records = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *records)
+            .into_iter()
+            .filter(|record| !record.torn_down())
+            .collect()
     }
 
-    /// Restore records whose server-side teardown failed, unless the owning slot
-    /// is being torn down. Merge rather than replace so a concurrent
-    /// `subscribe_push` registration is preserved. Returns whether the records
-    /// were written; `false` means the slot's `shutdown` token was already
-    /// cancelled and they were dropped.
-    ///
-    /// The token is read INSIDE the entry's shard lock, which is the lock
-    /// [`Self::take`] removes under, and that is the point. Detach cancels the
-    /// token BEFORE it takes the account's records, so this write is either
-    /// ordered before the take (which then discards it, as it discards
-    /// everything of that incarnation) or after it, where the cancellation is
-    /// already visible and the write is refused. A token check made before
-    /// calling, with the write a separate step, leaves an interval on a
-    /// multi-thread runtime in which detach can cancel AND take, and the orphan
-    /// then lands under an id a later attach of the same `AccountId` inherits.
-    ///
-    /// The slot's reopen lock does not close that interval. Detach does wait
-    /// for it before the take, but only for a bounded `detach_timeout`, because
-    /// a consumer-driven reattach holds it across `factory.open()` and network
-    /// calls and the one call a consumer has for getting rid of an account must
-    /// not wait on a wedged open; on expiry detach proceeds without the lock.
-    /// Only the token read
-    /// inside the shard lock orders this write against the take in every case.
-    pub(crate) fn restore_orphans(
-        &self,
-        account: AccountId,
-        records: Vec<RegisteredSubscription>,
-        shutdown: &CancellationToken,
-    ) -> bool {
-        if records.is_empty() {
+    pub(crate) fn restore_orphans(&self, restored: Vec<RegisteredSubscription>) -> bool {
+        if restored.is_empty() {
             return true;
         }
-        let entry = self.inner.entry(account);
-        if shutdown.is_cancelled() {
+        let mut records = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.shutdown.is_cancelled() {
             return false;
         }
-        entry.or_default().extend(records);
+        records.extend(restored);
         true
     }
 
-    /// Flag a still-registered handle whose server-side teardown failed.
-    /// Reopen keeps carrying the record and retrying it, but stops treating
-    /// its failure as a reason to abandon the swap. `desired` is left alone:
-    /// the caller is an aborted reopen, which leaves the old account
-    /// installed and the consumer still wanting the coverage, so the next
-    /// attempt must recreate it on its replacement.
-    pub(crate) fn mark_unconfirmed(&self, account: &AccountId, handle: &SubscriptionHandle) {
-        if let Some(mut records) = self.inner.get_mut(account) {
-            for record in records.iter_mut() {
-                // A failed teardown cannot resurrect a handle already known gone.
-                if &record.handle == handle && record.state == SubscriptionState::Live {
-                    record.state = SubscriptionState::LiveTeardownFailed;
-                }
+    pub(crate) fn mark_unconfirmed(&self, handle: &SubscriptionHandle) {
+        let mut records = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for record in records.iter_mut() {
+            if &record.handle == handle && record.state == SubscriptionState::Live {
+                record.state = SubscriptionState::LiveTeardownFailed;
             }
         }
     }
 
-    /// Record that a still-registered handle's server-side teardown
-    /// SUCCEEDED in a reopen attempt that may yet abort. A wanted record
-    /// stays, flagged `torn_down`, so the next attempt recreates it without
-    /// unsubscribing the dead handle again; a pure orphan has nothing left to
-    /// carry and is removed.
-    pub(crate) fn mark_torn_down(&self, account: &AccountId, handle: &SubscriptionHandle) {
-        if let Some(mut records) = self.inner.get_mut(account) {
-            records.retain_mut(|record| {
+    pub(crate) fn mark_torn_down(&self, handle: &SubscriptionHandle) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain_mut(|record| {
                 if &record.handle != handle {
                     return true;
                 }
@@ -187,89 +136,60 @@ impl SubscriptionRegistry {
                     false
                 }
             });
-        }
-    }
-
-    /// The account's pure orphan records, retaining scopes for throttle admission:
-    /// nobody wants them and their server-side teardown is still unconfirmed.
-    #[must_use]
-    pub(crate) fn orphans(&self, account: &AccountId) -> Vec<RegisteredSubscription> {
-        self.inner
-            .get(account)
-            .map(|records| {
-                records
-                    .iter()
-                    .filter(|record| !record.desired() && record.teardown_unconfirmed())
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Drop a pure orphan whose teardown has now succeeded. A `desired`
-    /// record under the same handle is left alone.
-    pub(crate) fn remove_orphan(&self, account: &AccountId, handle: &SubscriptionHandle) {
-        if let Some(mut records) = self.inner.get_mut(account) {
-            records.retain(|record| record.desired() || &record.handle != handle);
-        }
     }
 
     #[must_use]
-    pub(crate) fn snapshot(&self, account: &AccountId) -> Vec<RegisteredSubscription> {
+    pub(crate) fn orphans(&self) -> Vec<RegisteredSubscription> {
         self.inner
-            .get(account)
-            .map(|records| records.clone())
-            .unwrap_or_default()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|record| !record.desired() && record.teardown_unconfirmed())
+            .cloned()
+            .collect()
     }
 
-    /// Install `records` as the account's whole registry entry, unless the
-    /// owning slot is being torn down. `Err` hands the records back untouched:
-    /// the `shutdown` token was already cancelled, nothing was written, and the
-    /// caller still owns whatever server-side subscriptions the records name.
-    ///
-    /// Sealed the same way as [`Self::restore_orphans`] and [`Self::record`], by
-    /// reading the token inside the entry's shard lock that [`Self::take`] runs
-    /// under. Installing an empty set only removes the entry, which detach's take
-    /// would have done anyway, so it is never refused.
+    pub(crate) fn remove_orphan(&self, handle: &SubscriptionHandle) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|record| record.desired() || &record.handle != handle);
+    }
+
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> Vec<RegisteredSubscription> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub(crate) fn replace(
         &self,
-        account: AccountId,
-        records: Vec<RegisteredSubscription>,
-        shutdown: &CancellationToken,
+        replacement: Vec<RegisteredSubscription>,
     ) -> Result<(), Vec<RegisteredSubscription>> {
-        match self.inner.entry(account) {
-            Entry::Occupied(mut occupied) => {
-                if records.is_empty() {
-                    occupied.remove();
-                } else if shutdown.is_cancelled() {
-                    return Err(records);
-                } else {
-                    occupied.insert(records);
-                }
-            }
-            Entry::Vacant(vacant) => {
-                if records.is_empty() {
-                    return Ok(());
-                }
-                if shutdown.is_cancelled() {
-                    return Err(records);
-                }
-                vacant.insert(records);
-            }
+        let mut records = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !replacement.is_empty() && self.shutdown.is_cancelled() {
+            return Err(replacement);
         }
+        *records = replacement;
         Ok(())
     }
 
-    /// Snapshot for tests.
     #[must_use]
-    pub fn len(&self, account: &AccountId) -> usize {
-        self.inner.get(account).map(|v| v.len()).unwrap_or(0)
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
-    /// Convenience: total subscription count across accounts.
     #[must_use]
-    pub fn total(&self) -> usize {
-        self.inner.iter().map(|r| r.value().len()).sum()
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -288,41 +208,25 @@ mod tests {
 
     #[test]
     fn a_late_teardown_failure_does_not_resurrect_a_dead_handle() {
-        let registry = SubscriptionRegistry::new();
-        let account = AccountId("gone".into());
+        let registry = SubscriptionRegistry::new(CancellationToken::new());
         let handle = SubscriptionHandle("handle".into());
-        assert!(registry.record(
-            account.clone(),
-            handle.clone(),
-            vec![],
-            &CancellationToken::new()
-        ));
-        registry.mark_torn_down(&account, &handle);
-        registry.mark_unconfirmed(&account, &handle);
-        let records = registry.snapshot(&account);
+        assert!(registry.record(handle.clone(), vec![]));
+        registry.mark_torn_down(&handle);
+        registry.mark_unconfirmed(&handle);
+        let records = registry.snapshot();
         assert!(records[0].desired());
         assert!(records[0].torn_down());
         assert!(!records[0].teardown_unconfirmed());
-        assert!(registry.take(&account).is_empty());
+        assert!(registry.take().is_empty());
     }
 
     /// A live slot's orphans are merged into what is registered.
     #[test]
     fn a_live_slot_keeps_its_restored_orphans() {
-        let registry = SubscriptionRegistry::new();
-        let account = AccountId("live".to_owned());
-        assert!(registry.record(
-            account.clone(),
-            SubscriptionHandle("wanted".to_owned()),
-            vec![],
-            &CancellationToken::new(),
-        ));
-        assert!(registry.restore_orphans(
-            account.clone(),
-            vec![orphan("refused")],
-            &CancellationToken::new()
-        ));
-        assert_eq!(registry.len(&account), 2);
+        let registry = SubscriptionRegistry::new(CancellationToken::new());
+        assert!(registry.record(SubscriptionHandle("wanted".to_owned()), vec![]));
+        assert!(registry.restore_orphans(vec![orphan("refused")]));
+        assert_eq!(registry.len(), 2);
     }
 
     /// Once the slot's token is cancelled, an orphan is refused: detach cancels
@@ -330,16 +234,15 @@ mod tests {
     /// cancellation and leave nothing behind for a later attach to inherit.
     #[test]
     fn a_cancelled_slot_refuses_orphans_and_leaves_no_entry() {
-        let registry = SubscriptionRegistry::new();
-        let account = AccountId("detached".to_owned());
         let shutdown = CancellationToken::new();
+        let registry = SubscriptionRegistry::new(shutdown.clone());
         shutdown.cancel();
         // Detach's order: cancel, then take.
-        assert!(registry.take(&account).is_empty());
-        assert!(!registry.restore_orphans(account.clone(), vec![orphan("late")], &shutdown));
-        assert_eq!(registry.len(&account), 0);
+        assert!(registry.take().is_empty());
+        assert!(!registry.restore_orphans(vec![orphan("late")]));
+        assert_eq!(registry.len(), 0);
         assert!(
-            registry.take(&account).is_empty(),
+            registry.take().is_empty(),
             "a later attach of the same id inherits nothing"
         );
     }
@@ -347,55 +250,38 @@ mod tests {
     /// A registration made after detach's take is refused, and leaves no entry.
     #[test]
     fn a_cancelled_slot_refuses_a_new_record_and_leaves_no_entry() {
-        let registry = SubscriptionRegistry::new();
-        let account = AccountId("detached-record".to_owned());
         let shutdown = CancellationToken::new();
+        let registry = SubscriptionRegistry::new(shutdown.clone());
         shutdown.cancel();
-        assert!(registry.take(&account).is_empty());
-        assert!(!registry.record(
-            account.clone(),
-            SubscriptionHandle("late".to_owned()),
-            vec![],
-            &shutdown
-        ));
-        assert_eq!(registry.len(&account), 0);
+        assert!(registry.take().is_empty());
+        assert!(!registry.record(SubscriptionHandle("late".to_owned()), vec![]));
+        assert_eq!(registry.len(), 0);
     }
 
     /// A reattach commit landing after detach's take is refused, hands its
     /// records back, and leaves nothing behind; an empty set is never refused.
     #[test]
     fn a_cancelled_slot_refuses_a_replacement_and_returns_the_records() {
-        let registry = SubscriptionRegistry::new();
-        let account = AccountId("detached-replace".to_owned());
         let shutdown = CancellationToken::new();
+        let registry = SubscriptionRegistry::new(shutdown.clone());
         shutdown.cancel();
-        assert!(registry.take(&account).is_empty());
+        assert!(registry.take().is_empty());
         let refused = registry
-            .replace(account.clone(), vec![orphan("late")], &shutdown)
+            .replace(vec![orphan("late")])
             .expect_err("a cancelled slot refuses the install");
         assert_eq!(refused.len(), 1);
-        assert_eq!(registry.len(&account), 0);
-        assert!(registry.replace(account, Vec::new(), &shutdown).is_ok());
+        assert_eq!(registry.len(), 0);
+        assert!(registry.replace(Vec::new()).is_ok());
     }
 
     /// A live slot's replacement swaps the whole entry.
     #[test]
     fn a_live_slot_installs_a_replacement() {
-        let registry = SubscriptionRegistry::new();
-        let account = AccountId("live-replace".to_owned());
         let shutdown = CancellationToken::new();
-        assert!(registry.record(
-            account.clone(),
-            SubscriptionHandle("old".to_owned()),
-            vec![],
-            &shutdown
-        ));
-        assert!(
-            registry
-                .replace(account.clone(), vec![orphan("new")], &shutdown)
-                .is_ok()
-        );
-        let held = registry.snapshot(&account);
+        let registry = SubscriptionRegistry::new(shutdown.clone());
+        assert!(registry.record(SubscriptionHandle("old".to_owned()), vec![]));
+        assert!(registry.replace(vec![orphan("new")]).is_ok());
+        let held = registry.snapshot();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].handle, SubscriptionHandle("new".to_owned()));
     }

@@ -356,9 +356,23 @@ impl<D: Dialect> DavCollectionAccount<D> {
         )
     }
 
-    /// A known directory is no longer a personal collection. Retire the
-    /// original scope while keeping the per-hop guard's transmission evidence.
+    /// Keep recovery on the active cursor's exact key. A known directory is
+    /// retired while retaining the per-hop guard's transmission evidence.
     fn sync_error(error: AccountError, scope: &CursorScope) -> AccountError {
+        // Restart uses an exact stored key. Keep accepted legacy scopes and
+        // equivalent URL spellings restartable instead of replacing the key
+        // with the client's canonical collection/type scope.
+        if matches!(
+            error.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
+        ) && matches!(error.scope(), Some(ErrorScope::Cursor(_)))
+        {
+            return error
+                .into_builder()
+                .scope(ErrorScope::Cursor(scope.clone()))
+                .try_build()
+                .expect("rebinding a cursor invalidation preserves its classification");
+        }
         if !matches!(error.scope(), Some(ErrorScope::DirectoryGateway { .. }))
             || !matches!(error.kind(), AccountErrorKind::Unsupported(_))
         {

@@ -59,6 +59,11 @@ pub struct ResourceListing {
 }
 
 impl ResourceListing {
+    /// A complete refusal fails the call; mixed results retain per-id failures.
+    pub fn failure<D: Dialect>(&self, operation: AccountOperation) -> Option<AccountError> {
+        complete_failure_error::<D>(self.classify(), self.failed.len(), operation)
+    }
+
     pub fn resolve_hrefs_with(&mut self, base: &str, resolve: impl Fn(&str, &str) -> String) {
         for entry in &mut self.entries {
             entry.uri = resolve(base, &entry.uri);
@@ -101,6 +106,11 @@ pub struct MultigetReport {
 }
 
 impl MultigetReport {
+    /// A complete refusal fails the call; mixed results retain per-id failures.
+    pub fn failure<D: Dialect>(&self, operation: AccountOperation) -> Option<AccountError> {
+        complete_failure_error::<D>(self.classify(), self.failed.len(), operation)
+    }
+
     pub fn extend(&mut self, other: Self) {
         self.items.extend(other.items);
         self.failed.extend(other.failed);
@@ -209,14 +219,7 @@ impl<'a, D: Dialect> DavCollectionClient<'a, D> {
         while let Some(result) = legs.next().await {
             match result {
                 Ok(parsed) => {
-                    degraded = worse_recovery_option(
-                        degraded,
-                        complete_failure_error::<D>(
-                            parsed.classify(),
-                            parsed.failed.len(),
-                            operation,
-                        ),
-                    );
+                    degraded = worse_recovery_option(degraded, parsed.failure::<D>(operation));
                     report.extend(parsed);
                 }
                 Err(error) => degraded = worse_recovery(degraded, error),
@@ -266,9 +269,7 @@ impl<'a, D: Dialect> DavCollectionClient<'a, D> {
         let mut listing = D::parse_listing(&response.body)
             .map_err(|error| parse_error(operation, format!("query: {error}"), D::DAV))?;
         listing.resolve_hrefs_with(&response.url, D::resolve_href);
-        if let Some(error) =
-            complete_failure_error::<D>(listing.classify(), listing.failed.len(), operation)
-        {
+        if let Some(error) = listing.failure::<D>(operation) {
             return Err(error);
         }
         Ok(Some(listing))

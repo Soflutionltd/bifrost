@@ -150,7 +150,10 @@ pub(crate) enum Command {
     /// CHECK command (RFC 3501 Section 6.4.1).
     Check,
 
-    // --- Message operations  -  UID variants (RFC 3501 Section 6.4) ---
+    // The command forms retain distinct operand types. In particular, the
+    // VANISHED modifier exists only on UID FETCH; collapsing the forms would
+    // make a sequence FETCH with VANISHED representable and need another gate.
+    // --- Message operations (RFC 3501 Section 6.4) ---
     /// SEARCH command (RFC 3501 Section 6.4.4).
     Search { criteria: super::SearchCriteria },
     /// SEARCH RETURN (opts) command (RFC 4731 Section 3.2).
@@ -169,26 +172,26 @@ pub(crate) enum Command {
     SearchSave { criteria: super::SearchCriteria },
     /// FETCH command (RFC 3501 Section 6.4.5, RFC 7162 Section 3.1.4.1 for CHANGEDSINCE).
     Fetch {
-        sequence_set: SequenceSet,
+        sequence_set: SequenceSet<super::Seq>,
         items: super::fetch::FetchItems,
         /// Optional CHANGEDSINCE modifier (RFC 7162 Section 3.1.4.1).
         changed_since: Option<crate::types::ModSeq>,
     },
     /// STORE command (RFC 3501 Section 6.4.6, RFC 7162 for CONDSTORE).
     Store {
-        sequence_set: SequenceSet,
+        sequence_set: SequenceSet<super::Seq>,
         operation: super::StoreOperation,
         flags: Vec<Flag>,
         unchanged_since: Option<crate::types::ModSeqValzer>,
     },
     /// COPY command (RFC 3501 Section 6.4.7).
     Copy {
-        sequence_set: SequenceSet,
+        sequence_set: SequenceSet<super::Seq>,
         mailbox: MailboxName,
     },
     /// MOVE command (RFC 6851 Section 3).
     Move {
-        sequence_set: SequenceSet,
+        sequence_set: SequenceSet<super::Seq>,
         mailbox: MailboxName,
     },
     /// UID SEARCH command (RFC 3501 Section 6.4.4).
@@ -365,10 +368,9 @@ pub(crate) enum Command {
 /// Classification-level command discriminant.
 ///
 /// Used by [`crate::codec::classification::classify`] to route untagged
-/// responses. UID variants map to their non-UID counterpart because they
-/// produce identical solicited response sets. Similarly, `CreateSpecialUse`
-/// maps to `Create`, `ListExtended` maps to `List`, and `Done` maps to
-/// `Idle`.
+/// responses. UID FETCH retains its own kind because it can solicit
+/// historical VANISHED; the other UID variants share their response owners.
+/// `CreateSpecialUse` maps to `Create` and `ListExtended` maps to `List`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CommandKind {
     // --- Any state (RFC 3501 Section6.1) ---
@@ -432,8 +434,10 @@ pub(crate) enum CommandKind {
     SearchReturn,
     /// SEARCH RETURN (SAVE) / UID SEARCH RETURN (SAVE) (RFC 5182 Section2).
     SearchSave,
-    /// FETCH / UID FETCH (RFC 3501 Section6.4.5).
+    /// FETCH by sequence number (RFC 3501 Section6.4.5).
     Fetch,
+    /// UID FETCH can additionally solicit historical VANISHED (RFC 7162).
+    UidFetch,
     /// STORE / UID STORE (RFC 3501 Section6.4.6).
     Store,
     /// COPY / UID COPY (RFC 3501 Section6.4.7).
@@ -482,7 +486,7 @@ pub(crate) enum CommandKind {
     MyRights,
 }
 
-use crate::connection::SessionState;
+use crate::types::SessionState;
 
 /// Every live session state (RFC 3501 Section 3). Logout is not live: the
 /// connection is closing, and no command is legal there.
@@ -559,6 +563,7 @@ impl CommandKind {
             | Self::SearchReturn
             | Self::SearchSave
             | Self::Fetch
+            | Self::UidFetch
             | Self::Store
             | Self::Copy
             | Self::Move
@@ -577,28 +582,6 @@ impl CommandKind {
     /// new session and resets it (RFC 8437 Section 2).
     pub(crate) const fn refused_after_selection(self) -> bool {
         matches!(self, Self::Enable)
-    }
-
-    /// The key a pipelined batch splits on: two commands share a sub-batch
-    /// only when their keys differ.
-    ///
-    /// The batch hands an untagged response to the first still-active command
-    /// `classify` lets own it, which is only correct when no two commands of
-    /// one sub-batch can both claim the same response. Equal kinds obviously
-    /// can, but so can distinct kinds that solicit a common response type, and
-    /// those share a key here:
-    ///
-    /// * `QUOTA` is solicited by GETQUOTA, GETQUOTAROOT and SETQUOTA (RFC 9208
-    ///   Sections 4.2-4.4).
-    /// * `SEARCH` and `ESEARCH` by every search form, tagless `SEARCH` with no
-    ///   correlator at all (RFC 3501 Section 7.2.5, RFC 4731, RFC 5182).
-    /// * `LIST` by LIST and LIST-STATUS, and `STATUS` by LIST-STATUS and STATUS
-    ///   (RFC 5819 Section 2), so all three share one key.
-    /// * `VANISHED (EARLIER)` by FETCH and EXPUNGE (RFC 7162 Section 3.2.10).
-    ///
-    /// The classifier derives this key from its solicited-response owner sets.
-    pub(crate) fn untagged_routing_key(self) -> Self {
-        crate::codec::classification::untagged_routing_key(self)
     }
 
     /// Whether a command of this kind may ride a pipelined batch
@@ -680,8 +663,8 @@ impl Command {
 
     /// Return the classification-level discriminant for this command.
     ///
-    /// UID variants map to their non-UID counterpart because they produce
-    /// identical solicited response sets.
+    /// UID FETCH retains its addressing because only that FETCH form can
+    /// solicit historical VANISHED. Other UID forms share response owners.
     pub(crate) fn kind(&self) -> CommandKind {
         match self {
             // Any state (RFC 3501 Section6.1)
@@ -718,7 +701,8 @@ impl Command {
             Self::Search { .. } | Self::UidSearch { .. } => CommandKind::Search,
             Self::SearchReturn { .. } | Self::UidSearchReturn { .. } => CommandKind::SearchReturn,
             Self::SearchSave { .. } | Self::UidSearchSave { .. } => CommandKind::SearchSave,
-            Self::Fetch { .. } | Self::UidFetch { .. } => CommandKind::Fetch,
+            Self::Fetch { .. } => CommandKind::Fetch,
+            Self::UidFetch { .. } => CommandKind::UidFetch,
             Self::Store { .. } | Self::UidStore { .. } => CommandKind::Store,
             Self::Copy { .. } | Self::UidCopy { .. } => CommandKind::Copy,
             Self::Move { .. } | Self::UidMove { .. } => CommandKind::Move,

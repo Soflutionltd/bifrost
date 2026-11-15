@@ -3,26 +3,7 @@ use bytes::{Bytes, BytesMut};
 use crate::error::Error;
 use crate::types::response::Capability;
 
-/// Controls how the encoder produces literal markers.
-///
-/// RFC 3501 Section 4.3 defines synchronizing literals (`{N}\r\n`) which
-/// require the client to wait for a `+` continuation response. RFC 7888
-/// introduces two extensions that allow non-synchronizing literals (`{N+}\r\n`):
-///
-/// - **LITERAL+** (RFC 7888 Section 4): non-synchronizing literals of any size.
-/// - **LITERAL-** (RFC 7888 Section 5): non-synchronizing literals up to 4096
-///   bytes; larger literals MUST use synchronizing form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LiteralMode {
-    /// No literal extension  -  all literals use synchronizing form `{N}\r\n`
-    /// (RFC 3501 Section 4.3).
-    Synchronizing,
-    /// LITERAL+ (RFC 7888 Section 4)  -  non-synchronizing `{N+}\r\n` for all sizes.
-    LiteralPlus,
-    /// LITERAL- (RFC 7888 Section 5)  -  non-synchronizing `{N+}\r\n` only when
-    /// the literal is <= 4096 bytes; larger literals use synchronizing `{N}\r\n`.
-    LiteralMinus,
-}
+pub(crate) use crate::types::wire::LiteralMode;
 
 /// Encoding context derived from the current connection state.
 ///
@@ -40,7 +21,7 @@ pub(crate) struct EncodeOptions {
     /// In `WireMode::Utf8`, non-ASCII UTF-8 bytes are allowed in quoted strings
     /// (RFC 6855 Section 3 / RFC 9051 Section 9) and mailbox names are
     /// sent as raw UTF-8 instead of modified UTF-7.
-    pub(crate) utf8_mode: crate::codec::utf7::WireMode,
+    pub(crate) utf8_mode: crate::types::wire::WireMode,
     /// RFC 7888 LITERAL+ vs synchronizing literal (RFC 3501 Section 4.3).
     pub(crate) literal_mode: LiteralMode,
     /// Server-advertised capabilities (RFC 3501 Section 7.2.1).
@@ -248,12 +229,12 @@ impl CommandWriter {
     /// you send" sends them as a literal. With `utf8` (UTF8=ACCEPT per RFC 6855
     /// Section 3, or active rev2 per RFC 9051 Section 9) valid UTF-8 is also
     /// quotable, under the same control-character and DEL exclusions.
-    pub(crate) fn string(&mut self, data: &[u8], utf8: crate::codec::utf7::WireMode) {
+    pub(crate) fn string(&mut self, data: &[u8], utf8: crate::types::wire::WireMode) {
         if data.contains(&0) {
             self.invalid_nul = true;
             return;
         }
-        let quotable = if utf8 == crate::codec::utf7::WireMode::Utf8 {
+        let quotable = if utf8 == crate::types::wire::WireMode::Utf8 {
             std::str::from_utf8(data).is_ok()
                 && data.iter().all(|&b| (b >= 0x20 && b != 0x7F) || b >= 0x80)
         } else {

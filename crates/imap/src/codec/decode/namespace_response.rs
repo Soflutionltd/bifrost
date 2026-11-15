@@ -12,7 +12,7 @@ use super::*;
 /// (RFC 9051 Section 5.1 / RFC 6855 Section 3).
 pub(super) fn parse_untagged_namespace(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"NAMESPACE"[..]).parse(input)?;
     let (input, _) = sp(input)?;
@@ -37,7 +37,7 @@ pub(super) fn parse_untagged_namespace(
 /// Parse a namespace descriptor list: NIL or `((prefix delimiter) ...)` (RFC 2342 Section 5).
 fn namespace_list(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], Vec<NamespaceDescriptor>> {
     alt((
         value(vec![], nil_token),
@@ -56,16 +56,16 @@ fn namespace_list(
 /// Parse a single namespace descriptor: `(prefix delimiter [extensions])` (RFC 2342 Section 6).
 fn namespace_descriptor(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], NamespaceDescriptor> {
     let (input, _) = char('(').parse(input)?;
     let (input, raw_prefix) = string_utf8(input)?;
     // RFC 3501 Section 5.1.3 / RFC 9051 Section 5.1: decode namespace prefix
     // from Modified UTF-7 when not in UTF-8 mode.
-    let prefix = if utf8_mode == crate::codec::utf7::WireMode::Utf8 {
+    let prefix = if utf8_mode == crate::types::wire::WireMode::Utf8 {
         raw_prefix
     } else {
-        crate::codec::utf7::decode_utf7(raw_prefix.as_bytes())
+        crate::types::wire::decode_utf7(raw_prefix.as_bytes())
     };
     let (input, _) = sp(input)?;
     // RFC 2342 Section 6 / RFC 9051 Section 9: the delimiter is

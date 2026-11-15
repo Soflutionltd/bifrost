@@ -24,39 +24,6 @@ Each entry names the hunt scope(s) that reported it. Where hunters disagreed,
 both readings are recorded. The raw reports are in the commit that precedes
 this file's.
 
-## STR-002 - Owner-qualified ids travel as in-band separator strings
-
-**Reported by:** types (LATENT), jmap-account (latent disagreement among the stripping functions).
-
-JMAP (`jmap/src/sync/foreign.rs`) and Graph (`graph/src/account/foreign.rs`)
-each encode "this id belongs to principal P" as `"P\u{1f}native"` inside
-`FolderId`, `ObjectId`, `ThreadId`, `BlobId`, `ContainerId`; Graph adds `\u{1e}`
-for public folders plus parsers for public address books, contacts, calendars
-and events. Each crate also re-decides "a message and the container it is filed
-into must have the same owner" (JMAP `owner_of`; Graph `folder_owner` /
-`parse_message_id`). Meanwhile `Container` stores the same fact structurally
-(`namespace`, `owner`, `owner_local_id`, `owner_email`, and `native_id`, the
-encoded form) - two representations of one fact, kept consistent per producer.
-
-**Partly resolved.** JMAP now has one codec and one stripping rule
-(`foreign::Owner`, `JmapRef`, `registry::Route`, `Slot::wire`), and a
-primary-qualified id stays literal at every door. What remains is the
-cross-crate half: Graph keeps its own `\u{1f}` / `\u{1e}` codecs and owner
-checks, and no shared `Qualified<T>` exists in `bifrost-types`. The JMAP
-mint-site gap (a native id containing the separator) is tracked under STR-097.
-
-The JMAP module doc argues a shared type "would be a false generalization"
-because JMAP's owner is an `accountId` and Graph's a `/users/{id}` key. The
-hunter answers that this is about the owner string's MEANING, which stays
-provider-owned; the shared part is the STRUCTURE (optional owner plus native
-id, bare means primary, two operands must agree), and `bifrost-types` already
-generalized the owner as `MailboxId`.
-
-Proposal: `Qualified<T> { owner: Option<PrincipalId>, native: T }` (or an
-`owner()` accessor plus one codec) for the id newtypes that can be foreign, with
-one encoding and one "same owner?" check. If the in-band string must survive for
-persisted keys, the codec still belongs in one place.
-
 ## STR-005 - `BatchItemId(String)` has three meanings
 
 **Reported by:** types (LATENT), sync-engine.
@@ -247,43 +214,6 @@ places the message by `containers: Vec<ContainerId>` while inventory uses
 provider knowledge (Gmail fills the former with label ids, the latter with
 `MembershipScope::Label`).
 
-## STR-028 - The per-account actor is split across three bundles
-
-**Reported by:** sync-engine (the hunter calls it a big but clean rewrite).
-
-`AccountSlot` (`types.rs`, about 25 fields), `SlotContext` (`engine/context.rs`,
-about 28) and `RecoveryContext` (`engine/reattach.rs`, about 24 borrowed fields)
-bundle the same per-account handles: `SlotContext::recovery` rebuilds a
-`RecoveryContext` literal; `SyncEngine::reattach` hand-builds a second from
-`AccountSlot` fields; `AccountSlot` and `SlotContext` are populated field by
-field side by side at the end of `attach_opened`. `SyncEngine` also keeps a
-parallel `ack_senders: DashMap<AccountId, Sender>` beside `accounts`; many
-methods look up both and detach removes them separately. More engine-wide
-registries keyed by `AccountId` are cleaned at the bottom of detach (sink,
-budget gate, backfill registry, throttles, meter, subscriptions), each with its
-own forget call.
-
-Proposal: one `Slot` (`Arc`) owning every per-account handle, the writer
-sender, the boundary as `Boundary` (never the raw sender, fixing BUG-004
-structurally) and the workers; recovery, reattach, establishment, campaigns and
-passthrough become methods on it; `SyncEngine` becomes a registry
-(`engine.slot(id)?` then the operation); an RAII `SlotRegistrations` guard
-(sink, budget, meter, backfill registry) released by drop at the end of detach
-replaces the hand-ordered tail. "Is this account attached" becomes one lookup.
-
-The sync-lanes hunter makes the same argument for `SubscriptionRegistry`, a
-per-engine `DashMap<AccountId, Vec<..>>` whose every method takes the account
-id plus that slot's `shutdown` token. The whole "seal" mechanism (`record`,
-`restore_orphans`, `replace` reading the token inside the shard lock), with its
-detach-ordering argument and two integration tests, exists because a record
-written after detach would land under an id "a later attach of the same
-`AccountId` inherits". If the slot owned its subscriptions, a late write could
-only reach the dead slot's object and the next attach gets a fresh one by
-construction, so the bug class disappears rather than being defended.
-`BackfillRegistry` has the same shape (`forget_account` on detach).
-`InvalidationSinkInner`'s map is legitimately engine-wide (the consumer
-addresses it by id) and is not part of this.
-
 ## STR-032 - `run_bulk_pipeline` is one 850-line function over untyped campaign state
 
 **Reported by:** sync-engine.
@@ -331,18 +261,6 @@ Proposal: one configurable double per lane (changes, inventory, push, mutation,
 lifecycle) composed into a stub, and test files named after the contract they
 pin (`supervisor_*`, `delivery_*`, `campaign_*`, `establish_*`).
 
-## STR-035 - Engine ownership oddities
-
-**Reported by:** sync-engine.
-
-- `types.rs` mixes published configuration (`EngineConfig` and friends,
-  `Incarnation`) with the engine-private `AccountSlot`, `WorkerTask` and
-  `WorkerRole`; the slot belongs in `engine/` (STR-028).
-- `BackfillAdmission` holds a `BudgetPermit` in `Mutex<Option<_>>` and exposes
-  `admit()` and `release_admission()` separately, turning an RAII permit into a
-  flag the caller must clear. The permit should travel by value through the
-  wait (`wait_for_capacity(permit) -> Result<permit, WaitFailed>`).
-
 ## STR-036 - Vestigial engine surface
 
 **Reported by:** sync-engine (published; removal needs the owner).
@@ -354,33 +272,6 @@ pin (`supervisor_*`, `delivery_*`, `campaign_*`, `establish_*`).
 - `BackfillWiring::changes_tx: Option<broadcast::Sender>` is only used as
   `is_some()`, a bool meaning "broadcast at all"; publication goes through
   `delivery`.
-
-## STR-037 - `BackfillPartitionOutcome` is a product of flags with illegal combinations
-
-**Reported by:** sync-lanes.
-
-`{ complete: bool, scope_walk: ScopeWalkStep, end: Option<PartitionEnd> }` plus
-counts. `StopScopeWalk` with `end: Some(Exhausted)` is meaningless, `complete:
-true` with `end: None` is incoherent, and the `Default` exists only to pick safe
-values for fields a construction site might forget; `ScopeWalkDriver::fold`
-re-derives the real state from the three. Proposal: `enum PartitionVerdict {
-Exhausted { degraded }, MoreBeyond { degraded }, EndedUnannounced,
-StoppedAtBarrier }` beside the counts; `fold` becomes a match and
-`BackfillScopeWalk` (one bool) disappears into the driver.
-
-## STR-038 - Push lane verdicts and invalidation intent travel as tuples and paired flags
-
-**Reported by:** sync-lanes.
-
-- `PushLanes::failure() -> (Duration, bool, bool)` is (delay, terminal,
-  restart); a named `LaneDisposition` fits (CON-012).
-- `PendingPush { full, scopes, memberships, closed }` and `WorkSet { full,
-  scopes, hold }` encode "full reconcile" as a bool beside a set that must be
-  empty when it is true, and every site calls `clear()` to keep it so. `enum
-  Intent { Full, Some { scopes, memberships } }` makes the illegal state
-  unconstructable and is the natural home of the coarsening rule (CON-027).
-- `WorkSet::hold: Option<(u64, Instant)>` is a bare tuple of account generation
-  and deadline.
 
 ## STR-042 - `PendingCoverage` is five subsystems behind one lock and one public surface
 
@@ -415,20 +306,11 @@ taking the lock once per page) - harmless, noted because it is the hot path.
 
 **Reported by:** sync-lanes.
 
-`backfill/` holds the partitioner, runner, `ScopeWalkDriver`, checkpoint writer
-and registry. `engine/backfill.rs` (about 1,500 lines) holds the orchestrator
-loop and also pure backfill-domain decisions: `backfill_plan_for`,
-`BackfillPlan::resume`, `open_pages_resume`, `backfill_complete_recorded`,
-`emit_backfill_complete` (marker construction), `BackfillScan`, `MarkerOutcome`,
-`ScopeResume`, `WalkLabels`. The partition key format lives in
-`backfill/partitioner.rs` while its two readers (`open_pages_resume` and the ack
-writer) live in `engine/`. `backfill/parking_tests.rs` tests the engine
-orchestrator's `SlotContext` and is mounted from `engine/backfill.rs` with
-`#[path = "../backfill/parking_tests.rs"]`. Proposal: `backfill/plan.rs`
-(partitioning to plan plus resume, pure), `backfill/marker.rs` (marker plus the
-typed key of BUG-016), `backfill/scan.rs` (`BackfillScan`), with
-`engine/backfill.rs` keeping only the async loop, admission and wiring; tests
-move with what they test.
+Plan, marker and scan moved into `backfill/`, and the parking tests moved to
+`engine/`. What remains: the ack writer (`engine/writer/acknowledge.rs`)
+still reads the partition key format directly through
+`backfill::partitioner::is_completion_partition` rather than through a typed
+key owned by `backfill/marker.rs`.
 
 ## STR-046 - A partitioning framework with no producer imposes its costs on every consumer
 
@@ -469,73 +351,17 @@ per-scope state field by field (BUG-022).
 
 ## STR-050 - UID versus sequence number is not in the IMAP response types
 
-**Reported by:** imap-protocol.
+**Reported by:** imap-protocol, imap-connection.
 
-`UntaggedResponse::Search { uids: Vec<u32> }` ("sequence numbers or UIDs"),
-`Sort { nums }`, `ThreadNode::id: Option<u32>`, `EsearchResponse { uid: bool,
-min/max: Option<u32>, all: Vec<UidRange> }`, `ResponseCode::Modified(Vec<UidRange>)`
-("STORE seqs, UID STORE UIDs"), `Expunge(u32)`, `Removal::Seq(u32)`,
-`FetchResponse { seq: u32, uid: Option<u32> }`. The typed `Uid` / `Seq` exist and
-are unused; whether a number is a UID is decided by each consumer from which
-command it remembers issuing. Proposal: make addressing a type parameter of the
-result (`SearchResult<Uid>` vs `SearchResult<Seq>`), parse the ESEARCH `UID`
-indicator into the type, and hand `MODIFIED` to the consumer as a raw set it
-types by its command. Relatedly, ten UID/sequence `Command` twins
-(`Search`/`UidSearch`, `Fetch`/`UidFetch`, ...) double every match in `kind`,
-`mailbox_target`, the encoder and the classifier while `CommandKind` collapses
-them, so classification cannot tell UID FETCH from FETCH (`(CK::Fetch, VANISHED
-(EARLIER)) => OnlySolicited` also admits a non-UID FETCH, which cannot solicit
-VANISHED). One variant with `target: Addressed { Uid(UidSet), Seq(SeqNumSet) }`
-halves the matches and lets `CommandKind` carry the addressing.
-
-The imap-connection hunter reports the same axis from the connection layer,
-which uses the typed ids only at the ergonomics edge (`SyncFetchRequest::uids:
-UidSet`): `Command::Fetch` and `Command::UidFetch` both take `SequenceSet`, so
-`uid_fetch(&SequenceSet, ..)` accepts a `SeqSet`'s inner set; `SearchResult {
-ids: Vec<u32>, mod_seq: Option<u64> }` holds sequence numbers for SEARCH and UIDs
-for UID SEARCH/UID SORT, told apart only by which method was called
-(`SortConsumer` returns the same type); `IdleEvent::SearchUpdate`'s doc admits
-"the `uid` field may be inaccurate for legacy SEARCH"; `IdleEvent::{Exists,
-Expunge, Recent}(u32)`; `AppendConsumer::Output = Option<(u32, u32)>` and
-`MultiAppendConsumer::Output = Vec<(u32, u32)>` - a bare `(uid_validity, uid)`
-tuple of two silently swappable `u32`s; `uid_fetch_changed_since(.., mod_seq:
-u64)`, `uid_store(.., unchanged_since: Option<u64>)`; and raw `uidvalidity`,
-`fetch.uid`, `fetch.mod_seq` at the point `account/push.rs::absorb_idle_event`
-writes the modseq cache. Its target adds `Command::UidFetch { uids: UidSet, .. }`
-/ `Command::Fetch { seqs: SeqSet, .. }` for STORE/COPY/MOVE/EXPUNGE/SEARCH too,
-`AppendUid { validity: UidValidity, uid: Uid }`, and `ModSeq` in every modseq
-position.
-
-## STR-056 - Smaller IMAP protocol axes
-
-**Reported by:** imap-protocol.
-
-The escape-payload newtypes and `MailboxAttribute::Inbox` landed. One residue:
-
-- `MoveResult::copy_uid` / `CopyResult::copy_uid: Option<ResponseCode>` are
-  documented "Always a `ResponseCode::CopyUid` when present" and every consumer
-  re-matches. Use `Option<CopyUid { validity: UidValidity, source: UidSet, dest:
-  UidSet }>` (and the same struct inside `ResponseCode::CopyUid`); its readers
-  are `account/mutate.rs` and three matches in `account/error.rs`.
-
-## STR-059 - IMAP dependency edges point upward
-
-**Reported by:** imap-protocol.
-
-`codec/classification.rs` imports `crate::connection::NotifyFlags`;
-`codec/encode/mod.rs` imports `crate::connection::literals::literal_marker_at`
-(wire grammar in the connection layer); `codec/encode/dispatch.rs` calls
-`crate::connection::ImapConnection::search_criteria_contains_atom`;
-`types/command.rs` imports `crate::connection::SessionState` for
-`legal_states`; `types/events.rs` implements on `crate::TypedEvent`; the
-crate-root `error.rs` embeds `crate::account::sieve::SieveResponseCode`. The
-protocol core should be a leaf, `types <- codec <- connection <- account`: move
-`SessionState` and the `NotifyFlags` derivation into `types`, the literal-marker
-scanner into `codec`, the search grammar into a `SearchKey` AST (STR-053), and
-give ManageSieve its own error mapped at the account boundary. The
-imap-connection hunter reported the same four `codec`/`types` -> `connection`
-edges independently; `literals.rs` is a pure literal-marker scanner also used by
-`connection/wire.rs`.
+Search, sort and thread results are typed by addressing, ESEARCH's UID
+indicator is checked against the command, the command sets are typed
+(`SequenceSet<Seq>` versus `SequenceSet` of UIDs), `AppendUid` and `ModSeq`
+landed, and `CommandKind` tells UID FETCH from FETCH. What remains: the
+UID/sequence `Command` twins (`Search`/`UidSearch`, `Fetch`/`UidFetch`, ...)
+are still separate variants doubling every match in `kind`, `mailbox_target`
+and the encoder; one variant with an addressed target would halve them. The
+wire-level `FetchResponse { seq: u32, uid: Option<u32> }` and
+`Removal::Seq(u32)` are still bare numbers.
 
 ## STR-061 - The IMAP crate-root `allow(dead_code)` hides dead copies of live decisions
 
@@ -555,25 +381,13 @@ STR-051 says it belongs, deleting only what has no consumer.
 
 ## STR-062 - Protocol-value behaviour lives in IMAP `account/`, and account identity lives in `types/`
 
-**Reported by:** imap-protocol.
+**Reported by:** imap-protocol, imap-account.
 
-`CompactUidSet` (folder_registry) is IMAP set algebra (STR-049).
-`get.rs::merge_fetch_response` encodes FetchResponse merge semantics (which
-items are mutable state, which fill gaps), is shared with pim, and belongs on
-`FetchResponse`. Conversely `MailboxName::account_id` / `from_account_id` /
-`cmp_account_order` (the `~imap-wire:` FolderId encoding) are account identity
-policy embedded in the protocol type; they belong with `encode_object_id` in the
-account layer (or a dedicated identity module), which also hosts the single
-`MessageRef` (STR-051).
-
-The imap-account hunter reports the registry side: `CompactUidSet`, `UidSetDiff`
-and the range arithmetic live in `folder_registry.rs` while `UidSet`, `UidRange`
-and `SequenceSet` live in `types/`, with conversions between them
-(`UidSet::from_ranges(known_uids.ranges())`, `CompactUidSet::from_ranges`); the
-compact set belongs in `types/` as the set of record. `FolderEntry` bundles LIST
-facts, ownership, MYRIGHTS, a cursor hint, a MODSEQ cache and a last-seen instant
-behind four locks, and is the implicit (unexercised) owner of folder roles;
-making roles, ownership and the shared-error mapping explicit registry
+The set algebra, the FETCH merge and the `~imap-wire:` mailbox identity moved
+to their owners. What remains is the registry side: `FolderEntry` bundles LIST
+facts, ownership, MYRIGHTS, a cursor hint, a MODSEQ cache and a last-seen
+instant behind four locks, and is the implicit owner of folder roles; making
+roles, ownership and the shared-error mapping explicit registry
 responsibilities (BUG-028, BUG-046) gives those decisions a home.
 
 ## STR-064 - IMAP test layout mirrors the pre-split monolith
@@ -744,24 +558,6 @@ DAV one secret-handling story. TLS mode: `SubmissionTls { Implicit, StartTls,
 Plaintext }`, `ManageSieveTlsMode { Implicit, StartTls, None }`, and
 `ImapConfig`'s own, each with its own default-port table.
 
-## STR-079 - IMAP `pim.rs` is not PIM
-
-**Reported by:** imap-account.
-
-At about 4,600 lines it holds the direct mail-mutation primitives and their
-partial-commit records; SMTP send, raw send, draft create / send / discard;
-byte-level RFC 5322 header surgery (`split_header_body`, `rewrite_header_block`,
-`restamp_draft_date`, Bcc stripping); a search engine (criteria compiler,
-provider-query validator, position-based pager with its own cursor codec);
-container CRUD; folder-role derivation; MYRIGHTS projection; quota; typed message
-and thread hydration including MIME selection; and about 1,400 lines of inline
-tests. Contacts and calendars - the actual PIM - are not in it (they are
-forwarding in `mod.rs`). Its header says the long tail was never line-audited.
-Suggested split: `compose/` (send, draft, header rewriting - the header surgery
-arguably beside `bifrost_types::mime`), `search.rs`, `containers.rs`, roles into
-the registry (BUG-028), and the primitives folded into the mutation engine
-(STR-080).
-
 ## STR-082 - IMAP does not partition inventory, so large folders get no bounded backfill
 
 **Reported by:** imap-account (not a bug; a gap between vocabulary and its intended producer).
@@ -839,26 +635,6 @@ sections exist only to hold two copies in step (CON-042, CON-043), and at least 
 pins a defect (BUG-061). Wire tests should live in the module whose wire shape
 they pin; the agreement tables go when their duplication goes.
 
-## STR-097 - The JMAP account needs a per-account registry; its per-account facts are parallel maps keyed by bare strings
-
-**Reported by:** jmap-account (its dominant missing owner; the hunter recommends a rewrite of the account layer's internal plumbing rather than local fixes).
-
-The core landed: `sync/registry.rs` holds `Registry { primary, accounts }` of
-`Slot`s, each owning its handle, limits, state cell, scopes and submission bit,
-with `Registry::route` / `Route` as the one owner lookup. What remains:
-
-- `LifecycleTopology` (`discover.rs`, consumed in `account.rs` and `factory.rs`)
-  is still keyed by bare strings rather than by registry slot.
-- The optional families (submission, vacation, quota, sieve, contacts,
-  calendars) live once on `Registry::families`, not per slot, so a shared
-  account's family handles are not ordinary slot facts.
-- About ten `foreign::owner_of` declared-owner reads remain, mostly in
-  `pim.rs` plus `mutation.rs`; each should become `JmapRef::parse(..).owner`
-  against `registry.route`.
-- No mint site checks that a server-minted native id does not itself contain
-  the `\u{1f}` separator; a non-conformant id containing it would silently
-  route as foreign.
-
 ## STR-102 - JMAP refusals reach callers as prose
 
 **Reported by:** jmap-account (lower priority than the rest).
@@ -876,39 +652,6 @@ Blocked on bifrost-types: `RequestCause::Unsupported` carries only the
 operation and message keys are derived from the kind, so a typed refusal reason
 (with builder and accessor support) must land in bifrost-types first; the JMAP
 sites are commented to say so.
-
-## STR-104 - JMAP `pim.rs` does ten unrelated jobs, and `calendar_ops.rs` mixes doors with a conversion library
-
-**Reported by:** jmap-account.
-
-`pim.rs` is about 4,600 production lines (8,800 with tests): single-target mail
-mutations, the submission pipeline with partial-commit records, drafts and the
-attachment-handle codec, scheduled send, mail search with its own cursor codec and
-envelope validation, `containers_list` plus RFC 9670 owner-email resolution,
-identities, vacation, quota, thread and message hydration, JMAP <-> shared
-`Message` mapping, and role-mailbox lookup. Natural seams: `mail_set.rs` (the one
-`Email/set` executor shared with `mutation.rs`, BUG-071); `submission.rs` (send,
-draft send, schedule, cancel, reschedule, partial-commit construction);
-`drafts.rs`; `search.rs` (moved onto `page_cursor.rs`, STR-101); `containers.rs`;
-`message.rs` beside `hydrate.rs`; `settings.rs` (identities, vacation, quota).
-`calendar_ops.rs` (about 2,200 production lines) mixes the JMAP door logic with
-RRULE <-> JSCalendar recurrence conversion, iCal `UNTIL` handling, ISO 8601
-duration parsing (BUG-060) and time classification; the conversion half is a pure
-mapping module, and the parts restating shared-vocabulary rules (window overlap,
-recurrence validation) belong in `bifrost-types` (BUG-001). Same question for IMAP:
-STR-079.
-
-## STR-118 - Graph test layout mirrors the order the code was written
-
-**Reported by:** graph.
-
-About 450 lines of `#[cfg(test)]` scripting infrastructure (`ScriptedRest`,
-`ScriptedRestResponse`, `ScriptedDownload`, the record and script methods) live
-inside the production `client.rs` and belong in `client/test_support.rs`, like
-IMAP's `account/test_support.rs`. `pim/tests.rs` is one 2,559-line file covering
-nine modules, while `push/` splits its tests per arm. `account/ews_session_tests.rs`
-sits at the account root though it tests `ews_stream`. `graph_error.rs` carries
-about 1,900 lines of tests inline in three `mod` blocks.
 
 ## STR-119 - Graph event and contact sync lanes have no scope producer
 
@@ -993,22 +736,12 @@ the wrong place.
 
 **Reported by:** net-dav (its other "substantial rewrite" verdict).
 
-Steps (1) to (3) landed: a `Dialect` trait (`caldav/src/dialect.rs`,
-`carddav/src/dialect.rs`), the generic collection kernel
-(`dav-core/src/collection.rs`, `collection_account.rs`) and the shared
-`Unsupported` lanes (`dav-core/src/unsupported.rs`). What remains:
-
-- The two `client.rs` test modules still re-test dav-core's dispatcher under the
-  same names in both crates (credential origin, cross-origin redirect, hop count,
-  plaintext home, the discovery fallbacks, the multiget concurrency bound). They
-  should move into dav-core, parameterized over both dialects.
-- Small twins survive: `one_outcome_per_id` in both `account.rs` files, although
-  `dav-core::collection_account::one_outcome_per_id` now exists, and
-  `multiget_failure` / `listing_failure` in both `client.rs` files.
-- bifrost-net now has a pass-through exchange mode (`RequestBuilder::
-  statuses_as_data`), but DAV does not use it: `wire_outcome` still rebuilds the
-  response from `AttemptHistory`, special-cases 501 for the MOVE fallback, and
-  keeps its private refusal list. Moving DAV onto `statuses_as_data` (and onto
-  net's redirect walk, 401 recovery, deadline and attempt evidence) is the
-  residue of the net exchange-core work.
+The dialect trait, the generic collection kernel, the shared `Unsupported`
+lanes, the shared failure helpers and the move onto net's `statuses_as_data`
+exchange landed. What remains: the discovery-level credential tests
+(`discovered_cross_origin_https_home_receives_credentials`,
+`cross_origin_redirect_is_redispatched_with_credentials`,
+`discovered_plaintext_home_never_receives_credentials`) are still twinned in
+both `client.rs` test modules and could move into dav-core, parameterized over
+both dialects.
 

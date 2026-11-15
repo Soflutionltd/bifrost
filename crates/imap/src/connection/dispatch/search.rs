@@ -22,7 +22,8 @@ use tracing::warn;
 /// ESEARCH UID ranges are expanded into individual IDs. An expansion that
 /// would exceed the internal safety limit fails rather than returning a
 /// partial [`SearchResult`] (RFC 4731 Section3, RFC 3501 Section6.4.4).
-pub(crate) struct SearchConsumer {
+pub(crate) struct SearchConsumer<I = crate::types::Uid> {
+    addressing: std::marker::PhantomData<I>,
     /// Tag-correlated ESEARCH responses (highest priority).
     tag_correlated: Vec<EsearchResponse>,
     /// Tagless ESEARCH responses (second priority).
@@ -33,14 +34,26 @@ pub(crate) struct SearchConsumer {
     buffered: Vec<UntaggedResponse>,
 }
 
-impl SearchConsumer {
+impl<I: crate::types::search::SearchAddress> SearchConsumer<I> {
     pub(crate) fn new() -> Self {
         Self {
+            addressing: std::marker::PhantomData,
             tag_correlated: Vec::new(),
             tagless_esearch: Vec::new(),
             search_responses: Vec::new(),
             buffered: Vec::new(),
         }
+    }
+
+    fn expand(&self, response: &EsearchResponse) -> Result<SearchResult<I>, Error> {
+        // An enterprise user must never act on sequence numbers interpreted
+        // as UIDs. ESEARCH's explicit wire unit must agree with the command.
+        if response.is_uid() != I::UID {
+            return Err(Error::Provider(crate::error::ProviderFailure::Protocol(
+                "ESEARCH addressing disagrees with the SEARCH command".into(),
+            )));
+        }
+        expand_uid_ranges(response.all()).map(|ids| SearchResult::new(ids, response.mod_seq))
     }
 
     /// The responses that may reach the event queue once the command has
@@ -69,8 +82,8 @@ impl SearchConsumer {
     }
 }
 
-impl Consumer for SearchConsumer {
-    type Output = SearchResult;
+impl<I: crate::types::search::SearchAddress> Consumer for SearchConsumer<I> {
+    type Output = SearchResult<I>;
 
     fn on_response(
         &mut self,
@@ -87,7 +100,10 @@ impl Consumer for SearchConsumer {
             UntaggedResponse::Esearch(e) if e.tag.is_none() => {
                 self.tagless_esearch.push(e);
             }
-            UntaggedResponse::Search { uids, mod_seq } => {
+            UntaggedResponse::Search {
+                numbers: uids,
+                mod_seq,
+            } => {
                 self.search_responses.push((uids, mod_seq));
             }
             // Foreign-tagged ESEARCH and other response types.
@@ -99,7 +115,7 @@ impl Consumer for SearchConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Finalized<SearchResult> {
+    ) -> Finalized<SearchResult<I>> {
         if let Err(e) = tagged.require_ok() {
             // The generic `Either` buffer is surrendered; the accumulated
             // SEARCH/ESEARCH is dropped. `classify` makes both of those
@@ -121,10 +137,7 @@ impl Consumer for SearchConsumer {
             // The expansion may fail, but the response is consumed either
             // way: it is this tag's answer, so it must not be republished as
             // an asynchronous event.
-            let output = expand_uid_ranges(&esearch.all).map(|ids| SearchResult {
-                ids,
-                mod_seq: esearch.mod_seq,
-            });
+            let output = self.expand(esearch);
             return Finalized {
                 output,
                 reclassified_as_events: (*self).reclassified_extras(),
@@ -133,10 +146,7 @@ impl Consumer for SearchConsumer {
 
         // Pass 2: tagless ESEARCH.
         if let Some(esearch) = self.tagless_esearch.first() {
-            let output = expand_uid_ranges(&esearch.all).map(|ids| SearchResult {
-                ids,
-                mod_seq: esearch.mod_seq,
-            });
+            let output = self.expand(esearch);
             return Finalized {
                 output,
                 reclassified_as_events: (*self).reclassified_extras(),
@@ -147,7 +157,7 @@ impl Consumer for SearchConsumer {
         // Any further SEARCH is surplus solicited data and is dropped, like
         // every other surplus SEARCH/ESEARCH (see `reclassified_extras`).
         if let Some((uids, mod_seq)) = self.search_responses.into_iter().next() {
-            return Finalized::success(SearchResult { ids: uids, mod_seq }, self.buffered);
+            return Finalized::success(SearchResult::new(uids, mod_seq), self.buffered);
         }
 
         Finalized::failure(
@@ -348,7 +358,7 @@ impl Consumer for CopyConsumer {
             // RFC 4315 Section3: some servers send COPYUID in an untagged OK.
             resp @ UntaggedResponse::Status {
                 status: UntaggedStatus::Ok,
-                code: Some(ResponseCode::CopyUid { .. }),
+                code: Some(ResponseCode::CopyUid(_)),
                 ..
             } if self.copyuid.is_none() => {
                 self.copyuid = Some((self.buffered.len(), resp));
@@ -402,11 +412,11 @@ fn resolve_copyuid(
     retained: Option<(usize, UntaggedResponse)>,
 ) -> (
     Option<ResponseCode>,
-    Option<ResponseCode>,
+    Option<crate::types::response::CopyUid>,
     Vec<UntaggedResponse>,
 ) {
-    if matches!(tagged_code, Some(ResponseCode::CopyUid { .. })) {
-        let copy_uid = tagged_code.clone();
+    if let Some(ResponseCode::CopyUid(copy_uid)) = &tagged_code {
+        let copy_uid = Some(copy_uid.clone());
         return (tagged_code, copy_uid, reinsert_copyuid(buffered, retained));
     }
     // `on_response` retains only an untagged OK whose code is COPYUID.
@@ -415,7 +425,11 @@ fn resolve_copyuid(
         _ => None,
     };
     let code = tagged_code.or_else(|| untagged_code.clone());
-    (code, untagged_code, buffered)
+    let copy_uid = match untagged_code {
+        Some(ResponseCode::CopyUid(mapping)) => Some(mapping),
+        _ => None,
+    };
+    (code, copy_uid, buffered)
 }
 
 /// Consumer for MOVE and UID MOVE (RFC 6851 Section3).
@@ -486,7 +500,7 @@ impl Consumer for MoveConsumer {
             // ordinary untagged OK and is buffered.
             resp @ UntaggedResponse::Status {
                 status: UntaggedStatus::Ok,
-                code: Some(ResponseCode::CopyUid { .. }),
+                code: Some(ResponseCode::CopyUid(_)),
                 ..
             } if self.copyuid.is_none() => {
                 self.copyuid = Some((self.buffered.len(), resp));
@@ -753,8 +767,12 @@ mod tests {
     fn esearch(tag: Option<&str>, uid: u32) -> UntaggedResponse {
         UntaggedResponse::Esearch(EsearchResponse {
             tag: tag.map(ToOwned::to_owned),
-            uid: true,
-            all: vec![UidRange::single(uid)],
+            numbers: crate::types::response::EsearchNumbers::from_wire(
+                true,
+                None,
+                None,
+                vec![UidRange::single(uid)],
+            ),
             ..EsearchResponse::default()
         })
     }
@@ -764,11 +782,11 @@ mod tests {
     }
 
     fn copyuid(dest: u32) -> ResponseCode {
-        ResponseCode::CopyUid {
+        ResponseCode::CopyUid(crate::types::response::CopyUid {
             uid_validity: 7,
             source_uids: vec![UidRange::single(1)],
             dest_uids: vec![UidRange::single(dest)],
-        }
+        })
     }
 
     fn untagged_ok(code: Option<ResponseCode>, text: &str) -> UntaggedResponse {
@@ -779,13 +797,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn esearch_addressing_must_match_the_search_command() {
+        fn check<I: crate::types::search::SearchAddress>() {
+            let mut consumer = SearchConsumer::<I>::new();
+            feed(
+                &mut consumer,
+                UntaggedResponse::Esearch(EsearchResponse {
+                    tag: Some("A001".into()),
+                    numbers: crate::types::response::EsearchNumbers::from_wire(
+                        !I::UID,
+                        Some(7),
+                        Some(7),
+                        vec![UidRange::single(7)],
+                    ),
+                    ..Default::default()
+                }),
+            );
+            let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, None), &ctx());
+            assert!(matches!(
+                result.output,
+                Err(Error::Provider(crate::error::ProviderFailure::Protocol(_)))
+            ));
+            assert!(result.reclassified_as_events.is_empty());
+        }
+        check::<crate::types::Uid>();
+        check::<crate::types::Seq>();
+    }
+
     /// Surplus solicited SEARCH/ESEARCH is dropped on success: a second
     /// correlated ESEARCH, a tagless ESEARCH beside a correlated winner, and
     /// legacy SEARCH beside an ESEARCH winner. Only the `Either` responses
     /// survive, in wire order.
     #[test]
     fn search_success_drops_surplus_search_and_esearch() {
-        let mut consumer = SearchConsumer::new();
+        let mut consumer = SearchConsumer::<crate::types::Uid>::new();
         feed(&mut consumer, UntaggedResponse::Exists(1));
         feed(&mut consumer, esearch(Some("A001"), 4));
         feed(&mut consumer, esearch(Some("A001"), 9));
@@ -793,7 +839,7 @@ mod tests {
         feed(
             &mut consumer,
             UntaggedResponse::Search {
-                uids: vec![5],
+                numbers: vec![5],
                 mod_seq: None,
             },
         );
@@ -810,13 +856,13 @@ mod tests {
     /// Tagless winner: surplus tagless ESEARCH and legacy SEARCH are dropped.
     #[test]
     fn search_success_drops_surplus_when_tagless_esearch_wins() {
-        let mut consumer = SearchConsumer::new();
+        let mut consumer = SearchConsumer::<crate::types::Uid>::new();
         feed(&mut consumer, esearch(None, 4));
         feed(&mut consumer, esearch(None, 9));
         feed(
             &mut consumer,
             UntaggedResponse::Search {
-                uids: vec![5],
+                numbers: vec![5],
                 mod_seq: None,
             },
         );
@@ -829,18 +875,18 @@ mod tests {
     /// Legacy SEARCH winner: the second SEARCH is dropped.
     #[test]
     fn search_success_drops_surplus_legacy_search() {
-        let mut consumer = SearchConsumer::new();
+        let mut consumer = SearchConsumer::<crate::types::Uid>::new();
         feed(
             &mut consumer,
             UntaggedResponse::Search {
-                uids: vec![3],
+                numbers: vec![3],
                 mod_seq: None,
             },
         );
         feed(
             &mut consumer,
             UntaggedResponse::Search {
-                uids: vec![8],
+                numbers: vec![8],
                 mod_seq: None,
             },
         );
@@ -856,7 +902,8 @@ mod tests {
     /// holds for SEARCH RETURN without its ESEARCH.
     #[test]
     fn search_ok_without_a_result_is_a_missing_response() {
-        let result = Box::new(SearchConsumer::new()).finalize(tagged(StatusKind::Ok, None), &ctx());
+        let result = Box::new(SearchConsumer::<crate::types::Uid>::new())
+            .finalize(tagged(StatusKind::Ok, None), &ctx());
         assert!(matches!(
             result.output,
             Err(Error::Provider(crate::error::ProviderFailure::Missing(_)))
@@ -881,7 +928,10 @@ mod tests {
         let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, None), &ctx());
         let output = result.output.unwrap();
         assert_eq!(output.code, Some(copyuid(20)));
-        assert_eq!(output.copy_uid, Some(copyuid(20)));
+        assert_eq!(
+            output.copy_uid.map(ResponseCode::CopyUid),
+            Some(copyuid(20))
+        );
         assert_eq!(
             result.reclassified_as_events,
             vec![UntaggedResponse::Exists(3)]
@@ -900,7 +950,10 @@ mod tests {
         let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, Some(copyuid(30))), &ctx());
         let output = result.output.unwrap();
         assert_eq!(output.code, Some(copyuid(30)));
-        assert_eq!(output.copy_uid, Some(copyuid(30)));
+        assert_eq!(
+            output.copy_uid.map(ResponseCode::CopyUid),
+            Some(copyuid(30))
+        );
         assert_eq!(
             result.reclassified_as_events,
             vec![
@@ -928,7 +981,10 @@ mod tests {
         );
         let output = result.output.unwrap();
         assert_eq!(output.code, Some(ResponseCode::HighestModSeq(99)));
-        assert_eq!(output.copy_uid, Some(copyuid(20)));
+        assert_eq!(
+            output.copy_uid.map(ResponseCode::CopyUid),
+            Some(copyuid(20))
+        );
         assert_eq!(
             result.reclassified_as_events,
             vec![UntaggedResponse::Exists(3), UntaggedResponse::Expunge(1)]
@@ -981,7 +1037,10 @@ mod tests {
         let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, None), &ctx());
         let output = result.output.unwrap();
         assert_eq!(output.code, Some(copyuid(20)));
-        assert_eq!(output.copy_uid, Some(copyuid(20)));
+        assert_eq!(
+            output.copy_uid.map(ResponseCode::CopyUid),
+            Some(copyuid(20))
+        );
         assert_eq!(output.expunged, removals(vec![Removal::Seq(1)]));
         assert_eq!(
             result.reclassified_as_events,
@@ -1003,7 +1062,10 @@ mod tests {
         let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, Some(copyuid(30))), &ctx());
         let output = result.output.unwrap();
         assert_eq!(output.code, Some(copyuid(30)));
-        assert_eq!(output.copy_uid, Some(copyuid(30)));
+        assert_eq!(
+            output.copy_uid.map(ResponseCode::CopyUid),
+            Some(copyuid(30))
+        );
         assert_eq!(output.expunged, removals(vec![Removal::Seq(1)]));
         assert_eq!(
             result.reclassified_as_events,
@@ -1046,7 +1108,10 @@ mod tests {
         );
         let output = result.output.unwrap();
         assert_eq!(output.code, Some(ResponseCode::HighestModSeq(99)));
-        assert_eq!(output.copy_uid, Some(copyuid(20)));
+        assert_eq!(
+            output.copy_uid.map(ResponseCode::CopyUid),
+            Some(copyuid(20))
+        );
         assert_eq!(
             output.expunged,
             removals(vec![Removal::Uids {

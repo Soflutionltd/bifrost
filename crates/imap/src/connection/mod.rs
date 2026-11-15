@@ -39,7 +39,6 @@ mod extensions;
 mod helpers;
 mod idle;
 mod lifecycle;
-pub(crate) mod literals;
 mod mailbox;
 pub(super) mod pipeline;
 mod reply;

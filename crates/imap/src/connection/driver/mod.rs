@@ -1239,7 +1239,7 @@ pub(super) fn process_untagged_prefix(
 /// UTF-8 mode when `UTF8=ACCEPT` (RFC 6855 Section 3) has been enabled or
 /// `IMAP4rev2` is active (RFC 9051 Section 7). Asks the same authority the
 /// encoder uses so reads and writes cannot disagree.
-fn utf8_mode(state: &super::state::ProtocolState) -> crate::codec::utf7::WireMode {
+fn utf8_mode(state: &super::state::ProtocolState) -> crate::types::wire::WireMode {
     state.session.utf8_mode()
 }
 

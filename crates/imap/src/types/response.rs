@@ -132,7 +132,7 @@ pub enum UntaggedResponse {
     /// criterion and the result is non-empty (RFC 7162 Section 3.1.5).
     Search {
         /// Matching message sequence numbers or UIDs.
-        uids: Vec<u32>,
+        numbers: Vec<u32>,
         /// Highest mod-sequence of matching messages (RFC 7162 Section 3.1.5).
         mod_seq: Option<crate::types::ModSeq>,
     },
@@ -198,7 +198,7 @@ pub enum UntaggedResponse {
         entries: Vec<MetadataEntry>,
     },
     /// `* THREAD (...)` (RFC 5256 Section 4).
-    Thread(Vec<ThreadNode>),
+    Thread(Vec<ThreadNode<u32>>),
     /// SORT response  -  sorted message numbers and optional MODSEQ
     /// (RFC 5256 Section 4, RFC 7162 Section 3.1.6).
     ///
@@ -270,11 +270,7 @@ pub enum ResponseCode {
         uids: Vec<UidRange>,
     },
     /// `[COPYUID uidvalidity source-uids dest-uids]` (RFC 4315 UIDPLUS).
-    CopyUid {
-        uid_validity: u32,
-        source_uids: Vec<UidRange>,
-        dest_uids: Vec<UidRange>,
-    },
+    CopyUid(CopyUid),
     /// `[HIGHESTMODSEQ n]` (RFC 7162 CONDSTORE).
     HighestModSeq(u64),
     /// `[MODIFIED sequence-set]` (RFC 7162 Section 3.1.3 / Section 7).
@@ -495,20 +491,89 @@ pub struct EsearchResponse {
     /// Correlating tag from `(TAG "tagstring")`, if present
     /// (RFC 4466 Section 2.6.2 `search-correlator`).
     pub tag: Option<String>,
-    /// `true` when the response includes the `UID` indicator,
-    /// meaning all returned numbers are UIDs rather than sequence numbers
-    /// (RFC 4731 Section 3.1).
-    pub uid: bool,
-    /// MIN  -  lowest matching message number/UID (RFC 4731 Section 3.1).
-    pub min: Option<u32>,
-    /// MAX  -  highest matching message number/UID (RFC 4731 Section 3.1).
-    pub max: Option<u32>,
-    /// COUNT  -  number of matching messages (RFC 4731 Section 3.1).
+    /// The UID indicator determines the types of MIN/MAX and the ALL set.
+    pub numbers: EsearchNumbers,
+    /// COUNT is a count in either addressing mode (RFC 4731 Section 3.1).
     pub count: Option<u32>,
-    /// ALL  -  matching message numbers/UIDs as a uid-set (RFC 4731 Section 3.1).
-    pub all: Vec<UidRange>,
     /// MODSEQ  -  highest mod-sequence of matching messages (RFC 7162 Section 3.1.10).
     pub mod_seq: Option<crate::types::ModSeq>,
+}
+
+/// ESEARCH numbers carry the addressing the server actually reported.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum EsearchNumbers {
+    Uids(EsearchData<super::Uid>),
+    Seqs(EsearchData<super::Seq>),
+}
+
+/// MIN and MAX are nonzero identities, while ALL retains wire sequence-set
+/// grammar, including unresolved wildcards for the expansion boundary to judge.
+/// The containing variant supplies the addressing for those wire ranges.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EsearchData<I> {
+    pub min: Option<I>,
+    pub max: Option<I>,
+    pub all: Vec<UidRange>,
+}
+
+impl Default for EsearchNumbers {
+    fn default() -> Self {
+        Self::Seqs(EsearchData {
+            min: None,
+            max: None,
+            all: Vec::new(),
+        })
+    }
+}
+
+impl EsearchNumbers {
+    pub(crate) fn from_wire(
+        uid: bool,
+        min: Option<u32>,
+        max: Option<u32>,
+        all: Vec<UidRange>,
+    ) -> Self {
+        if uid {
+            Self::Uids(EsearchData {
+                min: min.and_then(super::Uid::new),
+                max: max.and_then(super::Uid::new),
+                all,
+            })
+        } else {
+            Self::Seqs(EsearchData {
+                min: min.and_then(super::Seq::new),
+                max: max.and_then(super::Seq::new),
+                all,
+            })
+        }
+    }
+}
+
+impl EsearchResponse {
+    pub(crate) fn is_uid(&self) -> bool {
+        matches!(self.numbers, EsearchNumbers::Uids(_))
+    }
+    pub(crate) fn all(&self) -> &[UidRange] {
+        match &self.numbers {
+            EsearchNumbers::Uids(data) => &data.all,
+            EsearchNumbers::Seqs(data) => &data.all,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn min(&self) -> Option<u32> {
+        match &self.numbers {
+            EsearchNumbers::Uids(data) => data.min.map(super::Uid::get),
+            EsearchNumbers::Seqs(data) => data.min.map(super::Seq::get),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn max(&self) -> Option<u32> {
+        match &self.numbers {
+            EsearchNumbers::Uids(data) => data.max.map(super::Uid::get),
+            EsearchNumbers::Seqs(data) => data.max.map(super::Seq::get),
+        }
+    }
 }
 
 /// Removals an EXPUNGE, UID EXPUNGE or MOVE reported (RFC 3501 Section
@@ -539,6 +604,26 @@ pub enum Removal {
     Uids { earlier: bool, uids: Vec<UidRange> },
 }
 
+/// Ordered UID correspondence reported by COPYUID (RFC 4315).
+///
+/// Keep the server's range order: sorting independent source/destination sets
+/// would change which copied message a destination UID identifies. Zero epoch
+/// observations remain representable so an acknowledged COPY is not turned
+/// into a retry that duplicates mail; account message detail requires a usable
+/// `validity()` while folder-level committed-copy evidence remains available.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CopyUid {
+    pub(crate) uid_validity: u32,
+    pub(crate) source_uids: Vec<UidRange>,
+    pub(crate) dest_uids: Vec<UidRange>,
+}
+
+impl CopyUid {
+    pub(crate) fn validity(&self) -> Option<super::UidValidity> {
+        super::UidValidity::new(self.uid_validity)
+    }
+}
+
 /// Result of a MOVE command (RFC 6851 Section 3).
 ///
 /// RFC 6851 Section 3 specifies that the server sends EXPUNGE (or VANISHED
@@ -561,12 +646,8 @@ pub struct MoveResult {
     /// The `COPYUID` response code (RFC 4315 Section 3, RFC 6851 Section
     /// 4.3): the tagged OK's code when that is COPYUID, otherwise the first
     /// untagged `OK [COPYUID ...]`, whatever code the tagged OK carries.
-    /// Always a [`ResponseCode::CopyUid`] when present. `None` when the
-    /// server sent no COPYUID at all.
-    // The account mutation effect recorder destructures this response code.
-    // A dedicated mapping type must migrate that reader together with this
-    // field; retaining the code here preserves its committed-copy evidence.
-    pub copy_uid: Option<ResponseCode>,
+    /// `None` when the server sent no COPYUID at all.
+    pub copy_uid: Option<CopyUid>,
     /// The EXPUNGE or VANISHED responses that preceded the tagged OK
     /// (RFC 6851 Section 3 / RFC 7162 Section 3.2.10).
     pub expunged: ExpungeResult,
@@ -589,13 +670,9 @@ pub struct CopyResult {
     pub code: Option<ResponseCode>,
     /// The `COPYUID` response code (RFC 4315 Section 3): the tagged OK's
     /// code when that is COPYUID, otherwise the first untagged
-    /// `OK [COPYUID ...]`, whatever code the tagged OK carries. Always a
-    /// [`ResponseCode::CopyUid`] when present. `None` when the server sent
-    /// no COPYUID at all.
-    // The account mutation effect recorder destructures this response code.
-    // A dedicated mapping type must migrate that reader together with this
-    // field; retaining the code here preserves its committed-copy evidence.
-    pub copy_uid: Option<ResponseCode>,
+    /// `OK [COPYUID ...]`, whatever code the tagged OK carries. `None` when
+    /// the server sent no COPYUID at all.
+    pub copy_uid: Option<CopyUid>,
 }
 
 /// A single quota resource from a QUOTA response (RFC 2087 Section 5.1).
@@ -682,13 +759,59 @@ pub struct MetadataResult {
 /// is used when the threading algorithm infers a parent that does not
 /// correspond to an existing message.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-pub struct ThreadNode {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ThreadNode<I = super::Uid> {
+    addressing: std::marker::PhantomData<I>,
     /// UID (or sequence number) of this message, or `None` if this is a
     /// dummy parent (RFC 5256 Section 4).
     pub id: Option<u32>,
     /// Child thread nodes (RFC 5256 Section 4).
     pub children: Vec<Self>,
+}
+
+impl<I> ThreadNode<I> {
+    pub(crate) fn new(id: Option<u32>, children: Vec<Self>) -> Self {
+        Self {
+            id,
+            children,
+            addressing: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<I> Default for ThreadNode<I> {
+    fn default() -> Self {
+        Self::new(None, Vec::new())
+    }
+}
+
+impl ThreadNode<u32> {
+    pub(crate) fn addressed<I>(self) -> ThreadNode<I> {
+        // A single parenthesized THREAD group can encode a long linear
+        // chain without exceeding the parser's nesting cap. Converting units
+        // must not add a recursive walk that overflows on that valid input.
+        let mut pending = vec![(
+            self.id,
+            self.children.into_iter(),
+            Vec::<ThreadNode<I>>::new(),
+        )];
+        loop {
+            let Some((id, mut remaining, converted)) = pending.pop() else {
+                unreachable!("the root returns when its frame completes");
+            };
+            if let Some(child) = remaining.next() {
+                pending.push((id, remaining, converted));
+                pending.push((child.id, child.children.into_iter(), Vec::new()));
+            } else {
+                let completed = ThreadNode::new(id, converted);
+                if let Some(parent) = pending.last_mut() {
+                    parent.2.push(completed);
+                } else {
+                    return completed;
+                }
+            }
+        }
+    }
 }
 
 /// A solicited LIST entry and its correlated STATUS items (RFC 5819).
@@ -715,7 +838,7 @@ impl From<&ResponseCode> for bifrost_types::ImapResponseCode {
             ResponseCode::UidValidity(_) => ImapResponseCode::UidValidity,
             ResponseCode::Unseen(_) => ImapResponseCode::Unseen,
             ResponseCode::AppendUid { .. } => ImapResponseCode::AppendUid,
-            ResponseCode::CopyUid { .. } => ImapResponseCode::CopyUid,
+            ResponseCode::CopyUid(_) => ImapResponseCode::CopyUid,
             ResponseCode::HighestModSeq(_) => ImapResponseCode::HighestModSeq,
             ResponseCode::Modified(_) => ImapResponseCode::Modified,
             ResponseCode::NoModSeq => ImapResponseCode::NoModSeq,

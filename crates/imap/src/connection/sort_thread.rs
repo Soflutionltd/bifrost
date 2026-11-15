@@ -22,7 +22,7 @@ impl ImapConnection {
         charset: &str,
         criteria: impl Into<crate::types::SearchCriteria>,
         timeout: Duration,
-    ) -> Result<SearchResult, Error> {
+    ) -> Result<SearchResult<crate::types::Seq>, Error> {
         let criteria = criteria.into();
         self.check_utf8_only_enforced()?;
 
@@ -87,7 +87,7 @@ impl ImapConnection {
         charset: &str,
         criteria: impl Into<crate::types::SearchCriteria>,
         timeout: Duration,
-    ) -> Result<Vec<ThreadNode>, Error> {
+    ) -> Result<Vec<ThreadNode<crate::types::Seq>>, Error> {
         let criteria = criteria.into();
         self.check_utf8_only_enforced()?;
 

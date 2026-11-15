@@ -460,11 +460,11 @@ fn response_code_copyuid_uidvalidity_zero() {
         "COPYUID with uidvalidity 0 must parse per Postel's law, \
              consistent with UIDVALIDITY response code tolerance",
     );
-    if let ResponseCode::CopyUid {
+    if let ResponseCode::CopyUid(crate::types::response::CopyUid {
         uid_validity,
         source_uids,
         dest_uids,
-    } = &code
+    }) = &code
     {
         assert_eq!(*uid_validity, 0);
         assert_eq!(source_uids.len(), 1);
@@ -477,11 +477,11 @@ fn response_code_copyuid_uidvalidity_zero() {
 #[test]
 fn response_code_copyuid() {
     let (_, code) = response_code(b"[COPYUID 1234 1:5 10:14]").unwrap();
-    if let ResponseCode::CopyUid {
+    if let ResponseCode::CopyUid(crate::types::response::CopyUid {
         uid_validity,
         source_uids,
         dest_uids,
-    } = &code
+    }) = &code
     {
         assert_eq!(*uid_validity, 1234);
         assert_eq!(source_uids.len(), 1);
@@ -787,7 +787,11 @@ fn untagged_list_special_use() {
 fn untagged_search() {
     let (_, resp) = parse_response(b"* SEARCH 1 5 10\r\n").unwrap();
     if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Search { uids, mod_seq } = &*u {
+        if let UntaggedResponse::Search {
+            numbers: uids,
+            mod_seq,
+        } = &*u
+        {
             assert_eq!(uids, &[1, 5, 10]);
             assert!(mod_seq.is_none());
         } else {
@@ -802,7 +806,7 @@ fn untagged_search() {
 fn untagged_search_empty() {
     let (_, resp) = parse_response(b"* SEARCH\r\n").unwrap();
     if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Search { uids, .. } = &*u {
+        if let UntaggedResponse::Search { numbers: uids, .. } = &*u {
             assert!(uids.is_empty());
         } else {
             panic!("expected Search");
@@ -824,7 +828,11 @@ fn untagged_search_empty() {
 fn search_trailing_space_empty() {
     let (_, resp) = parse_response(b"* SEARCH \r\n").unwrap();
     if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Search { uids, mod_seq } = &*u {
+        if let UntaggedResponse::Search {
+            numbers: uids,
+            mod_seq,
+        } = &*u
+        {
             assert!(
                 uids.is_empty(),
                 "trailing space should not produce phantom results"
@@ -853,7 +861,7 @@ fn search_trailing_space_empty() {
 fn search_filters_uid_zero() {
     let (_, resp) = parse_response(b"* SEARCH 5 0 10\r\n").unwrap();
     if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Search { uids, .. } = &*u {
+        if let UntaggedResponse::Search { numbers: uids, .. } = &*u {
             assert_eq!(
                 *uids,
                 vec![5, 10],
@@ -895,7 +903,7 @@ fn sort_filters_uid_zero() {
 fn search_trailing_spaces_with_results() {
     let (_, resp) = parse_response(b"* SEARCH 5 10 15  \r\n").unwrap();
     if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Search { uids, .. } = &*u {
+        if let UntaggedResponse::Search { numbers: uids, .. } = &*u {
             assert_eq!(*uids, vec![5, 10, 15]);
         } else {
             panic!("expected Search, got {u:?}");
@@ -912,7 +920,7 @@ fn search_trailing_space_followed_by_tagged() {
     // Parse just the untagged part
     let (rest, resp) = parse_response(b"* SEARCH \r\nA001 OK Success\r\n").unwrap();
     if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Search { uids, .. } = &*u {
+        if let UntaggedResponse::Search { numbers: uids, .. } = &*u {
             assert!(uids.is_empty());
         } else {
             panic!("expected Search");
@@ -1094,9 +1102,9 @@ fn esearch_with_all() {
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(esearch) = &*u {
             assert_eq!(esearch.tag.as_deref(), Some("A001"));
-            assert!(esearch.uid);
+            assert!(esearch.is_uid());
             assert_eq!(
-                esearch.all,
+                esearch.all(),
                 vec![UidRange::range(1, 3), UidRange::single(5)]
             );
         } else {
@@ -1114,11 +1122,11 @@ fn esearch_with_min_max_count() {
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(esearch) = &*u {
             assert_eq!(esearch.tag.as_deref(), Some("A002"));
-            assert!(esearch.uid);
-            assert_eq!(esearch.min, Some(1));
-            assert_eq!(esearch.max, Some(100));
+            assert!(esearch.is_uid());
+            assert_eq!(esearch.min(), Some(1));
+            assert_eq!(esearch.max(), Some(100));
             assert_eq!(esearch.count, Some(5));
-            assert!(esearch.all.is_empty());
+            assert!(esearch.all().is_empty());
         } else {
             panic!("expected Esearch, got {u:?}");
         }
@@ -1134,10 +1142,10 @@ fn esearch_empty() {
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(esearch) = &*u {
             assert_eq!(esearch.tag.as_deref(), Some("A003"));
-            assert!(!esearch.uid);
-            assert!(esearch.all.is_empty());
-            assert_eq!(esearch.min, None);
-            assert_eq!(esearch.max, None);
+            assert!(!esearch.is_uid());
+            assert!(esearch.all().is_empty());
+            assert_eq!(esearch.min(), None);
+            assert_eq!(esearch.max(), None);
             assert_eq!(esearch.count, None);
         } else {
             panic!("expected Esearch, got {u:?}");
@@ -1154,12 +1162,12 @@ fn esearch_all_fields_together() {
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(esearch) = &*u {
             assert_eq!(esearch.tag.as_deref(), Some("A004"));
-            assert!(esearch.uid);
-            assert_eq!(esearch.min, Some(2));
-            assert_eq!(esearch.max, Some(50));
+            assert!(esearch.is_uid());
+            assert_eq!(esearch.min(), Some(2));
+            assert_eq!(esearch.max(), Some(50));
             assert_eq!(esearch.count, Some(10));
             assert_eq!(
-                esearch.all,
+                esearch.all(),
                 vec![
                     UidRange::range(2, 5),
                     UidRange::single(10),
@@ -1182,10 +1190,10 @@ fn esearch_no_uid_indicator() {
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(esearch) = &*u {
             assert_eq!(esearch.tag.as_deref(), Some("A005"));
-            assert!(!esearch.uid);
+            assert!(!esearch.is_uid());
             assert_eq!(esearch.count, Some(3));
             assert_eq!(
-                esearch.all,
+                esearch.all(),
                 vec![
                     UidRange::single(1),
                     UidRange::single(5),
@@ -1208,9 +1216,9 @@ fn esearch_no_tag() {
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(esearch) = &*u {
             assert!(esearch.tag.is_none());
-            assert!(esearch.uid);
+            assert!(esearch.is_uid());
             assert_eq!(esearch.count, Some(0));
-            assert!(esearch.all.is_empty());
+            assert!(esearch.all().is_empty());
         } else {
             panic!("expected Esearch, got {u:?}");
         }
@@ -1225,10 +1233,10 @@ fn esearch_only_min() {
     let (_, resp) = parse_response(input).unwrap();
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(esearch) = &*u {
-            assert_eq!(esearch.min, Some(5));
-            assert_eq!(esearch.max, None);
+            assert_eq!(esearch.min(), Some(5));
+            assert_eq!(esearch.max(), None);
             assert_eq!(esearch.count, None);
-            assert!(esearch.all.is_empty());
+            assert!(esearch.all().is_empty());
         } else {
             panic!("expected Esearch, got {u:?}");
         }
@@ -1243,10 +1251,10 @@ fn esearch_only_max() {
     let (_, resp) = parse_response(input).unwrap();
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(esearch) = &*u {
-            assert_eq!(esearch.min, None);
-            assert_eq!(esearch.max, Some(99));
+            assert_eq!(esearch.min(), None);
+            assert_eq!(esearch.max(), Some(99));
             assert_eq!(esearch.count, None);
-            assert!(esearch.all.is_empty());
+            assert!(esearch.all().is_empty());
         } else {
             panic!("expected Esearch, got {u:?}");
         }
@@ -1261,10 +1269,10 @@ fn esearch_only_count() {
     let (_, resp) = parse_response(input).unwrap();
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(esearch) = &*u {
-            assert_eq!(esearch.min, None);
-            assert_eq!(esearch.max, None);
+            assert_eq!(esearch.min(), None);
+            assert_eq!(esearch.max(), None);
             assert_eq!(esearch.count, Some(0));
-            assert!(esearch.all.is_empty());
+            assert!(esearch.all().is_empty());
         } else {
             panic!("expected Esearch, got {u:?}");
         }
@@ -1279,9 +1287,9 @@ fn esearch_all_single_uid() {
     let (_, resp) = parse_response(input).unwrap();
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(esearch) = &*u {
-            assert_eq!(esearch.all, vec![UidRange::single(42)]);
-            assert_eq!(esearch.min, None);
-            assert_eq!(esearch.max, None);
+            assert_eq!(esearch.all(), vec![UidRange::single(42)]);
+            assert_eq!(esearch.min(), None);
+            assert_eq!(esearch.max(), None);
             assert_eq!(esearch.count, None);
         } else {
             panic!("expected Esearch, got {u:?}");
@@ -1299,15 +1307,15 @@ fn esearch_all_and_count_no_minmax() {
         if let UntaggedResponse::Esearch(esearch) = &*u {
             assert_eq!(esearch.count, Some(3));
             assert_eq!(
-                esearch.all,
+                esearch.all(),
                 vec![
                     UidRange::single(1),
                     UidRange::single(5),
                     UidRange::single(10),
                 ]
             );
-            assert_eq!(esearch.min, None);
-            assert_eq!(esearch.max, None);
+            assert_eq!(esearch.min(), None);
+            assert_eq!(esearch.max(), None);
         } else {
             panic!("expected Esearch, got {u:?}");
         }
@@ -1324,11 +1332,11 @@ fn esearch_keywords_case_insensitive() {
     let (_, resp) = parse_response(input).unwrap();
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(esearch) = &*u {
-            assert!(esearch.uid);
-            assert_eq!(esearch.min, Some(1));
-            assert_eq!(esearch.max, Some(100));
+            assert!(esearch.is_uid());
+            assert_eq!(esearch.min(), Some(1));
+            assert_eq!(esearch.max(), Some(100));
             assert_eq!(esearch.count, Some(5));
-            assert_eq!(esearch.all, vec![UidRange::range(1, 3)]);
+            assert_eq!(esearch.all(), vec![UidRange::range(1, 3)]);
         } else {
             panic!("expected Esearch, got {u:?}");
         }
@@ -1604,7 +1612,7 @@ fn imap_002_empty_encoded_text_q_decoded() {
 fn address_simple() {
     let (_, addr) = address(
         b"(\"Alice\" NIL \"alice\" \"example.com\")",
-        crate::codec::utf7::WireMode::ModifiedUtf7,
+        crate::types::wire::WireMode::ModifiedUtf7,
     )
     .unwrap();
     assert_eq!(addr.name.as_deref(), Some("Alice"));
@@ -1616,7 +1624,7 @@ fn address_simple() {
 fn address_all_nil() {
     let (_, addr) = address(
         b"(NIL NIL NIL NIL)",
-        crate::codec::utf7::WireMode::ModifiedUtf7,
+        crate::types::wire::WireMode::ModifiedUtf7,
     )
     .unwrap();
     assert!(addr.name.is_none());
@@ -1628,7 +1636,7 @@ fn address_all_nil() {
 fn address_rfc2047_name() {
     let (_, addr) = address(
         b"(\"=?UTF-8?B?QWxpY2U=?=\" NIL \"alice\" \"example.com\")",
-        crate::codec::utf7::WireMode::ModifiedUtf7,
+        crate::types::wire::WireMode::ModifiedUtf7,
     )
     .unwrap();
     assert_eq!(addr.name.as_deref(), Some("Alice"));
@@ -1636,7 +1644,7 @@ fn address_rfc2047_name() {
 
 #[test]
 fn address_list_nil() {
-    let (_, list) = address_list(b"NIL", crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, list) = address_list(b"NIL", crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(list.is_empty());
 }
 
@@ -1644,7 +1652,7 @@ fn address_list_nil() {
 fn address_list_multi() {
     let (_, list) = address_list(
         b"((\"A\" NIL \"a\" \"x.com\")(\"B\" NIL \"b\" \"y.com\"))",
-        crate::codec::utf7::WireMode::ModifiedUtf7,
+        crate::types::wire::WireMode::ModifiedUtf7,
     )
     .unwrap();
     assert_eq!(list.len(), 2);
@@ -1659,7 +1667,7 @@ fn envelope_full() {
             ((\"Recipient\" NIL \"rcpt\" \"example.com\")) \
             NIL NIL NIL \
             \"<msg-id@example.com>\")";
-    let (_, env) = envelope(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, env) = envelope(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(env.subject.as_deref(), Some("Test Subject"));
     assert_eq!(env.from.len(), 1);
     assert_eq!(env.to.len(), 1);
@@ -1669,7 +1677,7 @@ fn envelope_full() {
 #[test]
 fn envelope_all_nil() {
     let input = b"(NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)";
-    let (_, env) = envelope(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, env) = envelope(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(env.date.is_none());
     assert!(env.subject.is_none());
     assert!(env.from.is_empty());
@@ -1692,7 +1700,7 @@ fn envelope_nil_sender_reply_to_preserved() {
             ((\"Bob\" NIL \"bob\" \"example.com\")) \
             NIL NIL NIL \
             \"<msg@example.com>\")";
-    let (_, env) = envelope(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, env) = envelope(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
 
     // RFC 3501 Section 7.4.2: sender and reply_to default to from when NIL
     assert_eq!(env.from.len(), 1);
@@ -1752,7 +1760,7 @@ fn envelope_explicit_sender_reply_to_preserved() {
             ((\"Bob\" NIL \"bob\" \"example.com\")) \
             NIL NIL NIL \
             \"<msg@example.com>\")";
-    let (_, env) = envelope(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, env) = envelope(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
 
     assert_eq!(env.sender.len(), 1);
     assert_eq!(env.sender[0].mailbox.as_deref(), Some("secretary"));
@@ -1763,7 +1771,7 @@ fn envelope_explicit_sender_reply_to_preserved() {
 #[test]
 fn fetch_uid_flags() {
     let input = b"(UID 42 FLAGS (\\Seen \\Flagged))";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.uid, Some(42));
     let flags = fr.flags.unwrap();
     assert!(flags.contains(&Flag::Seen));
@@ -1773,7 +1781,7 @@ fn fetch_uid_flags() {
 #[test]
 fn fetch_rfc822_size() {
     let input = b"(RFC822.SIZE 1234)";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.rfc822_size, Some(1234));
 }
 
@@ -1783,7 +1791,7 @@ fn fetch_with_envelope() {
             ((\"Test\" NIL \"test\" \"example.com\")) \
             NIL NIL NIL NIL NIL NIL \
             \"<msg@example.com>\"))";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.uid, Some(10));
     let env = fr.envelope.unwrap();
     assert_eq!(env.subject.as_deref(), Some("Hello"));
@@ -1792,14 +1800,14 @@ fn fetch_with_envelope() {
 #[test]
 fn fetch_modseq() {
     let input = b"(UID 5 MODSEQ (12345))";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.mod_seq.map(crate::types::ModSeqValzer::get), Some(12345));
 }
 
 #[test]
 fn fetch_body_section() {
     let input = b"(BODY[] \"hello\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.body_sections.len(), 1);
     assert_eq!(fr.body_sections[0].section, "");
     assert_eq!(fr.body_sections[0].data.as_deref(), Some(b"hello".as_ref()));
@@ -1827,7 +1835,7 @@ fn full_fetch_response() {
 #[test]
 fn body_structure_text_plain() {
     let input = b"(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 100 5)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Text {
         media_subtype,
         params,
@@ -1852,7 +1860,7 @@ fn body_structure_rfc2231_params_end_to_end() {
     // End-to-end: parse BODYSTRUCTURE with RFC 2231 continuation params.
     // The parser automatically decodes and reassembles them.
     let input = b"(\"APPLICATION\" \"PDF\" (\"FILENAME*0*\" \"UTF-8''long%20\" \"FILENAME*1\" \"name.pdf\") NIL NIL \"BASE64\" 12345)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Basic { params, .. } = &bs {
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].0, "filename");
@@ -1865,7 +1873,7 @@ fn body_structure_rfc2231_params_end_to_end() {
 #[test]
 fn body_structure_basic_image() {
     let input = b"(\"IMAGE\" \"PNG\" NIL NIL NIL \"BASE64\" 2048)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Basic {
         media_type,
         media_subtype,
@@ -1886,7 +1894,7 @@ fn body_structure_multipart() {
     let input = b"((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 100 5)\
                        (\"TEXT\" \"HTML\" NIL NIL NIL \"QUOTED-PRINTABLE\" 200 10) \
                        \"ALTERNATIVE\")";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Multipart {
         media_subtype,
         bodies,
@@ -1908,7 +1916,7 @@ fn body_structure_multipart() {
 fn body_structure_multipart_whitespace_between_children() {
     // Note the space between the two child bodies: `) (`
     let input = b"((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 100 5) (\"TEXT\" \"HTML\" NIL NIL NIL \"QUOTED-PRINTABLE\" 200 10) \"ALTERNATIVE\")";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Multipart {
         bodies,
         media_subtype,
@@ -1930,7 +1938,7 @@ fn body_structure_multipart_whitespace_between_children() {
 fn body_structure_with_disposition() {
     let input = b"(\"APPLICATION\" \"PDF\" NIL NIL NIL \"BASE64\" 4096 \
                        NIL (\"ATTACHMENT\" (\"FILENAME\" \"report.pdf\")) NIL NIL)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Basic { disposition, .. } = &bs {
         let disp = disposition.as_ref().expect("expected disposition");
         assert_eq!(disp.disposition_type, "attachment");
@@ -2019,7 +2027,7 @@ fn body_params_rfc2231_iso8859() {
 fn body_structure_with_rfc2231_disposition() {
     // Full BODYSTRUCTURE with RFC 2231 encoded disposition parameter.
     let input = b"(\"APPLICATION\" \"PDF\" (\"NAME\" \"file.pdf\") NIL NIL \"BASE64\" 12345 NIL (\"attachment\" (\"FILENAME*\" \"UTF-8''t%C3%A9st.pdf\")) NIL NIL)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Basic { disposition, .. } = bs {
         let disp = disposition.expect("disposition should not be NIL");
         assert_eq!(disp.disposition_type, "attachment");
@@ -2110,7 +2118,7 @@ fn untagged_id_nil() {
 fn untagged_namespace_full() {
     let input = b"NAMESPACE ((\"\" \"/\")) ((\"~\" \"/\")) ((\"#shared.\" \".\"))\r\n";
     let (_, resp) =
-        parse_untagged_namespace(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_namespace(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Namespace {
         personal,
         other,
@@ -2134,7 +2142,7 @@ fn untagged_namespace_full() {
 fn untagged_namespace_all_nil() {
     let input = b"NAMESPACE NIL NIL NIL\r\n";
     let (_, resp) =
-        parse_untagged_namespace(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_namespace(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Namespace {
         personal,
         other,
@@ -2153,7 +2161,7 @@ fn untagged_namespace_all_nil() {
 fn untagged_status_mailbox() {
     let input = b"STATUS \"INBOX\" (MESSAGES 17 UNSEEN 5 UIDNEXT 100 UIDVALIDITY 1234)\r\n";
     let (_, resp) =
-        parse_untagged_status_mailbox(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_status_mailbox(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::MailboxStatus { mailbox, items } = resp {
         assert_eq!(mailbox.as_str(), "INBOX");
         assert_eq!(items.len(), 4);
@@ -2546,7 +2554,7 @@ fn fetch_internaldate() {
         panic!("expected Untagged, got {resp:?}");
     }
     // Also test standalone parser
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(
         fr.internal_date.as_deref(),
         Some("17-Jul-1996 02:44:25 -0700")
@@ -2602,7 +2610,7 @@ fn fetch_internaldate_nil_preserves_other_attrs() {
 #[test]
 fn fetch_body_header() {
     let input = b"(BODY[HEADER] \"Subject: Test\\r\\n\\r\\n\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.body_sections.len(), 1);
     assert_eq!(fr.body_sections[0].section, "HEADER");
     assert!(fr.body_sections[0].data.is_some());
@@ -2611,7 +2619,7 @@ fn fetch_body_header() {
 #[test]
 fn fetch_body_text() {
     let input = b"(BODY[TEXT] \"message body here\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.body_sections.len(), 1);
     assert_eq!(fr.body_sections[0].section, "TEXT");
     assert_eq!(
@@ -2623,7 +2631,7 @@ fn fetch_body_text() {
 #[test]
 fn fetch_body_header_fields() {
     let input = b"(BODY[HEADER.FIELDS (Subject From)] \"Subject: Hi\\r\\nFrom: a@b\\r\\n\\r\\n\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.body_sections.len(), 1);
     assert_eq!(fr.body_sections[0].section, "HEADER.FIELDS (Subject From)");
 }
@@ -2631,7 +2639,7 @@ fn fetch_body_header_fields() {
 #[test]
 fn fetch_body_part_number() {
     let input = b"(BODY[1.2] \"part data\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.body_sections.len(), 1);
     assert_eq!(fr.body_sections[0].section, "1.2");
     assert_eq!(
@@ -2643,7 +2651,7 @@ fn fetch_body_part_number() {
 #[test]
 fn fetch_body_partial_origin() {
     let input = b"(BODY[]<0> \"first 100 bytes\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.body_sections.len(), 1);
     assert_eq!(fr.body_sections[0].section, "");
     assert_eq!(fr.body_sections[0].origin, Some(0));
@@ -2652,7 +2660,7 @@ fn fetch_body_partial_origin() {
 #[test]
 fn fetch_body_nil_data() {
     let input = b"(BODY[TEXT] NIL)";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.body_sections.len(), 1);
     assert_eq!(fr.body_sections[0].section, "TEXT");
     assert!(fr.body_sections[0].data.is_none());
@@ -2661,7 +2669,7 @@ fn fetch_body_nil_data() {
 #[test]
 fn fetch_multiple_body_sections() {
     let input = b"(BODY[HEADER] \"hdr\" BODY[TEXT] \"body\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.body_sections.len(), 2);
     assert_eq!(fr.body_sections[0].section, "HEADER");
     assert_eq!(fr.body_sections[1].section, "TEXT");
@@ -2671,14 +2679,14 @@ fn fetch_multiple_body_sections() {
 fn fetch_body_without_section_is_bodystructure() {
     // BODY without [] is a synonym for BODYSTRUCTURE (RFC 3501 Section 6.4.5)
     let input = b"(BODY (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 100 5))";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(fr.body_structure.is_some());
 }
 
 #[test]
 fn fetch_body_with_literal() {
     let input = b"(BODY[] {5}\r\nhello)";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.body_sections.len(), 1);
     assert_eq!(fr.body_sections[0].data.as_deref(), Some(b"hello".as_ref()));
 }
@@ -2688,7 +2696,7 @@ fn fetch_all_items_combined() {
     let input = b"(UID 99 FLAGS (\\Seen) RFC822.SIZE 2048 \
             INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" \
             BODY[HEADER] \"From: test\\r\\n\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.uid, Some(99));
     assert_eq!(fr.rfc822_size, Some(2048));
     assert_eq!(
@@ -2704,7 +2712,7 @@ fn fetch_all_items_combined() {
 fn fetch_unknown_attribute_skipped() {
     // Future attributes should be skipped gracefully
     let input = b"(UID 1 FUTUREATTR \"value\" FLAGS (\\Seen))";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.uid, Some(1));
     let flags = fr.flags.unwrap();
     assert!(flags.contains(&Flag::Seen));
@@ -2716,7 +2724,7 @@ fn fetch_unknown_attribute_skipped() {
 fn fetch_binary_simple_section() {
     // BINARY[1] with quoted data (RFC 3516 Section 4.2)
     let input = b"(BINARY[1] \"binary data\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.binary_sections.len(), 1);
     assert_eq!(fr.binary_sections[0].section, vec![1]);
     assert_eq!(fr.binary_sections[0].origin, None);
@@ -2730,7 +2738,7 @@ fn fetch_binary_simple_section() {
 fn fetch_binary_nested_section() {
     // BINARY[1.2.3] with literal data (RFC 3516 Section 4.2)
     let input = b"(BINARY[1.2.3] {5}\r\nhello)";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.binary_sections.len(), 1);
     assert_eq!(fr.binary_sections[0].section, vec![1, 2, 3]);
     assert_eq!(fr.binary_sections[0].origin, None);
@@ -2744,7 +2752,7 @@ fn fetch_binary_nested_section() {
 fn fetch_binary_with_origin() {
     // BINARY[2]<0>  -  partial binary fetch with origin offset (RFC 3516 Section 4.2)
     let input = b"(BINARY[2]<0> \"partial\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.binary_sections.len(), 1);
     assert_eq!(fr.binary_sections[0].section, vec![2]);
     assert_eq!(fr.binary_sections[0].origin, Some(0));
@@ -2758,7 +2766,7 @@ fn fetch_binary_with_origin() {
 fn fetch_binary_nil_data() {
     // BINARY[1] NIL  -  server returns NIL for absent data (RFC 3516 Section 4.2)
     let input = b"(BINARY[1] NIL)";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.binary_sections.len(), 1);
     assert_eq!(fr.binary_sections[0].section, vec![1]);
     assert!(fr.binary_sections[0].data.is_none());
@@ -2768,7 +2776,7 @@ fn fetch_binary_nil_data() {
 fn fetch_binary_size() {
     // BINARY.SIZE[1] number (RFC 3516 Section 4.3)
     let input = b"(BINARY.SIZE[1] 2048)";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.binary_sizes.len(), 1);
     assert_eq!(fr.binary_sizes[0], (vec![1], 2048));
 }
@@ -2777,7 +2785,7 @@ fn fetch_binary_size() {
 fn fetch_binary_size_nested() {
     // BINARY.SIZE[1.2]  -  nested section (RFC 3516 Section 4.3)
     let input = b"(BINARY.SIZE[1.2] 512)";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.binary_sizes.len(), 1);
     assert_eq!(fr.binary_sizes[0], (vec![1, 2], 512));
 }
@@ -2786,7 +2794,7 @@ fn fetch_binary_size_nested() {
 fn fetch_binary_mixed_with_other_attrs() {
     // BINARY and BINARY.SIZE alongside regular FETCH attributes
     let input = b"(UID 42 BINARY[1] \"data\" BINARY.SIZE[2] 1024 FLAGS (\\Seen))";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.uid, Some(42));
     assert_eq!(fr.binary_sections.len(), 1);
     assert_eq!(fr.binary_sections[0].section, vec![1]);
@@ -2804,7 +2812,7 @@ fn fetch_binary_mixed_with_other_attrs() {
 fn fetch_multiple_binary_sections() {
     // Multiple BINARY sections in one response (RFC 3516 Section 4.2)
     let input = b"(BINARY[1] \"part1\" BINARY[2] \"part2\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.binary_sections.len(), 2);
     assert_eq!(fr.binary_sections[0].section, vec![1]);
     assert_eq!(
@@ -2823,7 +2831,7 @@ fn fetch_binary_empty_section() {
     // RFC 9051 Section 9: section-binary = "[" [section-part] "]"
     // Empty section-part is valid and produces an empty section vec.
     let input = b"(BINARY[] \"all\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.binary_sections.len(), 1);
     assert!(
         fr.binary_sections[0].section.is_empty(),
@@ -2837,7 +2845,7 @@ fn fetch_binary_size_empty_section() {
     // RFC 9051 Section 9: section-binary = "[" [section-part] "]"
     // Empty section-part is valid and produces an empty section vec.
     let input = b"(BINARY.SIZE[] 4096)";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.binary_sizes.len(), 1);
     let (ref section, size) = fr.binary_sizes[0];
     assert!(section.is_empty(), "RFC 9051: empty section-part");
@@ -2850,7 +2858,7 @@ fn binary_size_number64() {
     // BINARY.SIZE, but the parser accepts number64 as a Postel's-law
     // leniency. This test verifies values exceeding u32::MAX parse correctly.
     let input = b"(BINARY.SIZE[1] 5000000000)";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.binary_sizes.len(), 1);
     assert_eq!(fr.binary_sizes[0], (vec![1], 5_000_000_000u64));
 }
@@ -3171,7 +3179,7 @@ fn envelope_truncated() {
     // Envelope missing most fields
     let result = envelope(
         b"(\"date\" \"subject\"",
-        crate::codec::utf7::WireMode::ModifiedUtf7,
+        crate::types::wire::WireMode::ModifiedUtf7,
     );
     assert!(result.is_err());
 }
@@ -3180,7 +3188,7 @@ fn envelope_truncated() {
 fn body_structure_truncated() {
     let result = body_structure(
         b"(\"TEXT\" \"PLAIN\" NIL NIL NIL",
-        crate::codec::utf7::WireMode::ModifiedUtf7,
+        crate::types::wire::WireMode::ModifiedUtf7,
         0,
     );
     assert!(result.is_err());
@@ -3276,7 +3284,7 @@ fn continuation_plain_text_no_code() {
 #[test]
 fn untagged_list_with_all_attributes() {
     let input = b"LIST (\\HasChildren \\Subscribed) \".\" \"INBOX\"\r\n";
-    let (_, resp) = parse_untagged_list(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, resp) = parse_untagged_list(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::List(info) = resp {
         assert_eq!(info.name.as_str(), "INBOX");
         assert_eq!(info.delimiter, Some('.'));
@@ -3293,7 +3301,7 @@ fn esearch_unknown_key_skipped() {
     let input = b"ESEARCH (TAG \"A001\") UID ALL 1:3 XFUTURE foo\r\n";
     let (_, resp) = parse_untagged_esearch(input).unwrap();
     if let UntaggedResponse::Esearch(esearch) = resp {
-        assert_eq!(esearch.all, vec![UidRange::range(1, 3)]);
+        assert_eq!(esearch.all(), vec![UidRange::range(1, 3)]);
     } else {
         panic!("expected Esearch, got {resp:?}");
     }
@@ -3305,7 +3313,7 @@ fn namespace_with_extension_data() {
     // RFC 2342 Section6: Namespace_Response_Extension = SP string SP "(" string *(SP string) ")"
     let input = b"NAMESPACE ((\"\" \"/\" \"X-EXT\" (\"val\"))) NIL NIL\r\n";
     let (_, resp) =
-        parse_untagged_namespace(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_namespace(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Namespace { personal, .. } = resp {
         assert_eq!(personal.len(), 1);
         assert_eq!(personal[0].prefix, "");
@@ -3407,7 +3415,7 @@ fn lsub_preserves_childinfo() {
 fn status_messages_unseen() {
     let input = b"STATUS \"INBOX\" (MESSAGES 17 UNSEEN 2)\r\n";
     let (_, resp) =
-        parse_untagged_status_mailbox(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_status_mailbox(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::MailboxStatus { mailbox, items } = resp {
         assert_eq!(mailbox.as_str(), "INBOX");
         assert_eq!(items.len(), 2);
@@ -3422,7 +3430,7 @@ fn status_messages_unseen() {
 fn status_uidnext_uidvalidity() {
     let input = b"STATUS \"INBOX\" (UIDNEXT 4392 UIDVALIDITY 3857529045)\r\n";
     let (_, resp) =
-        parse_untagged_status_mailbox(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_status_mailbox(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::MailboxStatus { items, .. } = resp {
         assert!(items.contains(&StatusItem::UidNext(4392)));
         assert!(items.contains(&StatusItem::UidValidity(3_857_529_045)));
@@ -3435,7 +3443,7 @@ fn status_uidnext_uidvalidity() {
 fn status_recent() {
     let input = b"STATUS \"INBOX\" (RECENT 5)\r\n";
     let (_, resp) =
-        parse_untagged_status_mailbox(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_status_mailbox(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::MailboxStatus { items, .. } = resp {
         assert_eq!(items.len(), 1);
         assert!(items.contains(&StatusItem::Recent(5)));
@@ -3448,7 +3456,7 @@ fn status_recent() {
 fn status_all_items() {
     let input = b"STATUS \"INBOX\" (MESSAGES 10 RECENT 3 UNSEEN 2 UIDNEXT 100 UIDVALIDITY 1)\r\n";
     let (_, resp) =
-        parse_untagged_status_mailbox(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_status_mailbox(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::MailboxStatus { items, .. } = resp {
         assert_eq!(items.len(), 5);
         assert!(items.contains(&StatusItem::Messages(10)));
@@ -3470,7 +3478,7 @@ fn status_all_items() {
 fn status_unknown_attr_nil_prefix_atom() {
     let input = b"STATUS \"INBOX\" (MESSAGES 10 XHASH NILSIMSA UNSEEN 3)\r\n";
     let (_, resp) =
-        parse_untagged_status_mailbox(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_status_mailbox(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::MailboxStatus { mailbox, items } = resp {
         assert_eq!(mailbox.as_str(), "INBOX");
         assert!(
@@ -3500,7 +3508,7 @@ fn body_structure_nested_multipart() {
             \"ALTERNATIVE\")\
             (\"APPLICATION\" \"PDF\" NIL NIL NIL \"BASE64\" 5000) \
             \"MIXED\")";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Multipart {
         media_subtype,
         bodies,
@@ -3536,7 +3544,7 @@ fn body_structure_message_rfc822() {
     let input = b"(\"MESSAGE\" \"RFC822\" NIL NIL NIL \"7BIT\" 500 \
             (NIL \"embedded\" NIL NIL NIL NIL NIL NIL NIL NIL) \
             (\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 50 3) 20)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Message {
         size,
         envelope,
@@ -5030,7 +5038,7 @@ fn search_empty_result() {
     let input = b"* SEARCH\r\n";
     let (_, resp) = parse_response(input).unwrap();
     if let Response::Untagged(boxed) = resp
-        && let UntaggedResponse::Search { uids, .. } = *boxed
+        && let UntaggedResponse::Search { numbers: uids, .. } = *boxed
     {
         assert!(uids.is_empty());
         return;
@@ -5044,7 +5052,7 @@ fn search_multiple_uids() {
     let input = b"* SEARCH 1 5 10 42\r\n";
     let (_, resp) = parse_response(input).unwrap();
     if let Response::Untagged(boxed) = resp
-        && let UntaggedResponse::Search { uids, .. } = *boxed
+        && let UntaggedResponse::Search { numbers: uids, .. } = *boxed
     {
         assert_eq!(uids, vec![1, 5, 10, 42]);
         return;
@@ -5061,9 +5069,9 @@ fn esearch_all_preserves_ranges() {
         && let UntaggedResponse::Esearch(esearch) = *boxed
     {
         assert_eq!(esearch.tag.as_deref(), Some("A001"));
-        assert!(!esearch.uid);
+        assert!(!esearch.is_uid());
         assert_eq!(
-            esearch.all,
+            esearch.all(),
             vec![
                 UidRange::range(1, 3),
                 UidRange::single(5),
@@ -5114,14 +5122,14 @@ fn response_code_appenduid_multi() {
 fn envelope_truncated_fails() {
     // Only date and subject, then end of input
     let input = b"(\"Mon, 01 Jan 2024\" \"Subject\"";
-    assert!(envelope(input, crate::codec::utf7::WireMode::ModifiedUtf7).is_err());
+    assert!(envelope(input, crate::types::wire::WireMode::ModifiedUtf7).is_err());
 }
 
 /// BODYSTRUCTURE with no extension data (minimal text/plain).
 #[test]
 fn body_structure_minimal_text() {
     let input = b"(\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\" 42 3)";
-    let (_, body) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, body) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Text {
         media_subtype,
         size,
@@ -5249,7 +5257,7 @@ fn response_code_appenduid_range_multiappend() {
 #[test]
 fn address_group_start() {
     let input = b"(NIL NIL \"Friends\" NIL)";
-    let (_, addr) = address(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, addr) = address(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(addr.is_group_start());
     assert!(!addr.is_group_end());
     assert_eq!(addr.mailbox.as_deref(), Some("Friends"));
@@ -5260,7 +5268,7 @@ fn address_group_start() {
 #[test]
 fn address_group_end() {
     let input = b"(NIL NIL NIL NIL)";
-    let (_, addr) = address(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, addr) = address(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(addr.is_group_end());
     assert!(!addr.is_group_start());
 }
@@ -5271,7 +5279,7 @@ fn address_list_with_group() {
     // RFC 3501 Section 7.4.2: group is encoded as start marker, members, end marker.
     let input =
         b"((NIL NIL \"Team\" NIL)(\"Alice\" NIL \"alice\" \"example.com\")(NIL NIL NIL NIL))";
-    let (_, addrs) = address_list(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, addrs) = address_list(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(addrs.len(), 3);
     assert!(addrs[0].is_group_start());
     assert_eq!(addrs[0].mailbox.as_deref(), Some("Team"));
@@ -5286,7 +5294,7 @@ fn address_list_with_group() {
 #[test]
 fn fetch_lowercase_attributes() {
     let input = b"(uid 42 flags (\\Seen) rfc822.size 1024)";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.uid, Some(42));
     assert_eq!(fr.flags, Some(vec![Flag::Seen]));
     assert_eq!(fr.rfc822_size, Some(1024));
@@ -5296,7 +5304,7 @@ fn fetch_lowercase_attributes() {
 #[test]
 fn fetch_mixed_case_attributes() {
     let input = b"(Uid 99 Flags (\\Deleted \\Draft) Rfc822.Size 2048)";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.uid, Some(99));
     assert_eq!(fr.flags, Some(vec![Flag::Deleted, Flag::Draft]));
     assert_eq!(fr.rfc822_size, Some(2048));
@@ -5307,7 +5315,7 @@ fn fetch_mixed_case_attributes() {
 fn fetch_lowercase_bodystructure() {
     let input =
         b"(bodystructure (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 100 5))";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(fr.body_structure.is_some());
 }
 
@@ -5315,7 +5323,7 @@ fn fetch_lowercase_bodystructure() {
 #[test]
 fn fetch_lowercase_modseq() {
     let input = b"(modseq (12345))";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.mod_seq.map(crate::types::ModSeqValzer::get), Some(12345));
 }
 
@@ -5323,7 +5331,7 @@ fn fetch_lowercase_modseq() {
 #[test]
 fn fetch_lowercase_internaldate() {
     let input = b"(internaldate \"17-Jul-1996 02:44:25 -0700\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(
         fr.internal_date.as_deref(),
         Some("17-Jul-1996 02:44:25 -0700")
@@ -5337,7 +5345,7 @@ fn fetch_lowercase_internaldate() {
 fn body_structure_ext_md5_only() {
     // TEXT body with md5, but no disposition/language/location.
     let input = b"(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 100 5 \"abc123\")";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Text {
         md5, disposition, ..
     } = bs
@@ -5354,7 +5362,7 @@ fn body_structure_ext_md5_only() {
 fn body_structure_ext_md5_and_disposition() {
     let input =
         b"(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 100 5 NIL (\"inline\" NIL))";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Text {
         md5,
         disposition,
@@ -5377,7 +5385,7 @@ fn body_structure_ext_md5_and_disposition() {
 #[test]
 fn body_structure_ext_through_language() {
     let input = b"(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 100 5 NIL NIL (\"en\" \"fr\"))";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Text {
         language, location, ..
     } = bs
@@ -5394,7 +5402,7 @@ fn body_structure_ext_through_language() {
 #[test]
 fn body_structure_mpart_ext_params_only() {
     let input = b"((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 50 3)(\"TEXT\" \"HTML\" NIL NIL NIL \"7BIT\" 80 4) \"ALTERNATIVE\" (\"BOUNDARY\" \"----=_Part\"))";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Multipart {
         params,
         disposition,
@@ -5413,7 +5421,7 @@ fn body_structure_mpart_ext_params_only() {
 #[test]
 fn body_structure_mpart_no_extension() {
     let input = b"((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 50 3) \"MIXED\")";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Multipart {
         params,
         disposition,
@@ -5439,7 +5447,7 @@ fn body_type_mpart_rejects_zero_children() {
     // Input has no child bodies  -  starts directly with SP + subtype.
     // This violates the `1*body` ABNF rule (RFC 3501 Section 9).
     let input = b" \"MIXED\" NIL NIL NIL NIL)";
-    let result = body_type_mpart(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0);
+    let result = body_type_mpart(input, crate::types::wire::WireMode::ModifiedUtf7, 0);
     assert!(
         result.is_err(),
         "body_type_mpart must reject zero children per RFC 3501 Section 9 (1*body)"
@@ -5452,7 +5460,7 @@ fn body_type_mpart_rejects_zero_children() {
 #[test]
 fn fetch_multiple_unknown_attributes_skipped() {
     let input = b"(UID 42 X-CUSTOM1 \"value1\" X-CUSTOM2 (nested data) FLAGS (\\Seen))";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.uid, Some(42));
     assert_eq!(fr.flags, Some(vec![Flag::Seen]));
 }
@@ -5461,7 +5469,7 @@ fn fetch_multiple_unknown_attributes_skipped() {
 #[test]
 fn fetch_unknown_attribute_nil_value() {
     let input = b"(UID 10 X-UNKNOWN NIL FLAGS ())";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.uid, Some(10));
     assert_eq!(fr.flags, Some(vec![]));
 }
@@ -5470,7 +5478,7 @@ fn fetch_unknown_attribute_nil_value() {
 #[test]
 fn fetch_unknown_attribute_literal_value() {
     let input = b"(UID 7 X-DATA {5}\r\nhello FLAGS (\\Flagged))";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.uid, Some(7));
     assert_eq!(fr.flags, Some(vec![Flag::Flagged]));
 }
@@ -5650,7 +5658,7 @@ fn quotaroot_single_root_atom() {
     // Mailbox as atom, root as quoted string
     let input = b"QUOTAROOT INBOX \"root\"\r\n";
     let (_, resp) =
-        parse_untagged_quotaroot(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_quotaroot(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::QuotaRoot { mailbox, roots } = resp {
         assert_eq!(mailbox.as_str(), "INBOX");
         assert_eq!(roots, vec!["root"]);
@@ -5664,7 +5672,7 @@ fn quotaroot_single_root_atom() {
 fn quotaroot_multiple_roots_list() {
     let input = b"QUOTAROOT INBOX \"root1\" \"root2\" \"root3\"\r\n";
     let (_, resp) =
-        parse_untagged_quotaroot(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_quotaroot(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::QuotaRoot { mailbox, roots } = resp {
         assert_eq!(mailbox.as_str(), "INBOX");
         assert_eq!(roots, vec!["root1", "root2", "root3"]);
@@ -5678,7 +5686,7 @@ fn quotaroot_multiple_roots_list() {
 fn quotaroot_no_roots_at_all() {
     let input = b"QUOTAROOT \"Sent Items\"\r\n";
     let (_, resp) =
-        parse_untagged_quotaroot(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_quotaroot(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::QuotaRoot { mailbox, roots } = resp {
         assert_eq!(mailbox.as_str(), "Sent Items");
         assert!(roots.is_empty());
@@ -5694,7 +5702,7 @@ fn quotaroot_truncated_input() {
     assert!(
         parse_untagged_quotaroot(
             b"QUOTAROOT INBOX",
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
         )
         .is_err()
     );
@@ -5706,7 +5714,7 @@ fn quotaroot_truncated_input() {
 #[test]
 fn acl_single_entry_quoted_mailbox() {
     let input = b"ACL \"Sent Items\" alice lrswipcda\r\n";
-    let (_, resp) = parse_untagged_acl(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, resp) = parse_untagged_acl(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Acl { mailbox, entries } = resp {
         assert_eq!(mailbox.as_str(), "Sent Items");
         assert_eq!(entries.len(), 1);
@@ -5721,7 +5729,7 @@ fn acl_single_entry_quoted_mailbox() {
 #[test]
 fn acl_multiple_entries_varied() {
     let input = b"ACL INBOX alice lrswipcda bob lr chris lrswip\r\n";
-    let (_, resp) = parse_untagged_acl(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, resp) = parse_untagged_acl(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Acl { mailbox, entries } = resp {
         assert_eq!(mailbox.as_str(), "INBOX");
         assert_eq!(entries.len(), 3);
@@ -5740,7 +5748,7 @@ fn acl_multiple_entries_varied() {
 #[test]
 fn acl_no_entries_empty() {
     let input = b"ACL \"Archive\"\r\n";
-    let (_, resp) = parse_untagged_acl(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, resp) = parse_untagged_acl(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Acl { mailbox, entries } = resp {
         assert_eq!(mailbox.as_str(), "Archive");
         assert!(entries.is_empty());
@@ -5756,7 +5764,7 @@ fn acl_truncated_input() {
     assert!(
         parse_untagged_acl(
             b"ACL INBOX alice lrs",
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
         )
         .is_err()
     );
@@ -5769,7 +5777,7 @@ fn acl_garbage_data() {
     assert!(
         parse_untagged_acl(
             b"GARBAGE data\r\n",
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
         )
         .is_err()
     );
@@ -5780,7 +5788,7 @@ fn acl_garbage_data() {
 fn listrights_required_and_optional() {
     let input = b"LISTRIGHTS \"Sent Items\" bob lr s w i p c d a\r\n";
     let (_, resp) =
-        parse_untagged_listrights(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_listrights(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::ListRights {
         mailbox,
         identifier,
@@ -5803,7 +5811,7 @@ fn listrights_required_and_optional() {
 fn listrights_required_only() {
     let input = b"LISTRIGHTS INBOX alice lrswipcda\r\n";
     let (_, resp) =
-        parse_untagged_listrights(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_listrights(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::ListRights {
         required, optional, ..
     } = resp
@@ -5822,7 +5830,7 @@ fn listrights_truncated_input() {
     assert!(
         parse_untagged_listrights(
             b"LISTRIGHTS INBOX fred",
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
         )
         .is_err()
     );
@@ -5830,7 +5838,7 @@ fn listrights_truncated_input() {
     assert!(
         parse_untagged_listrights(
             b"LISTRIGHTS INBOX fred lr",
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
         )
         .is_err()
     );
@@ -5842,7 +5850,7 @@ fn listrights_garbage_data() {
     assert!(
         parse_untagged_listrights(
             b"LISTRIGHTS !!!GARBAGE\r\n",
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
         )
         .is_err()
     );
@@ -5853,7 +5861,7 @@ fn listrights_garbage_data() {
 fn myrights_atom_mailbox() {
     let input = b"MYRIGHTS INBOX lr\r\n";
     let (_, resp) =
-        parse_untagged_myrights(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_myrights(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::MyRights { mailbox, rights } = resp {
         assert_eq!(mailbox.as_str(), "INBOX");
         assert_eq!(rights, "lr");
@@ -5869,7 +5877,7 @@ fn myrights_truncated_input() {
     assert!(
         parse_untagged_myrights(
             b"MYRIGHTS INBOX",
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
         )
         .is_err()
     );
@@ -5877,7 +5885,7 @@ fn myrights_truncated_input() {
     assert!(
         parse_untagged_myrights(
             b"MYRIGHTS INBOX lrs",
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
         )
         .is_err()
     );
@@ -5889,7 +5897,7 @@ fn myrights_garbage_data() {
     assert!(
         parse_untagged_myrights(
             b"MYRIGHTS !!!GARBAGE\r\n",
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
         )
         .is_err()
     );
@@ -5902,7 +5910,7 @@ fn myrights_garbage_data() {
 fn metadata_single_entry() {
     let input = b"METADATA \"INBOX\" (\"/private/comment\" \"My folder\")\r\n";
     let (_, resp) =
-        parse_untagged_metadata(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_metadata(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Metadata { mailbox, entries } = resp {
         assert_eq!(mailbox.as_str(), "INBOX");
         assert_eq!(entries.len(), 1);
@@ -5918,7 +5926,7 @@ fn metadata_single_entry() {
 fn metadata_multiple_entries_mixed() {
     let input = b"METADATA \"INBOX\" (\"/private/comment\" \"hello\" \"/shared/comment\" \"world\" \"/private/vendor/foo\" \"bar\")\r\n";
     let (_, resp) =
-        parse_untagged_metadata(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_metadata(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Metadata { mailbox, entries } = resp {
         assert_eq!(mailbox.as_str(), "INBOX");
         assert_eq!(entries.len(), 3);
@@ -5938,7 +5946,7 @@ fn metadata_multiple_entries_mixed() {
 fn metadata_complex_vendor_keys() {
     let input = b"METADATA \"INBOX\" (\"/shared/vendor/example.com/widget\" \"config-value\")\r\n";
     let (_, resp) =
-        parse_untagged_metadata(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_metadata(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Metadata { entries, .. } = resp {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "/shared/vendor/example.com/widget");
@@ -5957,7 +5965,7 @@ fn metadata_nil_value_deleted() {
     let input =
         b"METADATA \"INBOX\" (\"/private/comment\" NIL \"/shared/comment\" \"present\")\r\n";
     let (_, resp) =
-        parse_untagged_metadata(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_metadata(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Metadata { entries, .. } = resp {
         assert_eq!(entries.len(), 2);
         assert!(entries[0].value.is_none());
@@ -5972,7 +5980,7 @@ fn metadata_nil_value_deleted() {
 fn metadata_all_nil_values() {
     let input = b"METADATA \"INBOX\" (\"/private/comment\" NIL \"/shared/comment\" NIL)\r\n";
     let (_, resp) =
-        parse_untagged_metadata(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_metadata(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Metadata { entries, .. } = resp {
         assert_eq!(entries.len(), 2);
         assert!(entries[0].value.is_none());
@@ -5987,7 +5995,7 @@ fn metadata_all_nil_values() {
 fn metadata_empty_list_standalone() {
     let input = b"METADATA \"Archive\" ()\r\n";
     let (_, resp) =
-        parse_untagged_metadata(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_metadata(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Metadata { mailbox, entries } = resp {
         assert_eq!(mailbox.as_str(), "Archive");
         assert!(entries.is_empty());
@@ -6003,7 +6011,7 @@ fn metadata_truncated_input() {
     assert!(
         parse_untagged_metadata(
             b"METADATA \"INBOX\" (\"/private/comment\" \"val\"\r\n",
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
         )
         .is_err()
     );
@@ -6011,7 +6019,7 @@ fn metadata_truncated_input() {
     assert!(
         parse_untagged_metadata(
             b"METADATA \"INBOX\" (\"/private/comment\" \"val\")",
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
         )
         .is_err()
     );
@@ -6019,7 +6027,7 @@ fn metadata_truncated_input() {
     assert!(
         parse_untagged_metadata(
             b"METADATA \"INBOX\" (\"/private/comment\"",
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
         )
         .is_err()
     );
@@ -6031,7 +6039,7 @@ fn metadata_garbage_data() {
     assert!(
         parse_untagged_metadata(
             b"METADATA !!!GARBAGE\r\n",
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
         )
         .is_err()
     );
@@ -6875,8 +6883,8 @@ fn esearch_unknown_key_skipped_stress() {
     if let Response::Untagged(boxed) = resp
         && let UntaggedResponse::Esearch(esearch) = *boxed
     {
-        assert!(esearch.all.is_empty(), "unknown key should be skipped");
-        assert!(esearch.uid);
+        assert!(esearch.all().is_empty(), "unknown key should be skipped");
+        assert!(esearch.is_uid());
         return;
     }
     panic!("expected Esearch response");
@@ -7144,7 +7152,7 @@ fn envelope_utf8_mode_subject_passthrough() {
             ((\"Sender\" NIL \"s\" \"x.com\")) \
             ((\"To\" NIL \"t\" \"x.com\")) \
             NIL NIL NIL \"<id@x.com>\")";
-    let (_, env) = envelope(input, crate::codec::utf7::WireMode::Utf8).unwrap();
+    let (_, env) = envelope(input, crate::types::wire::WireMode::Utf8).unwrap();
     // In utf8_mode the raw string is preserved, not decoded
     assert_eq!(env.subject.as_deref(), Some("=?UTF-8?B?QWxpY2U=?="));
 }
@@ -7158,7 +7166,7 @@ fn envelope_non_utf8_mode_subject_decoded() {
             ((\"Sender\" NIL \"s\" \"x.com\")) \
             ((\"To\" NIL \"t\" \"x.com\")) \
             NIL NIL NIL \"<id@x.com>\")";
-    let (_, env) = envelope(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, env) = envelope(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(env.subject.as_deref(), Some("Alice"));
 }
 
@@ -7167,7 +7175,7 @@ fn envelope_non_utf8_mode_subject_decoded() {
 fn address_utf8_mode_name_passthrough() {
     let (_, addr) = address(
         b"(\"=?UTF-8?B?QWxpY2U=?=\" NIL \"alice\" \"example.com\")",
-        crate::codec::utf7::WireMode::Utf8,
+        crate::types::wire::WireMode::Utf8,
     )
     .unwrap();
     // In utf8_mode the raw string is preserved
@@ -7179,7 +7187,7 @@ fn address_utf8_mode_name_passthrough() {
 fn address_non_utf8_mode_name_decoded() {
     let (_, addr) = address(
         b"(\"=?UTF-8?B?QWxpY2U=?=\" NIL \"alice\" \"example.com\")",
-        crate::codec::utf7::WireMode::ModifiedUtf7,
+        crate::types::wire::WireMode::ModifiedUtf7,
     )
     .unwrap();
     assert_eq!(addr.name.as_deref(), Some("Alice"));
@@ -7191,7 +7199,7 @@ fn address_utf8_mode_raw_utf8_name() {
     // Raw UTF-8 name: "日本太郎"
     let raw_name = "日本太郎";
     let input = format!("(\"{raw_name}\" NIL \"taro\" \"example.jp\")");
-    let (_, addr) = address(input.as_bytes(), crate::codec::utf7::WireMode::Utf8).unwrap();
+    let (_, addr) = address(input.as_bytes(), crate::types::wire::WireMode::Utf8).unwrap();
     assert_eq!(addr.name.as_deref(), Some("日本太郎"));
 }
 
@@ -7204,7 +7212,7 @@ fn parse_response_utf8_fetch_envelope() {
             ((\"=?UTF-8?B?QWxpY2U=?=\" NIL \"a\" \"x.com\")) \
             NIL NIL NIL NIL \"<id@x.com>\"))\r\n";
     // utf8_mode=true: no RFC 2047 decoding
-    let (_, resp) = parse_response_utf8(input, crate::codec::utf7::WireMode::Utf8).unwrap();
+    let (_, resp) = parse_response_utf8(input, crate::types::wire::WireMode::Utf8).unwrap();
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Fetch(fr) = *u {
             let env = fr.envelope.unwrap();
@@ -7226,7 +7234,7 @@ fn parse_response_utf8_false_decodes_rfc2047() {
             ((\"=?UTF-8?B?QWxpY2U=?=\" NIL \"a\" \"x.com\")) \
             ((\"=?UTF-8?B?QWxpY2U=?=\" NIL \"a\" \"x.com\")) \
             NIL NIL NIL NIL \"<id@x.com>\"))\r\n";
-    let (_, resp) = parse_response_utf8(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, resp) = parse_response_utf8(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Fetch(fr) = *u {
             let env = fr.envelope.unwrap();
@@ -7250,7 +7258,7 @@ fn fetch_literal8_body_section() {
         std::str::from_utf8(body).unwrap()
     );
     let (_, fr) =
-        fetch_response_inner(input.as_bytes(), crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        fetch_response_inner(input.as_bytes(), crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.body_sections.len(), 1);
     assert_eq!(fr.body_sections[0].data.as_deref(), Some(&body[..]));
 }
@@ -7268,7 +7276,7 @@ fn fetch_envelope_literal8_subject() {
             NIL NIL NIL NIL \"<id@x.com>\"))"
     );
     let (_, fr) =
-        fetch_response_inner(input.as_bytes(), crate::codec::utf7::WireMode::Utf8).unwrap();
+        fetch_response_inner(input.as_bytes(), crate::types::wire::WireMode::Utf8).unwrap();
     let env = fr.envelope.unwrap();
     assert_eq!(env.subject.as_deref(), Some("テスト件名"));
 }
@@ -7281,7 +7289,7 @@ fn fetch_envelope_literal8_subject() {
 #[test]
 fn address_list_accepts_empty_parens() {
     // "()"  -  accepted per Postel's law even though RFC 3501 requires 1*address
-    let (rest, addrs) = address_list(b"()", crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (rest, addrs) = address_list(b"()", crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(rest.is_empty());
     assert!(addrs.is_empty());
 }
@@ -7289,7 +7297,7 @@ fn address_list_accepts_empty_parens() {
 #[test]
 fn address_list_accepts_nil() {
     // NIL is the valid way to express "no addresses"
-    let (rest, addrs) = address_list(b"NIL", crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (rest, addrs) = address_list(b"NIL", crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(rest.is_empty());
     assert!(addrs.is_empty());
 }
@@ -7328,7 +7336,7 @@ fn esearch_min_accepts_one() {
 fn list_delimiter_multibyte_utf8() {
     // "÷" is U+00F7, encoded as [0xC3, 0xB7] in UTF-8
     let input = b"LIST (\\HasNoChildren) \"\xC3\xB7\" INBOX\r\n";
-    let (_, resp) = parse_untagged_list(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, resp) = parse_untagged_list(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::List(info) = resp {
         assert_eq!(
             info.delimiter,
@@ -7348,7 +7356,7 @@ fn list_delimiter_multibyte_utf8() {
 #[test]
 fn list_delimiter_single_char_valid() {
     let input = b"LIST () \"/\" INBOX\r\n";
-    let (_, resp) = parse_untagged_list(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, resp) = parse_untagged_list(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::List(info) = resp {
         assert_eq!(info.delimiter, Some('/'));
     } else {
@@ -7360,7 +7368,7 @@ fn list_delimiter_single_char_valid() {
 #[test]
 fn list_delimiter_nil_valid() {
     let input = b"LIST () NIL INBOX\r\n";
-    let (_, resp) = parse_untagged_list(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, resp) = parse_untagged_list(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::List(info) = resp {
         assert_eq!(info.delimiter, None);
     } else {
@@ -7374,7 +7382,7 @@ fn list_delimiter_nil_valid() {
 #[test]
 fn list_delimiter_multi_char_tolerant() {
     let input = b"LIST () \"//\" INBOX\r\n";
-    let (_, resp) = parse_untagged_list(input, crate::codec::utf7::WireMode::ModifiedUtf7).expect(
+    let (_, resp) = parse_untagged_list(input, crate::types::wire::WireMode::ModifiedUtf7).expect(
         "multi-character delimiter must be tolerated per Postel's law \
              (RFC 3501 Section 9): take the first char, not a hard error",
     );
@@ -7423,7 +7431,7 @@ fn tagged_response_rejects_bare_plus_tag() {
 #[test]
 fn list_with_oldname_extended_data() {
     let input = b"LIST () \"/\" \"NewMailbox\" (\"OLDNAME\" (\"OldMailbox\"))\r\n";
-    let result = parse_untagged_list(input, crate::codec::utf7::WireMode::ModifiedUtf7);
+    let result = parse_untagged_list(input, crate::types::wire::WireMode::ModifiedUtf7);
     assert!(
         result.is_ok(),
         "LIST with OLDNAME extended data should parse successfully \
@@ -7442,7 +7450,7 @@ fn list_with_oldname_extended_data() {
 #[test]
 fn list_with_childinfo_extended_data() {
     let input = b"LIST (\\HasChildren) \"/\" \"INBOX\" (\"CHILDINFO\" (\"SUBSCRIBED\"))\r\n";
-    let result = parse_untagged_list(input, crate::codec::utf7::WireMode::ModifiedUtf7);
+    let result = parse_untagged_list(input, crate::types::wire::WireMode::ModifiedUtf7);
     assert!(
         result.is_ok(),
         "LIST with CHILDINFO extended data should parse successfully \
@@ -7468,7 +7476,11 @@ fn search_with_modseq_trailing() {
     );
     let (_, resp) = result.unwrap();
     if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Search { uids, mod_seq } = *u {
+        if let UntaggedResponse::Search {
+            numbers: uids,
+            mod_seq,
+        } = *u
+        {
             assert_eq!(uids, vec![2, 5, 6, 7, 11, 12, 18, 19, 20, 23]);
             assert_eq!(
                 mod_seq,
@@ -7493,7 +7505,11 @@ fn search_modseq_rejects_zero() {
     let (_, resp) = parse_response(input)
         .expect("SEARCH with MODSEQ 0 must still parse  -  UIDs must be preserved");
     if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Search { uids, mod_seq } = &*u {
+        if let UntaggedResponse::Search {
+            numbers: uids,
+            mod_seq,
+        } = &*u
+        {
             assert_eq!(*uids, vec![1, 5], "UIDs must be preserved");
             assert_eq!(
                 *mod_seq, None,
@@ -7513,7 +7529,11 @@ fn search_modseq_accepts_one() {
     let input = b"* SEARCH 1 5 (MODSEQ 1)\r\n";
     let (_, resp) = parse_response(input).unwrap();
     if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Search { uids, mod_seq } = *u {
+        if let UntaggedResponse::Search {
+            numbers: uids,
+            mod_seq,
+        } = *u
+        {
             assert_eq!(uids, vec![1, 5]);
             assert_eq!(
                 mod_seq,
@@ -7560,9 +7580,9 @@ fn spec_audit_esearch_all_accepts_wildcard() {
     assert!(rem.is_empty());
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(es) = &*u {
-            assert_eq!(es.all.len(), 1);
-            assert_eq!(es.all[0].start(), 1);
-            assert_eq!(es.all[0].end_bound(), Some(crate::types::SeqBound::Star));
+            assert_eq!(es.all().len(), 1);
+            assert_eq!(es.all()[0].start(), 1);
+            assert_eq!(es.all()[0].end_bound(), Some(crate::types::SeqBound::Star));
         } else {
             panic!("Expected Esearch, got {u:?}");
         }
@@ -7592,7 +7612,7 @@ fn esearch_uid_keyword_boundary() {
     let (_, resp) = result.unwrap();
     if let UntaggedResponse::Esearch(es) = resp {
         assert!(
-            !es.uid,
+            !es.is_uid(),
             "uid must be false when the atom is 'UIDFOO', not 'UID'"
         );
         assert_eq!(
@@ -7614,7 +7634,7 @@ fn esearch_uid_keyword_boundary() {
 fn namespace_nested_extension_data() {
     // Extension data with nested parens: "X-PARAM" ("FLAG1" "FLAG2")
     let input = b"NAMESPACE ((\"\" \"/\" \"X-PARAM\" (\"FLAG1\" \"FLAG2\"))) NIL NIL\r\n";
-    let result = parse_untagged_namespace(input, crate::codec::utf7::WireMode::ModifiedUtf7);
+    let result = parse_untagged_namespace(input, crate::types::wire::WireMode::ModifiedUtf7);
     assert!(
         result.is_ok(),
         "NAMESPACE with nested extension parens should parse per RFC 2342, \
@@ -7642,7 +7662,7 @@ fn namespace_nested_extension_data() {
 fn namespace_multiple_descriptors_nested_ext() {
     let input =
         b"NAMESPACE ((\"\" \"/\")(\"#mh/\" \"/\" \"X-PARAM\" (\"FLAG1\" \"FLAG2\"))) NIL NIL\r\n";
-    let result = parse_untagged_namespace(input, crate::codec::utf7::WireMode::ModifiedUtf7);
+    let result = parse_untagged_namespace(input, crate::types::wire::WireMode::ModifiedUtf7);
     assert!(
         result.is_ok(),
         "NAMESPACE with multiple descriptors and nested extensions should parse, \
@@ -7667,7 +7687,7 @@ fn namespace_multiple_descriptors_nested_ext() {
 fn namespace_extension_data_preserved() {
     let input = b"NAMESPACE ((\"\" \"/\" \"TRANSLATION\" (\"strstrumpf\"))) NIL NIL\r\n";
     let (_, resp) =
-        parse_untagged_namespace(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_namespace(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Namespace {
         personal,
         other,
@@ -7693,7 +7713,7 @@ fn namespace_extension_data_preserved() {
 fn namespace_multiple_extensions_preserved() {
     let input = b"NAMESPACE ((\"\" \"/\" \"TRANSLATION\" (\"strstrumpf\") \"X-PARAM\" (\"FLAG1\" \"FLAG2\"))) NIL NIL\r\n";
     let (_, resp) =
-        parse_untagged_namespace(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_namespace(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Namespace { personal, .. } = resp {
         assert_eq!(personal.len(), 1);
         assert_eq!(personal[0].extensions.len(), 2);
@@ -7718,7 +7738,7 @@ fn namespace_multiple_extensions_preserved() {
 fn namespace_no_extension_data_empty_vec() {
     let input = b"NAMESPACE ((\"\" \"/\")) NIL NIL\r\n";
     let (_, resp) =
-        parse_untagged_namespace(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_namespace(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Namespace { personal, .. } = resp {
         assert_eq!(personal.len(), 1);
         assert!(personal[0].extensions.is_empty());
@@ -7769,7 +7789,11 @@ fn search_accepts_zero_in_results() {
     let input = b"* SEARCH 1 0 5\r\n";
     let (_, resp) = parse_response(input).unwrap();
     if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Search { uids, mod_seq } = &*u {
+        if let UntaggedResponse::Search {
+            numbers: uids,
+            mod_seq,
+        } = &*u
+        {
             assert_eq!(
                 *uids,
                 vec![1, 5],
@@ -7790,7 +7814,7 @@ fn search_empty_results_still_works() {
     let (_, resp) = parse_response(input).unwrap();
     // empty SEARCH is fine (many0 accepts zero results)
     if let Response::Untagged(boxed) = resp
-        && let UntaggedResponse::Search { uids, .. } = *boxed
+        && let UntaggedResponse::Search { numbers: uids, .. } = *boxed
     {
         assert!(uids.is_empty());
         return;
@@ -8109,7 +8133,7 @@ fn response_code_copyuid_zero_uidvalidity_accepted() {
     // is accepted (non-conformant servers may send it).
     let (_, code) = response_code(b"[COPYUID 0 1:5 10:14]")
         .expect("COPYUID with uidvalidity 0 must be accepted");
-    if let ResponseCode::CopyUid { uid_validity, .. } = &code {
+    if let ResponseCode::CopyUid(crate::types::response::CopyUid { uid_validity, .. }) = &code {
         assert_eq!(*uid_validity, 0);
     } else {
         panic!("expected CopyUid, got {code:?}");
@@ -9309,7 +9333,7 @@ fn audit_m1_esearch_tag_string_accepts_astring() {
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(e) = &*u {
             assert_eq!(e.tag.as_deref(), Some("A001"));
-            assert!(e.uid);
+            assert!(e.is_uid());
             assert_eq!(e.count, Some(5));
         } else {
             panic!("expected Esearch, got {u:?}");
@@ -9324,7 +9348,7 @@ fn audit_m1_esearch_tag_string_accepts_astring() {
 #[test]
 fn audit_m2_threadid_mixed_case_nil() {
     let input = b"(THREADID Nil UID 42)";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(fr.thread_id.is_none(), "THREADID Nil should parse as None");
     assert_eq!(fr.uid, Some(42));
 }
@@ -9348,7 +9372,7 @@ fn threadid_nil_requires_token_boundary() {
     // not start with "(". The overall parse must therefore error.
     let input = b"(UID 5 THREADID NIL2 42)";
     assert!(
-        fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).is_err(),
+        fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).is_err(),
         "THREADID NIL2 must not be parsed as THREADID NIL: \
              'NIL2' is not the NIL token (RFC 8474 Section 4, RFC 3501 Section 9)"
     );
@@ -9359,7 +9383,7 @@ fn threadid_nil_requires_token_boundary() {
 #[test]
 fn threadid_nil_followed_by_sp_attr() {
     let input = b"(THREADID NIL UID 42)";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(fr.thread_id.is_none(), "THREADID NIL should parse as None");
     assert_eq!(fr.uid, Some(42));
 }
@@ -9369,7 +9393,7 @@ fn threadid_nil_followed_by_sp_attr() {
 #[test]
 fn threadid_nil_at_end_of_fetch() {
     let input = b"(UID 5 THREADID NIL)";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.uid, Some(5));
     assert!(fr.thread_id.is_none());
 }
@@ -9448,7 +9472,7 @@ fn audit_l6_fetch_modseq_accepts_zero() {
     // we accept 0 per Postel's law (RFC 1122 Section 1.2.2) for
     // consistency with the STATUS HIGHESTMODSEQ parser.
     let input = b"(UID 1 MODSEQ (0))";
-    let result = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7);
+    let result = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7);
     let (_, fr) = result.expect("FETCH with MODSEQ (0) must parse  -  0 accepted per Postel's law");
     assert_eq!(
         fr.mod_seq.map(crate::types::ModSeqValzer::get),
@@ -9536,7 +9560,7 @@ fn audit_l11_logindisabled_capability_variant() {
 #[test]
 fn audit_l13_emailid_nil_rejected() {
     let input = b"(EMAILID NIL UID 42)";
-    let result = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7);
+    let result = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7);
     assert!(
         result.is_err(),
         "EMAILID NIL must be rejected per RFC 8474 Section 7: \
@@ -9635,7 +9659,7 @@ fn message_global_subtype() {
     let input = b"(\"MESSAGE\" \"GLOBAL\" (\"charset\" \"utf-8\") NIL NIL \"7BIT\" 500 \
             (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) \
             (\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 100 5) 20)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Message {
         media_subtype,
         size,
@@ -9745,7 +9769,10 @@ fn spec_audit_search_modseq_case_insensitive() {
     let (_, resp) = parse_response(input).unwrap();
     match resp {
         Response::Untagged(u) => match *u {
-            UntaggedResponse::Search { uids, mod_seq } => {
+            UntaggedResponse::Search {
+                numbers: uids,
+                mod_seq,
+            } => {
                 assert_eq!(uids, vec![2, 5]);
                 assert_eq!(
                     mod_seq,
@@ -10190,7 +10217,7 @@ fn spec_audit_param_names_lowercased() {
 #[test]
 fn fetch_flags_must_exclude_wildcard() {
     let input = b"(FLAGS (\\Seen \\*))";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     let flags = fr.flags.expect("flags must be present");
     assert!(
         !flags.contains(&Flag::Wildcard),
@@ -10447,7 +10474,7 @@ fn body_section_header_fields_literal() {
 fn body_section_quoted_bracket_in_header_field_name() {
     // The `]` inside the quoted string `"X]Field"` is not the section closer.
     let input = b"(BODY[HEADER.FIELDS (\"X]Field\")] \"data\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7)
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7)
         .expect("should parse HEADER.FIELDS with quoted ] in field name");
     assert_eq!(fr.body_sections.len(), 1);
     assert_eq!(fr.body_sections[0].section, "HEADER.FIELDS (\"X]Field\")");
@@ -10458,7 +10485,7 @@ fn body_section_quoted_bracket_in_header_field_name() {
 #[test]
 fn body_section_mime() {
     let input = b"(BODY[1.MIME] \"Content-Type: text/plain\")";
-    let (_, fr) = fetch_response_inner(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, fr) = fetch_response_inner(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(fr.body_sections.len(), 1);
     assert_eq!(fr.body_sections[0].section, "1.MIME");
     assert_eq!(
@@ -10682,7 +10709,11 @@ fn regression_search_modseq_zero_preserves_uids() {
     let (_, resp) = parse_response(input)
         .expect("SEARCH with malformed MODSEQ must still parse  -  UIDs must not be silently lost");
     if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Search { uids, mod_seq } = &*u {
+        if let UntaggedResponse::Search {
+            numbers: uids,
+            mod_seq,
+        } = &*u
+        {
             assert_eq!(
                 *uids,
                 vec![1, 5, 10],
@@ -10775,7 +10806,11 @@ fn regression_search_modseq_overflow_preserves_uids() {
     let input = b"* SEARCH 42 (MODSEQ 9223372036854775808)\r\n";
     let (_, resp) = parse_response(input).expect("SEARCH with overflowing MODSEQ must still parse");
     if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Search { uids, mod_seq } = &*u {
+        if let UntaggedResponse::Search {
+            numbers: uids,
+            mod_seq,
+        } = &*u
+        {
             assert_eq!(*uids, vec![42]);
             assert_eq!(*mod_seq, None);
         } else {
@@ -10798,7 +10833,7 @@ fn regression_esearch_modseq_zero_preserves_results() {
         if let UntaggedResponse::Esearch(esearch) = &*u {
             assert_eq!(esearch.count, Some(5), "COUNT must be preserved");
             assert_eq!(
-                esearch.all,
+                esearch.all(),
                 vec![
                     UidRange::range(1, 3),
                     UidRange::single(7),
@@ -10806,7 +10841,7 @@ fn regression_esearch_modseq_zero_preserves_results() {
                 ],
                 "ALL must be preserved"
             );
-            assert!(esearch.uid, "UID indicator must be preserved");
+            assert!(esearch.is_uid(), "UID indicator must be preserved");
             assert_eq!(esearch.tag.as_deref(), Some("A1"), "TAG must be preserved");
         } else {
             panic!(
@@ -10828,8 +10863,8 @@ fn regression_esearch_modseq_overflow_preserves_results() {
         parse_response(input).expect("ESEARCH with overflowing MODSEQ must still parse");
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(esearch) = &*u {
-            assert_eq!(esearch.min, Some(1), "MIN must be preserved");
-            assert_eq!(esearch.max, Some(100), "MAX must be preserved");
+            assert_eq!(esearch.min(), Some(1), "MIN must be preserved");
+            assert_eq!(esearch.max(), Some(100), "MAX must be preserved");
         } else {
             panic!("expected Esearch, got {u:?}");
         }
@@ -10852,7 +10887,7 @@ fn regression_esearch_modseq_missing_space_preserves_results() {
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Esearch(esearch) = &*u {
             assert_eq!(esearch.count, Some(5), "COUNT must be preserved");
-            assert!(esearch.uid, "UID indicator must be preserved");
+            assert!(esearch.is_uid(), "UID indicator must be preserved");
             assert_eq!(esearch.tag.as_deref(), Some("A1"), "TAG must be preserved");
             assert_eq!(
                 esearch.mod_seq.map(crate::types::ModSeq::get),
@@ -11019,7 +11054,7 @@ fn bodystructure_multipart_trailing_space() {
 fn bodystructure_1part_all_four_ext_fields() {
     // text/plain with md5="abc123", disposition=inline, language=("en"), location="http://example.com"
     let input = b"(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 100 5 \"abc123\" (\"inline\" NIL) \"en\" \"http://example.com\")";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Text {
         md5,
         disposition,
@@ -11046,7 +11081,7 @@ fn bodystructure_mpart_all_four_ext_fields() {
     // multipart/mixed with params=(BOUNDARY "----=_Part"), disposition=inline,
     // language=("en" "fr"), location="http://example.com"
     let input = b"((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 50 3)(\"TEXT\" \"HTML\" NIL NIL NIL \"7BIT\" 80 4) \"MIXED\" (\"BOUNDARY\" \"----=_Part\") (\"inline\" NIL) (\"en\" \"fr\") \"http://example.com\")";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Multipart {
         media_subtype,
         params,
@@ -11172,7 +11207,7 @@ fn bodystructure_description_rfc2047_decoded() {
     // "Hello" encoded as RFC 2047 Base64 in UTF-8
     let input =
         b"(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL \"=?UTF-8?B?SGVsbG8=?=\" \"7BIT\" 100 5)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Text { description, .. } = &bs {
         assert_eq!(
             description.as_deref(),
@@ -11185,7 +11220,7 @@ fn bodystructure_description_rfc2047_decoded() {
 
     // Also test Basic body type (e.g., image/png)
     let input = b"(\"IMAGE\" \"PNG\" NIL NIL \"=?UTF-8?Q?=C3=A9t=C3=A9?=\" \"BASE64\" 2048)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Basic { description, .. } = &bs {
         assert_eq!(
             description.as_deref(),
@@ -11207,7 +11242,7 @@ fn spec_audit_bodystructure_description_rfc2047_utf8_mode() {
     // RFC 2047 encoded "Hello"  -  must be decoded even in UTF8=ACCEPT mode
     let input =
         b"(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL \"=?UTF-8?B?SGVsbG8=?=\" \"7BIT\" 100 5)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::Utf8, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::Utf8, 0).unwrap();
     if let BodyStructure::Text { description, .. } = &bs {
         assert_eq!(
             description.as_deref(),
@@ -11222,7 +11257,7 @@ fn spec_audit_bodystructure_description_rfc2047_utf8_mode() {
 
     // Also test Basic body type with RFC 2047 Q-encoding
     let input = b"(\"IMAGE\" \"PNG\" NIL NIL \"=?UTF-8?Q?=C3=A9t=C3=A9?=\" \"BASE64\" 2048)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::Utf8, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::Utf8, 0).unwrap();
     if let BodyStructure::Basic { description, .. } = &bs {
         assert_eq!(
             description.as_deref(),
@@ -11237,7 +11272,7 @@ fn spec_audit_bodystructure_description_rfc2047_utf8_mode() {
     // passes through raw UTF-8 via String::from_utf8_lossy.
     let input =
         b"(\"TEXT\" \"HTML\" (\"CHARSET\" \"UTF-8\") NIL \"\xc3\xa9t\xc3\xa9\" \"7BIT\" 50 2)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::Utf8, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::Utf8, 0).unwrap();
     if let BodyStructure::Text { description, .. } = &bs {
         assert_eq!(
             description.as_deref(),
@@ -11259,7 +11294,7 @@ fn spec_audit_bodystructure_description_rfc2047_utf8_mode() {
 fn spec_audit_address_list_empty_parens() {
     // "()" should parse as an empty address list per Postel's law (RFC 1122 Section1.2.2),
     // even though RFC 3501 Section9 formally requires 1*address in the parenthesized form.
-    let (rest, addrs) = address_list(b"()", crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (rest, addrs) = address_list(b"()", crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(rest.is_empty());
     assert!(
         addrs.is_empty(),
@@ -11318,7 +11353,7 @@ fn regression_esearch_unknown_key_quoted_string_value() {
                 Some(5),
                 "COUNT must be parsed after skipping unknown quoted-string value"
             );
-            assert!(esearch.uid);
+            assert!(esearch.is_uid());
         } else {
             panic!("expected Esearch, got {u:?}");
         }
@@ -11340,7 +11375,7 @@ fn regression_esearch_unknown_key_literal_value() {
                 Some(3),
                 "COUNT must be parsed after skipping unknown literal value"
             );
-            assert!(esearch.uid);
+            assert!(esearch.is_uid());
         } else {
             panic!("expected Esearch, got {u:?}");
         }
@@ -11874,7 +11909,7 @@ fn status_deleted_storage() {
 fn status_deleted_storage_with_other_items() {
     let input = b"STATUS \"INBOX\" (MESSAGES 10 DELETED-STORAGE 512)\r\n";
     let (_, resp) =
-        parse_untagged_status_mailbox(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_status_mailbox(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::MailboxStatus { mailbox, items } = resp {
         assert_eq!(mailbox.as_str(), "INBOX");
         assert_eq!(items.len(), 2);
@@ -11902,7 +11937,7 @@ fn namespace_descriptor_nil_delimiter() {
     // Namespace with NIL delimiter (flat namespace, no hierarchy)
     let input = b"NAMESPACE ((\"\" NIL)) NIL NIL\r\n";
     let (_, resp) =
-        parse_untagged_namespace(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_namespace(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Namespace { personal, .. } = resp {
         assert_eq!(personal.len(), 1);
         assert_eq!(personal[0].prefix, "");
@@ -11918,7 +11953,7 @@ fn namespace_descriptor_nil_delimiter() {
 fn namespace_descriptor_empty_string_delimiter() {
     let input = b"NAMESPACE ((\"\" \"\")) NIL NIL\r\n";
     let (_, resp) =
-        parse_untagged_namespace(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_namespace(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     if let UntaggedResponse::Namespace { personal, .. } = resp {
         assert_eq!(personal.len(), 1);
         assert_eq!(personal[0].delimiter, None);
@@ -11938,7 +11973,7 @@ fn envelope_nil_in_reply_to_and_message_id() {
             ((\"B\" NIL \"b\" \"y.com\")) \
             NIL NIL \
             NIL NIL)";
-    let (_, env) = envelope(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, env) = envelope(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(env.in_reply_to.is_none(), "in-reply-to NIL must be None");
     assert!(env.message_id.is_none(), "message-id NIL must be None");
     assert!(env.cc.is_empty(), "cc NIL must be empty Vec");
@@ -11949,7 +11984,7 @@ fn envelope_nil_in_reply_to_and_message_id() {
 #[test]
 fn envelope_all_address_lists_nil() {
     let input = b"(NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)";
-    let (_, env) = envelope(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, env) = envelope(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(env.date.is_none());
     assert!(env.subject.is_none());
     assert!(env.from.is_empty());
@@ -11980,7 +12015,7 @@ fn esearch_trailing_space_tolerated() {
         .expect("ESEARCH with trailing space must parse (Postel's law)");
     if let UntaggedResponse::Esearch(esearch) = resp {
         assert_eq!(esearch.tag.as_deref(), Some("A001"));
-        assert!(esearch.uid);
+        assert!(esearch.is_uid());
         assert_eq!(esearch.count, Some(3));
     } else {
         panic!("expected Esearch, got {resp:?}");
@@ -11997,10 +12032,10 @@ fn esearch_no_result_data_immediate_crlf() {
     if let Response::Untagged(boxed) = resp
         && let UntaggedResponse::Esearch(esearch) = *boxed
     {
-        assert!(esearch.uid);
-        assert!(esearch.all.is_empty());
-        assert_eq!(esearch.min, None);
-        assert_eq!(esearch.max, None);
+        assert!(esearch.is_uid());
+        assert!(esearch.all().is_empty());
+        assert_eq!(esearch.min(), None);
+        assert_eq!(esearch.max(), None);
         assert_eq!(esearch.count, None);
         return;
     }
@@ -12017,7 +12052,7 @@ fn quotaroot_trailing_space_tolerated_per_postels_law() {
     // (RFC 1122 Section 1.2.2). The parser strips trailing whitespace
     // before CRLF, matching the pattern used by CAPABILITY, FLAGS, etc.
     let input = b"QUOTAROOT INBOX \"\" \r\n";
-    let result = parse_untagged_quotaroot(input, crate::codec::utf7::WireMode::ModifiedUtf7);
+    let result = parse_untagged_quotaroot(input, crate::types::wire::WireMode::ModifiedUtf7);
     assert!(
         result.is_ok(),
         "trailing space after last root should be tolerated (Postel's law); \
@@ -12168,7 +12203,11 @@ fn search_zero_in_results_filtered() {
     let input = b"* SEARCH 1 0 3\r\n";
     let (_, resp) = parse_response(input).unwrap();
     if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Search { uids, mod_seq } = &*u {
+        if let UntaggedResponse::Search {
+            numbers: uids,
+            mod_seq,
+        } = &*u
+        {
             assert_eq!(
                 *uids,
                 vec![1, 3],
@@ -12274,7 +12313,7 @@ fn edge_bodystructure_empty_parens_params() {
 /// canonical encoding for the ampersand character.
 #[test]
 fn edge_utf7_escaped_ampersand() {
-    use crate::codec::utf7::{decode_utf7, encode_utf7};
+    use crate::types::wire::{decode_utf7, encode_utf7};
 
     // &- must decode to &
     assert_eq!(
@@ -12314,7 +12353,7 @@ fn edge_envelope_nil_date_valid_subject() {
             NIL NIL \
             ((\"Bob\" NIL \"bob\" \"example.com\")) \
             NIL NIL NIL NIL)";
-    let (_, env) = envelope(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, env) = envelope(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(env.date.is_none(), "NIL date must be None");
     assert_eq!(env.subject.as_deref(), Some("Draft subject"));
     assert_eq!(env.from.len(), 1);
@@ -12330,7 +12369,7 @@ fn edge_bodystructure_message_rfc822_nested() {
             (NIL \"Inner subject\" ((\"Inner\" NIL \"inner\" \"ex.com\")) NIL NIL NIL NIL NIL NIL NIL) \
             ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 100 5)(\"IMAGE\" \"PNG\" NIL NIL NIL \"BASE64\" 200) \"MIXED\") \
             20)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Message {
         media_subtype,
         envelope: env,
@@ -12364,7 +12403,7 @@ fn edge_envelope_q_encoded_subject_underscore() {
     let input = b"(NIL \"=?UTF-8?Q?hello_world?=\" \
             ((\"Test\" NIL \"test\" \"ex.com\")) \
             NIL NIL NIL NIL NIL NIL NIL)";
-    let (_, env) = envelope(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, env) = envelope(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(
         env.subject.as_deref(),
         Some("hello world"),
@@ -12392,7 +12431,7 @@ fn envelope_nil_sender_reply_to_defaults_to_from() {
             ((\"Bob\" NIL \"bob\" \"example.com\")) \
             NIL NIL NIL \
             \"<msg@example.com>\")";
-    let (_, env) = envelope(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, env) = envelope(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(env.from.len(), 1);
     // RFC 3501 Section 7.4.2: sender defaults to from when NIL
     assert_eq!(
@@ -12411,7 +12450,7 @@ fn envelope_nil_sender_reply_to_defaults_to_from() {
 #[test]
 fn envelope_nil_sender_reply_to_stays_empty_when_from_nil() {
     let input = b"(NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)";
-    let (_, env) = envelope(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, env) = envelope(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(env.from.is_empty());
     assert!(
         env.sender.is_empty(),
@@ -12434,7 +12473,7 @@ fn envelope_explicit_sender_reply_to_not_overridden() {
             ((\"Bob\" NIL \"bob\" \"example.com\")) \
             NIL NIL NIL \
             \"<msg@example.com>\")";
-    let (_, env) = envelope(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, env) = envelope(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert_eq!(env.sender.len(), 1);
     assert_eq!(env.sender[0].mailbox.as_deref(), Some("secretary"));
     assert_eq!(env.reply_to.len(), 1);
@@ -12541,7 +12580,7 @@ fn trailing_whitespace_id() {
 fn trailing_whitespace_namespace() {
     let input = b"NAMESPACE ((\"\" \"/\")) NIL NIL  \r\n";
     let (_, resp) =
-        parse_untagged_namespace(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_namespace(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(matches!(resp, UntaggedResponse::Namespace { .. }));
 }
 
@@ -12558,7 +12597,7 @@ fn trailing_whitespace_quota() {
 fn trailing_whitespace_quotaroot() {
     let input = b"QUOTAROOT INBOX root1  \r\n";
     let (_, resp) =
-        parse_untagged_quotaroot(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_quotaroot(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(matches!(resp, UntaggedResponse::QuotaRoot { .. }));
 }
 
@@ -12566,7 +12605,7 @@ fn trailing_whitespace_quotaroot() {
 #[test]
 fn trailing_whitespace_acl() {
     let input = b"ACL INBOX alice lrs  \r\n";
-    let (_, resp) = parse_untagged_acl(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+    let (_, resp) = parse_untagged_acl(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(matches!(resp, UntaggedResponse::Acl { .. }));
 }
 
@@ -12575,7 +12614,7 @@ fn trailing_whitespace_acl() {
 fn trailing_whitespace_myrights() {
     let input = b"MYRIGHTS INBOX lrs  \r\n";
     let (_, resp) =
-        parse_untagged_myrights(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_myrights(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(matches!(resp, UntaggedResponse::MyRights { .. }));
 }
 
@@ -12599,7 +12638,7 @@ fn regression_esearch_unknown_key_no_value() {
             Some(5),
             "COUNT must be preserved when trailing unknown key has no value"
         );
-        assert!(esearch.uid, "UID indicator must be preserved");
+        assert!(esearch.is_uid(), "UID indicator must be preserved");
         assert_eq!(esearch.tag.as_deref(), Some("t1"), "TAG must be preserved");
         return;
     }
@@ -12611,7 +12650,7 @@ fn regression_esearch_unknown_key_no_value() {
 fn trailing_whitespace_listrights() {
     let input = b"LISTRIGHTS INBOX fred lr s w  \r\n";
     let (_, resp) =
-        parse_untagged_listrights(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_listrights(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(matches!(resp, UntaggedResponse::ListRights { .. }));
 }
 
@@ -12620,7 +12659,7 @@ fn trailing_whitespace_listrights() {
 fn trailing_whitespace_metadata_form1() {
     let input = b"METADATA \"INBOX\" (/private/comment \"value\")  \r\n";
     let (_, resp) =
-        parse_untagged_metadata(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_metadata(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(matches!(resp, UntaggedResponse::Metadata { .. }));
 }
 
@@ -12629,7 +12668,7 @@ fn trailing_whitespace_metadata_form1() {
 fn trailing_whitespace_metadata_form2() {
     let input = b"METADATA \"INBOX\" /private/comment  \r\n";
     let (_, resp) =
-        parse_untagged_metadata(input, crate::codec::utf7::WireMode::ModifiedUtf7).unwrap();
+        parse_untagged_metadata(input, crate::types::wire::WireMode::ModifiedUtf7).unwrap();
     assert!(matches!(resp, UntaggedResponse::Metadata { .. }));
 }
 
@@ -12860,17 +12899,19 @@ fn edge_esearch_empty_uid_list() {
             Some("A001"),
             "TAG must be preserved"
         );
-        assert!(esearch.uid, "UID indicator must be true");
+        assert!(esearch.is_uid(), "UID indicator must be true");
         assert!(
-            esearch.all.is_empty(),
+            esearch.all().is_empty(),
             "ALL must be empty for an empty ESEARCH result"
         );
         assert_eq!(
-            esearch.min, None,
+            esearch.min(),
+            None,
             "MIN must be None for an empty ESEARCH result"
         );
         assert_eq!(
-            esearch.max, None,
+            esearch.max(),
+            None,
             "MAX must be None for an empty ESEARCH result"
         );
         assert_eq!(
@@ -13106,7 +13147,7 @@ fn bodystructure_fields_normalized_to_lowercase() {
     // Single-part text: media_subtype and encoding must be lowercase.
     let text_input = b"(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"BASE64\" 100 5)";
     let (_, bs) =
-        body_structure(text_input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+        body_structure(text_input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Text {
         media_subtype,
         encoding,
@@ -13128,7 +13169,7 @@ fn bodystructure_fields_normalized_to_lowercase() {
     // Basic part: media_type and media_subtype must be lowercase.
     let basic_input = b"(\"IMAGE\" \"PNG\" NIL NIL NIL \"BASE64\" 2048)";
     let (_, bs) =
-        body_structure(basic_input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+        body_structure(basic_input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Basic {
         media_type,
         media_subtype,
@@ -13155,7 +13196,7 @@ fn bodystructure_fields_normalized_to_lowercase() {
     // Multipart: media_subtype must be lowercase.
     let mpart_input = b"((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 50 3)(\"TEXT\" \"HTML\" NIL NIL NIL \"7BIT\" 80 4) \"MIXED\")";
     let (_, bs) =
-        body_structure(mpart_input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+        body_structure(mpart_input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Multipart { media_subtype, .. } = &bs {
         assert_eq!(
             media_subtype, "mixed",
@@ -13169,7 +13210,7 @@ fn bodystructure_fields_normalized_to_lowercase() {
     let msg_input = b"(\"MESSAGE\" \"RFC822\" NIL NIL NIL \"7BIT\" 500 \
             (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) \
             (\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 100 5) 20)";
-    let (_, bs) = body_structure(msg_input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(msg_input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Message { media_subtype, .. } = &bs {
         assert_eq!(
             media_subtype, "rfc822",
@@ -13264,7 +13305,7 @@ fn list_childinfo_double_space_between_items() {
 fn bodystructure_bare_atom_media_type() {
     // Bare atoms instead of quoted strings for media type, subtype, and encoding.
     let input = b"(TEXT PLAIN (\"CHARSET\" \"UTF-8\") NIL NIL 7BIT 42 3)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Text {
         media_subtype,
         encoding,
@@ -13286,7 +13327,7 @@ fn bodystructure_bare_atom_media_type() {
 #[test]
 fn bodystructure_bare_atom_basic_type() {
     let input = b"(IMAGE JPEG NIL NIL NIL BASE64 12345)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Basic {
         media_type,
         media_subtype,
@@ -13309,7 +13350,7 @@ fn bodystructure_bare_atom_basic_type() {
 fn bodystructure_bare_atom_multipart_subtype() {
     let input =
             b"((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 10 1)(\"TEXT\" \"HTML\" NIL NIL NIL \"7BIT\" 20 2) MIXED)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Multipart {
         media_subtype,
         bodies,
@@ -13343,7 +13384,7 @@ fn body_params_double_space_within_pair() {
 #[test]
 fn bodystructure_params_double_space_within_pair() {
     let input = b"(\"TEXT\" \"PLAIN\" (\"CHARSET\"  \"UTF-8\") NIL NIL \"7BIT\" 100 5)";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Text { params, .. } = &bs {
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].0, "charset");
@@ -13361,7 +13402,7 @@ fn bodystructure_params_double_space_within_pair() {
 fn bodystructure_mpart_multi_space_before_subtype() {
     // Two spaces between the child body closing paren and the subtype string.
     let input = b"((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 10 1)  \"MIXED\")";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Multipart {
         media_subtype,
         bodies,
@@ -13380,7 +13421,7 @@ fn bodystructure_mpart_multi_space_before_subtype() {
 #[test]
 fn bodystructure_mpart_tab_before_subtype() {
     let input = b"((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 10 1)\t\"MIXED\")";
-    let (_, bs) = body_structure(input, crate::codec::utf7::WireMode::ModifiedUtf7, 0).unwrap();
+    let (_, bs) = body_structure(input, crate::types::wire::WireMode::ModifiedUtf7, 0).unwrap();
     if let BodyStructure::Multipart {
         media_subtype,
         bodies,
@@ -13512,8 +13553,8 @@ mod prop_invariants {
         /// Parser never panics on arbitrary input (RFC 3501  -  Postel's law).
         #[test]
         fn parse_response_never_panics(data in prop::collection::vec(any::<u8>(), 0..500)) {
-            let _ = parse_response_utf8(&data, crate::codec::utf7::WireMode::ModifiedUtf7);
-            let _ = parse_response_utf8(&data, crate::codec::utf7::WireMode::Utf8);
+            let _ = parse_response_utf8(&data, crate::types::wire::WireMode::ModifiedUtf7);
+            let _ = parse_response_utf8(&data, crate::types::wire::WireMode::Utf8);
         }
 
         /// Parser never panics on greeting input.
@@ -13529,7 +13570,7 @@ mod prop_invariants {
         /// loops where the parser succeeds but consumes nothing.
         #[test]
         fn parse_response_consumes_bytes(data in prop::collection::vec(any::<u8>(), 1..500)) {
-            if let Ok((remaining, _)) = parse_response_utf8(&data, crate::codec::utf7::WireMode::ModifiedUtf7) {
+            if let Ok((remaining, _)) = parse_response_utf8(&data, crate::types::wire::WireMode::ModifiedUtf7) {
                 prop_assert!(
                     remaining.len() < data.len(),
                     "parser must consume at least one byte on success"
@@ -13543,8 +13584,8 @@ mod prop_invariants {
         /// response, all UIDs must be >= 1.
         #[test]
         fn search_uids_nonzero(data in prop::collection::vec(any::<u8>(), 0..500)) {
-            if let Ok((_, Response::Untagged(boxed))) = parse_response_utf8(&data, crate::codec::utf7::WireMode::ModifiedUtf7).as_ref()
-                && let UntaggedResponse::Search { uids, .. } = boxed.as_ref()
+            if let Ok((_, Response::Untagged(boxed))) = parse_response_utf8(&data, crate::types::wire::WireMode::ModifiedUtf7).as_ref()
+                && let UntaggedResponse::Search { numbers: uids, .. } = boxed.as_ref()
             {
                 for uid in uids {
                     prop_assert!(*uid >= 1, "UID must be >= 1 (RFC 3501 Section 9), got {}", uid);
@@ -13567,11 +13608,11 @@ mod prop_invariants {
         #[test]
         fn parse_response_does_not_overconsume(data in prop::collection::vec(any::<u8>(), 0..200)) {
             // Only test when the data alone produces a successful parse.
-            if let Ok((rest_alone, _)) = parse_response_utf8(&data, crate::codec::utf7::WireMode::ModifiedUtf7) {
+            if let Ok((rest_alone, _)) = parse_response_utf8(&data, crate::types::wire::WireMode::ModifiedUtf7) {
                 let sentinel = b"A001 OK done\r\n";
                 let mut combined = data.clone();
                 combined.extend_from_slice(sentinel);
-                if let Ok((remaining, _)) = parse_response_utf8(&combined, crate::codec::utf7::WireMode::ModifiedUtf7) {
+                if let Ok((remaining, _)) = parse_response_utf8(&combined, crate::types::wire::WireMode::ModifiedUtf7) {
                     // The parser should consume no more from `combined` than
                     // it consumed from `data` alone  -  so remaining must still
                     // include the full sentinel.
@@ -13828,7 +13869,7 @@ mod stuck_tests {
         // excessive backtracking or infinite loops.
         let data = vec![0xFFu8; 100_000];
         assert_terminates("100KB 0xFF", || {
-            let _ = parse_response_utf8(&data, crate::codec::utf7::WireMode::ModifiedUtf7);
+            let _ = parse_response_utf8(&data, crate::types::wire::WireMode::ModifiedUtf7);
         });
     }
 
@@ -13840,7 +13881,7 @@ mod stuck_tests {
         data.extend(vec![b'A'; 100_000]);
         data.extend(b"\r\n");
         assert_terminates("100KB untagged garbage", || {
-            let _ = parse_response_utf8(&data, crate::codec::utf7::WireMode::ModifiedUtf7);
+            let _ = parse_response_utf8(&data, crate::types::wire::WireMode::ModifiedUtf7);
         });
     }
 
@@ -13853,7 +13894,7 @@ mod stuck_tests {
         }
         data.extend(b")\r\n");
         assert_terminates("10K nested parens", || {
-            let _ = parse_response_utf8(&data, crate::codec::utf7::WireMode::ModifiedUtf7);
+            let _ = parse_response_utf8(&data, crate::types::wire::WireMode::ModifiedUtf7);
         });
     }
 
@@ -13862,7 +13903,7 @@ mod stuck_tests {
         // Literal with absurd byte count  -  should not allocate or loop
         let data = b"* 1 FETCH (BODY[] {999999999}\r\n";
         assert_terminates("huge literal count", || {
-            let _ = parse_response_utf8(data, crate::codec::utf7::WireMode::ModifiedUtf7);
+            let _ = parse_response_utf8(data, crate::types::wire::WireMode::ModifiedUtf7);
         });
     }
 
@@ -14631,7 +14672,7 @@ fn generated_bodystructures_round_trip_to_their_tree_shape() {
         render_body_node(&mut rng, &node, &mut wire);
         let parsed = body_structure(
             wire.as_bytes(),
-            crate::codec::utf7::WireMode::ModifiedUtf7,
+            crate::types::wire::WireMode::ModifiedUtf7,
             0,
         );
         let Ok((rest, bs)) = parsed else {
@@ -14664,7 +14705,7 @@ fn mutated_bodystructures_never_panic_or_overrun() {
             _ => bytes.insert(at, *rng.pick(b"()\"{} N\r")),
         }
 
-        match body_structure(&bytes, crate::codec::utf7::WireMode::ModifiedUtf7, 0) {
+        match body_structure(&bytes, crate::types::wire::WireMode::ModifiedUtf7, 0) {
             Ok((rest, _)) => {
                 assert!(
                     bytes.ends_with(rest),
@@ -14714,7 +14755,7 @@ fn bodystructure_nesting_beyond_the_depth_guard_is_a_failure() {
         matches!(
             body_structure(
                 wire.as_bytes(),
-                crate::codec::utf7::WireMode::ModifiedUtf7,
+                crate::types::wire::WireMode::ModifiedUtf7,
                 0
             ),
             Err(nom::Err::Failure(_))

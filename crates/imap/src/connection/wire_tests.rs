@@ -277,7 +277,7 @@ async fn read_one_fails_fast_on_an_undeliverable_literal_count() {
 
     let err = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        reader.read_one(crate::codec::utf7::WireMode::ModifiedUtf7),
+        reader.read_one(crate::types::wire::WireMode::ModifiedUtf7),
     )
     .await
     .expect("read_one must not wait for octets that cannot exist")
@@ -308,7 +308,7 @@ async fn read_one_reassembles_a_response_split_across_writes() {
     });
 
     let resp = reader
-        .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
+        .read_one(crate::types::wire::WireMode::ModifiedUtf7)
         .await
         .unwrap();
     let _server = feeder.await.unwrap();
@@ -336,7 +336,7 @@ async fn read_one_reassembles_a_literal_split_across_writes() {
     });
 
     let resp = reader
-        .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
+        .read_one(crate::types::wire::WireMode::ModifiedUtf7)
         .await
         .unwrap();
     let _server = feeder.await.unwrap();
@@ -373,7 +373,7 @@ async fn small_fetch_literals_leave_the_reader_allocation_reusable() {
         .expect("binary payload is in the response");
 
     let response = reader
-        .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
+        .read_one(crate::types::wire::WireMode::ModifiedUtf7)
         .await
         .expect("valid FETCH response");
     let Response::Untagged(response) = response else {
@@ -400,7 +400,7 @@ async fn small_fetch_literals_leave_the_reader_allocation_reusable() {
     assert!(!reader.buffer_is_empty(), "next response stays buffered");
     assert!(matches!(
         reader
-            .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
+            .read_one(crate::types::wire::WireMode::ModifiedUtf7)
             .await
             .expect("tagged completion"),
         Response::Tagged(_)
@@ -423,7 +423,7 @@ fn many_co_read_small_responses_move_the_unread_suffix_amortized() {
 
     for _ in 0..response_count {
         let response = reader
-            .try_parse_response_limited(crate::codec::utf7::WireMode::ModifiedUtf7, None)
+            .try_parse_response_limited(crate::types::wire::WireMode::ModifiedUtf7, None)
             .expect("valid response")
             .expect("response already buffered");
         let Response::Untagged(response) = response else {
@@ -450,14 +450,14 @@ async fn read_one_returns_two_responses_from_one_segment() {
     server.flush().await.unwrap();
 
     let first = reader
-        .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
+        .read_one(crate::types::wire::WireMode::ModifiedUtf7)
         .await
         .unwrap();
     assert!(matches!(first, Response::Untagged(_)));
     assert!(!reader.buffer_is_empty(), "tagged line stays buffered");
 
     let second = reader
-        .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
+        .read_one(crate::types::wire::WireMode::ModifiedUtf7)
         .await
         .unwrap();
     match second {
@@ -472,7 +472,7 @@ async fn read_one_reports_eof_as_closed() {
     let (mut reader, server) = memory_reader();
     drop(server);
     match reader
-        .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
+        .read_one(crate::types::wire::WireMode::ModifiedUtf7)
         .await
     {
         Err(Error::Transport {
@@ -491,7 +491,7 @@ async fn read_one_reports_a_hard_parse_error() {
     server.write_all(b"%%%\r\n").await.unwrap();
     server.flush().await.unwrap();
     match reader
-        .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
+        .read_one(crate::types::wire::WireMode::ModifiedUtf7)
         .await
     {
         Err(Error::Provider(crate::error::ProviderFailure::Parse(msg))) => {
@@ -512,7 +512,7 @@ async fn read_one_rejects_a_malformed_recognized_fetch_attribute() {
         server.flush().await.unwrap();
         assert!(matches!(
             reader
-                .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
+                .read_one(crate::types::wire::WireMode::ModifiedUtf7)
                 .await,
             Err(Error::Provider(crate::error::ProviderFailure::Parse(_)))
         ));
@@ -543,7 +543,7 @@ async fn take_buffer_hands_over_unparsed_bytes() {
     server.flush().await.unwrap();
 
     let resp = reader
-        .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
+        .read_one(crate::types::wire::WireMode::ModifiedUtf7)
         .await
         .unwrap();
     assert!(matches!(resp, Response::Tagged(_)));
@@ -596,7 +596,7 @@ async fn bandwidth_pending_idle_read_does_not_hold_a_turn() {
     use tokio::time::{Duration, Instant};
     let budget = bifrost_net::BandwidthBudget::new(Some(4));
     let (mut idle, _silent_peer) = bandwidth_reader(budget.clone());
-    let mut pending = Box::pin(idle.read_one(crate::codec::utf7::WireMode::ModifiedUtf7));
+    let mut pending = Box::pin(idle.read_one(crate::types::wire::WireMode::ModifiedUtf7));
     assert!((&mut pending).now_or_never().is_none());
     let (mut active, mut peer) = bandwidth_reader(budget);
     peer.write_all(b"abcd").await.unwrap();
@@ -835,7 +835,7 @@ async fn bandwidth_cancelled_peer_io_keeps_its_spent_time() {
     let start = Instant::now();
     let result = super::super::lifecycle::setup_timeout(
         Duration::from_millis(30),
-        reader.read_one(crate::codec::utf7::WireMode::ModifiedUtf7),
+        reader.read_one(crate::types::wire::WireMode::ModifiedUtf7),
     )
     .await;
     assert!(matches!(
@@ -848,7 +848,7 @@ async fn bandwidth_cancelled_peer_io_keeps_its_spent_time() {
     assert_eq!(start.elapsed(), Duration::from_millis(30));
     assert!(matches!(
         reader
-            .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
+            .read_one(crate::types::wire::WireMode::ModifiedUtf7)
             .await,
         Err(Error::Transport {
             kind: crate::error::TransportFailure::Timeout,
@@ -869,7 +869,7 @@ async fn literal_budget_refuses_a_marker_without_reading_its_payload() {
     // absent payload. The marker itself must suffice for the refusal.
     assert!(matches!(
         reader
-            .read_one_limited(crate::codec::utf7::WireMode::ModifiedUtf7, Some(1024))
+            .read_one_limited(crate::types::wire::WireMode::ModifiedUtf7, Some(1024))
             .await,
         Err(Error::ResultLimit(
             crate::error::ResultLimit::FetchLiteral {
@@ -889,7 +889,7 @@ async fn literal_budget_counts_sections_together_and_skips_payload_syntax() {
     peer.shutdown().await.unwrap();
     assert!(matches!(
         reader
-            .read_one_limited(crate::codec::utf7::WireMode::ModifiedUtf7, Some(8))
+            .read_one_limited(crate::types::wire::WireMode::ModifiedUtf7, Some(8))
             .await,
         Err(Error::ResultLimit(
             crate::error::ResultLimit::FetchLiteral {
@@ -908,13 +908,13 @@ async fn literal_budget_accepts_exact_payload_and_does_not_charge_next_response(
         .unwrap();
     assert!(
         reader
-            .read_one_limited(crate::codec::utf7::WireMode::ModifiedUtf7, Some(3))
+            .read_one_limited(crate::types::wire::WireMode::ModifiedUtf7, Some(3))
             .await
             .is_ok()
     );
     assert!(
         reader
-            .read_one_limited(crate::codec::utf7::WireMode::ModifiedUtf7, Some(4))
+            .read_one_limited(crate::types::wire::WireMode::ModifiedUtf7, Some(4))
             .await
             .is_ok()
     );
@@ -926,7 +926,7 @@ async fn status_braces_do_not_spend_the_literal_budget() {
     peer.write_all(b"* OK limit {999}\r\n").await.unwrap();
     assert!(
         reader
-            .read_one_limited(crate::codec::utf7::WireMode::ModifiedUtf7, Some(0))
+            .read_one_limited(crate::types::wire::WireMode::ModifiedUtf7, Some(0))
             .await
             .is_ok()
     );
@@ -959,7 +959,7 @@ fn large_fetch_literals_share_only_proportionate_backing() {
         reader.buf.extend_from_slice(b"A001 OK done\r\n");
         let base = reader.buf.as_ptr() as usize;
         let response = reader
-            .try_parse_response_limited(crate::codec::utf7::WireMode::ModifiedUtf7, None)
+            .try_parse_response_limited(crate::types::wire::WireMode::ModifiedUtf7, None)
             .unwrap()
             .unwrap();
         let Response::Untagged(response) = response else {
@@ -997,7 +997,7 @@ fn co_read_responses_do_not_inflate_retained_literal_backing() {
     reader.buf.resize(frame_len + 65536, b' ');
     let base = reader.buf.as_ptr() as usize;
     let response = reader
-        .try_parse_response_limited(crate::codec::utf7::WireMode::ModifiedUtf7, None)
+        .try_parse_response_limited(crate::types::wire::WireMode::ModifiedUtf7, None)
         .unwrap()
         .unwrap();
     let Response::Untagged(response) = response else {

@@ -64,7 +64,7 @@ impl RepairPacing {
         error: &AccountError,
     ) {
         let deadline =
-            crate::throttle::record_repair_throttle(ctx.throttles, ctx.account_id, error);
+            crate::throttle::record_repair_throttle(&ctx.throttles, &ctx.account_id, error);
         self.local_deadline = self.local_deadline.max(deadline);
     }
 
@@ -82,7 +82,7 @@ impl RepairPacing {
         if let (Some(account), Some(scope)) = (account, scope) {
             keys.extend(crate::throttle::declared_keys(
                 account,
-                ctx.account_id,
+                &ctx.account_id,
                 bifrost_types::ThrottleWork::Scope(scope),
             ));
         }
@@ -90,7 +90,7 @@ impl RepairPacing {
             .local_deadline
             .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
             .unwrap_or_default();
-        let shared = crate::throttle::throttle_wait(ctx.throttles, ctx.account_id, &keys)
+        let shared = crate::throttle::throttle_wait(&ctx.throttles, &ctx.account_id, &keys)
             .unwrap_or_default();
         local.max(shared)
     }
@@ -103,12 +103,12 @@ impl RepairPacing {
         scope: Option<&CursorScope>,
     ) -> Result<crate::engine::drive_start::RecoveryAdmission, Error> {
         let gate = crate::engine::drive_start::DriveStart {
-            current: ctx.current,
+            current: &ctx.current,
             control,
-            scheduler: ctx.scheduler,
-            throttles: ctx.throttles,
-            account_id: ctx.account_id,
-            shutdown: ctx.shutdown,
+            scheduler: &ctx.scheduler,
+            throttles: &ctx.throttles,
+            account_id: &ctx.account_id,
+            shutdown: &ctx.shutdown,
         };
         loop {
             self.wait(ctx, account, scope).await?;
@@ -117,7 +117,7 @@ impl RepairPacing {
                     if let Some(scope) = scope {
                         crate::throttle::declared_keys(
                             account,
-                            ctx.account_id,
+                            &ctx.account_id,
                             bifrost_types::ThrottleWork::Scope(scope),
                         )
                     } else {
@@ -182,7 +182,7 @@ impl RepairPacing {
 
 pub(in crate::engine) fn warn_wait_budget(ctx: &RecoveryContext<'_>, scope: CursorScope) {
     broadcast_warning(
-        ctx.delivery,
+        &ctx.delivery,
         Some(scope),
         bifrost_types::Warning::user_safe(
             bifrost_types::WarningKind::Engine(

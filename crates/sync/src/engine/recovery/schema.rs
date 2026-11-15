@@ -71,7 +71,7 @@ pub(in crate::engine) async fn handle_schema_incompatible(
     let Some(activity) = ctx.control.begin_activity() else {
         tracing::debug!(
             target: "bifrost.sync.changes",
-            account = ?ctx.account_id,
+            account = ?&ctx.account_id,
             "schema recovery deferred: the account is paused; the reset is parked and \
              re-runs after resume"
         );
@@ -91,7 +91,7 @@ pub(in crate::engine) async fn handle_schema_incompatible(
     for attempt in 0..REOPEN_RETRY_BUDGET.0 {
         if attempt > 0 {
             let sleep_for = backoff.record_failure(crate::backoff::jitter_seed());
-            if !sleep_unless_shutdown(sleep_for, ctx.shutdown).await {
+            if !sleep_unless_shutdown(sleep_for, &ctx.shutdown).await {
                 return RecoveryFollowUp::None;
             }
         }
@@ -116,7 +116,7 @@ pub(in crate::engine) async fn handle_schema_incompatible(
             Err(error) => {
                 tracing::warn!(
                     target: "bifrost.sync.changes",
-                    account = ?ctx.account_id,
+                    account = ?&ctx.account_id,
                     attempt,
                     error = %error,
                     "SchemaIncompatible: account-wide checkpoint clear failed"
@@ -127,7 +127,7 @@ pub(in crate::engine) async fn handle_schema_incompatible(
     }
     let detail = last.map_or_else(String::new, |error| error.to_string());
     broadcast_warning(
-        ctx.delivery,
+        &ctx.delivery,
         None,
         bifrost_types::Warning::user_safe(
             bifrost_types::WarningKind::Engine(bifrost_types::EngineNotice::SchemaRecoveryFailed),

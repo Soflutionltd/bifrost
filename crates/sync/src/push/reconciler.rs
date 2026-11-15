@@ -5,6 +5,7 @@
 //! cursor for each affected scope. Output flows to the multiplexer's
 //! broadcast so consumers see a single unified `Change` stream.
 
+use super::InvalidationIntent;
 use crate::engine::supervisor::ReopenRequest;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -54,8 +55,14 @@ pub struct Reconciler {
 
 #[derive(Default)]
 struct WorkSet {
-    intent: super::PendingPush,
-    hold: Option<(crate::types::AccountGeneration, tokio::time::Instant)>,
+    intent: InvalidationIntent<HashSet<CursorScope>>,
+    hold: Option<GenerationHold>,
+}
+
+#[derive(Clone, Copy)]
+struct GenerationHold {
+    generation: crate::types::AccountGeneration,
+    until: tokio::time::Instant,
 }
 
 impl WorkSet {
@@ -65,28 +72,50 @@ impl WorkSet {
         registry: &CursorRegistry,
         ingress: &super::PushIngress,
     ) -> bool {
-        let hinted = !pending.scopes.is_empty() || !pending.memberships.is_empty();
-        self.intent.full |= pending.full;
-        if !self.intent.full {
-            for scope in pending.scopes {
-                self.intent.scopes.extend(scopes_for_hint(
-                    registry,
-                    &HintPayload::SpecificCursorScope(scope),
-                ));
+        match pending.intent {
+            InvalidationIntent::Full => self.intent = InvalidationIntent::Full,
+            InvalidationIntent::Specific(hints) => {
+                let hinted = !hints.scopes.is_empty() || !hints.memberships.is_empty();
+                if let InvalidationIntent::Specific(scopes) = &mut self.intent {
+                    for scope in hints.scopes {
+                        scopes.extend(scopes_for_hint(
+                            registry,
+                            &HintPayload::SpecificCursorScope(scope),
+                        ));
+                    }
+                    for membership in hints.memberships {
+                        scopes.extend(scopes_for_hint(
+                            registry,
+                            &HintPayload::SpecificMembership(membership),
+                        ));
+                    }
+                }
+                // An empty ingress must not re-bound a previously resolved full sweep.
+                if hinted && self.intent.bound(ingress.capacity(), HashSet::len) {
+                    ingress.count_coarsening();
+                }
             }
-            for membership in pending.memberships {
-                self.intent.scopes.extend(scopes_for_hint(
-                    registry,
-                    &HintPayload::SpecificMembership(membership),
-                ));
-            }
-        }
-        // A full sweep is resolved at drive time so topology changes are seen.
-        // Do not apply the hint bound to an already resolved full sweep.
-        if (hinted || self.intent.full) && self.intent.bound(ingress.capacity()) {
-            ingress.count_coarsening();
         }
         pending.closed
+    }
+
+    fn restore(&mut self, scope: CursorScope) {
+        if let InvalidationIntent::Specific(scopes) = &mut self.intent {
+            scopes.insert(scope);
+        }
+    }
+
+    fn has_work(&self) -> bool {
+        match &self.intent {
+            InvalidationIntent::Full => true,
+            InvalidationIntent::Specific(scopes) => !scopes.is_empty(),
+        }
+    }
+
+    fn resolve_full(&mut self, registry: &CursorRegistry) {
+        if matches!(self.intent, InvalidationIntent::Full) {
+            self.intent = InvalidationIntent::Specific(registry.all_scopes().into_iter().collect());
+        }
     }
 }
 
@@ -112,7 +141,7 @@ impl Reconciler {
                 return;
             }
             closed |= work.merge(ingress.take(), &self.cursors, &ingress);
-            if let Some((generation, until)) = work.hold {
+            if let Some(GenerationHold { generation, until }) = work.hold {
                 let current = *self.account_generation.borrow_and_update();
                 if generation != current || tokio::time::Instant::now() >= until {
                     work.hold = None;
@@ -132,13 +161,10 @@ impl Reconciler {
                 .collect();
             for scope in ready {
                 deferred.remove(&scope);
-                work.intent.scopes.insert(scope);
+                work.restore(scope);
             }
-            if work.hold.is_none() && (work.intent.full || !work.intent.scopes.is_empty()) {
-                if work.intent.full {
-                    work.intent.full = false;
-                    work.intent.scopes.extend(self.cursors.all_scopes());
-                }
+            if work.hold.is_none() && work.has_work() {
+                work.resolve_full(&self.cursors);
                 if let Err(error) = self.drive_scopes(&mut work, &mut deferred).await {
                     tracing::warn!(target: "bifrost.sync.reconcile", %error, "push reconcile failed");
                 }
@@ -155,9 +181,10 @@ impl Reconciler {
             } else {
                 self.next_deferred_due(&deferred)
             };
-            let hold_wait = work
-                .hold
-                .map(|(_, until)| until.saturating_duration_since(tokio::time::Instant::now()));
+            let hold_wait = work.hold.map(|hold| {
+                hold.until
+                    .saturating_duration_since(tokio::time::Instant::now())
+            });
             tokio::select! {
                 () = self.shutdown.cancelled() => return,
                 () = ingress.changed() => {},
@@ -202,13 +229,18 @@ impl Reconciler {
         work: &mut WorkSet,
         deferred: &mut HashSet<CursorScope>,
     ) -> Result<(), Error> {
-        let scopes: Vec<_> = work.intent.scopes.iter().cloned().collect();
+        let InvalidationIntent::Specific(scopes) = &work.intent else {
+            return Ok(());
+        };
+        let scopes: Vec<_> = scopes.iter().cloned().collect();
         for scope in scopes {
             #[cfg(test)]
             if let Some(attempts) = &self.attempts {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            work.intent.scopes.remove(&scope);
+            if let InvalidationIntent::Specific(scopes) = &mut work.intent {
+                scopes.remove(&scope);
+            }
             // This dispatch speaks for any older deferral of the same scope:
             // drop it, so a fresh hint that drives the scope does not leave a
             // due entry behind for the timer to drive a second time. Every
@@ -298,7 +330,7 @@ impl Reconciler {
                 Some(Ok(driven)) => driven,
                 Some(Err(crate::engine::drive_start::StartRefused::ShuttingDown)) => return Ok(()),
                 Some(Err(crate::engine::drive_start::StartRefused::Paused)) => {
-                    work.intent.scopes.insert(scope);
+                    work.restore(scope);
                     return Ok(());
                 }
                 Some(Err(crate::engine::drive_start::StartRefused::Held { .. })) => {
@@ -333,7 +365,7 @@ impl Reconciler {
             match outcome {
                 ChangesEvent::Advanced | ChangesEvent::Done | ChangesEvent::Stopped => {}
                 ChangesEvent::Paused => {
-                    work.intent.scopes.insert(scope);
+                    work.restore(scope);
                     return Ok(());
                 }
                 ChangesEvent::Terminated(error) => {
@@ -428,10 +460,11 @@ impl Reconciler {
                                 // remainder would sit out the full 30s
                                 // fallback while the listener declines this
                                 // now-stale request.
-                                work.hold = Some((
-                                    incarnation,
-                                    tokio::time::Instant::now() + crate::recovery::REOPEN_WAIT,
-                                ));
+                                work.hold = Some(GenerationHold {
+                                    generation: incarnation,
+                                    until: tokio::time::Instant::now()
+                                        + crate::recovery::REOPEN_WAIT,
+                                });
                                 return Ok(());
                             }
                             continue;
@@ -644,7 +677,9 @@ mod tests {
         registry.link_membership(membership, scope("one"));
         let mut work = WorkSet::default();
         work.merge(ingress.take(), &registry, &ingress);
-        assert_eq!(work.intent.scopes, HashSet::from([scope("one")]));
+        assert!(
+            matches!(&work.intent, InvalidationIntent::Specific(scopes) if *scopes == HashSet::from([scope("one")]))
+        );
     }
 
     #[test]
@@ -654,18 +689,19 @@ mod tests {
         let mut work = WorkSet::default();
         for name in ["one", "two"] {
             let pending = PendingPush {
-                scopes: HashSet::from([scope(name)]),
+                intent: InvalidationIntent::Specific(super::super::PushHints {
+                    scopes: HashSet::from([scope(name)]),
+                    ..Default::default()
+                }),
                 ..PendingPush::default()
             };
             work.merge(pending, &registry, &ingress);
         }
-        assert!(work.intent.full && work.intent.scopes.is_empty());
+        assert!(matches!(work.intent, InvalidationIntent::Full));
         assert_eq!(ingress.coarsened(), 1);
-        work.intent.full = false;
-        work.intent.scopes.extend([scope("one"), scope("two")]);
+        work.intent = InvalidationIntent::Specific(HashSet::from([scope("one"), scope("two")]));
         work.merge(PendingPush::default(), &registry, &ingress);
-        assert!(!work.intent.full);
-        assert_eq!(work.intent.scopes.len(), 2);
+        assert!(matches!(&work.intent, InvalidationIntent::Specific(scopes) if scopes.len() == 2));
         assert_eq!(ingress.coarsened(), 1);
     }
 }

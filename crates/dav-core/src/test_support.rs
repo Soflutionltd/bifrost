@@ -11,10 +11,10 @@
 //! Two contract facts inherited from the net seam, and they change how a DAV
 //! test is written:
 //!
-//! - Every 4xx and 5xx becomes an `Err` inside the pipeline. The DAV dispatcher
-//!   reconstitutes a terminal `Error::Status` back into a `DavResponse`, so a
-//!   scripted 404 still reaches the DAV status ladder - but a scripted 503 is
-//!   RETRIED first, and the script must answer every attempt.
+//! - DAV selects client refusals other than 401/408/429, plus 501, as data.
+//!   A scripted 404 or 501 reaches the DAV status ladder immediately, with its
+//!   complete body. A scripted 503 is retried first for replayable requests,
+//!   and the script must answer every attempt.
 //! - An exhausted script panics rather than reaching a socket, so a test that
 //!   under-scripts fails loudly.
 //!
@@ -163,10 +163,9 @@ impl From<crate::DavResponse> for Canned {
 /// An `AccountNet` whose wire dispatch answers from `script`, configured the
 /// way a real DAV account is.
 ///
-/// Redirects disabled and no token source, matching `dav_account_spec`: the
-/// dispatcher walks hops itself and mints its own credentials, so a test that
-/// attached under net's defaults would exercise a pipeline the production one
-/// is not.
+/// No account token source: DAV selects its own credentials through the hop
+/// policy. The DAV dispatcher installs net's redirect walk per request, even
+/// when this injected account disables redirects.
 #[must_use]
 pub fn scripted_dav_net(script: &Arc<ScriptedDispatch>) -> AccountNet {
     scripted_dav_net_capped(script, None)

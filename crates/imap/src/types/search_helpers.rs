@@ -108,7 +108,7 @@ pub(super) fn validate_imap_date(date: &str) -> Result<(), crate::Error> {
     } else {
         day.to_owned()
     };
-    crate::codec::encode::validate_append_datetime(&format!(
+    crate::types::datetime::validate_append_datetime(&format!(
         "{fixed_day}-{month}-{year} 00:00:00 +0000"
     ))
     .map_err(|error| {

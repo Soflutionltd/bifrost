@@ -7,9 +7,12 @@
 //! keeps `CursorScope` untouched (the engine never inspects the payload)
 //! and mirrors how IMAP namespaces other-user folders by path.
 //!
-//! The codec is `pub(crate)` and lives per-crate: the JMAP equivalent
-//! carries an `accountId` where Graph carries a `/users/{id}` routing
-//! key, so a shared `bifrost-types` type would be a false generalization.
+//! This module owns owner-qualified and public-folder id spellings and the
+//! same-owner rule. Graph mailbox routing compares owner keys ASCII-case-insensitively
+//! while preserving their stored spelling. JMAP account keys compare exactly
+//! and strip qualification only for the matching shared route. Keep these
+//! provider policies here; public-folder identities name an EWS routing
+//! collection rather than an optional mailbox owner.
 
 #[cfg(test)]
 use bifrost_types::CursorScope;

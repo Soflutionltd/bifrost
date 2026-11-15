@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
-pub use ingress::{PendingPush, PushIngress};
+pub use ingress::{InvalidationIntent, PendingPush, PushHints, PushIngress};
 pub use reconciler::{Reconciler, scopes_for_hint};
 pub(crate) use subscription::RegisteredSubscription;
 pub use subscription::SubscriptionRegistry;
@@ -252,7 +252,10 @@ mod tests {
             sink.push(account, WatchEvent::Reconnected),
             SinkPush::Accepted
         ));
-        assert!(target.ingress.take().full);
+        assert!(matches!(
+            target.ingress.take().intent,
+            crate::push::InvalidationIntent::Full
+        ));
     }
     #[test]
     fn sink_push_for_an_unknown_account_is_not_attached() {
@@ -317,7 +320,9 @@ mod tests {
         assert!(broadcast.recovery().is_terminal());
         assert!(rx.try_recv().is_err(), "exactly one broadcast");
         let pending = target.ingress.take();
-        assert!(!pending.full && pending.scopes.is_empty() && pending.memberships.is_empty());
+        assert!(
+            matches!(pending.intent, InvalidationIntent::Specific(hints) if hints.scopes.is_empty() && hints.memberships.is_empty())
+        );
         assert!(reopen.try_recv().is_err());
     }
     #[test]

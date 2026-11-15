@@ -6,16 +6,16 @@ use super::{Consumer, ConsumerContext, Finalized};
 /// Consumer for THREAD and UID THREAD (RFC 5256 Section3).
 ///
 /// Accumulates the single THREAD response.
-#[derive(Default)]
-pub(crate) struct ThreadConsumer {
+pub(crate) struct ThreadConsumer<I = crate::types::Uid> {
+    addressing: std::marker::PhantomData<I>,
     /// The THREAD response, if received.
-    result: Option<Vec<ThreadNode>>,
+    result: Option<Vec<ThreadNode<u32>>>,
     /// Non-THREAD responses routed here.
     buffered: Vec<UntaggedResponse>,
 }
 
-impl Consumer for ThreadConsumer {
-    type Output = Vec<ThreadNode>;
+impl<I: crate::types::search::SearchAddress> Consumer for ThreadConsumer<I> {
+    type Output = Vec<ThreadNode<I>>;
 
     fn on_response(
         &mut self,
@@ -35,7 +35,7 @@ impl Consumer for ThreadConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Finalized<Vec<ThreadNode>> {
+    ) -> Finalized<Vec<ThreadNode<I>>> {
         // `buffered` is `Either`-classified data that only the event stream
         // carries, so it is surrendered on both arms.
         if let Err(e) = tagged.require_ok() {
@@ -44,7 +44,12 @@ impl Consumer for ThreadConsumer {
         // RFC 5256 Section 4: an empty THREAD result (no matching
         // messages) may be represented by the server omitting the
         // untagged THREAD response entirely and sending only tagged OK.
-        let threads = self.result.unwrap_or_default();
+        let threads = self
+            .result
+            .unwrap_or_default()
+            .into_iter()
+            .map(ThreadNode::addressed)
+            .collect();
         Finalized::success(threads, self.buffered)
     }
 }
@@ -53,16 +58,16 @@ impl Consumer for ThreadConsumer {
 ///
 /// Accumulates the single SORT response with optional MODSEQ
 /// (RFC 7162 Section3.1.6).
-#[derive(Default)]
-pub(crate) struct SortConsumer {
+pub(crate) struct SortConsumer<I = crate::types::Uid> {
+    addressing: std::marker::PhantomData<I>,
     /// The SORT response, if received.
     result: Option<(Vec<u32>, Option<crate::types::ModSeq>)>,
     /// Non-SORT responses routed here.
     buffered: Vec<UntaggedResponse>,
 }
 
-impl Consumer for SortConsumer {
-    type Output = SearchResult;
+impl<I: crate::types::search::SearchAddress> Consumer for SortConsumer<I> {
+    type Output = SearchResult<I>;
 
     fn on_response(
         &mut self,
@@ -82,7 +87,7 @@ impl Consumer for SortConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Finalized<SearchResult> {
+    ) -> Finalized<SearchResult<I>> {
         // `buffered` is `Either`-classified data that only the event stream
         // carries, so it is surrendered on both arms.
         if let Err(e) = tagged.require_ok() {
@@ -92,6 +97,26 @@ impl Consumer for SortConsumer {
         // messages) may be represented by the server omitting the
         // untagged SORT response entirely and sending only tagged OK.
         let (ids, mod_seq) = self.result.unwrap_or_default();
-        Finalized::success(SearchResult { ids, mod_seq }, self.buffered)
+        Finalized::success(SearchResult::new(ids, mod_seq), self.buffered)
+    }
+}
+
+impl<I> Default for SortConsumer<I> {
+    fn default() -> Self {
+        Self {
+            result: None,
+            buffered: Vec::new(),
+            addressing: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<I> Default for ThreadConsumer<I> {
+    fn default() -> Self {
+        Self {
+            result: None,
+            buffered: Vec::new(),
+            addressing: std::marker::PhantomData,
+        }
     }
 }

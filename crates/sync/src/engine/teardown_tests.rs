@@ -60,7 +60,7 @@ async fn a_worker_aborted_on_a_spent_deadline_is_named() {
     let join = tokio::spawn(std::future::pending::<()>());
     let watch = join.abort_handle();
     let worker = WorkerTask {
-        role: crate::types::WorkerRole::Multiplexer,
+        role: crate::engine::context::WorkerRole::Multiplexer,
         abort: join.abort_handle(),
         join,
     };

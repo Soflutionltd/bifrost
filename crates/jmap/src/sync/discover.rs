@@ -16,12 +16,12 @@ use crate::mailbox::{Mailbox, MailboxChanges, MailboxGet, MailboxId, Property};
 use super::capabilities::CoreLimits;
 use super::state_walk::ChangesWalk;
 
+/// Only the primary account is polled, so this topology owns one position.
 /// Lifecycle position and announced names are published together. A dropped
 /// stream replays the unfinished page rather than hiding sidebar changes.
 #[derive(Default)]
 pub(crate) struct LifecycleTopology {
-    pub(crate) positions:
-        HashMap<String, Option<crate::core::id::ObjectState<crate::mailbox::Mailbox>>>,
+    pub(crate) position: Option<crate::core::id::ObjectState<crate::mailbox::Mailbox>>,
     pub(crate) names: HashMap<String, String>,
 }
 
@@ -145,7 +145,6 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
     mail: MailAccount<T>,
     limits: CoreLimits,
     topology: Topology,
-    account_id: String,
     shutdown: CancellationToken,
     client: crate::client::Client<T>,
 ) -> AccountStream<ScopeLifecycleEvent> {
@@ -174,7 +173,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                 break;
             }
 
-            let since_state = topology.lock().await.positions.get(&account_id).cloned().flatten();
+            let since_state = topology.lock().await.position.clone();
 
             let Some(since_state) = since_state else {
                 walk = None;
@@ -378,7 +377,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                     {
                         let mut published = topology.lock().await;
                         published.names = names;
-                        published.positions.insert(account_id.clone(), Some(new_state.clone().into()));
+                        published.position = Some(new_state.clone().into());
                     }
 
                     if !response.has_more_changes() {
@@ -420,7 +419,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
                                 // before this point leaves both facts replayable.
                                 let mut published = topology.lock().await;
                                 published.names = names;
-                                published.positions.insert(account_id.clone(), Some(state.clone().into()));
+                                published.position = Some(state.clone().into());
                                 state_walk.reset_changes_burst(&state);
                             }
                             Err(err) => {
@@ -745,7 +744,7 @@ mod tests {
         .expect("client builds");
         let mail = crate::account::Account::new(client.clone(), "primary");
         let states = Arc::new(Mutex::new(LifecycleTopology {
-            positions: HashMap::from([("primary".to_string(), Some("mbx-1".into()))]),
+            position: Some("mbx-1".into()),
             names,
         }));
         let shutdown = CancellationToken::new();
@@ -756,7 +755,6 @@ mod tests {
                 max_objects_in_set: 256,
             },
             Arc::clone(&states),
-            "primary".to_string(),
             shutdown.clone(),
             client,
         );
@@ -805,10 +803,7 @@ mod tests {
             Some(ScopeLifecycleEvent::Polled)
         ));
         assert_eq!(requests.lock().expect("requests").len(), 2);
-        assert_eq!(
-            states.lock().await.positions.get("primary"),
-            Some(&Some("mbx-3".into()))
-        );
+        assert_eq!(states.lock().await.position.as_ref(), Some(&"mbx-3".into()));
         shutdown.cancel();
         assert!(stream.next().await.is_none());
     }
@@ -828,10 +823,7 @@ mod tests {
             Some(ScopeLifecycleEvent::Terminated(_))
         ));
         assert!(stream.next().await.is_none());
-        assert_eq!(
-            states.lock().await.positions.get("primary"),
-            Some(&Some("mbx-1".into()))
-        );
+        assert_eq!(states.lock().await.position.as_ref(), Some(&"mbx-1".into()));
     }
 
     #[tokio::test(start_paused = true)]
@@ -884,14 +876,7 @@ mod tests {
             assert_eq!(new, old);
             assert_eq!((old_name.as_str(), new_name.as_str()), ("Before", "After"));
             assert_eq!(
-                states
-                    .lock()
-                    .await
-                    .positions
-                    .get("primary")
-                    .cloned()
-                    .flatten()
-                    .as_deref(),
+                states.lock().await.position.clone().as_deref(),
                 Some("mbx-1")
             );
             // Pull past the snapshot's final yield, committing its state and
@@ -904,14 +889,7 @@ mod tests {
             };
             assert_eq!(id.0, "e-later");
             assert_eq!(
-                states
-                    .lock()
-                    .await
-                    .positions
-                    .get("primary")
-                    .cloned()
-                    .flatten()
-                    .as_deref(),
+                states.lock().await.position.clone().as_deref(),
                 Some("mbx-fresh")
             );
             {
@@ -946,14 +924,7 @@ mod tests {
             assert_eq!(started.elapsed(), std::time::Duration::ZERO);
             assert_eq!(requests.lock().expect("requests").len(), expected_requests);
             assert_eq!(
-                states
-                    .lock()
-                    .await
-                    .positions
-                    .get("primary")
-                    .cloned()
-                    .flatten()
-                    .as_deref(),
+                states.lock().await.position.clone().as_deref(),
                 Some("mbx-1"),
                 "the replacement reader must retry the uncommitted position",
             );
@@ -978,14 +949,7 @@ mod tests {
         ));
         assert_eq!(started.elapsed(), std::time::Duration::ZERO);
         assert_eq!(
-            states
-                .lock()
-                .await
-                .positions
-                .get("primary")
-                .cloned()
-                .flatten()
-                .as_deref(),
+            states.lock().await.position.clone().as_deref(),
             Some("mbx-1")
         );
         assert_eq!(requests.lock().expect("requests").len(), 2);
@@ -1008,7 +972,7 @@ mod tests {
         .expect("client builds");
         let mail = crate::account::Account::new(client.clone(), "primary");
         let states = Arc::new(Mutex::new(LifecycleTopology {
-            positions: HashMap::from([("primary".to_string(), Some("mbx-1".into()))]),
+            position: Some("mbx-1".into()),
             names: HashMap::new(),
         }));
         let shutdown = CancellationToken::new();
@@ -1020,7 +984,6 @@ mod tests {
                     max_objects_in_set: 256,
                 },
                 Arc::clone(&states),
-                "primary".to_string(),
                 shutdown.clone(),
                 client.clone(),
             ))
@@ -1033,14 +996,7 @@ mod tests {
         drop(first);
         assert!(states.lock().await.names.is_empty());
         assert_eq!(
-            states
-                .lock()
-                .await
-                .positions
-                .get("primary")
-                .cloned()
-                .flatten()
-                .as_deref(),
+            states.lock().await.position.clone().as_deref(),
             Some("mbx-1")
         );
 
@@ -1058,14 +1014,7 @@ mod tests {
         assert!(resumed.next().await.is_none());
         assert_eq!(states.lock().await.names.len(), 2);
         assert_eq!(
-            states
-                .lock()
-                .await
-                .positions
-                .get("primary")
-                .cloned()
-                .flatten()
-                .as_deref(),
+            states.lock().await.position.clone().as_deref(),
             Some("mbx-fresh")
         );
     }
@@ -1085,7 +1034,7 @@ mod tests {
         .expect("client builds");
         let mail = crate::account::Account::new(client.clone(), "primary");
         let states = Arc::new(Mutex::new(LifecycleTopology {
-            positions: HashMap::from([("primary".to_string(), Some("mbx-1".into()))]),
+            position: Some("mbx-1".into()),
             names: HashMap::from([
                 ("a-new".into(), "Old".into()),
                 ("b-new".into(), "Old".into()),
@@ -1100,7 +1049,6 @@ mod tests {
                     max_objects_in_set: 256,
                 },
                 Arc::clone(&states),
-                "primary".to_string(),
                 shutdown.clone(),
                 client.clone(),
             ))
@@ -1115,14 +1063,7 @@ mod tests {
         drop(first);
         assert!(states.lock().await.names.values().all(|name| name == "Old"));
         assert_eq!(
-            states
-                .lock()
-                .await
-                .positions
-                .get("primary")
-                .cloned()
-                .flatten()
-                .as_deref(),
+            states.lock().await.position.clone().as_deref(),
             Some("mbx-1")
         );
 
@@ -1143,14 +1084,7 @@ mod tests {
         assert!(resumed.next().await.is_none());
         assert_eq!(states.lock().await.names.len(), 2);
         assert_eq!(
-            states
-                .lock()
-                .await
-                .positions
-                .get("primary")
-                .cloned()
-                .flatten()
-                .as_deref(),
+            states.lock().await.position.clone().as_deref(),
             Some("mbx-2")
         );
     }
@@ -1166,14 +1100,7 @@ mod tests {
         };
         assert!(error.recovery().is_terminal());
         assert_eq!(
-            states
-                .lock()
-                .await
-                .positions
-                .get("primary")
-                .cloned()
-                .flatten()
-                .as_deref(),
+            states.lock().await.position.clone().as_deref(),
             Some("mbx-1")
         );
         assert!(stream.next().await.is_none());
@@ -1304,13 +1231,7 @@ mod tests {
         shutdown.cancel();
         assert!(stream.next().await.is_none());
         assert_eq!(
-            states
-                .lock()
-                .await
-                .positions
-                .get("primary")
-                .cloned()
-                .flatten(),
+            states.lock().await.position.clone(),
             Some("mbx-2".into()),
             "the state still advances; the vanished create is not replayable"
         );
@@ -1372,13 +1293,7 @@ mod tests {
         }
         assert!(stream.next().await.is_none());
         assert_eq!(
-            states
-                .lock()
-                .await
-                .positions
-                .get("primary")
-                .cloned()
-                .flatten(),
+            states.lock().await.position.clone(),
             Some("mbx-1".into()),
             "the refused page is not committed; the state never moved"
         );
@@ -1550,18 +1465,12 @@ mod tests {
         );
         // The poller committed its OWN position, and only after every
         // follow-up describing that response succeeded. Nothing else
-        // writes these positions. Delta passes and local Mailbox/set calls
+        // writes this position. Delta passes and local Mailbox/set calls
         // must not fast-forward past unseen lifecycle events.
         assert_eq!(
-            states
-                .lock()
-                .await
-                .positions
-                .get("primary")
-                .cloned()
-                .flatten(),
+            states.lock().await.position.clone(),
             Some("mbx-2".into()),
-            "the lifecycle poller advances the map it was handed"
+            "the lifecycle poller advances the topology it was handed"
         );
     }
 }

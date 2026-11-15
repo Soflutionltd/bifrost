@@ -11,9 +11,9 @@
 #[path = "classification_tests.rs"]
 mod tests;
 
-use crate::connection::NotifyFlags;
 use crate::types::CommandKind;
 use crate::types::CommandKind as CK;
+use crate::types::notify::NotifyFlags;
 use crate::types::response::UntaggedResponse;
 use crate::types::response::UntaggedResponse as UR;
 use crate::types::validated::MailboxName;
@@ -61,6 +61,9 @@ macro_rules! solicited_rows {
 
         const SOLICITED_OWNER_GROUPS: &[&[CommandKind]] = &[
             $(&[$($owner),+],)+
+            // FETCH is Either below, but its wire-identical replies still
+            // prevent these two commands sharing a pipeline sub-batch.
+            &[CK::Fetch, CK::UidFetch],
         ];
     };
 }
@@ -77,7 +80,7 @@ solicited_rows! {
     UR::Id(_) => [CK::Id],
     UR::Enabled(_) => [CK::Enable],
     UR::Esearch(_) => [CK::Search, CK::SearchReturn, CK::SearchSave],
-    UR::Vanished { earlier: true, .. } => [CK::Select, CK::Examine, CK::Fetch, CK::Expunge],
+    UR::Vanished { earlier: true, .. } => [CK::Select, CK::Examine, CK::UidFetch, CK::Expunge],
     UR::Quota { .. } => [CK::GetQuota, CK::GetQuotaRoot, CK::SetQuota],
     UR::QuotaRoot { .. } => [CK::GetQuotaRoot],
     UR::Acl { .. } => [CK::GetAcl],
@@ -216,5 +219,29 @@ pub(crate) fn classify(
         | UR::Sort { .. } => Impossible,
         // RFC 9051 Section 2.2.2: tolerate unrecognized extension responses.
         UR::Unknown(_) => OnlyUnsolicited,
+    }
+}
+
+impl CommandKind {
+    /// The key a pipelined batch splits on: two commands share a sub-batch
+    /// only when their keys differ.
+    ///
+    /// The batch hands an untagged response to the first still-active command
+    /// `classify` lets own it, which is only correct when no two commands of
+    /// one sub-batch can both claim the same response. Equal kinds obviously
+    /// can, but so can distinct kinds that solicit a common response type, and
+    /// those share a key here:
+    ///
+    /// * `QUOTA` is solicited by GETQUOTA, GETQUOTAROOT and SETQUOTA (RFC 9208
+    ///   Sections 4.2-4.4).
+    /// * `SEARCH` and `ESEARCH` by every search form, tagless `SEARCH` with no
+    ///   correlator at all (RFC 3501 Section 7.2.5, RFC 4731, RFC 5182).
+    /// * `LIST` by LIST and LIST-STATUS, and `STATUS` by LIST-STATUS and STATUS
+    ///   (RFC 5819 Section 2), so all three share one key.
+    /// * `VANISHED (EARLIER)` by FETCH and EXPUNGE (RFC 7162 Section 3.2.10).
+    ///
+    /// The classifier derives this key from its solicited-response owner sets.
+    pub(crate) fn untagged_routing_key(self) -> Self {
+        untagged_routing_key(self)
     }
 }

@@ -211,7 +211,7 @@ impl DriveStart<'_> {
     }
 }
 
-impl crate::types::AccountSlot {
+impl crate::engine::context::AccountSlot {
     pub(crate) fn drive_start<'a>(&'a self, account_id: &'a AccountId) -> DriveStart<'a> {
         DriveStart {
             current: &self.current,

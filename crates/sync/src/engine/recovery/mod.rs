@@ -20,54 +20,19 @@ pub(crate) use parked::{DeferredSchemaReset, DeferredScopeRepairs};
 pub(crate) use schema::run_parked_schema_reset;
 pub(crate) use scoped::establish_if_absent;
 
-/// Shared context bundle used by every recovery-dispatch path. Folds
-/// the per-account state most paths need into a single argument so
-/// `handle_account_error`, the engine-directive arm, and the reopen
-/// loop don't carry seven-positional argument lists.
+/// One recovery dispatch borrows the account slot and its writer endpoint.
+/// Only the request's incarnation stamp varies between dispatches.
 pub(crate) struct RecoveryContext<'a> {
-    pub scheduler: &'a Scheduler,
-    pub deferred_schema_reset: &'a Arc<DeferredSchemaReset>,
-    pub bandwidth_budget: Option<&'a bifrost_net::BandwidthBudget>,
-    pub factory: &'a Arc<dyn AccountFactory>,
-    pub current: &'a Arc<ArcSwap<crate::types::Incarnation>>,
-    pub cursors: &'a Arc<CursorRegistry>,
-    pub account_id: &'a AccountId,
-    pub control: &'a SyncControl,
-    pub account_control_tx: &'a broadcast::Sender<AccountControl>,
-    pub throttles: &'a Arc<crate::throttle::ThrottleBucket>,
-    pub capabilities: &'a Arc<std::sync::RwLock<AccountCapabilities>>,
-    pub subscriptions: &'a Arc<SubscriptionRegistry>,
-    pub account_generation_tx: &'a watch::Sender<crate::types::AccountGeneration>,
-    /// The lane supervisor's retirement watch (drained generation plus
-    /// one). Reattach waits on it before closing the account it replaced.
-    pub push_retired: &'a watch::Sender<crate::types::AccountGeneration>,
-    /// Bound on that wait (`EngineConfig::detach_timeout`).
-    pub push_drain_wait: Duration,
-    /// The incarnation generation a stamped request (`PushRecovery`, or a
-    /// `Recovery` carrying one) was raised against; `None` for an unstamped
-    /// request, which acts on whichever incarnation is current.
-    pub expected_generation: Option<crate::types::AccountGeneration>,
-    pub reopen_lock: &'a Arc<AsyncMutex<()>>,
-    /// Slot-lifetime open-skip lane; a successful reattach replaces it
-    /// with the replacement open's `OpenedAccount::skipped_scopes`.
-    pub open_skips: &'a Arc<std::sync::Mutex<Vec<SkippedScope>>>,
-    /// Cancels a queued recovery during detach.
-    pub shutdown: &'a CancellationToken,
-    /// The account's single durable writer.
-    ///
-    /// Reattach persists and rolls back replacement cursors THROUGH this
-    /// channel rather than touching `store` directly. Both are ordered against
-    /// consumer acknowledgements that way, which matters because a
-    /// replacement's inventory pass broadcasts checkpoint-bearing batches
-    /// before the cutover: a direct write racing the ack writer let an aborted
-    /// reattach delete a cursor a consumer had already acknowledged.
+    pub slot: &'a AccountSlot,
     pub writer: &'a WriterHandle,
-    /// Where inventory walks record what they proved, read back by the writer.
-    pub coverage: &'a Arc<PendingCoverage>,
-    /// The account's change delivery gate. Re-establishment runs inventory
-    /// fusion, whose checkpoint-bearing pages have to know whether a NUMBERED
-    /// receiver took delivery; the raw `changes_tx` cannot say.
-    pub delivery: &'a Arc<ChangeDelivery>,
+    pub expected_generation: Option<crate::types::AccountGeneration>,
+}
+
+impl std::ops::Deref for RecoveryContext<'_> {
+    type Target = AccountSlot;
+    fn deref(&self) -> &Self::Target {
+        self.slot
+    }
 }
 
 /// Recovery work a dispatch could not finish and that nothing else will raise

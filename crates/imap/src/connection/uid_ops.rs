@@ -333,18 +333,18 @@ impl ImapConnection {
     }
 
     /// Shared implementation for SEARCH and UID SEARCH (RFC 3501 Section 6.4.4).
-    pub(super) async fn search_impl(
+    pub(super) async fn search_impl<I: crate::types::search::SearchAddress>(
         &self,
         cmd: Command,
         _label: &str,
         timeout: Duration,
-    ) -> Result<SearchResult, Error> {
+    ) -> Result<SearchResult<I>, Error> {
         // RFC 6855 Section 6: SEARCH criteria are free-form strings, so a
         // UTF8=ONLY server requires ENABLE UTF8=ACCEPT before SEARCH.
         self.check_utf8_only_enforced()?;
         self.submit_regular(
             cmd,
-            dispatch::SearchConsumer::new(),
+            dispatch::SearchConsumer::<I>::new(),
             Some(tokio::time::Instant::now() + timeout),
         )
         .await

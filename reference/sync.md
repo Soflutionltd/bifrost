@@ -13,9 +13,12 @@ crate. Consumers wire one `Arc<dyn AccountFactory>` per account.
 ```
 SyncEngine
   AccountSlot per attached account:
-    current: ArcSwap<Arc<dyn Account>>
+    current: ArcSwap<Incarnation>
     control: SyncControl
     workers: Vec<WorkerTask {join, abort}>
+    writer: detachable WriterHandle
+    subscriptions: SubscriptionRegistry (this attachment only)
+    registrations: SlotRegistrations (engine-wide indexes)
     Multiplexer task        -> per-scope poll + lifecycle + reopen
     Backfill orchestrator   -> partition runner per scope
                                (parks on the account's backfill bound)
@@ -33,12 +36,28 @@ SyncEngine
     BackfillBound (per account; the backfill bound's wait plus its admission)
     CheckpointStore (consumer-provided; InMemoryCheckpointStore for tests)
     InvalidationSinkInner (per-account SinkTargets)
-    SubscriptionRegistry (per-engine push subscription handles)
 ```
 
-`slot.current` is `ArcSwap<Arc<dyn Account>>` so reopens are
+`slot.current` is `ArcSwap<Incarnation>` so reopens are
 visible to spawned tasks immediately: every iteration calls
 `current.load_full()`. No `RwLock` on the hot path.
+
+`engine/context.rs` owns `AccountSlot`, `WorkerTask` and `WorkerRole`.
+`SlotContext` is an alias for `Arc<AccountSlot>`; workers share the installed
+slot instead of copying its handles. Recovery borrows the same slot, its typed
+writer endpoint and the request's expected account generation. Public
+configuration and connection identity remain in `types.rs`.
+
+Detach removes the slot's writer endpoint synchronously, before spawning its
+owned teardown task. The task keeps it through the discard drain, then drops
+it before awaiting the writer. Workers and callers retaining a slot Arc cannot
+pin that endpoint or obtain the next attachment's writer. Already cloned writer
+handles still receive the documented bounded final drain. After account close,
+detach takes and drops `SlotRegistrations` before releasing the lifecycle
+reservation. Old slot Arcs can outlive detach without later unregistering a
+fresh attachment's sink, budget, backfill projection, throttles or meter.
+This preserves the user's expectation that detaching one attachment cannot
+silently disable the account they attach next.
 
 The engine uses distinct names for three independent mechanisms:
 `cursor::coverage::PublicationStream` keys publication supersession and
@@ -165,11 +184,11 @@ Any error after `factory.open` and before slot installation closes the
 opened account best-effort before returning, so failed discovery or
 establishment cannot strand protocol workers or connections.
 
-`detach` sends `Stop` on the boundary channel, cancels the
-shutdown token, calls `Account::close()`, awaits all workers
-with `EngineConfig::detach_timeout` (default 5s) and aborts
-stragglers, removes the slot, unregisters the sink and ack
-sender.
+`detach` removes the slot, takes its writer endpoint, sends `Stop` and
+cancels shutdown before spawning the owned teardown task. That task awaits
+stream workers, drains the writer, waits for the reopen lock, closes the
+current account and releases the slot registrations. Each waiting phase has
+its own `EngineConfig::detach_timeout` (default 5s); stragglers are aborted.
 
 Worker awaits are two-phase and ORDERED: every stream worker first, the ack
 writer last. Each stream worker holds a clone of the writer's request sender,
@@ -650,23 +669,15 @@ without the lock (Drop cannot await, the dropping reattach usually still holds
 it, and with no runtime nothing can be running a concurrent reattach) and the
 close cannot run.
 
-Every registry write made off the detach path is sealed the same way: orphan
-restores (`restore_orphans`), a consumer's `subscribe_push` registration
-(`record`) and the reattach commit's install (`replace`) each take the slot's
-shutdown token and read it INSIDE the registry's own shard lock, the same lock
-`take` runs under. Detach
-cancels the token before it takes the registry, so a restore is either ordered
-before the take (and discarded by it) or after it (and sees the cancelled token
-and refuses). A check made before the write, as the cleanup task once did,
-leaves a window on a multi-thread runtime: the token is read, detach cancels
-and takes, and the orphan then lands under an id a later attach of the same
-`AccountId` inherits. The reopen lock does not close that window: detach's wait
-for it before the take is bounded by `detach_timeout` (consumer-driven
-reattaches hold it across `factory.open()` and network calls, and the one call
-a consumer has for getting rid of an account must not wait on a wedged open),
-and on expiry detach proceeds without it. The token read inside the shard lock
-is what orders a restore against the take in every case. The same sealed write is used by the ordinary abort's unwind and by
-`unsubscribe_push`.
+Each attachment owns its subscription registry and its shutdown token. Late
+writes cannot reach a fresh attachment under the same account id. Registry
+writes still check that token under the registry mutex, which `take` also
+holds. Detach cancels before taking the records, so a transfer either precedes
+the final take or is refused. This ordering protects server-handle cleanup:
+accepting a handle after that take would leave nobody to retry it. It no
+longer protects an engine-wide account-id map. The reopen lock still orders
+snapshot/replace against orphan restores, while detach's wait for that lock
+remains bounded.
 
 A refused `record` or `replace` names subscriptions that are LIVE on the
 provider, so refusal is followed by teardown, not a drop. Detach's "leave
@@ -1044,8 +1055,8 @@ under the same write lock.
    the batch, then call `SyncEngine::ack(account, token)`. Scope, checkpoint
    and acknowledgement lane come from that opaque token. Diagnostic-only
    events have no token.
-4. The per-account writer task (one per slot, fed by an
-   mpsc kept in `engine.ack_senders`) receives an `AckRequest`,
+4. The per-account writer task (one per slot, reached through the slot's
+   `WriterHandle`) receives an `AckRequest`,
    writes to `CheckpointStore`, then fires
    `SyncControl::record_checkpoint` to wake `pause` /
    `checkpoint_now` waiters. The returned `DurableCheckpointSet`
@@ -1403,17 +1414,17 @@ rescan can never plan a walk for a scope the registry has dropped.
 Open-ended `PageCount` (`total: None`) drives `BackfillPlan::OpenPages`:
 the orchestrator walks `Page { from, to }` windows of width `chunk`,
 advancing `from = to` each pass, and terminates only when a partition's
-completion DECLARES `PartitionEnd::Exhausted` (carried on
-`BackfillPartitionOutcome::end`). The entry count is never read as that
-declaration: a server whose query cap sits below `chunk` returns a short
+completion DECLARES `PartitionEnd::Exhausted` (represented by
+`BackfillPartitionOutcome::verdict` as `PartitionVerdict::Exhausted`). The entry
+count is never read as that declaration: a server whose query cap sits below `chunk` returns a short
 page with more behind it, and a window whose ids all vanished before
 hydration is empty with more behind it. A partition stream that ends
 without any completion declared nothing, so the walk ends there without
 completing the scope - neither asking for windows forever nor writing a
 sentinel over ground nothing proved. The same holds for every plan, not only
 `OpenPages`: `run_partition` reports a silently ended stream as
-`complete: false`, so a fixed plan (Full, time windows, UID ranges) no longer
-writes its completion sentinel over it, and the scope stays eligible for retry. Both
+`PartitionVerdict::EndedUnannounced`, so a fixed plan (Full, time windows,
+UID ranges) no longer writes its completion sentinel over it, and the scope stays eligible for retry. Both
 inventory front ends surface the silent end as a typed `SyncEvent::Warning`
 of kind `WarningKind::InventoryEndedUnannounced`
 (`inventory_walk::unannounced_end_warning`); the fusion walk establishes no
@@ -1718,8 +1729,12 @@ the runner turns into a failed partition on the rescan ramp; it is never read
 as `WaitFailed::ShuttingDown`, which would retire the whole orchestrator. The
 completion marker takes no admission at all (`wait_for_capacity`): it does no
 wire work and is emitted after the partition pass has handed its permit back.
-A `BackfillPermit` drop guard also releases the gate's stored permit when the
-partition future is cancelled. Capacity wakeup resumes the same already-open
+`BackfillAdmission` owns the partition's budget permit by value. The runner
+moves that owner through each capacity wait, which returns the retained or
+reacquired permit. Dropping an unpolled or parked partition future releases
+its admission without a separate release call. The cloneable bound stores no
+permit, so keeping it alive cannot hold or release another pass's budget.
+Capacity wakeup resumes the same already-open
 stream with its original activity, account and publication fence; it does not
 start a new drive or load a replacement account. Its low-level refused
 re-admission remains a partition failure, distinct from drive-start refusal.
@@ -2089,6 +2104,20 @@ consumers obtain one through `SyncEngine::backfill_checkpoint_writer` when they
 need the published helper, or build one over a bare store with
 `BackfillCheckpointTarget::direct`.
 
+`BackfillPartitionOutcome` carries counts and one `PartitionVerdict`:
+`Exhausted { degraded }`, `MoreBeyond { degraded }`, `EndedUnannounced`, or
+`StoppedAtBarrier`. A terminal completion can declare exhaustion while carrying
+a barrier; the barrier verdict takes precedence because later checkpoints must
+not cross unreplayable ground. `ScopeWalkDriver` retains the sticky barrier stop
+and coverage eligibility directly, without a separate one-flag walk wrapper.
+
+Planning and resume decisions live in `backfill/plan.rs`; planning takes the
+advertised partitioning and an explicit current timestamp. Completion marker
+construction and guarded publication live in `backfill/marker.rs`. Incarnation
+scheduling and its registry projection live in `backfill/scan.rs`. The engine
+orchestrator owns the async loop, admission and wiring. The existing typed
+`partitioner::BackfillKey` remains the shared key codec for resume and the writer.
+
 Partition SEQUENCING is not the orchestrator's; `ScopeWalkDriver` in
 `backfill/scope_walk.rs` owns it, so a barrier stops the enclosing scope walk
 rather than only the partition that hit it. See "A barrier taints the walk".
@@ -2103,10 +2132,10 @@ broadcast nor a recovery outcome for the replacement.
 `InvalidationSinkInner` maps attached accounts to `SinkTarget`s. Each target
 holds a bounded `PushIngress`, delivery gate, recovery sender, throttle bucket
 and account boundary. The ingress stores invalidation intent only: distinct
-cursor scopes and memberships, or one full-reconcile bit. Past
-`MultiplexerConfig::watch_capacity` (default 256) it clears the sets and keeps
-the full bit. `dropped()` and `bifrost_sync_push_dropped_total` count these
-coarsenings, including coarsenings of merged reconciler work. No reconcile is
+cursor scopes and memberships in `InvalidationIntent::Specific(PushHints)`,
+or `InvalidationIntent::Full`. Past `MultiplexerConfig::watch_capacity`
+(default 256), it replaces specific hints with full intent. `dropped()` and
+`bifrost_sync_push_dropped_total` count these coarsenings, including coarsenings of merged reconciler work. No reconcile is
 lost. Its synchronous mutex and latched `Notify` work off-runtime too.
 Unregister closes the ingress and wakes its reader.
 
@@ -2122,10 +2151,11 @@ event for resubmission. A refusal may persist through a consumer pause.
 Controls intentionally overtake pending invalidations: invalidations are
 idempotent wake-ups and no control verdict discharges them.
 
-Ingress and retained work share `PendingPush::bound`: crossing the distinct
-hint capacity clears narrow intent, requests a full sweep and counts exactly
-one coarsening. The reconciler routes specific hints through `scopes_for_hint`;
-full intent remains unresolved until the sweep so it sees current topology.
+Ingress and retained work share `InvalidationIntent::bound`: crossing the
+distinct hint capacity replaces narrow intent with a full sweep and counts
+exactly one coarsening. Retained work uses specific resolved cursor scopes;
+full intent cannot retain a competing narrow set. The reconciler routes
+specific hints through `scopes_for_hint`; full intent remains unresolved until the sweep so it sees current topology.
 
 The reconciler owns a persistent work set. It resolves memberships at merge
 time and full reconciliation at sweep time, retaining undispatched scopes.
@@ -2188,13 +2218,17 @@ this distinguishes generation zero's completed drain from initial state.
 Detach drains workers before closing the account. Providers retain ownership
 of effects that must survive a dropped stream.
 
-`SubscriptionRegistry` (per-engine `DashMap<AccountId,
-Vec<RegisteredSubscription>>`) stashes each returned handle together
+Each slot owns a fresh `SubscriptionRegistry` (a mutex-protected vector plus
+that attachment's shutdown token). It stashes each returned handle together
 with only the scopes in `PushSubscription::outcomes()`' succeeded lane. Failed
 scopes remain polling-only and are never recorded as covered. The validated
 three-lane outcome accounts for every requested scope, and an all-rejected
 request returns no handle. That accepted-scope snapshot lets account
 reopen recreate subscriptions against the replacement topology.
+Late cleanup can only reach the old attachment's registry. Writes still check
+the registry's own shutdown token under its lock: accepting a newly created
+server handle after teardown would abandon the cleanup obligation. A refused
+transfer tells its caller to tear the handle down or report provider expiry.
 The consumer can later call
 `SyncEngine::unsubscribe_push(account)` to walk the handles back
 through `Account::push_unsubscribe`. A failed teardown is returned to
@@ -2288,7 +2322,7 @@ not repeat the clear. Pinned by
 A `Created` lifecycle scope, or a deferred inventory scope, has no cursor, so a
 repair declined under a pause has nothing for the poll to re-raise the
 directive from. The dispatch returns it as a follow-up, and the reopen
-listener (directly, or through `SlotContext::recover`, which the
+listener (directly, or through `AccountSlot::recover`, which the
 deferred-inventory worker also dispatches through) parks it in the slot's `DeferredScopeRepairs` with
 the scope's lifecycle epoch. Each parked scope is a small task that waits for
 the boundary to read `Run`, claims only the map entry matching its captured
@@ -3521,7 +3555,7 @@ attach and closes the opened account; ordinary store errors propagate.
 `run_establish` also translates an unreadable
 row into a typed `AccountError` whose derived `RecoveryClass` is
 `Engine(SchemaIncompatible)`, but its callers do not feed that result
-back through `RecoveryContext::recover` and `handle_account_error`, which
+back through `AccountSlot::recover` and `handle_account_error`, which
 dispatches to the schema-clear arm. Per-scope recovery retries and then
 terminates that scope. Replacement attach rejects the candidate
 connection, and automatic account restart retries the reopen. It leaves
@@ -3532,7 +3566,7 @@ state, and reattach rollback has no safe restore path because consumer
 acknowledgements may persist newer rows. Rollback only deletes rows
 created by its own attempt. A consumer-driven reattach returns the
 failure. The account-wide schema clear loop is reached when a running
-worker sends a classified error through `RecoveryContext::recover`, not
+worker sends a classified error through `AccountSlot::recover`, not
 from the `run_establish` result alone.
 
 (These are engine `Error` enum variants, not `RecoveryClass`
@@ -4269,33 +4303,25 @@ crates/sync/src/
                           // resolved through `crate::engine` before the
                           // split still resolves here.
     drive_start.rs        // new wire admission, holds and scheduler refusal pacing
-    context.rs            // SlotContext: the slot-wide handle bundle
-                          // every spawned worker shares, plus
-                          // `recovery()` which borrows it as a
-                          // RecoveryContext and `backfill_bound()` which
-                          // borrows it as the backfill producer's door
-                          // onto the backfill bound
+    context.rs            // AccountSlot, WorkerTask, WorkerRole, SlotRegistrations;
+                          // SlotContext = Arc<AccountSlot>, shared by workers;
+                          // recovery() borrows the slot and writer;
+                          // backfill_bound() builds a capacity handle
     backfill_bound.rs     // BackfillBound + BackfillAdmission + WaitFailed.
                           // The backfill bound itself lives on the
                           // publication records in PendingCoverage, so
                           // this module keeps no ledger: it is the wait
                           // (`wait_for_capacity`, and the variant that
                           // gives up scheduler admission while parked)
-                          // plus the account's sync admission, which is
-                          // the only state it owns
+                          // plus by-value partition admission owners
     attach.rs             // attach / attach_inner / attach_opened,
                           // discover_scopes(_from), establish_one,
                           // persist_cursor, link_discovered_memberships,
                           // wait_for_real_subscriber,
                           // run_deferred_inventory_establishment
     backfill.rs           // run_backfill_orchestrator + BackfillWiring;
-                          // BackfillScan (rescan eligibility + retry
-                          // ramp); BackfillPlan -> ScopeResume is the
-                          // ONE seam where the fixed and open-page
-                          // shapes differ - the walk itself is shared;
-                          // open_pages_resume,
-                          // backfill_complete_recorded,
-                          // emit_backfill_complete
+                          // async loop, admission and engine wiring
+    parking_tests.rs      // orchestrator throttle parking and SlotContext tests
     writer/
       mod.rs              // Writer state owner, initial ledger load and serial dispatch
       protocol.rs         // private WriterRequest / AckRequest / OperatorDecision;
@@ -4340,7 +4366,7 @@ crates/sync/src/
   inventory_walk.rs       // shared inventory barrier and resume state
   types.rs                // EngineConfig, MultiplexerConfig,
                           // BackfillConfig, MutationConfig, PushConfig,
-                          // SchedulerConfig, AccountSlot, WorkerTask
+                          // SchedulerConfig, Incarnation, AccountGeneration
   recovery/
     mod.rs                // shared recovery dispatch entry points
     plan.rs               // plan_recovery + RecoveryPlan, failure effects,
@@ -4372,6 +4398,11 @@ crates/sync/src/
                           // cap LIVE_SUPERSEDES_DEFAULT_CAP)
     partitioner.rs        // plan() for TimeWindowed / UidRange / PageCount
     checkpoint.rs         // BackfillCheckpointWriter wrapper
+    plan.rs               // partitioning -> BackfillPlan -> ScopeResume;
+                          // durable completion and open-page resume decisions
+    marker.rs             // completion marker construction and guarded publication
+    scan.rs               // BackfillScan: incarnation scheduling, retained walks,
+                          // retry ramp and BackfillRegistry projection
     scope_walk.rs         // ScopeWalkDriver: partition sequencing;
                           // a barrier stops the whole scope walk
   push/
@@ -4380,7 +4411,7 @@ crates/sync/src/
     supervisor.rs         // Session supervision, pacing, generation drain
     health.rs             // Retained per-lane coverage state
     reconciler.rs         // Retained work set -> changes_stream
-    subscription.rs       // SubscriptionRegistry (per-engine DashMap)
+    subscription.rs       // SubscriptionRegistry (per-attachment vector)
   mutation/
     mod.rs                // MutationCounters,
                           // fanout::partition_by_account
@@ -4825,9 +4856,10 @@ Cursor and backfill inspection contracts:
   Crossing also preserves the retained decision when restoring an older
   snapshot that contains both forms of the key. The operator's accepted loss
   must not silently revert to automatic debt on the next walk.
-- `BackfillBound::clone` shares account capacity and warning state but allocates an
-  independent `BackfillAdmission` permit slot. A clone represents another pass;
-  use an `Arc<BackfillBound>` to share the same pass with a helper task.
+- `BackfillBound::clone` shares account capacity and warning state. It stores
+  no admission. Each `admit` returns an independent `BackfillAdmission` owner,
+  consumed by `BackfillRunner::run_partition`; its permit follows the future
+  through waits and drops on completion, refusal or cancellation.
 - Account writers bind every issued acknowledgement receipt to their account
   id and check that binding before resolving live claims or restart replay.
   Acknowledgement token format version 2 authenticates this account id.
@@ -4878,6 +4910,10 @@ Unfinished inventory establishment that reaches no numbered receiver returns
 bounded retry paths still handle it as an engine failure, without inventing an
 account recovery classification or treating the walk as complete. Other error
 variants retain their existing shapes.
+
+Push lane failures return `LaneDisposition`, pairing a named delay with an
+exclusive retry, terminal or restart action. Reconciler account holds use
+`GenerationHold` with named generation and deadline fields.
 
 Push lane retry and reconcile delays explicitly use `recovery::HINTLESS_RETRY_WAIT`
 when advice carries no hint. The lane takes the maximum of this delay and its

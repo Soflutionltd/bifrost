@@ -105,7 +105,7 @@ async fn sent_append_receipt(reply: Option<&'static str>) -> bifrost_types::Send
     });
     let receipt = tokio::time::timeout(
         Duration::from_secs(5),
-        super::pim::append_to_sent_or_fallback(
+        super::compose::append_to_sent_or_fallback(
             &account,
             bytes::Bytes::from_static(b"HELLO"),
             true,
@@ -179,7 +179,8 @@ async fn sent_copy_without_a_sent_folder_or_request_writes_nothing() {
     let account = scripted_account(conn, 1);
     let raw = bytes::Bytes::from_static(b"HELLO");
     let missing =
-        super::pim::append_to_sent_or_fallback(&account, raw.clone(), true, "m1@example.com").await;
+        super::compose::append_to_sent_or_fallback(&account, raw.clone(), true, "m1@example.com")
+            .await;
     assert!(matches!(
         missing.sent_copy,
         bifrost_types::SentCopy::NotFiled {
@@ -188,7 +189,7 @@ async fn sent_copy_without_a_sent_folder_or_request_writes_nothing() {
         }
     ));
     let declined =
-        super::pim::append_to_sent_or_fallback(&account, raw, false, "m1@example.com").await;
+        super::compose::append_to_sent_or_fallback(&account, raw, false, "m1@example.com").await;
     assert!(matches!(
         declined.sent_copy,
         bifrost_types::SentCopy::NotRequested
@@ -369,7 +370,7 @@ async fn draft_send_scripted(
     );
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
-        super::pim::draft_send_with_clock(
+        super::compose::draft_send_with_clock(
             account,
             bifrost_types::DraftHandle(draft.0),
             draft_send_clock,
@@ -552,7 +553,7 @@ async fn draft_discard_on_a_bare_server_retries_a_failed_post_send_discard() {
     );
     tokio::time::timeout(
         Duration::from_secs(5),
-        super::pim::draft_discard(account, bifrost_types::DraftHandle(draft.0)),
+        super::compose::draft_discard(account, bifrost_types::DraftHandle(draft.0)),
     )
     .await
     .expect("draft_discard must finish")
@@ -731,7 +732,7 @@ async fn send_through_peers(
     let send = match call {
         SendCall::Message(request) => {
             let record = Arc::clone(&rendered);
-            super::pim::send_message_with_render(account, *request, move |request, from| {
+            super::compose::send_message_with_render(account, *request, move |request, from| {
                 let out = bifrost_types::send_request_to_rfc5322(request, from)?;
                 *record.lock().unwrap() = Some(out.clone());
                 Ok(out)
@@ -739,7 +740,7 @@ async fn send_through_peers(
         }
         SendCall::Raw {
             raw, save_to_sent, ..
-        } => super::pim::send_raw_message(
+        } => super::compose::send_raw_message(
             account,
             bytes::Bytes::from_static(raw.as_bytes()),
             save_to_sent,
@@ -1054,7 +1055,7 @@ async fn container_create_completes_under_a_single_permit_pool() {
 
     let created = tokio::time::timeout(
         Duration::from_secs(5),
-        super::pim::container_create(
+        super::containers::container_create(
             account.clone(),
             ContainerKind::Folder,
             "Archive".to_owned(),
@@ -1886,7 +1887,7 @@ async fn container_delete_deselects_a_target_left_selected_in_the_pool() {
         .unwrap();
     drop(pooled);
 
-    super::pim::container_delete(account.clone(), ContainerId("Archive".to_owned()))
+    super::containers::container_delete(account.clone(), ContainerId("Archive".to_owned()))
         .await
         .expect("selected target must be deselected before delete");
     let _server = script.await.unwrap();
@@ -4309,7 +4310,7 @@ async fn pim_select_without_uidvalidity_is_the_providers_missing_field() {
         cases.push((
             AccountOperation::AddToContainer,
             pim_error_on_select_without_uidvalidity(move |account| {
-                super::pim::add_to_container(
+                super::mail_actions::add_to_container(
                     account,
                     MutationTarget::Message(id),
                     ContainerId("Archive".to_owned()),
@@ -4323,7 +4324,7 @@ async fn pim_select_without_uidvalidity_is_the_providers_missing_field() {
         cases.push((
             AccountOperation::RemoveFromContainer,
             pim_error_on_select_without_uidvalidity(move |account| {
-                super::pim::remove_from_container(
+                super::mail_actions::remove_from_container(
                     account,
                     MutationTarget::Message(id),
                     ContainerId("INBOX".to_owned()),
@@ -4337,7 +4338,7 @@ async fn pim_select_without_uidvalidity_is_the_providers_missing_field() {
         cases.push((
             AccountOperation::SetIsRead,
             pim_error_on_select_without_uidvalidity(move |account| {
-                super::pim::set_is_read(account, MutationTarget::Message(id), true)
+                super::mail_actions::set_is_read(account, MutationTarget::Message(id), true)
             })
             .await,
         ));
@@ -4347,7 +4348,7 @@ async fn pim_select_without_uidvalidity_is_the_providers_missing_field() {
         cases.push((
             AccountOperation::HydrateMessage,
             pim_error_on_select_without_uidvalidity(move |account| {
-                super::pim::message_hydrate(account, id, HydrationProjection::Full)
+                super::message::message_hydrate(account, id, HydrationProjection::Full)
             })
             .await,
         ));
@@ -4355,14 +4356,14 @@ async fn pim_select_without_uidvalidity_is_the_providers_missing_field() {
     cases.push((
         AccountOperation::Search,
         pim_error_on_select_without_uidvalidity(move |account| {
-            super::pim::search(account, in_inbox())
+            super::search::search(account, in_inbox())
         })
         .await,
     ));
     cases.push((
         AccountOperation::SearchMessages,
         pim_error_on_select_without_uidvalidity(move |account| {
-            super::pim::search_messages(account, in_inbox())
+            super::search::search_messages(account, in_inbox())
         })
         .await,
     ));
@@ -4470,7 +4471,7 @@ async fn search_messages_returns_the_boundary_survivor_after_an_earlier_expunge(
     };
 
     let first = search_page_against("* SEARCH 101 102 103 104", |account| {
-        super::pim::search_messages(account, request(None))
+        super::search::search_messages(account, request(None))
     })
     .await;
     assert_eq!(first.items, ids(&[101, 102]));
@@ -4478,7 +4479,7 @@ async fn search_messages_returns_the_boundary_survivor_after_an_earlier_expunge(
     // 101 is expunged before page two.
     let cursor = first.next_cursor.clone();
     let second = search_page_against("* SEARCH 102 103 104", move |account| {
-        super::pim::search_messages(account, request(cursor))
+        super::search::search_messages(account, request(cursor))
     })
     .await;
     assert_eq!(second.items, ids(&[103, 104]));
@@ -4499,7 +4500,7 @@ async fn thread_search_pages_by_lowest_member_uid() {
     };
 
     let first = search_page_against("* THREAD (104)(102 105)(101)(103)", |account| {
-        super::pim::search(account, request(None))
+        super::search::search(account, request(None))
     })
     .await;
     assert_eq!(
@@ -4514,7 +4515,7 @@ async fn thread_search_pages_by_lowest_member_uid() {
     // Thread 101 is expunged; an offset of 1 would land past thread 102.
     let cursor = first.next_cursor.clone();
     let second = search_page_against("* THREAD (104)(102 105)(103)", move |account| {
-        super::pim::search(account, request(cursor))
+        super::search::search(account, request(cursor))
     })
     .await;
     assert_eq!(
@@ -4576,7 +4577,7 @@ async fn hydrate_uid_3_against(
     let inbox = crate::types::MailboxName::new("INBOX").unwrap();
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        super::pim::message_hydrate(
+        super::message::message_hydrate(
             account,
             super::encode_object_id(
                 &inbox,
@@ -4681,7 +4682,7 @@ async fn add_to_container_and_message_hydrate_honour_their_capability_flags() {
 
     let err = tokio::time::timeout(
         Duration::from_secs(5),
-        super::pim::add_to_container(
+        super::mail_actions::add_to_container(
             account.clone(),
             MutationTarget::Message(id.clone()),
             ContainerId("Archive".to_owned()),
@@ -4697,7 +4698,7 @@ async fn add_to_container_and_message_hydrate_honour_their_capability_flags() {
 
     let err = tokio::time::timeout(
         Duration::from_secs(5),
-        super::pim::message_hydrate(
+        super::message::message_hydrate(
             account,
             id,
             bifrost_types::hydration::HydrationProjection::Headers,
@@ -4777,7 +4778,7 @@ async fn thread_hydrate_answers_once_per_requested_uid() {
 
     let hydrated = tokio::time::timeout(
         Duration::from_secs(5),
-        super::pim::thread_hydrate(account, thread),
+        super::message::thread_hydrate(account, thread),
     )
     .await
     .expect("thread_hydrate must not hang")
@@ -4844,7 +4845,7 @@ async fn a_refused_preflight_select_leaves_the_mutation_unsent() {
 
     let err = tokio::time::timeout(
         Duration::from_secs(5),
-        super::pim::add_to_container(
+        super::mail_actions::add_to_container(
             account,
             MutationTarget::Message(super::encode_object_id(
                 &inbox,

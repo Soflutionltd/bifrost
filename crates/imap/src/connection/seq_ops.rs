@@ -14,7 +14,7 @@ impl ImapConnection {
     /// Prefer [`uid_fetch`](Self::uid_fetch) for stable message references.
     pub async fn fetch(
         &self,
-        sequence_set: &SequenceSet,
+        sequence_set: &SequenceSet<crate::types::Seq>,
         items: &[FetchAttr],
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
@@ -38,7 +38,7 @@ impl ImapConnection {
     /// message references.
     pub async fn fetch_changed_since(
         &self,
-        sequence_set: &SequenceSet,
+        sequence_set: &SequenceSet<crate::types::Seq>,
         items: &[FetchAttr],
         mod_seq: crate::types::ModSeq,
         timeout: Duration,
@@ -62,7 +62,7 @@ impl ImapConnection {
     #[allow(clippy::type_complexity)]
     pub fn fetch_stream<'a>(
         &'a self,
-        sequence_set: &'a SequenceSet,
+        sequence_set: &'a SequenceSet<crate::types::Seq>,
         items: &'a [FetchAttr],
         timeout: Duration,
     ) -> Result<
@@ -79,7 +79,7 @@ impl ImapConnection {
     #[allow(clippy::type_complexity)]
     pub fn fetch_stream_with_capacity<'a>(
         &'a self,
-        sequence_set: &'a SequenceSet,
+        sequence_set: &'a SequenceSet<crate::types::Seq>,
         items: &'a [FetchAttr],
         capacity: usize,
         timeout: Duration,
@@ -114,7 +114,7 @@ impl ImapConnection {
     /// message references.
     pub async fn fetch_streaming(
         &self,
-        sequence_set: &SequenceSet,
+        sequence_set: &SequenceSet<crate::types::Seq>,
         items: &[FetchAttr],
         tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
         timeout: Duration,
@@ -140,7 +140,7 @@ impl ImapConnection {
         &self,
         criteria: impl Into<crate::types::SearchCriteria>,
         timeout: Duration,
-    ) -> Result<SearchResult, Error> {
+    ) -> Result<SearchResult<crate::types::Seq>, Error> {
         let criteria = criteria.into();
         self.search_impl(Command::Search { criteria }, "SEARCH", timeout)
             .await
@@ -236,7 +236,7 @@ impl ImapConnection {
     /// (they are not valid in STORE flag lists).
     pub async fn store(
         &self,
-        sequence_set: &SequenceSet,
+        sequence_set: &SequenceSet<crate::types::Seq>,
         operation: StoreOperation,
         flags: &[Flag],
         unchanged_since: Option<crate::types::ModSeqValzer>,
@@ -269,7 +269,7 @@ impl ImapConnection {
     /// Section 3), whether the server sent it tagged or untagged.
     pub async fn copy(
         &self,
-        sequence_set: &SequenceSet,
+        sequence_set: &SequenceSet<crate::types::Seq>,
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<CopyResult, Error> {
@@ -298,7 +298,7 @@ impl ImapConnection {
     ///   Section 3.2.10), the server sends VANISHED instead of EXPUNGE.
     pub async fn move_messages(
         &self,
-        sequence_set: &SequenceSet,
+        sequence_set: &SequenceSet<crate::types::Seq>,
         mailbox: &(impl crate::types::MailboxInput + ?Sized),
         timeout: Duration,
     ) -> Result<MoveResult, Error> {

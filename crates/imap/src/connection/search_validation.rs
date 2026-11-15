@@ -11,7 +11,7 @@ impl ImapConnection {
                 criteria: criteria.into(),
             },
             &crate::codec::encode::EncodeOptions {
-                utf8_mode: crate::codec::utf7::WireMode::ModifiedUtf7,
+                utf8_mode: crate::types::wire::WireMode::ModifiedUtf7,
                 literal_mode: crate::codec::encode::LiteralMode::LiteralPlus,
                 session: std::sync::Arc::clone(&snap.session),
             },

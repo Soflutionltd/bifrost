@@ -157,7 +157,7 @@ fn account_with(submission_available: bool, foreign_submission_id: Option<&str>)
         ws,
         shutdown,
         super::discover::LifecycleTopology {
-            positions: HashMap::new(),
+            position: None,
             names: HashMap::new(),
         },
     )

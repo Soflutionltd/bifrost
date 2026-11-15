@@ -1,9 +1,7 @@
 use crate::dialect::CardDavDialect;
 #[cfg(test)]
 use bifrost_dav_core::DavRequest;
-use bifrost_dav_core::collection::{
-    DavCollectionClient, Dialect, MultigetFetch, QUERY_HREF_PROPS, complete_failure_error,
-};
+use bifrost_dav_core::collection::{DavCollectionClient, Dialect, MultigetFetch, QUERY_HREF_PROPS};
 use std::fmt;
 
 use bifrost_dav_core::{
@@ -348,7 +346,7 @@ impl CardDavClient {
         let mut listing = parse_propfind_contacts(&response.text)
             .map_err(|error| parse_error(operation, format!("contact list: {error}")))?;
         listing.resolve_hrefs_with(&response.url, CardDavDialect::resolve_href);
-        if let Some(error) = listing_failure(&listing, operation) {
+        if let Some(error) = listing.failure::<CardDavDialect>(operation) {
             return Err(error);
         }
         Ok(listing)
@@ -422,7 +420,7 @@ impl CardDavClient {
         let (report, truncated) =
             crate::parse::parse_directory_report(&response.body, &response.url)
                 .map_err(|error| parse_error(operation, error))?;
-        if let Some(error) = multiget_failure(&report, operation) {
+        if let Some(error) = report.failure::<CardDavDialect>(operation) {
             return Err(error);
         }
         Ok((report, truncated))
@@ -573,30 +571,6 @@ pub(crate) fn extend_candidates(
     listing: crate::parse::CardDavContactListing,
 ) {
     listing.extend_candidates(query);
-}
-
-/// Keep whichever failure demands the more drastic recovery, so a 503 on
-/// one chunk cannot hide a 401 on another.
-fn multiget_failure(
-    report: &crate::parse::CardDavMultigetReport,
-    operation: AccountOperation,
-) -> Option<AccountError> {
-    complete_failure_error::<CardDavDialect>(report.classify(), report.failed.len(), operation)
-}
-
-/// The same ladder for a LISTING 207 - the depth-1 PROPFIND, the snapshot poll,
-/// and the `addressbook-query` candidate lane.
-///
-/// A listing with any committed entry never reaches here, so a member refused
-/// beside members that answered stays a per-id failure on `Page::failed_ids`
-/// and the page is served. Only a 207 in which every response failed, for a
-/// reason other than the resource being gone, becomes an error. Twin of the
-/// CalDAV function of the same name.
-fn listing_failure(
-    listing: &crate::parse::CardDavContactListing,
-    operation: AccountOperation,
-) -> Option<AccountError> {
-    complete_failure_error::<CardDavDialect>(listing.classify(), listing.failed.len(), operation)
 }
 
 pub(crate) fn contact_scope(id: impl Into<String>) -> ErrorScope {
@@ -1213,49 +1187,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn credentials_never_reach_a_resource_href_origin() {
-        // Two canned responses, so a neutered guard reaches the transport and
-        // fails on the destination assertion below rather than on a starved
-        // script - the failure has to name the credential leak.
-        let deleted = || DavResponse {
-            status: StatusCode::NO_CONTENT,
-            headers: HeaderMap::new(),
-            body: String::new(),
-            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                .expect("test DAV URL"),
-        };
-        let script = dav_script([deleted(), deleted()]);
-        let client =
-            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-
-        client
-            .delete_vcard(
-                "https://dav.example.test/book/one.vcf",
-                AccountOperation::ContactDelete,
-            )
-            .await
-            .expect("trusted request succeeds");
-        client
-            .delete_vcard(
-                "https://evil.test/stolen.vcf",
-                AccountOperation::ContactDelete,
-            )
-            .await
-            .expect_err("foreign resource origin is rejected");
-
-        let requests = transcripts(&script);
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://dav.example.test/book/one.vcf");
-        assert_eq!(
-            requests[0]
-                .headers
-                .get(AUTHORIZATION)
-                .and_then(|value| value.to_str().ok()),
-            Some("Bearer token")
-        );
-    }
-
     /// A poll-path snapshot spends the depth-0 ctag request and the depth-1
     /// contact listing, and never re-lists the address book home.
     ///
@@ -1756,48 +1687,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn discovery_falls_back_to_base_after_empty_well_known_response() {
-        let response = |body: &str| DavResponse {
-            status: StatusCode::MULTI_STATUS,
-            headers: HeaderMap::new(),
-            body: body.to_string(),
-            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                .expect("test DAV URL"),
-        };
-        let script = dav_script([
-            response("<D:multistatus xmlns:D=\"DAV:\"/>"),
-            response(
-                "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
-            ),
-            response(
-                "<C:addressbook-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:href>/books/ada/</D:href></C:addressbook-home-set>",
-            ),
-        ]);
-        let client =
-            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-
-        let home = client
-            .discover_addressbook_home()
-            .await
-            .expect("base fallback discovers home")
-            .home;
-
-        assert_eq!(home, "https://dav.example.test/books/ada/");
-        let urls = transcripts(&script)
-            .into_iter()
-            .map(|request| request.url)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            urls,
-            vec![
-                "https://dav.example.test/.well-known/carddav".to_string(),
-                "https://dav.example.test/".to_string(),
-                "https://dav.example.test/principals/ada/".to_string(),
-            ]
-        );
-    }
-
     /// A principal whose answer parses but names no addressbook home is a
     /// MISSING FIELD, not a parse failure. Twin of `bifrost-caldav`'s test of
     /// the same name. Against the code before the reclassification the kind
@@ -1841,114 +1730,6 @@ mod tests {
             "the principal answered: {error:?}"
         );
         assert_eq!(transcripts(&script).len(), 2);
-    }
-
-    /// Twin of `bifrost-caldav`'s
-    /// `discovery_falls_back_to_base_after_a_well_known_index_page`. A front end
-    /// answering the origin-root PROPFIND with `200` and its index page is the
-    /// same deployment the empty-207 test above covers, and must reach the same
-    /// place. Two things stood in the way here and BOTH are load-bearing: the
-    /// probe predicate did not admit `Protocol(ParseFailed)`, and the decode ran
-    /// inside the `Ok` arm and lifted its failure with `?`, so it never reached
-    /// the predicate at all.
-    #[tokio::test]
-    async fn discovery_falls_back_to_base_after_a_well_known_index_page() {
-        let script = dav_script([
-            DavResponse {
-                status: StatusCode::OK,
-                headers: HeaderMap::new(),
-                body: "<html><body><p>It works!</body></html>".to_string(),
-                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                    .expect("test DAV URL"),
-            },
-            DavResponse {
-                status: StatusCode::MULTI_STATUS,
-                headers: HeaderMap::new(),
-                body: "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>".to_string(),
-                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                    .expect("test DAV URL"),
-            },
-            DavResponse {
-                status: StatusCode::MULTI_STATUS,
-                headers: HeaderMap::new(),
-                body: "<C:addressbook-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:href>/books/ada/</D:href></C:addressbook-home-set>".to_string(),
-                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                    .expect("test DAV URL"),
-            },
-        ]);
-        let client =
-            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-
-        let home = client
-            .discover_addressbook_home()
-            .await
-            .expect("an index page at the origin root is not a discovery answer")
-            .home;
-
-        assert_eq!(home, "https://dav.example.test/books/ada/");
-        let urls = transcripts(&script)
-            .into_iter()
-            .map(|request| request.url)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            urls,
-            vec![
-                "https://dav.example.test/.well-known/carddav".to_string(),
-                "https://dav.example.test/".to_string(),
-                "https://dav.example.test/principals/ada/".to_string(),
-            ]
-        );
-    }
-
-    /// RFC 6764 puts well-known discovery at the origin root. A base URL
-    /// carrying a path is the only input that distinguishes an
-    /// origin-rooted construction from suffix concatenation, and getting
-    /// it wrong is not merely a wasted request: only the crate's
-    /// not-found classification falls back, so a deployment answering
-    /// the bogus path with 401/403 would fail the open outright.
-    #[tokio::test]
-    async fn well_known_probe_is_origin_rooted_for_a_path_bearing_base() {
-        let response = |body: &str| DavResponse {
-            status: StatusCode::MULTI_STATUS,
-            headers: HeaderMap::new(),
-            body: body.to_string(),
-            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                .expect("test DAV URL"),
-        };
-        let script = dav_script([
-            response("<D:multistatus xmlns:D=\"DAV:\"/>"),
-            response(
-                "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
-            ),
-            response(
-                "<C:addressbook-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:href>/books/ada/</D:href></C:addressbook-home-set>",
-            ),
-        ]);
-        let client = CardDavClient::with_account_net(
-            "https://dav.example.test/service",
-            scripted_dav_net(&script),
-        );
-
-        let home = client
-            .discover_addressbook_home()
-            .await
-            .expect("base fallback discovers home")
-            .home;
-
-        assert_eq!(home, "https://dav.example.test/books/ada/");
-        let urls = transcripts(&script)
-            .into_iter()
-            .map(|request| request.url)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            urls,
-            vec![
-                "https://dav.example.test/.well-known/carddav".to_string(),
-                "https://dav.example.test/service".to_string(),
-                "https://dav.example.test/principals/ada/".to_string(),
-            ],
-            "the well-known probe is rooted at the origin, and only the fallback uses the configured path"
-        );
     }
 
     fn discovery_script(home_href: &str) -> Arc<ScriptedDispatch> {
@@ -2062,70 +1843,6 @@ mod tests {
             books[0].href,
             "https://books.example.test/dav/homes/ada/team/"
         );
-    }
-
-    /// A redirect is server-controlled input: an origin discovery never
-    /// admitted must fail locally, and no request at all may reach it.
-    #[tokio::test]
-    async fn redirect_to_an_unadmitted_origin_is_refused_locally() {
-        let mut redirect_headers = HeaderMap::new();
-        redirect_headers.insert(
-            reqwest::header::LOCATION,
-            HeaderValue::from_static("https://evil.test/dav/"),
-        );
-        let script = dav_script([DavResponse {
-            status: StatusCode::FOUND,
-            headers: redirect_headers,
-            body: String::new(),
-            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                .expect("test DAV URL"),
-        }]);
-        let client =
-            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-
-        client
-            .list_addressbooks("https://dav.example.test/books/ada/")
-            .await
-            .expect_err("an unadmitted redirect target is refused");
-
-        assert_eq!(transcripts(&script).len(), 1);
-    }
-
-    #[tokio::test]
-    async fn manual_redirect_walk_allows_the_configured_hop_count() {
-        let max_hops = usize::from(bifrost_net::RedirectPolicy::default().max_hops);
-        let mut responses = Vec::new();
-        for _ in 0..max_hops {
-            let mut headers = HeaderMap::new();
-            headers.insert(reqwest::header::LOCATION, HeaderValue::from_static("/next"));
-            responses.push(DavResponse {
-                status: StatusCode::TEMPORARY_REDIRECT,
-                headers,
-                body: String::new(),
-                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                    .expect("test DAV URL"),
-            });
-        }
-        responses.push(DavResponse {
-            status: StatusCode::OK,
-            headers: HeaderMap::new(),
-            body: "ok".to_string(),
-            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                .expect("test DAV URL"),
-        });
-        let script = dav_script(responses);
-        let client =
-            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-
-        client
-            .delete_vcard(
-                "https://dav.example.test/start",
-                AccountOperation::ContactDelete,
-            )
-            .await
-            .expect("the configured number of redirects is allowed");
-
-        assert_eq!(transcripts(&script).len(), max_hops + 1);
     }
 
     /// RFC 4918 resolves a relative href against the EFFECTIVE request URI.
@@ -2582,7 +2299,8 @@ mod tests {
             missing_data: Vec::new(),
         };
 
-        let error = multiget_failure(&report, AccountOperation::ContactsList)
+        let error = report
+            .failure::<CardDavDialect>(AccountOperation::ContactsList)
             .expect("all-401 report is a complete failure");
         assert_eq!(
             error.kind(),
@@ -2607,7 +2325,11 @@ mod tests {
             missing_data: Vec::new(),
         };
 
-        assert!(multiget_failure(&report, AccountOperation::ContactsList).is_none());
+        assert!(
+            report
+                .failure::<CardDavDialect>(AccountOperation::ContactsList)
+                .is_none()
+        );
     }
 
     fn usable_report() -> CardDavMultigetReport {

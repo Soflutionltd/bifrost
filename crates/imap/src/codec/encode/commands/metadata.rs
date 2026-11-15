@@ -17,7 +17,7 @@ pub(in crate::codec::encode) fn encode_getmetadata(
     entries: &[String],
     max_size: Option<u64>,
     depth: Option<&str>,
-    utf8: crate::codec::utf7::WireMode,
+    utf8: crate::types::wire::WireMode,
 ) -> Result<(), crate::Error> {
     // RFC 5464 Section 5: `maxsize-opt = "MAXSIZE" SP number`
     // RFC 3501 Section 9: `number = 1*DIGIT`, unsigned 32-bit integer.
@@ -116,7 +116,7 @@ pub(in crate::codec::encode) fn encode_setmetadata(
     tag: &str,
     mailbox: impl AsRef<[u8]>,
     entries: &[(String, Option<Vec<u8>>)],
-    utf8: crate::codec::utf7::WireMode,
+    utf8: crate::types::wire::WireMode,
 ) -> Result<(), crate::Error> {
     // RFC 5464 Section 5 ABNF: `entry-values = "(" entry *(SP entry) ")"`.
     if entries.is_empty() {
@@ -173,6 +173,6 @@ pub(in crate::codec::encode) fn encode_metadata_value(w: &mut CommandWriter, dat
     if data.contains(&0) {
         w.literal(data, LiteralForm::Literal8);
     } else {
-        w.string(data, crate::codec::utf7::WireMode::ModifiedUtf7);
+        w.string(data, crate::types::wire::WireMode::ModifiedUtf7);
     }
 }

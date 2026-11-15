@@ -1,76 +1,152 @@
-//! The per-slot worker context.
-//!
-//! Every long-running worker `attach` spawns needs some subset of the
-//! same eighteen handles, and each one used to take them as positional
-//! arguments - the backfill orchestrator carried sixteen, the deferred
-//! inventory worker twenty, and the reopen listener rebuilt a
-//! seventeen-field [`RecoveryContext`] literal by hand at each of its
-//! call sites. Bundling them once at the end of `attach` means a worker
-//! takes the context plus only the handles that are genuinely its own,
-//! and a new slot-wide handle is added in one place rather than threaded
-//! through four signatures.
-//!
-//! Cheap to clone by construction: every field is an `Arc`, a channel
-//! sender, or a handle that is itself `Arc`-backed.
+//! One account attachment and its owned worker and registration lifetimes.
 
 use super::*;
 
-/// Slot-wide handles shared by the workers `attach` spawns.
-#[derive(Clone)]
-pub(super) struct SlotContext {
-    pub bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
-    pub factory: Arc<dyn AccountFactory>,
-    /// The currently-open protocol handle. Workers load through the
-    /// `ArcSwap` on every hot-path use so a reopen is observed
-    /// immediately.
-    pub current: Arc<ArcSwap<crate::types::Incarnation>>,
-    pub cursors: Arc<CursorRegistry>,
+/// Workers share the installed slot; they do not rebuild its handles.
+pub(crate) type SlotContext = Arc<AccountSlot>;
+
+/// Engine-side per-account state. Held inside the engine's
+/// `DashMap<AccountId, Arc<AccountSlot>>`.
+///
+/// `current` is an `ArcSwap<crate::types::Incarnation>` so a reopen swap
+/// becomes visible to spawned workers (reconciler, multiplexer,
+/// backfill, mutation) at their next iteration without re-spawning.
+/// Workers load with `current.load_full()`.
+pub(crate) struct AccountSlot {
     pub account_id: AccountId,
-    pub control: SyncControl,
-    pub account_control_tx: broadcast::Sender<AccountControl>,
-    pub throttles: Arc<crate::throttle::ThrottleBucket>,
-    pub boundary_tx: watch::Sender<crate::cancel::BoundaryRequest>,
-    pub capabilities: Arc<std::sync::RwLock<AccountCapabilities>>,
+    /// The account's single durable writer, taken by detach.
+    ///
+    /// Reattach persists and rolls back replacement cursors through this
+    /// channel rather than touching the store directly, so both are ordered
+    /// against consumer acknowledgements. A replacement's inventory pass
+    /// broadcasts checkpoint-bearing batches before the cutover: a direct
+    /// write racing the ack writer let an aborted reattach delete a cursor a
+    /// consumer had already acknowledged.
+    pub writer: std::sync::Mutex<Option<WriterHandle>>,
     pub subscriptions: Arc<SubscriptionRegistry>,
-    pub account_generation_tx: watch::Sender<crate::types::AccountGeneration>,
-    pub push_retired: watch::Sender<crate::types::AccountGeneration>,
-    pub push_topology: watch::Sender<crate::engine::PushTopologyGeneration>,
-    pub push_drain_wait: Duration,
-    pub reopen_lock: Arc<AsyncMutex<()>>,
-    /// Slot-lifetime open-skip lane; a successful reattach replaces it
-    /// with the replacement open's `OpenedAccount::skipped_scopes`.
-    pub open_skips: Arc<std::sync::Mutex<Vec<SkippedScope>>>,
-    /// Per-slot child of the engine's root cancellation token.
-    pub shutdown: CancellationToken,
-    /// Sender onto the account's single durable writer.
-    pub writer_tx: mpsc::Sender<WriterRequest>,
-    pub coverage: Arc<PendingCoverage>,
-    /// Fired when a real consumer subscribes to `changes_tx`, so a
-    /// cold-start worker can park instead of broadcasting into a channel
-    /// with no reader.
-    pub subscriber_notify: Arc<Notify>,
-    pub scheduler: Scheduler,
-    /// The account's change broadcast plus its receiver numbering. The backfill
-    /// producer publishes through it so a page's send and its delivery stamp are
-    /// one step; see `delivery::ChangeDelivery`.
-    pub delivery: Arc<ChangeDelivery>,
-    /// How many published-but-unanswered backfill batches the account may have
-    /// in flight before its cold-start producer parks.
-    pub backfill_capacity: usize,
-    /// The slot's own reopen channel, for re-offering a declined scope repair.
-    pub reopen_tx: mpsc::Sender<ReopenRequest>,
-    /// Scope repairs declined under a pause that nothing else will raise again.
     pub deferred_repairs: Arc<DeferredScopeRepairs>,
-    /// An account-wide schema reset declined under a pause or exhausted, with
-    /// the scopes it owes re-establishment, plus the count of resets that have
-    /// committed during this attachment. See [`DeferredSchemaReset`].
-    pub deferred_schema_reset: Arc<DeferredSchemaReset>,
-    /// The multiplexer's per-scope poll tokens, for retiring a scope the
-    /// reopen listener learns was deleted after it established it.
     pub scope_tokens: crate::multiplexer::ScopeTokens,
+    pub backfill_capacity: usize,
+    pub push_drain_wait: Duration,
+    pub registrations: std::sync::Mutex<Option<SlotRegistrations>>,
+    pub deferred_schema_reset: Arc<crate::engine::DeferredSchemaReset>,
+    /// Strong owner across replacement opens, released with the slot.
+    pub bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
+    pub scheduler: Scheduler,
+    pub factory: Arc<dyn AccountFactory>,
+    pub current: Arc<ArcSwap<crate::types::Incarnation>>,
+    /// Monotonic signal bumped after a successful handle swap, carrying the
+    /// generation of the incarnation just installed. Long-lived push and
+    /// lifecycle streams select on it so they drop the old stream even when
+    /// that stream never terminates itself. A wake signal only: a stale
+    /// recovery request is judged against `current`, never against this.
+    pub account_generation_tx: watch::Sender<crate::types::AccountGeneration>,
+    pub push_health_tx: watch::Sender<crate::push::health::PushHealth>,
+    pub push_topology_tx: watch::Sender<crate::engine::PushTopologyGeneration>,
+    pub push_retired_tx: watch::Sender<crate::types::AccountGeneration>,
+    pub reopen_lock: Arc<tokio::sync::Mutex<()>>,
+    pub capabilities: Arc<std::sync::RwLock<AccountCapabilities>>,
+    /// Held for the slot's lifetime so the handle's owned resources are
+    /// released with the slot; engine code reaches the multiplexer through
+    /// `ChangeDelivery` and `PagePublisher`, not through this field.
+    #[allow(dead_code)]
+    pub multiplexer: MultiplexerHandle,
+    pub cursors: Arc<CursorRegistry>,
+    /// What each scope's latest enumeration proved, pending the
+    /// acknowledgement that makes it durable. Shared with the account's single
+    /// writer, which reads it back to build one atomic checkpoint record.
+    pub coverage: Arc<crate::cursor::PendingCoverage>,
+    pub boundary: Boundary,
+    pub shutdown: CancellationToken,
+    pub control: SyncControl,
+    /// Sentinel receiver keeps `changes_tx` alive across periods with
+    /// no subscribers so new subscribers don't get a closed-channel
+    /// error.
+    #[allow(dead_code)]
+    pub _sentinel_rx: tokio::sync::broadcast::Receiver<crate::delivery::MultiplexerEvent>,
+    /// Spawned workers paired with their abort handles. `detach`
+    /// aborts each worker on timeout so tasks do not leak past the
+    /// configured deadline.
+    pub workers: std::sync::Mutex<Vec<WorkerTask>>,
+    /// Per-account control stream. Engine publishes
+    /// `AccountControl::Pause(reason)` when the engine has automatically
+    /// paused the account (operator-override directive, retry budget
+    /// exhausted, tenant throttle). Consumers subscribe via
+    /// `SyncEngine::account_control_stream`.
+    pub account_control_tx: broadcast::Sender<AccountControl>,
+    /// Sentinel receiver keeps the account-control channel alive.
+    #[allow(dead_code)]
+    pub _account_control_sentinel: broadcast::Receiver<AccountControl>,
+    /// Notify fired when a new real subscriber arrives on
+    /// `changes_tx`. Lets deferred-inventory workers park on `notified`
+    /// instead of hot-polling `receiver_count`.
+    pub subscriber_notify: Arc<Notify>,
+    /// Per-account reopen channel. The bulk-mutation campaign routes
+    /// `EngineDirective::*` raised mid-stream through here so the
+    /// reopen listener dispatches via `handle_engine_directive`.
+    pub reopen_tx: mpsc::Sender<ReopenRequest>,
+    /// Engine-wide throttle bucket (shared by every slot so tenant /
+    /// provider deadlines cross accounts). Recovery paths record waits
+    /// keyed by `ThrottleKey`; the per-scope poll loop and the push
+    /// reconciler consult it before driving work.
+    pub throttles: Arc<crate::throttle::ThrottleBucket>,
+    /// The `OpenedAccount::skipped_scopes` lane from the most recent
+    /// successful `factory.open` (attach or reopen swap): the parts of
+    /// the account surface the protocol crate discovered but could not
+    /// bring up, with their classified errors. Exposed via
+    /// `SyncEngine::open_skipped_scopes` so a consumer can tell a
+    /// degraded shared namespace apart from one that does not exist.
+    pub open_skips: Arc<std::sync::Mutex<Vec<bifrost_types::SkippedScope>>>,
+    /// The account's change broadcast plus the numbering of the receivers it has
+    /// handed out.
+    ///
+    /// The engine numbers them because `tokio::broadcast` cannot say whether a
+    /// given receiver can still take delivery of a given batch, and a subscriber
+    /// COUNT answers that question wrongly the moment one consumer is replaced by
+    /// an overlapping successor. One mutex orders send-and-stamp,
+    /// subscribe-and-number, and unregister-and-sweep, so the answer is exact
+    /// rather than approximate.
+    pub delivery: Arc<crate::delivery::ChangeDelivery>,
 }
 
-impl SlotContext {
+pub(crate) struct WorkerTask {
+    pub role: WorkerRole,
+    pub join: tokio::task::JoinHandle<()>,
+    pub abort: tokio::task::AbortHandle,
+}
+
+/// Which spawned slot worker a [`WorkerTask`] is.
+///
+/// One variant per spawn site in `engine/attach.rs`, so the `role` field on the
+/// detach worker phase's warn lines (rendered with `Debug`, which prints the
+/// variant name) names the worker that wedged or panicked. Only `AckWriter` has
+/// behavior attached (it is torn down in its own phase, last); every other
+/// variant is a stream-phase worker and exists purely for attribution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkerRole {
+    /// Durably persists cursors as they are acked; drained in its own phase.
+    AckWriter,
+    /// Forwards priority and bandwidth-cap changes to the open handle.
+    ControlApplier,
+    /// Push reconciler: turns watch events into driven scopes.
+    PushReconciler,
+    /// Supervises push sessions and their bounded cleanup.
+    PushSupervisor,
+    /// The per-scope poll multiplexer.
+    Multiplexer,
+    /// Walks registered scopes and runs their backfill partitions.
+    BackfillOrchestrator,
+    /// Establishes cold-start inventory once the slot has a subscriber.
+    DeferredInventory,
+    /// Serves reopen and scope-deleted requests.
+    ReopenListener,
+    /// Polls the bandwidth meter into the control's observed-bps atomic.
+    BandwidthFeed,
+    /// Retries the teardown of orphaned push subscriptions on a timer.
+    OrphanTeardownRetrier,
+}
+
+impl AccountSlot {
     /// Dispatch a classified error through recovery, and park whatever the
     /// dispatch declined because the account was paused (or, for an account
     /// reset, could not complete), when nothing else would raise it again. See
@@ -131,8 +207,8 @@ impl SlotContext {
     ///
     /// The gate holds no ledger of its own - capacity is a property of the
     /// publication records in `coverage`. It bundles the bound, the token and
-    /// the account's scheduler admission, and that admission is the only state
-    /// it owns.
+    /// admission configuration. Each admitted partition owns its permit by
+    /// value, independently of this cloneable bound.
     pub(super) fn backfill_bound(&self) -> BackfillBound {
         BackfillBound::new(
             Arc::clone(&self.coverage),
@@ -145,44 +221,105 @@ impl SlotContext {
     }
 }
 
-impl SlotContext {
-    /// A handle onto the account's single durable writer.
-    ///
-    /// Minted per use rather than stored, because `WriterHandle` is a
-    /// thin wrapper over the sender and the recovery paths want one
-    /// borrowed for the duration of a single dispatch.
+impl AccountSlot {
+    /// Clone the writer while this slot still owns it. Once detach begins, old slot holders get a closed endpoint rather than a replacement
+    /// attachment's writer.
     pub(super) fn writer(&self) -> WriterHandle {
-        WriterHandle::new(self.writer_tx.clone())
+        self.writer
+            .lock()
+            .expect("slot writer lock poisoned")
+            .clone()
+            .unwrap_or_else(WriterHandle::closed)
     }
 
-    /// Borrow this context as the recovery dispatch's argument bundle.
-    ///
-    /// The writer is passed separately because `RecoveryContext` borrows
-    /// it, so it has to outlive the dispatch on the caller's stack.
+    pub(super) fn take_writer(&self) -> Option<WriterHandle> {
+        self.writer
+            .lock()
+            .expect("slot writer lock poisoned")
+            .take()
+    }
+
     pub(super) fn recovery<'a>(&'a self, writer: &'a WriterHandle) -> RecoveryContext<'a> {
         RecoveryContext {
-            scheduler: &self.scheduler,
-            deferred_schema_reset: &self.deferred_schema_reset,
-            bandwidth_budget: self.bandwidth_budget.as_ref(),
-            factory: &self.factory,
-            current: &self.current,
-            cursors: &self.cursors,
-            account_id: &self.account_id,
-            control: &self.control,
-            account_control_tx: &self.account_control_tx,
-            throttles: &self.throttles,
-            capabilities: &self.capabilities,
-            subscriptions: &self.subscriptions,
-            account_generation_tx: &self.account_generation_tx,
-            push_retired: &self.push_retired,
-            push_drain_wait: self.push_drain_wait,
-            expected_generation: None,
-            reopen_lock: &self.reopen_lock,
-            open_skips: &self.open_skips,
-            shutdown: &self.shutdown,
+            slot: self,
             writer,
-            coverage: &self.coverage,
-            delivery: &self.delivery,
+            expected_generation: None,
         }
+    }
+}
+
+/// Owns the engine-wide indexes for one attachment. Detach takes this guard
+/// after close, before releasing the lifecycle reservation. Retained slot Arcs
+/// must never unregister a later attachment when they eventually drop.
+pub(super) struct SlotRegistrations {
+    pub account_id: AccountId,
+    pub sink: Arc<InvalidationSinkInner>,
+    pub budget: BudgetGate,
+    pub backfill_registry: Arc<BackfillRegistry>,
+    pub throttles: Arc<crate::throttle::ThrottleBucket>,
+    pub bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
+}
+
+impl Drop for SlotRegistrations {
+    fn drop(&mut self) {
+        self.sink.unregister(&self.account_id);
+        self.budget.forget(&self.account_id);
+        self.backfill_registry.forget_account(&self.account_id);
+        self.throttles.forget_account(&self.account_id);
+        if let Some(meter) = &self.bandwidth_meter {
+            meter.forget_account(&self.account_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduler::WorkKind;
+    use crate::test_common::{StubAccount, StubFactory};
+
+    #[tokio::test(start_paused = true)]
+    async fn retained_slot_neither_pins_writer_drain_nor_retires_a_later_attach() {
+        let engine = SyncEngine::builder().build().expect("engine");
+        let account_id = AccountId("retained-slot".into());
+        let factory: Arc<dyn AccountFactory> = Arc::new(StubFactory::queue(vec![
+            Arc::new(StubAccount::new(Vec::new())),
+            Arc::new(StubAccount::new(Vec::new())),
+        ]));
+        engine
+            .attach(account_id.clone(), Arc::clone(&factory))
+            .await
+            .expect("attach");
+        let retired = engine.slot(&account_id).expect("slot");
+        tokio::time::timeout(Duration::from_millis(100), engine.detach(&account_id))
+            .await
+            .expect("retaining the slot must not spend the writer timeout")
+            .expect("detach");
+        assert!(matches!(
+            retired.writer().get_ledger().await,
+            Err(Error::ShuttingDown)
+        ));
+
+        engine
+            .attach(account_id.clone(), factory)
+            .await
+            .expect("fresh attach");
+        let fresh = engine.slot(&account_id).expect("fresh slot");
+        let handle = bifrost_types::SubscriptionHandle("fresh-handle".into());
+        assert!(fresh.subscriptions.record(handle.clone(), Vec::new()));
+        assert!(!retired.subscriptions.record(
+            bifrost_types::SubscriptionHandle("late-old-handle".into()),
+            Vec::new()
+        ));
+        drop(retired);
+        assert_eq!(fresh.subscriptions.snapshot()[0].handle, handle);
+        let permit = engine
+            .scheduler
+            .budget()
+            .acquire(&account_id, WorkKind::Sync)
+            .await
+            .expect("retired slot cannot forget the replacement's budget");
+        drop(permit);
+        engine.detach(&account_id).await.expect("final detach");
     }
 }

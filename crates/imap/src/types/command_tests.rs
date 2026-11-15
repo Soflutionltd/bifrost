@@ -922,7 +922,7 @@ fn command_append_debug_never_prints_the_body() {
 /// extension sections, including the rows that are easy to get wrong.
 #[test]
 fn legal_states_follow_the_rfc_rows() {
-    use crate::connection::SessionState::{Authenticated, NotAuthenticated, Selected};
+    use crate::types::SessionState::{Authenticated, NotAuthenticated, Selected};
 
     assert_eq!(
         CommandKind::Noop.legal_states(),
@@ -949,7 +949,7 @@ fn legal_states_follow_the_rfc_rows() {
 /// No command is legal in Logout, and every command is legal somewhere.
 #[test]
 fn no_command_is_legal_in_logout() {
-    use crate::connection::SessionState;
+    use crate::types::SessionState;
 
     let every_kind = every_command_kind();
     for kind in every_kind {
@@ -1029,6 +1029,7 @@ fn every_command_kind() -> Vec<CommandKind> {
         K::SearchReturn,
         K::SearchSave,
         K::Fetch,
+        K::UidFetch,
         K::Store,
         K::Copy,
         K::Move,
@@ -1082,6 +1083,7 @@ fn every_command_kind() -> Vec<CommandKind> {
             | K::SearchReturn
             | K::SearchSave
             | K::Fetch
+            | K::UidFetch
             | K::Store
             | K::Copy
             | K::Move

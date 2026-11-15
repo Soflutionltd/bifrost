@@ -111,6 +111,31 @@ impl WriterHandle {
             .await?
     }
 
+    pub(crate) async fn enqueue_discard(
+        &self,
+        scope: CursorScope,
+    ) -> Result<oneshot::Receiver<Result<(), Error>>, Error> {
+        let (done, recv) = oneshot::channel();
+        self.tx
+            .send(WriterRequest::DiscardBackfillProgress { scope, done })
+            .await
+            .map_err(|_| Error::ShuttingDown)?;
+        Ok(recv)
+    }
+
+    pub(crate) async fn operator_decision(
+        &self,
+        key: bifrost_types::ObligationKey,
+        decision: OperatorDecision,
+    ) -> Result<bool, Error> {
+        self.request(|done| WriterRequest::OperatorDecision {
+            key,
+            decision,
+            done,
+        })
+        .await?
+    }
+
     pub(crate) async fn discard_backfill_progress(
         &self,
         scope: CursorScope,
@@ -136,6 +161,12 @@ impl WriterHandle {
             done,
         })
         .await?
+    }
+
+    pub(crate) fn closed() -> Self {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        Self::new(tx)
     }
 
     pub(crate) fn new(tx: mpsc::Sender<WriterRequest>) -> Self {
@@ -250,8 +281,37 @@ impl WriterHandle {
         recv.await.map_err(|_| Error::ShuttingDown)?
     }
 
-    pub(crate) fn sender(&self) -> mpsc::Sender<WriterRequest> {
-        self.tx.clone()
+    /// Compensation from a dropped reattach must enter the queue synchronously
+    /// before a later attempt can enqueue inserts. A full queue retains the
+    /// same fallback ownership in a spawned send.
+    pub(crate) fn settle_reattach_on_drop(
+        &self,
+        attempt: crate::engine::ReattachAttempt,
+        committed: bool,
+        runtime: Option<&tokio::runtime::Handle>,
+        account_id: &AccountId,
+    ) {
+        let request = if committed {
+            WriterRequest::ReattachCommit { attempt }
+        } else {
+            let (done, _ignored) = oneshot::channel();
+            WriterRequest::ReattachAbort { attempt, done }
+        };
+        match self.tx.try_send(request) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(request)) => {
+                if let Some(runtime) = runtime {
+                    let writer = self.clone();
+                    runtime.spawn(async move {
+                        let _ = writer.tx.send(request).await;
+                    });
+                } else {
+                    tracing::error!(target: "bifrost.sync.reopen", account = ?account_id,
+                        "writer queue full and no runtime on a dropped reattach; \
+                         provisional cursor rows keep their state until a later abort or commit");
+                }
+            }
+        }
     }
 
     pub(crate) async fn reattach_insert(

@@ -1297,7 +1297,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
         | ResponseCode::UidValidity(_)
         | ResponseCode::Unseen(_)
         | ResponseCode::AppendUid { .. }
-        | ResponseCode::CopyUid { .. }
+        | ResponseCode::CopyUid(_)
         | ResponseCode::HighestModSeq(_)
         | ResponseCode::MailboxId(_)
         | ResponseCode::MetadataLongEntries(_) => return None,
@@ -1750,6 +1750,42 @@ pub(super) fn rejected_scope_error(detail: &'static str) -> AccountError {
     .text(bifrost_types::DiagnosticText::user_safe(detail))
     .try_build()
     .expect("valid push scope error")
+}
+
+/// Build a `map_err` closure that stamps every internal IMAP `Error` with
+/// the operation of the calling public method. Threading operation
+/// per call site is what lets the central recovery mapping distinguish
+/// `Reconcile` vs `Retry::SameRequest` on non-idempotent operations.
+pub(super) fn op_err(op: AccountOperation) -> impl Fn(Error) -> AccountError + Copy {
+    move |e| super::account_error_with(e, ImapErrorContext::operation(op))
+}
+
+pub(super) fn folder_err<'a>(
+    account: &'a super::ImapAccount,
+    folder: &'a MailboxName,
+    op: AccountOperation,
+) -> impl Fn(Error) -> AccountError + Copy + 'a {
+    move |error| account.folder_error(error, folder, ImapErrorContext::operation(op))
+}
+
+/// Folder-aware classification for a failure in the PREFLIGHT of a per-folder step - the
+/// checkout, the SELECT/EXAMINE, the UIDVALIDITY read - restamped `Unsent`
+/// relative to the operation, the rule `connection::append`'s
+/// `unsent_preflight` states for APPEND. The preflight command carries its own
+/// transmission evidence (a tagged `NO` to SELECT is `Acknowledged`), but that
+/// is about the SELECT, not about the COPY / STORE / FETCH the operation is
+/// made of, which was never sent. Publishing the SELECT's evidence would make
+/// recovery reconcile a non-idempotent mutation that never reached the server.
+///
+/// This speaks only for the folder being prepared. Earlier folders' committed
+/// effects remain in FolderProgress and are attached by the public operation;
+/// an unsent preparation does not erase them.
+pub(super) fn folder_preflight_err<'a>(
+    account: &'a super::ImapAccount,
+    folder: &'a MailboxName,
+    op: AccountOperation,
+) -> impl Fn(Error) -> AccountError + Copy + 'a {
+    move |error| folder_err(account, folder, op)(error.for_unsent_operation())
 }
 
 #[cfg(test)]

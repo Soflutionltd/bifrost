@@ -1,22 +1,10 @@
-//! Engine-internal types: configuration knobs, work-kind tags, and
-//! the `AccountSlot` shape the engine keeps in its `DashMap`.
+//! Published engine configuration and account connection identity.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
-use bifrost_types::{Account, AccountCapabilities, AccountControl, AccountFactory};
-use tokio::sync::{Notify, broadcast, mpsc, watch};
+use bifrost_types::Account;
 
-use crate::engine::supervisor::ReopenRequest;
-use tokio::task::{AbortHandle, JoinHandle};
-use tokio_util::sync::CancellationToken;
-
-use crate::cancel::BoundaryRequest;
-use crate::control::SyncControl;
-use crate::cursor::CursorRegistry;
-use crate::multiplexer::MultiplexerHandle;
-use crate::scheduler::Scheduler;
 use crate::scheduler::budget::ConcurrencyBudget;
 
 /// Top-level engine configuration. Cloned into every `AccountSlot`.
@@ -356,129 +344,4 @@ impl std::fmt::Debug for Incarnation {
             .field("generation", &self.generation)
             .finish_non_exhaustive()
     }
-}
-
-/// Engine-side per-account state. Held inside the engine's
-/// `DashMap<AccountId, Arc<AccountSlot>>`.
-///
-/// `current` is an `ArcSwap<Incarnation>` so a reopen swap
-/// becomes visible to spawned workers (reconciler, multiplexer,
-/// backfill, mutation) at their next iteration without re-spawning.
-/// Workers load with `current.load_full()`.
-pub(crate) struct AccountSlot {
-    pub deferred_schema_reset: Arc<crate::engine::DeferredSchemaReset>,
-    /// Strong owner across replacement opens, released with the slot.
-    pub bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
-    pub scheduler: Scheduler,
-    pub factory: Arc<dyn AccountFactory>,
-    pub current: Arc<ArcSwap<Incarnation>>,
-    /// Monotonic signal bumped after a successful handle swap, carrying the
-    /// generation of the incarnation just installed. Long-lived push and
-    /// lifecycle streams select on it so they drop the old stream even when
-    /// that stream never terminates itself. A wake signal only: a stale
-    /// recovery request is judged against `current`, never against this.
-    pub account_generation_tx: watch::Sender<crate::types::AccountGeneration>,
-    pub push_health_tx: watch::Sender<crate::push::health::PushHealth>,
-    pub push_topology_tx: watch::Sender<crate::engine::PushTopologyGeneration>,
-    pub push_retired_tx: watch::Sender<crate::types::AccountGeneration>,
-    pub reopen_lock: Arc<tokio::sync::Mutex<()>>,
-    pub capabilities: Arc<std::sync::RwLock<AccountCapabilities>>,
-    /// Held for the slot's lifetime so the handle's owned resources are
-    /// released with the slot; engine code reaches the multiplexer through
-    /// `ChangeDelivery` and `PagePublisher`, not through this field.
-    #[allow(dead_code)]
-    pub multiplexer: MultiplexerHandle,
-    pub cursors: Arc<CursorRegistry>,
-    /// What each scope's latest enumeration proved, pending the
-    /// acknowledgement that makes it durable. Shared with the account's single
-    /// writer, which reads it back to build one atomic checkpoint record.
-    pub coverage: Arc<crate::cursor::PendingCoverage>,
-    pub boundary_tx: watch::Sender<BoundaryRequest>,
-    pub shutdown: CancellationToken,
-    pub control: SyncControl,
-    /// Sentinel receiver keeps `changes_tx` alive across periods with
-    /// no subscribers so new subscribers don't get a closed-channel
-    /// error.
-    #[allow(dead_code)]
-    pub _sentinel_rx: tokio::sync::broadcast::Receiver<crate::delivery::MultiplexerEvent>,
-    /// Spawned workers paired with their abort handles. `detach`
-    /// aborts each worker on timeout so tasks do not leak past the
-    /// configured deadline.
-    pub workers: Mutex<Vec<WorkerTask>>,
-    /// Per-account control stream. Engine publishes
-    /// `AccountControl::Pause(reason)` when the engine has automatically
-    /// paused the account (operator-override directive, retry budget
-    /// exhausted, tenant throttle). Consumers subscribe via
-    /// `SyncEngine::account_control_stream`.
-    pub account_control_tx: broadcast::Sender<AccountControl>,
-    /// Sentinel receiver keeps the account-control channel alive.
-    #[allow(dead_code)]
-    pub _account_control_sentinel: broadcast::Receiver<AccountControl>,
-    /// Notify fired when a new real subscriber arrives on
-    /// `changes_tx`. Lets deferred-inventory workers park on `notified`
-    /// instead of hot-polling `receiver_count`.
-    pub subscriber_notify: Arc<Notify>,
-    /// Per-account reopen channel. The bulk-mutation campaign routes
-    /// `EngineDirective::*` raised mid-stream through here so the
-    /// reopen listener dispatches via `handle_engine_directive`.
-    pub reopen_tx: mpsc::Sender<ReopenRequest>,
-    /// Engine-wide throttle bucket (shared by every slot so tenant /
-    /// provider deadlines cross accounts). Recovery paths record waits
-    /// keyed by `ThrottleKey`; the per-scope poll loop and the push
-    /// reconciler consult it before driving work.
-    pub throttles: Arc<crate::throttle::ThrottleBucket>,
-    /// The `OpenedAccount::skipped_scopes` lane from the most recent
-    /// successful `factory.open` (attach or reopen swap): the parts of
-    /// the account surface the protocol crate discovered but could not
-    /// bring up, with their classified errors. Exposed via
-    /// `SyncEngine::open_skipped_scopes` so a consumer can tell a
-    /// degraded shared namespace apart from one that does not exist.
-    pub open_skips: Arc<Mutex<Vec<bifrost_types::SkippedScope>>>,
-    /// The account's change broadcast plus the numbering of the receivers it has
-    /// handed out.
-    ///
-    /// The engine numbers them because `tokio::broadcast` cannot say whether a
-    /// given receiver can still take delivery of a given batch, and a subscriber
-    /// COUNT answers that question wrongly the moment one consumer is replaced by
-    /// an overlapping successor. One mutex orders send-and-stamp,
-    /// subscribe-and-number, and unregister-and-sweep, so the answer is exact
-    /// rather than approximate.
-    pub delivery: Arc<crate::delivery::ChangeDelivery>,
-}
-
-pub(crate) struct WorkerTask {
-    pub role: WorkerRole,
-    pub join: JoinHandle<()>,
-    pub abort: AbortHandle,
-}
-
-/// Which spawned slot worker a [`WorkerTask`] is.
-///
-/// One variant per spawn site in `engine/attach.rs`, so the `role` field on the
-/// detach worker phase's warn lines (rendered with `Debug`, which prints the
-/// variant name) names the worker that wedged or panicked. Only `AckWriter` has
-/// behavior attached (it is torn down in its own phase, last); every other
-/// variant is a stream-phase worker and exists purely for attribution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WorkerRole {
-    /// Durably persists cursors as they are acked; drained in its own phase.
-    AckWriter,
-    /// Forwards priority and bandwidth-cap changes to the open handle.
-    ControlApplier,
-    /// Push reconciler: turns watch events into driven scopes.
-    PushReconciler,
-    /// Supervises push sessions and their bounded cleanup.
-    PushSupervisor,
-    /// The per-scope poll multiplexer.
-    Multiplexer,
-    /// Walks registered scopes and runs their backfill partitions.
-    BackfillOrchestrator,
-    /// Establishes cold-start inventory once the slot has a subscriber.
-    DeferredInventory,
-    /// Serves reopen and scope-deleted requests.
-    ReopenListener,
-    /// Polls the bandwidth meter into the control's observed-bps atomic.
-    BandwidthFeed,
-    /// Retries the teardown of orphaned push subscriptions on a timer.
-    OrphanTeardownRetrier,
 }

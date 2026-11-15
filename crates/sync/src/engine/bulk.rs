@@ -281,7 +281,7 @@ impl SyncEngine {
                 break;
             }
             let aborting = first_error.is_some();
-            let mut boundary = slot.boundary_tx.subscribe();
+            let mut boundary = slot.boundary.sender().subscribe();
             let mut generation = slot.account_generation_tx.subscribe();
             if aborting && !matches!(*boundary.borrow_and_update(), BoundaryRequest::Run) {
                 break;

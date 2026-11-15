@@ -34,6 +34,8 @@ mod capabilities;
 mod capability_contract_tests;
 mod changes;
 mod close;
+mod compose;
+mod containers;
 mod envelope;
 pub(crate) mod error;
 mod factory;
@@ -41,11 +43,14 @@ mod folder_registry;
 mod get;
 mod hydration;
 mod inventory;
+mod mail_actions;
+mod mailbox_identity;
+mod message;
+mod message_targets;
 mod mutate;
 /// BODYSTRUCTURE part traversal + durable part-handle codec (imap-G1 stage 1).
 /// Not wired into any projection or opener yet; see the module docs.
 mod parts;
-mod pim;
 mod poll;
 mod pool;
 mod push;
@@ -53,6 +58,8 @@ mod scopes;
 #[cfg(test)]
 #[path = "scripted_tests.rs"]
 mod scripted_tests;
+mod search;
+mod settings;
 pub(crate) mod sieve;
 mod submission;
 mod targets;
@@ -645,7 +652,7 @@ impl Account for ImapAccount {
         target: MutationTarget,
         container: ContainerId,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::add_to_container(self.clone(), target, container)
+        mail_actions::add_to_container(self.clone(), target, container)
     }
 
     fn remove_from_container(
@@ -653,7 +660,7 @@ impl Account for ImapAccount {
         target: MutationTarget,
         container: ContainerId,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::remove_from_container(self.clone(), target, container)
+        mail_actions::remove_from_container(self.clone(), target, container)
     }
 
     fn set_keyword(
@@ -662,7 +669,7 @@ impl Account for ImapAccount {
         keyword: bifrost_types::Flag,
         value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::set_keyword(self.clone(), target, keyword, value)
+        mail_actions::set_keyword(self.clone(), target, keyword, value)
     }
 
     fn set_label_membership(
@@ -671,7 +678,7 @@ impl Account for ImapAccount {
         _label: ContainerId,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::unsupported_unit(AccountOperation::SetLabelMembership)
+        settings::unsupported_unit(AccountOperation::SetLabelMembership)
     }
 
     fn set_category(
@@ -680,7 +687,7 @@ impl Account for ImapAccount {
         _category: String,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::unsupported_unit(AccountOperation::SetCategory)
+        settings::unsupported_unit(AccountOperation::SetCategory)
     }
 
     fn set_extended_property(
@@ -689,7 +696,7 @@ impl Account for ImapAccount {
         _property_id: String,
         _value: Option<String>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::unsupported_unit(AccountOperation::SetExtendedProperty)
+        settings::unsupported_unit(AccountOperation::SetExtendedProperty)
     }
 
     fn set_is_read(
@@ -697,7 +704,7 @@ impl Account for ImapAccount {
         target: MutationTarget,
         is_read: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::set_is_read(self.clone(), target, is_read)
+        mail_actions::set_is_read(self.clone(), target, is_read)
     }
 
     fn set_importance(
@@ -705,14 +712,14 @@ impl Account for ImapAccount {
         target: MutationTarget,
         level: Importance,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::set_importance(self.clone(), target, level)
+        mail_actions::set_importance(self.clone(), target, level)
     }
 
     fn send_message(
         &self,
         request: SendRequest,
     ) -> AccountFuture<Result<SendReceipt, AccountError>> {
-        pim::send_message(self.clone(), request)
+        compose::send_message(self.clone(), request)
     }
 
     fn send_raw_message(
@@ -720,7 +727,7 @@ impl Account for ImapAccount {
         raw: bytes::Bytes,
         save_to_sent: Option<bool>,
     ) -> AccountFuture<Result<SendReceipt, AccountError>> {
-        pim::send_raw_message(self.clone(), raw, save_to_sent)
+        compose::send_raw_message(self.clone(), raw, save_to_sent)
     }
 
     fn attachment_upload(
@@ -728,7 +735,7 @@ impl Account for ImapAccount {
         _bytes: AccountStream<Result<bytes::Bytes, AccountError>>,
         _mime: String,
     ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
-        pim::unsupported_attachment(AccountOperation::AttachmentUpload)
+        settings::unsupported_attachment(AccountOperation::AttachmentUpload)
     }
 
     fn host_attachment(
@@ -736,11 +743,11 @@ impl Account for ImapAccount {
         _bytes: bytes::Bytes,
         _meta: CloudUploadMeta,
     ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
-        pim::unsupported_hosted(AccountOperation::HostAttachment)
+        settings::unsupported_hosted(AccountOperation::HostAttachment)
     }
 
     fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
-        pim::draft_create(self.clone(), patch)
+        compose::draft_create(self.clone(), patch)
     }
 
     fn draft_update(
@@ -748,21 +755,21 @@ impl Account for ImapAccount {
         _draft: DraftHandle,
         _patch: DraftPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::unsupported_unit(AccountOperation::DraftUpdate)
+        settings::unsupported_unit(AccountOperation::DraftUpdate)
     }
 
     fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
-        pim::draft_discard(self.clone(), draft)
+        compose::draft_discard(self.clone(), draft)
     }
 
     fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
-        pim::draft_send(self.clone(), draft)
+        compose::draft_send(self.clone(), draft)
     }
 
     fn cancel_scheduled_send(&self, _handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
         // SMTP FUTURERELEASE is fire-and-submit: RFC 4865 has no verb to
         // recall an accepted HOLDUNTIL submission. Honest provider limit.
-        pim::unsupported_unit(AccountOperation::CancelScheduledSend)
+        settings::unsupported_unit(AccountOperation::CancelScheduledSend)
     }
 
     fn reschedule_send(
@@ -770,25 +777,25 @@ impl Account for ImapAccount {
         _handle: ObjectId,
         _scheduled: std::time::SystemTime,
     ) -> AccountFuture<Result<ObjectId, AccountError>> {
-        pim::unsupported_object(AccountOperation::RescheduleSend)
+        settings::unsupported_object(AccountOperation::RescheduleSend)
     }
 
     fn search(
         &self,
         request: SearchRequest,
     ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
-        pim::search(self.clone(), request)
+        search::search(self.clone(), request)
     }
 
     fn search_messages(
         &self,
         request: SearchRequest,
     ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
-        pim::search_messages(self.clone(), request)
+        search::search_messages(self.clone(), request)
     }
 
     fn containers_list(&self) -> AccountFuture<Result<ContainerList, AccountError>> {
-        pim::containers_list(self.clone())
+        containers::containers_list(self.clone())
     }
 
     fn container_create(
@@ -798,7 +805,7 @@ impl Account for ImapAccount {
         parent: Option<ContainerId>,
         style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<ContainerId, AccountError>> {
-        pim::container_create(self.clone(), kind, name, parent, style)
+        containers::container_create(self.clone(), kind, name, parent, style)
     }
 
     fn container_rename(
@@ -807,7 +814,7 @@ impl Account for ImapAccount {
         name: String,
         style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::container_rename(self.clone(), container, name, style)
+        containers::container_rename(self.clone(), container, name, style)
     }
 
     fn container_move(
@@ -815,15 +822,15 @@ impl Account for ImapAccount {
         container: ContainerId,
         new_parent: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::container_move(self.clone(), container, new_parent)
+        containers::container_move(self.clone(), container, new_parent)
     }
 
     fn container_delete(&self, container: ContainerId) -> AccountFuture<Result<(), AccountError>> {
-        pim::container_delete(self.clone(), container)
+        containers::container_delete(self.clone(), container)
     }
 
     fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>> {
-        pim::identities_list()
+        settings::identities_list()
     }
 
     fn identity_update(
@@ -831,19 +838,19 @@ impl Account for ImapAccount {
         identity: IdentityId,
         patch: IdentityPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::identity_update(identity, patch)
+        settings::identity_update(identity, patch)
     }
 
     fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
-        pim::vacation_get()
+        settings::vacation_get()
     }
 
     fn vacation_set(&self, config: VacationConfig) -> AccountFuture<Result<(), AccountError>> {
-        pim::vacation_set(config)
+        settings::vacation_set(config)
     }
 
     fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
-        pim::quota_get(self.clone())
+        settings::quota_get(self.clone())
     }
 
     fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
@@ -1104,7 +1111,7 @@ impl Account for ImapAccount {
         &self,
         thread: ThreadId,
     ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
-        pim::thread_hydrate(self.clone(), thread)
+        message::thread_hydrate(self.clone(), thread)
     }
 
     fn message_hydrate(
@@ -1112,7 +1119,7 @@ impl Account for ImapAccount {
         message: ObjectId,
         projection: HydrationProjection,
     ) -> AccountFuture<Result<Message, AccountError>> {
-        pim::message_hydrate(self.clone(), message, projection)
+        message::message_hydrate(self.clone(), message, projection)
     }
 
     fn move_thread(
@@ -1121,7 +1128,7 @@ impl Account for ImapAccount {
         target: ContainerId,
         source: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::move_thread(self.clone(), thread, target, source)
+        mail_actions::move_thread(self.clone(), thread, target, source)
     }
 
     fn delete_thread(
@@ -1129,7 +1136,7 @@ impl Account for ImapAccount {
         thread: ThreadId,
         current: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::delete_thread(self.clone(), thread, current)
+        mail_actions::delete_thread(self.clone(), thread, current)
     }
 
     // Account: closes the pool; direct users close a single connection with logout().

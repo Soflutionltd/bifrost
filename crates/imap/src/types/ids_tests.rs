@@ -101,3 +101,16 @@ fn modseq_owns_the_positive_63_bit_range() {
     assert!(ModSeqValzer::new(ModSeq::MAX).is_some());
     assert!(ModSeqValzer::new(ModSeq::MAX + 1).is_none());
 }
+
+#[test]
+fn unwrapped_set_expressions_preserve_their_addressing_type() {
+    use std::any::TypeId;
+    fn unit<T: 'static>(_: &SequenceSet<T>) -> TypeId {
+        TypeId::of::<T>()
+    }
+    let uid = UidSetExpr::one(Uid::new(7).unwrap());
+    let seq = SeqSetExpr::one(Seq::new(7).unwrap());
+    assert_eq!(unit(uid.as_sequence_set()), TypeId::of::<Uid>());
+    assert_eq!(unit(seq.as_sequence_set()), TypeId::of::<Seq>());
+    assert_ne!(unit(uid.as_sequence_set()), unit(seq.as_sequence_set()));
+}

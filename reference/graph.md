@@ -289,7 +289,10 @@ that explicit sparse projection.
   - `pim/common.rs` - the few helpers two or more of the above share:
     `object_id_from_value`, `pim_protocol_error`,
     `graph_extended_property_id`, and the Graph time formats.
-  - `pim/tests.rs` - the PIM suite, kept as one module across the split.
+  - `pim/tests/` - tests grouped by production owner: common projections,
+    containers, drafts, hydration, messages, search, send and threads. Replay
+    policy tests keep their transport builders in `replay.rs`; helpers used by
+    one topic stay in that topic.
 - `filters.rs` - Stage 2 Inbox `messageRules` typed-rule
   list/create/update/delete plus local validation.
 - `blob.rs` - `open_blob` / `open_blob_range` over Graph
@@ -350,6 +353,15 @@ that explicit sparse projection.
   `Anyone -> anonymous`, `Organization -> organization`.
 - `error.rs` - blob-not-byte-stream warning helper. Classification
   helpers live in `graph_error.rs`.
+
+`client/test_support.rs` owns the test-only response builders, script state,
+request records and `GraphClient` scripting/recording methods. `client/tests.rs`
+exercises the client itself. The support module compiles only under `cfg(test)`;
+production funnels retain only their recording hooks and shared-state field.
+`account/graph_error/` holds the classification, unsupported-constructor and
+replay test modules beside their production owner.
+`account/ews_stream/tests/` holds stream tests and a `session` submodule of
+in-memory transcripts; `ews_stream/replay_tests.rs` pins transport replay policy.
 
 `GraphClient` owns the REST test seam. Every REST helper - raw MIME import
 included - funnels through one private `execute_wire`, which adapts the
@@ -3081,6 +3093,16 @@ context-free parser cannot distinguish them. Scheduled-send handles use the
 same owner encoder/decoder as folders, messages and threads, and resolve their
 client through `GraphAccount::client_for_owner`. Their existing send-as refusal
 classification remains at the send API boundary.
+
+Owner encoding, decoding and comparison are already centralized here; no
+shared `Qualified<T>` is needed to synchronize Graph entry points. Graph owner
+comparison folds ASCII case and resolves configured `/users/{id}` routes. JMAP
+compares account ids exactly and strips qualification only on a matching shared
+route, leaving primary-qualified or departed-share ids literal. Sharing their
+separator would not unify those policies. Public-folder ids carry an EWS
+collection routing key, rather than a mailbox owner. `Container` ownership
+fields describe the discovered namespace for consumers; its encoded identity
+still makes later id-only operations self-routing without discovery state.
 
 Existing persisted spellings remain unchanged: US separates an owner from a
 native id, RS separates public identity components, and `::` separates a

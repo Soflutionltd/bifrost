@@ -209,7 +209,7 @@ impl AccountFactory for JmapAccountFactory {
             let session = client.session();
             let SeededOpenState {
                 mut registry,
-                lifecycle_mailbox_states,
+                lifecycle_mailbox_state,
                 mailbox_names,
                 skipped_scopes,
             } = validate_and_seed(&client, &mail).await?;
@@ -261,7 +261,7 @@ impl AccountFactory for JmapAccountFactory {
                 ws,
                 shutdown,
                 super::discover::LifecycleTopology {
-                    positions: lifecycle_mailbox_states,
+                    position: Some(lifecycle_mailbox_state),
                     names: mailbox_names,
                 },
             );
@@ -278,8 +278,7 @@ impl AccountFactory for JmapAccountFactory {
 /// account: the primary account's two states, and one probe per foreign
 /// (shared/delegate) mail account.
 struct SeededOpenState<Tr: HttpTransport> {
-    lifecycle_mailbox_states:
-        HashMap<String, Option<crate::core::id::ObjectState<crate::mailbox::Mailbox>>>,
+    lifecycle_mailbox_state: crate::core::id::ObjectState<crate::mailbox::Mailbox>,
     mailbox_names: HashMap<String, String>,
     registry: Registry<Tr>,
     skipped_scopes: Vec<SkippedScope>,
@@ -335,8 +334,7 @@ async fn validate_and_seed<Tr: HttpTransport>(
         ),
     ];
     let mut registry = Registry::new(primary);
-    let mut lifecycle_mailbox_states = HashMap::new();
-    lifecycle_mailbox_states.insert(primary_id.clone(), Some(mailbox_state.clone()));
+    let lifecycle_mailbox_state = mailbox_state.clone();
 
     // Foreign (shared/delegate) accounts: the session lists every
     // non-personal mail account. For each, probe its two states
@@ -406,7 +404,7 @@ async fn validate_and_seed<Tr: HttpTransport>(
     }
 
     Ok(SeededOpenState {
-        lifecycle_mailbox_states,
+        lifecycle_mailbox_state,
         mailbox_names,
         registry,
         skipped_scopes,

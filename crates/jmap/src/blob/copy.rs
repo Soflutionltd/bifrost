@@ -25,8 +25,10 @@ pub(crate) struct CopyBlobResponse {
     #[serde(rename = "accountId")]
     account_id: AccountId,
     #[serde(rename = "copied")]
+    #[serde(default, deserialize_with = "crate::core::id::echo::map")]
     copied: Option<HashMap<BlobId, BlobId>>,
     #[serde(rename = "notCopied")]
+    #[serde(default, deserialize_with = "crate::core::id::echo::map")]
     not_copied: Option<HashMap<BlobId, SetError<String>>>,
 }
 

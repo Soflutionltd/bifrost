@@ -220,7 +220,10 @@ async fn a_first_session_on_generation_zero_owes_nothing() {
         false,
     )
     .await;
-    assert!(!f.ingress.take().full);
+    assert!(matches!(
+        f.ingress.take().intent,
+        crate::push::InvalidationIntent::Specific(_)
+    ));
     f.finish().await;
 }
 #[tokio::test(start_paused = true)]
@@ -238,10 +241,16 @@ async fn a_connection_lane_on_a_new_generation_reconciles_at_establishment() {
         false,
     )
     .await;
-    assert!(!f.ingress.take().full);
+    assert!(matches!(
+        f.ingress.take().intent,
+        crate::push::InvalidationIntent::Specific(_)
+    ));
     release.notify_one();
     settle().await;
-    assert!(f.ingress.take().full);
+    assert!(matches!(
+        f.ingress.take().intent,
+        crate::push::InvalidationIntent::Full
+    ));
     f.finish().await;
 }
 #[tokio::test(start_paused = true)]
@@ -254,7 +263,10 @@ async fn a_registration_lane_on_a_new_generation_reconciles_at_lane_start() {
         false,
     )
     .await;
-    assert!(f.ingress.take().full);
+    assert!(matches!(
+        f.ingress.take().intent,
+        crate::push::InvalidationIntent::Full
+    ));
     f.finish().await;
 }
 #[tokio::test(start_paused = true)]
@@ -270,11 +282,17 @@ async fn a_terminal_parked_connection_lane_owes_a_reconcile_on_restart() {
         false,
     )
     .await;
-    assert!(!f.ingress.take().full);
+    assert!(matches!(
+        f.ingress.take().intent,
+        crate::push::InvalidationIntent::Specific(_)
+    ));
     f.topology
         .send_modify(crate::engine::PushTopologyGeneration::changed);
     settle().await;
-    assert!(f.ingress.take().full);
+    assert!(matches!(
+        f.ingress.take().intent,
+        crate::push::InvalidationIntent::Full
+    ));
     f.finish().await;
 }
 #[tokio::test(start_paused = true)]
@@ -390,10 +408,16 @@ async fn a_connection_lane_owes_a_full_reconcile_after_a_lost_session() {
         false,
     )
     .await;
-    assert!(!f.ingress.take().full);
+    assert!(matches!(
+        f.ingress.take().intent,
+        crate::push::InvalidationIntent::Specific(_)
+    ));
     tokio::time::advance(Duration::from_secs(5)).await;
     settle().await;
-    assert!(f.ingress.take().full);
+    assert!(matches!(
+        f.ingress.take().intent,
+        crate::push::InvalidationIntent::Full
+    ));
     f.finish().await;
 }
 #[tokio::test(start_paused = true)]
@@ -410,7 +434,10 @@ async fn reconfigure_restarts_at_once_and_owes_a_reconcile() {
     )
     .await;
     assert_eq!(f.opens(), 2);
-    assert!(f.ingress.take().full);
+    assert!(matches!(
+        f.ingress.take().intent,
+        crate::push::InvalidationIntent::Full
+    ));
     let log = f.stub.push_session_log.lock().unwrap().clone();
     assert_eq!(log[0].opened, log[1].opened);
     f.finish().await;

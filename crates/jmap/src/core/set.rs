@@ -59,6 +59,7 @@ pub(crate) struct SetRequest<O: SetObject> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(bound(deserialize = "O: serde::de::DeserializeOwned"))]
 pub(crate) struct SetResponse<O: SetObject> {
     #[serde(skip)]
     pub(crate) answer_context: crate::core::answer::AnswerContext,
@@ -79,10 +80,12 @@ pub(crate) struct SetResponse<O: SetObject> {
 
     /// Successful updates, keyed by the real server ID.
     #[serde(rename = "updated")]
+    #[serde(default, deserialize_with = "crate::core::id::echo::map")]
     updated: Option<HashMap<O::Id, Option<O>>>,
 
     /// Successfully destroyed real server IDs.
     #[serde(rename = "destroyed")]
+    #[serde(default, deserialize_with = "crate::core::id::echo::optional_vec")]
     destroyed: Option<Vec<O::Id>>,
 
     /// Failed creates, keyed by the consumer-provided create-id.
@@ -90,9 +93,11 @@ pub(crate) struct SetResponse<O: SetObject> {
     not_created: Option<HashMap<String, SetError<O::Property>>>,
 
     #[serde(rename = "notUpdated")]
+    #[serde(default, deserialize_with = "crate::core::id::echo::map")]
     not_updated: Option<HashMap<O::Id, SetError<O::Property>>>,
 
     #[serde(rename = "notDestroyed")]
+    #[serde(default, deserialize_with = "crate::core::id::echo::map")]
     not_destroyed: Option<HashMap<O::Id, SetError<O::Property>>>,
 }
 

@@ -242,7 +242,7 @@ pub struct BackfillRunner;
 /// enough - both orchestrator loops read that as a degraded partition and went
 /// on to request the next one, recreating the silent-loss bug the barrier stop
 /// exists to prevent one layer up. The verdict is therefore a `#[must_use]`
-/// value produced by `BackfillScopeWalk::admit`, so a loop that folds an
+/// value produced by `ScopeWalkDriver::fold`, so a loop that folds an
 /// outcome in cannot quietly discard the answer.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,87 +256,40 @@ pub enum ScopeWalkStep {
     StopScopeWalk,
 }
 
-/// Folds partition outcomes into the enclosing scope-walk decision.
-///
-/// The orchestrator loops own "do I request another partition?", so the rule
-/// lives here rather than being re-derived at each call site.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BackfillScopeWalk {
-    stopped: bool,
+/// Enumeration and coverage verdict for one partition pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PartitionVerdict {
+    /// The provider declared no results beyond this partition.
+    Exhausted { degraded: bool },
+    /// The provider declared results beyond this partition.
+    MoreBeyond { degraded: bool },
+    /// The stream ended without a completion declaration.
+    EndedUnannounced,
+    /// An unreplayable coverage barrier forbids later partitions.
+    StoppedAtBarrier,
 }
 
-impl BackfillScopeWalk {
-    /// A walk that has not been stopped.
+impl PartitionVerdict {
+    /// Whether this partition declared its end with all coverage accounted for.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Fold one partition outcome in and answer whether the scope walk may
-    /// continue. Once stopped, a walk stays stopped.
-    pub fn admit(&mut self, outcome: &BackfillPartitionOutcome) -> ScopeWalkStep {
-        if outcome.scope_walk == ScopeWalkStep::StopScopeWalk {
-            self.stopped = true;
-        }
-        if self.stopped {
-            ScopeWalkStep::StopScopeWalk
-        } else {
-            ScopeWalkStep::RequestNextPartition
-        }
-    }
-
-    /// True once any partition has stopped the scope.
-    #[must_use]
-    pub fn stopped(&self) -> bool {
-        self.stopped
+    pub fn complete(self) -> bool {
+        matches!(
+            self,
+            Self::Exhausted { degraded: false } | Self::MoreBeyond { degraded: false }
+        )
     }
 }
 
-/// Outcome for one partition pass.
+/// Outcome for one partition pass. Counts never imply exhaustion or coverage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackfillPartitionOutcome {
-    /// Inventory entries and explicit removals observed before the
-    /// live-supersedes filter.
+    /// Inventory entries and explicit removals before the supersedes filter.
     pub seen: u64,
-    /// Inventory entries forwarded after the live-supersedes filter.
-    /// Explicit removals are not included in this count.
+    /// Entries forwarded after filtering, excluding explicit removals.
     pub kept: u64,
-    /// Whether the walk exhausted its space with everything accounted for.
-    ///
-    /// `false` means the partition finished but left obligations open, so the
-    /// orchestrator must NOT write a completion sentinel for the scope: the
-    /// sentinel makes the next attach skip the walk entirely, which would turn
-    /// a declared gap into a permanent one. Note `seen` counts materialized
-    /// entries and explicit removals, so an unaccounted object is not even
-    /// in that total - the count cannot be used to detect this.
-    pub complete: bool,
-    /// Whether the enclosing scope walk may request another partition.
-    ///
-    /// Distinct from `complete`: an incomplete partition leaves obligations the
-    /// ledger can chase later, whereas `StopScopeWalk` means no later partition
-    /// of this scope may even be requested, because its checkpoint would
-    /// certify a prefix that crosses a region nothing can replay.
-    pub scope_walk: ScopeWalkStep,
-    /// What the partition's completion declared about results past its end,
-    /// or `None` when the stream ended without a completion at all. An
-    /// open-ended page walk stops on `Exhausted` and nowhere else: the entry
-    /// count is never read as a declaration.
-    pub end: Option<bifrost_types::PartitionEnd>,
-}
-
-impl Default for BackfillPartitionOutcome {
-    /// Defaults are the SAFE answers: nothing counted, nothing complete, and
-    /// the scope walk stopped. A default that read as "continue" would let a
-    /// construction site that forgot the field advance past a barrier.
-    fn default() -> Self {
-        Self {
-            seen: 0,
-            kept: 0,
-            complete: false,
-            scope_walk: ScopeWalkStep::StopScopeWalk,
-            end: None,
-        }
-    }
+    /// The sole enumeration and coverage verdict.
+    pub verdict: PartitionVerdict,
 }
 
 impl BackfillRunner {
@@ -358,11 +311,11 @@ impl BackfillRunner {
         envelope_version: bifrost_types::TraitEnvelopeVersion,
         publisher: &crate::delivery::PagePublisher,
         generation: crate::cursor::WalkGeneration,
-        bound: Option<&crate::engine::backfill_bound::BackfillBound>,
+        mut admission: Option<crate::engine::backfill_bound::BackfillAdmission<'_>>,
         walk_fence: crate::cursor::ScopeFence,
     ) -> Result<BackfillPartitionOutcome, Error> {
-        if let Some(gate) = bound
-            && !publisher.shares_bound_ledger(gate)
+        if let Some(pass) = &admission
+            && !publisher.shares_bound_ledger(pass.bound())
         {
             return Err(Error::Other("backfill bound ledger mismatch".into()));
         }
@@ -401,10 +354,9 @@ impl BackfillRunner {
             // therefore completed before control returns here.
             //
             // The outcome is an ERROR rather than a partial
-            // `BackfillPartitionOutcome`, which is what makes it safe: an
-            // outcome could only be reported as `complete: false` with
-            // `StopScopeWalk`, and getting either field wrong would have the
-            // orchestrator write a completion sentinel that makes the next
+            // `BackfillPartitionOutcome`, which is what makes it safe: a
+            // partial outcome must never be treated as completion, or the
+            // orchestrator could write a completion sentinel that makes the next
             // attach skip the scope entirely. That is silent data
             // invisibility, not re-work. `Error::ShuttingDown` is a shape this
             // function already produces at the capacity wait, and the
@@ -497,9 +449,7 @@ impl BackfillRunner {
                         return Ok(BackfillPartitionOutcome {
                             seen: seen_total,
                             kept: kept_total,
-                            complete: false,
-                            scope_walk: ScopeWalkStep::StopScopeWalk,
-                            end: None,
+                            verdict: PartitionVerdict::StoppedAtBarrier,
                         });
                     }
 
@@ -524,9 +474,9 @@ impl BackfillRunner {
                         // The wait also hands the account's scheduler admission
                         // back for its duration, so a parked cold start is not
                         // sitting on the permit polling needs.
-                        if let Some(gate) = bound {
-                            match gate.wait_for_capacity_holding_admission().await {
-                                Ok(()) => {}
+                        if let Some(pass) = admission.take() {
+                            match pass.wait_for_capacity().await {
+                                Ok(pass) => admission = Some(pass),
                                 // The account is detaching. Publishing now would
                                 // broadcast into a teardown; the partition fails,
                                 // the scope stays Pending, and the next attach
@@ -704,9 +654,21 @@ impl BackfillRunner {
         Ok(BackfillPartitionOutcome {
             seen: seen_total,
             kept: kept_total,
-            complete,
-            scope_walk,
-            end,
+            verdict: if scope_walk == ScopeWalkStep::StopScopeWalk {
+                // A terminal barrier can also declare exhaustion. The barrier
+                // takes precedence: no later checkpoint may cross that region.
+                PartitionVerdict::StoppedAtBarrier
+            } else {
+                match end {
+                    Some(bifrost_types::PartitionEnd::Exhausted) => PartitionVerdict::Exhausted {
+                        degraded: !complete,
+                    },
+                    Some(_) => PartitionVerdict::MoreBeyond {
+                        degraded: !complete,
+                    },
+                    None => PartitionVerdict::EndedUnannounced,
+                }
+            },
         })
     }
 }

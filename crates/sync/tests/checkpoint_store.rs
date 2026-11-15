@@ -3,7 +3,7 @@
 //! The in-memory store is the reference `CheckpointStore` every
 //! engine test rides on, and its `get_backfill` "latest by
 //! `items_done`" selection is load-bearing for backfill resume
-//! (`open_pages_resume` / `backfill_complete_recorded` in engine.rs).
+//! (`open_pages_resume` / `backfill_complete_recorded` in backfill/plan.rs).
 //! Equal-progress ties are pinned as well: the furthest page upper
 //! bound wins, making resume deterministic and preventing a needless
 //! re-walk from an earlier equal-sized window.

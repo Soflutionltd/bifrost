@@ -5,6 +5,7 @@
 use super::primitives::*;
 #[allow(clippy::wildcard_imports)]
 use super::*;
+type ThreadNode = crate::types::response::ThreadNode<u32>;
 
 // ---------------------------------------------------------------------------
 // QUOTA (RFC 2087) parsers
@@ -67,7 +68,7 @@ fn parse_quota_resource_list(input: &[u8]) -> IResult<&[u8], Vec<QuotaResource>>
 /// The response contains a mailbox name followed by zero or more quota root names.
 pub(super) fn parse_untagged_quotaroot(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"QUOTAROOT "[..]).parse(input)?;
     // Decode wire-form mailbox name (MUTF-7 or UTF-8) at parse time
@@ -103,7 +104,7 @@ pub(super) fn parse_untagged_quotaroot(
 /// The ACL response lists all access control entries for the specified mailbox.
 pub(super) fn parse_untagged_acl(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"ACL "[..]).parse(input)?;
     // Decode wire-form mailbox name (MUTF-7 or UTF-8) at parse time
@@ -137,7 +138,7 @@ pub(super) fn parse_untagged_acl(
 /// Parse `* MYRIGHTS <mailbox> <rights>` (RFC 4314 Section 3.8).
 pub(super) fn parse_untagged_myrights(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"MYRIGHTS "[..]).parse(input)?;
     // Decode wire-form mailbox name (MUTF-7 or UTF-8) at parse time
@@ -159,7 +160,7 @@ pub(super) fn parse_untagged_myrights(
 /// strings, each representing a set of rights that can be granted independently.
 pub(super) fn parse_untagged_listrights(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"LISTRIGHTS "[..]).parse(input)?;
     // Decode wire-form mailbox name (MUTF-7 or UTF-8) at parse time
@@ -209,7 +210,7 @@ pub(super) fn parse_untagged_listrights(
 ///    without values, terminated by CRLF. Each produces `MetadataEntry { name, value: None }`.
 pub(super) fn parse_untagged_metadata(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"METADATA "[..]).parse(input)?;
     // Decode wire-form mailbox name (MUTF-7 or UTF-8) at parse time
@@ -630,10 +631,7 @@ fn parse_thread_node(input: &[u8], depth: u32) -> IResult<&[u8], ThreadNode> {
     // We build bottom-up: start from the deepest chain UID.
     let children = build_thread_tree(&chain_uids, &branch_groups);
 
-    let mut node = ThreadNode {
-        id: root_id,
-        children,
-    };
+    let mut node = ThreadNode::new(root_id, children);
 
     // RFC 5256 Section 5: `thread-nested = 2*thread-list`  -  a dummy parent
     // (id == None) must have at least 2 children.  Non-conformant servers
@@ -676,10 +674,7 @@ pub(super) fn build_thread_tree(
     };
 
     // Wrap the last UID.
-    let mut result = ThreadNode {
-        id: chain_uids[last],
-        children: last_children,
-    };
+    let mut result = ThreadNode::new(chain_uids[last], last_children);
 
     // Walk backwards through the remaining chain UIDs.
     for i in (0..last).rev() {
@@ -690,10 +685,7 @@ pub(super) fn build_thread_tree(
         };
         // The next UID in the chain is a child.
         children.push(result);
-        result = ThreadNode {
-            id: chain_uids[i],
-            children,
-        };
+        result = ThreadNode::new(chain_uids[i], children);
     }
 
     vec![result]

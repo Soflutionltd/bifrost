@@ -125,14 +125,13 @@ refused before its dispatch.
 Status classification receives the HTTP response headers and uses
 `bifrost_net::request::parse_retry_after_hint`, preserving HTTP dates as
 `RetryHint::At`, including elapsed dates. Rate-limit and quota errors carry account
-throttle scope as DAV's conservative scheduling policy. Exhausted retry and
-rate-limit errors retain net's complete retry history, except 501, which MOVE
-must read as an unsupported-method answer. A non-idempotent request can also
-read its terminal status after earlier proven refusals, the shared
-`bifrost_net::is_proven_refusal` rule (401, 429, 405 and 501); a 503 can
-follow an upstream commit, so it stays commit-ambiguous, and a history
-containing a 503 or transport ambiguity keeps reconciliation. Conditional
-412 and locked 423 remain DAV conflicts; 400/413/422 are malformed requests and
+throttle scope as DAV's conservative scheduling policy. Client refusals other
+than 401/408/429 and the unsupported-method 501 are selected as data through net, preserving complete DAV precondition bodies and
+avoiding status retries for MOVE/filter fallback. Authentication recovery and
+transient-status retries stay in net; exhausted retry and rate-limit errors
+retain its complete history. Earlier possible commits on unreplayable requests
+still require reconciliation, using net's shared ledger rather than a private
+refusal list. Conditional 412 and locked 423 remain DAV conflicts; 400/413/422 are malformed requests and
 408/502/503/504 are unavailable. Cursor-invalid 410 is interpreted only by the
 sync-collection caller before the generic resource ladder.
 
@@ -827,8 +826,11 @@ conflict. Self-fetched validators pay the same accepted read-back cost.
 Net narrows possible-commit failures and `dispatch_once` also stamps DAV-minted
 failures. Ambiguous retryable statuses (including 503) stop before another
 write; the proven refusals of `bifrost_net::is_proven_refusal` (401, 429, 405,
-501) are not ambiguous. DAV's all-401 history exception permits a terminal
-status to be consumed after net refreshes a rejected token. Relocation returns
+501) are not ambiguous. DAV selects client refusals and 501 as data, and checks
+earlier outcomes with net's ledger before consuming an unreplayable failure.
+A terminal 412 after a proven 401/429 refusal is a conflict; an earlier possible
+commit requires reconciliation, except a terminal 405/501, which denies the
+method itself and stays data for the MOVE fallback. Relocation returns
 Before, MovedThenPut or CopiedThenDelete progress. contact_update attaches once:
 committed Moved/Copied steps are Blocking, with source/destination contact
 identities; the Updated/Deleted primary is Repeatable and scoped to its target.

@@ -158,10 +158,13 @@ async fn run_observed(
 async fn a_fixed_partition_that_ends_silently_is_incomplete_and_says_so() {
     let (outcome, warnings) = run_observed(Vec::new()).await;
     assert!(
-        !outcome.complete,
+        !outcome.verdict.complete(),
         "a silent end must not complete the partition"
     );
-    assert_eq!(outcome.end, None);
+    assert_eq!(
+        outcome.verdict,
+        bifrost_sync::backfill::PartitionVerdict::EndedUnannounced
+    );
     assert!(
         warnings
             .iter()
@@ -180,7 +183,7 @@ async fn a_fixed_partition_that_ends_in_done_completes_without_the_warning() {
         PartitionEnd::Exhausted,
     ));
     let (outcome, warnings) = run_observed(vec![done]).await;
-    assert!(outcome.complete);
+    assert!(outcome.verdict.complete());
     assert!(
         warnings
             .iter()

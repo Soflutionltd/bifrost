@@ -52,7 +52,7 @@ pub(super) async fn run_orphan_teardown_retrier(ctx: SlotContext, interval: Dura
             () = ctx.shutdown.cancelled() => return,
             () = tokio::time::sleep(interval) => {}
         }
-        for record in ctx.subscriptions.orphans(&ctx.account_id) {
+        for record in ctx.subscriptions.orphans() {
             let gate = super::maintenance::MaintenanceGate {
                 control: &ctx.control,
                 scheduler: &ctx.scheduler,
@@ -60,7 +60,7 @@ pub(super) async fn run_orphan_teardown_retrier(ctx: SlotContext, interval: Dura
                 throttles: &ctx.throttles,
                 account_id: &ctx.account_id,
                 shutdown: &ctx.shutdown,
-                boundary_tx: &ctx.boundary_tx,
+                boundary: &ctx.boundary,
                 // Timer-driven: refuse and retry on the next tick.
                 wait_for_run: false,
             };
@@ -72,7 +72,7 @@ pub(super) async fn run_orphan_teardown_retrier(ctx: SlotContext, interval: Dura
                 break;
             };
             let handle = record.handle;
-            let _topology = super::TopologyBump(&ctx.push_topology);
+            let _topology = super::TopologyBump(&ctx.push_topology_tx);
             let result = tokio::select! {
                 biased;
                 () = ctx.shutdown.cancelled() => return,
@@ -88,7 +88,7 @@ pub(super) async fn run_orphan_teardown_retrier(ctx: SlotContext, interval: Dura
                 return;
             }
             match result {
-                Ok(Ok(())) => ctx.subscriptions.remove_orphan(&ctx.account_id, &handle),
+                Ok(Ok(())) => ctx.subscriptions.remove_orphan(&handle),
                 Ok(Err(error)) => {
                     crate::recovery::observe_failure_throttles(
                         &ctx.throttles,

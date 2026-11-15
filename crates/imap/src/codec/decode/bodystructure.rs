@@ -28,7 +28,7 @@ const MAX_BODY_NESTING_DEPTH: u32 = 64;
 // rather than hand-built enum values, so it needs the real parser.
 pub(crate) fn body_structure(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
     depth: u32,
 ) -> IResult<&[u8], BodyStructure> {
     // Defense-in-depth: reject excessively nested BODYSTRUCTURE to prevent
@@ -58,7 +58,7 @@ pub(crate) fn body_structure(
 /// `depth` tracks the current nesting level for recursion-depth enforcement.
 fn body_type_single(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
     depth: u32,
 ) -> IResult<&[u8], BodyStructure> {
     // media-type SP media-subtype
@@ -188,7 +188,7 @@ fn body_type_single(
 /// `depth` tracks the current nesting level for recursion-depth enforcement.
 pub(super) fn body_type_mpart(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
     depth: u32,
 ) -> IResult<&[u8], BodyStructure> {
     // One or more nested body structures  -  each child increments the depth.

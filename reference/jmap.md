@@ -803,10 +803,20 @@ crates/jmap/src/sync/
   hydrate.rs       - get_stream projection logic
   push.rs          - WebSocket push, ReconnectPolicy, subscribe/unsubscribe
   mutation.rs      - bulk_set_flags / bulk_move / bulk_destroy pipeline
-  pim.rs           - unified PIM primitives: mail mutations, send,
-                     drafts, search, containers, settings, hydration
+  pim.rs           - internal mail-door facade and shared slot aliases
+  pim/
+    mail_mutation.rs - single-target and thread Email/set workflows and progress
+    submission.rs  - immediate / raw / draft / scheduled sends and commit evidence
+    drafts.rs      - draft editing and attachment upload
+    body.rs        - compose bodies and account-scoped attachment handle codec
+    search.rs      - mail query routing, projection and positional page validation
+    containers.rs  - Mailbox CRUD, role lookup and owner-email discovery
+    message.rs     - message / thread hydration and shared Message mapping
+    settings.rs    - identities, vacation and quota
+    tests.rs       - retained hermetic mail-door transcripts and mapping tests
   contacts.rs      - AddressBook / ContactCard primitives
-  calendar_ops.rs  - Calendar / CalendarEvent primitives
+  calendar_ops.rs  - Calendar / CalendarEvent doors, query and hydration orchestration
+  calendar_mapping.rs - pure JSCalendar / shared event conversion, time and recurrence
   page_cursor.rs   - the anchored, state-pinned page cursor both of the
                      above share (see "PIM page cursors")
   filters.rs       - SieveScript-backed server-side filter scripts
@@ -871,8 +881,12 @@ cursor scopes, submission support and one typed Email `StateCache` / `StateCell`
 Mail slots and each optional family's slots carry their own capability type.
 Families are installed sequentially; handles for one account share the same
 observation cell, including two optional families whose account serves no Mail.
-No Mail handle is manufactured for an optional-only account. A Submission
-account can differ from the Mail primary; send and draft workflows check a
+No Mail handle is manufactured for an optional-only account.
+`Registry::families` is the session's selection of each capability's primary account, not a second table of
+per-mail-account facts. These typed slots may select different account ids;
+moving them into Mail slots would misrepresent contacts-only accounts and would
+require new shared-family routing doors. Shared submission support is already a
+fact on each seeded Mail slot. A Submission account can differ from the Mail primary; send and draft workflows check a
 Mail view of that same Submission account before Email operations.
 Only successfully seeded foreign mail slots enter shared discovery, send-as
 routing and push topology. An optional-only primary account adds no shared
@@ -1133,7 +1147,15 @@ locally-rejected targets emits them without probing Email state.
 
 ### PIM primitives and conveniences
 
-`pim.rs` is the Stage 1 unified mail surface. Message/thread field mutations resolve `MutationTarget::Thread` via `Thread/get`, then use `Email/set` patches against `mailboxIds`/`keywords`/`$seen` without account-wide `ifInState`; the patch names the requested fields and preserves other properties, while an unrelated Email change cannot reject it. Thread keyword and membership updates and Trash destruction split large Email ID sets at the account's bounded `maxObjectsInSet`. The already-in-Trash `delete_thread` branch reads member `mailboxIds` at `maxObjectsInGet`, then sends each `Email/set destroy` with `ifInState`: the first batch uses the membership read's state, and each later batch uses the preceding set's `newState`. A membership change during a multi-get walk or before a destroy therefore refuses that destructive batch; because Email state is account-wide, an unrelated Email change can also reject it. Retrying reads membership again. If a multi-message set partially succeeds before a later batch fails, the operation returns `Protocol(PartialResponse)` with acknowledged transmission evidence so the caller reconciles before retrying. The email state cache advances compare-and-swap style from each response. Gmail labels, Graph categories/extended properties return `Unsupported`. `Thread.emailIds` decodes as optional, because a `/get` may project it away; both readers (`thread_hydrate` and the mutation-target expansion) reject a response that omits an explicitly requested `emailIds` rather than treating it as an empty thread. That expansion failure is reported under the MUTATION's `AccountOperation`, not `HydrateThread` - the thread lookup is an implementation detail of the mutation, and the operation drives the recovery class the engine derives.
+`pim.rs` re-exports the internal mail doors from focused modules under `pim/`.
+`pim/mail_mutation.rs` owns the single-target and thread mutation workflows;
+`sync/mail_set.rs` remains their shared executor with bulk mutations.
+`pim/submission.rs` owns the send pipeline and its partial-commit records,
+while `pim/body.rs` constructs compose bodies and attachment handles.
+Calendar account doors stay in `calendar_ops.rs`; their pure projection,
+recurrence and time conversions live in `calendar_mapping.rs`. Shared recurrence
+validation and range overlap remain in `bifrost-types`; duration syntax remains
+in `calendar_event/value.rs`. Message/thread field mutations resolve `MutationTarget::Thread` via `Thread/get`, then use `Email/set` patches against `mailboxIds`/`keywords`/`$seen` without account-wide `ifInState`; the patch names the requested fields and preserves other properties, while an unrelated Email change cannot reject it. Thread keyword and membership updates and Trash destruction split large Email ID sets at the account's bounded `maxObjectsInSet`. The already-in-Trash `delete_thread` branch reads member `mailboxIds` at `maxObjectsInGet`, then sends each `Email/set destroy` with `ifInState`: the first batch uses the membership read's state, and each later batch uses the preceding set's `newState`. A membership change during a multi-get walk or before a destroy therefore refuses that destructive batch; because Email state is account-wide, an unrelated Email change can also reject it. Retrying reads membership again. If a multi-message set partially succeeds before a later batch fails, the operation returns `Protocol(PartialResponse)` with acknowledged transmission evidence so the caller reconciles before retrying. The email state cache advances compare-and-swap style from each response. Gmail labels, Graph categories/extended properties return `Unsupported`. `Thread.emailIds` decodes as optional, because a `/get` may project it away; both readers (`thread_hydrate` and the mutation-target expansion) reject a response that omits an explicitly requested `emailIds` rather than treating it as an empty thread. That expansion failure is reported under the MUTATION's `AccountOperation`, not `HydrateThread` - the thread lookup is an implementation detail of the mutation, and the operation drives the recovery class the engine derives.
 
 `patch_mailbox_membership` (`add_to_container` / `remove_from_container`, and
 the two legs of `move_thread` / `delete_thread`) applies the same owner check
@@ -1231,7 +1253,7 @@ anchored and positional variants serving three families of walk. It uses `search
 retired formats use that same restart-paging signal. Contact and calendar reject each other's query method. The ambiguous legacy `2:` format is retired: an Outlook user
 expects a wrong-collection cursor to restart paging rather than skip objects.
 
-**Mail search (`pim.rs`)** is positional: `search-3:<position>:<queryState>`,
+**Mail search (`pim/search.rs`)** is positional: `search-3:<position>:<queryState>`,
 owner-qualified for a share. It is described under "Known limitations" below.
 
 **The contact and calendar page walks** - `ContactCard/query` behind
@@ -1316,7 +1338,7 @@ Both alternatives are unsound, and both were live in this crate:
 - **End the walk on an absent `total`** (what `contacts.rs` and
   `calendar_ops.rs` did, via a `?` on the `Option`) truncates at page ONE
   against such a server, and reports the truncation as completion.
-- **Fall back to page fullness** (what `pim.rs::search_email_ids` did) is not
+- **Fall back to page fullness** (what `pim/search.rs::search_email_ids` did) is not
   a completion test. Note the reason, because this document and three code
   comments used to give the wrong one: RFC 8620 s5.5 does NOT permit an
   arbitrary short non-final page - `ids` runs to the end of the result list
@@ -1331,7 +1353,7 @@ Both alternatives are unsound, and both were live in this crate:
 Continue-until-empty is sound for the anchored contact and calendar walks
 because the cursor names the last id of a nonempty page, so the next request
 either returns more or returns nothing, and nothing is the honest end signal.
-It transfers to `pim.rs`'s POSITIONAL cursor because the successor position is
+It transfers to `pim/search.rs`'s POSITIONAL cursor because the successor position is
 the server's own `position` echo plus what it served. The cost is one extra
 round trip against a `total`-less server whose last page landed exactly on
 the end.
@@ -1368,7 +1390,7 @@ ordered list, and a walk that does not advance under an unmoved state is a
 contract violation rather than a long list. All three walks now detect it, and
 refuse with the same `Protocol(ContractViolation)`:
 
-- `pim.rs` compares the response's `position` against the position it SENT
+- `pim/search.rs` compares the response's `position` against the position it SENT
   rather than trusting the echo. On a positive positional continuation - which
   only a decoded cursor produces, and which therefore always carries a
   verified pin - a nonempty response must BEGIN where it was asked to; there
@@ -1875,8 +1897,10 @@ wait constant. Sync helpers carry the selected slot and its validated limits. Ba
 handles outside the sync registry retain the protocol-owned
 `Session::object_limits` accessor.
 
-The primary lifecycle walk stores its positions and announced mailbox names in
-one `LifecycleTopology` behind one lock. Both ordinary changes pages and expired
+The primary lifecycle walk stores its single Mailbox position and announced
+mailbox names in one `LifecycleTopology` behind one lock. It has no account-keyed
+position map: only the primary account is polled, and the account's primary slot
+supplies that walk's handle and limits. Both ordinary changes pages and expired
 history reseeds publish them together after yielding their events. A dropped
 partial page leaves both unchanged, allowing a replacement stream to replay the
 page. Duplicate events after interruption are preferable to missing sidebar
@@ -1891,11 +1915,21 @@ lifecycle remains primary-only polling's documented limitation.
 
 The foreign Folder codec retains its historical first-separator decoding,
 including an empty owner and additional separators in the mailbox suffix.
-The encoders accept arbitrary strings and protocol Id deserialization does not
-validate them, so such ids may already have been minted and persisted. Rejecting
-these shapes only at this reader could orphan persisted containers. The empty
-mailbox suffix also remains the intentional account-level scope encoding. A
-stricter codec requires versioning and continued legacy decoding.
+Older versions accepted arbitrary native ids, so these consumer ids may already
+have been minted and persisted. Rejecting them at the consumer reader could
+orphan persisted containers. The empty mailbox suffix remains the intentional
+account-level scope encoding. New server observations instead reject the reserved
+separator during native `Id` deserialization, including account and membership
+map keys, before any projection can mint a consumer id. Per-id answer ledgers
+retain echoed submitted identities, including a legacy qualified id kept literal
+on the primary route: an explicit notFound must still correlate to its request.
+Single-operation partial-commit records re-qualify native ids only with the
+selected slot's owner, preserving literal fallback identities byte for byte.
+An enterprise user must never have malformed server data redirect a read or
+mutation to another account.
+Opaque object/query/session/push state tokens retain their own decoding domain
+and do not acquire native-id restrictions. Existing consumer bytes and their
+first-separator parser are unchanged.
 
 
 ### Shared mail-set execution and progress

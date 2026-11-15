@@ -510,7 +510,7 @@ mod bandwidth_review_tests {
             "the coalesced deflate suffix is counted after decompression"
         );
         reader
-            .read_one(crate::codec::utf7::WireMode::ModifiedUtf7)
+            .read_one(crate::types::wire::WireMode::ModifiedUtf7)
             .await
             .unwrap();
         assert_eq!(

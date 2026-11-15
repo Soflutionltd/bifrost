@@ -10,8 +10,8 @@
 
 use std::panic::AssertUnwindSafe;
 
-use crate::connection::NotifyFlags;
 use crate::types::CommandKind as CK;
+use crate::types::notify::NotifyFlags;
 use crate::types::response::{EsearchResponse, UntaggedResponse as UR, UntaggedStatus};
 use crate::types::validated::MailboxName;
 
@@ -46,6 +46,7 @@ fn all_rfc3501_command_kinds() -> Vec<CK> {
         CK::Expunge,
         CK::Search,
         CK::Fetch,
+        CK::UidFetch,
         CK::Store,
         CK::Copy,
     ]
@@ -116,7 +117,7 @@ fn all_rfc3501_untagged_variants() -> Vec<UR> {
         },
         // Section7.2.5  -  SEARCH
         UR::Search {
-            uids: vec![],
+            numbers: vec![],
             mod_seq: None,
         },
         // Section7.2.6  -  FLAGS
@@ -663,7 +664,7 @@ fn search_return_routes_search_as_solicited() {
         command_target: None,
     };
     let resp = UR::Search {
-        uids: vec![],
+        numbers: vec![],
         mod_seq: None,
     };
     let result = classify(CK::SearchReturn, &resp, &ctx);
@@ -681,7 +682,7 @@ fn search_save_routes_search_as_solicited() {
         command_target: None,
     };
     let resp = UR::Search {
-        uids: vec![],
+        numbers: vec![],
         mod_seq: None,
     };
     let result = classify(CK::SearchSave, &resp, &ctx);
@@ -729,7 +730,7 @@ fn search_routes_search_as_solicited() {
         command_target: None,
     };
     let resp = UR::Search {
-        uids: vec![],
+        numbers: vec![],
         mod_seq: None,
     };
     let result = classify(CK::Search, &resp, &ctx);
@@ -895,5 +896,47 @@ fn close_expunge_is_solicited() {
     assert!(
         matches!(result, SolicitationRule::OnlySolicited),
         "EXPUNGE during CLOSE should be OnlySolicited, got {result:?}"
+    );
+}
+
+#[test]
+fn fetch_addressing_controls_vanished_earlier_and_pipeline_overlap() {
+    use crate::types::{Command, SequenceSet, UidRange};
+    let sequence = Command::Fetch {
+        sequence_set: SequenceSet::new("1").unwrap(),
+        items: "UID".into(),
+        changed_since: None,
+    };
+    let uid = Command::UidFetch {
+        sequence_set: SequenceSet::new("1").unwrap(),
+        items: "UID".into(),
+        changed_since: Some(crate::types::ModSeq::new(1).unwrap()),
+        vanished: true,
+    };
+    let response = UR::Vanished {
+        earlier: true,
+        uids: vec![UidRange::single(1)],
+    };
+    let context = ClassificationContext {
+        notify: NotifyFlags::default(),
+        command_target: None,
+    };
+    assert!(matches!(
+        classify(sequence.kind(), &response, &context),
+        SolicitationRule::Impossible
+    ));
+    assert!(matches!(
+        classify(uid.kind(), &response, &context),
+        SolicitationRule::OnlySolicited
+    ));
+    // Both FETCH forms can receive a wire-identical FETCH. UID FETCH also
+    // overlaps EXPUNGE through historical VANISHED, so all remain serialized.
+    assert_eq!(
+        sequence.kind().untagged_routing_key(),
+        uid.kind().untagged_routing_key()
+    );
+    assert_eq!(
+        uid.kind().untagged_routing_key(),
+        CK::Expunge.untagged_routing_key()
     );
 }

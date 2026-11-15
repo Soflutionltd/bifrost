@@ -19,7 +19,7 @@ use super::*;
 pub(super) fn take_ack_writer(workers: &mut Vec<WorkerTask>) -> Option<WorkerTask> {
     workers
         .iter()
-        .position(|worker| worker.role == crate::types::WorkerRole::AckWriter)
+        .position(|worker| worker.role == crate::engine::context::WorkerRole::AckWriter)
         .map(|position| workers.remove(position))
 }
 

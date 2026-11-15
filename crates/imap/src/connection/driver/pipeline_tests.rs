@@ -433,7 +433,7 @@ async fn two_pipelined_searches_run_as_sequential_sub_batches() {
         .downcast_ref::<crate::types::EsearchResponse>()
         .expect("SEARCH RETURN output is an EsearchResponse");
     assert_eq!(second.tag.as_deref(), Some(tag2.as_str()));
-    assert_eq!(second.all, vec![crate::types::UidRange::single(7)]);
+    assert_eq!(second.all(), vec![crate::types::UidRange::single(7)]);
 }
 
 /// A tag-correlated ESEARCH naming a pipelined search that has ALREADY
@@ -486,7 +486,7 @@ async fn a_surplus_esearch_for_a_finalized_search_is_dropped_not_published() {
         .expect("the search completes normally")
         .downcast_ref::<crate::types::EsearchResponse>()
         .expect("SEARCH RETURN output is an EsearchResponse");
-    assert_eq!(search.all, vec![crate::types::UidRange::single(7)]);
+    assert_eq!(search.all(), vec![crate::types::UidRange::single(7)]);
     assert!(results[1].is_ok(), "the NOOP completes normally");
 
     let events = conn.drain_events().await;

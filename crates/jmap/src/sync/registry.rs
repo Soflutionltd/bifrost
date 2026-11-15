@@ -138,6 +138,10 @@ impl<T: HttpTransport, C: Capability> Slot<T, C> {
     }
 }
 
+// Each entry selects that capability's primary account in the session. These
+// are not optional fields of a Mail slot: Contacts and Calendars can belong to
+// accounts with no Mail capability at all. Shared Mail submission support lives
+// on the selected Mail slot and does not change these primary-family doors.
 pub(crate) struct Families<T: HttpTransport = ReqwestTransport> {
     pub(crate) submission: Option<Slot<T, capability::Submission>>,
     pub(crate) vacation: Option<Slot<T, capability::VacationResponseCap>>,

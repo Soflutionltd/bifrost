@@ -78,6 +78,84 @@ pub struct FetchResponse {
     pub gmail_labels: Option<Vec<String>>,
 }
 
+impl FetchResponse {
+    /// Fold a later observation of the same message. Mutable state takes the
+    /// latest value; immutable data only fills gaps. Enterprise users expect
+    /// split FETCH data to survive a later FLAGS-only update.
+    pub(crate) fn merge(&mut self, later: Self) {
+        if later.flags.is_some() {
+            self.flags = later.flags;
+        }
+        if later.mod_seq.is_some() {
+            self.mod_seq = later.mod_seq;
+        }
+        if self.envelope.is_none() {
+            self.envelope = later.envelope;
+        }
+        if self.body_structure.is_none() {
+            self.body_structure = later.body_structure;
+        }
+        if self.rfc822_size.is_none() {
+            self.rfc822_size = later.rfc822_size;
+        }
+        if self.internal_date.is_none() {
+            self.internal_date = later.internal_date;
+        }
+        if self.save_date.is_none() {
+            self.save_date = later.save_date;
+        }
+        if self.preview.is_none() {
+            self.preview = later.preview;
+        }
+        if self.email_id.is_none() {
+            self.email_id = later.email_id;
+        }
+        if self.thread_id.is_none() {
+            self.thread_id = later.thread_id;
+        }
+        if self.gmail_msg_id.is_none() {
+            self.gmail_msg_id = later.gmail_msg_id;
+        }
+        if self.gmail_thread_id.is_none() {
+            self.gmail_thread_id = later.gmail_thread_id;
+        }
+        // Labels are mutable state like FLAGS: the later report is the fresher.
+        if later.gmail_labels.is_some() {
+            self.gmail_labels = later.gmail_labels;
+        }
+        for section in later.body_sections {
+            if self
+                .body_sections
+                .iter()
+                .any(|held| held.same_fetch_key(&section) && held.data.is_some())
+            {
+                continue;
+            }
+            self.body_sections
+                .retain(|held| !held.same_fetch_key(&section));
+            self.body_sections.push(section);
+        }
+        for (section, size) in later.binary_sizes {
+            if self.binary_sizes.iter().any(|(held, _)| *held == section) {
+                continue;
+            }
+            self.binary_sizes.push((section, size));
+        }
+        for section in later.binary_sections {
+            if self.binary_sections.iter().any(|held| {
+                held.section == section.section
+                    && held.origin == section.origin
+                    && held.data.is_some()
+            }) {
+                continue;
+            }
+            self.binary_sections
+                .retain(|held| held.section != section.section || held.origin != section.origin);
+            self.binary_sections.push(section);
+        }
+    }
+}
+
 /// A single fetched BINARY section (RFC 3516 Section 4.2).
 ///
 /// Returned as `BINARY[section]<origin>` in FETCH responses.

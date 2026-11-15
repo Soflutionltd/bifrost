@@ -94,11 +94,11 @@ impl SessionCapabilities {
         imap4rev2_active(&self.capabilities, self.enabled.as_slice())
     }
 
-    pub(crate) fn utf8_mode(&self) -> crate::codec::utf7::WireMode {
+    pub(crate) fn utf8_mode(&self) -> crate::types::wire::WireMode {
         if self.imap4rev2_active() || self.enabled.contains(&Capability::Utf8Accept) {
-            crate::codec::utf7::WireMode::Utf8
+            crate::types::wire::WireMode::Utf8
         } else {
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
         }
     }
 
@@ -109,13 +109,13 @@ impl SessionCapabilities {
         self.supports(&Capability::Binary) || self.imap4rev2_active()
     }
 
-    pub(crate) fn literal_mode(&self) -> crate::codec::encode::LiteralMode {
+    pub(crate) fn literal_mode(&self) -> crate::types::wire::LiteralMode {
         if self.capabilities.contains(&Capability::LiteralPlus) {
-            crate::codec::encode::LiteralMode::LiteralPlus
+            crate::types::wire::LiteralMode::LiteralPlus
         } else if self.supports(&Capability::LiteralMinus) {
-            crate::codec::encode::LiteralMode::LiteralMinus
+            crate::types::wire::LiteralMode::LiteralMinus
         } else {
-            crate::codec::encode::LiteralMode::Synchronizing
+            crate::types::wire::LiteralMode::Synchronizing
         }
     }
 }

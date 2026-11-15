@@ -258,5 +258,26 @@ fn decode_utf16be(bytes: &[u8], out: &mut String) {
 }
 
 #[cfg(test)]
-#[path = "utf7_tests.rs"]
+#[path = "wire_tests.rs"]
 mod tests;
+
+/// Controls how the encoder produces literal markers.
+///
+/// RFC 3501 Section 4.3 defines synchronizing literals (`{N}\r\n`) which
+/// require the client to wait for a `+` continuation response. RFC 7888
+/// introduces two extensions that allow non-synchronizing literals (`{N+}\r\n`):
+///
+/// - **LITERAL+** (RFC 7888 Section 4): non-synchronizing literals of any size.
+/// - **LITERAL-** (RFC 7888 Section 5): non-synchronizing literals up to 4096
+///   bytes; larger literals MUST use synchronizing form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiteralMode {
+    /// No literal extension  -  all literals use synchronizing form `{N}\r\n`
+    /// (RFC 3501 Section 4.3).
+    Synchronizing,
+    /// LITERAL+ (RFC 7888 Section 4)  -  non-synchronizing `{N+}\r\n` for all sizes.
+    LiteralPlus,
+    /// LITERAL- (RFC 7888 Section 5)  -  non-synchronizing `{N+}\r\n` only when
+    /// the literal is <= 4096 bytes; larger literals use synchronizing `{N}\r\n`.
+    LiteralMinus,
+}

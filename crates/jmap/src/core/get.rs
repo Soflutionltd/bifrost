@@ -48,7 +48,7 @@ pub(crate) struct GetResponse<O: Object> {
     // Missing notFound is tolerated as an empty lane, never as evidence that
     // all submitted ids were answered. `answer` reconciles each requested id.
     #[serde(rename = "notFound")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::core::id::echo::vec")]
     not_found: Vec<O::Id>,
 }
 

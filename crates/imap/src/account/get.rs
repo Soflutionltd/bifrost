@@ -14,10 +14,10 @@ use futures::StreamExt;
 use crate::types::FetchAttr;
 use crate::types::{FetchResponse, MailboxName};
 
+#[cfg(test)]
+use super::hydration::PREVIEW_FETCH_BYTES;
 use super::hydration::{BodySelection, FetchSelection, decode_selected_body};
 use super::inventory::{fetch_to_inventory, flags_set};
-#[cfg(test)]
-use super::pim::PREVIEW_FETCH_BYTES;
 use super::targets::{TargetBatch, Verdict};
 use super::{
     BATCH_ITEMS, DecodedObjectId, ImapAccount, batch, decode_object_id, guarded_receiver_stream,
@@ -594,86 +594,9 @@ pub(super) fn merge_requested_fetches<E>(
     Ok(by_uid)
 }
 
-/// Fold a later FETCH response for the same UID into the one already held.
-/// Data items only ever fill gaps: a second response may add `FLAGS` or a
-/// section the first lacked, but it must never blank out data the first
-/// response carried. Shared with `pim::hydrate_decoded`, which faces the
-/// same split responses.
+/// Fold the protocol observations collected by account hydration.
 pub(super) fn merge_fetch_response(existing: &mut FetchResponse, later: FetchResponse) {
-    if later.flags.is_some() {
-        existing.flags = later.flags;
-    }
-    if later.mod_seq.is_some() {
-        existing.mod_seq = later.mod_seq;
-    }
-    if existing.envelope.is_none() {
-        existing.envelope = later.envelope;
-    }
-    if existing.body_structure.is_none() {
-        existing.body_structure = later.body_structure;
-    }
-    if existing.rfc822_size.is_none() {
-        existing.rfc822_size = later.rfc822_size;
-    }
-    if existing.internal_date.is_none() {
-        existing.internal_date = later.internal_date;
-    }
-    if existing.save_date.is_none() {
-        existing.save_date = later.save_date;
-    }
-    if existing.preview.is_none() {
-        existing.preview = later.preview;
-    }
-    if existing.email_id.is_none() {
-        existing.email_id = later.email_id;
-    }
-    if existing.thread_id.is_none() {
-        existing.thread_id = later.thread_id;
-    }
-    if existing.gmail_msg_id.is_none() {
-        existing.gmail_msg_id = later.gmail_msg_id;
-    }
-    if existing.gmail_thread_id.is_none() {
-        existing.gmail_thread_id = later.gmail_thread_id;
-    }
-    // Labels are mutable state like FLAGS: the later report is the fresher.
-    if later.gmail_labels.is_some() {
-        existing.gmail_labels = later.gmail_labels;
-    }
-    for section in later.body_sections {
-        if existing
-            .body_sections
-            .iter()
-            .any(|held| held.same_fetch_key(&section) && held.data.is_some())
-        {
-            continue;
-        }
-        existing
-            .body_sections
-            .retain(|held| !held.same_fetch_key(&section));
-        existing.body_sections.push(section);
-    }
-    for (section, size) in later.binary_sizes {
-        if existing
-            .binary_sizes
-            .iter()
-            .any(|(held, _)| *held == section)
-        {
-            continue;
-        }
-        existing.binary_sizes.push((section, size));
-    }
-    for section in later.binary_sections {
-        if existing.binary_sections.iter().any(|held| {
-            held.section == section.section && held.origin == section.origin && held.data.is_some()
-        }) {
-            continue;
-        }
-        existing
-            .binary_sections
-            .retain(|held| held.section != section.section || held.origin != section.origin);
-        existing.binary_sections.push(section);
-    }
+    existing.merge(later);
 }
 
 #[cfg(test)]
@@ -1119,60 +1042,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn body_merge_retains_origins_and_only_replaces_matching_nil() {
-        let mut first = body_section("TEXT", b"first");
-        first.origin = Some(0);
-        let mut second = body_section("text", b"second");
-        second.origin = Some(5);
-        let mut missing = second.clone();
-        missing.data = None;
-        let mut fetch = FetchResponse {
-            body_sections: vec![first.clone(), missing],
-            ..Default::default()
-        };
-        merge_fetch_response(
-            &mut fetch,
-            FetchResponse {
-                body_sections: vec![second.clone(), body_section("TEXT", b"whole")],
-                ..Default::default()
-            },
-        );
-        assert_eq!(fetch.body_sections.len(), 3);
-        assert_eq!(fetch.body_sections[0], first);
-        assert_eq!(fetch.body_sections[1], second);
-        assert_eq!(fetch.body_sections[2].origin, None);
-    }
-
-    #[test]
-    fn binary_merge_retains_origins_and_replaces_matching_nil() {
-        use crate::types::fetch::BinarySection;
-        let first = BinarySection {
-            section: vec![1],
-            origin: Some(0),
-            data: Some(bytes::Bytes::from_static(b"a")),
-        };
-        let second = BinarySection {
-            section: vec![1],
-            origin: Some(1),
-            data: Some(bytes::Bytes::from_static(b"b")),
-        };
-        let mut missing = second.clone();
-        missing.data = None;
-        let mut fetch = FetchResponse {
-            binary_sections: vec![first.clone(), missing],
-            ..Default::default()
-        };
-        merge_fetch_response(
-            &mut fetch,
-            FetchResponse {
-                binary_sections: vec![second.clone()],
-                ..Default::default()
-            },
-        );
-        assert_eq!(fetch.binary_sections, vec![first, second]);
-    }
-
     // A server is free to append an unsolicited FLAGS-only FETCH for a UID
     // it has already answered fully. Folding it in must not blank the body
     // that the solicited response carried.
@@ -1222,7 +1091,7 @@ mod tests {
     }
 
     // Every data item fills a gap the earlier response left, not only the
-    // body-shaped ones: `pim::fetch_to_message` reads THREADID and the Gmail
+    // body-shaped ones: `message::fetch_to_message` reads THREADID and the Gmail
     // thread id, and a split response used to lose them. BINARY.SIZE entries
     // add per section without replacing one already held; Gmail labels are
     // mutable state like FLAGS, so the later report wins.

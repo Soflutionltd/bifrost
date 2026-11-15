@@ -322,6 +322,7 @@ pub(crate) struct BlobGetResponse {
     list: Vec<BlobGetResult>,
 
     #[serde(rename = "notFound")]
+    #[serde(default, deserialize_with = "crate::core::id::echo::optional_vec")]
     not_found: Option<Vec<BlobId>>,
 }
 
@@ -492,6 +493,7 @@ pub(crate) struct BlobLookupResponse {
     list: Vec<BlobLookupResult>,
 
     #[serde(rename = "notFound")]
+    #[serde(default, deserialize_with = "crate::core::id::echo::optional_vec")]
     not_found: Option<Vec<BlobId>>,
 }
 

@@ -489,24 +489,13 @@ impl DavDispatch {
         )
     }
 
-    /// One wire attempt through `bifrost-net`, with its status-bearing failures
-    /// turned back into responses.
+    /// Send one logical DAV exchange through net's retry and hop engine.
     ///
-    /// DAV reads statuses as data, not only as failure: `sync-collection` reads
-    /// 403 and 410 as cursor invalidation, `MOVE` reads 405 and 501 as "no MOVE
-    /// here, fall back to copy-then-delete", and a conditional PUT reads 412.
-    /// The net retry loop turns every 4xx and 5xx into `Err` before a response
-    /// surfaces, so a terminal `Error::Status` is reconstituted here rather than
-    /// classified, as is exhausted 501 for MOVE fallback. Exhausted retry and
-    /// rate-limit budgets and transport failures keep the shared funnel, which
-    /// preserves their retry history and transmission evidence. The DAV status
-    /// ladder receives headers for statuses interpreted outside that funnel.
-    ///
-    /// One narrowing worth knowing: a reconstituted body is capped at
-    /// `bifrost_net::STATUS_BODY_CAP`, where the previous DAV transport buffered
-    /// error bodies to the full 64 MiB ceiling. Every status DAV reads as data
-    /// carries a short precondition document, so the cap does not bite; a
-    /// diagnostic body longer than the cap now arrives truncated.
+    /// DAV consumes client refusals and unsupported-method answers as data:
+    /// sync-collection reads 403/410, MOVE reads 405/501 and PUT reads 412.
+    /// Authentication, timeout and rate-limit responses keep net's recovery;
+    /// other server failures retain its retry budget and complete history.
+    /// Selected bodies use the normal buffered ceiling, not diagnostic excerpts.
     async fn dispatch_once(
         &self,
         request: &DavRequest,
@@ -554,6 +543,12 @@ impl DavDispatch {
             .net
             .request(request.method.clone(), target.as_url().clone())
             .without_bearer_auth()
+            .statuses_as_data(
+                (400..500)
+                    .filter(|code| !matches!(code, 401 | 408 | 429))
+                    .map(|code| StatusCode::from_u16(code).expect("HTTP client status"))
+                    .chain([StatusCode::NOT_IMPLEMENTED]),
+            )
             .follow_redirects(FollowRedirects::default())
             .hop_policy(Arc::clone(&policy) as Arc<dyn HopPolicy>)
             .timeout(timeout);
@@ -637,80 +632,55 @@ impl DavDispatch {
             )
         })?;
         match outcome {
-            Err(error @ NetError::AttemptHistory { .. }) => {
-                // The terminal status of an unreplayable request is data only
-                // when its earlier attempts cannot have produced it. A replay
-                // after the request's own committed first attempt can answer
-                // 412 (conditional PUT/DELETE, create-PUT) or 404 (versioned
-                // DELETE, MOVE whose source already moved), so those go to the
-                // shared classifier, whose possible-commit ledger path
-                // reconciles. A 405/501 denies the method itself, which no
-                // earlier commit can cause, and is the one status DAV needs as
-                // data after a refusal (the MOVE fallback).
-                //
-                // The shared walk retains the rejected 401 before refreshing.
-                // Such a proven refusal permits DAV to consume the terminal
-                // status as data without losing earlier commit uncertainty.
-                let refused_only = match &error {
-                    NetError::AttemptHistory { evidence, .. } => {
-                        let attempts = evidence.attempts();
-                        let status_is = |attempt: &NetError, codes: &[u16]| {
-                            matches!(attempt, NetError::Status { code, .. }
-                                if codes.contains(&code.as_u16()))
-                        };
-                        let all_auth = !attempts.is_empty()
-                            && attempts.iter().all(|attempt| status_is(attempt, &[401]));
-                        let method_refused = match error.terminal() {
-                            NetError::Status { code, .. } => matches!(code.as_u16(), 405 | 501),
-                            NetError::RetryBudgetExhausted {
-                                final_response: Some(r),
-                                ..
-                            } => matches!(r.status.as_u16(), 405 | 501),
-                            _ => false,
-                        };
-                        // A terminal 405/501 denies the method itself, which no
-                        // earlier attempt (even an ambiguous 503) can have
-                        // caused, so earlier attempts do not gate it.
-                        all_auth || method_refused
+            Ok(response) => {
+                // Check only earlier attempts: a direct terminal refusal is a
+                // complete answer. Net's ledger owns the possible-commit rule,
+                // including its proven-refusal predicate. A 429 then 412 is a
+                // real conflict; a possibly committed redirect then 412 needs
+                // read-back. An enterprise user must not blindly retry a write
+                // whose earlier result is unknown. A terminal 405/501 denies
+                // the method itself, which no earlier attempt can have caused,
+                // so MOVE still falls back to copy-then-delete after a hop.
+                let method_refused = matches!(
+                    response.status,
+                    StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+                );
+                if !request.replayable() && !response.status.is_success() && !method_refused {
+                    let outcomes = response.evidence().ledger().outcomes();
+                    let mut prior = bifrost_net::AttemptLedger::default();
+                    for outcome in outcomes.iter().take(outcomes.len().saturating_sub(1)) {
+                        prior.record(*outcome, false);
                     }
-                    _ => false,
-                };
-                if request.replayable() || refused_only {
-                    let response = match error.terminal() {
-                        NetError::Status {
-                            code,
-                            headers,
-                            body,
-                        } => Some((*code, headers, body)),
-                        NetError::RetryBudgetExhausted {
-                            final_response: Some(response),
-                            ..
-                        }
-                        | NetError::RateLimited {
-                            final_response: response,
-                            ..
-                        } if response.status == StatusCode::NOT_IMPLEMENTED => {
-                            Some((response.status, &response.headers, &response.body))
-                        }
-                        _ => None,
-                    };
-                    if let Some((status, headers, body)) = response {
-                        return Ok(DavResponse {
-                            status,
-                            headers: headers.clone(),
-                            body: decode_body(body),
-                            url: url.clone(),
-                        });
-                    }
-                    if let NetError::ResponseTooLarge { limit } = error.terminal() {
-                        let limit = *limit;
-                        return Err(response_read_error_with_history(
-                            error,
-                            limit,
-                            operation,
-                            self.protocol,
+                    if prior.verdict() == bifrost_net::CommitEvidence::MayHaveCommitted {
+                        return Err(into_account_error(
+                            response.into_status_error(),
+                            NetErrorContext {
+                                provider: None,
+                                protocol: self.protocol.protocol(),
+                                operation,
+                                scope: None,
+                            },
                         ));
                     }
+                }
+                Ok(DavResponse {
+                    status: response.status,
+                    headers: response.headers,
+                    body: decode_body(&response.body),
+                    url: url.clone(),
+                })
+            }
+            Err(error) => {
+                // A body past the buffered ceiling is acknowledged but unreadable:
+                // an unreplayable mutation must reconcile rather than replay.
+                if let NetError::ResponseTooLarge { limit } = error.terminal() {
+                    let limit = *limit;
+                    return Err(response_read_error_with_history(
+                        error,
+                        limit,
+                        operation,
+                        self.protocol,
+                    ));
                 }
                 Err(into_account_error(
                     error,
@@ -722,52 +692,6 @@ impl DavDispatch {
                     },
                 ))
             }
-            Ok(response) => Ok(DavResponse {
-                status: response.status,
-                headers: response.headers,
-                body: decode_body(&response.body),
-                url: url.clone(),
-            }),
-            Err(NetError::Status {
-                code,
-                body,
-                headers,
-            }) => Ok(DavResponse {
-                status: code,
-                headers,
-                body: decode_body(&body),
-                url: url.clone(),
-            }),
-            // MOVE consumes 501 as data even after net exhausts its 5xx
-            // retry budget. Other exhausted statuses keep their complete retry
-            // history in the shared funnel instead of being rebuilt as a bare
-            // response and losing Retry-After evidence.
-            Err(NetError::RetryBudgetExhausted {
-                final_response: Some(response),
-                ..
-            }) if response.status == StatusCode::NOT_IMPLEMENTED => Ok(DavResponse {
-                status: response.status,
-                headers: response.headers,
-                body: decode_body(&response.body),
-                url: url.clone(),
-            }),
-            // A body past the buffered ceiling is acknowledged but unreadable:
-            // the request reached the server and may have taken effect, so a
-            // non-idempotent mutation must reconcile rather than replay.
-            Err(NetError::ResponseTooLarge { limit }) => Err(response_read_error(
-                operation,
-                format!("DAV response body exceeded the buffered ceiling ({limit} bytes)"),
-                self.protocol,
-            )),
-            Err(error) => Err(into_account_error(
-                error,
-                NetErrorContext {
-                    provider: None,
-                    protocol: self.protocol.protocol(),
-                    operation,
-                    scope: None,
-                },
-            )),
         }
     }
 
@@ -1241,6 +1165,149 @@ mod tests {
         )
     }
 
+    fn protocol_dispatch(net: AccountNet, protocol: DavProtocol) -> DavDispatch {
+        DavDispatch::with_account_net(
+            net,
+            BASE,
+            DavCredentials::Basic {
+                username: "user".into(),
+                password: "pass".into(),
+            },
+            protocol,
+        )
+    }
+
+    #[tokio::test]
+    async fn credential_origins_and_redirect_admission_hold_for_both_protocols() {
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            let script = dav_script([
+                answer(StatusCode::OK),
+                dav_redirect(StatusCode::FOUND, "https://evil.test/stolen"),
+            ]);
+            let dispatch = protocol_dispatch(scripted_dav_net(&script), protocol);
+            let get = |url| dispatch.request(Method::GET, url);
+            dispatch
+                .send_raw_request(get(BASE), AccountOperation::SyncInventory)
+                .await
+                .unwrap();
+            dispatch
+                .send_raw_request(
+                    get("https://evil.test/stolen"),
+                    AccountOperation::SyncInventory,
+                )
+                .await
+                .unwrap_err();
+            dispatch
+                .send_raw_request(get(BASE), AccountOperation::SyncInventory)
+                .await
+                .unwrap_err();
+            let sent = transcripts(&script);
+            assert_eq!(sent.len(), 2);
+            for request in sent {
+                assert!(request.url.starts_with(BASE));
+                assert_eq!(request.headers[AUTHORIZATION], "Basic dXNlcjpwYXNz");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_https_redirects_receive_credentials_but_plaintext_homes_do_not() {
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            let script = dav_script([
+                dav_redirect(
+                    StatusCode::MOVED_PERMANENTLY,
+                    "https://homes.example.test/next/",
+                ),
+                answer(StatusCode::MULTI_STATUS),
+            ]);
+            let mut dispatch = protocol_dispatch(scripted_dav_net(&script), protocol);
+            dispatch.admit_discovered_urls([
+                "https://homes.example.test/home/".into(),
+                "http://plain.example.test/home/".into(),
+            ]);
+            let response = dispatch
+                .send_raw_request(
+                    dispatch
+                        .request(crate::PROPFIND.clone(), BASE)
+                        .replay(bifrost_net::ReplayPolicy::Idempotent),
+                    AccountOperation::SyncInventory,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.url.as_str(), "https://homes.example.test/next/");
+            dispatch
+                .send_raw_request(
+                    dispatch.request(Method::GET, "http://plain.example.test/home/"),
+                    AccountOperation::SyncInventory,
+                )
+                .await
+                .unwrap_err();
+            let sent = transcripts(&script);
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[1].url, "https://homes.example.test/next/");
+            assert_eq!(sent[1].method, *crate::PROPFIND);
+            assert_eq!(
+                sent[1].headers[AUTHORIZATION],
+                sent[0].headers[AUTHORIZATION]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn both_protocols_allow_the_configured_redirect_hop_count() {
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            let max_hops = usize::from(bifrost_net::DEFAULT_MAX_HOPS);
+            let script = dav_script(
+                (0..max_hops)
+                    .map(|_| dav_redirect(StatusCode::TEMPORARY_REDIRECT, "/next"))
+                    .chain([answer(StatusCode::NO_CONTENT)]),
+            );
+            let dispatch = protocol_dispatch(scripted_dav_net(&script), protocol);
+            dispatch
+                .delete_resource(BASE, AccountOperation::SyncInventory)
+                .await
+                .unwrap();
+            assert_eq!(transcripts(&script).len(), max_hops + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn statuses_as_data_preserves_complete_dav_bodies_without_status_retries() {
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            for status in [
+                StatusCode::FORBIDDEN,
+                StatusCode::GONE,
+                StatusCode::PRECONDITION_FAILED,
+                StatusCode::NOT_IMPLEMENTED,
+            ] {
+                let body = format!(
+                    "{}<D:valid-sync-token/>",
+                    " ".repeat(bifrost_net::STATUS_BODY_CAP + 1)
+                );
+                let script = dav_script([Canned::Response {
+                    status,
+                    headers: HeaderMap::new(),
+                    body: Bytes::from(body.clone()),
+                }]);
+                let dispatch = protocol_dispatch(scripted_dav_net(&script), protocol);
+                let (dispatch, tally) = dispatch.metered();
+                let response = dispatch
+                    .send_raw_request(
+                        dispatch
+                            .request(crate::REPORT.clone(), BASE)
+                            .replay(bifrost_net::ReplayPolicy::Idempotent),
+                        AccountOperation::SyncChanges,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status, status);
+                assert_eq!(response.body, body);
+                assert_eq!(tally.take(), body.len() as u64);
+                assert_eq!(transcripts(&script).len(), 1);
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn batch_tally_counts_raw_bodies_across_retries_and_redirects() {
         let response = |status, body: &'static [u8]| Canned::Response {
@@ -1590,67 +1657,48 @@ mod tests {
         assert_eq!(transcripts(&script).len(), 1);
     }
 
-    #[test]
-    fn a_status_after_a_possible_commit_is_not_read_as_data() {
-        let dispatch = scripted_dispatch(scripted_dav_net(&dav_script_empty()));
+    #[tokio::test]
+    async fn a_status_after_a_possible_commit_is_not_read_as_data() {
         for (method, code, operation) in [
             (Method::PUT, 412, AccountOperation::EventUpdate),
             (Method::DELETE, 404, AccountOperation::EventDelete),
-            (
-                Method::from_bytes(b"MOVE").unwrap(),
-                404,
-                AccountOperation::EventUpdate,
-            ),
-            (Method::PUT, 405, AccountOperation::EventUpdate),
+            (crate::MOVE.clone(), 404, AccountOperation::EventUpdate),
         ] {
-            let status = |code| NetError::Status {
-                code: StatusCode::from_u16(code).unwrap(),
-                headers: HeaderMap::new(),
-                body: Bytes::new(),
-            };
-            let request =
-                DavRequest::new(method, format!("{BASE}/one.ics")).header("If-Match", "v1");
-            let result = dispatch.wire_outcome(
-                &request,
-                operation,
-                Err(NetError::AttemptHistory {
-                    source: Box::new(status(code)),
-                    evidence: bifrost_net::RequestEvidence::new(
-                        vec![status(503)],
-                        bifrost_net::CommitEvidence::MayHaveCommitted,
-                    ),
-                }),
-            );
-            if code == 405 {
-                assert_eq!(result.unwrap().status, StatusCode::METHOD_NOT_ALLOWED);
-            } else {
-                assert!(reconciles(&result.unwrap_err()));
-            }
+            let script = dav_script([
+                dav_redirect(StatusCode::TEMPORARY_REDIRECT, "/relocated"),
+                answer(StatusCode::from_u16(code).unwrap()),
+            ]);
+            let dispatch = scripted_dispatch(scripted_dav_net(&script));
+            let error = dispatch
+                .send_raw_request(
+                    DavRequest::new(method, format!("{BASE}/one.ics"))
+                        .replay(bifrost_net::ReplayPolicy::Never),
+                    operation,
+                )
+                .await
+                .unwrap_err();
+            assert!(reconciles(&error), "status {code}: {error:?}");
+            assert_eq!(transcripts(&script).len(), 2);
         }
-        let request = DavRequest::new(
-            Method::from_bytes(b"MOVE").unwrap(),
-            format!("{BASE}/one.ics"),
-        );
-        let result = dispatch.wire_outcome(
-            &request,
-            AccountOperation::EventUpdate,
-            Err(NetError::AttemptHistory {
-                source: Box::new(NetError::RetryBudgetExhausted {
-                    final_response: Some(bifrost_net::error::FinalResponse {
-                        status: StatusCode::NOT_IMPLEMENTED,
-                        headers: HeaderMap::new(),
-                        body: Bytes::new(),
-                    }),
-                    retry_after_history: vec![],
-                    stop_reason: bifrost_net::RetryStopReason::AttemptBudget,
-                }),
-                evidence: bifrost_net::RequestEvidence::new(
-                    vec![],
-                    bifrost_net::CommitEvidence::MayHaveCommitted,
-                ),
-            }),
-        );
-        assert_eq!(result.unwrap().status, StatusCode::NOT_IMPLEMENTED);
+        // A method refusal cannot be caused by an earlier hop, so the MOVE
+        // copy-then-delete fallback still sees it as data.
+        for code in [StatusCode::METHOD_NOT_ALLOWED, StatusCode::NOT_IMPLEMENTED] {
+            let script = dav_script([
+                dav_redirect(StatusCode::TEMPORARY_REDIRECT, "/relocated"),
+                answer(code),
+            ]);
+            let dispatch = scripted_dispatch(scripted_dav_net(&script));
+            let response = dispatch
+                .send_raw_request(
+                    DavRequest::new(crate::MOVE.clone(), format!("{BASE}/one.ics"))
+                        .replay(bifrost_net::ReplayPolicy::Never),
+                    AccountOperation::EventUpdate,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status, code);
+            assert_eq!(transcripts(&script).len(), 2);
+        }
     }
 
     #[tokio::test]
@@ -1683,16 +1731,9 @@ mod tests {
             assert_eq!(script.remaining(), 1);
         }
         for status in [StatusCode::METHOD_NOT_ALLOWED, StatusCode::NOT_IMPLEMENTED] {
-            // 501 is a proven refusal (`is_proven_refusal`), so net may retry
-            // it even for an unreplayable MOVE; script the whole retry budget
-            // so the final 501 surfaces as data. 405 is not a retry candidate.
-            let replies = if status == StatusCode::NOT_IMPLEMENTED {
-                3
-            } else {
-                1
-            };
-            let script =
-                dav_script((0..replies).map(|_| replay_dav_response(status, "unsupported")));
+            // Both refusals are selected as data before retry handling. One
+            // response is sufficient even for the otherwise retryable 501.
+            let script = dav_script([replay_dav_response(status, "unsupported")]);
             let dispatch = scripted_dispatch(scripted_dav_net(&script));
             assert!(
                 !dispatch
@@ -2076,7 +2117,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_429_refusal_preserves_move_fallback_but_create_ambiguity_reconciles() {
+    async fn a_429_refusal_preserves_move_fallback_and_a_real_create_conflict() {
         let script = dav_script([
             answer(StatusCode::TOO_MANY_REQUESTS),
             answer(StatusCode::METHOD_NOT_ALLOWED),
@@ -2108,7 +2149,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(reconciles(&error));
+        assert_eq!(error.kind(), &AccountErrorKind::ConcurrencyConflict);
         assert_eq!(transcripts(&script).len(), 2);
     }
 

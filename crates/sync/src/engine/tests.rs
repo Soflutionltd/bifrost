@@ -1,15 +1,14 @@
-use super::backfill::BackfillScan;
 use super::bulk::{
     MutationBucket, classify_item_outcome, counters_from_outcomes, queue_unresolved_for_retry,
     should_forward_engine_recovery, unresolved_readback_ids,
 };
+use super::context::{WorkerRole, WorkerTask};
 use super::reattach::accepted_push_scopes;
 use super::{
     Arc, ChangeCursor, DynCheckpointStore, WriterHandle, WriterRequest, ack_writer, mpsc, oneshot,
     take_ack_writer,
 };
 use crate::cursor::store::CheckpointStore;
-use crate::types::{WorkerRole, WorkerTask};
 
 fn idle_worker(role: WorkerRole) -> WorkerTask {
     let join = tokio::spawn(async {});
@@ -58,7 +57,6 @@ async fn taking_the_ack_writer_from_a_writerless_list_yields_none() {
 
 use crate::error::Error;
 use bifrost_types::{CursorScope, EngineDirective, FolderId, MembershipScope, ObjectType};
-use std::collections::HashSet;
 
 /// Harness for driving the account writer directly.
 fn writer_harness_observed() -> (
@@ -588,7 +586,7 @@ async fn a_replayed_marker_does_not_create_a_completion_the_new_attachment_never
         .await
         .expect("store read");
     assert!(
-        !super::backfill::backfill_complete_recorded(stored.as_ref()),
+        !crate::backfill::plan::backfill_complete_recorded(stored.as_ref()),
         "a replayed marker must not record a completion this ledger cannot vouch for: \
          the fresh walk reads this row back and answers Skip, so the page the departed \
          consumer stranded is never re-offered. got {stored:?}"
@@ -903,7 +901,7 @@ async fn a_completion_marker_acknowledged_without_a_publication_is_withheld() {
         .await
         .expect("store read");
     assert!(
-        !super::backfill::backfill_complete_recorded(stored.as_ref()),
+        !crate::backfill::plan::backfill_complete_recorded(stored.as_ref()),
         "a completion nothing can vouch for must not become durable: it retires the \
          scope for every later attach. got {stored:?}"
     );
@@ -2914,269 +2912,6 @@ async fn only_a_reattach_resume_of_a_provisional_row_claims_it() {
 }
 
 #[test]
-fn backfill_skips_only_the_fusion_owned_incarnation_and_rescans_new_scopes() {
-    let fused = CursorScope::Type(ObjectType::Email);
-    let created = CursorScope::Folder(FolderId("created".into()));
-    let fusion_owned = HashSet::from([fused.clone()]);
-    let mut scan = BackfillScan::default();
-    let coverage = crate::cursor::PendingCoverage::new();
-    let now = tokio::time::Instant::now();
-
-    let inc = crate::cursor::ScopeIncarnation::for_test;
-    let first = scan.select(vec![(fused.clone(), inc(1))], &fusion_owned, now, &coverage);
-    assert!(
-        first.is_empty(),
-        "fusion's inventory must not be double-walked"
-    );
-
-    let later = scan.select(
-        vec![(fused.clone(), inc(2)), (created.clone(), inc(3))],
-        &fusion_owned,
-        now,
-        &coverage,
-    );
-    assert_eq!(later, vec![(fused, inc(2)), (created, inc(3))]);
-}
-
-/// A completed walk retires the incarnation; a failed one does not.
-/// Filtering a failed incarnation out permanently would let a single
-/// transient partition or checkpoint-store error cost that scope its
-/// entire backfill for the rest of the attachment.
-#[tokio::test(start_paused = true)]
-async fn a_failed_backfill_incarnation_stays_eligible_for_retry() {
-    let scope = CursorScope::Type(ObjectType::Email);
-    let fusion_owned = HashSet::new();
-    let mut scan = BackfillScan::default();
-    let coverage = crate::cursor::PendingCoverage::new();
-    let available = vec![(scope.clone(), crate::cursor::ScopeIncarnation::for_test(7))];
-
-    assert_eq!(
-        scan.select(
-            available.clone(),
-            &fusion_owned,
-            tokio::time::Instant::now(),
-            &coverage
-        ),
-        vec![(scope.clone(), crate::cursor::ScopeIncarnation::for_test(7))]
-    );
-    scan.record_attempt(
-        (scope.clone(), crate::cursor::ScopeIncarnation::for_test(7)),
-        false,
-    );
-    assert!(
-        scan.select(
-            available.clone(),
-            &fusion_owned,
-            tokio::time::Instant::now(),
-            &coverage
-        )
-        .is_empty(),
-        "a just-failed incarnation must back off rather than re-walk immediately"
-    );
-
-    tokio::time::advance(super::backfill::BACKFILL_RETRY_INITIAL * 2).await;
-    assert_eq!(
-        scan.select(
-            available.clone(),
-            &fusion_owned,
-            tokio::time::Instant::now(),
-            &coverage
-        ),
-        vec![(scope.clone(), crate::cursor::ScopeIncarnation::for_test(7))],
-        "a failed incarnation must come back once its backoff elapses"
-    );
-
-    scan.record_attempt(
-        (scope.clone(), crate::cursor::ScopeIncarnation::for_test(7)),
-        true,
-    );
-    tokio::time::advance(super::backfill::BACKFILL_RETRY_CAP * 2).await;
-    assert!(
-        scan.select(
-            available,
-            &fusion_owned,
-            tokio::time::Instant::now(),
-            &coverage
-        )
-        .is_empty(),
-        "a completed incarnation is never re-walked"
-    );
-}
-
-/// An incarnation that leaves the registry takes its residue with it.
-///
-/// A scope that is deleted, re-established, or simply never comes back otherwise
-/// leaves a retry deadline, a lost-pages mark and a baseline behind it - one set
-/// per incarnation, for the life of the attachment - and the orchestrator's
-/// "vanished during the subscriber wait" path adds one every time it fires.
-/// `settled` is deliberately kept: it is the memory that stops a concluded
-/// incarnation being walked again, and incarnation numbers only move forward.
-#[tokio::test(start_paused = true)]
-async fn a_departed_incarnation_leaves_no_residue_behind() {
-    let scope = CursorScope::Type(ObjectType::Email);
-    let fusion_owned = HashSet::new();
-    let mut scan = BackfillScan::default();
-    let coverage = crate::cursor::PendingCoverage::new();
-    coverage.note_undelivered(&scope, 3);
-    let key = (scope.clone(), crate::cursor::ScopeIncarnation::for_test(11));
-
-    scan.select(
-        vec![key.clone()],
-        &fusion_owned,
-        tokio::time::Instant::now(),
-        &coverage,
-    );
-    assert_eq!(
-        scan.begin_walk(&key, &coverage),
-        crate::cursor::UndeliveredMark::for_test(3),
-        "the walk begins under the scope's current reading"
-    );
-    scan.note_lost_pages(key.clone());
-    assert_eq!(
-        scan.baseline_for(&key),
-        crate::cursor::UndeliveredMark::for_test(3),
-        "which the scan holds for it"
-    );
-    assert!(scan.restarts_from_scratch(&key));
-
-    // The registry no longer carries it.
-    assert!(
-        scan.select(
-            Vec::new(),
-            &fusion_owned,
-            tokio::time::Instant::now(),
-            &coverage
-        )
-        .is_empty()
-    );
-    assert_eq!(
-        scan.baseline_for(&key),
-        crate::cursor::UndeliveredMark::for_test(0),
-        "a departed incarnation's baseline must not be kept for the life of the attachment"
-    );
-    assert!(!scan.restarts_from_scratch(&key), "nor its lost-pages mark");
-}
-
-/// A settle must be recorded against the reading its walk was CHECKED against,
-/// so a loss landing after those checks reopens the incarnation.
-///
-/// The window is small and real: the writer refuses the completion marker and
-/// discards the rows on exactly such a loss, and if the rescan adopts the same
-/// event as its baseline it compares that reading against itself for ever - the
-/// two halves of one repair reading one event in opposite directions, with the
-/// scope never walked again for the rest of the attachment. `BackfillScan` takes
-/// the baseline through `begin_walk`, as the walk starts, for that reason: a
-/// settle cannot be handed a reading nothing validated, because it is not handed
-/// one at all.
-#[tokio::test(start_paused = true)]
-async fn a_loss_after_the_checks_reopens_the_incarnation_it_settled() {
-    let scope = CursorScope::Type(ObjectType::Email);
-    let fusion_owned = HashSet::new();
-    let mut scan = BackfillScan::default();
-    let coverage = crate::cursor::PendingCoverage::new();
-    let available = vec![(scope.clone(), crate::cursor::ScopeIncarnation::for_test(3))];
-
-    assert_eq!(
-        scan.select(
-            available.clone(),
-            &fusion_owned,
-            tokio::time::Instant::now(),
-            &coverage
-        ),
-        vec![(scope.clone(), crate::cursor::ScopeIncarnation::for_test(3))]
-    );
-    // A loss BEFORE this walk begins belongs to whatever came earlier, and the
-    // baseline it starts under has to include it - otherwise every scope after
-    // the first in one rescan batch re-walks over its predecessor's losses.
-    coverage.note_undelivered(&scope, 4);
-    assert_eq!(
-        scan.begin_walk(
-            &(scope.clone(), crate::cursor::ScopeIncarnation::for_test(3)),
-            &coverage
-        ),
-        crate::cursor::UndeliveredMark::for_test(4)
-    );
-    // And the loss that lands after every check this pass made, before the
-    // settle, is precisely the interleaving the writer acts on.
-    coverage.note_undelivered(&scope, 1);
-    scan.record_attempt(
-        (scope.clone(), crate::cursor::ScopeIncarnation::for_test(3)),
-        true,
-    );
-
-    assert_eq!(
-        scan.select(
-            available,
-            &fusion_owned,
-            tokio::time::Instant::now(),
-            &coverage
-        ),
-        vec![(scope.clone(), crate::cursor::ScopeIncarnation::for_test(3))],
-        "the incarnation must be reopened: its walk was settled on checks made \
-         before a page of it reached nobody"
-    );
-    assert!(
-        scan.restarts_from_scratch(&(scope, crate::cursor::ScopeIncarnation::for_test(3))),
-        "and reopened as a walk that may not trust its stored resume position"
-    );
-}
-
-/// The same reopen, for an incarnation whose last attempt FAILED rather than
-/// settled.
-///
-/// A departure sweep landing after a transient partition failure reaches nobody:
-/// `note_lost_pages` runs at a walk's END, and the next attempt takes the moved
-/// reading as its own baseline, so it RESUMES past the hole, judges itself whole
-/// and earns a durable marker. The discard request that loss raised then sits
-/// outstanding until `detach` acts on it and deletes the marker the second walk
-/// legitimately earned - a full re-walk on the next attach, once per flaky
-/// partition, for as long as the provider keeps failing. The failed attempt's
-/// baseline therefore SURVIVES the failure, and the rescan compares it exactly as
-/// it compares a settled one.
-#[tokio::test(start_paused = true)]
-async fn a_loss_after_a_failed_attempt_restarts_the_next_walk_from_scratch() {
-    let scope = CursorScope::Type(ObjectType::Email);
-    let fusion_owned = HashSet::new();
-    let mut scan = BackfillScan::default();
-    let coverage = crate::cursor::PendingCoverage::new();
-    let key = (scope.clone(), crate::cursor::ScopeIncarnation::for_test(7));
-
-    scan.select(
-        vec![key.clone()],
-        &fusion_owned,
-        tokio::time::Instant::now(),
-        &coverage,
-    );
-    assert_eq!(
-        scan.begin_walk(&key, &coverage),
-        crate::cursor::UndeliveredMark::for_test(0)
-    );
-    // The attempt ends on a transient failure, with every page it published
-    // still in a live consumer's hands.
-    scan.record_attempt(key.clone(), false);
-    assert!(
-        !scan.restarts_from_scratch(&key),
-        "a plain failure is not a reason to distrust the stored resume position"
-    );
-
-    // Only now does the consumer holding one of that attempt's pages depart.
-    coverage.note_undelivered(&scope, 1);
-    scan.select(
-        vec![key.clone()],
-        &fusion_owned,
-        tokio::time::Instant::now(),
-        &coverage,
-    );
-
-    assert!(
-        scan.restarts_from_scratch(&key),
-        "the retry must start the walk over: resuming past the hole earns a durable \
-         marker while the discard request the loss raised waits for a repair that \
-         never comes, and detach then deletes the marker that walk earned"
-    );
-}
-
-#[test]
 fn rejected_push_scopes_are_not_treated_as_covered() {
     let accepted = CursorScope::Folder(FolderId("accepted".into()));
     let rejected = CursorScope::Folder(FolderId("rejected".into()));
@@ -3575,193 +3310,6 @@ fn disable_scope_deletes_cursor_and_drops_membership() {
     assert_eq!(
         cursors.scopes_for_membership(&MembershipScope::Folder(FolderId("INBOX".into()))),
         vec![sibling]
-    );
-}
-
-/// Build a backfill checkpoint on a given partition key + progress for
-/// the open-pages resume tests.
-#[cfg(test)]
-fn checkpoint_on(
-    partition: bifrost_types::Partition,
-    items_done: u64,
-) -> bifrost_types::BackfillCheckpoint {
-    bifrost_types::BackfillCheckpoint {
-        scope: CursorScope::Type(ObjectType::Email),
-        partition,
-        progress_marker: None,
-        progress: bifrost_types::BackfillProgress {
-            items_done,
-            items_estimated: None,
-        },
-        envelope_version: bifrost_types::TraitEnvelopeVersion::new(1),
-    }
-}
-
-#[test]
-fn backfill_complete_recorded_detects_sentinel() {
-    use super::backfill::backfill_complete_recorded;
-    assert!(!backfill_complete_recorded(None));
-
-    let marker = checkpoint_on(crate::backfill::partitioner::completion_partition(), 99);
-    assert!(backfill_complete_recorded(Some(&marker)));
-
-    // A real partition checkpoint (e.g. a fully-walked Full plan) is
-    // not the completion signal.
-    let full = checkpoint_on(
-        crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Full),
-        99,
-    );
-    assert!(!backfill_complete_recorded(Some(&full)));
-}
-
-#[test]
-fn open_pages_resume_no_checkpoint_starts_fresh() {
-    use super::backfill::{OpenPagesResume, open_pages_resume};
-    assert_eq!(open_pages_resume(None), OpenPagesResume::ResumeFrom(0));
-}
-
-#[test]
-fn open_pages_resume_completion_marker_skips() {
-    use super::backfill::{OpenPagesResume, open_pages_resume};
-    let ck = checkpoint_on(crate::backfill::partitioner::completion_partition(), 1234);
-    assert_eq!(open_pages_resume(Some(&ck)), OpenPagesResume::Skip);
-}
-
-#[test]
-fn open_pages_resume_short_final_page_resumes_rather_than_skipping() {
-    use super::backfill::{OpenPagesResume, open_pages_resume};
-    // A 256-of-500 page is NOT proof the inventory ran out inside the
-    // window: a partition may emit fewer entries than its width while
-    // the scope still has results (ids deleted between listing and
-    // hydration, id-less objects dropped). Only the completion marker
-    // proves exhaustion. Skipping here would silently drop every
-    // message past the window on re-attach.
-    let key =
-        crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Page(
-            bifrost_types::PageWindow::new(0, 500).expect("ordered window"),
-        ));
-    let ck = checkpoint_on(key, 256);
-    assert_eq!(
-        open_pages_resume(Some(&ck)),
-        OpenPagesResume::ResumeFrom(500)
-    );
-}
-
-#[test]
-fn open_pages_resume_full_page_resumes_after_it() {
-    use super::backfill::{OpenPagesResume, open_pages_resume};
-    let key =
-        crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Page(
-            bifrost_types::PageWindow::new(500, 1000).expect("ordered window"),
-        ));
-    let ck = checkpoint_on(key, 500);
-    assert_eq!(
-        open_pages_resume(Some(&ck)),
-        OpenPagesResume::ResumeFrom(1000)
-    );
-}
-
-#[test]
-fn open_pages_resume_unrecognised_partition_starts_fresh() {
-    use super::backfill::{OpenPagesResume, open_pages_resume};
-    let key = crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Full);
-    let ck = checkpoint_on(key, 7);
-    assert_eq!(open_pages_resume(Some(&ck)), OpenPagesResume::ResumeFrom(0));
-}
-
-/// The orchestrator drives both plan shapes through one shared walk, so
-/// `BackfillPlan::resume` is now the ONLY place the two differ. These pin
-/// each arm on both sides of the skip/walk choice: a wired-up-backwards
-/// resume would either re-walk a finished scope every attach or, far
-/// worse, skip a scope that never finished.
-#[test]
-fn a_fixed_plan_skips_only_on_its_completion_marker() {
-    use super::backfill::{BackfillPlan, ScopeResume};
-
-    let marker = checkpoint_on(crate::backfill::partitioner::completion_partition(), 99);
-    let plan = BackfillPlan::Fixed(vec![bifrost_types::InventoryPartition::Full]);
-    assert!(matches!(plan.resume(Some(&marker)), ScopeResume::Skip));
-
-    // No marker: walk every partition. A fixed plan has no positional
-    // resume, so re-walking is the only correct answer.
-    let plan = BackfillPlan::Fixed(vec![bifrost_types::InventoryPartition::Full]);
-    let ScopeResume::Walk(mut driver) = plan.resume(None) else {
-        panic!("a fixed plan without a completion marker must walk");
-    };
-    assert_eq!(
-        driver.next_partition(),
-        Some(bifrost_types::InventoryPartition::Full)
-    );
-
-    // A checkpoint that is merely a walked partition is NOT the
-    // completion signal. Treating any stored row as "done" would strand
-    // a plan that crashed after its first partition acked.
-    let partial = checkpoint_on(
-        crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Full),
-        42,
-    );
-    let plan = BackfillPlan::Fixed(vec![bifrost_types::InventoryPartition::Full]);
-    let ScopeResume::Walk(mut driver) = plan.resume(Some(&partial)) else {
-        panic!("only the completion marker may skip a fixed plan");
-    };
-    assert_eq!(
-        driver.next_partition(),
-        Some(bifrost_types::InventoryPartition::Full)
-    );
-}
-
-#[test]
-fn an_open_pages_plan_resumes_at_the_acked_window() {
-    use super::backfill::{BackfillPlan, ScopeResume};
-
-    let marker = checkpoint_on(crate::backfill::partitioner::completion_partition(), 99);
-    let plan = BackfillPlan::OpenPages { chunk: 500 };
-    assert!(matches!(plan.resume(Some(&marker)), ScopeResume::Skip));
-
-    let key =
-        crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Page(
-            bifrost_types::PageWindow::new(0, 500).expect("ordered window"),
-        ));
-    let acked = checkpoint_on(key, 500);
-    let plan = BackfillPlan::OpenPages { chunk: 500 };
-    let ScopeResume::Walk(mut driver) = plan.resume(Some(&acked)) else {
-        panic!("an unfinished page walk must resume, not skip");
-    };
-    assert_eq!(
-        driver.next_partition(),
-        Some(bifrost_types::InventoryPartition::Page(
-            bifrost_types::PageWindow::new(500, 1000).expect("ordered window")
-        )),
-        "the walk resumes after the furthest durably-acked window"
-    );
-}
-
-/// A checkpoint READ failure is not evidence of coverage. Both shapes
-/// must fall back to a full walk rather than a skip, or one flaky store
-/// call silently drops everything a prior run had not finished.
-#[test]
-fn a_failed_resume_read_walks_from_scratch_on_both_plan_shapes() {
-    use super::backfill::{BackfillPlan, ScopeResume};
-
-    let plan = BackfillPlan::Fixed(vec![bifrost_types::InventoryPartition::Full]);
-    let ScopeResume::Walk(mut driver) = plan.walk_from_scratch() else {
-        panic!("a failed read must not skip a fixed plan");
-    };
-    assert_eq!(
-        driver.next_partition(),
-        Some(bifrost_types::InventoryPartition::Full)
-    );
-
-    let plan = BackfillPlan::OpenPages { chunk: 250 };
-    let ScopeResume::Walk(mut driver) = plan.walk_from_scratch() else {
-        panic!("a failed read must not skip a page walk");
-    };
-    assert_eq!(
-        driver.next_partition(),
-        Some(bifrost_types::InventoryPartition::Page(
-            bifrost_types::PageWindow::new(0, 250).expect("ordered window")
-        )),
-        "a failed read restarts at page 0, never at a guessed offset"
     );
 }
 
@@ -4361,41 +3909,6 @@ async fn an_already_persisted_change_ack_promotes_a_provisional_row() {
     drop(handle);
     drop(tx);
     writer.await.expect("writer");
-}
-
-#[test]
-fn legacy_empty_completion_rechecks_but_nonempty_completion_remains_valid() {
-    use super::backfill::{BackfillPlan, OpenPagesResume, ScopeResume, open_pages_resume};
-    for items_done in [0, 1] {
-        let legacy = checkpoint_on(bifrost_types::Partition(b"complete".to_vec()), items_done);
-        let ScopeResume::Walk(mut driver) = BackfillPlan::Fixed(Vec::new()).resume(Some(&legacy))
-        else {
-            panic!("legacy empty marker must not skip inventory");
-        };
-        assert_eq!(
-            driver.next_partition(),
-            Some(bifrost_types::InventoryPartition::Full)
-        );
-        assert_eq!(
-            open_pages_resume(Some(&legacy)),
-            OpenPagesResume::ResumeFrom(0)
-        );
-    }
-    let legacy = checkpoint_on(bifrost_types::Partition(b"complete".to_vec()), 2);
-    assert!(matches!(
-        BackfillPlan::Fixed(Vec::new()).resume(Some(&legacy)),
-        ScopeResume::Skip
-    ));
-    assert_eq!(open_pages_resume(Some(&legacy)), OpenPagesResume::Skip);
-    let checked_empty = checkpoint_on(crate::backfill::partitioner::completion_partition(), 1);
-    assert!(matches!(
-        BackfillPlan::Fixed(Vec::new()).resume(Some(&checked_empty)),
-        ScopeResume::Skip
-    ));
-    assert_eq!(
-        open_pages_resume(Some(&checked_empty)),
-        OpenPagesResume::Skip
-    );
 }
 
 #[tokio::test]

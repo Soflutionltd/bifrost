@@ -137,21 +137,34 @@ pub const DEFAULT_BACKFILL_CAPACITY: usize = 64;
 /// bury the case worth seeing, which is a park that never ends.
 const PARK_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The account's scheduler admission, owned by the gate so a parked producer is
-/// not sitting on budget the live work needs.
-///
-/// The engine admits every wire path, and with a minimal budget the account has
-/// a single sync permit. A backfill that filled the bound, started the next
-/// partition, took that permit and then parked blocked polling and push
-/// reconciliation until an acknowledgement arrived, and with `global = 1` other
-/// accounts and mutations too. So the permit is dropped for the duration of a
-/// park and re-acquired on the wake.
+/// One admitted partition pass. The permit belongs to the runner future,
+/// rather than a cloneable gate; cancellation drops it even if the bound lives
+/// for the rest of the attachment.
 #[derive(Debug)]
-pub struct BackfillAdmission {
-    pub(super) scheduler: Scheduler,
-    account_id: AccountId,
-    control: SyncControl,
-    permit: Mutex<Option<BudgetPermit>>,
+#[must_use = "retain admission for the partition pass"]
+pub struct BackfillAdmission<'a> {
+    bound: &'a BackfillBound,
+    permit: BudgetPermit,
+}
+
+impl<'a> BackfillAdmission<'a> {
+    #[must_use]
+    pub fn bound(&self) -> &BackfillBound {
+        self.bound
+    }
+
+    /// Move admission through the wait. A park drops the old permit before
+    /// awaiting capacity; a successful wake returns the newly acquired permit.
+    pub async fn wait_for_capacity(self) -> Result<Self, WaitFailed> {
+        let permit = self
+            .bound
+            .wait_for_capacity_holding_admission(self.permit)
+            .await?;
+        Ok(Self {
+            bound: self.bound,
+            permit,
+        })
+    }
 }
 
 /// Why a capacity wait ended without a go-ahead.
@@ -171,56 +184,6 @@ pub enum WaitFailed {
     Refused(Error),
 }
 
-impl BackfillAdmission {
-    fn new(scheduler: Scheduler, account_id: AccountId, control: SyncControl) -> Self {
-        Self {
-            scheduler,
-            account_id,
-            control,
-            permit: Mutex::new(None),
-        }
-    }
-
-    async fn acquire(&self, shutdown: &CancellationToken) -> Result<(), WaitFailed> {
-        let admitted = tokio::select! {
-            () = shutdown.cancelled() => return Err(WaitFailed::ShuttingDown),
-            permit = self.scheduler.admit(
-                self.account_id.clone(),
-                self.control.priority_snapshot(),
-                WorkKind::Backfill,
-            ) => permit,
-        };
-        match admitted {
-            Ok(permit) => {
-                *self
-                    .permit
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(permit);
-                Ok(())
-            }
-            Err(error) => Err(WaitFailed::Refused(error)),
-        }
-    }
-
-    fn release(&self) {
-        let taken = self
-            .permit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        drop(taken);
-    }
-
-    /// Whether the account's sync budget is currently held. Observability.
-    #[must_use]
-    pub fn is_held(&self) -> bool {
-        self.permit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    }
-}
-
 /// The producer's door onto the bound: the account's publication ledger (which
 /// IS the capacity ledger), the token a park must be able to end through, and
 /// the account's scheduler admission.
@@ -229,38 +192,28 @@ pub struct BackfillBound {
     coverage: Arc<PendingCoverage>,
     capacity: usize,
     shutdown: CancellationToken,
-    admission: Arc<BackfillAdmission>,
+    scheduler: Scheduler,
+    account_id: AccountId,
+    control: SyncControl,
     /// When this gate last warned about a park. Shared across clones, because
     /// the rate limit is about the ACCOUNT's log and a gate is cloned per
     /// partition pass.
     park_warned_at: Arc<Mutex<Option<tokio::time::Instant>>>,
 }
 
-// Capacity and warning state belong to the account; admission belongs to one
-// pass. Sharing the permit slot lets a cloned pass release another pass's budget.
+// Clones share account capacity and warning state. Every admission is owned by
+// its calling future, so cloning a bound cannot release another pass's permit.
 impl Clone for BackfillBound {
     fn clone(&self) -> Self {
         Self {
             coverage: Arc::clone(&self.coverage),
             capacity: self.capacity,
             shutdown: self.shutdown.clone(),
-            admission: Arc::new(BackfillAdmission::new(
-                self.admission.scheduler.clone(),
-                self.admission.account_id.clone(),
-                self.admission.control.clone(),
-            )),
+            scheduler: self.scheduler.clone(),
+            account_id: self.account_id.clone(),
+            control: self.control.clone(),
             park_warned_at: Arc::clone(&self.park_warned_at),
         }
-    }
-}
-
-/// A cancelled partition future must release the gate's stored budget too.
-/// Keeping the permit only in the cloneable gate would outlive that future.
-pub(super) struct BackfillPermit<'a>(&'a BackfillBound);
-
-impl Drop for BackfillPermit<'_> {
-    fn drop(&mut self) {
-        self.0.release_admission();
     }
 }
 
@@ -280,14 +233,15 @@ impl BackfillBound {
             // misconfigured knob must not be able to produce one.
             capacity: capacity.max(1),
             shutdown,
-            admission: Arc::new(BackfillAdmission::new(scheduler, account_id, control)),
+            scheduler,
+            account_id,
+            control,
             park_warned_at: Arc::new(Mutex::new(None)),
         }
     }
 
-    #[must_use]
-    pub fn admission(&self) -> &Arc<BackfillAdmission> {
-        &self.admission
+    pub(super) fn scheduler(&self) -> &Scheduler {
+        &self.scheduler
     }
 
     #[must_use]
@@ -301,25 +255,28 @@ impl BackfillBound {
     }
 
     /// Take the account's sync admission for a partition pass.
-    pub async fn admit(&self) -> Result<(), WaitFailed> {
-        self.admission.acquire(&self.shutdown).await
+    pub async fn admit(&self) -> Result<BackfillAdmission<'_>, WaitFailed> {
+        let permit = self.acquire().await?;
+        Ok(self.hold_admission(permit))
     }
 
-    /// Install a permit acquired by the slot's drive-start gate. The gate
-    /// retains activity and the incarnation in the partition caller; this
-    /// owner releases only the scarce scheduler budget at a capacity park.
-    pub(super) fn hold_admission(&self, permit: BudgetPermit) -> BackfillPermit<'_> {
-        *self
-            .admission
-            .permit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(permit);
-        BackfillPermit(self)
+    async fn acquire(&self) -> Result<BudgetPermit, WaitFailed> {
+        tokio::select! {
+            biased;
+            () = self.shutdown.cancelled() => Err(WaitFailed::ShuttingDown),
+            permit = self.scheduler.admit(self.account_id.clone(),
+                self.control.priority_snapshot(), WorkKind::Backfill) => {
+                permit.map_err(WaitFailed::Refused)
+            }
+        }
     }
 
-    /// Give the account's sync admission back.
-    pub fn release_admission(&self) {
-        self.admission.release();
+    /// Transfer the drive-start permit into the runner's owned pass.
+    pub(super) fn hold_admission(&self, permit: BudgetPermit) -> BackfillAdmission<'_> {
+        BackfillAdmission {
+            bound: self,
+            permit,
+        }
     }
 
     /// Wait for room to publish another backfill page, WITHOUT touching the
@@ -352,17 +309,23 @@ impl BackfillBound {
     /// account pays nothing. Only a genuine park hands the budget back, and the
     /// re-acquisition after the wake reports a refusal as [`WaitFailed::Refused`]
     /// rather than as shutdown.
-    pub async fn wait_for_capacity_holding_admission(&self) -> Result<(), WaitFailed> {
-        if self.coverage.backfill_in_flight() < self.capacity {
-            return Ok(());
+    pub async fn wait_for_capacity_holding_admission(
+        &self,
+        permit: BudgetPermit,
+    ) -> Result<BudgetPermit, WaitFailed> {
+        if self.shutdown.is_cancelled() {
+            return Err(WaitFailed::ShuttingDown);
         }
-        self.release_admission();
+        if self.coverage.backfill_in_flight() < self.capacity {
+            return Ok(permit);
+        }
+        drop(permit);
         self.wait_for_capacity().await?;
         // This resumes an already-open partition stream; it is not a new
         // drive. Replacing its account here would pair an old stream with new
         // state. The runner retains the original activity and publication
         // fence; protocol pacing owns holds discovered during that drive.
-        self.admit().await
+        self.acquire().await
     }
 
     /// Name the stall, at most once per [`PARK_WARN_INTERVAL`].
@@ -390,7 +353,7 @@ impl BackfillBound {
         let (holders, scopes) = self.coverage.backfill_charge_holders();
         tracing::warn!(
             target: "bifrost.sync.backfill",
-            account = %self.admission.account_id.0,
+            account = %self.account_id.0,
             capacity = self.capacity,
             in_flight,
             holders = ?holders,
@@ -422,8 +385,8 @@ impl BackfillBound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backfill::marker::MarkerOutcome;
     use crate::cursor::CoverageClaim;
-    use crate::engine::backfill::MarkerOutcome;
     use crate::scheduler::{BudgetGate, ConcurrencyBudget};
     use bifrost_types::{
         BackfillCheckpoint, BackfillProgress, Checkpoint, CursorScope, ObjectType, Partition,
@@ -611,7 +574,10 @@ mod tests {
                 bifrost_types::TraitEnvelopeVersion::new(1),
                 &publisher,
                 crate::cursor::WalkGeneration::for_test(1),
-                bound,
+                match bound {
+                    Some(gate) => Some(gate.admit().await.expect("admission")),
+                    None => None,
+                },
                 old,
             )
             .await;
@@ -663,7 +629,7 @@ mod tests {
                 writer_tx,
                 self.bound.shutdown.clone(),
             );
-            crate::engine::backfill::emit_backfill_complete(
+            crate::backfill::marker::emit_backfill_complete(
                 scope,
                 crate::backfill::ScopeWalkDriver::fixed(Vec::new()).total_seen(),
                 &publisher,
@@ -1102,7 +1068,12 @@ mod tests {
             still_parked(wait.as_mut()).await,
             "the wait must park at the bound"
         );
-        assert!(!h.gate.admission().is_held());
+        let permit = h
+            .gate
+            .admit()
+            .await
+            .expect("capacity wait holds no admission");
+        drop(permit);
 
         h.coverage.acknowledge_publication(id);
         assert!(
@@ -1111,68 +1082,66 @@ mod tests {
                 .expect("the wake must arrive")
                 .is_ok()
         );
-        assert!(
-            !h.gate.admission().is_held(),
-            "an admission-free wait must not leave the account's sync permit held; \
-             the sentinel is emitted after the partition pass gave it back, and holding \
-             it starves polling for the rest of the attachment"
-        );
+        let permit = h.gate.admit().await.expect("sentinel left the permit free");
+        drop(permit);
     }
 
     #[tokio::test]
-    async fn cloned_passes_have_independent_admission_slots() {
-        // Three per-account permits leave two in the sync pool once the
-        // mutation share is carved out; two simultaneous admissions need both.
+    async fn cloned_passes_have_independent_admission_owners() {
         let h = harness_with_budget(1, 3, 3);
         let other = h.gate.clone();
-        h.gate.admit().await.expect("first admission");
-        other.admit().await.expect("second admission");
-        other.release_admission();
-        assert!(h.gate.admission().is_held());
-        assert!(!other.admission().is_held());
-        h.gate.release_admission();
+        let first = h.gate.admit().await.expect("first admission");
+        let second = other.admit().await.expect("second admission");
+        drop(second);
+        let replacement = other
+            .admit()
+            .await
+            .expect("released only the second permit");
+        let queued = h.gate.admit();
+        tokio::pin!(queued);
+        assert!(
+            still_parked(queued.as_mut()).await,
+            "first pass still holds its permit"
+        );
+        drop(first);
+        drop(queued.await.expect("first permit released by its owner"));
+        drop(replacement);
     }
 
-    /// FINDING 3 of the previous round, kept: a producer parked mid-partition
-    /// must give the budget back, or the live work starves on a minimal budget.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(start_paused = true)]
+    async fn dropping_an_unpolled_capacity_wait_releases_its_owned_admission() {
+        let h = harness_with_budget(1, 2, 1);
+        let pass = h.gate.admit().await.expect("first admission");
+        let unpolled = pass.wait_for_capacity();
+        drop(unpolled);
+        drop(
+            tokio::time::timeout(std::time::Duration::from_secs(1), h.gate.admit())
+                .await
+                .expect("an unpolled future must already own and drop the permit")
+                .expect("replacement admission"),
+        );
+    }
+
+    /// A parked producer releases actual scheduler budget, not an observed flag.
+    #[tokio::test(start_paused = true)]
     async fn a_parked_producer_gives_up_the_accounts_sync_admission() {
         let h = harness_with_budget(1, 2, 2);
         h.publish(&page(&scope_a(), "page:0:10", 1), 1);
-
-        let gate = Arc::new(h.gate.clone());
-        gate.admit().await.expect("admission");
-        assert!(gate.admission().is_held());
-        let parked_gate = Arc::clone(&gate);
-        let parked =
-            tokio::spawn(async move { parked_gate.wait_for_capacity_holding_admission().await });
-
-        let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while gate.admission().is_held() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
+        let pass = h.gate.admit().await.expect("admission");
+        let wait = pass.wait_for_capacity();
+        tokio::pin!(wait);
+        assert!(still_parked(wait.as_mut()).await);
+        let live = h
+            .scheduler
+            .admit(h.account.clone(), Priority::Normal, WorkKind::Sync);
         assert!(
-            released.is_ok(),
-            "a producer parked on the bound must not hold the account's sync budget"
+            tokio::time::timeout(std::time::Duration::from_secs(5), live)
+                .await
+                .is_ok_and(|permit| permit.is_ok()),
+            "polling can run during the park"
         );
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                h.scheduler
-                    .admit(h.account.clone(), Priority::Normal, WorkKind::Sync)
-            )
-            .await
-            .is_ok_and(|permit| permit.is_ok()),
-            "polling must be admissible while cold start is parked"
-        );
-
         h.shutdown.cancel();
-        assert!(matches!(
-            parked.await.expect("task"),
-            Err(WaitFailed::ShuttingDown)
-        ));
+        assert!(matches!(wait.await, Err(WaitFailed::ShuttingDown)));
     }
 
     /// FINDING 5, exercised through the real mid-partition wait rather than
@@ -1216,11 +1185,10 @@ mod tests {
         };
 
         let producer = gate_for("producer", Arc::clone(&coverage));
-        producer
+        let pass = producer
             .admit()
             .await
             .expect("the first admission succeeds");
-        assert!(producer.admission().is_held());
 
         // Fill the bound, then park the mid-partition wait.
         let id = coverage.register(
@@ -1231,18 +1199,14 @@ mod tests {
             },
         );
         coverage.mark_delivered(&id, crate::delivery::ReceiverSequence::for_test(1));
-        let wait = producer.wait_for_capacity_holding_admission();
+        let wait = pass.wait_for_capacity();
         tokio::pin!(wait);
         assert!(still_parked(wait.as_mut()).await, "parked at the bound");
-        assert!(
-            !producer.admission().is_held(),
-            "and it gave the account's sync budget back before parking"
-        );
 
         // While it is parked, the scheduler fills up: one holder takes the only
         // global permit and one waiter occupies the only lane slot.
         let holder = gate_for("holder", Arc::new(PendingCoverage::new()));
-        holder.admit().await.expect("the permit is free again");
+        let held = holder.admit().await.expect("the permit is free again");
         let queued = gate_for("queued", Arc::new(PendingCoverage::new()));
         let queued_admit = queued.admit();
         tokio::pin!(queued_admit);
@@ -1265,7 +1229,7 @@ mod tests {
              shutdown"
         );
 
-        holder.release_admission();
+        drop(held);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), queued_admit).await;
     }
 

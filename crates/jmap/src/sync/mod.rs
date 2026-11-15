@@ -7,6 +7,7 @@
 
 mod account;
 mod blob;
+mod calendar_mapping;
 mod calendar_ops;
 mod capabilities;
 #[cfg(test)]

@@ -8,8 +8,8 @@
 //! bytes into [`MailboxName`] at parse time, so the decoder's output is always
 //! in decoded user-facing form, with the original address retained separately.
 
-use crate::codec::utf7::WireMode;
 use crate::types::validated::MailboxName;
+use crate::types::wire::WireMode;
 
 /// Decode a mailbox name from wire bytes into a [`MailboxName`].
 ///

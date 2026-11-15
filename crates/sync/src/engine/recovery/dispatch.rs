@@ -38,7 +38,7 @@ pub(crate) async fn handle_account_error(
             // provider Retry-After delay.
             tracing::debug!(
                 target: "bifrost.sync.recovery",
-                account = ?ctx.account_id,
+                account = ?&ctx.account_id,
                 scope = ?scope,
                 retry = ?advice,
                 "retry recovery reached reopen listener; caller owns the retry"
@@ -100,7 +100,7 @@ pub(crate) async fn handle_account_error(
             let view = err.telemetry_fields();
             tracing::warn!(
                 target: "bifrost.sync.changes",
-                account = ?ctx.account_id,
+                account = ?&ctx.account_id,
                 scope = ?scope,
                 kind = view.kind_discriminant,
                 message_key = view.message_key,
@@ -138,7 +138,7 @@ fn log_reconcile_advice(
         .collect();
     tracing::warn!(
         target: "bifrost.sync.changes",
-        account = ?ctx.account_id,
+        account = ?&ctx.account_id,
         scope = ?scope,
         kind = ?error.kind(),
         message_key = error.message_key(),
@@ -188,7 +188,7 @@ async fn handle_engine_directive(
                 return RecoveryFollowUp::None;
             };
             broadcast_warning(
-                ctx.delivery,
+                &ctx.delivery,
                 Some(directive_scope.clone()),
                 bifrost_types::Warning::user_safe(
                     bifrost_types::WarningKind::Engine(
@@ -221,7 +221,7 @@ async fn handle_engine_directive(
                 _ => fallback_scope.clone(),
             };
             broadcast_warning(
-                ctx.delivery,
+                &ctx.delivery,
                 warning_scope,
                 bifrost_types::Warning::user_safe(
                     bifrost_types::WarningKind::StrategyDowngraded,
@@ -260,7 +260,7 @@ async fn handle_engine_directive(
                 {
                     tracing::debug!(
                         target: "bifrost.sync.recovery",
-                        account = ?ctx.account_id,
+                        account = ?&ctx.account_id,
                         "declining stale scope repair after strategy downgrade"
                     );
                     return RecoveryFollowUp::None;
@@ -286,7 +286,7 @@ async fn handle_engine_directive(
             // routing the warning to one folder's scope would misfile
             // an account-wide condition.
             broadcast_warning(
-                ctx.delivery,
+                &ctx.delivery,
                 None,
                 bifrost_types::Warning::support_only(
                     bifrost_types::WarningKind::Engine(
@@ -329,7 +329,7 @@ pub(in crate::engine) fn stale_generation(ctx: &RecoveryContext<'_>) -> bool {
     if stale {
         tracing::debug!(
             target: "bifrost.sync.recovery",
-            account = ?ctx.account_id,
+            account = ?&ctx.account_id,
             "declining stale recovery raised against a replaced account"
         );
     }

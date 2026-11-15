@@ -16,6 +16,6 @@
 pub(crate) mod classification;
 pub(crate) mod decode;
 pub(crate) mod encode;
-pub(crate) mod utf7;
+pub(crate) mod literals;
 
 pub(crate) mod search;

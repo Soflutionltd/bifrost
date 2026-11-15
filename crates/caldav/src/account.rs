@@ -1111,24 +1111,6 @@ fn event_calendar_url(event_url: &str) -> Option<String> {
     bifrost_dav_core::url::parent_collection_url(event_url)
 }
 
-/// Reduce the failure lane to one outcome per resource id.
-///
-/// Search runs a REPORT per property, so the resource the ATTENDEE query
-/// refused can be the same resource the SUMMARY query returned in full.
-/// The data arrived, so success is the true outcome; reporting the id in
-/// both lanes would make a consumer count it twice and treat an event it
-/// can display as lost. The sort and dedup finish the job for ids that
-/// failed in more than one REPORT.
-///
-/// The shared helper accepts the materialized href projection explicitly.
-#[cfg(test)]
-fn one_outcome_per_id(failed: &mut Vec<String>, materialized: &HashSet<String>) {
-    bifrost_dav_core::collection_account::one_outcome_per_id(
-        failed,
-        materialized.iter().map(String::as_str),
-    );
-}
-
 /// Publish a partially-refused walk as a skipped scope.
 ///
 /// A REPORT leg that failed wholly means this calendar was not fully
@@ -1819,6 +1801,86 @@ mod tests {
         CursorScope::FolderType {
             folder: FolderId("https://dav.example.test/cal/".to_string()),
             ty: ObjectType::CalendarEvent,
+        }
+    }
+
+    /// RestartScope must identify the cursor discovery actually advertised,
+    /// so an expired token is replaced instead of replayed on every poll.
+    #[tokio::test]
+    async fn expired_sync_token_restarts_the_discovered_calendar_cursor() {
+        use bifrost_types::{EngineDirective, RecoveryClass};
+
+        for (status, spelling) in [StatusCode::FORBIDDEN, StatusCode::GONE]
+            .into_iter()
+            .flat_map(|status| (0..4).map(move |spelling| (status, spelling)))
+        {
+            let script = dav_script([
+                DavResponse {
+                    status,
+                    body: "<D:error xmlns:D=\"DAV:\"><D:valid-sync-token/></D:error>".into(),
+                    ..cal_multistatus(String::new())
+                },
+                cal_multistatus(wrap(&[concat!(
+                    "<D:response><D:href>/cal/</D:href><D:propstat><D:prop>",
+                    "<D:sync-token>fresh</D:sync-token></D:prop>",
+                    "<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
+                )
+                .into()])),
+                cal_multistatus(wrap(&[queried("one")])),
+            ]);
+            let client = CalDavClient::with_account_net(
+                "https://dav.example.test",
+                scripted_dav_net(&script),
+            );
+            let account =
+                CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+            let scopes = account.discover_cursor_scopes().collect::<Vec<_>>().await;
+            let SyncEvent::Batch(batch) = &scopes[0] else {
+                panic!("expected discovered scopes")
+            };
+            let scope = match spelling {
+                0 => batch.items[0].clone(),
+                1 => CursorScope::Folder(FolderId("https://dav.example.test/cal/".into())),
+                2 => CursorScope::Type(ObjectType::CalendarEvent),
+                _ => batch.items[0].clone(),
+            };
+            let stale = Kernel::cursor_from_snapshot(
+                scope.clone(),
+                &EventSnapshot {
+                    collection_url: if spelling == 3 {
+                        "https://DAV.example.test:443/cal/".into()
+                    } else {
+                        "https://dav.example.test/cal/".into()
+                    },
+                    token: Some("expired".into()),
+                    ..EventSnapshot::default()
+                },
+            );
+            let events = account.changes_stream(stale).collect::<Vec<_>>().await;
+            let SyncEvent::Terminated(error) = &events[0] else {
+                panic!("expected expired token: {events:?}")
+            };
+            let RecoveryClass::Engine(EngineDirective::RestartScope(restart)) = error.recovery()
+            else {
+                panic!("expected restart: {:?}", error.recovery())
+            };
+            assert_eq!(
+                restart, &scope,
+                "restart must match the stored cursor exactly"
+            );
+            let CursorEstablishment::Ready(fresh) = account
+                .establish_initial_cursor(restart.clone())
+                .await
+                .unwrap()
+            else {
+                panic!("DAV establishes synchronously")
+            };
+            assert_eq!(fresh.scope, scope);
+            assert_eq!(
+                Kernel::decode_snapshot(&fresh).unwrap().token.as_deref(),
+                Some("fresh")
+            );
+            assert_eq!(transcripts(&script).len(), 3);
         }
     }
 
@@ -2554,7 +2616,10 @@ mod tests {
         ];
         let materialized = HashSet::from(["/cal/one.ics".to_string()]);
 
-        one_outcome_per_id(&mut failed, &materialized);
+        bifrost_dav_core::collection_account::one_outcome_per_id(
+            &mut failed,
+            materialized.iter().map(String::as_str),
+        );
 
         assert_eq!(failed, vec!["/cal/two.ics".to_string()]);
     }

@@ -118,7 +118,7 @@ fn fragment(mode: LiteralMode, write: impl FnOnce(&mut CommandWriter)) -> Vec<u8
 fn assert_string_nul_rejected(data: &[u8]) {
     let mut w = CommandWriter::new(&default_opts());
     w.raw(b"A001 X ");
-    w.string(data, crate::codec::utf7::WireMode::ModifiedUtf7);
+    w.string(data, crate::types::wire::WireMode::ModifiedUtf7);
     w.raw(b"\r\n");
     assert!(matches!(
         w.finish(),
@@ -138,7 +138,7 @@ fn try_fragment(
 
 fn push_quoted_or_literal(buf: &mut BytesMut, data: &[u8], mode: LiteralMode) {
     buf.extend_from_slice(&fragment(mode, |w| {
-        w.string(data, crate::codec::utf7::WireMode::ModifiedUtf7);
+        w.string(data, crate::types::wire::WireMode::ModifiedUtf7);
     }));
 }
 
@@ -319,7 +319,7 @@ fn append_wire(
 #[test]
 fn encode_enable_uses_imap4rev2_base_capability() {
     let opts = EncodeOptions {
-        utf8_mode: crate::codec::utf7::WireMode::ModifiedUtf7,
+        utf8_mode: crate::types::wire::WireMode::ModifiedUtf7,
         literal_mode: LiteralMode::Synchronizing,
         session: crate::types::profile::SessionCapabilities::new(
             vec![Capability::Imap4Rev2],
@@ -336,7 +336,7 @@ fn encode_enable_uses_imap4rev2_base_capability() {
 #[test]
 fn encode_options_treats_list_status_as_imap4rev2_base_capability() {
     let opts = EncodeOptions {
-        utf8_mode: crate::codec::utf7::WireMode::ModifiedUtf7,
+        utf8_mode: crate::types::wire::WireMode::ModifiedUtf7,
         literal_mode: LiteralMode::Synchronizing,
         session: crate::types::profile::SessionCapabilities::new(
             vec![Capability::Imap4Rev2],
@@ -358,7 +358,7 @@ fn encode_options_capability_answers_match_the_authority() {
 
     for (capabilities, enabled) in connection_states() {
         let opts = EncodeOptions {
-            utf8_mode: crate::codec::utf7::WireMode::ModifiedUtf7,
+            utf8_mode: crate::types::wire::WireMode::ModifiedUtf7,
             literal_mode: LiteralMode::Synchronizing,
             session: crate::types::profile::SessionCapabilities::new(
                 capabilities.clone(),
@@ -379,7 +379,7 @@ fn encode_options_capability_answers_match_the_authority() {
     }
 
     let qresync_only = EncodeOptions {
-        utf8_mode: crate::codec::utf7::WireMode::ModifiedUtf7,
+        utf8_mode: crate::types::wire::WireMode::ModifiedUtf7,
         literal_mode: LiteralMode::Synchronizing,
         session: crate::types::profile::SessionCapabilities::new(
             vec![Capability::QResync],
@@ -2671,7 +2671,7 @@ fn spec_audit_l2_recent_in_store() {
 fn spec_audit_l14_invalid_sequence_set() {
     // "abc" is not a valid sequence set per RFC 3501 Section 9.
     // SequenceSet::new() rejects it at construction time.
-    assert!(SequenceSet::new("abc").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new("abc").is_err());
 }
 
 // ===== Audit finding #1: APPEND lacks RFC 6855 UTF8 data extension =====
@@ -2847,7 +2847,7 @@ fn append_literal8_plus_marker_matrix() {
 
     // Pure rev2 with BINARY advertised: literal8 is always synchronizing.
     let rev2_binary = EncodeOptions {
-        utf8_mode: crate::codec::utf7::WireMode::Utf8,
+        utf8_mode: crate::types::wire::WireMode::Utf8,
         literal_mode: LiteralMode::LiteralMinus,
         session: crate::types::profile::SessionCapabilities::new(
             vec![
@@ -2872,7 +2872,7 @@ fn append_literal8_plus_marker_matrix() {
 #[test]
 fn rev2_does_not_imply_binary_for_append() {
     let rev2 = EncodeOptions {
-        utf8_mode: crate::codec::utf7::WireMode::Utf8,
+        utf8_mode: crate::types::wire::WireMode::Utf8,
         literal_mode: LiteralMode::LiteralMinus,
         session: crate::types::profile::SessionCapabilities::new(
             vec![Capability::Imap4Rev2],
@@ -3222,12 +3222,12 @@ fn audit_l10_authenticate_empty_initial_response() {
 /// L9: `SequenceSet::new` rejects invalid input (RFC 3501 Section 9).
 #[test]
 fn audit_l9_sequence_set_rejects_invalid() {
-    assert!(SequenceSet::new("abc").is_err());
-    assert!(SequenceSet::new("0").is_err());
-    assert!(SequenceSet::new("").is_err());
-    assert!(SequenceSet::new("1,,2").is_err());
-    assert!(SequenceSet::new("1:*").is_ok());
-    assert!(SequenceSet::new("1,2,3").is_ok());
+    assert!(SequenceSet::<crate::types::Uid>::new("abc").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new("0").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new("").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new("1,,2").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new("1:*").is_ok());
+    assert!(SequenceSet::<crate::types::Uid>::new("1,2,3").is_ok());
 }
 
 /// RFC 3501 Section 9: `nz-number` is a non-zero unsigned 32-bit integer
@@ -3235,14 +3235,14 @@ fn audit_l9_sequence_set_rejects_invalid() {
 #[test]
 fn sequence_set_rejects_overflow_u32() {
     // 99999999999 exceeds u32::MAX (4294967295)
-    assert!(SequenceSet::new("99999999999").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new("99999999999").is_err());
     // u32::MAX itself is valid
-    assert!(SequenceSet::new("4294967295").is_ok());
+    assert!(SequenceSet::<crate::types::Uid>::new("4294967295").is_ok());
     // u32::MAX + 1 is invalid
-    assert!(SequenceSet::new("4294967296").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new("4294967296").is_err());
     // Very large number in a range
-    assert!(SequenceSet::new("1:99999999999").is_err());
-    assert!(SequenceSet::new("99999999999:1").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new("1:99999999999").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new("99999999999:1").is_err());
 }
 
 /// RFC 3501 Section 9: invalid sequence set "0" is rejected at
@@ -3250,7 +3250,7 @@ fn sequence_set_rejects_overflow_u32() {
 #[test]
 fn sequence_set_rejects_zero_via_newtype() {
     assert!(
-        SequenceSet::new("0").is_err(),
+        SequenceSet::<crate::types::Uid>::new("0").is_err(),
         "\"0\" must be rejected per RFC 3501 Section 9 (nz-number)"
     );
 }
@@ -3259,7 +3259,7 @@ fn sequence_set_rejects_zero_via_newtype() {
 #[test]
 fn sequence_set_rejects_empty() {
     assert!(
-        SequenceSet::new("").is_err(),
+        SequenceSet::<crate::types::Uid>::new("").is_err(),
         "Empty string must be rejected per RFC 3501 Section 9"
     );
 }
@@ -3268,7 +3268,7 @@ fn sequence_set_rejects_empty() {
 #[test]
 fn sequence_set_rejects_alphabetic() {
     assert!(
-        SequenceSet::new("abc").is_err(),
+        SequenceSet::<crate::types::Uid>::new("abc").is_err(),
         "Alphabetic string must be rejected per RFC 3501 Section 9"
     );
 }
@@ -3277,7 +3277,7 @@ fn sequence_set_rejects_alphabetic() {
 #[test]
 fn sequence_set_rejects_overflow() {
     assert!(
-        SequenceSet::new("99999999999").is_err(),
+        SequenceSet::<crate::types::Uid>::new("99999999999").is_err(),
         "u32 overflow must be rejected per RFC 3501 Section 9"
     );
 }
@@ -3286,7 +3286,7 @@ fn sequence_set_rejects_overflow() {
 #[test]
 fn sequence_set_rejects_zero() {
     assert!(
-        SequenceSet::new("0").is_err(),
+        SequenceSet::<crate::types::Uid>::new("0").is_err(),
         "Zero must be rejected per RFC 3501 Section 9 (nz-number)"
     );
 }
@@ -3618,25 +3618,25 @@ fn regression_qresync_seq_match_without_known_uids_returns_err() {
 fn regression_sequence_set_dollar_in_comma_list() {
     // RFC 5182 Section 5: $ as component in comma-separated lists
     assert!(
-        SequenceSet::new("1:5,$").is_ok(),
+        SequenceSet::<crate::types::Uid>::new("1:5,$").is_ok(),
         "\"1:5,$\" must be valid per RFC 5182 Section 5"
     );
     assert!(
-        SequenceSet::new("$,1:*").is_ok(),
+        SequenceSet::<crate::types::Uid>::new("$,1:*").is_ok(),
         "\"$,1:*\" must be valid per RFC 5182 Section 5"
     );
     assert!(
-        SequenceSet::new("42,$").is_ok(),
+        SequenceSet::<crate::types::Uid>::new("42,$").is_ok(),
         "\"42,$\" must be valid per RFC 5182 Section 5"
     );
     // Bare $ must still work
     assert!(
-        SequenceSet::new("$").is_ok(),
+        SequenceSet::<crate::types::Uid>::new("$").is_ok(),
         "bare \"$\" must still be valid per RFC 5182 Section 2"
     );
     // $ cannot be part of a range (it's not a seq-number)
     assert!(
-        SequenceSet::new("$:5").is_err(),
+        SequenceSet::<crate::types::Uid>::new("$:5").is_err(),
         "\"$:5\" must be rejected ($ is not a seq-number, cannot form a range)"
     );
 }
@@ -3979,7 +3979,7 @@ fn append_shape_and_capability_validation() {
 #[test]
 fn append_rev2_uses_utf8_mailbox_without_the_utf8_wrapper() {
     let rev2 = EncodeOptions {
-        utf8_mode: crate::codec::utf7::WireMode::Utf8,
+        utf8_mode: crate::types::wire::WireMode::Utf8,
         literal_mode: LiteralMode::Synchronizing,
         session: crate::types::profile::SessionCapabilities::new(
             vec![Capability::Imap4Rev2],
@@ -4174,7 +4174,7 @@ fn encode_quoted_escapes_backslash_and_dquote() {
 fn encode_string_rejects_nul_without_rewriting_the_command() {
     let mut w = CommandWriter::new(&opts(LiteralMode::Synchronizing, true));
     w.raw(b"A001 X ");
-    w.string(b"hello\x00world", crate::codec::utf7::WireMode::Utf8);
+    w.string(b"hello\x00world", crate::types::wire::WireMode::Utf8);
     w.raw(b"\r\n");
 
     assert!(matches!(
@@ -4498,11 +4498,11 @@ fn encode_uid_store_unchangedsince_rejects_overflow() {
 #[test]
 fn known_sequence_set_accepts_valid() {
     // Simple nz-numbers and ranges
-    assert!(SequenceSet::new_known("1").is_ok());
-    assert!(SequenceSet::new_known("1:100").is_ok());
-    assert!(SequenceSet::new_known("1,2,3").is_ok());
-    assert!(SequenceSet::new_known("1:5,10:20").is_ok());
-    assert!(SequenceSet::new_known("4294967295").is_ok()); // u32::MAX
+    assert!(SequenceSet::<crate::types::Uid>::new_known("1").is_ok());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("1:100").is_ok());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("1,2,3").is_ok());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("1:5,10:20").is_ok());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("4294967295").is_ok()); // u32::MAX
 }
 
 /// RFC 7162 Section 7: known-uids / known-sequence-set / known-uid-set
@@ -4511,27 +4511,27 @@ fn known_sequence_set_accepts_valid() {
 #[test]
 fn known_sequence_set_rejects_invalid() {
     // Empty string  -  not a valid sequence-set
-    assert!(SequenceSet::new_known("").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("").is_err());
     // Non-numeric content  -  not valid nz-number
-    assert!(SequenceSet::new_known("abc").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("abc").is_err());
     // Contains spaces  -  not valid sequence-set syntax
-    assert!(SequenceSet::new_known("1 2").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("1 2").is_err());
     // Contains wildcard  -  disallowed per RFC 7162 Section 3.2.5.2
-    assert!(SequenceSet::new_known("1:*").is_err());
-    assert!(SequenceSet::new_known("*").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("1:*").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("*").is_err());
     // Contains $ (RFC 5182 search result reference)  -  not meaningful in QRESYNC
-    assert!(SequenceSet::new_known("$").is_err());
-    assert!(SequenceSet::new_known("1,$").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("$").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("1,$").is_err());
     // Standalone zero  -  not a valid nz-number
-    assert!(SequenceSet::new_known("0").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("0").is_err());
     // Leading zeros  -  not a valid nz-number (digit-nz *DIGIT)
-    assert!(SequenceSet::new_known("01").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("01").is_err());
     // Overflow  -  exceeds u32::MAX
-    assert!(SequenceSet::new_known("4294967296").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("4294967296").is_err());
     // Trailing comma  -  produces empty part
-    assert!(SequenceSet::new_known("1,").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("1,").is_err());
     // Double colon  -  produces empty range element
-    assert!(SequenceSet::new_known("1::2").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new_known("1::2").is_err());
 }
 
 /// RFC 5464 Section 5 / RFC 3501 Section 9: MAXSIZE must fit in `number` (u32).
@@ -4746,11 +4746,11 @@ fn encode_lsub_with_reference_and_pattern() {
 #[test]
 fn sequence_set_newtype_rejects_invalid_values() {
     // "0"  -  nz-number does not allow zero
-    assert!(SequenceSet::new("0").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new("0").is_err());
     // "abc"  -  not a valid nz-number or seq-range
-    assert!(SequenceSet::new("abc").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new("abc").is_err());
     // ""  -  empty string is not a valid sequence-set
-    assert!(SequenceSet::new("").is_err());
+    assert!(SequenceSet::<crate::types::Uid>::new("").is_err());
 }
 
 // ---------------------------------------------------------------
@@ -5666,7 +5666,7 @@ fn writer_literal8_non_synchronizing_needs_binary_and_rev1() {
 
     // BINARY on an active rev2 connection: rev2 literal8 has no `+` form.
     let rev2 = EncodeOptions {
-        utf8_mode: crate::codec::utf7::WireMode::Utf8,
+        utf8_mode: crate::types::wire::WireMode::Utf8,
         literal_mode: LiteralMode::LiteralPlus,
         session: crate::types::profile::SessionCapabilities::new(
             vec![Capability::Imap4Rev2, Capability::Binary],
@@ -5822,7 +5822,7 @@ fn criteria_non_synchronizing_literal_without_an_extension_is_refused() {
 
 #[test]
 fn out_of_range_literal_count_is_not_a_marker_for_the_shared_parser() {
-    use crate::connection::literals::{LiteralMarker, literal_marker_at};
+    use crate::codec::literals::{LiteralMarker, literal_marker_at};
 
     assert!(matches!(
         literal_marker_at(b"{9223372036854775807}\r\n", 0),
@@ -6391,7 +6391,7 @@ fn an_encoder_capability_refusal_names_the_command_and_the_capability() {
         vanished: false,
     };
     let no_condstore = EncodeOptions {
-        utf8_mode: crate::codec::utf7::WireMode::ModifiedUtf7,
+        utf8_mode: crate::types::wire::WireMode::ModifiedUtf7,
         literal_mode: LiteralMode::Synchronizing,
         session: crate::types::profile::SessionCapabilities::new(
             vec![Capability::Imap4Rev1],
@@ -6823,7 +6823,7 @@ mod prop_roundtrip {
 
     /// Generate a valid sequence set.
     /// RFC 3501 Section 9: sequence-set = (seq-number / seq-range) *("," ...)
-    fn arb_sequence_set() -> impl Strategy<Value = SequenceSet> {
+    fn arb_sequence_set<I: std::fmt::Debug>() -> impl Strategy<Value = SequenceSet<I>> {
         prop_oneof![
             (1u32..=99999).prop_map(|n| n.to_string()),
             (1u32..=999, 1u32..=99999).prop_map(|(a, b)| format!("{a}:{b}")),

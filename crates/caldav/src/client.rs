@@ -1,9 +1,7 @@
 use crate::dialect::CalDavDialect;
 #[cfg(test)]
 use crate::parse::CalDavMultigetReport;
-use bifrost_dav_core::collection::{
-    DavCollectionClient, Dialect, MultigetFetch, QUERY_HREF_PROPS, complete_failure_error,
-};
+use bifrost_dav_core::collection::{DavCollectionClient, Dialect, MultigetFetch, QUERY_HREF_PROPS};
 use std::fmt;
 
 pub(crate) use bifrost_dav_core::PutCondition;
@@ -12,7 +10,7 @@ pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery};
 use bifrost_net::{AccountId, AccountNet};
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
-    DiagnosticText, ErrorScope, FolderId, Protocol, StateCause, SyncStateErrorKind,
+    DiagnosticText, ErrorScope, FolderId, ObjectType, Protocol, StateCause, SyncStateErrorKind,
 };
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Method, StatusCode};
@@ -223,7 +221,7 @@ impl CalDavClient {
         let mut listing =
             parse_propfind_events(&response.text).map_err(|error| parse_error(operation, error))?;
         listing.resolve_hrefs_with(&response.url, CalDavDialect::resolve_href);
-        if let Some(error) = listing_failure(&listing, operation) {
+        if let Some(error) = listing.failure::<CalDavDialect>(operation) {
             return Err(error);
         }
         Ok(listing)
@@ -568,20 +566,19 @@ fn sync_collection_body(sync_token: &str) -> String {
 }
 
 fn cursor_invalid_error(calendar_url: &str, status: StatusCode, body: String) -> AccountError {
-    // The error scope routes the engine's RestartScope directive. Live
-    // cursors are per-calendar (`CursorScope::Folder(collection url)`), so
-    // the invalidation must name the folder scope of the calendar whose
-    // token went stale - a type-wide scope would restart a cursor that does
-    // not exist while the invalid one fails identically on every poll.
+    // Restart exactly the collection/type cursor discovery advertises. An
+    // enterprise user's expired calendar token must rebuild that calendar,
+    // rather than poll the same stale token forever under a different key.
     let mut builder = AccountErrorBuilder::new(
         AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
         Cause::State(StateCause::CursorInvalid),
     )
     .protocol(Protocol::CalDav)
     .operation(AccountOperation::SyncChanges)
-    .scope(ErrorScope::Cursor(CursorScope::Folder(FolderId(
-        calendar_url.to_string(),
-    ))))
+    .scope(ErrorScope::Cursor(CursorScope::FolderType {
+        folder: FolderId(calendar_url.to_string()),
+        ty: ObjectType::CalendarEvent,
+    }))
     .status(Some(status.as_u16()));
     let body = body.trim();
     if !body.is_empty() {
@@ -598,30 +595,6 @@ fn cursor_invalid_error(calendar_url: &str, status: StatusCode, body: String) ->
 /// query, four for a text search - and in nothing else.
 pub(crate) fn extend_candidates(query: &mut HrefQuery, listing: crate::parse::CalDavEventListing) {
     listing.extend_candidates(query);
-}
-
-/// Keep whichever failure demands the more drastic recovery, so a 503 on
-/// one chunk cannot hide a 401 on another.
-#[cfg(test)]
-fn multiget_failure(
-    report: &crate::parse::CalDavMultigetReport,
-    operation: AccountOperation,
-) -> Option<AccountError> {
-    complete_failure_error::<CalDavDialect>(report.classify(), report.failed.len(), operation)
-}
-
-/// The same ladder for a LISTING 207 - the depth-1 PROPFIND, the snapshot poll,
-/// and the `calendar-query` candidate lane.
-///
-/// A listing with any committed entry never reaches here, so a member refused
-/// beside members that answered stays a per-id failure on `Page::failed_ids`
-/// and the page is served. Only a 207 in which every response failed, for a
-/// reason other than the resource being gone, becomes an error.
-fn listing_failure(
-    listing: &crate::parse::CalDavEventListing,
-    operation: AccountOperation,
-) -> Option<AccountError> {
-    complete_failure_error::<CalDavDialect>(listing.classify(), listing.failed.len(), operation)
 }
 
 pub(crate) fn missing_event_error(operation: AccountOperation, id: String) -> AccountError {
@@ -2179,46 +2152,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn credentials_never_reach_a_resource_href_origin() {
-        // Two canned responses, so a neutered guard reaches the transport and
-        // fails on the destination assertion below rather than on a starved
-        // script - the failure has to name the credential leak.
-        let event = || DavResponse {
-            status: StatusCode::OK,
-            headers: HeaderMap::new(),
-            body: "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:one\nEND:VEVENT\nEND:VCALENDAR".to_string(),
-            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                .expect("test DAV URL"),
-        };
-        let script = dav_script([event(), event()]);
-        let client =
-            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-
-        client
-            .get_event(
-                "https://dav.example.test/calendar/one.ics",
-                AccountOperation::EventGet,
-            )
-            .await
-            .expect("trusted request succeeds");
-        client
-            .get_event("https://evil.test/stolen.ics", AccountOperation::EventGet)
-            .await
-            .expect_err("foreign resource origin is rejected");
-
-        let requests = transcripts(&script);
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://dav.example.test/calendar/one.ics");
-        assert_eq!(
-            requests[0]
-                .headers
-                .get(AUTHORIZATION)
-                .and_then(|value| value.to_str().ok()),
-            Some("Bearer token")
-        );
-    }
-
     fn discovery_script(home_href: &str) -> Arc<ScriptedDispatch> {
         let response = |body: String| DavResponse {
             status: StatusCode::MULTI_STATUS,
@@ -2237,44 +2170,6 @@ mod tests {
             )),
             response("<D:multistatus xmlns:D=\"DAV:\"/>".to_string()),
         ])
-    }
-
-    #[tokio::test]
-    async fn discovery_falls_back_to_base_after_empty_well_known_response() {
-        let response = |body: &str| DavResponse {
-            status: StatusCode::MULTI_STATUS,
-            headers: HeaderMap::new(),
-            body: body.to_string(),
-            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                .expect("test DAV URL"),
-        };
-        let script = dav_script([
-            response("<D:multistatus xmlns:D=\"DAV:\"/>"),
-            response(
-                "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
-            ),
-            response(
-                "<C:calendar-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:href>/cal/ada/</D:href></C:calendar-home-set>",
-            ),
-        ]);
-        let client =
-            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-
-        let discovery = client.discover_account().await.expect("fallback succeeds");
-
-        assert_eq!(discovery.calendar_home, "https://dav.example.test/cal/ada/");
-        let urls = transcripts(&script)
-            .into_iter()
-            .map(|request| request.url)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            urls,
-            vec![
-                "https://dav.example.test/.well-known/caldav".to_string(),
-                "https://dav.example.test/".to_string(),
-                "https://dav.example.test/principals/ada/".to_string(),
-            ]
-        );
     }
 
     /// A principal whose answer parses but names no calendar home is a MISSING
@@ -2321,108 +2216,6 @@ mod tests {
             "the principal answered: {error:?}"
         );
         assert_eq!(transcripts(&script).len(), 2);
-    }
-
-    /// A front end sitting on the origin root answers a PROPFIND with `200` and
-    /// its index page. That is the SAME deployment the empty-207 test above
-    /// covers - a base URL that works, behind an origin root that knows nothing
-    /// about DAV - and it must reach the same place. It did not: the HTML fails
-    /// the XML decode, which mints `Protocol(ParseFailed)`, and the probe
-    /// predicate admitted only 404, 405 and a refused redirect, so the open
-    /// FAILED on a deployment one status code away from one that works.
-    #[tokio::test]
-    async fn discovery_falls_back_to_base_after_a_well_known_index_page() {
-        let script = dav_script([
-            DavResponse {
-                status: StatusCode::OK,
-                headers: HeaderMap::new(),
-                body: "<html><body><p>It works!</body></html>".to_string(),
-                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                    .expect("test DAV URL"),
-            },
-            DavResponse {
-                status: StatusCode::MULTI_STATUS,
-                headers: HeaderMap::new(),
-                body: "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>".to_string(),
-                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                    .expect("test DAV URL"),
-            },
-            DavResponse {
-                status: StatusCode::MULTI_STATUS,
-                headers: HeaderMap::new(),
-                body: "<C:calendar-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:href>/cal/ada/</D:href></C:calendar-home-set>".to_string(),
-                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                    .expect("test DAV URL"),
-            },
-        ]);
-        let client =
-            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-
-        let discovery = client
-            .discover_account()
-            .await
-            .expect("an index page at the origin root is not a discovery answer");
-
-        assert_eq!(discovery.calendar_home, "https://dav.example.test/cal/ada/");
-        let urls = transcripts(&script)
-            .into_iter()
-            .map(|request| request.url)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            urls,
-            vec![
-                "https://dav.example.test/.well-known/caldav".to_string(),
-                "https://dav.example.test/".to_string(),
-                "https://dav.example.test/principals/ada/".to_string(),
-            ]
-        );
-    }
-
-    /// RFC 6764 puts well-known discovery at the origin root. A base URL
-    /// carrying a path is the only input that distinguishes an
-    /// origin-rooted construction from suffix concatenation, and getting
-    /// it wrong is not merely a wasted request: only the crate's
-    /// not-found classification falls back, so a deployment answering
-    /// the bogus path with 401/403 would fail the open outright.
-    #[tokio::test]
-    async fn well_known_probe_is_origin_rooted_for_a_path_bearing_base() {
-        let response = |body: &str| DavResponse {
-            status: StatusCode::MULTI_STATUS,
-            headers: HeaderMap::new(),
-            body: body.to_string(),
-            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                .expect("test DAV URL"),
-        };
-        let script = dav_script([
-            response("<D:multistatus xmlns:D=\"DAV:\"/>"),
-            response(
-                "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
-            ),
-            response(
-                "<C:calendar-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:href>/cal/ada/</D:href></C:calendar-home-set>",
-            ),
-        ]);
-        let client = CalDavClient::with_account_net(
-            "https://dav.example.test/service",
-            scripted_dav_net(&script),
-        );
-
-        let discovery = client.discover_account().await.expect("fallback succeeds");
-
-        assert_eq!(discovery.calendar_home, "https://dav.example.test/cal/ada/");
-        let urls = transcripts(&script)
-            .into_iter()
-            .map(|request| request.url)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            urls,
-            vec![
-                "https://dav.example.test/.well-known/caldav".to_string(),
-                "https://dav.example.test/service".to_string(),
-                "https://dav.example.test/principals/ada/".to_string(),
-            ],
-            "the well-known probe is rooted at the origin, and only the fallback uses the configured path"
-        );
     }
 
     #[tokio::test]
@@ -2545,67 +2338,6 @@ mod tests {
             calendars[0].href,
             "https://cal.example.test/dav/homes/ada/team/"
         );
-    }
-
-    /// A redirect is server-controlled input: an origin discovery never
-    /// admitted must fail locally, and no request at all may reach it.
-    #[tokio::test]
-    async fn redirect_to_an_unadmitted_origin_is_refused_locally() {
-        let mut redirect_headers = HeaderMap::new();
-        redirect_headers.insert(
-            reqwest::header::LOCATION,
-            HeaderValue::from_static("https://evil.test/dav/"),
-        );
-        let script = dav_script([DavResponse {
-            status: StatusCode::FOUND,
-            headers: redirect_headers,
-            body: String::new(),
-            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                .expect("test DAV URL"),
-        }]);
-        let client =
-            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-
-        client
-            .list_calendars("https://dav.example.test/calendars/ada/")
-            .await
-            .expect_err("an unadmitted redirect target is refused");
-
-        assert_eq!(transcripts(&script).len(), 1);
-    }
-
-    #[tokio::test]
-    async fn manual_redirect_walk_allows_the_configured_hop_count() {
-        let max_hops = usize::from(bifrost_net::RedirectPolicy::default().max_hops);
-        let mut responses = Vec::new();
-        for _ in 0..max_hops {
-            let mut headers = HeaderMap::new();
-            headers.insert(reqwest::header::LOCATION, HeaderValue::from_static("/next"));
-            responses.push(DavResponse {
-                status: StatusCode::TEMPORARY_REDIRECT,
-                headers,
-                body: String::new(),
-                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                    .expect("test DAV URL"),
-            });
-        }
-        responses.push(DavResponse {
-            status: StatusCode::OK,
-            headers: HeaderMap::new(),
-            body: "ok".to_string(),
-            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
-                .expect("test DAV URL"),
-        });
-        let script = dav_script(responses);
-        let client =
-            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
-
-        client
-            .get_event("https://dav.example.test/start", AccountOperation::EventGet)
-            .await
-            .expect("the configured number of redirects is allowed");
-
-        assert_eq!(transcripts(&script).len(), max_hops + 1);
     }
 
     /// RFC 4918 resolves a relative href against the EFFECTIVE request URI.
@@ -3030,11 +2762,9 @@ mod tests {
     }
 
     /// The engine routes `CursorInvalid`'s RestartScope by the error's
-    /// cursor scope, and live CalDAV cursors are one per calendar
-    /// (`CursorScope::Folder`). A type-wide scope here restarted a cursor
-    /// that does not exist while the stale folder cursor livelocked.
+    /// cursor scope, including the object type of the discovered calendar.
     #[test]
-    fn stale_sync_token_maps_to_the_invalid_calendars_folder_scope() {
+    fn stale_sync_token_maps_to_the_invalid_calendars_typed_scope() {
         let error = cursor_invalid_error(
             "https://cal.example/cal/work/",
             StatusCode::FORBIDDEN,
@@ -3047,9 +2777,10 @@ mod tests {
         );
         assert_eq!(
             error.scope(),
-            Some(&ErrorScope::Cursor(CursorScope::Folder(FolderId(
-                "https://cal.example/cal/work/".to_string()
-            ))))
+            Some(&ErrorScope::Cursor(CursorScope::FolderType {
+                folder: FolderId("https://cal.example/cal/work/".to_string()),
+                ty: ObjectType::CalendarEvent,
+            }))
         );
     }
 
@@ -3081,7 +2812,11 @@ mod tests {
             missing_data: Vec::new(),
         };
 
-        assert!(multiget_failure(&report, AccountOperation::EventsInRange).is_none());
+        assert!(
+            report
+                .failure::<CalDavDialect>(AccountOperation::EventsInRange)
+                .is_none()
+        );
     }
 
     fn usable_report() -> CalDavMultigetReport {

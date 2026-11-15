@@ -11,7 +11,7 @@ pub struct KnownUids {
 }
 
 fn finite<I: super::set::SetId>(
-    expr: &SequenceSet,
+    expr: &SequenceSet<I>,
 ) -> Result<super::set::NumberSet<I>, crate::Error> {
     if !expr.is_finite() {
         return Err(crate::Error::LocalRefusal(

@@ -2,7 +2,7 @@
 //!
 //! When an `ImapAccountConfig` carries a `SmtpSubmissionConfig`, the
 //! factory builds one of these and stores it on the account. The send
-//! path (`pim::send_message` / `pim::draft_send`) drives it to submit
+//! path (`compose::send_message` / `compose::draft_send`) drives it to submit
 //! RFC 5322 bytes over `bifrost-smtp`, authenticating with the same
 //! credentials the IMAP login uses (or an explicit override), so a
 //! consumer reaches `send` through the uniform `Account` surface with no

@@ -32,7 +32,7 @@ const PROMPT: Duration = Duration::from_secs(5);
 /// Both halves matter. Without the arm the walk never returns at all, and the
 /// worker burns a full `detach_timeout` before being aborted. With the arm but
 /// a partial `BackfillPartitionOutcome` instead of an error, a wrong
-/// `complete`/`scope_walk` pair would mint a completion sentinel for a scope
+/// partition verdict could mint a completion sentinel for a scope
 /// that was never walked.
 #[tokio::test]
 async fn a_cancelled_partition_walk_fails_rather_than_reporting_completion() {
@@ -101,7 +101,11 @@ async fn cancelled_partition(with_lane: bool) {
             bifrost_types::TraitEnvelopeVersion::new(1),
             &publisher,
             walk_generation(0),
-            with_lane.then_some(&gate),
+            if with_lane {
+                Some(gate.admit().await.expect("partition admission"))
+            } else {
+                None
+            },
             bifrost_sync::cursor::PendingCoverage::initial_fence(),
         )
         .await

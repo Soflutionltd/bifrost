@@ -1,9 +1,11 @@
 use super::*;
 
+use crate::backfill::BackfillState;
 use crate::test_common as common;
 
 use bifrost_types::{
-    CoverageDomain, InventoryCompletion, InventoryEvent, PartitionEnd, ThrottleKey,
+    CoverageDomain, InventoryCompletion, InventoryEvent, InventoryPartitioning, PartitionEnd,
+    ThrottleKey,
 };
 use std::sync::Mutex;
 
@@ -119,7 +121,7 @@ impl Harness {
                 }
             }
         });
-        let ctx = SlotContext {
+        let ctx = Arc::new(crate::engine::context::AccountSlot {
             deferred_schema_reset: Arc::new(crate::engine::DeferredSchemaReset::default()),
             bandwidth_budget: None,
             factory,
@@ -132,17 +134,17 @@ impl Harness {
             control,
             account_control_tx: broadcast::channel(8).0,
             throttles,
-            boundary_tx: boundary.sender(),
+            boundary: boundary.clone(),
             capabilities: Arc::new(std::sync::RwLock::new(caps)),
-            subscriptions: Arc::new(SubscriptionRegistry::new()),
+            subscriptions: Arc::new(SubscriptionRegistry::new(CancellationToken::new())),
             account_generation_tx: watch::channel(crate::types::AccountGeneration::for_test(0)).0,
-            push_retired: watch::channel(crate::types::AccountGeneration::for_test(0)).0,
-            push_topology: watch::channel(crate::engine::PushTopologyGeneration::for_test(0)).0,
+            push_retired_tx: watch::channel(crate::types::AccountGeneration::for_test(0)).0,
+            push_topology_tx: watch::channel(crate::engine::PushTopologyGeneration::for_test(0)).0,
             push_drain_wait: Duration::from_secs(5),
             reopen_lock: Arc::new(AsyncMutex::new(())),
             open_skips: Arc::new(Mutex::new(vec![])),
             shutdown: CancellationToken::new(),
-            writer_tx,
+            writer: Mutex::new(Some(WriterHandle::new(writer_tx))),
             coverage,
             subscriber_notify: Arc::new(Notify::new()),
             scheduler,
@@ -151,14 +153,26 @@ impl Harness {
             reopen_tx: mpsc::channel(8).0,
             deferred_repairs: Arc::new(DeferredScopeRepairs::new()),
             scope_tokens: Arc::new(Mutex::new(HashMap::new())),
-        };
+            push_health_tx: watch::channel(crate::push::health::PushHealth {
+                generation: crate::types::Incarnation::initial_generation(),
+                lanes: Vec::new(),
+            })
+            .0,
+            multiplexer: MultiplexerHandle {
+                cancel: CancellationToken::new(),
+            },
+            _sentinel_rx: broadcast::channel(1).1,
+            _account_control_sentinel: broadcast::channel(1).1,
+            workers: Mutex::new(Vec::new()),
+            registrations: Mutex::new(None),
+        });
         let receiver = Some(ctx.delivery.subscribe(
             Some(ctx.control.clone()),
             Arc::<PendingCoverage>::clone(&ctx.coverage),
         ));
         let registry = Arc::new(BackfillRegistry::new());
         let task = tokio::spawn(run_backfill_orchestrator(
-            ctx.clone(),
+            Arc::clone(&ctx),
             BackfillWiring {
                 live: Arc::new(LiveSupersedes::new()),
                 registry: Arc::clone(&registry),

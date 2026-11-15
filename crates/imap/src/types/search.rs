@@ -133,79 +133,6 @@ impl SearchCriteria {
         self
     }
 
-    pub(crate) fn required_capabilities(&self) -> Vec<super::Capability> {
-        use super::Capability;
-        let mut result = Vec::new();
-        for key in &self.keys {
-            match key {
-                SearchKey::Number { key: "MODSEQ", .. } => result.push(Capability::Condstore),
-                SearchKey::Number { .. }
-                | SearchKey::Keyword(_)
-                | SearchKey::Date { .. }
-                | SearchKey::Flag { .. }
-                | SearchKey::Uid(_)
-                | SearchKey::Sequence(_)
-                | SearchKey::String { .. } => {}
-                SearchKey::Not(inner) => result.extend(inner.required_capabilities()),
-                SearchKey::Group(inner) => result.extend(inner.required_capabilities()),
-                SearchKey::Or(a, b) => {
-                    result.extend(a.required_capabilities());
-                    result.extend(b.required_capabilities());
-                }
-                SearchKey::Raw { text, requires } => {
-                    result.extend(requires.iter().cloned());
-                    for (atoms, capability) in [
-                        (&["MODSEQ"][..], Capability::Condstore),
-                        (&["OLDER", "YOUNGER"][..], Capability::Within),
-                        (
-                            &["SAVEDBEFORE", "SAVEDON", "SAVEDSINCE", "SAVEDATESUPPORTED"][..],
-                            Capability::SaveDate,
-                        ),
-                        (&["EMAILID", "THREADID"][..], Capability::ObjectId),
-                        (&["$"][..], Capability::SearchRes),
-                    ] {
-                        if atoms
-                            .iter()
-                            .any(|atom| crate::codec::search::contains_atom(text, atom))
-                        {
-                            result.push(capability);
-                        }
-                    }
-                }
-            }
-        }
-        result
-    }
-
-    pub(crate) fn validate_raw(
-        &self,
-        mode: crate::codec::encode::LiteralMode,
-    ) -> Result<(), crate::Error> {
-        for key in &self.keys {
-            match key {
-                SearchKey::Raw { text, .. } => crate::codec::encode::validate_search_criteria_crlf(
-                    text,
-                    "SEARCH criteria",
-                    mode,
-                )?,
-                SearchKey::Not(inner) => inner.validate_raw(mode)?,
-                SearchKey::Group(inner) => inner.validate_raw(mode)?,
-                SearchKey::Or(a, b) => {
-                    a.validate_raw(mode)?;
-                    b.validate_raw(mode)?;
-                }
-                SearchKey::Keyword(_)
-                | SearchKey::Date { .. }
-                | SearchKey::Number { .. }
-                | SearchKey::Flag { .. }
-                | SearchKey::Uid(_)
-                | SearchKey::Sequence(_)
-                | SearchKey::String { .. } => {}
-            }
-        }
-        Ok(())
-    }
-
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -829,11 +756,41 @@ impl PartialEq<&str> for SearchCriteria {
 /// Contains both the matching sequence numbers/UIDs and the optional
 /// highest mod-sequence value (RFC 7162 Section 3.1.5).
 #[non_exhaustive]
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub(crate) struct SearchResult {
-    /// Matching message sequence numbers (SEARCH) or UIDs (UID SEARCH).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SearchResult<I = super::Uid> {
+    addressing: std::marker::PhantomData<I>,
+    /// Numeric projection for the account identity boundary. The result's
+    /// `I` retains whether these observations identify UIDs or sequences.
     pub(crate) ids: Vec<u32>,
     /// Highest mod-sequence of matching messages, if MODSEQ was used
     /// in the search criteria (RFC 7162 Section 3.1.5).
     pub(crate) mod_seq: Option<crate::types::ModSeq>,
+}
+
+impl<I> SearchResult<I> {
+    pub(crate) fn new(ids: Vec<u32>, mod_seq: Option<super::ModSeq>) -> Self {
+        Self {
+            ids,
+            mod_seq,
+            addressing: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<I> Default for SearchResult<I> {
+    fn default() -> Self {
+        Self::new(Vec::new(), None)
+    }
+}
+
+/// Addressing supplied by the command for legacy SEARCH/SORT responses, whose
+/// wire syntax contains no unit. ESEARCH supplies its own unit and must agree.
+pub(crate) trait SearchAddress: Send + 'static {
+    const UID: bool;
+}
+impl SearchAddress for super::Uid {
+    const UID: bool = true;
+}
+impl SearchAddress for super::Seq {
+    const UID: bool = false;
 }

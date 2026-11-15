@@ -212,7 +212,7 @@ fn sort_consumer_empty_result_returns_ok() {
     // When the server sends only a tagged OK with no `* SORT` untagged
     // response (permitted by RFC 5256 when no messages match),
     // `SortConsumer::finalize` should return an empty SearchResult.
-    let consumer = Box::new(SortConsumer::default());
+    let consumer = Box::new(SortConsumer::<crate::types::Uid>::default());
     let result = consumer.finalize(tagged_ok(), &default_ctx());
     let sorted = result.output.expect("an empty SORT result is not an error");
     assert!(sorted.ids.is_empty());
@@ -223,8 +223,7 @@ fn sort_consumer_empty_result_returns_ok() {
 fn esearch_all(tag: Option<&str>, all: Vec<UidRange>) -> UntaggedResponse {
     UntaggedResponse::Esearch(EsearchResponse {
         tag: tag.map(ToOwned::to_owned),
-        uid: true,
-        all,
+        numbers: crate::types::response::EsearchNumbers::from_wire(true, None, None, all),
         ..EsearchResponse::default()
     })
 }
@@ -235,7 +234,7 @@ fn esearch_all(tag: Option<&str>, all: Vec<UidRange>) -> UntaggedResponse {
 /// keep their wire order.
 #[test]
 fn search_consumer_keeps_the_solicited_reply_when_uid_expansion_is_incomplete() {
-    let mut consumer = SearchConsumer::new();
+    let mut consumer = SearchConsumer::<crate::types::Uid>::new();
     let ctx = default_ctx();
     consumer.on_response(UntaggedResponse::Exists(1), NotifyFlags::default(), &ctx);
     consumer.on_response(
@@ -267,7 +266,7 @@ fn search_consumer_keeps_the_solicited_reply_when_uid_expansion_is_incomplete() 
 /// is never an asynchronous notification, so it must not become an event.
 #[test]
 fn search_consumer_drops_the_surplus_esearch_on_success() {
-    let mut consumer = SearchConsumer::new();
+    let mut consumer = SearchConsumer::<crate::types::Uid>::new();
     let ctx = default_ctx();
     consumer.on_response(UntaggedResponse::Exists(1), NotifyFlags::default(), &ctx);
     consumer.on_response(
@@ -296,7 +295,7 @@ fn search_consumer_drops_the_surplus_esearch_on_success() {
 fn search_consumer_rejects_a_bare_star_and_counts_overlap_once() {
     let ctx = default_ctx();
 
-    let mut consumer = SearchConsumer::new();
+    let mut consumer = SearchConsumer::<crate::types::Uid>::new();
     consumer.on_response(
         // `ALL *` is kept distinct from the numeric UID maximum.
         esearch_all(
@@ -319,7 +318,7 @@ fn search_consumer_rejects_a_bare_star_and_counts_overlap_once() {
         "a standalone `*` must not expand to the literal id 4294967295"
     );
 
-    let mut consumer = SearchConsumer::new();
+    let mut consumer = SearchConsumer::<crate::types::Uid>::new();
     consumer.on_response(
         esearch_all(
             Some("A001"),
@@ -345,7 +344,7 @@ fn search_consumer_rejects_a_bare_star_and_counts_overlap_once() {
 fn thread_consumer_empty_result_returns_ok() {
     // Same as SortConsumer  -  when no messages match the THREAD criteria
     // the server may omit the untagged THREAD response entirely.
-    let consumer = Box::new(ThreadConsumer::default());
+    let consumer = Box::new(ThreadConsumer::<crate::types::Uid>::default());
     let result = consumer.finalize(tagged_ok(), &default_ctx());
     assert!(
         result

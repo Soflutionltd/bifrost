@@ -10,8 +10,11 @@
 //! `bifrost-sync.md` -> Default partition policy.
 
 pub mod checkpoint;
+pub(crate) mod marker;
 pub mod partitioner;
+pub(crate) mod plan;
 pub mod runner;
+pub(crate) mod scan;
 pub mod scope_walk;
 
 use bifrost_types::{AccountId, CursorScope};
@@ -19,7 +22,7 @@ use bifrost_types::{AccountId, CursorScope};
 pub use checkpoint::{BackfillCheckpointTarget, BackfillCheckpointWriter};
 pub use partitioner::{BackfillPolicy, BackfillStrategy, PartitionPlan, default_time_boundaries};
 pub use runner::{
-    BackfillPartitionOutcome, BackfillRunner, BackfillScopeWalk, LiveSupersedes, ScopeWalkStep,
+    BackfillPartitionOutcome, BackfillRunner, LiveSupersedes, PartitionVerdict, ScopeWalkStep,
 };
 pub use scope_walk::ScopeWalkDriver;
 

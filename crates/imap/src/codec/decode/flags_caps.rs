@@ -429,11 +429,11 @@ fn response_code_inner<'a>(
             let (input, dest_uids) = uid_set(input)?;
             Ok((
                 input,
-                ResponseCode::CopyUid {
+                ResponseCode::CopyUid(crate::types::response::CopyUid {
                     uid_validity,
                     source_uids,
                     dest_uids,
-                },
+                }),
             ))
         }
         "MODIFIED" => {

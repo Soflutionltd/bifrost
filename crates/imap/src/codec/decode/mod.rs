@@ -37,7 +37,7 @@ use crate::types::mailbox::{MailboxAttribute, MailboxInfo, StatusItem};
 use crate::types::response::{
     AclEntry, Capability, ContinuationRequest, EsearchResponse, GreetingResponse, GreetingStatus,
     MetadataEntry, NamespaceDescriptor, QuotaResource, Response, ResponseCode, StatusKind,
-    TaggedResponse, ThreadNode, UidRange, UntaggedResponse, UntaggedStatus,
+    TaggedResponse, UidRange, UntaggedResponse, UntaggedStatus,
 };
 use crate::types::validated::MailboxName;
 
@@ -91,7 +91,7 @@ pub(super) use search_response::*;
 /// Equivalent to `parse_response_utf8(input, WireMode::ModifiedUtf7)`  -  RFC 2047 decoding is applied.
 #[cfg(test)]
 pub(crate) fn parse_response(input: &[u8]) -> IResult<&[u8], Response> {
-    parse_response_utf8(input, crate::codec::utf7::WireMode::ModifiedUtf7)
+    parse_response_utf8(input, crate::types::wire::WireMode::ModifiedUtf7)
 }
 
 /// Parse a single IMAP response line, with UTF-8 mode for RFC 6532/6855.
@@ -100,7 +100,7 @@ pub(crate) fn parse_response(input: &[u8]) -> IResult<&[u8], Response> {
 /// fields contain raw UTF-8 (RFC 6532 Section 3) and RFC 2047 decoding is skipped.
 pub(crate) fn parse_response_utf8(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], Response> {
     parse_response_with_backing(input, utf8_mode, None)
 }
@@ -109,14 +109,14 @@ pub(crate) fn parse_response_utf8(
 /// retain slices of the reader's response buffer.
 pub(crate) fn parse_response_bytes(
     input: &Bytes,
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], Response> {
     parse_response_with_backing(input.as_ref(), utf8_mode, Some(input))
 }
 
 fn parse_response_with_backing<'a>(
     input: &'a [u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
     backing: Option<&Bytes>,
 ) -> IResult<&'a [u8], Response> {
     alt((

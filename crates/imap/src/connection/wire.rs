@@ -142,14 +142,14 @@ impl WireReader {
     /// Section 7).
     pub(crate) async fn read_one(
         &mut self,
-        utf8_mode: crate::codec::utf7::WireMode,
+        utf8_mode: crate::types::wire::WireMode,
     ) -> Result<Response, Error> {
         self.read_one_limited(utf8_mode, None).await
     }
 
     pub(crate) async fn read_one_limited(
         &mut self,
-        utf8_mode: crate::codec::utf7::WireMode,
+        utf8_mode: crate::types::wire::WireMode,
         limit: Option<usize>,
     ) -> Result<Response, Error> {
         loop {
@@ -447,7 +447,7 @@ impl WireReader {
     /// (RFC 9051 Section 7: quoted-strings carry raw UTF-8).
     fn try_parse_response_limited(
         &mut self,
-        utf8_mode: crate::codec::utf7::WireMode,
+        utf8_mode: crate::types::wire::WireMode,
         limit: Option<usize>,
     ) -> Result<Option<Response>, Error> {
         if self.buffer_is_empty() {
@@ -853,9 +853,9 @@ fn try_parse_literal_marker(buf: &[u8], crlf_pos: usize) -> Result<Option<usize>
     let Some(brace_pos) = before_crlf.iter().rposition(|&b| b == b'{') else {
         return Ok(None);
     };
-    use super::literals::LiteralMarker;
+    use crate::codec::literals::LiteralMarker;
 
-    let parsed = super::literals::literal_marker_at(buf, brace_pos);
+    let parsed = crate::codec::literals::literal_marker_at(buf, brace_pos);
     let (data_start, size) = match parsed {
         LiteralMarker::Counted {
             data_start, size, ..

@@ -377,7 +377,6 @@ impl Account for JmapAccount {
             self.registry.primary.mail.clone(),
             self.registry.primary.limits,
             Arc::clone(&self.lifecycle_topology),
-            self.registry.primary.mail.id_str().to_string(),
             self.shutdown.clone(),
             self.client.clone(),
         )

@@ -102,14 +102,14 @@ pub(super) fn parse_tagged(input: &[u8]) -> IResult<&[u8], TaggedResponse> {
 /// When `utf8_mode` is `WireMode::Utf8`, ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
 pub(super) fn parse_untagged(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     parse_untagged_with_backing(input, utf8_mode, None)
 }
 
 pub(super) fn parse_untagged_with_backing<'a>(
     input: &'a [u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
     backing: Option<&Bytes>,
 ) -> IResult<&'a [u8], UntaggedResponse> {
     let (input, _) = tag(&b"* "[..]).parse(input)?;
@@ -201,14 +201,14 @@ pub(super) fn parse_untagged_status(input: &[u8]) -> IResult<&[u8], UntaggedResp
 /// When `utf8_mode` is `WireMode::Utf8`, FETCH ENVELOPE fields use raw UTF-8 per RFC 6532 Section 3 / RFC 6855 Section 3.
 pub(super) fn parse_untagged_numbered(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     parse_untagged_numbered_with_backing(input, utf8_mode, None)
 }
 
 fn parse_untagged_numbered_with_backing<'a>(
     input: &'a [u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
     backing: Option<&Bytes>,
 ) -> IResult<&'a [u8], UntaggedResponse> {
     let num_start = input; // Save position for leading-zero check
@@ -303,7 +303,7 @@ pub(super) fn parse_untagged_flags(input: &[u8]) -> IResult<&[u8], UntaggedRespo
 /// - `"CHILDINFO" "(" astring *(SP astring) ")"` (RFC 5258 Section 4)
 fn parse_list_extended_data(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], (Option<MailboxName>, Vec<String>)> {
     let (mut input, _) = char('(').parse(input)?;
     let mut old_name = None;
@@ -381,7 +381,7 @@ fn parse_list_extended_data(
 fn parse_mailbox_list_response<'a, F>(
     input: &'a [u8],
     keyword: &'static [u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
     wrap: F,
 ) -> IResult<&'a [u8], UntaggedResponse>
 where
@@ -445,7 +445,7 @@ where
 /// discarded for now, but its presence must not cause a parse failure.
 pub(super) fn parse_untagged_list(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     parse_mailbox_list_response(input, b"LIST", utf8_mode, UntaggedResponse::List)
 }
@@ -456,7 +456,7 @@ pub(super) fn parse_untagged_list(
 /// but still sent by some servers.
 pub(super) fn parse_untagged_lsub(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     parse_mailbox_list_response(input, b"LSUB", utf8_mode, UntaggedResponse::Lsub)
 }
@@ -506,7 +506,7 @@ pub(super) fn parse_mailbox_attribute(s: &str) -> MailboxAttribute {
 /// Parse `* STATUS "mailbox" (...)` (RFC 3501 Section 7.2.4).
 pub(super) fn parse_untagged_status_mailbox(
     input: &[u8],
-    utf8_mode: crate::codec::utf7::WireMode,
+    utf8_mode: crate::types::wire::WireMode,
 ) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"STATUS"[..]).parse(input)?;
     let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;

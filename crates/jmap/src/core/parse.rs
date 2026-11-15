@@ -5,6 +5,7 @@ use serde::Deserialize;
 use super::id::{AccountId, BlobId};
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
 pub(crate) struct ParseResponse<T> {
     #[serde(skip)]
     pub(crate) answer_context: crate::core::answer::AnswerContext,
@@ -12,12 +13,15 @@ pub(crate) struct ParseResponse<T> {
     account_id: AccountId,
 
     #[serde(rename = "parsed")]
+    #[serde(default, deserialize_with = "crate::core::id::echo::map")]
     parsed: Option<HashMap<BlobId, T>>,
 
     #[serde(rename = "notParsable")]
+    #[serde(default, deserialize_with = "crate::core::id::echo::optional_vec")]
     not_parsable: Option<Vec<BlobId>>,
 
     #[serde(rename = "notFound")]
+    #[serde(default, deserialize_with = "crate::core::id::echo::optional_vec")]
     not_found: Option<Vec<BlobId>>,
 }
 

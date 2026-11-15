@@ -1185,24 +1185,6 @@ fn default_collection_url(collections: &[AddressBookCollection]) -> Option<Strin
     )
 }
 
-/// Reduce the failure lane to one outcome per resource id.
-///
-/// Text search runs a REPORT per property, so the resource the EMAIL query
-/// refused can be the same resource the FN query returned in full. The
-/// data arrived, so success is the true outcome; reporting the id in both
-/// lanes would make a consumer count it twice and treat a contact it can
-/// display as lost. The sort and dedup finish the job for ids that failed
-/// in more than one REPORT.
-///
-/// The shared helper accepts the materialized href projection explicitly.
-#[cfg(test)]
-fn one_outcome_per_id(failed_ids: &mut Vec<String>, cards: &[ContactCard]) {
-    bifrost_dav_core::collection_account::one_outcome_per_id(
-        failed_ids,
-        cards.iter().map(|card| card.native_id.as_str()),
-    );
-}
-
 #[cfg(test)]
 fn merge_listing_failures(failed_ids: &mut Vec<String>, listing_failed_hrefs: Vec<String>) {
     failed_ids.extend(listing_failed_hrefs);
@@ -2501,7 +2483,10 @@ mod tests {
             "/book/two.vcf".to_string(),
         ];
 
-        one_outcome_per_id(&mut failed_ids, std::slice::from_ref(&card));
+        bifrost_dav_core::collection_account::one_outcome_per_id(
+            &mut failed_ids,
+            std::iter::once(card.native_id.as_str()),
+        );
 
         assert_eq!(failed_ids, vec!["/book/two.vcf".to_string()]);
     }

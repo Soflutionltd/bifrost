@@ -282,9 +282,9 @@ impl<'conn, T> Pipeline<'conn, T> {
 
     pipeline_method! {
         /// SEARCH command (RFC 3501 Section6.4.4).
-        fn search(criteria: impl Into<crate::types::SearchCriteria>) -> Result<SearchResult, Error>;
+        fn search(criteria: impl Into<crate::types::SearchCriteria>) -> Result<SearchResult<crate::types::Seq>, Error>;
         command = Command::Search { criteria: criteria.into() };
-        consumer = dispatch::SearchConsumer::new();
+        consumer = dispatch::SearchConsumer::<crate::types::Seq>::new();
     }
 
     pipeline_method! {
@@ -307,7 +307,7 @@ impl<'conn, T> Pipeline<'conn, T> {
     pipeline_method! {
         /// FETCH command (RFC 3501 Section6.4.5).
         fn fetch(
-            sequence_set: SequenceSet,
+            sequence_set: SequenceSet<crate::types::Seq>,
             items: impl Into<crate::types::fetch::FetchItems>,
             changed_since: Option<crate::types::ModSeq>,
         ) -> Vec<FetchResponse>;
@@ -318,7 +318,7 @@ impl<'conn, T> Pipeline<'conn, T> {
     pipeline_method! {
         /// STORE command (RFC 3501 Section6.4.6).
         fn store(
-            sequence_set: SequenceSet,
+            sequence_set: SequenceSet<crate::types::Seq>,
             operation: StoreOperation,
             flags: Vec<Flag>,
             unchanged_since: Option<crate::types::ModSeqValzer>,
@@ -329,14 +329,14 @@ impl<'conn, T> Pipeline<'conn, T> {
 
     pipeline_method! {
         /// COPY command (RFC 3501 Section6.4.7).
-        fn copy(sequence_set: SequenceSet, mailbox: MailboxName) -> CopyResult;
+        fn copy(sequence_set: SequenceSet<crate::types::Seq>, mailbox: MailboxName) -> CopyResult;
         command = Command::Copy { sequence_set, mailbox };
         consumer = dispatch::CopyConsumer::new();
     }
 
     pipeline_method! {
         /// MOVE command (RFC 6851 Section3).
-        fn move_messages(sequence_set: SequenceSet, mailbox: MailboxName) -> MoveResult;
+        fn move_messages(sequence_set: SequenceSet<crate::types::Seq>, mailbox: MailboxName) -> MoveResult;
         command = Command::Move { sequence_set, mailbox };
         consumer = dispatch::MoveConsumer::new();
     }
@@ -349,7 +349,7 @@ impl<'conn, T> Pipeline<'conn, T> {
         /// UID SEARCH command (RFC 3501 Section6.4.4).
         fn uid_search(criteria: impl Into<crate::types::SearchCriteria>) -> Result<SearchResult, Error>;
         command = Command::UidSearch { criteria: criteria.into() };
-        consumer = dispatch::SearchConsumer::new();
+        consumer = dispatch::SearchConsumer::<crate::types::Uid>::new();
     }
 
     pipeline_method! {
@@ -485,30 +485,30 @@ impl<'conn, T> Pipeline<'conn, T> {
 
     pipeline_method! {
         /// THREAD command (RFC 5256 Section3).
-        fn thread(algorithm: String, charset: String, criteria: impl Into<crate::types::SearchCriteria>) -> Vec<ThreadNode>;
+        fn thread(algorithm: String, charset: String, criteria: impl Into<crate::types::SearchCriteria>) -> Vec<ThreadNode<crate::types::Seq>>;
         command = Command::Thread { algorithm, charset, criteria: criteria.into() };
-        consumer = dispatch::ThreadConsumer::default();
+        consumer = dispatch::ThreadConsumer::<crate::types::Seq>::default();
     }
 
     pipeline_method! {
         /// UID THREAD command (RFC 5256 Section3).
         fn uid_thread(algorithm: String, charset: String, criteria: impl Into<crate::types::SearchCriteria>) -> Vec<ThreadNode>;
         command = Command::UidThread { algorithm, charset, criteria: criteria.into() };
-        consumer = dispatch::ThreadConsumer::default();
+        consumer = dispatch::ThreadConsumer::<crate::types::Uid>::default();
     }
 
     pipeline_method! {
         /// SORT command (RFC 5256 Section2).
-        fn sort(sort_criteria: String, charset: String, criteria: impl Into<crate::types::SearchCriteria>) -> SearchResult;
+        fn sort(sort_criteria: String, charset: String, criteria: impl Into<crate::types::SearchCriteria>) -> SearchResult<crate::types::Seq>;
         command = Command::Sort { sort_criteria, charset, criteria: criteria.into() };
-        consumer = dispatch::SortConsumer::default();
+        consumer = dispatch::SortConsumer::<crate::types::Seq>::default();
     }
 
     pipeline_method! {
         /// UID SORT command (RFC 5256 Section2).
         fn uid_sort(sort_criteria: String, charset: String, criteria: impl Into<crate::types::SearchCriteria>) -> SearchResult;
         command = Command::UidSort { sort_criteria, charset, criteria: criteria.into() };
-        consumer = dispatch::SortConsumer::default();
+        consumer = dispatch::SortConsumer::<crate::types::Uid>::default();
     }
 
     pipeline_method! {

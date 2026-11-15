@@ -673,8 +673,8 @@ pub(crate) struct LocalFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StateRequirement {
     LegalStates {
-        actual: crate::connection::SessionState,
-        allowed: Vec<crate::connection::SessionState>,
+        actual: crate::types::SessionState,
+        allowed: Vec<crate::types::SessionState>,
     },
     BeforeFirstSelection {
         command: crate::types::CommandKind,
@@ -779,7 +779,8 @@ mod typed_failure_tests {
 
     #[test]
     fn validation_conversion_preserves_the_rule() {
-        let validation = crate::types::SequenceSet::new_known("*").unwrap_err();
+        let validation =
+            crate::types::SequenceSet::<crate::types::Uid>::new_known("*").unwrap_err();
         let error = Error::from(validation.clone());
         let Error::LocalRefusal(LocalRefusal::InvalidInput(detail)) = error else {
             panic!("expected local validation")

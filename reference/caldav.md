@@ -145,14 +145,13 @@ refused before its dispatch.
 Status classification receives the HTTP response headers and uses
 `bifrost_net::request::parse_retry_after_hint`, preserving HTTP dates as
 `RetryHint::At`, including elapsed dates. Rate-limit and quota errors carry account
-throttle scope as DAV's conservative scheduling policy. Exhausted retry and
-rate-limit errors retain net's complete retry history, except 501, which MOVE
-must read as an unsupported-method answer. A non-idempotent request can also
-read its terminal status after earlier proven refusals, the shared
-`bifrost_net::is_proven_refusal` rule (401, 429, 405 and 501); a 503 can
-follow an upstream commit, so it stays commit-ambiguous, and a history
-containing a 503 or transport ambiguity keeps reconciliation. Conditional
-412 and locked 423 remain DAV conflicts; 400/413/422 are malformed requests and
+throttle scope as DAV's conservative scheduling policy. Client refusals other
+than 401/408/429 and the unsupported-method 501 are selected as data through net, preserving complete DAV precondition bodies and
+avoiding status retries for MOVE/filter fallback. Authentication recovery and
+transient-status retries stay in net; exhausted retry and rate-limit errors
+retain its complete history. Earlier possible commits on unreplayable requests
+still require reconciliation, using net's shared ledger rather than a private
+refusal list. Conditional 412 and locked 423 remain DAV conflicts; 400/413/422 are malformed requests and
 408/502/503/504 are unavailable. Cursor-invalid 410 is interpreted only by the
 sync-collection caller before the generic resource ladder.
 
@@ -711,7 +710,7 @@ Supported calendar primitives:
   ahead of a `403` one report a wholly refused collection as a benign missing
   resource, so the 207 classified `Usable` with no entries and the diff
   destroyed everything in it. The
-  depth-1 listing and the snapshot poll go through the same `listing_failure`
+  depth-1 listing and the snapshot poll go through the same `ResourceListing::failure`
   funnel and inherit the classification. A listing with any committed entry
   never reaches it, so a member refused beside members that answered stays a
   per-id failure on `Page::failed_ids` and the page is served; only a wholly
@@ -733,7 +732,7 @@ Supported calendar primitives:
   non-404/410 DAV failure (a resource deleted between listing and multiget
   is the benign per-resource case). A 2xx response that omits
   `calendar-data` remains an absent-data `failed_ids` outcome but is not a
-  server failure. `multiget_failure` routes a complete failure through
+  server failure. `MultigetReport::failure` routes a complete failure through
   `status_error`, so an all-401 body reauthorizes and an all-503 body
   retries instead of returning an empty page that a consumer would
   record as a completed walk - which would drop those resources
@@ -993,13 +992,16 @@ Folder-scoped cursors must name an equivalent collection URL in their payload;
 a mismatch is rejected as schema-incompatible before polling. Legacy type
 scopes have no collection URL to compare.
 An expired token reported as 403 with `DAV:valid-sync-token`, or as 410,
-becomes `SyncState(CursorInvalid)` scoped to the invalid calendar's own
-folder cursor (`ErrorScope::Cursor(CursorScope::Folder(collection url))`),
-which directs the engine to restart exactly that per-calendar cursor. The
-scope must be the folder scope: live cursors are one per calendar, so a
-type-wide scope would ask the engine to restart a cursor that does not
-exist while the stale one failed identically on every poll. Cursor entry counts are payload-bounded
-before allocation. Range, search, inventory, changes, and their failed-id
+becomes `SyncState(CursorInvalid)` scoped to
+`ErrorScope::Cursor(CursorScope::FolderType { folder: FolderId(collection_url), ty: ObjectType::CalendarEvent })`.
+The engine matches restart scopes exactly, so this must name the same collection
+and object type as discovery. An enterprise user's expired calendar token must
+restart that calendar rather than fail every poll under a mismatched cursor key.
+The account regression exercises both expiry statuses, matches the restart to
+the discovered cursor and establishes a fresh token. The shared account kernel
+rebinds cursor invalidation to the exact active cursor key, preserving accepted
+legacy scopes and equivalent URL spellings. The same regression exercises those
+forms. Cursor entry counts are payload-bounded before allocation. Range, search, inventory, changes, and their failed-id
 lanes all use resolved absolute resource URLs as native ids. Snapshot-poll
 fallback refreshes a collection token with a depth-0 `sync-token` PROPFIND,
 rather than repeating the calendar-home depth-1 listing.
@@ -1166,8 +1168,9 @@ the hop policy used by `send_raw_request`, and the generic verbs `propfind_raw`,
 `delete_resource` and `move_resource`. `CalDavClient` is now a newtype over it
 plus the CalDAV-specific bodies and parsers. This was the security-sensitive
 half: the credential gate, the HTTPS-downgrade refusal and the redirect walk
-were all duplicated, and a divergence there is a credential leak. Ablating
-`is_trusted_url` in the shared crate fails three tests in each crate.
+were all duplicated, and a divergence there is a credential leak. Origin,
+redirect admission and hop-budget tests now run in dav-core for both protocols;
+dialect suites retain authenticated home discovery and href projection tests.
 
 **How `resolve_url` turns a native id into a request URL.** Three shapes, and
 only the third is interesting. An href already carrying an `http://` or
@@ -1254,15 +1257,19 @@ statuses. Net also narrows classification on possible-commit failures.
 because DAV itself mints oversized-body failures. The operation table alone
 cannot prove MOVE or a partly completed sequence safe.
 
-DAV only reads method refusals (405/501) as data after histories consisting of
-proven refusals, the shared `bifrost_net::is_proven_refusal` rule in
-`crates/net/src/attempt.rs`: 401, 429, 405 and 501. A 503 can follow an
-upstream commit, so it is commit-ambiguous, and any history containing one
-reconciles, as do other ambiguous histories. Redirect walks feed the same rule
-through net's `AttemptLedger`. The all-401 history exception permits a
-terminal status to be consumed after the shared walk refreshes a rejected token. A lone 501
-remains data for MOVE fallback; a lone 503 reconciles and cannot consume a
-queued 405. A genuine first-attempt 412 stays a conflict.
+DAV selects client statuses other than 401/408/429, plus 501, through
+`RequestBuilder::statuses_as_data`. Client refusals reach the DAV status ladder
+with their complete bodies; 501 reaches MOVE and filter fallback immediately.
+Net retains authentication recovery, timeout/rate retries and all other 5xx
+retry handling. A lone 503 on an unreplayable write reconciles and cannot consume
+a queued 405. A direct 412, including one after proven 401/429 refusals, remains
+a conflict. Before consuming a non-success response on an unreplayable request,
+DAV feeds the earlier outcomes through net's `AttemptLedger`; earlier possible
+commits go through `Response::into_status_error` and reconciliation instead of
+triggering a false conflict. A terminal 405/501 is exempt: it denies the method
+itself, which no earlier hop can cause, so MOVE still falls back to
+copy-then-delete after a redirect. No private refusal list or response
+reconstruction from net errors remains.
 
 **Multi-step failures preserve the leaf.** Relocation returns shared
 Before, MovedThenPut or CopiedThenDelete progress, and the public update attaches
@@ -1452,6 +1459,8 @@ whole-query filter degradation, result settlement, and conditional CRUD.
 `ResourceListing`, `FetchedResource`, `MultigetReport` and `MultigetFetch` are
 shared result types. The protocol parsers keep semantic local names as aliases.
 `QUERY_HREF_PROPS` and the default 250-resource page size have one definition.
+`ResourceListing::failure<D>` and `MultigetReport::failure<D>` share the complete
+207-refusal gate; protocol clients have no local wrappers for it.
 
 `DavCollectionAccount<D>` is a stateless kernel called by both Account impls.
 It owns discovered-scope construction, routing and coverage, cursor encoding

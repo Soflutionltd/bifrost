@@ -1,8 +1,16 @@
+use super::*;
+
 // Session transcripts, entirely in memory.
-use bifrost_types::{PushSessionEvent as E, PushSessionEnd as End, SessionStop};
+use bifrost_types::{PushSessionEnd as End, PushSessionEvent as E, SessionStop};
 use std::sync::Arc;
 
-async fn setup(steps: Vec<ScriptStep>) -> (GraphAccount, bifrost_types::AccountStream<E>, tokio::sync::mpsc::UnboundedReceiver<String>) {
+async fn setup(
+    steps: Vec<ScriptStep>,
+) -> (
+    GraphAccount,
+    bifrost_types::AccountStream<E>,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
     let account = GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
     register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
     let (transport, requests) = scripted(steps);
@@ -12,16 +20,28 @@ async fn setup(steps: Vec<ScriptStep>) -> (GraphAccount, bifrost_types::AccountS
 
 #[tokio::test]
 async fn an_uncertain_subscribe_is_forwarded_for_reconciliation() {
-    let (_, mut session, mut requests) = setup(vec![ScriptStep::Fail(EwsError::Transport(bifrost_net::Error::Network { message: "lost".into(), transmission_state: bifrost_types::TransmissionState::InFlight, source: None }))]).await;
-    assert!(matches!(session.next().await, Some(E::Failed(e)) if e.recovery().requires_reconciliation()));
+    let (_, mut session, mut requests) = setup(vec![ScriptStep::Fail(EwsError::Transport(
+        bifrost_net::Error::Network {
+            message: "lost".into(),
+            transmission_state: bifrost_types::TransmissionState::InFlight,
+            source: None,
+        },
+    ))])
+    .await;
+    assert!(
+        matches!(session.next().await, Some(E::Failed(e)) if e.recovery().requires_reconciliation())
+    );
     assert!(session.next().await.is_none());
     assert!(requests.recv().await.unwrap().contains("Subscribe"));
     assert!(requests.try_recv().is_err());
 }
 #[tokio::test]
 async fn an_unreplayed_subscribe_status_fails_the_session_without_resubscribing() {
-    let (_, mut session, mut requests) = setup(vec![ScriptStep::Fail(unreplayed_unavailable())]).await;
-    assert!(matches!(session.next().await, Some(E::Failed(e)) if e.recovery().requires_reconciliation()));
+    let (_, mut session, mut requests) =
+        setup(vec![ScriptStep::Fail(unreplayed_unavailable())]).await;
+    assert!(
+        matches!(session.next().await, Some(E::Failed(e)) if e.recovery().requires_reconciliation())
+    );
     assert!(session.next().await.is_none());
     assert!(requests.recv().await.is_some());
     assert!(requests.try_recv().is_err());
@@ -34,7 +54,12 @@ async fn a_complete_long_poll_reports_healthy() {
 }
 #[tokio::test]
 async fn a_topology_change_hands_off_the_stream_without_a_false_disconnect() {
-    let (account, mut session, mut requests) = setup(vec![ScriptStep::Respond(subscribe_response_xml("sub-1")), ScriptStep::Hang, ScriptStep::Respond(unsubscribe_response_xml())]).await;
+    let (account, mut session, mut requests) = setup(vec![
+        ScriptStep::Respond(subscribe_response_xml("sub-1")),
+        ScriptStep::Hang,
+        ScriptStep::Respond(unsubscribe_response_xml()),
+    ])
+    .await;
     assert!(matches!(session.next().await, Some(E::Established)));
     let mut next = Box::pin(session.next());
     assert!(futures::poll!(&mut next).is_pending());
@@ -47,18 +72,39 @@ async fn a_topology_change_hands_off_the_stream_without_a_false_disconnect() {
 }
 #[tokio::test]
 async fn the_first_registration_subscribes_exactly_once() {
-    let (_, mut session, mut requests) = setup(vec![ScriptStep::Respond(subscribe_response_xml("sub-1")), ScriptStep::Hang]).await;
+    let (_, mut session, mut requests) = setup(vec![
+        ScriptStep::Respond(subscribe_response_xml("sub-1")),
+        ScriptStep::Hang,
+    ])
+    .await;
     assert!(matches!(session.next().await, Some(E::Established)));
     let mut next = Box::pin(session.next());
     assert!(futures::poll!(&mut next).is_pending());
     assert!(requests.recv().await.unwrap().contains("<m:Subscribe>"));
-    assert!(requests.recv().await.unwrap().contains("GetStreamingEvents"));
+    assert!(
+        requests
+            .recv()
+            .await
+            .unwrap()
+            .contains("GetStreamingEvents")
+    );
     assert!(requests.try_recv().is_err());
 }
 #[tokio::test]
 async fn every_classified_stream_failure_ends_the_session_failed() {
-    for code in [crate::ews::SoapFaultCode::ErrorAccessDenied, crate::ews::SoapFaultCode::ErrorStreamingSubscriptionInvalid] {
-        let (_, mut session, mut requests) = setup(vec![ScriptStep::Respond(subscribe_response_xml("sub-1")), ScriptStep::Fail(EwsError::SoapFault { code, detail: DiagnosticText::support_only("fault") }), ScriptStep::Respond(unsubscribe_response_xml())]).await;
+    for code in [
+        crate::ews::SoapFaultCode::ErrorAccessDenied,
+        crate::ews::SoapFaultCode::ErrorStreamingSubscriptionInvalid,
+    ] {
+        let (_, mut session, mut requests) = setup(vec![
+            ScriptStep::Respond(subscribe_response_xml("sub-1")),
+            ScriptStep::Fail(EwsError::SoapFault {
+                code,
+                detail: DiagnosticText::support_only("fault"),
+            }),
+            ScriptStep::Respond(unsubscribe_response_xml()),
+        ])
+        .await;
         assert!(matches!(session.next().await, Some(E::Established)));
         assert!(matches!(session.next().await, Some(E::Failed(_))));
         assert!(session.next().await.is_none());
@@ -164,11 +210,18 @@ async fn ews_release_is_claimed_once_and_joined_by_every_caller() {
     let account = GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let gate = Arc::new(tokio::sync::Notify::new());
-    let count = Arc::clone(&calls); let ready = Arc::clone(&gate);
+    let count = Arc::clone(&calls);
+    let ready = Arc::clone(&gate);
     use futures::FutureExt;
     let releaser: EwsReleaser = Arc::new(move |_| {
-        let count = Arc::clone(&count); let ready = Arc::clone(&ready);
-        async move { count.fetch_add(1, std::sync::atomic::Ordering::SeqCst); ready.notified().await; Ok(()) }.boxed()
+        let count = Arc::clone(&count);
+        let ready = Arc::clone(&ready);
+        async move {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ready.notified().await;
+            Ok(())
+        }
+        .boxed()
     });
     account.ews.ledger.lock().unwrap().entries.insert(
         "id".into(),
@@ -191,23 +244,43 @@ async fn ews_release_is_claimed_once_and_joined_by_every_caller() {
 async fn a_failed_ews_release_keeps_its_obligation_without_hiding_a_newer_subscription() {
     use futures::FutureExt;
     let account = GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
-    let fail: EwsReleaser = Arc::new(|_| async { Err(EwsError::Internal("failed cleanup".into())) }.boxed());
+    let fail: EwsReleaser =
+        Arc::new(|_| async { Err(EwsError::Internal("failed cleanup".into())) }.boxed());
     let good: EwsReleaser = Arc::new(|_| async { Ok(()) }.boxed());
     {
         let mut ledger = account.ews.ledger.lock().unwrap();
-        ledger.entries.insert("old".into(), EwsEntry { state: EwsEntryState::Live, releaser: fail });
-        ledger.entries.insert("new".into(), EwsEntry { state: EwsEntryState::Live, releaser: good });
+        ledger.entries.insert(
+            "old".into(),
+            EwsEntry {
+                state: EwsEntryState::Live,
+                releaser: fail,
+            },
+        );
+        ledger.entries.insert(
+            "new".into(),
+            EwsEntry {
+                state: EwsEntryState::Live,
+                releaser: good,
+            },
+        );
     }
     account.ews.release(&account.push_tasks, "old").await;
     let ledger = account.ews.ledger.lock().unwrap();
-    assert!(matches!(ledger.entries["old"].state, EwsEntryState::Orphaned));
+    assert!(matches!(
+        ledger.entries["old"].state,
+        EwsEntryState::Orphaned
+    ));
     assert!(matches!(ledger.entries["new"].state, EwsEntryState::Live));
 }
 
 #[tokio::test]
 async fn a_forced_session_drop_leaves_the_subscription_for_close_to_release() {
     use bifrost_types::Account;
-    let (account, mut session, mut requests) = setup(vec![ScriptStep::Respond(subscribe_response_xml("sub-1")), ScriptStep::Respond(unsubscribe_response_xml())]).await;
+    let (account, mut session, mut requests) = setup(vec![
+        ScriptStep::Respond(subscribe_response_xml("sub-1")),
+        ScriptStep::Respond(unsubscribe_response_xml()),
+    ])
+    .await;
     assert!(matches!(session.next().await, Some(E::Established)));
     drop(session);
     assert!(matches!(
@@ -237,7 +310,9 @@ async fn a_session_start_releases_orphaned_subscriptions() {
     let mut session = ews_session(account.clone(), Arc::new(transport), SessionStop::never());
     let mut next = Box::pin(session.next());
     assert!(futures::poll!(&mut next).is_pending());
-    for _ in 0..20 { tokio::task::yield_now().await; }
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
     assert!(account.ews.ledger.lock().unwrap().entries.is_empty());
     assert!(requests.try_recv().is_err());
 }
@@ -248,7 +323,10 @@ async fn a_subscribe_answered_after_close_is_released_not_recorded() {
     let account = GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
     register(&account, "h", vec![ews_scope("rest", "ews")]).await;
     let ready = Arc::new(tokio::sync::Notify::new());
-    let (transport, mut requests) = scripted(vec![ScriptStep::Delayed(Arc::clone(&ready), subscribe_response_xml("late")), ScriptStep::Respond(unsubscribe_response_xml())]);
+    let (transport, mut requests) = scripted(vec![
+        ScriptStep::Delayed(Arc::clone(&ready), subscribe_response_xml("late")),
+        ScriptStep::Respond(unsubscribe_response_xml()),
+    ]);
     let mut session = ews_session(account.clone(), Arc::new(transport), SessionStop::never());
     let mut next = Box::pin(session.next());
     assert!(futures::poll!(&mut next).is_pending());
@@ -263,7 +341,12 @@ async fn a_subscribe_answered_after_close_is_released_not_recorded() {
 #[tokio::test]
 async fn a_terminal_response_error_in_the_stream_terminates_instead_of_reconnecting() {
     let frame = r#"<m:GetStreamingEventsResponseMessage ResponseClass="Error"><m:MessageText>denied</m:MessageText><m:ResponseCode>ErrorAccessDenied</m:ResponseCode></m:GetStreamingEventsResponseMessage>"#;
-    let (_, mut session, mut requests) = setup(vec![ScriptStep::Respond(subscribe_response_xml("sub-1")), ScriptStep::Respond(frame.into()), ScriptStep::Respond(unsubscribe_response_xml())]).await;
+    let (_, mut session, mut requests) = setup(vec![
+        ScriptStep::Respond(subscribe_response_xml("sub-1")),
+        ScriptStep::Respond(frame.into()),
+        ScriptStep::Respond(unsubscribe_response_xml()),
+    ])
+    .await;
     assert!(matches!(session.next().await, Some(E::Established)));
     assert!(matches!(session.next().await, Some(E::Failed(e)) if e.recovery().is_terminal()));
     assert!(session.next().await.is_none());

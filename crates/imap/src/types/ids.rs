@@ -248,27 +248,29 @@ impl fmt::Display for UidSetExpr {
 
 /// A typed message sequence-number set for non-UID commands.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SeqSetExpr(SequenceSet);
+pub struct SeqSetExpr(SequenceSet<Seq>);
 
 impl SeqSetExpr {
     /// All sequence numbers in the selected mailbox.
     pub fn all() -> Self {
-        Self(SequenceSet::new("1:*").expect("static sequence set is valid"))
+        Self(SequenceSet::<Seq>::new("1:*").expect("static sequence set is valid"))
     }
 
     /// The server-side saved search result `$`.
     pub fn saved_search() -> Self {
-        Self(SequenceSet::new("$").expect("static sequence set is valid"))
+        Self(SequenceSet::<Seq>::new("$").expect("static sequence set is valid"))
     }
 
     /// A single sequence number.
     pub fn one(seq: Seq) -> Self {
-        Self(SequenceSet::from_finite(vec![UidRange::single(seq.get())]))
+        Self(SequenceSet::<Seq>::from_finite(vec![UidRange::single(
+            seq.get(),
+        )]))
     }
 
     /// An inclusive sequence range.
     pub fn range(start: Seq, end: Seq) -> Self {
-        Self(SequenceSet::from_finite(vec![UidRange::range(
+        Self(SequenceSet::<Seq>::from_finite(vec![UidRange::range(
             start.get(),
             end.get(),
         )]))
@@ -295,22 +297,22 @@ impl SeqSetExpr {
     /// already-validated strings from higher-level code.
     #[doc(hidden)]
     pub fn parse(value: impl Into<String>) -> Result<Self, ValidationError> {
-        SequenceSet::new(value).map(Self)
+        SequenceSet::<Seq>::new(value).map(Self)
     }
 
     /// Borrow the underlying validated sequence set.
-    pub fn as_sequence_set(&self) -> &SequenceSet {
+    pub fn as_sequence_set(&self) -> &SequenceSet<Seq> {
         &self.0
     }
 
     /// Consume the wrapper and return the underlying sequence set.
-    pub fn into_sequence_set(self) -> SequenceSet {
+    pub fn into_sequence_set(self) -> SequenceSet<Seq> {
         self.0
     }
 }
 
-impl AsRef<SequenceSet> for SeqSetExpr {
-    fn as_ref(&self) -> &SequenceSet {
+impl AsRef<SequenceSet<Seq>> for SeqSetExpr {
+    fn as_ref(&self) -> &SequenceSet<Seq> {
         self.as_sequence_set()
     }
 }

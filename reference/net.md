@@ -196,8 +196,9 @@ Pass that error to `into_account_error_with_throttle_scope` with the provider's
 a non-replayable write still requires reconciliation, even when no earlier
 attempt exists; a direct 412 remains a state conflict. Protocol-specific status
 interpretation remains the caller's decision, guided by the retained evidence.
-DAV's existing status reconstruction remains a consumer of the default error
-mode until its dispatch explicitly selects statuses as data.
+DAV selects client refusals other than 401/408/429, plus 501, as data. Its
+protocol preconditions and MOVE/filter fallback receive complete bodies while
+net retains authentication recovery and transient-status retries.
 
 ### Shared provider holds and error observation
 
@@ -280,10 +281,10 @@ remains sticky across later attempts. Histories containing only unsent attempts
 keep the terminal classification. Ordinary acknowledged idempotent auth and
 policy failures also retain their terminal classification.
 Protocol consumers that read statuses as data must inspect `terminal()` while
-retaining the complete error for failure classification. DAV reconstitutes a
-terminal response from a replayable request (including DELETE followed by 404)
-and preserves its response-overflow classification with the history attached.
-Unreplayable DAV histories go through the shared reconciliation mapping. Graph's
+retaining the complete error for failure classification. DAV consumes selected
+terminal responses directly (including DELETE followed by 404), preserves
+response-overflow history and sends earlier possible commits through the shared
+reconciliation mapping. Graph's
 status reader also sees terminal evidence inside the envelope, so subscription
 cleanup and throttle-budget attribution retain their existing status handling.
 

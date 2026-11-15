@@ -659,3 +659,59 @@ fn format_multiple_attrs_with_parens() {
     let result = format_fetch_attrs(&[FetchAttr::Uid, FetchAttr::Flags, FetchAttr::Envelope]);
     assert_eq!(result, "(UID FLAGS ENVELOPE)");
 }
+
+fn body_section(section: &str, data: &[u8]) -> crate::types::fetch::BodySection {
+    crate::types::fetch::BodySection {
+        section: section.to_owned(),
+        origin: None,
+        data: Some(data.to_vec().into()),
+    }
+}
+
+#[test]
+fn body_merge_retains_origins_and_only_replaces_matching_nil() {
+    let mut first = body_section("TEXT", b"first");
+    first.origin = Some(0);
+    let mut second = body_section("text", b"second");
+    second.origin = Some(5);
+    let mut missing = second.clone();
+    missing.data = None;
+    let mut fetch = FetchResponse {
+        body_sections: vec![first.clone(), missing],
+        ..Default::default()
+    };
+    fetch.merge(FetchResponse {
+        body_sections: vec![second.clone(), body_section("TEXT", b"whole")],
+        ..Default::default()
+    });
+    assert_eq!(fetch.body_sections.len(), 3);
+    assert_eq!(fetch.body_sections[0], first);
+    assert_eq!(fetch.body_sections[1], second);
+    assert_eq!(fetch.body_sections[2].origin, None);
+}
+
+#[test]
+fn binary_merge_retains_origins_and_replaces_matching_nil() {
+    use crate::types::fetch::BinarySection;
+    let first = BinarySection {
+        section: vec![1],
+        origin: Some(0),
+        data: Some(bytes::Bytes::from_static(b"a")),
+    };
+    let second = BinarySection {
+        section: vec![1],
+        origin: Some(1),
+        data: Some(bytes::Bytes::from_static(b"b")),
+    };
+    let mut missing = second.clone();
+    missing.data = None;
+    let mut fetch = FetchResponse {
+        binary_sections: vec![first.clone(), missing],
+        ..Default::default()
+    };
+    fetch.merge(FetchResponse {
+        binary_sections: vec![second.clone()],
+        ..Default::default()
+    });
+    assert_eq!(fetch.binary_sections, vec![first, second]);
+}

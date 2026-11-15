@@ -1,6 +1,7 @@
 use crate::types::{FetchAttr, FetchResponse};
 
-use super::pim::PREVIEW_FETCH_BYTES;
+/// A preview fetch needs enough source to reach past MIME framing in ordinary mail.
+pub(crate) const PREVIEW_FETCH_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BodySelection {

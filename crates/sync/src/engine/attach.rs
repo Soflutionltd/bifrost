@@ -347,12 +347,6 @@ impl SyncEngine {
             .sink
             .new_ingress(self.config.multiplexer.watch_capacity);
 
-        // Per-account ack channel: consumers push
-        // (scope, checkpoint) here after committing the matching
-        // batch; a dedicated writer task persists them to
-        // `CheckpointStore`.
-        self.ack_senders.insert(account_id.clone(), ack_tx.clone());
-
         // Register per-account budget semaphores.
         self.scheduler.budget().register(account_id.clone());
         if let Some(meter) = &self.bandwidth_meter {
@@ -403,7 +397,8 @@ impl SyncEngine {
 
         // Helper to track both the JoinHandle and a clone of its
         // AbortHandle so detach can fire `abort()` on timeout.
-        let mut spawn = |role: crate::types::WorkerRole, fut: tokio::task::JoinHandle<()>| {
+        let mut spawn = |role: crate::engine::context::WorkerRole,
+                         fut: tokio::task::JoinHandle<()>| {
             workers.push(WorkerTask {
                 role,
                 abort: fut.abort_handle(),
@@ -414,7 +409,7 @@ impl SyncEngine {
         // Transfer the early writer into slot teardown ownership only after
         // all fallible discovery and establishment operations have completed.
         spawn(
-            crate::types::WorkerRole::AckWriter,
+            crate::engine::context::WorkerRole::AckWriter,
             cleanup.writer.take().expect("attach owns writer"),
         );
 
@@ -429,7 +424,7 @@ impl SyncEngine {
             let mut priority_view = priority_rx.clone();
             let mut bandwidth_view = bandwidth_cap_rx.clone();
             spawn(
-                crate::types::WorkerRole::ControlApplier,
+                crate::engine::context::WorkerRole::ControlApplier,
                 tokio::spawn(async move {
                     {
                         let account = control_account.load_full();
@@ -483,7 +478,7 @@ impl SyncEngine {
             attempts: None,
         };
         spawn(
-            crate::types::WorkerRole::PushReconciler,
+            crate::engine::context::WorkerRole::PushReconciler,
             tokio::spawn(reconciler.run(Arc::clone(&ingress))),
         );
 
@@ -517,7 +512,7 @@ impl SyncEngine {
             drain_bound: self.config.detach_timeout / 2,
         };
         spawn(
-            crate::types::WorkerRole::PushSupervisor,
+            crate::engine::context::WorkerRole::PushSupervisor,
             tokio::spawn(push_supervisor.run()),
         );
 
@@ -545,7 +540,7 @@ impl SyncEngine {
             scheduler: self.scheduler.clone(),
         };
         spawn(
-            crate::types::WorkerRole::Multiplexer,
+            crate::engine::context::WorkerRole::Multiplexer,
             tokio::spawn(mux.run()),
         );
 
@@ -562,7 +557,7 @@ impl SyncEngine {
 
         // The slot-wide handle bundle every spawned worker below shares.
         // Cheap to clone; see `SlotContext`.
-        let ctx = SlotContext {
+        let ctx = Arc::new(AccountSlot {
             bandwidth_budget: bandwidth_budget.clone(),
             factory: Arc::clone(&factory),
             current: Arc::clone(&current),
@@ -571,17 +566,17 @@ impl SyncEngine {
             control: control.clone(),
             account_control_tx: account_control_tx.clone(),
             throttles: Arc::clone(&throttles),
-            boundary_tx: boundary.sender(),
+            boundary: boundary.clone(),
             capabilities: Arc::clone(&capabilities),
-            subscriptions: Arc::clone(&self.subscriptions),
+            subscriptions: Arc::new(SubscriptionRegistry::new(shutdown.clone())),
             account_generation_tx: account_generation_tx.clone(),
-            push_retired: push_retired_tx.clone(),
-            push_topology: push_topology_tx.clone(),
+            push_retired_tx: push_retired_tx.clone(),
+            push_topology_tx: push_topology_tx.clone(),
             push_drain_wait: self.config.detach_timeout,
             reopen_lock: Arc::clone(&reopen_lock),
             open_skips: Arc::clone(&open_skips),
             shutdown: shutdown.clone(),
-            writer_tx: ack_tx.clone(),
+            writer: std::sync::Mutex::new(Some(writer.clone())),
             coverage: Arc::clone(&pending_coverage),
             subscriber_notify: Arc::clone(&subscriber_notify),
             scheduler: self.scheduler.clone(),
@@ -591,7 +586,22 @@ impl SyncEngine {
             deferred_repairs: Arc::new(DeferredScopeRepairs::new()),
             deferred_schema_reset: Arc::new(DeferredSchemaReset::default()),
             scope_tokens: Arc::clone(&scope_tokens),
-        };
+            push_health_tx,
+            multiplexer: MultiplexerHandle {
+                cancel: multiplexer_cancel,
+            },
+            _sentinel_rx: sentinel_rx,
+            _account_control_sentinel: account_control_sentinel,
+            workers: std::sync::Mutex::new(Vec::new()),
+            registrations: std::sync::Mutex::new(Some(context::SlotRegistrations {
+                account_id: account_id.clone(),
+                sink: Arc::clone(&self.sink),
+                budget: self.scheduler.budget(),
+                backfill_registry: Arc::clone(&self.backfill_registry),
+                throttles: Arc::clone(&self.throttles),
+                bandwidth_meter: self.bandwidth_meter.clone(),
+            })),
+        });
 
         let backfill_wiring = BackfillWiring {
             live: Arc::clone(&live_supersedes),
@@ -602,9 +612,9 @@ impl SyncEngine {
                 .map(|inventory| inventory.scope().clone())
                 .collect(),
         };
-        let backfill_ctx = ctx.clone();
+        let backfill_ctx = Arc::clone(&ctx);
         spawn(
-            crate::types::WorkerRole::BackfillOrchestrator,
+            crate::engine::context::WorkerRole::BackfillOrchestrator,
             tokio::spawn(async move {
                 run_backfill_orchestrator(backfill_ctx, backfill_wiring).await;
             }),
@@ -615,9 +625,9 @@ impl SyncEngine {
         // before broadcasting cold-start inventory batches, so those
         // batches do not vanish during attach.
         if !deferred_inventory_scopes.is_empty() {
-            let inventory_ctx = ctx.clone();
+            let inventory_ctx = Arc::clone(&ctx);
             spawn(
-                crate::types::WorkerRole::DeferredInventory,
+                crate::engine::context::WorkerRole::DeferredInventory,
                 tokio::spawn(async move {
                     run_deferred_inventory_establishment(inventory_ctx, deferred_inventory_scopes)
                         .await;
@@ -627,14 +637,14 @@ impl SyncEngine {
 
         // The account supervisor serializes recovery and lifecycle requests.
         spawn(
-            crate::types::WorkerRole::ReopenListener,
-            tokio::spawn(super::supervisor::run(ctx.clone(), reopen_rx)),
+            crate::engine::context::WorkerRole::ReopenListener,
+            tokio::spawn(super::supervisor::run(Arc::clone(&ctx), reopen_rx)),
         );
 
         if let Some(interval) = self.config.push.orphan_teardown_retry_interval {
-            let retrier_ctx = ctx.clone();
+            let retrier_ctx = Arc::clone(&ctx);
             spawn(
-                crate::types::WorkerRole::OrphanTeardownRetrier,
+                crate::engine::context::WorkerRole::OrphanTeardownRetrier,
                 tokio::spawn(super::orphan_teardown::run_orphan_teardown_retrier(
                     retrier_ctx,
                     interval,
@@ -651,7 +661,7 @@ impl SyncEngine {
             let bw_control = control.clone();
             let bw_shutdown = shutdown.clone();
             spawn(
-                crate::types::WorkerRole::BandwidthFeed,
+                crate::engine::context::WorkerRole::BandwidthFeed,
                 tokio::spawn(async move {
                     let view = meter_handle.account(bw_aid);
                     loop {
@@ -667,39 +677,8 @@ impl SyncEngine {
             );
         }
 
-        let multiplexer = MultiplexerHandle {
-            cancel: multiplexer_cancel,
-        };
-        let slot = Arc::new(AccountSlot {
-            deferred_schema_reset: Arc::clone(&ctx.deferred_schema_reset),
-            bandwidth_budget,
-            scheduler: self.scheduler.clone(),
-            factory,
-            current,
-            account_generation_tx,
-            push_health_tx,
-            push_topology_tx,
-            push_retired_tx,
-            reopen_lock,
-            capabilities,
-            multiplexer,
-            cursors: Arc::clone(&cursors),
-            coverage: Arc::clone(&pending_coverage),
-            boundary_tx: boundary.sender(),
-            shutdown: shutdown.clone(),
-            control: control.clone(),
-            _sentinel_rx: sentinel_rx,
-            workers: std::sync::Mutex::new(workers),
-            account_control_tx,
-            _account_control_sentinel: account_control_sentinel,
-            subscriber_notify,
-            reopen_tx: reopen_tx.clone(),
-            throttles: Arc::clone(&throttles),
-            open_skips,
-            delivery,
-        });
-
-        self.accounts.insert(account_id.clone(), slot);
+        *ctx.workers.lock().expect("worker list lock poisoned") = workers;
+        self.accounts.insert(account_id.clone(), ctx);
 
         Ok(control)
     }

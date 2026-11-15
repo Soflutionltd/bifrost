@@ -25,7 +25,7 @@
 //! - `establish` - shared cursor establishment and inventory fusion.
 //! - `bulk` - the bulk mutation pipeline and its campaign entry points.
 //! - `passthrough` - the read-only hydration and PIM forwarders.
-//! - `context` - `SlotContext`, the handle bundle the spawned workers
+//! - `context` - the account slot and its owned resources, which workers
 //!   share.
 //! - `lane` - the bounded backfill lane: producer-side flow control so a
 //!   cold start cannot outrun a consumer into the broadcast ring.
@@ -40,21 +40,19 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use bifrost_types::{
     Account, AccountCapabilities, AccountControl, AccountError, AccountFactory, AccountFuture,
-    AccountId, AccountStream, BackfillCheckpoint, Batch, ChangeCursor, Checkpoint,
-    CursorEstablishment, CursorScope, DiagnosticText, EngineDirective, ErrorScope,
-    InvalidationSink, InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope,
-    MutationSuccess, OpenedAccount, PageBoundary, PauseReason, Priority, ReconcileAction,
+    AccountId, AccountStream, ChangeCursor, CursorEstablishment, CursorScope, DiagnosticText,
+    EngineDirective, ErrorScope, InvalidationSink, InventoryPartition, ItemOutcome,
+    MembershipScope, MutationSuccess, OpenedAccount, PauseReason, Priority, ReconcileAction,
     ReconcileAdvice, RecoveryClass, RetryAdvice, SkippedScope, SyncEvent,
 };
+#[cfg(test)]
+use bifrost_types::{Batch, Checkpoint, PageBoundary};
 use dashmap::DashMap;
 use futures::stream::StreamExt;
-use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::backfill::{
-    BackfillPolicy, BackfillRegistry, BackfillRunner, BackfillState, BackfillStrategy,
-    LiveSupersedes,
-};
+use crate::backfill::{BackfillRegistry, BackfillRunner, LiveSupersedes};
 use crate::cancel::{Boundary, BoundaryRequest};
 use crate::control::{SyncActivityGuard, SyncControl};
 use crate::cursor::CursorRegistry;
@@ -67,7 +65,9 @@ use crate::error::Error;
 use crate::multiplexer::{Multiplexer, MultiplexerHandle};
 use crate::push::{InvalidationSinkInner, RegisteredSubscription, SubscriptionRegistry};
 use crate::scheduler::{BudgetGate, ConcurrencyBudget, Scheduler};
-use crate::types::{AccountSlot, BackfillConfig, EngineConfig, WorkerTask};
+use crate::types::{BackfillConfig, EngineConfig};
+#[cfg(test)]
+use tokio::sync::oneshot;
 use writer::OperatorDecision;
 
 /// Result of a bounded best-effort close. Callers own logging and lifecycle
@@ -106,6 +106,8 @@ pub(crate) use recovery::DeferredSchemaReset;
 pub use recovery::ResetCount;
 use supervisor::ReopenRequest;
 #[cfg(test)]
+mod parking_tests;
+#[cfg(test)]
 mod tests;
 
 // Re-imported at the parent so every sibling module reaches them through
@@ -114,7 +116,7 @@ mod tests;
 use attach::{discover_scopes_from, link_discovered_memberships, wait_for_real_subscriber};
 use backfill::{BackfillWiring, run_backfill_orchestrator};
 use backfill_bound::BackfillBound;
-use context::SlotContext;
+use context::{AccountSlot, SlotContext, WorkerTask};
 use reattach::{ReplacementOpen, accepted_push_scopes, open_replacement, reattach_account};
 use teardown::{await_ack_writer_until, await_worker_until, take_ack_writer};
 use writer::{WriterHandle, WriterRequest, ack_writer};
@@ -133,7 +135,6 @@ pub struct SyncEngine {
     accounts: DashMap<AccountId, Arc<AccountSlot>>,
     backfill_registry: Arc<BackfillRegistry>,
     sink: Arc<InvalidationSinkInner>,
-    subscriptions: Arc<SubscriptionRegistry>,
     scheduler: Scheduler,
     root_cancel: CancellationToken,
     /// Optional bandwidth meter wired through `bifrost-net`. When
@@ -141,9 +142,6 @@ pub struct SyncEngine {
     /// account so `Control::bandwidth_observed` returns a real reading.
     bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
     bandwidth_registry: Option<Arc<bifrost_net::BandwidthRegistry>>,
-    /// Per-account ack senders; consumers call `ack` to
-    /// durably persist a cursor for a specific scope.
-    ack_senders: DashMap<AccountId, mpsc::Sender<WriterRequest>>,
     /// Per-account in-flight lifecycle guard, held for the whole of
     /// `attach` AND the whole of `detach`.
     ///
@@ -252,12 +250,10 @@ impl SyncEngineBuilder {
             accounts: DashMap::new(),
             backfill_registry: Arc::new(BackfillRegistry::new()),
             sink: Arc::new(InvalidationSinkInner::new()),
-            subscriptions: Arc::new(SubscriptionRegistry::new()),
             scheduler,
             root_cancel: CancellationToken::new(),
             bandwidth_meter: self.bandwidth_meter,
             bandwidth_registry: self.bandwidth_registry,
-            ack_senders: DashMap::new(),
             lifecycle_inflight: Arc::new(AsyncMutex::new(std::collections::HashSet::new())),
             throttles: Arc::new(crate::throttle::ThrottleBucket::new()),
         })
@@ -323,14 +319,8 @@ fn scope_local_establish_failure(error: &AccountError) -> bool {
 /// the old incarnation's writer, close or registry cleanup.
 struct DetachingAccount {
     slot: Arc<AccountSlot>,
-    teardown_writer: Option<mpsc::Sender<WriterRequest>>,
+    teardown_writer: Option<WriterHandle>,
     timeout: Duration,
-    subscriptions: Arc<SubscriptionRegistry>,
-    sink: Arc<InvalidationSinkInner>,
-    budget: BudgetGate,
-    backfill_registry: Arc<BackfillRegistry>,
-    throttles: Arc<crate::throttle::ThrottleBucket>,
-    bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
 }
 
 impl DetachingAccount {
@@ -430,13 +420,13 @@ impl DetachingAccount {
         let writer_deadline = tokio::time::Instant::now() + timeout;
         if let Some(writer) = teardown_writer {
             for scope in slot.coverage.take_backfill_discards() {
-                let (done, recv) = oneshot::channel();
-                let request = WriterRequest::DiscardBackfillProgress {
-                    scope: scope.clone(),
-                    done,
-                };
-                match tokio::time::timeout_at(writer_deadline, writer.send(request)).await {
-                    Ok(Ok(())) => {}
+                let recv = match tokio::time::timeout_at(
+                    writer_deadline,
+                    writer.enqueue_discard(scope.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(recv)) => recv,
                     // The writer is already gone: nothing left to settle to.
                     Ok(Err(_)) => break,
                     Err(_) => {
@@ -449,7 +439,7 @@ impl DetachingAccount {
                         );
                         break;
                     }
-                }
+                };
                 match tokio::time::timeout_at(writer_deadline, recv).await {
                     Ok(Ok(Err(error))) => {
                         tracing::warn!(
@@ -600,7 +590,7 @@ impl DetachingAccount {
         // hold live subscriptions until it expires them on its own
         // schedule (24h for Graph). That is a consumer bug the contract
         // cannot prevent, so it is reported rather than silently absorbed.
-        let stranded = self.subscriptions.take(account_id);
+        let stranded = slot.subscriptions.take();
         if !stranded.is_empty() {
             tracing::warn!(
                 target: "bifrost.sync.push",
@@ -611,13 +601,14 @@ impl DetachingAccount {
                  keeps delivering until they expire",
             );
         }
-        self.sink.unregister(account_id);
-        self.budget.forget(account_id);
-        self.backfill_registry.forget_account(account_id);
-        self.throttles.forget_account(account_id);
-        if let Some(meter) = &self.bandwidth_meter {
-            meter.forget_account(account_id);
-        }
+        // Release while this attachment still holds the lifecycle reservation,
+        // even when callers retain an Arc to the retired slot.
+        drop(
+            slot.registrations
+                .lock()
+                .expect("registration lock poisoned")
+                .take(),
+        );
         Ok(())
     }
 }
@@ -638,6 +629,13 @@ impl SyncEngine {
         SyncEngineBuilder::new()
     }
 
+    fn slot(&self, account_id: &AccountId) -> Result<Arc<AccountSlot>, Error> {
+        self.accounts
+            .get(account_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))
+    }
+
     /// Acknowledge a publication after committing its items to the consumer store.
     /// Persist the token with that transaction using `encode_ack_token` when
     /// acknowledgement may need to replay after a writer restart.
@@ -649,12 +647,8 @@ impl SyncEngine {
         account_id: &AccountId,
         token: crate::cursor::AckToken,
     ) -> Result<crate::AckOutcome, Error> {
-        let tx = self
-            .ack_senders
-            .get(account_id)
-            .map(|r| r.value().clone())
-            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        WriterHandle::new(tx).ack(token).await
+        let tx = self.slot(account_id)?.writer();
+        tx.ack(token).await
     }
 
     /// Build the published backfill checkpoint helper on this account's single
@@ -663,14 +657,10 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
     ) -> Result<crate::backfill::BackfillCheckpointWriter, Error> {
-        let tx = self
-            .ack_senders
-            .get(account_id)
-            .map(|entry| entry.value().clone())
-            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        let tx = self.slot(account_id)?.writer();
         Ok(crate::backfill::BackfillCheckpointWriter::new(
             account_id.clone(),
-            crate::backfill::BackfillCheckpointTarget::attached(WriterHandle::new(tx)),
+            crate::backfill::BackfillCheckpointTarget::attached(tx),
         ))
     }
 
@@ -698,12 +688,9 @@ impl SyncEngine {
     ) -> Result<crate::cursor::DebtLedger, Error> {
         // A user inspecting debt must see obligations even when persistence failed.
         // Detached accounts have no writer and expose their durable snapshot.
-        let tx = self
-            .ack_senders
-            .get(account_id)
-            .map(|entry| entry.value().clone());
+        let tx = self.accounts.get(account_id).map(|slot| slot.writer());
         if let Some(tx) = tx {
-            writer::WriterHandle::new(tx).get_ledger().await
+            tx.get_ledger().await
         } else {
             self.checkpoints.get_ledger(account_id).await
         }
@@ -740,11 +727,7 @@ impl SyncEngine {
             .get(account_id)
             .map(|slot| Arc::clone(slot.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        let writer_tx = self
-            .ack_senders
-            .get(account_id)
-            .map(|r| r.value().clone())
-            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        let writer_tx = slot.writer();
         let gate = maintenance::MaintenanceGate {
             control: &slot.control,
             scheduler: &slot.scheduler,
@@ -752,14 +735,12 @@ impl SyncEngine {
             throttles: &slot.throttles,
             account_id,
             shutdown: &slot.shutdown,
-            boundary_tx: &slot.boundary_tx,
+            boundary: &slot.boundary,
             // Caller-driven: wait out a pause or checkpoint barrier.
             wait_for_run: true,
         };
         let (account, _activity, _admission, ledger) = loop {
-            let ledger = writer::WriterHandle::new(writer_tx.clone())
-                .get_ledger()
-                .await?;
+            let ledger = writer_tx.get_ledger().await?;
             if max_requests == 0 || ledger.repairable().next().is_none() {
                 return Ok(0);
             }
@@ -771,9 +752,7 @@ impl SyncEngine {
             let (_account, activity, admission) = gate.acquire(&scopes).await?;
             // The writer read is another internal wait. Its answer may name
             // different scopes, and a reopen or hold may have landed meanwhile.
-            let ledger = writer::WriterHandle::new(writer_tx.clone())
-                .get_ledger()
-                .await?;
+            let ledger = writer_tx.get_ledger().await?;
             let scopes = ledger
                 .repairable()
                 .take(max_requests)
@@ -812,7 +791,7 @@ impl SyncEngine {
         let observe = |error: &AccountError| {
             crate::recovery::observe_failure_throttles(&slot.throttles, account_id, error);
         };
-        let writer = WriterHandle::new(writer_tx.clone());
+        let writer = writer_tx.clone();
         tokio::select! {
             biased;
             () = slot.shutdown.cancelled() => Err(Error::ShuttingDown),
@@ -883,20 +862,8 @@ impl SyncEngine {
         // mutation: an operator decision races acknowledged checkpoints for the
         // same ledger, and serializing them is what makes a compare-and-swap on
         // the store unnecessary.
-        let tx = self
-            .ack_senders
-            .get(account_id)
-            .map(|r| r.value().clone())
-            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        let (done, wait) = oneshot::channel();
-        tx.send(WriterRequest::OperatorDecision {
-            key,
-            decision,
-            done,
-        })
-        .await
-        .map_err(|_| Error::ShuttingDown)?;
-        wait.await.map_err(|_| Error::ShuttingDown)?
+        let tx = self.slot(account_id)?.writer();
+        tx.operator_decision(key, decision).await
     }
 
     /// Explicitly shutdown the engine. Cancels the engine root token FIRST,
@@ -1038,15 +1005,9 @@ impl SyncEngine {
         // No await between claiming the reservation and spawning its owner:
         // even a caller dropped before the task's first poll cannot strand it.
         let teardown = DetachingAccount {
+            teardown_writer: slot.take_writer(),
             slot,
-            teardown_writer: self.ack_senders.remove(account_id).map(|(_, tx)| tx),
             timeout: self.config.detach_timeout,
-            subscriptions: Arc::clone(&self.subscriptions),
-            sink: Arc::clone(&self.sink),
-            budget: self.scheduler.budget(),
-            backfill_registry: Arc::clone(&self.backfill_registry),
-            throttles: Arc::clone(&self.throttles),
-            bandwidth_meter: self.bandwidth_meter.clone(),
         };
         teardown.begin();
         let lifecycle = Arc::clone(&self.lifecycle_inflight);
@@ -1111,36 +1072,9 @@ impl SyncEngine {
             .get(account_id)
             .map(|r| Arc::clone(r.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        let writer_tx = self
-            .ack_senders
-            .get(account_id)
-            .map(|r| r.value().clone())
-            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        let writer = WriterHandle::new(writer_tx);
-        let ctx = RecoveryContext {
-            scheduler: &slot.scheduler,
-            deferred_schema_reset: &slot.deferred_schema_reset,
-            bandwidth_budget: slot.bandwidth_budget.as_ref(),
-            factory: &slot.factory,
-            current: &slot.current,
-            cursors: &slot.cursors,
-            account_id,
-            control: &slot.control,
-            account_control_tx: &slot.account_control_tx,
-            throttles: &slot.throttles,
-            capabilities: &slot.capabilities,
-            subscriptions: &self.subscriptions,
-            account_generation_tx: &slot.account_generation_tx,
-            push_retired: &slot.push_retired_tx,
-            push_drain_wait: self.config.detach_timeout,
-            expected_generation: None,
-            reopen_lock: &slot.reopen_lock,
-            open_skips: &slot.open_skips,
-            shutdown: &slot.shutdown,
-            writer: &writer,
-            coverage: &slot.coverage,
-            delivery: &slot.delivery,
-        };
+        let writer_tx = slot.writer();
+        let writer = writer_tx;
+        let ctx = slot.recovery(&writer);
         loop {
             if !slot.control.wait_until_running(&slot.shutdown).await {
                 return Err(Error::ShuttingDown);
@@ -1326,7 +1260,7 @@ impl SyncEngine {
         // a take/restore interleaved with that window would either resurrect
         // records the consumer just tore down or race the handle swap.
         let _reopen_guard = slot.reopen_lock.lock().await;
-        let records = self.subscriptions.take(account_id);
+        let records = slot.subscriptions.take();
         let account = slot.current.load_full();
         let mut failed = Vec::new();
         let mut first_error = None;
@@ -1344,13 +1278,10 @@ impl SyncEngine {
                 failed.push(record.into_orphan());
             }
         }
-        // A detach racing this call has already cancelled the slot and may
-        // already have taken the registry; the sealed write drops the orphans
-        // then, rather than leaving them under an id a later attach inherits.
-        if !self
-            .subscriptions
-            .restore_orphans(account_id.clone(), failed, &slot.shutdown)
-        {
+        // A detach racing this call may already have drained this attachment's
+        // registry. Refusal reports that nobody remains to retry these handles;
+        // the next attachment owns an independent registry.
+        if !slot.subscriptions.restore_orphans(failed) {
             tracing::debug!(
                 target: "bifrost.sync.push",
                 account = ?account_id,
@@ -1401,12 +1332,7 @@ impl SyncEngine {
             );
         }
         if let Some(handle) = result.handle()
-            && !self.subscriptions.record(
-                account_id.clone(),
-                handle.clone(),
-                covered,
-                &slot.shutdown,
-            )
+            && !slot.subscriptions.record(handle.clone(), covered)
         {
             // Detach cancelled the slot while `push_subscribe` was in flight and
             // may already have taken the registry, so the subscription just made

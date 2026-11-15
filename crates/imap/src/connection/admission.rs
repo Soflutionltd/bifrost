@@ -684,8 +684,11 @@ fn admit_arguments(command: &Command, session: &SessionView<'_>) -> Result<(), E
             sequence_set,
             items,
             ..
+        } => {
+            session.validate_sequence_set(sequence_set)?;
+            session.validate_fetch_items(items)?;
         }
-        | Command::UidFetch {
+        Command::UidFetch {
             sequence_set,
             items,
             ..
@@ -694,10 +697,10 @@ fn admit_arguments(command: &Command, session: &SessionView<'_>) -> Result<(), E
             session.validate_fetch_items(items)?;
         }
         Command::Store { sequence_set, .. }
-        | Command::UidStore { sequence_set, .. }
         | Command::Copy { sequence_set, .. }
+        | Command::Move { sequence_set, .. } => session.validate_sequence_set(sequence_set)?,
+        Command::UidStore { sequence_set, .. }
         | Command::UidCopy { sequence_set, .. }
-        | Command::Move { sequence_set, .. }
         | Command::UidMove { sequence_set, .. }
         | Command::UidExpunge { sequence_set } => session.validate_sequence_set(sequence_set)?,
         _ => {}
@@ -858,7 +861,10 @@ impl SessionView<'_> {
         Ok(())
     }
 
-    fn validate_sequence_set(&self, sequence_set: &crate::types::SequenceSet) -> Result<(), Error> {
+    fn validate_sequence_set<I>(
+        &self,
+        sequence_set: &crate::types::SequenceSet<I>,
+    ) -> Result<(), Error> {
         // Saved-result references must mean the same thing in a pipeline as in
         // a single request. Outlook users expect the same mailbox operation.
         if sequence_set.as_str().contains('$') {

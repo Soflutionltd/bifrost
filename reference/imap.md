@@ -20,7 +20,7 @@ Every active exchange reads through `driver/read_loop.rs`. Its `LoopPolicy` admi
 
 Before the nom parser runs, `WireReader` asks a framing pre-check whether the buffer can hold a whole response, because the parser is in `complete` mode and cannot distinguish "truncated" from "malformed". The pre-check has three answers, not two: complete, need more bytes, and *unreachable*. Unreachable is a literal count this process can never be handed the octets for  -  above the RFC 9051 `number64` ceiling, or above `usize` on a narrow target, or a chain of counts whose running offset leaves the addressable buffer. Those return `ProviderFailure::Parse` (connection-fatal, `ProviderContractViolation`) rather than "need more bytes", which would park the read loop until the peer closed. The bound matches `codec::decode::literal`, so the pre-check never accepts a count the decoder would reject and never rejects one the decoder would take.
 
-The literal marker parser (`connection/literals.rs`, `literal_marker_at`) is shared by the read side's framing pre-check and the encoder's walk over caller-written SEARCH / SORT / THREAD criteria. It answers three ways: a counted marker (count guaranteed `<= i64::MAX`), a well-formed marker whose count is above the RFC 9051 `number64` ceiling, and "not a marker". Each call site decides what the middle answer means for it - fatal framing on the read path; on the criteria walk it cannot arise, because the validator has already refused a count whose payload is not inside the criteria. A digit run too long even for `u64` is not recognizable framing at all and is handed to the decoder. The encoder never scans its OWN output: see "One command path" below.
+The literal marker parser (`codec/literals.rs`, `literal_marker_at`) is shared by the read side's framing pre-check and the encoder's walk over caller-written SEARCH / SORT / THREAD criteria. It answers three ways: a counted marker (count guaranteed `<= i64::MAX`), a well-formed marker whose count is above the RFC 9051 `number64` ceiling, and "not a marker". Each call site decides what the middle answer means for it - fatal framing on the read path; on the criteria walk it cannot arise, because the validator has already refused a count whose payload is not inside the criteria. A digit run too long even for `u64` is not recognizable framing at all and is handed to the decoder. The encoder never scans its OWN output: see "One command path" below.
 
 FETCH body and binary fields use `bytes::Bytes`. `WireReader` parses responses smaller than 4096 bytes with owned literals and advances a consumed-prefix offset, reusing its read allocation. It compacts the unread suffix in place only after the consumed prefix exceeds half the buffer capacity, so many co-read small responses do not move the suffix once per response. Larger responses transfer their backing to the parser, copying only when capacity exceeds twice the frame length. Co-read suffix bytes move to a separate read buffer with capacity at least 8 KiB. Literals smaller than 4096 bytes or smaller than one quarter of their frame are copied into independent storage; large proportionate literals retain slices without copying the payload. Standalone parser entry points that receive only `&[u8]` copy literal data because they have no owned backing allocation. The response still has to be fully framed and parsed before it is emitted, so this does not stream a literal incrementally. The literal ceiling still counts declarations before reading payload, and non-literal syntax and parser object overhead remain outside it.
 
@@ -37,7 +37,7 @@ Equality and hashing distinguish noncanonical wire identities even when their
 display strings coincide, while canonical names compare equal to caller-created
 names. NUL-bearing mailbox wire strings are refused rather than silently
 stripped. Gmail FETCH labels use the negotiated mailbox decoding mode.
-The codec's `utf7::WireMode` is also the decoder, encoder and wire reader's
+`types::wire::WireMode` is also the decoder, encoder and wire reader's
 mode parameter: `ModifiedUtf7` and `Utf8` replace Boolean mode arguments.
 The session capability owner derives that mode, literal mode and BINARY FETCH
 usability together. Mailbox identity adapters accept a value convertible to
@@ -133,7 +133,7 @@ Bodies are not copied. `AppendMessage::data` is `bytes::Bytes`, carried into the
 
 A MULTIAPPEND's APPENDUID uid-set is believed only when it names exactly as many UIDs as messages were submitted (`MultiAppendConsumer::new(submitted)`), counted BEFORE anything is expanded, so `[APPENDUID 7 1:4294967295]` costs a subtraction, not four billion pairs. A range may be written in either direction (RFC 3501 Section 9) and expands ascending. A count that disagrees discards the code, as if the server had no UIDPLUS: the messages were appended, so an error would invite a retry that duplicates them. A single APPEND expands nothing and takes the first UID of the set, unchecked on purpose: `draft_create` reports a missing UID as `Unsupported`, which for a draft already appended would invite a duplicating retry.
 
-`CopyConsumer` and `MoveConsumer` handle an untagged `* OK [COPYUID ...]` differently, because the tagged OK can carry a code of its own (under QRESYNC typically `HIGHESTMODSEQ`, RFC 7162) and a single slot let that code hide the COPYUID. `CopyResult` and `MoveResult` therefore carry two fields, filled by one shared `resolve_copyuid` on the success arm: `code` is the tagged code when it has one, else the retained untagged OK's code; `copy_uid` is the COPYUID wherever it came from (the tagged code when that is COPYUID, else the retained untagged OK), always a `ResponseCode::CopyUid` when present. The retained untagged OK is consumed exactly when it supplies `copy_uid`, i.e. whenever the tagged code is not itself COPYUID; when the tagged code is COPYUID the untagged one was not this command's answer and is surrendered at its wire position among the buffered responses. For MOVE an untagged COPYUID is the expected shape, not a quirk: RFC 6851 Section 4.3 asks a UIDPLUS server to send it in an untagged OK before the expunges, though some servers put it on the tagged OK instead. `MoveConsumer` retains only the first such OK, whole, with the length of its buffer at arrival; a second one is an ordinary untagged OK and is buffered. On a tagged NO the retained OK goes back into the buffer at its wire position (a COPYUID naming a move the server then failed is not this command's answer), and the EXPUNGE / VANISHED mutations are surrendered after the buffer, verbatim, as before.
+`CopyConsumer` and `MoveConsumer` handle an untagged `* OK [COPYUID ...]` differently, because the tagged OK can carry a code of its own (under QRESYNC typically `HIGHESTMODSEQ`, RFC 7162) and a single slot let that code hide the COPYUID. `CopyResult` and `MoveResult` therefore carry two fields, filled by one shared `resolve_copyuid` on the success arm: `code` is the tagged code when it has one, else the retained untagged OK's code; `copy_uid` is the COPYUID wherever it came from (the tagged code when that is COPYUID, else the retained untagged OK), a dedicated `CopyUid` payload when present. The retained untagged OK is consumed exactly when it supplies `copy_uid`, i.e. whenever the tagged code is not itself COPYUID; when the tagged code is COPYUID the untagged one was not this command's answer and is surrendered at its wire position among the buffered responses. For MOVE an untagged COPYUID is the expected shape, not a quirk: RFC 6851 Section 4.3 asks a UIDPLUS server to send it in an untagged OK before the expunges, though some servers put it on the tagged OK instead. `MoveConsumer` retains only the first such OK, whole, with the length of its buffer at arrival; a second one is an ordinary untagged OK and is buffered. On a tagged NO the retained OK goes back into the buffer at its wire position (a COPYUID naming a move the server then failed is not this command's answer), and the EXPUNGE / VANISHED mutations are surrendered after the buffer, verbatim, as before.
 
 On the UID MOVE fallback (COPY, STORE, UID EXPUNGE, for servers without MOVE) `MoveResult::code` mirrors the native path's tagged code: it is the final UID EXPUNGE's tagged code (under QRESYNC the source mailbox's new `HIGHESTMODSEQ`), falling back to the COPY's `code` only when the EXPUNGE carried none, and `copy_uid` is the COPY's. The EXPUNGE runs through `ExpungeConsumer::with_tagged_code` so the plain consumer's discarded tagged code is available; the plain `uid_expunge` is unchanged. Once COPY is acknowledged, a later STORE or EXPUNGE failure returns
 `MoveFallbackIncomplete { copy, stored_deleted, source }`, with the CopyResult
@@ -330,7 +330,7 @@ by both, since head routing would hand one's answer to the other. Distinct
 kinds share a key where `classify` makes a response `OnlySolicited` for both:
 GETQUOTA / GETQUOTAROOT / SETQUOTA (`QUOTA`), the three search forms (tagless
 `SEARCH`, uncorrelated `ESEARCH`), LIST / LIST-STATUS / STATUS (`LIST`,
-`STATUS`), and FETCH / EXPUNGE (`VANISHED (EARLIER)`). A classifier test checks
+`STATUS`), and UID FETCH / EXPUNGE (`VANISHED (EARLIER)`). A classifier test checks
 every pair of pipelinable kinds with distinct keys against `classify`, so a new
 shared row fails until the key groups it.
 
@@ -709,7 +709,7 @@ empty-but-successful `open_raw_rfc822` stream.
 
 Every locally-malformed `AccountError` the account layer mints carries the
 operation of the call that produced it. `envelope::malformed` (id decode) and
-`pim::pim_malformed` (mailbox-name validation, UIDVALIDITY drift, operand
+`error::pim_malformed` (mailbox-name validation, UIDVALIDITY drift, operand
 refusal, search-criteria assembly, page-cursor parsing) both take an
 `AccountOperation`, and the private helpers between them and their public
 entry points thread it down rather than guessing: `decode_object_id`,
@@ -914,8 +914,20 @@ Submodules:
 - `folder_registry.rs` - mailbox map plus per-folder cursor and MODSEQ caches (`record_modseq`, `modseq`, `clear_modseqs`, `clear_modseq_ranges`), keyed by `(folder, uidvalidity, uid)`, storing LIST delimiter/attributes and the A5c `shared_owner` tag, clearing on UIDVALIDITY change, delete, or rename.
 - `envelope.rs` - `FolderCursor` (QResync/Condstore/Basic) plus `encode_cursor`/`decode_cursor` over `OpaqueChangeState`.
 - `capabilities.rs`, `inventory.rs`, `changes.rs`, `get.rs`, `blob.rs`, `mutate.rs`, `push.rs`, `close.rs`, `scopes.rs` - one file per `Account` method group. `mod.rs` holds `route_scope`/`ScopeHandler`; DAV type and qualified collection scopes dispatch by object type, while legacy bare collection folder scopes dispatch through `DavScopeIndex`. New DAV discovery uses `FolderType` qualified by Contact or CalendarEvent, so equal mailbox and collection strings remain independent and route by object type. `DavScopeIndex` retains legacy bare-folder routing only: mailbox collisions and cross-dialect collisions remain classified open-time skips, and losing legacy scopes are filtered from discovery. Push admission consults the same index: an indexed DAV collection scope is a syntactically valid mailbox name but names no mailbox, so it is refused per-item (the DAV sub-accounts have no push lane) instead of being reported as pushed and burning a push slot on a folder no worker can SELECT. `scopes.rs` holds the discovery fan-in.
-- `pim.rs` - Stage 1 mail actions: container membership, keyword/read mutations, search, folder CRUD, quota, draft create/discard, message/thread hydration, IMAP-specific thread move/delete conveniences.
+- `mail_actions.rs` - direct container-membership and keyword/read/importance mutations, composed thread move/delete actions, and their partial-commit projection over the shared mutation engine. It owns the importance keyword consumed by message hydration.
+- `message_targets.rs` - snapshot and native conversation target resolution, per-folder grouping and the UID operand admission shared by actions, drafts and hydration.
+- `compose/` - SMTP send, raw send, draft create/send/discard and Sent-copy policy. `headers.rs` owns byte-preserving envelope parsing, Bcc stripping and draft Date finalization. Header rewriting stays local to submission rather than expanding the shared MIME surface.
+- `search.rs` - typed filter compilation, provider-query validation and position-based search paging.
+- `containers.rs` - container snapshots, MYRIGHTS projection and mailbox hierarchy edits. Role classification and account role selection remain owned by the folder registry; rights classification remains owned by `MailboxRights`.
+- `message.rs` - typed message/thread hydration and MIME projection; `hydration.rs` owns the FETCH selector and shared preview floor used by this path and `get.rs`.
+- `settings.rs` - quota, identity/vacation refusals and unsupported primitive results.
 - `sieve.rs` - Stage 2 literal script filter list/create/update/delete/validate adapter for the sibling `crate::sieve` protocol client.
+
+Tests for the split mail-action modules live in each owner's `tests.rs`;
+submission header tests live in `compose/headers/tests.rs`. Cross-method account
+transcripts remain in `scripted_tests.rs`. The layout split is not a new line
+audit: the earlier bug hunt did not line-audit the former PIM module's long tail
+beyond membership, keyword and search entry points.
 
 ### CONDSTORE / QRESYNC strategy
 
@@ -1029,7 +1041,7 @@ race cannot be closed by this client.
   carries no native handle. Hydration is advertised with OBJECTID or
   X-GM-EXT-1 as well as THREAD=REFERENCES; native lookup does not require the
   THREAD algorithm. Members are resolved at redemption time by UID SEARCH
-  (`pim::resolve_thread_members`) in the folders `native_thread_folders`
+  (`message_targets::resolve_thread_members`) in the folders `native_thread_folders`
   picks: for X-GM-THRID the one `\All` folder when listed (labels are views of
   one store), else every selectable folder; for THREADID every selectable
   folder. Hydration and flag changes use every such folder, removal searches
@@ -1043,7 +1055,7 @@ race cannot be closed by this client.
   `imapthread1`/`imapthread2` handles retain their explicit UID snapshot
   semantics and remain the fallback when neither key exists.
 - Search messages: UID SEARCH across selectable folders, `SearchFilter::In` restricting the selected mailbox. Thread search is advertised only with `THREAD=REFERENCES`, returning synthetic thread ids containing folder, UIDVALIDITY, and member UIDs.
-- Search paging (`pim::SearchPager`): every page call re-runs the search, so the page cursor is a position, never an offset - an offset into a re-run result skips the boundary survivor whenever an earlier result is expunged between pages. The walk is ordered by folder (`MailboxName::cmp_account_order`) and then by key UID ascending (the message UID; for threads, the lowest member UID), and the cursor (`imapsearch1:` plus the canonical `imap2` id of the last returned position) resumes strictly after it. Folders ordered before the cursor's are not searched again, and once one item past the page is known no later folder is searched. An undecodable cursor and a cursor outside the `SearchFilter::In` restriction are `Request(Malformed)` with cause `InvalidArgument { field: Some("page_cursor") }`, the shared signal (JMAP uses it too) to restart from page one. A changed UIDVALIDITY on the cursor's folder stays `ConcurrencyConflict` (repeat the walk), scoped to that folder's cursor: the cursor was valid when issued and the server replaced the mailbox under it, and `Malformed` would derive ClientBug and report a server-side epoch change as an application defect. An Outlook user whose mailbox was rebuilt expects the search to simply run again; a consumer restarts paging on either error. How UIDVALIDITY changes are classified elsewhere in the account is a separate open question. A zero limit is `Request(Malformed)` without that cursor marker. `estimated_total` is set only when one call enumerated the whole result from the start. Not promised: items moved, or folders created or renamed, behind the cursor are not returned, and a thread whose membership changed between pages may repeat under a new id or be passed.
+- Search paging (`search::SearchPager`): every page call re-runs the search, so the page cursor is a position, never an offset - an offset into a re-run result skips the boundary survivor whenever an earlier result is expunged between pages. The walk is ordered by folder (`MailboxName::cmp_account_order`) and then by key UID ascending (the message UID; for threads, the lowest member UID), and the cursor (`imapsearch1:` plus the canonical `imap2` id of the last returned position) resumes strictly after it. Folders ordered before the cursor's are not searched again, and once one item past the page is known no later folder is searched. An undecodable cursor and a cursor outside the `SearchFilter::In` restriction are `Request(Malformed)` with cause `InvalidArgument { field: Some("page_cursor") }`, the shared signal (JMAP uses it too) to restart from page one. A changed UIDVALIDITY on the cursor's folder stays `ConcurrencyConflict` (repeat the walk), scoped to that folder's cursor: the cursor was valid when issued and the server replaced the mailbox under it, and `Malformed` would derive ClientBug and report a server-side epoch change as an application defect. An Outlook user whose mailbox was rebuilt expects the search to simply run again; a consumer restarts paging on either error. How UIDVALIDITY changes are classified elsewhere in the account is a separate open question. A zero limit is `Request(Malformed)` without that cursor marker. `estimated_total` is set only when one call enumerated the whole result from the start. Not promised: items moved, or folders created or renamed, behind the cursor are not returned, and a thread whose membership changed between pages may repeat under a new id or be passed.
 - Containers: LIST-backed enumeration plus CREATE, RENAME-as-rename, RENAME-as-move, and guarded DELETE (checks `STATUS MESSAGES`, refuses non-empty mailboxes).
 - Quota: `GETQUOTAROOT`, mapped from STORAGE units to bytes when QUOTA is advertised. The account probes the Inbox role when it exists; otherwise it chooses the first selectable folder by display name, wire octets, and encoding mode. Hydration: one-shot message FETCH and synthetic thread hydration.
 - Draft create/discard: APPEND to Drafts with `\Draft` when a delimiter-aware Drafts role and UIDPLUS or active IMAP4rev2 are present (create returns the APPENDUID-derived id); discard is advertised on every server and removes through the shared removal path above. Draft bodies use the shared `bifrost-types::mime` assembler (inline attachments supported; uploaded-attachment handles rejected as `AttachmentUpload`), preserving the `Bcc:` header in the saved draft.
@@ -1181,7 +1193,7 @@ legacy-literal versus current wire-identity folder decoder in `envelope.rs`.
 Their positive integer text fields share the nonzero decoder. Wire operand
 admission, compact-set observation filtering, cache generation checks and the
 poller's assertion of already-decoded values retain their distinct failure
-policies. Importance reads and writes share one keyword constant in `pim.rs`.
+policies. Importance reads and writes share one keyword constant in `mail_actions.rs`.
 Both hydration lanes use `merge_requested_fetches` to filter and merge replies
 for requested UIDs; later mutable fields win and immutable data fills gaps.
 
@@ -1199,16 +1211,16 @@ Output ordering is therefore input-window order, then folder display-name order 
   inventing an empty message. Explicit empty body bytes are valid.
 - A requested UID the server never returns is `Failed(NotFound(Message))` rather than being silently dropped.
 - The valid (non-stale) ids of a folder become a `TargetBatch`, so the FETCH operand and the set the loop attributes results to are the same object. Its typed identities all reach the operand. Stale-epoch failures are published before the FETCH, preserving known per-item truth if that command fails.
-- FETCH responses are merged per UID before conversion. A server may follow the solicited response with unsolicited FLAGS-only FETCHes for the same UID; the merge adopts later `FLAGS` / `MODSEQ` and Gmail labels (mutable state, so the fresher report wins) and fills gaps in every other item (preview, EMAILID / THREADID, the Gmail message and thread ids, body and BINARY sections, per-section `BINARY.SIZE`), but never blanks a data item or body section the earlier response carried, so a trailing partial response cannot turn a complete hydration into an empty one. `merge_fetch_response` is shared with the PIM lane: `pim::hydrate_decoded` folds the FETCH's responses into exactly one per REQUESTED UID (`merge_requested_fetches`), dropping unsolicited FETCHes for UIDs nobody asked about and responses without a UID, so a split or FLAGS-only-follow-up response can no longer hydrate as a duplicate, possibly bodiless, message.
-- `pim::message_hydrate` picks its answer by the canonical id rather than by position, and a UID the tagged OK never answered for (its UIDVALIDITY already matched, so the UID is a live name in this epoch) is `NotFound(Message)` with `Acknowledged` evidence - the message was expunged between the caller learning the id and the FETCH - not the caller's malformed request.
-- `Projection::Preview` and `Projection::TextOnly` both ask for `BODY.PEEK[]` (whole message, not the TEXT section) - preview bounded to a prefix, text-only unbounded. `BODY[TEXT]` is never requested by either: the hydrated value is raw MIME the consumer parses, and the TEXT section of a multipart message is boundaries and base64 with no headers to decode them by. `get.rs` and `pim.rs` use the same 64 KiB preview floor (`PREVIEW_FETCH_BYTES`), raised to the caller's limit when that is larger.
+- FETCH responses are merged per UID before conversion. A server may follow the solicited response with unsolicited FLAGS-only FETCHes for the same UID; the merge adopts later `FLAGS` / `MODSEQ` and Gmail labels (mutable state, so the fresher report wins) and fills gaps in every other item (preview, EMAILID / THREADID, the Gmail message and thread ids, body and BINARY sections, per-section `BINARY.SIZE`), but never blanks a data item or body section the earlier response carried, so a trailing partial response cannot turn a complete hydration into an empty one. `FetchResponse::merge` owns this fold; the account hydration helper delegates to it for the PIM lane: `message::hydrate_decoded` folds the FETCH's responses into exactly one per REQUESTED UID (`merge_requested_fetches`), dropping unsolicited FETCHes for UIDs nobody asked about and responses without a UID, so a split or FLAGS-only-follow-up response can no longer hydrate as a duplicate, possibly bodiless, message.
+- `message::message_hydrate` picks its answer by the canonical id rather than by position, and a UID the tagged OK never answered for (its UIDVALIDITY already matched, so the UID is a live name in this epoch) is `NotFound(Message)` with `Acknowledged` evidence - the message was expunged between the caller learning the id and the FETCH - not the caller's malformed request.
+- `Projection::Preview` and `Projection::TextOnly` both ask for `BODY.PEEK[]` (whole message, not the TEXT section) - preview bounded to a prefix, text-only unbounded. `BODY[TEXT]` is never requested by either: the hydrated value is raw MIME the consumer parses, and the TEXT section of a multipart message is boundaries and base64 with no headers to decode them by. `get.rs` and `message.rs` use the same 64 KiB preview floor (`hydration::PREVIEW_FETCH_BYTES`), raised to the caller's limit when that is larger.
 - A projection that asks for a body section runs through `uid_fetch_limited` under `HYDRATION_FETCH_BUDGET` (256 MiB per batch); metadata and flag projections keep the unbudgeted `uid_fetch`, being bounded by their own response shape. The budget is a guard against a corrupt or adversarial server, not a per-message limit: crossing the retained-object estimate surfaces as `ResultLimit::Fetch` after the tagged completion. A literal declaration above the remaining budget instead fails before payload accumulation with `ResultLimit::FetchLiteral` and retires the connection.
 - Full and preview hydration parse the fetched RFC 5322 source through
   `bifrost-types::mime`. Full exposes text and HTML plus attachment metadata;
   `FullWithBlobs` carries decoded attachment bytes inline because IMAP has no
   redeemable per-part handle. Preview fetches a whole-message prefix (at least
   64 KiB, or the requested limit when larger) rather than `BODY[TEXT]`, so
-  multipart framing is not shown as prose - in `pim.rs` and `get.rs` alike.
+  multipart framing is not shown as prose - in `message.rs` and `get.rs` alike.
   RFC 2047 and RFC 2231 decoding now
   lives in `bifrost-types::mime`, shared with this parser.
 
@@ -1484,7 +1496,7 @@ OAuth, incomplete-MOVE and unsent-operation wrappers. Payload kinds own their
 diagnostics and equality; I/O equality compares `io::ErrorKind`, and OAuth equality compares the
 retained classified error by pointer identity. Transport evidence uses `Option<TransmissionState>` directly. The account boundary converts protocol errors into `bifrost_types::AccountError` via `error::into_account_error(error, ctx)`; consumers never see the crate-internal taxonomy.
 
-`ImapErrorContext` carries the calling `AccountOperation` (required), optional `ErrorScope`, `Provider`, explicit `transmission_state`, and `idempotency_override`. Every `pim.rs` method threads its operation via a local `op_err` closure stamping `ImapErrorContext::operation(<op>)` on every `map_err`; multi-call helpers (`copy_messages`, `delete_messages`, `set_flag`, `hydrate_decoded`, `refresh_folders`, `folder_from_scope`) take an explicit `op: AccountOperation`. This lets recovery distinguish `Reconcile` from `Retry::SameRequest` for non-idempotent ops like `AddToContainer` and `DraftCreate`.
+`ImapErrorContext` carries the calling `AccountOperation` (required), optional `ErrorScope`, `Provider`, explicit `transmission_state`, and `idempotency_override`. Mail-action modules thread the calling operation through `error::op_err`, `error::folder_err` and `error::folder_preflight_err`, stamping `ImapErrorContext::operation(<op>)` at classification; multi-call helpers (`copy_messages`, `delete_messages`, `set_flag`, `hydrate_decoded`, `refresh_folders`, `folder_from_scope`) take an explicit `op: AccountOperation`. This lets recovery distinguish `Reconcile` from `Retry::SameRequest` for non-idempotent ops like `AddToContainer` and `DraftCreate`.
 
 `Error::response_code()` returns the structured `ResponseCode` from `[CODE ...]` brackets (first only); recovery consumes those via the typed `ImapResponseCode` wire variants.
 
@@ -1731,7 +1743,13 @@ crates/imap/src/
 |   |-- mod.rs             - ImapAccount trait impl, helpers
 |   |-- mutate.rs          - bulk_set_flags, bulk_move, bulk_destroy
 |   |-- parts.rs           - BODYSTRUCTURE part traversal + part-handle codec (unwired)
-|   |-- pim.rs             - unified PIM primitives + conveniences
+|   |-- compose/           - send, drafts, Sent copies; headers.rs preserves raw bytes
+|   |-- containers.rs      - container snapshots and mailbox hierarchy edits
+|   |-- mail_actions.rs    - direct/composed mutations and partial-commit projection
+|   |-- message.rs         - typed message/thread hydration and MIME projection
+|   |-- message_targets.rs - message/conversation target resolution and UID operands
+|   |-- search.rs          - criteria compilation and search paging
+|   |-- settings.rs        - quota and unsupported primitive results
 |   |-- pool.rs            - per-folder connection checkout
 |   |-- push.rs            - IDLE-driven push sessions
 |   |-- sieve.rs           - account filter adapter
@@ -1972,7 +1990,7 @@ because servers include a virtual letter when any member is present. The
 wire strings are retained: SETACL's optional +/- prefix is an operation,
 LISTRIGHTS groups express tied grants, and RIGHTS= advertises an alphabet,
 so these are not interchangeable with a granted MYRIGHTS set. Discovery
-parses MYRIGHTS once into MailboxRights; pim delegates its projection.
+parses MYRIGHTS once into MailboxRights; containers delegate the projection.
 
 ## Selected mailbox numeric observations
 
@@ -2276,3 +2294,52 @@ translation unwraps it and applies that enclosing-operation evidence after wire
 classification. An enterprise user expects a refused preparatory SELECT to fail
 without reconciliation for a move that was never sent. OAuth failures continue to
 retain their existing endpoint classification. No error category reparses text.
+
+## Protocol addressing and value ownership
+
+`SequenceSet<I>` preserves UID or sequence addressing even when borrowed from
+`UidSetExpr` or `SeqSetExpr`. Connection methods, pipelines, command operands
+and finite QRESYNC knowledge retain that unit. FETCH, STORE, COPY and MOVE keep
+their separate command forms: their operand types differ, and only UID FETCH
+can represent the VANISHED modifier. Collapsing those forms would require a new
+runtime admission rule for an invalid sequence FETCH with VANISHED.
+
+`CommandKind::UidFetch` alone supplies FETCH's historical VANISHED owner.
+Sequence FETCH cannot solicit it. Both FETCH forms still share a pipeline
+routing component, transitively with EXPUNGE, because their FETCH responses
+are wire-identical and UID FETCH also overlaps EXPUNGE through VANISHED.
+
+`SearchResult<Uid>` and `SearchResult<Seq>` distinguish SEARCH/SORT outputs;
+`ThreadNode<Uid>` and `ThreadNode<Seq>` distinguish THREAD outputs. Their numeric
+projections remain `u32` for account identity construction. A wire THREAD tree
+is `ThreadNode<u32>` until its consumer supplies the command's addressing.
+Legacy SEARCH observations are named `numbers`, not `uids`: the response has no
+wire indicator. Raw-to-addressed THREAD conversion uses an explicit stack, since
+a linear chain can be much deeper than the parser's parenthesis nesting cap.
+ESEARCH supplies its own `EsearchNumbers::Uids` or `Seqs`, with
+typed nonzero MIN/MAX identities and wire ALL ranges in that addressing. A
+SEARCH consumer refuses a selected ESEARCH whose addressing disagrees with its
+command. Enterprise users must never act on sequence numbers mistaken for UIDs.
+Raw FETCH/EXPUNGE observations and contextual MODIFIED ranges remain wire values;
+they preserve existing decoder tolerance instead of admitting invalid nonzero
+identities or inventing addressing the server did not send.
+
+`CopyUid` is the common response-code and COPY/MOVE-result payload. Its range
+lists retain the server's positional correspondence rather than becoming
+independently normalized finite sets. A zero UIDVALIDITY observation remains
+representable; `validity()` admits it to message identity construction only when
+nonzero. An acknowledged copy must keep its committed folder effect even when
+the server supplies unusable message detail, since retrying could duplicate mail.
+
+`types::wire` owns mailbox encoding and literal-mode vocabulary;
+`types::datetime` owns shared SEARCH/APPEND calendar validation. The codec owns
+literal-marker grammar, syntax-aware SEARCH capability/validation methods and
+pipeline routing components. Protocol types have no production imports from
+codec, connection or account. Connection classification consumes NOTIFY flags
+from their type owner, and root errors name the type-owned session state.
+
+`FetchResponse::merge` owns protocol observation folding and its section/origin
+tests. Account hydration delegates to that method and retains its account result
+checks. `account/mailbox_identity.rs` owns the `~imap-wire:` identity envelope,
+its decoding and account ordering; the protocol name exposes only its cached
+wire identity. Existing account ids and persisted envelopes retain their bytes.

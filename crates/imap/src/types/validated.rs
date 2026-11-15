@@ -58,7 +58,9 @@ impl ValidationError {
 // SequenceSet  -  RFC 3501 Section 9
 // ---------------------------------------------------------------------------
 
-/// A validated IMAP sequence-set string.
+/// A validated IMAP sequence-set expression addressed by `I` (UID by default).
+/// The unit survives borrowing the expression from a typed wrapper, so a
+/// sequence-number operand cannot be passed to a UID command.
 ///
 /// RFC 3501 Section 9 formal syntax:
 /// ```text
@@ -74,7 +76,8 @@ impl ValidationError {
 /// Construction validates the full ABNF and rejects empty, malformed,
 /// or overflowing values.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SequenceSet {
+pub struct SequenceSet<I = super::Uid> {
+    addressing: std::marker::PhantomData<I>,
     wire: String,
     members: Vec<SetMember>,
 }
@@ -87,7 +90,7 @@ enum SetMember {
     SavedResult,
 }
 
-impl SequenceSet {
+impl<I> SequenceSet<I> {
     fn from_validated(wire: String) -> Self {
         let members = wire
             .split(',')
@@ -109,7 +112,11 @@ impl SequenceSet {
                 SetMember::Range(super::UidRange::from_sequence_bounds(start, end))
             })
             .collect();
-        Self { wire, members }
+        Self {
+            wire,
+            members,
+            addressing: std::marker::PhantomData,
+        }
     }
 
     pub(crate) fn from_finite(ranges: Vec<super::UidRange>) -> Self {
@@ -123,6 +130,7 @@ impl SequenceSet {
             .collect::<Vec<_>>()
             .join(",");
         Self {
+            addressing: std::marker::PhantomData,
             wire,
             members: ranges.into_iter().map(SetMember::Range).collect(),
         }
@@ -205,13 +213,13 @@ impl SequenceSet {
     }
 }
 
-impl AsRef<str> for SequenceSet {
+impl<I> AsRef<str> for SequenceSet<I> {
     fn as_ref(&self) -> &str {
         &self.wire
     }
 }
 
-impl fmt::Display for SequenceSet {
+impl<I> fmt::Display for SequenceSet<I> {
     /// Formats the sequence set as its wire representation
     /// (RFC 3501 Section 9).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -219,7 +227,7 @@ impl fmt::Display for SequenceSet {
     }
 }
 
-impl TryFrom<String> for SequenceSet {
+impl<I> TryFrom<String> for SequenceSet<I> {
     type Error = ValidationError;
 
     /// Convert from `String`, validating per RFC 3501 Section 9.
@@ -228,7 +236,7 @@ impl TryFrom<String> for SequenceSet {
     }
 }
 
-impl TryFrom<&str> for SequenceSet {
+impl<I> TryFrom<&str> for SequenceSet<I> {
     type Error = ValidationError;
 
     /// Convert from `&str`, validating per RFC 3501 Section 9.
@@ -237,8 +245,8 @@ impl TryFrom<&str> for SequenceSet {
     }
 }
 
-impl From<SequenceSet> for String {
-    fn from(s: SequenceSet) -> Self {
+impl<I> From<SequenceSet<I>> for String {
+    fn from(s: SequenceSet<I>) -> Self {
         s.into_inner()
     }
 }
@@ -439,7 +447,7 @@ enum MailboxWire {
     Canonical,
     Raw {
         bytes: Vec<u8>,
-        mode: crate::codec::utf7::WireMode,
+        mode: crate::types::wire::WireMode,
         canonical: bool,
     },
 }
@@ -503,7 +511,7 @@ impl MailboxName {
     pub(crate) fn from_wire(
         s: String,
         bytes: &[u8],
-        utf8: impl Into<crate::codec::utf7::WireMode>,
+        utf8: impl Into<crate::types::wire::WireMode>,
     ) -> Self {
         let mode = utf8.into();
         let (decoded, canonical) = mode.decode(bytes);
@@ -515,10 +523,10 @@ impl MailboxName {
     pub(crate) fn from_wire_decoded(
         s: String,
         bytes: &[u8],
-        mode: crate::codec::utf7::WireMode,
+        mode: crate::types::wire::WireMode,
         canonical: bool,
     ) -> Self {
-        let utf8 = mode == crate::codec::utf7::WireMode::Utf8;
+        let utf8 = mode == crate::types::wire::WireMode::Utf8;
         let identity = if canonical {
             Self::canonical_identity(&s)
         } else {
@@ -538,7 +546,7 @@ impl MailboxName {
     /// Original octets apply only in the mode in which they were received.
     pub(crate) fn wire_bytes(
         &self,
-        utf8: impl Into<crate::codec::utf7::WireMode>,
+        utf8: impl Into<crate::types::wire::WireMode>,
     ) -> Option<&[u8]> {
         let wire_mode = utf8.into();
         match &self.1 {
@@ -550,70 +558,15 @@ impl MailboxName {
     fn canonical_identity(display: &str) -> (bool, Vec<u8>) {
         (
             false,
-            crate::codec::utf7::WireMode::ModifiedUtf7
+            crate::types::wire::WireMode::ModifiedUtf7
                 .encode(display)
                 .into_bytes(),
         )
     }
 
     // Construction pays the conversion cost once; registry probes only borrow.
-    fn identity(&self) -> &(bool, Vec<u8>) {
+    pub(crate) fn identity(&self) -> &(bool, Vec<u8>) {
         &self.2
-    }
-
-    /// Stable account identity. Ordinary canonical names keep their existing ids;
-    /// noncanonical wire addresses and reserved-prefix names use an escaped form.
-    pub(crate) fn account_id(&self) -> String {
-        use base64::Engine;
-        const PREFIX: &str = "~imap-wire:";
-        if self.can_reencode() && !self.0.starts_with(PREFIX) && Self::new(self.0.clone()).is_ok() {
-            return self.0.clone();
-        }
-        let (utf8, bytes) = self.identity();
-        let mut payload = vec![u8::from(*utf8)];
-        payload.extend_from_slice(bytes);
-        format!(
-            "{PREFIX}{}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
-        )
-    }
-
-    /// Stable display ordering with canonical wire identity as the tie-breaker.
-    pub(crate) fn cmp_account_order(&self, other: &Self) -> std::cmp::Ordering {
-        self.as_str().cmp(other.as_str()).then_with(|| {
-            let (mode, bytes) = self.identity();
-            let (other_mode, other_bytes) = other.identity();
-            bytes.cmp(other_bytes).then(mode.cmp(other_mode))
-        })
-    }
-
-    pub(crate) fn from_account_id(id: &str) -> Result<Self, ValidationError> {
-        use base64::Engine;
-        let Some(payload) = id.strip_prefix("~imap-wire:") else {
-            return Self::new(id);
-        };
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(payload)
-            .map_err(|_| {
-                ValidationError::new(
-                    ValidationReason::InvalidMailboxIdentity,
-                    "invalid mailbox identity",
-                )
-            })?;
-        let Some((&mode, bytes)) = payload.split_first() else {
-            return Err(ValidationError::new(
-                ValidationReason::InvalidMailboxIdentity,
-                "empty mailbox identity",
-            ));
-        };
-        if mode > 1 || bytes.contains(&0) {
-            return Err(ValidationError::new(
-                ValidationReason::InvalidMailboxIdentity,
-                "invalid mailbox identity payload",
-            ));
-        }
-        let (display, _) = crate::codec::utf7::WireMode::from(mode == 1).decode(bytes);
-        Ok(Self::from_wire(display, bytes, mode == 1))
     }
 
     pub(crate) fn child(&self, delimiter: char, leaf: &str) -> Result<Self, ValidationError> {
@@ -957,26 +910,3 @@ impl From<ObjectId> for String {
 #[cfg(test)]
 #[path = "validated_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-mod account_identity_tests {
-    use super::MailboxName;
-
-    #[test]
-    fn equal_canonical_names_have_equal_escaped_ids_in_both_modes() {
-        for display in ["~imap-wire:literal", "~imap-wire:旅行", "line\r\nbreak"] {
-            let caller = MailboxName::from_decoded(display.into());
-            let rev1_bytes = crate::codec::utf7::encode_utf7(display).into_bytes();
-            let rev1 = MailboxName::from_wire(display.into(), &rev1_bytes, false);
-            let utf8 = MailboxName::from_wire(display.into(), display.as_bytes(), true);
-            for name in [caller.clone(), rev1, utf8] {
-                assert_eq!(name, caller);
-                assert_eq!(name.account_id(), caller.account_id());
-                assert_eq!(
-                    MailboxName::from_account_id(&name.account_id()).unwrap(),
-                    caller
-                );
-            }
-        }
-    }
-}

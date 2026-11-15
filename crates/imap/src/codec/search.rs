@@ -47,7 +47,7 @@ pub(crate) fn contains_atom(criteria: &str, atom: &str) -> bool {
 /// When scanning criteria for extension atoms, the literal payload must be
 /// skipped verbatim so its contents are not mistaken for syntax.
 fn search_criteria_literal_end(bytes: &[u8], pos: usize) -> Option<usize> {
-    use crate::connection::literals::{LiteralMarker, literal_marker_at};
+    use crate::codec::literals::{LiteralMarker, literal_marker_at};
     let LiteralMarker::Counted {
         data_start, size, ..
     } = literal_marker_at(bytes, pos)
@@ -234,4 +234,81 @@ enum SearchCriteriaItem<'a> {
     Bare(&'a str),
     Quoted,
     Literal,
+}
+
+use crate::types::search::{SearchCriteria, SearchKey};
+
+impl SearchCriteria {
+    pub(crate) fn required_capabilities(&self) -> Vec<crate::types::Capability> {
+        use crate::types::Capability;
+        let mut result = Vec::new();
+        for key in self.keys() {
+            match key {
+                SearchKey::Number { key: "MODSEQ", .. } => result.push(Capability::Condstore),
+                SearchKey::Number { .. }
+                | SearchKey::Keyword(_)
+                | SearchKey::Date { .. }
+                | SearchKey::Flag { .. }
+                | SearchKey::Uid(_)
+                | SearchKey::Sequence(_)
+                | SearchKey::String { .. } => {}
+                SearchKey::Not(inner) => result.extend(inner.required_capabilities()),
+                SearchKey::Group(inner) => result.extend(inner.required_capabilities()),
+                SearchKey::Or(a, b) => {
+                    result.extend(a.required_capabilities());
+                    result.extend(b.required_capabilities());
+                }
+                SearchKey::Raw { text, requires } => {
+                    result.extend(requires.iter().cloned());
+                    for (atoms, capability) in [
+                        (&["MODSEQ"][..], Capability::Condstore),
+                        (&["OLDER", "YOUNGER"][..], Capability::Within),
+                        (
+                            &["SAVEDBEFORE", "SAVEDON", "SAVEDSINCE", "SAVEDATESUPPORTED"][..],
+                            Capability::SaveDate,
+                        ),
+                        (&["EMAILID", "THREADID"][..], Capability::ObjectId),
+                        (&["$"][..], Capability::SearchRes),
+                    ] {
+                        if atoms
+                            .iter()
+                            .any(|atom| crate::codec::search::contains_atom(text, atom))
+                        {
+                            result.push(capability);
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    pub(crate) fn validate_raw(
+        &self,
+        mode: crate::codec::encode::LiteralMode,
+    ) -> Result<(), crate::Error> {
+        for key in self.keys() {
+            match key {
+                SearchKey::Raw { text, .. } => crate::codec::encode::validate_search_criteria_crlf(
+                    text,
+                    "SEARCH criteria",
+                    mode,
+                )?,
+                SearchKey::Not(inner) => inner.validate_raw(mode)?,
+                SearchKey::Group(inner) => inner.validate_raw(mode)?,
+                SearchKey::Or(a, b) => {
+                    a.validate_raw(mode)?;
+                    b.validate_raw(mode)?;
+                }
+                SearchKey::Keyword(_)
+                | SearchKey::Date { .. }
+                | SearchKey::Number { .. }
+                | SearchKey::Flag { .. }
+                | SearchKey::Uid(_)
+                | SearchKey::Sequence(_)
+                | SearchKey::String { .. } => {}
+            }
+        }
+        Ok(())
+    }
 }

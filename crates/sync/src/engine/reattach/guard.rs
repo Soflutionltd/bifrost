@@ -34,19 +34,13 @@ pub(super) async fn unwind_replacement_subscriptions(
             pacing.record_holds(ctx, &cleanup);
             tracing::warn!(
                 target: "bifrost.sync.reopen",
-                account = ?ctx.account_id,
+                account = ?&ctx.account_id,
                 error = %cleanup,
                 "replacement push cleanup failed while unwinding reopen; retaining handle for retry"
             );
-            // Through the sealed write, not a bare restore: this abort can run
-            // after a detach that never waited for it, and an orphan landing
-            // after detach's registry take is inherited by a later attach.
-            register_orphans(
-                ctx.subscriptions,
-                ctx.account_id,
-                ctx.shutdown,
-                vec![replacement],
-            );
+            // Cleanup can outlive detach. Refusal means this attachment can no
+            // longer retry the handle; the next attachment owns another registry.
+            register_orphans(&ctx.subscriptions, &ctx.account_id, vec![replacement]);
         }
     }
 }
@@ -111,11 +105,10 @@ pub(in crate::engine) struct ReattachGuard {
     pub(super) account: Arc<dyn Account>,
     subscriptions: Arc<SubscriptionRegistry>,
     account_id: AccountId,
-    shutdown: CancellationToken,
     /// The slot's reopen lock, for the spawned cleanup's registry write.
     reopen_lock: Arc<AsyncMutex<()>>,
     /// The account's writer queue, for the synchronous compensation on drop.
-    writer: tokio::sync::mpsc::Sender<WriterRequest>,
+    writer: WriterHandle,
     /// This attempt's unique id. It rides every provisional insert and the
     /// abort or commit that settles them, so the writer touches only rows this
     /// attempt owns, even when a delayed send from a dropped attempt arrives
@@ -152,11 +145,10 @@ impl ReattachGuard {
             attempt: ReattachAttempt::mint(),
             close_owed: Some(Arc::clone(&account)),
             account,
-            subscriptions: Arc::clone(ctx.subscriptions),
+            subscriptions: Arc::clone(&ctx.subscriptions),
             account_id: ctx.account_id.clone(),
-            shutdown: ctx.shutdown.clone(),
-            reopen_lock: Arc::clone(ctx.reopen_lock),
-            writer: ctx.writer.sender(),
+            reopen_lock: Arc::clone(&ctx.reopen_lock),
+            writer: ctx.writer.clone(),
             live: Vec::new(),
             rollback_owed: false,
             commit_owed: false,
@@ -198,56 +190,21 @@ impl ReattachGuard {
     }
 }
 
-/// Enqueue a writer request from a `Drop`. Never blocks: a closed channel means
-/// the writer is gone (the slot was detached) and there is nothing to
-/// compensate against; a full one falls back to a spawned send.
-fn enqueue_writer_request(
-    writer: &mpsc::Sender<WriterRequest>,
-    request: WriterRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-    account_id: &AccountId,
-) {
-    match writer.try_send(request) {
-        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-        Err(mpsc::error::TrySendError::Full(request)) => {
-            if let Some(runtime) = runtime {
-                let writer = writer.clone();
-                runtime.spawn(async move {
-                    let _ = writer.send(request).await;
-                });
-            } else {
-                tracing::error!(
-                    target: "bifrost.sync.reopen",
-                    account = ?account_id,
-                    "writer queue full and no runtime on a dropped reattach; \
-                     provisional cursor rows keep their state until a later abort or commit"
-                );
-            }
-        }
-    }
-}
-
 impl Drop for ReattachGuard {
     fn drop(&mut self) {
         let runtime = tokio::runtime::Handle::try_current().ok();
         if self.rollback_owed {
-            let (done, _ignored) = oneshot::channel();
-            enqueue_writer_request(
-                &self.writer,
-                WriterRequest::ReattachAbort {
-                    attempt: self.attempt,
-                    done,
-                },
+            self.writer.settle_reattach_on_drop(
+                self.attempt,
+                false,
                 runtime.as_ref(),
                 &self.account_id,
             );
         }
         if self.commit_owed {
-            enqueue_writer_request(
-                &self.writer,
-                WriterRequest::ReattachCommit {
-                    attempt: self.attempt,
-                },
+            self.writer.settle_reattach_on_drop(
+                self.attempt,
+                true,
                 runtime.as_ref(),
                 &self.account_id,
             );
@@ -260,7 +217,6 @@ impl Drop for ReattachGuard {
         let account = Arc::clone(&self.account);
         let subscriptions = Arc::clone(&self.subscriptions);
         let account_id = self.account_id.clone();
-        let shutdown = self.shutdown.clone();
         let reopen_lock = Arc::clone(&self.reopen_lock);
         match runtime {
             Some(runtime) => {
@@ -268,7 +224,6 @@ impl Drop for ReattachGuard {
                     account,
                     subscriptions,
                     account_id,
-                    shutdown,
                     reopen_lock,
                     live,
                     close,
@@ -291,25 +246,19 @@ impl Drop for ReattachGuard {
                     "reattach dropped with no runtime to clean up on; registering replacement \
                      handles as orphans, and an account owed a close cannot be closed"
                 );
-                register_orphans(&subscriptions, &account_id, &shutdown, live);
+                register_orphans(&subscriptions, &account_id, live);
             }
         }
     }
 }
 
-/// Register `records` as orphans for retry, unless the slot is being torn down.
-///
-/// The teardown check is made by the registry, inside the shard lock `take`
-/// runs under (`SubscriptionRegistry::restore_orphans`), not here beforehand.
-/// Detach cancels the shutdown token and only later takes and discards the
-/// account's registry entry, so an orphan written after that take would sit
-/// under an id a later attach of the same `AccountId` inherits. A check made
-/// before the write leaves a gap on a multi-thread runtime between reading the
-/// token and writing the entry, wide enough for detach to cancel AND take.
+/// Restore refused handles only while this attachment can still retry them.
+/// The registry owns the slot's shutdown token and checks under its own lock,
+/// ordering a transfer against detach's final take. No later attachment can
+/// inherit this object, even when dropped reattach cleanup finishes late.
 fn register_orphans(
     subscriptions: &SubscriptionRegistry,
     account_id: &AccountId,
-    shutdown: &CancellationToken,
     records: Vec<RegisteredSubscription>,
 ) {
     if records.is_empty() {
@@ -320,7 +269,7 @@ fn register_orphans(
         .into_iter()
         .map(RegisteredSubscription::into_orphan)
         .collect();
-    if !subscriptions.restore_orphans(account_id.clone(), orphans, shutdown) {
+    if !subscriptions.restore_orphans(orphans) {
         tracing::warn!(
             target: "bifrost.sync.reopen",
             account = ?account_id,
@@ -336,7 +285,6 @@ struct Stranded {
     pub(super) account: Arc<dyn Account>,
     subscriptions: Arc<SubscriptionRegistry>,
     account_id: AccountId,
-    shutdown: CancellationToken,
     reopen_lock: Arc<AsyncMutex<()>>,
     pub(super) live: Vec<RegisteredSubscription>,
     /// The account still owed a `close()`: the replacement before the swap, the
@@ -367,7 +315,6 @@ async fn retire_stranded(stranded: Stranded) {
         account,
         subscriptions,
         account_id,
-        shutdown,
         reopen_lock,
         live,
         close,
@@ -386,7 +333,7 @@ async fn retire_stranded(stranded: Stranded) {
     }
     if !refused.is_empty() {
         let _reopen_guard = reopen_lock.lock().await;
-        register_orphans(&subscriptions, &account_id, &shutdown, refused);
+        register_orphans(&subscriptions, &account_id, refused);
     }
     if let Some(owed) = close
         && let Err(error) = owed.close().await
@@ -450,7 +397,7 @@ pub(super) async fn commit_reattach_inserts(ctx: &RecoveryContext<'_>, guard: &m
     if ctx.writer.reattach_commit(guard.attempt).await.is_err() {
         tracing::error!(
             target: "bifrost.sync.reopen",
-            account = ?ctx.account_id,
+            account = ?&ctx.account_id,
             "writer channel closed before the reattach could be committed"
         );
     }

@@ -89,7 +89,12 @@ async fn move_by_sequence_requires_move_or_rev2() {
     // Unlike UID MOVE there is no COPY+EXPUNGE fallback here.
     let conn = selected(vec![Capability::Imap4Rev1, Capability::UidPlus]);
     assert!(matches!(
-        conn.move_messages(&set("1:5"), "Archive", T).await,
+        conn.move_messages(
+            &SequenceSet::<crate::types::Seq>::new("1:5").unwrap(),
+            "Archive",
+            T
+        )
+        .await,
         Err(Error::LocalRefusal(
             crate::error::LocalRefusal::MissingCapability(_)
         ))
@@ -218,7 +223,7 @@ async fn changed_since_requires_condstore() {
     ));
     assert!(matches!(
         conn.fetch_changed_since(
-            &set("1:5"),
+            &SequenceSet::<crate::types::Seq>::new("1:5").unwrap(),
             &[FetchAttr::Uid],
             crate::types::ModSeq::new(5).expect("valid protocol test value"),
             T
@@ -364,7 +369,7 @@ fn sort_and_thread_inherit_the_search_criteria_gates() {
     use crate::types::Command;
 
     let opts = EncodeOptions {
-        utf8_mode: crate::codec::utf7::WireMode::ModifiedUtf7,
+        utf8_mode: crate::types::wire::WireMode::ModifiedUtf7,
         literal_mode: LiteralMode::Synchronizing,
         session: crate::types::profile::SessionCapabilities::new(
             vec![
@@ -470,12 +475,12 @@ async fn uid_move_fallback_carries_the_expunge_tagged_code_and_the_copyuid() {
 
     assert_eq!(result.code, Some(ResponseCode::HighestModSeq(99)));
     assert_eq!(
-        result.copy_uid,
-        Some(ResponseCode::CopyUid {
+        result.copy_uid.map(ResponseCode::CopyUid),
+        Some(ResponseCode::CopyUid(crate::types::response::CopyUid {
             uid_validity: 7,
             source_uids: vec![UidRange::single(4)],
             dest_uids: vec![UidRange::single(20)],
-        })
+        }))
     );
     assert_eq!(
         result.expunged,
