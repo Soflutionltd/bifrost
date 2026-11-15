@@ -3535,11 +3535,10 @@ fn build_search_query(
     Ok(query_request)
 }
 
-/// Version tag of the current search-page-cursor payload. v1 was a bare
-/// integer position with no `queryState` pin; v2 adds the pin. The two are
-/// distinguishable without ambiguity - a v1 payload is entirely digits (with
-/// an optional sign) and so can never contain the `SEARCH_CURSOR_SEP`.
-const SEARCH_CURSOR_V2: &str = "2";
+/// The search-specific tag separates positional cursors from anchored page
+/// cursors before decoding either payload. The old shared `2` tag and bare
+/// integer cursors are refused so callers restart with an unambiguous codec.
+const SEARCH_CURSOR_TAG: &str = "search-3";
 
 /// Separator inside the search cursor payload. `:` is safe as a payload
 /// delimiter because only the first two fields are split on it: the
@@ -3547,7 +3546,7 @@ const SEARCH_CURSOR_V2: &str = "2";
 /// opaque state string containing `:` round-trips verbatim.
 const SEARCH_CURSOR_SEP: char = ':';
 
-/// Encode a search page cursor: `2:<position>:<queryState>` for the primary
+/// Encode a search page cursor: `search-3:<position>:<queryState>` for the primary
 /// account, and the owner-qualified form (the same object-id codec every
 /// other foreign id uses) for a share.
 ///
@@ -3564,7 +3563,7 @@ const SEARCH_CURSOR_SEP: char = ':';
 fn encode_position(position: i32, query_state: &str, owner: Option<&str>) -> Vec<u8> {
     qualify(
         owner,
-        format!("{SEARCH_CURSOR_V2}{SEARCH_CURSOR_SEP}{position}{SEARCH_CURSOR_SEP}{query_state}"),
+        format!("{SEARCH_CURSOR_TAG}{SEARCH_CURSOR_SEP}{position}{SEARCH_CURSOR_SEP}{query_state}"),
     )
     .into_bytes()
 }
@@ -3602,17 +3601,15 @@ fn decode_position(
             owner,
         ));
     }
-    let mut parts = payload.splitn(3, SEARCH_CURSOR_SEP);
-    let (Some(version), Some(position), Some(query_state)) =
-        (parts.next(), parts.next(), parts.next())
+    let Some(payload) = payload
+        .strip_prefix(SEARCH_CURSOR_TAG)
+        .and_then(|tail| tail.strip_prefix(SEARCH_CURSOR_SEP))
     else {
-        // Either a v1 bare integer or an unparseable payload; both are a
-        // schema refusal, and neither can be paged from safely.
         return Err(schema_incompatible_search_cursor(op));
     };
-    if version != SEARCH_CURSOR_V2 {
+    let Some((position, query_state)) = payload.split_once(SEARCH_CURSOR_SEP) else {
         return Err(schema_incompatible_search_cursor(op));
-    }
+    };
     Ok(SearchCursor {
         position: position
             .parse::<i32>()
@@ -5509,7 +5506,7 @@ mod tests {
         let cursor = page.next_cursor.expect("a full page has a next cursor");
         assert_eq!(
             String::from_utf8(cursor.clone()).expect("utf8"),
-            super::super::foreign::encode_object("shared", "2:1:q-1"),
+            super::super::foreign::encode_object("shared", "search-3:1:q-1"),
             "the cursor names the account it was minted against, \
              the position it resumes at, and the queryState it belongs to"
         );
@@ -5572,7 +5569,7 @@ mod tests {
         assert_eq!(
             page.next_cursor
                 .map(|c| String::from_utf8(c).expect("utf8")),
-            Some("2:1:q-1".to_string())
+            Some("search-3:1:q-1".to_string())
         );
     }
 
@@ -5736,7 +5733,7 @@ mod tests {
         assert_eq!(
             page.next_cursor
                 .map(|c| String::from_utf8(c).expect("utf8")),
-            Some("2:2:q-1".to_string()),
+            Some("search-3:2:q-1".to_string()),
             "seven hits remain, so the walk must continue"
         );
     }
@@ -6000,6 +5997,29 @@ mod tests {
                     .expect("round-trips");
                 assert_eq!(decoded.position, 42);
                 assert_eq!(decoded.query_state.as_deref(), Some(state));
+            }
+        }
+    }
+
+    #[test]
+    fn search_cursors_have_a_distinct_tag_and_refuse_the_shared_old_tag() {
+        for owner in [None, Some("shared")] {
+            let encoded = encode_position(42, "q:1", owner);
+            assert_eq!(
+                encoded,
+                qualify(owner, "search-3:42:q:1".to_string()).into_bytes()
+            );
+            for payload in ["2:42:q:1", "2:[\"c2\",\"q1\"]"] {
+                let foreign_or_primary = qualify(owner, payload.to_string()).into_bytes();
+                let error =
+                    decode_position(Some(&foreign_or_primary), owner, AccountOperation::Search)
+                        .expect_err("a cursor with the anchored codec's tag must be refused");
+                assert_eq!(
+                    error.kind(),
+                    &bifrost_types::AccountErrorKind::SyncState(
+                        bifrost_types::SyncStateErrorKind::SchemaIncompatible
+                    )
+                );
             }
         }
     }

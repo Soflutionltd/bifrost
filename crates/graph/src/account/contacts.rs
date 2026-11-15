@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::client::Resource;
+use crate::etag::GraphETag;
 use crate::origin::AdmittedUrl;
 use crate::paging::DirectoryMode;
 use crate::types::ODataCollection;
@@ -216,7 +217,7 @@ pub(crate) async fn update(
             .patch_if_match(
                 Resource::Outlook,
                 &path,
-                etag,
+                &GraphETag::from_odata_annotation(etag),
                 &body,
                 bifrost_net::ReplayPolicy::IdempotentUnlessConditional,
             )
@@ -271,7 +272,7 @@ pub(crate) async fn delete_if_version(
             .delete_if_match(
                 Resource::Outlook,
                 &path,
-                etag,
+                &GraphETag::from_odata_annotation(etag),
                 bifrost_net::ReplayPolicy::Never,
             )
             .await

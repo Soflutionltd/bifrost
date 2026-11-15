@@ -37,25 +37,20 @@ pub(crate) enum ScopeRecoveryPolicy {
     SnapshotReseed,
 }
 
-enum WalkProgress {
-    Changes { seen_states: HashSet<String> },
-    Inventory { anchor: Option<String> },
-}
-
-/// One policy object for paged JMAP walks.
-///
-/// Changes and lifecycle walks send a prior server state and share the same
-/// forward-progress guard. Inventory walks do not send a prior state: query
-/// state churn is allowed, while replaying the prior anchor is not. Each
-/// variant supplies the matching error context and keeps its recovery rule
-/// beside that progress guard.
-pub(crate) struct StateWalk {
+/// State-bearing changes walk, including lifecycle polling bursts.
+pub(crate) struct ChangesWalk {
     scope: CursorScope,
-    progress: WalkProgress,
+    seen_states: HashSet<String>,
     recovery: ScopeRecoveryPolicy,
 }
 
-impl StateWalk {
+/// Stateless query walk. Only query requests can carry its anchor context.
+pub(crate) struct InventoryWalk {
+    scope: CursorScope,
+    anchor: Option<String>,
+}
+
+impl ChangesWalk {
     pub(crate) fn changes(scope: CursorScope, since_state: &str) -> Self {
         Self::state_changes(scope, since_state, ScopeRecoveryPolicy::EngineRestart)
     }
@@ -67,39 +62,13 @@ impl StateWalk {
     fn state_changes(scope: CursorScope, since_state: &str, recovery: ScopeRecoveryPolicy) -> Self {
         Self {
             scope,
-            progress: WalkProgress::Changes {
-                seen_states: std::iter::once(since_state.to_string()).collect(),
-            },
+            seen_states: std::iter::once(since_state.to_string()).collect(),
             recovery,
         }
     }
 
-    pub(crate) fn inventory(scope: CursorScope) -> Self {
-        Self {
-            scope,
-            progress: WalkProgress::Inventory { anchor: None },
-            recovery: ScopeRecoveryPolicy::EngineRestart,
-        }
-    }
-
     pub(crate) fn error_context(&self, operation: AccountOperation) -> JmapErrorContext {
-        if matches!(&self.progress, WalkProgress::Changes { .. }) {
-            JmapErrorContext::state_cursor(operation, self.scope.clone())
-        } else {
-            JmapErrorContext::cursor(operation, self.scope.clone())
-        }
-    }
-
-    /// The query door knows whether this page carries an anchor. A scoped
-    /// inventory walk by itself is not enough to classify `anchorNotFound`:
-    /// its `/get` call has the same cursor scope but cannot send an anchor.
-    pub(crate) fn query_error_context(&self, operation: AccountOperation) -> JmapErrorContext {
-        let context = self.error_context(operation);
-        if matches!(&self.progress, WalkProgress::Inventory { anchor: Some(_) }) {
-            context.with_anchored_query()
-        } else {
-            context
-        }
+        JmapErrorContext::state_cursor(operation, self.scope.clone())
     }
 
     pub(crate) fn recovery_policy(&self) -> ScopeRecoveryPolicy {
@@ -120,72 +89,90 @@ impl StateWalk {
         new_state: &str,
         has_more_changes: bool,
     ) -> Option<StateWalkFault> {
-        let WalkProgress::Changes { seen_states } = &mut self.progress else {
-            unreachable!("inventory walk cannot observe a changes page");
-        };
-
         if !has_more_changes {
             return None;
         }
         if new_state == since_state {
             return Some(StateWalkFault::Unmoved);
         }
-        if !seen_states.insert(new_state.to_string()) {
+        if !self.seen_states.insert(new_state.to_string()) {
             return Some(StateWalkFault::Cycle);
         }
         None
     }
 
     pub(crate) fn reset_changes_burst(&mut self, since_state: &str) {
-        let WalkProgress::Changes { seen_states } = &mut self.progress else {
-            unreachable!("inventory walk has no changes burst");
-        };
-        seen_states.clear();
-        seen_states.insert(since_state.to_string());
+        self.seen_states.clear();
+        self.seen_states.insert(since_state.to_string());
+    }
+}
+
+impl InventoryWalk {
+    pub(crate) fn inventory(scope: CursorScope) -> Self {
+        Self {
+            scope,
+            anchor: None,
+        }
+    }
+
+    pub(crate) fn error_context(&self, operation: AccountOperation) -> JmapErrorContext {
+        JmapErrorContext::cursor(operation, self.scope.clone())
+    }
+
+    pub(crate) fn query_error_context(&self, operation: AccountOperation) -> JmapErrorContext {
+        let context = self.error_context(operation);
+        if self.anchor.is_some() {
+            context.with_anchored_query()
+        } else {
+            context
+        }
     }
 
     pub(crate) fn inventory_anchor(&self) -> Option<&str> {
-        match &self.progress {
-            WalkProgress::Inventory { anchor } => anchor.as_deref(),
-            WalkProgress::Changes { .. } => {
-                unreachable!("changes walk has no inventory anchor")
-            }
-        }
+        self.anchor.as_deref()
     }
 
     pub(crate) fn observe_inventory_page<T: ToString>(
         &mut self,
         ids: &[T],
     ) -> Option<StateWalkFault> {
-        let WalkProgress::Inventory { anchor } = &mut self.progress else {
-            unreachable!("changes walk cannot observe an inventory page");
-        };
-
         if ids.is_empty() {
             return None;
         }
-        if anchor
+        if self
+            .anchor
             .as_ref()
             .is_some_and(|previous| ids.iter().any(|id| id.to_string() == *previous))
         {
             return Some(StateWalkFault::RepeatedAnchor);
         }
-        *anchor = ids.last().map(ToString::to_string);
+        self.anchor = ids.last().map(ToString::to_string);
         None
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ScopeRecoveryPolicy, StateWalk, StateWalkFault};
+    use super::{ChangesWalk, InventoryWalk, ScopeRecoveryPolicy, StateWalkFault};
     use bifrost_types::{AccountOperation, CursorScope, ObjectType};
+
+    #[test]
+    fn changes_and_inventory_have_distinct_mode_types() {
+        // Aliasing both modes back to one policy type must not compile.
+        trait WalkMode {}
+        impl WalkMode for ChangesWalk {}
+        impl WalkMode for InventoryWalk {}
+        fn assert_mode<T: WalkMode>() {}
+        assert_mode::<ChangesWalk>();
+        assert_mode::<InventoryWalk>();
+    }
 
     #[test]
     fn state_walk_policy_pairs_guards_with_recovery_and_error_context() {
         let scope = CursorScope::Type(ObjectType::Email);
-        let changes = StateWalk::changes(scope.clone(), "s0");
-        let lifecycle = StateWalk::lifecycle(scope.clone(), "s0");
-        let inventory = StateWalk::inventory(scope);
+        let changes = ChangesWalk::changes(scope.clone(), "s0");
+        let lifecycle = ChangesWalk::lifecycle(scope.clone(), "s0");
+        let inventory = InventoryWalk::inventory(scope);
 
         assert_eq!(
             changes.recovery_policy(),
@@ -194,10 +181,6 @@ mod tests {
         assert_eq!(
             lifecycle.recovery_policy(),
             ScopeRecoveryPolicy::SnapshotReseed
-        );
-        assert_eq!(
-            inventory.recovery_policy(),
-            ScopeRecoveryPolicy::EngineRestart
         );
         assert!(
             changes
@@ -224,13 +207,13 @@ mod tests {
     #[test]
     fn state_walk_owns_change_progress_and_inventory_anchor_guards() {
         let scope = CursorScope::Type(ObjectType::Email);
-        let mut changes = StateWalk::changes(scope.clone(), "s0");
+        let mut changes = ChangesWalk::changes(scope.clone(), "s0");
         assert_eq!(
             changes.observe_changes_page("s0", "s0", true),
             Some(StateWalkFault::Unmoved)
         );
 
-        let mut changes = StateWalk::changes(scope.clone(), "s0");
+        let mut changes = ChangesWalk::changes(scope.clone(), "s0");
         assert_eq!(changes.observe_changes_page("s0", "s1", true), None);
         assert_eq!(
             changes.observe_changes_page("s1", "s0", true),
@@ -238,12 +221,12 @@ mod tests {
         );
         assert_eq!(changes.observe_changes_page("s0", "s0", false), None);
 
-        let mut lifecycle = StateWalk::lifecycle(scope.clone(), "s0");
+        let mut lifecycle = ChangesWalk::lifecycle(scope.clone(), "s0");
         assert_eq!(lifecycle.observe_changes_page("s0", "s1", true), None);
         lifecycle.reset_changes_burst("s1");
         assert_eq!(lifecycle.observe_changes_page("s1", "s0", true), None);
 
-        let mut inventory = StateWalk::inventory(scope);
+        let mut inventory = InventoryWalk::inventory(scope);
         assert_eq!(inventory.inventory_anchor(), None);
         assert_eq!(
             inventory.observe_inventory_page(&["e1".to_string(), "e2".to_string()]),

@@ -325,22 +325,40 @@ pub(crate) fn validate_atom_bytes(bytes: &[u8], context: &str) -> Result<(), Val
 /// LF exclusion for names you did not construct yourself. Injection safety on
 /// the wire comes from the encoder, not from this type.
 ///
-/// There is no `From<String>` or `From<&str>`  -  constructing the type
-/// outside these paths is a compile error:
-///
-/// ```compile_fail
-/// use bifrost_imap::MailboxName;
-/// // There is no From<String>. This must fail to compile.
-/// let _: MailboxName = "Inbox".to_string().into();
-/// ```
-///
-/// ```compile_fail
-/// use bifrost_imap::MailboxName;
-/// // There is no From<&str>. This must fail to compile.
-/// let _: MailboxName = "Inbox".into();
-/// ```
+/// There is no `From<String>` or `From<&str>`: callers must use validating
+/// construction. In-crate compile-time assertions pin both exclusions against
+/// this internal type; external doctests cannot name it through the private
+/// protocol module.
 #[derive(Debug, Clone)]
 pub struct MailboxName(String, Option<(Vec<u8>, bool)>);
+
+#[cfg(test)]
+mod mailbox_conversion_contract {
+    use super::MailboxName;
+
+    // If the forbidden conversion exists, both implementations apply and the
+    // inferred marker becomes ambiguous. Unlike an external compile-fail
+    // example, this assertion must resolve the actual internal type first.
+    #[test]
+    fn mailbox_name_has_no_infallible_string_conversion() {
+        trait AmbiguousIfFrom<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfFrom<()> for T {}
+        impl<T: From<String>> AmbiguousIfFrom<u8> for T {}
+        let _ = <MailboxName as AmbiguousIfFrom<_>>::check;
+    }
+
+    #[test]
+    fn mailbox_name_has_no_infallible_str_conversion() {
+        trait AmbiguousIfFrom<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfFrom<()> for T {}
+        impl<T: From<&'static str>> AmbiguousIfFrom<u8> for T {}
+        let _ = <MailboxName as AmbiguousIfFrom<_>>::check;
+    }
+}
 
 impl MailboxName {
     /// Create a validated mailbox name.

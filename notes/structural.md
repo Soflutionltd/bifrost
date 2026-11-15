@@ -2218,18 +2218,6 @@ codec keeps decoding the dead tags so old rows classify, mapping them to a
 `PAYLOAD_ENVELOPE_VERSION = 2` build ever seeded per-mailbox scopes; if none did,
 the version gate already refuses those rows and the branches are dead.
 
-## STR-099 - JMAP `StateWalk` is two types in one struct
-
-**Reported by:** jmap-account.
-
-`state_walk::StateWalk` holds `WalkProgress::{Changes, Inventory}`, and every
-mode-specific method opens with `let ... else { unreachable!() }`
-(`observe_changes_page`, `reset_changes_burst`, `inventory_anchor`,
-`observe_inventory_page`). The recovery policy enum (`EngineRestart` /
-`SnapshotReseed`) is meaningful only for the changes mode. Two types
-(`ChangesWalk { recovery }`, `InventoryWalk`) sharing an `error_context` trait
-remove four panics and make a mode mix-up a compile error.
-
 ## STR-100 - `JmapErrorContext` routes classification through booleans
 
 **Reported by:** jmap-account.
@@ -2245,22 +2233,6 @@ deletes those arms and lets an "anchored page walk" be expressed (BUG-069).
 `provider: Option<Provider>` is never `Some` in production and can go.
 `send_boundary` exists to compensate for the blanket `From<serde_json::Error>`
 (STR-090).
-
-## STR-101 - JMAP has two page-cursor codecs, both tagged `2`
-
-**Reported by:** jmap-account.
-
-`page_cursor.rs` is the shared anchored, state-pinned cursor for contact and
-calendar walks: `2:` + JSON `[anchor, queryState]`. Mail search has its own in
-`pim.rs` (`encode_position` / `decode_position`): `2:<position>:<queryState>`,
-owner-qualified with the object-id codec, position-based, with its own envelope
-validation (`validate_search_page`) restating the three refusals
-`PageKind::next_cursor` enforces. `page_cursor.rs` argues at length that position
-paging under a server-defined order skips and duplicates, and names mail search as
-carrying "the same limitation". Both payloads start with the byte `2`, so a cursor
-from one door handed to the other is distinguished only by parse failure. Fold
-mail search into `PageKind` (with an owner field), or give the payloads distinct
-tags. Related: STR-006.
 
 ## STR-102 - JMAP refusals reach callers as prose
 
@@ -2362,19 +2334,6 @@ NativeFolderId }, Events { calendar }, Contacts { folder }, PublicFolder(FolderI
 `mint_object_id()`, `client()` and `etag_cached()`; a scope that cannot parse is
 refused once. Its `PublicFolder` variant also owns "is this a public folder"
 (BUG-079). The JMAP twin is STR-098.
-
-## STR-107 - Graph ETags and change keys are both `String`
-
-**Reported by:** graph.
-
-`inventory::graph_etag` encodes a rule enforced only by comment: a bare `changeKey`
-must never go into `If-Match`; it must be wrapped as `W/"..."`
-(`graph_change_key_etag`). ETags travel as `String` through `EtagIndex`,
-`MessagePatch::etag`, `patch_if_match(etag: &str)` and
-`BatchRequestItem::headers["If-Match"]`, so a change key can go where an etag
-belongs. A `GraphETag` newtype whose only constructors are `from_odata_annotation`
-and `from_change_key` makes the bare form unsendable; `ServerVersion::ETag` already
-exists on the boundary.
 
 ## STR-108 - One Graph `$batch` engine with typed legs and answers
 

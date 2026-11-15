@@ -8,6 +8,7 @@ use bifrost_types::{
 use serde_json::Value;
 
 use crate::client::Resource;
+use crate::etag::GraphETag;
 use crate::origin::AdmittedUrl;
 use crate::types::{CONTACT_SELECT, ODataCollection};
 
@@ -247,8 +248,11 @@ fn inventory_stream_from(
                             format!("graph:unidentifiable-value:{}", current_url.as_str()).into_bytes(),
                         ),
                         failure_label: format!("{scope:?}:unidentifiable-value"),
-                        error: super::graph_error::unsupported_account_error(
+                        error: super::graph_error::protocol_violation(
+                            bifrost_types::ProtocolErrorKind::ContractViolation,
                             AccountOperation::SyncInventory,
+                            Some(ErrorScope::Cursor(scope.clone())),
+                            "Graph delta page carried a value with no usable id",
                         ),
                         recovery: bifrost_types::RegionRecovery::CheckpointBarrier {
                             transient_replay: Some(bifrost_types::TransientReplayHint {
@@ -261,7 +265,7 @@ fn inventory_stream_from(
                 };
                 if is_mail_scope(&scope)
                     && let ServerVersion::ETag(etag) = &entry.fingerprint.server_version {
-                    etags.push((entry.id.0.clone(), etag.clone()));
+                    etags.push((entry.id.0.clone(), GraphETag::from_odata_annotation(etag)));
                 }
                 if let Some(owner) = &owner {
                     entry
@@ -351,7 +355,7 @@ pub(crate) fn inventory_entry_from_value(
     let etag = graph_etag(value);
     let fingerprint = Fingerprint {
         server_version: etag
-            .map(ServerVersion::ETag)
+            .map(|etag| ServerVersion::ETag(etag.into_string()))
             .unwrap_or(ServerVersion::Unavailable),
         size: None,
         flags_hash: flags_hash(value),
@@ -447,13 +451,13 @@ pub(crate) fn sync_object_id(scope: &CursorScope, id: &str) -> ObjectId {
     }
 }
 
-pub(crate) fn graph_etag(value: &Value) -> Option<String> {
+pub(crate) fn graph_etag(value: &Value) -> Option<GraphETag> {
     // The OData annotation is already an HTTP entity-tag. A change key is
     // only its opaque payload, so never send it bare in If-Match.
     value
         .get("@odata.etag")
         .and_then(Value::as_str)
-        .map(str::to_string)
+        .map(GraphETag::from_odata_annotation)
         .or_else(|| {
             value
                 .get("changeKey")
@@ -464,8 +468,8 @@ pub(crate) fn graph_etag(value: &Value) -> Option<String> {
 
 /// Turn Graph's opaque change key into the weak HTTP entity-tag used by
 /// `If-Match` when the provider omitted its `@odata.etag` annotation.
-pub(crate) fn graph_change_key_etag(change_key: &str) -> String {
-    format!("W/\"{change_key}\"")
+pub(crate) fn graph_change_key_etag(change_key: &str) -> GraphETag {
+    GraphETag::from_change_key(change_key)
 }
 
 pub(crate) fn is_removed(value: &Value) -> bool {
@@ -997,7 +1001,7 @@ mod tests {
             .etag_index
             .write()
             .await
-            .insert("gone".to_string(), "old".to_string());
+            .insert("gone".to_string(), GraphETag::from_odata_annotation("old"));
         let scope = CursorScope::FolderType {
             folder: FolderId("inbox".to_string()),
             ty: ObjectType::Email,
@@ -1551,11 +1555,10 @@ mod tests {
                 ScriptedRestResponse::json(reqwest::StatusCode::OK, page),
             ]);
             let account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
-            account
-                .etag_index
-                .write()
-                .await
-                .insert("item".into(), "mail-version".into());
+            account.etag_index.write().await.insert(
+                "item".into(),
+                GraphETag::from_odata_annotation("mail-version"),
+            );
             let scope = CursorScope::FolderType {
                 folder: FolderId("collection".into()),
                 ty,
@@ -1824,6 +1827,50 @@ mod tests {
             key.contains("/messages/delta"),
             "the obligation key must name the specific page: {key}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_idless_inventory_value_reports_a_scoped_contract_violation() {
+        for value in [json!({"changeKey": "ck"}), json!({"@removed": {}})] {
+            let client = GraphClient::new("token");
+            client.script_rest([ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [value],
+                    "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta?token=final"
+                }),
+            )]);
+            let account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
+            let scope = CursorScope::FolderType {
+                folder: FolderId("inbox".into()),
+                ty: ObjectType::Email,
+            };
+            let events: Vec<_> = inventory_stream(account, scope.clone()).collect().await;
+            let completion = events
+                .iter()
+                .find_map(|event| match event {
+                    bifrost_types::InventoryEvent::Done(completion) => Some(completion),
+                    _ => None,
+                })
+                .expect("inventory completion");
+            let error = completion
+                .coverage
+                .obligations()
+                .iter()
+                .find_map(|obligation| match obligation {
+                    bifrost_types::InventoryObligation::Region { error, .. } => Some(error),
+                    _ => None,
+                })
+                .expect("an id-less value creates a region obligation");
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::ContractViolation,
+                ),
+            );
+            assert_eq!(error.scope(), Some(&ErrorScope::Cursor(scope)));
+            assert!(completion.coverage.has_barrier());
+        }
     }
 
     #[test]

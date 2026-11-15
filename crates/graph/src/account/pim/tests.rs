@@ -7,6 +7,7 @@ use bytes::Bytes;
 use serde_json::json;
 
 use crate::account::GraphAccount;
+use crate::etag::GraphETag;
 use crate::types::{BatchRequestItem, GraphMailFolder};
 use base64::Engine;
 use bifrost_types::{
@@ -193,11 +194,10 @@ async fn raw_mime_import_posts_the_base64_octets_as_text_plain() {
     assert_eq!(requests[1].raw_body, None);
 }
 
-/// Clearing an extended property rides the destroy flag for its 404
-/// tolerance, but it is not a message destroy: the message's cached etag
-/// must survive, while a refusal still names the message in the record.
+/// Clearing a property can change the parent message's validator. Evict that
+/// observation while preserving the message identities in partial progress.
 #[tokio::test]
-async fn an_extended_property_clear_keeps_the_message_etag() {
+async fn an_extended_property_clear_evicts_the_message_etag() {
     let client = GraphClient::new("token");
     client.script_rest([ScriptedRestResponse::json(
         reqwest::StatusCode::OK,
@@ -215,7 +215,7 @@ async fn an_extended_property_clear_keeps_the_message_etag() {
         .etag_index
         .write()
         .await
-        .insert(cleared.0.clone(), "tag".to_string());
+        .insert(cleared.0.clone(), GraphETag::from_odata_annotation("tag"));
     let error = delete_extended_property(
         &account,
         &[cleared.clone(), refused.clone()],
@@ -224,10 +224,7 @@ async fn an_extended_property_clear_keeps_the_message_etag() {
     )
     .await
     .unwrap_err();
-    assert_eq!(
-        account.etag_index.write().await.get(&cleared.0),
-        Some("tag".to_string())
-    );
+    assert_eq!(account.etag_index.write().await.get(&cleared.0), None);
     let record = error.partial_commit().expect("one clear committed");
     assert_eq!(
         record.primary().targets.refs[0].scope,
@@ -254,11 +251,10 @@ async fn write_batch_drains_past_a_failure_to_evict_a_later_destroy_etag() {
     let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
     let failed = ObjectId("failed".to_string());
     let destroyed = ObjectId("destroyed".to_string());
-    account
-        .etag_index
-        .write()
-        .await
-        .insert(destroyed.0.clone(), "stale".to_string());
+    account.etag_index.write().await.insert(
+        destroyed.0.clone(),
+        GraphETag::from_odata_annotation("stale"),
+    );
     let requests = vec![
         BatchRequestItem {
             id: "0".to_string(),
@@ -2556,4 +2552,241 @@ async fn typed_writes_refuse_public_folder_items_without_a_request() {
         AccountOperation::AddToContainer,
     );
     assert!(client.take_rest_requests().is_empty());
+}
+
+#[tokio::test]
+async fn successful_pim_patches_discard_the_pre_write_validator() {
+    for status in [200, 204] {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({"id": "m1", "changeKey": "before"}),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({"responses": [{"id": "0", "status": status}]}),
+            ),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let id = ObjectId("m1".into());
+        set_is_read(account.clone(), MutationTarget::Message(id.clone()), true)
+            .await
+            .expect("the PATCH succeeded");
+        assert_eq!(account.etag_index.write().await.get(&id.0), None);
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].body.as_ref().unwrap()["requests"][0]["headers"]["If-Match"],
+            "W/\"before\""
+        );
+    }
+}
+
+#[tokio::test]
+async fn direct_draft_writes_evict_only_after_success() {
+    for operation in [
+        AccountOperation::DraftUpdate,
+        AccountOperation::DraftDiscard,
+        AccountOperation::Send,
+    ] {
+        for succeeds in [true, false] {
+            let client = GraphClient::new("token");
+            let status = if succeeds {
+                reqwest::StatusCode::NO_CONTENT
+            } else {
+                reqwest::StatusCode::FORBIDDEN
+            };
+            client.script_rest([ScriptedRestResponse::empty(status)]);
+            let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+            {
+                let mut cache = account.etag_index.write().await;
+                cache.insert("draft".into(), GraphETag::from_change_key("before"));
+                cache.insert("other".into(), GraphETag::from_change_key("other"));
+            }
+            let draft = bifrost_types::DraftHandle("draft".into());
+            let result = match operation {
+                AccountOperation::DraftUpdate => {
+                    draft_update(
+                        account.clone(),
+                        draft,
+                        draft_patch(|patch| {
+                            patch.subject = Some(Some("Updated".into()));
+                        }),
+                    )
+                    .await
+                }
+                AccountOperation::DraftDiscard => draft_discard(account.clone(), draft).await,
+                AccountOperation::Send => draft_send(account.clone(), draft).await.map(|_| ()),
+                _ => unreachable!("only direct draft writes are listed"),
+            };
+            assert_eq!(result.is_ok(), succeeds, "{operation:?}");
+            let mut cache = account.etag_index.write().await;
+            assert_eq!(
+                cache.get("draft").as_deref(),
+                if succeeds { None } else { Some("W/\"before\"") },
+                "{operation:?}",
+            );
+            assert_eq!(cache.get("other").as_deref(), Some("W/\"other\""));
+            let requests = client.take_rest_requests();
+            assert_eq!(requests.len(), 1);
+            let (method, suffix) = match operation {
+                AccountOperation::DraftUpdate => ("PATCH", "/me/messages/draft"),
+                AccountOperation::DraftDiscard => ("DELETE", "/me/messages/draft"),
+                AccountOperation::Send => ("POST", "/me/messages/draft/send"),
+                _ => unreachable!("only direct draft writes are listed"),
+            };
+            assert_eq!(requests[0].method, method);
+            assert!(requests[0].url.ends_with(suffix));
+        }
+    }
+}
+
+#[tokio::test]
+async fn deferred_send_stamping_evicts_only_the_owning_mailbox_after_success() {
+    for owner in [None, Some("shared@contoso.com")] {
+        for operation in [AccountOperation::Send, AccountOperation::RescheduleSend] {
+            for succeeds in [true, false] {
+                let client = GraphClient::new("token");
+                let status = if succeeds {
+                    reqwest::StatusCode::NO_CONTENT
+                } else {
+                    reqwest::StatusCode::FORBIDDEN
+                };
+                client.script_rest([ScriptedRestResponse::empty(status)]);
+                let account = GraphAccount::new_for_tests_with_shared(
+                    client.clone(),
+                    PushMode::GraphSubscriptions,
+                    &["shared@contoso.com".into()],
+                );
+                let primary_key = "draft".to_string();
+                let shared_key = crate::account::foreign::qualify_with_owner(
+                    Some("shared@contoso.com"),
+                    "draft",
+                );
+                let (target, sibling) = if owner.is_some() {
+                    (&shared_key, &primary_key)
+                } else {
+                    (&primary_key, &shared_key)
+                };
+                {
+                    let mut cache = account.etag_index.write().await;
+                    for key in [&primary_key, &shared_key] {
+                        cache.insert(key.clone(), GraphETag::from_change_key("before"));
+                    }
+                }
+                // Exercise the stamping seam without consulting the wall clock.
+                let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+                let result = stamp_deferred_send_time(
+                    &account,
+                    owner,
+                    &bifrost_types::DraftHandle("draft".into()),
+                    at,
+                    operation,
+                )
+                .await;
+                assert_eq!(result.is_ok(), succeeds);
+                let mut cache = account.etag_index.write().await;
+                assert_eq!(
+                    cache.get(target).as_deref(),
+                    if succeeds { None } else { Some("W/\"before\"") },
+                );
+                assert_eq!(cache.get(sibling).as_deref(), Some("W/\"before\""));
+                let requests = client.take_rest_requests();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].method, "PATCH");
+                let prefix = account.client_for_owner(owner).unwrap().api_path_prefix();
+                assert!(
+                    requests[0]
+                        .url
+                        .ends_with(&format!("{prefix}/messages/draft"))
+                );
+                assert_eq!(
+                    requests[0].body.as_ref().unwrap(),
+                    &deferred_send_time_body(at)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelling_scheduled_send_evicts_only_the_owning_mailbox_after_success() {
+    for owner in [None, Some("shared@contoso.com")] {
+        for succeeds in [true, false] {
+            let client = GraphClient::new("token");
+            let status = if succeeds {
+                reqwest::StatusCode::NO_CONTENT
+            } else {
+                reqwest::StatusCode::FORBIDDEN
+            };
+            client.script_rest([ScriptedRestResponse::empty(status)]);
+            let account = GraphAccount::new_for_tests_with_shared(
+                client.clone(),
+                PushMode::GraphSubscriptions,
+                &["shared@contoso.com".into()],
+            );
+            let key = crate::account::foreign::qualify_with_owner(owner, "draft");
+            let sibling = crate::account::foreign::qualify_with_owner(
+                if owner.is_some() {
+                    None
+                } else {
+                    Some("shared@contoso.com")
+                },
+                "draft",
+            );
+            {
+                let mut cache = account.etag_index.write().await;
+                cache.insert(key.clone(), GraphETag::from_change_key("before"));
+                cache.insert(sibling.clone(), GraphETag::from_change_key("sibling"));
+            }
+            let result = cancel_scheduled_send(
+                account.clone(),
+                ObjectId(encode_scheduled_send_handle(owner, "draft")),
+            )
+            .await;
+            assert_eq!(result.is_ok(), succeeds);
+            let mut cache = account.etag_index.write().await;
+            assert_eq!(
+                cache.get(&key).as_deref(),
+                if succeeds { None } else { Some("W/\"before\"") },
+            );
+            assert_eq!(cache.get(&sibling).as_deref(), Some("W/\"sibling\""));
+            let requests = client.take_rest_requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method, "DELETE");
+        }
+    }
+}
+
+#[tokio::test]
+async fn sending_created_drafts_evicts_the_cached_validator() {
+    for raw in [true, false] {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(reqwest::StatusCode::CREATED, json!({"id": "draft"})),
+            ScriptedRestResponse::empty(reqwest::StatusCode::ACCEPTED),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        account
+            .etag_index
+            .write()
+            .await
+            .insert("draft".into(), GraphETag::from_change_key("before"));
+        if raw {
+            send_raw_message(
+                account.clone(),
+                Bytes::from_static(b"Subject: test\r\n\r\nbody"),
+                None,
+            )
+            .await
+            .expect("raw send");
+        } else {
+            send_message(account.clone(), bifrost_types::SendRequest::default())
+                .await
+                .expect("structured send");
+        }
+        assert_eq!(account.etag_index.write().await.get("draft"), None);
+        assert_eq!(client.take_rest_requests().len(), 2);
+    }
 }

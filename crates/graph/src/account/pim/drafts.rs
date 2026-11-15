@@ -53,7 +53,11 @@ pub(crate) async fn draft_update(
             bifrost_net::ReplayPolicy::Idempotent,
         )
         .await
-        .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftUpdate)))
+        .map_err(|e| {
+            into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftUpdate))
+        })?;
+    evict_draft_etag(&account, None, &draft).await;
+    Ok(())
 }
 
 pub(crate) async fn draft_discard(
@@ -71,7 +75,9 @@ pub(crate) async fn draft_discard(
         .await
         .map_err(|e| {
             into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftDiscard))
-        })
+        })?;
+    evict_draft_etag(&account, None, &draft).await;
+    Ok(())
 }
 
 pub(crate) async fn draft_send(
@@ -79,7 +85,19 @@ pub(crate) async fn draft_send(
     draft: DraftHandle,
 ) -> Result<ObjectId, AccountError> {
     send_draft_message(&account.client, &draft).await?;
+    evict_draft_etag(&account, None, &draft).await;
     Ok(ObjectId(draft.0))
+}
+
+/// A confirmed draft write invalidates the observed message validator. The
+/// wire uses a native draft id, while the cache uses its mailbox-qualified id.
+pub(super) async fn evict_draft_etag(
+    account: &GraphAccount,
+    owner: Option<&str>,
+    draft: &DraftHandle,
+) {
+    let id = crate::account::foreign::qualify_with_owner(owner, &draft.0);
+    account.etag_index.write().await.remove(&id);
 }
 
 pub(super) fn message_from_send_request(

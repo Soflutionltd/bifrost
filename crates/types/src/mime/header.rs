@@ -103,24 +103,114 @@ impl HeaderMap {
     pub fn date(&self, name: &str) -> Option<SystemTime> {
         self.get(name).and_then(parse_date)
     }
+    /// First structural Message-ID, with a trimmed bare-value fallback for
+    /// legacy senders. Quoted strings and comments do not delimit IDs.
+    pub fn first_message_id(raw: &str) -> Option<&str> {
+        first_structural_angle_token(raw).or_else(|| {
+            if find_structural_angle(raw, 0, b'<').is_some() {
+                return None;
+            }
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+    }
+
+    /// Extract structural angle-delimited IDs from every occurrence of a field.
+    /// Unlike the single-ID convenience parser, lists require angle delimiters.
     pub fn message_ids(&self, name: &str) -> Vec<String> {
         self.get_all(name)
             .flat_map(|value| {
                 let mut values = Vec::new();
-                let mut rest = value;
-                while let Some(start) = rest.find('<') {
-                    let after = &rest[start + 1..];
-                    let Some(end) = after.find('>') else { break };
-                    let id = after[..end].trim();
+                let mut offset = 0;
+                while let Some(start) = find_structural_angle(value, offset, b'<') {
+                    let Some(end) = find_structural_angle(value, start + 1, b'>') else {
+                        break;
+                    };
+                    let id = value[start + 1..end].trim();
                     if !id.is_empty() {
                         values.push(id.to_owned());
                     }
-                    rest = &after[end + 1..];
+                    offset = end + 1;
                 }
                 values
             })
             .collect()
     }
+}
+
+/// Finds the first non-empty `<...>` token outside quoted strings and comments.
+///
+/// RFC 5322 Section 3.6.4 uses angle brackets as the structural `msg-id`
+/// delimiters. Quoted strings (Section 3.2.4) and comments (Section 3.2.2)
+/// may contain literal `<` / `>` characters, so this helper ignores those
+/// contexts when extracting a consumer-facing identifier.
+fn first_structural_angle_token(raw: &str) -> Option<&str> {
+    let mut offset = 0usize;
+    while let Some(start) = find_structural_angle(raw, offset, b'<') {
+        let Some(end) = find_structural_angle(raw, start + 1, b'>') else {
+            break;
+        };
+
+        let inner = raw[start + 1..end].trim();
+        if !inner.is_empty() {
+            return Some(inner);
+        }
+        offset = end + 1;
+    }
+    None
+}
+
+/// Finds the next angle bracket outside quoted strings and comments.
+///
+/// # References
+/// - RFC 5322 Section 3.2.2
+/// - RFC 5322 Section 3.2.4
+fn find_structural_angle(raw: &str, start: usize, target: u8) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut idx = start;
+    let mut comment_depth = 0u32;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if escaped {
+            escaped = false;
+            idx += 1;
+            continue;
+        }
+
+        if in_quotes {
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => in_quotes = false,
+                _ => {}
+            }
+            idx += 1;
+            continue;
+        }
+
+        if comment_depth > 0 {
+            match byte {
+                b'\\' => escaped = true,
+                b'(' => comment_depth = comment_depth.saturating_add(1),
+                b')' => comment_depth = comment_depth.saturating_sub(1),
+                _ => {}
+            }
+            idx += 1;
+            continue;
+        }
+
+        match byte {
+            b'"' => in_quotes = true,
+            b'(' => comment_depth = 1,
+            _ if byte == target => return Some(idx),
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    None
 }
 
 pub(super) fn split_headers(

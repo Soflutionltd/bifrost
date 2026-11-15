@@ -243,3 +243,28 @@ fn header_checked_addresses_collect_rejections_across_repeated_fields() {
             .is_empty()
     );
 }
+
+#[test]
+fn message_id_lists_ignore_quoted_and_nested_commented_decoys() {
+    let parsed = headers(
+        b"References: \"<quoted@test>\" (outer (<comment@test>)) <first@test> <> <second@test>\r\nReferences: <third@test>\r\n\r\n",
+    );
+    assert_eq!(
+        parsed.message_ids("references"),
+        ["first@test", "second@test", "third@test"]
+    );
+    assert_eq!(
+        HeaderMap::first_message_id(parsed.get("references").unwrap()),
+        Some("first@test")
+    );
+}
+
+#[test]
+fn single_message_id_preserves_bare_fallback_and_rejects_empty_angles() {
+    assert_eq!(
+        HeaderMap::first_message_id(" bare@test "),
+        Some("bare@test")
+    );
+    assert_eq!(HeaderMap::first_message_id("(comment) <>"), None);
+    assert_eq!(HeaderMap::first_message_id("<unfinished"), None);
+}

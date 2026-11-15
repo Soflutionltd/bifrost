@@ -235,18 +235,11 @@ impl GmailErrorContext {
     }
 
     pub(crate) fn send() -> Self {
-        let mut ctx = Self::base(AccountOperation::Send);
-        ctx.idempotency_override = Some(false);
-        ctx
+        Self::base(AccountOperation::Send)
     }
 
     pub(crate) fn draft(operation: AccountOperation) -> Self {
         let mut ctx = Self::base(operation);
-        // Drafts other than DraftSend are write-but-not-side-effectful
-        // outside Gmail; only DraftSend needs explicit non-idempotent.
-        if matches!(operation, AccountOperation::DraftSend) {
-            ctx.idempotency_override = Some(false);
-        }
         ctx.resource = Some(GmailResource::Draft);
         ctx
     }
@@ -1418,6 +1411,16 @@ mod tests {
         format!(
             r#"{{"error":{{"code":429,"message":"x","errors":[{{"domain":"usageLimits","reason":"{reason}"}}]}}}}"#
         )
+    }
+
+    #[test]
+    fn send_contexts_inherit_shared_idempotency() {
+        for context in [
+            GmailErrorContext::send(),
+            GmailErrorContext::draft(AccountOperation::DraftSend),
+        ] {
+            assert_eq!(context.idempotency_override, None);
+        }
     }
 
     #[test]

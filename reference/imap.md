@@ -480,6 +480,11 @@ presented fresh on reconnect. Password material stays in the internal
 
 Internal `AuthMechanism`: PLAIN, LOGIN, XOAUTH2, OAUTHBEARER, CRAM-MD5, SCRAM-SHA-1, SCRAM-SHA-256, and the channel-bound SCRAM-SHA-1-PLUS / SCRAM-SHA-256-PLUS. Each variant's `name()` is the wire token; the PLUS variants match the `-PLUS` advertisement and the SASL crate (`ScramHash::mechanism_name`) is the single authority for the token emitted on the socket.
 
+The shared OAuth AUTHENTICATE consumer uses `bifrost_sasl::OAuthMechanism`
+to select its error-continuation acknowledgement after the initial payload:
+XOAUTH2 sends an empty line; OAUTHBEARER sends base64 SOH (`AQ==`) plus CRLF.
+This applies both with SASL-IR and with a prompted initial response.
+
 SCRAM and CRAM-MD5 computation (`scram_client_final` / `verify_server_final`
 transitions, per-hash proofs, CRAM-MD5 response) lives in the private
 `bifrost-sasl` crate; the dispatch consumers (`AuthenticateScramConsumer`, `AuthenticateCramMd5Consumer`) drive the `+` continuation flow and map `bifrost_sasl::SaslError` into the IMAP error model at the boundary.
@@ -1351,6 +1356,16 @@ every submitted id is answered exactly once, across all three lanes.
 
 ### Output-channel-dropped contract
 
+Raw RFC822 reads, inventory, changes and hydration abort their producer task
+when the returned stream is dropped, including before its first poll. Driver
+command abandonment and pool return retire or reclaim the checked-out session.
+Mutation and scope lifecycle producers retain their detached completion policy.
+
+IMAP doctests are enabled for the public surface. Private protocol types use
+in-crate tests: compile-time ambiguity assertions forbid infallible String and
+str conversions into MailboxName, and the search chaining test checks the
+internal builder's example output without an inaccessible external import.
+
 Every streaming task (`inventory_stream`, `changes_stream`, `get_stream`, `open_raw_rfc822`, `mutation_stream`) treats a `tx.send` failure on a dropped output receiver as silent termination: the task returns without synthesizing any `crate::Error` or fatal `Terminated`. The error funnel is reserved for wire failures and structural invariant breaks; a consumer walking away from its stream is not an error.
 
 ### Terminated-event helper
@@ -1468,3 +1483,12 @@ Replay protection does not change the existing failure-return contract.
 Sent APPEND and post-send draft discard failures are successes reported on the
 `SendReceipt`, outside the failure-path producer set. Single-request draft creates
 without APPENDUID are likewise outside this multi-step adoption.
+
+## Date and Message-ID helpers
+
+SEARCH date helpers accept ASCII-case-insensitive months and validate calendar
+days through the APPEND date-time validator, including leap-year rules. SEARCH
+retains its one-or-two-digit day syntax; APPEND retains its fixed-width syntax.
+Envelope Message-ID and In-Reply-To extraction delegates to the shared MIME
+HeaderMap parser, so quoted or commented angle brackets cannot displace a
+structural identifier.

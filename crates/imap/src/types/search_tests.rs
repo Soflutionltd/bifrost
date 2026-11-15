@@ -863,3 +863,13 @@ fn validate_imap_date_all_months_valid() {
         );
     }
 }
+
+#[test]
+fn search_dates_share_append_calendar_rules() {
+    for date in ["13-feb-2025", "29-FEB-2000", "1-jAn-2025"] {
+        assert!(validate_imap_date(date).is_ok(), "{date}");
+    }
+    for date in ["30-Feb-2025", "29-Feb-1900", "31-Apr-2025", "0-Jan-2025"] {
+        assert!(validate_imap_date(date).is_err(), "{date}");
+    }
+}

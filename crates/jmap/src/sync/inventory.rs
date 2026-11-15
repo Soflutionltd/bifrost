@@ -12,7 +12,7 @@ use crate::email::{Email, EmailGet, EmailQuery, Property as EmailProperty};
 use crate::mailbox::{Mailbox, MailboxGet, MailboxQuery, Property as MailboxProperty};
 
 use super::capabilities::CoreLimits;
-use super::state_walk::StateWalk;
+use super::state_walk::InventoryWalk;
 
 type MailAccount<T> = crate::account::Account<T>;
 
@@ -122,7 +122,7 @@ fn email_inventory_loop<T: HttpTransport>(
         // both requests of its page.
         let (mail, tally) = mail.metered();
 
-        let mut walk = StateWalk::inventory(scope.clone());
+        let mut walk = InventoryWalk::inventory(scope.clone());
         loop {
             let started = Instant::now();
             let mut query = EmailQuery::new();
@@ -336,7 +336,7 @@ fn mailbox_inventory<T: HttpTransport>(
     Box::pin(async_stream::stream! {
         let (mail, tally) = mail.metered();
         let scope = CursorScope::Type(ObjectType::Mailbox);
-        let mut walk = StateWalk::inventory(scope.clone());
+        let mut walk = InventoryWalk::inventory(scope.clone());
         loop {
             let started = Instant::now();
             let mut query = MailboxQuery::new()

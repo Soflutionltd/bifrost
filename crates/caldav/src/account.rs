@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use bifrost_types::*;
 use bytes::Bytes;
-use futures::{StreamExt, stream};
+use futures::{FutureExt, StreamExt, stream};
 use jiff::tz::Offset;
 use jiff::{Timestamp, civil};
 use reqwest::Url;
@@ -59,8 +59,40 @@ const SYNC_TRUNCATION_ROUNDS: usize = 16;
 /// published method returns.
 const EVENT_PAGE_SIZE: usize = 250;
 
+/// No dynamic scope events are available, but exhaustion would make the
+/// consumer reconnect. Keep every subscription alive until account shutdown.
+#[derive(Debug)]
+struct IdleLifecycle {
+    sender: std::sync::Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+    shutdown: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
+}
+
+impl Default for IdleLifecycle {
+    fn default() -> Self {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        Self {
+            sender: std::sync::Mutex::new(Some(sender)),
+            shutdown: receiver.shared(),
+        }
+    }
+}
+
+impl IdleLifecycle {
+    fn stream(&self) -> AccountStream<bifrost_types::ScopeLifecycleEvent> {
+        Box::pin(stream::pending().take_until(self.shutdown.clone()))
+    }
+
+    fn close(&self) {
+        let sender = self.sender.lock().expect("lifecycle lock poisoned").take();
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct CalDavAccount {
+    lifecycle: IdleLifecycle,
     client: Arc<CalDavClient>,
     capabilities: AccountCapabilities,
     calendar_home: String,
@@ -93,6 +125,7 @@ impl CalDavAccount {
     #[cfg(test)]
     pub(crate) fn for_tests_without_collections(client: Arc<CalDavClient>, home: &str) -> Self {
         Self {
+            lifecycle: IdleLifecycle::default(),
             client,
             capabilities: crate::capabilities::caldav_capabilities(false),
             calendar_home: home.to_string(),
@@ -110,6 +143,7 @@ impl CalDavAccount {
         additional_calendar_urls: Vec<String>,
     ) -> Self {
         Self {
+            lifecycle: IdleLifecycle::default(),
             client,
             capabilities: crate::capabilities::caldav_capabilities(false),
             calendar_home: default_calendar_url.to_string(),
@@ -160,6 +194,7 @@ impl CalDavAccount {
         let default_calendar_url = default_collection_url(&collections);
         let calendar_urls = discovered_collection_urls(&collections);
         Ok(Self {
+            lifecycle: IdleLifecycle::default(),
             client: Arc::new(client),
             capabilities: caldav_capabilities(event_rsvp),
             calendar_home,
@@ -452,7 +487,7 @@ impl Account for CalDavAccount {
     }
 
     fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
-        Box::pin(stream::empty())
+        self.lifecycle.stream()
     }
 
     fn establish_initial_cursor(
@@ -1397,6 +1432,7 @@ impl Account for CalDavAccount {
     }
 
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
+        self.lifecycle.close();
         Box::pin(async { Ok(()) })
     }
 }
@@ -2397,12 +2433,57 @@ fn contains(value: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use bifrost_dav_core::DavResponse;
     use bifrost_dav_core::test_support::{
         dav_script, dav_script_empty, scripted_dav_net, transcripts,
     };
     use reqwest::StatusCode;
     use reqwest::header::HeaderMap;
+
+    #[tokio::test]
+    async fn lifecycle_subscriptions_wait_until_close_and_wake_together() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let client = CalDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&dav_script_empty()),
+        );
+        let account =
+            CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/collection/");
+        let mut first = account.scope_lifecycle_stream();
+        let mut second = account.scope_lifecycle_stream();
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let second_wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let second_waker = Waker::from(Arc::clone(&second_wakes));
+        let mut second_context = Context::from_waker(&second_waker);
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(
+            first.as_mut().poll_next(&mut context),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            second.as_mut().poll_next(&mut second_context),
+            Poll::Pending
+        ));
+
+        account.close().await.expect("close succeeds");
+        assert!(wakes.0.load(Ordering::SeqCst) > 0);
+        assert!(second_wakes.0.load(Ordering::SeqCst) > 0);
+        assert!(first.next().await.is_none());
+        assert!(second.next().await.is_none());
+        assert!(account.scope_lifecycle_stream().next().await.is_none());
+        account.close().await.expect("repeated close succeeds");
+    }
 
     #[tokio::test]
     async fn blank_scheduling_values_refuse_rsvp_before_io() {

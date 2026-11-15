@@ -15,7 +15,7 @@ use crate::mailbox::{Mailbox, MailboxChanges, MailboxGet, MailboxId, Property};
 
 use super::capabilities::CoreLimits;
 use super::state_cache::{self, StateMap};
-use super::state_walk::StateWalk;
+use super::state_walk::ChangesWalk;
 
 type MailAccount<T> = crate::account::Account<T>;
 
@@ -152,7 +152,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
         // loop against one non-conformant server. The guard resets
         // whenever the loop reaches a poll pause, because a state legitimately
         // repeating across two polls minutes apart is not a spin.
-        let mut walk: Option<StateWalk> = None;
+        let mut walk: Option<ChangesWalk> = None;
         loop {
             if shutdown.is_cancelled() {
                 break;
@@ -174,7 +174,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
             };
 
             let state_walk = walk.get_or_insert_with(|| {
-                StateWalk::lifecycle(
+                ChangesWalk::lifecycle(
                     CursorScope::Type(bifrost_types::ObjectType::Mailbox),
                     &since_state,
                 )

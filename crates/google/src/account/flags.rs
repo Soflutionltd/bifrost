@@ -48,7 +48,7 @@ pub(crate) fn is_archive_id(id: &str) -> bool {
 /// - a user label -> add it, drop INBOX + SPAM + TRASH, so filing a
 ///   spammed or trashed message actually takes it out of Spam / Trash.
 /// - `SPAM` / `TRASH` -> add it, drop the other two.
-pub(crate) fn move_placement_patch(destination: &str) -> LabelPatch {
+pub(crate) fn move_placement_patch(destination: &str, source: Option<&str>) -> LabelPatch {
     let canonical_destination = EXCLUSIVE_CONTAINERS
         .iter()
         .find(|container| destination.eq_ignore_ascii_case(container))
@@ -59,11 +59,21 @@ pub(crate) fn move_placement_patch(destination: &str) -> LabelPatch {
     } else {
         vec![canonical_destination.to_string()]
     };
-    let remove_label_ids = EXCLUSIVE_CONTAINERS
+    let mut remove_label_ids: Vec<String> = EXCLUSIVE_CONTAINERS
         .iter()
         .filter(|container| !destination.eq_ignore_ascii_case(container))
         .map(|container| (*container).to_string())
         .collect();
+    if let Some(source) = source {
+        let redundant = is_archive_id(source)
+            || source.eq_ignore_ascii_case(destination)
+            || remove_label_ids
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case(source));
+        if !redundant {
+            remove_label_ids.push(source.to_string());
+        }
+    }
     LabelPatch {
         add_label_ids,
         remove_label_ids,
@@ -676,7 +686,7 @@ mod tests {
 
     #[test]
     fn move_to_inbox_drops_the_other_exclusive_containers() {
-        let patch = move_placement_patch(LABEL_INBOX);
+        let patch = move_placement_patch(LABEL_INBOX, None);
         assert_eq!(patch.add_label_ids, vec![LABEL_INBOX.to_string()]);
         assert_eq!(
             patch.remove_label_ids,
@@ -686,7 +696,7 @@ mod tests {
 
     #[test]
     fn move_to_user_label_drops_spam_and_trash_too() {
-        let patch = move_placement_patch("Label_42");
+        let patch = move_placement_patch("Label_42", None);
         assert_eq!(patch.add_label_ids, vec!["Label_42".to_string()]);
         assert_eq!(
             patch.remove_label_ids,
@@ -701,7 +711,7 @@ mod tests {
 
     #[test]
     fn move_to_archive_adds_no_label() {
-        let patch = move_placement_patch(ARCHIVE_ID);
+        let patch = move_placement_patch(ARCHIVE_ID, None);
         assert!(
             patch.add_label_ids.is_empty(),
             "`archive` is synthetic and is not a Gmail label id"
@@ -718,7 +728,7 @@ mod tests {
 
     #[test]
     fn move_to_spam_keeps_spam_and_drops_the_rest() {
-        let patch = move_placement_patch(LABEL_SPAM);
+        let patch = move_placement_patch(LABEL_SPAM, None);
         assert_eq!(patch.add_label_ids, vec![LABEL_SPAM.to_string()]);
         assert_eq!(
             patch.remove_label_ids,
@@ -728,7 +738,7 @@ mod tests {
 
     #[test]
     fn exclusive_container_match_is_case_insensitive() {
-        let patch = move_placement_patch("inbox");
+        let patch = move_placement_patch("inbox", None);
         assert_eq!(patch.add_label_ids, vec![LABEL_INBOX.to_string()]);
         assert_eq!(
             patch.remove_label_ids,

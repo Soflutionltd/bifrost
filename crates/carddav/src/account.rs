@@ -30,7 +30,7 @@ use bifrost_types::{
     SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
 };
 use bytes::Bytes;
-use futures::{StreamExt, stream};
+use futures::{FutureExt, StreamExt, stream};
 use uuid::Uuid;
 
 use crate::CardDavConfig;
@@ -64,8 +64,40 @@ const CONTACT_PAGE_SIZE: usize = 250;
 const CURSOR_ENVELOPE_VERSION: u32 = 2;
 const CURSOR_MAGIC: &[u8] = b"CDAVCTAG1";
 
+/// No dynamic scope events are available, but exhaustion would make the
+/// consumer reconnect. Keep every subscription alive until account shutdown.
+#[derive(Debug)]
+struct IdleLifecycle {
+    sender: std::sync::Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+    shutdown: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
+}
+
+impl Default for IdleLifecycle {
+    fn default() -> Self {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        Self {
+            sender: std::sync::Mutex::new(Some(sender)),
+            shutdown: receiver.shared(),
+        }
+    }
+}
+
+impl IdleLifecycle {
+    fn stream(&self) -> AccountStream<bifrost_types::ScopeLifecycleEvent> {
+        Box::pin(stream::pending().take_until(self.shutdown.clone()))
+    }
+
+    fn close(&self) {
+        let sender = self.sender.lock().expect("lifecycle lock poisoned").take();
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct CardDavAccount {
+    lifecycle: IdleLifecycle,
     client: Arc<CardDavClient>,
     capabilities: AccountCapabilities,
     addressbook_home: String,
@@ -101,6 +133,7 @@ impl CardDavAccount {
         additional_addressbook_urls: Vec<String>,
     ) -> Self {
         Self {
+            lifecycle: IdleLifecycle::default(),
             client,
             capabilities: carddav_capabilities(),
             directory_gateways: Vec::new(),
@@ -119,6 +152,7 @@ impl CardDavAccount {
     #[cfg(test)]
     pub(crate) fn for_tests_without_collections(client: Arc<CardDavClient>, home: &str) -> Self {
         Self {
+            lifecycle: IdleLifecycle::default(),
             client,
             capabilities: carddav_capabilities(),
             directory_gateways: Vec::new(),
@@ -182,6 +216,7 @@ impl CardDavAccount {
         let mut capabilities = carddav_capabilities();
         capabilities.pim_methods.directory_search = !gateways.is_empty();
         Ok(Self {
+            lifecycle: IdleLifecycle::default(),
             client: Arc::new(client),
             capabilities,
             addressbook_home,
@@ -548,7 +583,7 @@ impl Account for CardDavAccount {
     }
 
     fn scope_lifecycle_stream(&self) -> AccountStream<bifrost_types::ScopeLifecycleEvent> {
-        Box::pin(stream::empty())
+        self.lifecycle.stream()
     }
 
     fn establish_initial_cursor(
@@ -1576,6 +1611,7 @@ impl Account for CardDavAccount {
     }
 
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
+        self.lifecycle.close();
         Box::pin(async { Ok(()) })
     }
 }
@@ -2228,6 +2264,7 @@ fn contains(value: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use bifrost_dav_core::DavResponse;
     use bifrost_dav_core::test_support::{
         dav_script, dav_script_empty, scripted_dav_net, transcripts,
@@ -2238,6 +2275,50 @@ mod tests {
     };
     use reqwest::StatusCode;
     use reqwest::header::HeaderMap;
+
+    #[tokio::test]
+    async fn lifecycle_subscriptions_wait_until_close_and_wake_together() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let client = CardDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&dav_script_empty()),
+        );
+        let account =
+            CardDavAccount::for_tests(Arc::new(client), "https://dav.example.test/collection/");
+        let mut first = account.scope_lifecycle_stream();
+        let mut second = account.scope_lifecycle_stream();
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let second_wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let second_waker = Waker::from(Arc::clone(&second_wakes));
+        let mut second_context = Context::from_waker(&second_waker);
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(
+            first.as_mut().poll_next(&mut context),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            second.as_mut().poll_next(&mut second_context),
+            Poll::Pending
+        ));
+
+        account.close().await.expect("close succeeds");
+        assert!(wakes.0.load(Ordering::SeqCst) > 0);
+        assert!(second_wakes.0.load(Ordering::SeqCst) > 0);
+        assert!(first.next().await.is_none());
+        assert!(second.next().await.is_none());
+        assert!(account.scope_lifecycle_stream().next().await.is_none());
+        account.close().await.expect("repeated close succeeds");
+    }
 
     fn book_multistatus(body: String) -> DavResponse {
         DavResponse {

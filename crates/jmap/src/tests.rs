@@ -14,17 +14,34 @@ mod patch_object_null_semantics {
     use crate::core::SetCreate;
 
     #[test]
-    fn calendar_event_calendar_id_false_produces_null() {
+    fn membership_patch_removal_keeps_null_path_operations() {
+        use crate::calendar_event::CalendarEventPatch;
+        use crate::contact_card::ContactCardPatch;
+
+        let mut event = CalendarEventPatch::default();
+        event.calendar_id("cal/1", false);
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({"calendarIds/cal~11": null})
+        );
+        let mut card = ContactCardPatch::default();
+        card.address_book_id("ab~1", false);
+        assert_eq!(
+            serde_json::to_value(&card).unwrap(),
+            json!({"addressBookIds/ab~01": null})
+        );
+    }
+
+    #[test]
+    fn calendar_event_create_removal_omits_membership() {
         let mut event = CalendarEventCreate::new(Some(0));
+        event.calendar_id("keep", true);
+        event.calendar_id("cal-1", true);
         event.calendar_id("cal-1", false);
+        event.calendar_id("absent", false);
 
         let value = serde_json::to_value(&event).unwrap();
-        let calendar_ids = value.get("calendarIds").expect("calendarIds missing");
-        let entry = calendar_ids.get("cal-1").expect("cal-1 missing");
-        assert!(
-            entry.is_null(),
-            "calendar_id(id, false) must produce null, got {entry:?}"
-        );
+        assert_eq!(value["calendarIds"], json!({"keep": true}));
     }
 
     #[test]
@@ -39,17 +56,15 @@ mod patch_object_null_semantics {
     }
 
     #[test]
-    fn contact_card_address_book_id_false_produces_null() {
+    fn contact_card_create_removal_omits_membership() {
         let mut card = ContactCardCreate::new(Some(0));
+        card.address_book_id("keep", true);
+        card.address_book_id("ab-1", true);
         card.address_book_id("ab-1", false);
+        card.address_book_id("absent", false);
 
         let value = serde_json::to_value(&card).unwrap();
-        let ab_ids = value.get("addressBookIds").expect("addressBookIds missing");
-        let entry = ab_ids.get("ab-1").expect("ab-1 missing");
-        assert!(
-            entry.is_null(),
-            "address_book_id(id, false) must produce null, got {entry:?}"
-        );
+        assert_eq!(value["addressBookIds"], json!({"keep": true}));
     }
 
     #[test]
@@ -3651,6 +3666,16 @@ mod thin_query_wire {
         serde_json::to_value(value).expect("query fragments serialize")
     }
 
+    #[test]
+    fn principal_time_zone_filter_matches_rfc9670() {
+        use crate::principal::query::Filter;
+
+        assert_eq!(
+            wire(&Filter::timezone("Europe/Oslo")),
+            json!({"timeZone": "Europe/Oslo"})
+        );
+    }
+
     /// RFC 9670 Section 2.4 (`Principal/query`).
     #[test]
     fn principal_filter_and_comparator_property_names() {
@@ -3678,7 +3703,7 @@ mod thin_query_wire {
         );
         assert_eq!(
             wire(&Filter::timezone("Europe/Oslo")),
-            json!({"timezone": "Europe/Oslo"})
+            json!({"timeZone": "Europe/Oslo"})
         );
         assert_eq!(wire(&Filter::members("p-1")), json!({"members": "p-1"}));
         assert_eq!(

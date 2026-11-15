@@ -126,8 +126,8 @@ pub(crate) async fn run_move_readback_guard_observed(
 ///
 /// - the fetch `Succeeded` -> the object is still hydratable, so the
 ///   destroy did NOT land; the `Failed` outcome stands (`still_failed`).
-/// - the fetch `Failed(NotFound)` -> the server no longer returns the
-///   id, so the destroy landed; downgrade to `Skipped`.
+/// - the fetch `Failed(NotFound(Message))` -> the server no longer returns
+///   the message, so the destroy landed; downgrade to `Skipped`.
 /// - any other fetch `Failed` -> the read-back itself failed; classify
 ///   it as uncertain so the original mutation outcome stands.
 /// - the fetch was `Uncertain` -> `uncertain`; the original `Failed`
@@ -136,7 +136,7 @@ pub(crate) async fn run_move_readback_guard_observed(
 /// An id the protocol simply omits from the hydrated stream (rather than
 /// emitting `Failed` for) counts as `uncertain` here and `pending_retry` in
 /// the campaign. A destroy is only
-/// reclassified as `Skipped` on an explicit not-found signal.
+/// reclassified as `Skipped` on an explicit message not-found signal.
 pub async fn run_destroy_readback_guard(
     account: &dyn Account,
     ids: Vec<ObjectId>,
@@ -291,7 +291,12 @@ pub(crate) async fn run_object_readback(
 }
 
 fn destroy_readback_saw_absence(error: &bifrost_types::AccountError) -> bool {
-    matches!(error.kind(), AccountErrorKind::NotFound(_))
+    // Bulk destroy targets mail messages. A missing containing mailbox or
+    // account does not establish that the message itself is absent.
+    matches!(
+        error.kind(),
+        AccountErrorKind::NotFound(bifrost_types::ResourceKind::Message)
+    )
 }
 
 #[cfg(test)]

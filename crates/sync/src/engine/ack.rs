@@ -249,14 +249,6 @@ pub(super) async fn ack_writer(
                     }
                     continue;
                 }
-                // An acknowledgement is real committed consumer progress, so
-                // the row is no longer merely provisional even if a reattach
-                // inserted it. A replacement's inventory pass broadcasts
-                // checkpoint-bearing batches BEFORE cutover, so this genuinely
-                // happens: without the discharge, an abort would delete a
-                // cursor the consumer had already persisted against.
-                // Whichever attempt owns the mark.
-                provisional.remove(&req.scope);
                 req
             }
             WriterRequest::ReattachInsert {
@@ -674,6 +666,12 @@ pub(super) async fn ack_writer(
                 }
             }
             Ok(AckPersistOutcome::Durable) => {
+                // Only a durable change cursor promotes the provisional row.
+                // Rejected, withheld and failed writes leave it abort-owned;
+                // a backfill write does not commit the change cursor at all.
+                if matches!(&req.checkpoint, Checkpoint::Change(_)) {
+                    provisional.remove(&req.scope);
+                }
                 // Notify pause / checkpoint_now waiters AFTER the
                 // durable write lands - the contract is that the
                 // returned checkpoint has been persisted. The
@@ -1626,6 +1624,7 @@ mod tests {
     struct FlakyLedgerStore {
         inner: crate::cursor::InMemoryCheckpointStore,
         fail_reads: std::sync::atomic::AtomicBool,
+        fail_transitions: std::sync::atomic::AtomicBool,
         fail_writes: std::sync::atomic::AtomicBool,
     }
 
@@ -1645,6 +1644,12 @@ mod tests {
             transition: crate::cursor::store::CheckpointTransition,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>>
         {
+            if self
+                .fail_transitions
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Box::pin(async { Err(Error::CheckpointStore("transition failed".into())) });
+            }
             self.inner.apply_transition(account, transition)
         }
 
@@ -1838,6 +1843,7 @@ mod tests {
         let store = Arc::new(FlakyLedgerStore {
             inner: crate::cursor::InMemoryCheckpointStore::new(),
             fail_reads: std::sync::atomic::AtomicBool::new(false),
+            fail_transitions: std::sync::atomic::AtomicBool::new(false),
             fail_writes: std::sync::atomic::AtomicBool::new(false),
         });
         let report = bifrost_types::InventoryCoverageReport::degraded(
@@ -1852,6 +1858,114 @@ mod tests {
             .await
             .expect("seed debt");
         store
+    }
+
+    async fn provisional_ack_abort_case(case: &str) {
+        let store = seeded_store().await;
+        let account = AccountId("acct".into());
+        let (tx, task) = start_flaky_writer(Arc::clone(&store));
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::ReattachInsert {
+            attempt: 71,
+            cursor: change_cursor(b"provisional"),
+            done,
+        })
+        .await
+        .expect("writer alive");
+        wait.await.expect("insert answered").expect("insert landed");
+
+        let mut cursor = change_cursor(b"acked");
+        if case == "rejected" {
+            cursor.envelope_version = u32::MAX;
+        }
+        store
+            .fail_transitions
+            .store(case == "failed", std::sync::atomic::Ordering::SeqCst);
+        let checkpoint = if case == "backfill" || case == "withheld" {
+            Checkpoint::Backfill(bifrost_types::BackfillCheckpoint {
+                scope: email_scope(),
+                partition: if case == "withheld" {
+                    crate::backfill::partitioner::completion_partition()
+                } else {
+                    bifrost_types::Partition(b"page".to_vec())
+                },
+                progress_marker: None,
+                progress: bifrost_types::BackfillProgress::default(),
+                envelope_version: crate::cursor::ENGINE_VERSION,
+            })
+        } else {
+            Checkpoint::Change(cursor)
+        };
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::Ack(AckRequest {
+            scope: email_scope(),
+            checkpoint,
+            publication: (case == "publication").then(|| {
+                PendingCoverage::new().publish(crate::cursor::CoverageClaim {
+                    reports: Vec::new(),
+                    generation: 0,
+                })
+            }),
+            auto: false,
+            complete: Some(done),
+        }))
+        .await
+        .expect("writer alive");
+        let result = wait.await.expect("ack answered");
+        assert_eq!(
+            result.is_err(),
+            matches!(case, "rejected" | "failed" | "publication")
+        );
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::ReattachAbort { attempt: 71, done })
+            .await
+            .expect("writer alive");
+        wait.await.expect("abort answered");
+        let saved = store
+            .inner
+            .get_change_cursor(&account, &email_scope())
+            .await
+            .expect("read cursor");
+        if case == "durable" {
+            assert_eq!(
+                saved.expect("committed cursor").server_state.bytes,
+                b"acked"
+            );
+        } else {
+            assert!(saved.is_none(), "{case} ack must preserve abort ownership");
+        }
+        drop(tx);
+        task.await.expect("writer finished");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_ack_preserves_provisional_abort_ownership() {
+        provisional_ack_abort_case("rejected").await;
+    }
+
+    #[tokio::test]
+    async fn an_invalid_publication_ack_preserves_provisional_abort_ownership() {
+        provisional_ack_abort_case("publication").await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_ack_preserves_provisional_abort_ownership() {
+        provisional_ack_abort_case("failed").await;
+    }
+
+    #[tokio::test]
+    async fn a_durable_change_ack_survives_provisional_abort() {
+        provisional_ack_abort_case("durable").await;
+    }
+
+    #[tokio::test]
+    async fn a_backfill_ack_does_not_promote_a_provisional_change_cursor() {
+        provisional_ack_abort_case("backfill").await;
+    }
+
+    #[tokio::test]
+    async fn a_withheld_ack_preserves_provisional_abort_ownership() {
+        provisional_ack_abort_case("withheld").await;
     }
 
     #[tokio::test]

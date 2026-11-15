@@ -98,6 +98,10 @@ inside the protocol consumers, never the other way around.
   retains its own NUL-validating builder. ManageSieve also uses the shared
   XOAUTH2 builder and keeps its base64 payload and authentication command in
   zeroizing storage.
+- `OAuthMechanism` - `#[non_exhaustive]` `{ Xoauth2, OAuthBearer }`.
+  `name()` returns the wire token; `error_ack()` returns the raw error answer
+  as a static string: empty for XOAUTH2, SOH for OAUTHBEARER (RFC 7628
+  Section 3.2.3). Protocol crates base64-frame the answer and append CRLF.
 - `xoauth2_payload(user, access_token) -> Secret` /
   `oauthbearer_payload(identity, access_token) -> Secret` (`oauth.rs`) - OAuth
   SASL client payloads as a zeroizing `Secret` of the *raw* (un-base64'd)

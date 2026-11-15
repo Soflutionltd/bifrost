@@ -10,6 +10,7 @@ use crate::account::graph_error::{
 };
 use crate::account::inventory::graph_etag;
 use crate::client::Resource;
+use crate::etag::GraphETag;
 use crate::types::{BatchRequest, BatchRequestItem, BatchResponse, ODataCollection};
 use bifrost_types::{
     AccountError, AccountOperation, ContainerId, ErrorScope, Importance, MutationTarget, ObjectId,
@@ -194,15 +195,14 @@ pub(super) async fn delete_extended_property(
             headers: None,
         });
     }
-    // `destroy` here only buys the 404 tolerance. No per-request targets are
-    // threaded into the batch: with targets, a successful DELETE would also
-    // evict the MESSAGE's cached etag, which a property clear must not do.
-    // The record still names each message, from `ids`.
+    // `destroy` buys 404 tolerance for an already absent property. A successful
+    // clear can change the parent message's validator, so retain its target
+    // for cache eviction as well as error correlation.
     let resource = account
         .batch_resource(ids)
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?;
     let progress =
-        submit_write_batch_resource(account, resource, requests, &[], true, operation).await?;
+        submit_write_batch_resource(account, resource, requests, ids, true, operation).await?;
     batch_progress_error(progress, ids, StepEffect::Updated, StepReplay::Repeatable)
 }
 
@@ -322,7 +322,7 @@ pub(super) fn categories_from_value(value: &Value) -> Vec<String> {
 pub(super) struct MessagePatch {
     pub(super) id: ObjectId,
     pub(super) body: Value,
-    pub(super) etag: String,
+    pub(super) etag: GraphETag,
 }
 
 pub(super) async fn resolve_target_ids(
@@ -520,7 +520,7 @@ pub(super) async fn patch_messages(
     let mut targets = Vec::new();
     for (index, patch) in patches.iter().enumerate() {
         let mut headers = HashMap::new();
-        headers.insert("If-Match".to_string(), patch.etag.clone());
+        headers.insert("If-Match".to_string(), patch.etag.clone().into_string());
         requests.push(BatchRequestItem {
             id: index.to_string(),
             method: "PATCH".to_string(),
@@ -601,7 +601,7 @@ pub(super) async fn move_messages(
             )
         })?;
         let mut headers = HashMap::new();
-        headers.insert("If-Match".to_string(), etag);
+        headers.insert("If-Match".to_string(), etag.into_string());
         requests.push(BatchRequestItem {
             id: index.to_string(),
             method: "POST".to_string(),
@@ -776,7 +776,9 @@ async fn submit_write_batch_resource(
                         });
                     progress.committed.push((index, new_id));
                 }
-                if destroy && let Some(id) = target {
+                // A successful write consumes the observed validator, including
+                // PATCHes and moves whose response omits the new etag.
+                if let Some(id) = target {
                     account.etag_index.write().await.remove(&id.0);
                 }
             }
@@ -908,7 +910,7 @@ mod replay_tests {
             &account,
             vec![MessagePatch {
                 id: ObjectId("m1".into()),
-                etag: "v1".into(),
+                etag: GraphETag::from_odata_annotation("v1"),
                 body: json!({"categories":["blue"]}),
             }],
             AccountOperation::SetCategory,

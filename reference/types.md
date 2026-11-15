@@ -530,3 +530,12 @@ lane; subscribe only registers coverage. Registration maintenance checks
 account state until yielded. Effects needing to survive drop run in
 account-owned tasks or actors. SessionStop resolves on explicit stop or
 stopper drop. WatchEvent remains the external receiver-to-sink vocabulary.
+
+## MIME Message-ID extraction
+
+`mime::HeaderMap::message_ids` extracts nonempty structural angle-delimited
+identifiers across all occurrences of a header, preserving order and ignoring
+angle brackets inside quoted strings and nested comments. The associated
+`first_message_id` helper uses the same scanner and retains a trimmed bare-value
+fallback when there is no structural opening angle bracket. Empty or unfinished
+structural brackets do not become bare identifiers.

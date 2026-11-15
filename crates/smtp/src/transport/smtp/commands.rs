@@ -544,8 +544,8 @@ mod test {
     #[test]
     fn xoauth2_challenge_emits_dummy_cancel() {
         // A failed XOAUTH2 auth returns `334 <base64-json-error>`. Building the
-        // continuation reply from that challenge must emit the dummy-cancel
-        // line (`AQ==` = base64 of `\x01`), matching OAUTHBEARER, so the server
+        // continuation reply from that challenge must emit the empty
+        // acknowledgement XOAUTH2 requires (a bare CRLF line), so the server
         // emits the tagged failure reply instead of the exchange leaking
         // through as an untagged "does not expect a challenge" error.
         let credentials = Credentials::oauth2("user".to_owned(), "token".to_owned());
@@ -568,7 +568,7 @@ mod test {
                 )
                 .unwrap()
             ),
-            "AQ==\r\n"
+            "\r\n"
         );
     }
 

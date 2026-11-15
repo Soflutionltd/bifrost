@@ -12,6 +12,7 @@ use reqwest::StatusCode;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 
+use crate::etag::GraphETag;
 use crate::types::{BatchRequest, BatchRequestItem, BatchResponse, MESSAGE_SELECT};
 
 use super::GraphAccount;
@@ -420,7 +421,7 @@ fn reconcile_hydration_responses(
     // outer `$batch` mixes mailboxes; each sub-request does not.
     budget_for: &dyn Fn(&ObjectId) -> Option<bifrost_types::ThrottleBudget>,
     replayable: &[bool],
-) -> Vec<(String, String)> {
+) -> Vec<(String, GraphETag)> {
     let mut etags = Vec::new();
     let mut seen_indices = HashSet::new();
 

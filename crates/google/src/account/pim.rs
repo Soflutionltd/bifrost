@@ -777,18 +777,7 @@ fn move_container_patch(
     target: &ContainerId,
     source: Option<&ContainerId>,
 ) -> (Vec<String>, Vec<String>) {
-    let mut patch = flags::move_placement_patch(&target.0);
-    if let Some(source) = source {
-        let redundant = is_archive_id(&source.0)
-            || source.0.eq_ignore_ascii_case(&target.0)
-            || patch
-                .remove_label_ids
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(&source.0));
-        if !redundant {
-            patch.remove_label_ids.push(source.0.clone());
-        }
-    }
+    let patch = flags::move_placement_patch(&target.0, source.map(|id| id.0.as_str()));
     (patch.add_label_ids, patch.remove_label_ids)
 }
 
@@ -986,16 +975,17 @@ async fn message_from_gmail(
     projection: HydrationProjection,
 ) -> Result<Message, AccountError> {
     let headers = message_headers(message);
-    let (body_text, body_html) = match projection {
-        HydrationProjection::Headers => (None, None),
+    let (body_text, body_html, incomplete) = match projection {
+        HydrationProjection::Headers => (None, None, false),
         HydrationProjection::Preview(limit) => (
             Some(message.snippet.chars().take(limit).collect::<String>()),
             None,
+            false,
         ),
         HydrationProjection::Full | HydrationProjection::FullWithBlobs => {
-            body_parts(message.payload.as_ref())
+            selected_body_parts(message.payload.as_ref())
         }
-        _ => body_parts(message.payload.as_ref()),
+        _ => selected_body_parts(message.payload.as_ref()),
     };
     let attachments = if matches!(
         projection,
@@ -1032,7 +1022,7 @@ async fn message_from_gmail(
         body_text,
         body_html,
         attachments,
-        incomplete: false,
+        incomplete,
         size_bytes: message.size_estimate.and_then(non_negative_i64),
         in_reply_to: header_from(headers, "In-Reply-To"),
         references: references_from_header(header_from(headers, "References").as_deref()),
@@ -1159,28 +1149,83 @@ fn collect_attachment_refs(part: &GmailPayload, refs: &mut Vec<AttachmentRef>) {
 }
 
 fn body_parts(payload: Option<&GmailPayload>) -> (Option<String>, Option<String>) {
-    let mut text = None;
-    let mut html = None;
-    if let Some(payload) = payload {
-        collect_body_parts(payload, &mut text, &mut html);
-    }
+    let (text, html, _) = selected_body_parts(payload);
     (text, html)
 }
 
-fn collect_body_parts(part: &GmailPayload, text: &mut Option<String>, html: &mut Option<String>) {
-    if let Some(data) = part.body.as_ref().and_then(|body| body.data.as_deref())
-        && (text.is_none() || html.is_none())
-        && let Ok(bytes) = decode_base64url_nopad(data)
-        && let Ok(decoded) = String::from_utf8(bytes)
-    {
-        if part.mime_type.eq_ignore_ascii_case("text/plain") && text.is_none() {
-            *text = Some(decoded);
-        } else if part.mime_type.eq_ignore_ascii_case("text/html") && html.is_none() {
-            *html = Some(decoded);
-        }
-    }
-    for child in &part.parts {
-        collect_body_parts(child, text, html);
+fn selected_body_parts(payload: Option<&GmailPayload>) -> (Option<String>, Option<String>, bool) {
+    use bifrost_types::mime::{ParsedMessage, select_body};
+
+    let Some(payload) = payload else {
+        return (None, None, true);
+    };
+    let mut incomplete = false;
+    let root = gmail_mime_part(payload, &mut incomplete);
+    let selected = select_body(&ParsedMessage {
+        headers: root.headers.clone(),
+        root,
+        defects: Vec::new(),
+    });
+    incomplete |= !selected.defects.is_empty();
+    (selected.text, selected.html, incomplete)
+}
+
+/// Gmail has already decoded Content-Transfer-Encoding. Preserve MIME metadata
+/// and topology, but feed the selector those decoded bytes without decoding twice.
+fn gmail_mime_part(part: &GmailPayload, incomplete: &mut bool) -> bifrost_types::mime::MimePart {
+    use bifrost_types::mime::{
+        HeaderMap, MimePart, PartBody, TransferEncoding, parse_content_type,
+    };
+
+    let header_block = part
+        .headers
+        .iter()
+        .map(|header| format!("{}: {}\r\n", header.name, header.value))
+        .collect::<String>();
+    let headers = HeaderMap::parse(header_block.as_bytes());
+    let content_type = parse_content_type(headers.get("Content-Type").unwrap_or(&part.mime_type));
+    let disposition = headers
+        .get("Content-Disposition")
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let filename = (!part.filename.is_empty()).then(|| part.filename.clone());
+    let body = if content_type.ty == "multipart" {
+        PartBody::Multipart(
+            part.parts
+                .iter()
+                .map(|child| gmail_mime_part(child, incomplete))
+                .collect(),
+        )
+    } else {
+        let data = part.body.as_ref().and_then(|body| body.data.as_deref());
+        let bytes = match data.map(decode_base64url_nopad).transpose() {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                if content_type.ty == "text" && disposition != "attachment" && filename.is_none() {
+                    *incomplete = true;
+                }
+                Vec::new()
+            }
+            Err(_) => {
+                *incomplete = true;
+                Vec::new()
+            }
+        };
+        PartBody::Leaf(bytes)
+    };
+    MimePart {
+        content_id: content_id_value(&part.headers),
+        headers,
+        content_type,
+        encoding: TransferEncoding::Binary,
+        disposition,
+        filename,
+        description: None,
+        body,
     }
 }
 
@@ -1454,6 +1499,60 @@ fn account_error_for(error: crate::Error, ctx: error::GmailErrorContext) -> Acco
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn hydrate_decodes_declared_charset_without_transfer_decoding_twice() {
+        let message = gmail_message(serde_json::json!({
+            "id": "m1", "threadId": "t1",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    {"name": "Content-Type", "value": "text/plain; charset=iso-8859-1"},
+                    {"name": "Content-Transfer-Encoding", "value": "quoted-printable"}
+                ],
+                "body": {"data": URL_SAFE_NO_PAD.encode(b"caf\xe9 =E9"), "size": 8}
+            }
+        }));
+        let hydrated = message_from_gmail(&[], &message, HydrationProjection::Full)
+            .await
+            .unwrap();
+        assert_eq!(hydrated.body_text.as_deref(), Some("caf\u{e9} =E9"));
+        assert!(!hydrated.incomplete);
+    }
+
+    #[tokio::test]
+    async fn hydrate_missing_or_invalid_body_is_incomplete() {
+        for body in [
+            serde_json::json!({"attachmentId": "external-body", "size": 42}),
+            serde_json::json!({"data": "!!!", "size": 42}),
+        ] {
+            let message = gmail_message(serde_json::json!({
+                "id": "m1", "threadId": "t1",
+                "payload": {"mimeType": "text/plain", "body": body}
+            }));
+            let hydrated = message_from_gmail(&[], &message, HydrationProjection::Full)
+                .await
+                .unwrap();
+            assert!(hydrated.incomplete);
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_selects_last_alternative_and_skips_text_attachments() {
+        let message = gmail_message(serde_json::json!({
+            "id": "m1", "threadId": "t1",
+            "payload": {"mimeType": "multipart/alternative", "parts": [
+                {"mimeType": "text/plain", "filename": "a.txt",
+                 "body": {"data": URL_SAFE_NO_PAD.encode(b"attachment")}},
+                {"mimeType": "text/plain", "body": {"data": URL_SAFE_NO_PAD.encode(b"old")}},
+                {"mimeType": "text/plain", "body": {"data": URL_SAFE_NO_PAD.encode(b"new")}}
+            ]}
+        }));
+        let hydrated = message_from_gmail(&[], &message, HydrationProjection::Full)
+            .await
+            .unwrap();
+        assert_eq!(hydrated.body_text.as_deref(), Some("new"));
+    }
+
     #[test]
     fn draft_attachment_disposition_uses_only_the_type() {
         let part: crate::types::GmailPayload = serde_json::from_value(serde_json::json!({

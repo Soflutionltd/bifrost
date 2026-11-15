@@ -729,7 +729,10 @@ fn validate_checkpoint_envelope(checkpoint: Option<&Checkpoint>) -> Result<(), E
              bound and never swept"
                 .into(),
         )),
-        _ => Ok(()),
+        None => Ok(()),
+        Some(_) => Err(Error::Other(
+            "inventory fusion carried an unsupported checkpoint variant".into(),
+        )),
     }
 }
 

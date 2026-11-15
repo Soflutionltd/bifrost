@@ -10,6 +10,37 @@ use zeroize::Zeroizing;
 
 use crate::Secret;
 
+/// OAuth SASL mechanism, including its failed-authentication acknowledgement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum OAuthMechanism {
+    /// Google's XOAUTH2 mechanism.
+    Xoauth2,
+    /// RFC 7628 OAUTHBEARER.
+    OAuthBearer,
+}
+
+impl OAuthMechanism {
+    /// SASL mechanism token used on the wire.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Xoauth2 => "XOAUTH2",
+            Self::OAuthBearer => "OAUTHBEARER",
+        }
+    }
+
+    /// Raw answer to a server's OAuth error continuation, before base64 framing.
+    ///
+    /// Google's XOAUTH2 exchange requires an empty answer; RFC 7628 Section
+    /// 3.2.3 requires a single SOH byte for OAUTHBEARER. Both are UTF-8 strings.
+    pub const fn error_ack(self) -> &'static str {
+        match self {
+            Self::Xoauth2 => "",
+            Self::OAuthBearer => "\x01",
+        }
+    }
+}
+
 /// Strip the `\x01` (SOH) frame delimiter from an interpolated OAuth field.
 ///
 /// XOAUTH2 and OAUTHBEARER delimit attributes with `\x01`, so an embedded
@@ -65,6 +96,12 @@ pub fn oauthbearer_payload(identity: &str, access_token: &str) -> Secret {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_error_acknowledgements_are_mechanism_specific() {
+        assert_eq!(OAuthMechanism::Xoauth2.error_ack().as_bytes(), b"");
+        assert_eq!(OAuthMechanism::OAuthBearer.error_ack().as_bytes(), b"\x01");
+    }
 
     #[test]
     fn xoauth2_payload_pins_raw_bytes() {

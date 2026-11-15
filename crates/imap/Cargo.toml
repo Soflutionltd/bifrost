@@ -12,7 +12,7 @@ keywords = ["email", "imap", "async", "tokio"]
 categories = ["email", "network-programming", "asynchronous"]
 
 [lib]
-doctest = false
+doctest = true
 
 [lints]
 workspace = true

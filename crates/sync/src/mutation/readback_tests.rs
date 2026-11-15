@@ -571,3 +571,50 @@ async fn a_per_item_engine_failure_is_reported_not_absorbed() {
         ObjectReadback::Unresolved
     );
 }
+
+#[tokio::test]
+async fn destroy_readback_requires_message_not_found() {
+    use bifrost_types::{BatchFailure, BatchItemId, RequestCause, ResourceKind};
+
+    let cases = [
+        ("message", ResourceKind::Message),
+        ("mailbox", ResourceKind::Mailbox),
+        ("account", ResourceKind::Account),
+        ("thread", ResourceKind::Thread),
+        ("calendar", ResourceKind::Calendar),
+        ("contact", ResourceKind::Contact),
+        ("draft", ResourceKind::Draft),
+        ("identity", ResourceKind::Identity),
+        ("vacation", ResourceKind::Vacation),
+        ("push", ResourceKind::PushSubscription),
+        ("filter", ResourceKind::Filter),
+        ("event", ResourceKind::Event),
+    ];
+    let account = scripted(
+        cases
+            .iter()
+            .map(|(id, kind)| {
+                let error = AccountErrorBuilder::new(
+                    AccountErrorKind::NotFound(*kind),
+                    Cause::Request(RequestCause::NotFound {
+                        what: *kind,
+                        id: None,
+                    }),
+                )
+                .try_build()
+                .expect("valid not-found classification");
+                ItemOutcome::Failed(BatchFailure::new(BatchItemId((*id).into()), error))
+            })
+            .collect(),
+    );
+    let outcome = run_destroy_readback_guard(
+        &account,
+        cases.iter().map(|(id, _)| ObjectId((*id).into())).collect(),
+    )
+    .await
+    .expect("per-item failures do not terminate read-back");
+
+    assert_eq!(outcome.skipped, 1);
+    assert_eq!(outcome.still_failed, 0);
+    assert_eq!(outcome.uncertain, (cases.len() - 1) as u64);
+}

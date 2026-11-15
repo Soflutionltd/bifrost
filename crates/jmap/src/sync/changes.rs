@@ -14,7 +14,7 @@ use crate::mailbox::{Mailbox, MailboxChanges};
 use super::capabilities::CoreLimits;
 use super::state::{self, JmapScopeRepr};
 use super::state_cache::{self, StateMap};
-use super::state_walk::StateWalk;
+use super::state_walk::ChangesWalk;
 
 type MailAccount<T> = crate::account::Account<T>;
 
@@ -160,7 +160,7 @@ pub(crate) fn stream<T: HttpTransport>(
 ///   Email and Mailbox states are separate JMAP `(accountId, type)`
 ///   positions and must not share a map.
 ///
-/// `StateWalk` owns the shared progress guard and state-aware error context.
+/// `ChangesWalk` owns the shared progress guard and state-aware error context.
 /// Its policy keeps the different recovery obligations explicit: the engine
 /// restarts a durable change scope, lifecycle reconciles a fresh name snapshot,
 /// and anchored inventory allows queryState churn but restarts on a lost
@@ -190,7 +190,7 @@ where
         // traffic instead of each restating a running total.
         let (mail, tally) = mail.metered();
         let max_changes = nonzero(limits.max_objects_in_get);
-        let mut walk = StateWalk::changes(scope.clone(), &since_state);
+        let mut walk = ChangesWalk::changes(scope.clone(), &since_state);
         loop {
             let started = Instant::now();
             let response = mail

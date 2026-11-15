@@ -410,14 +410,9 @@ impl Mechanism {
                 }
             }
             Mechanism::Xoauth2 => match challenge {
-                // A failed XOAUTH2 auth returns `334 <base64-json-error>`
-                // (Google / Microsoft) rather than a tagged failure. RFC 6749
-                // SASL XOAUTH2 requires the client to acknowledge with an empty
-                // response so the server emits the final failure reply; we send
-                // the `\x01` dummy-cancel line (`AQ==` on the wire), matching
-                // OAUTHBEARER's RFC 7628 error-continuation. The connection
-                // driver then classifies the negative reply on the Auth lane.
-                Some(_) => Ok(Secret::from("\x01")),
+                Some(_) => Ok(Secret::from(
+                    bifrost_sasl::OAuthMechanism::Xoauth2.error_ack(),
+                )),
                 None => {
                     let (identity, access_token) =
                         credentials.oauth_identity_and_token(oauth_token)?;
@@ -428,9 +423,9 @@ impl Mechanism {
                 }
             },
             Mechanism::OAuthBearer => match challenge {
-                // RFC 7628 error-continuation response: protocol command flow,
-                // not payload construction, so it stays in SMTP.
-                Some(_) => Ok(Secret::from("\x01")),
+                Some(_) => Ok(Secret::from(
+                    bifrost_sasl::OAuthMechanism::OAuthBearer.error_ack(),
+                )),
                 None => {
                     let (identity, access_token) =
                         credentials.oauth_identity_and_token(oauth_token)?;
@@ -1656,6 +1651,17 @@ mod test {
     }
 
     #[test]
+    fn oauth_error_answers_do_not_reuse_the_initial_payload() {
+        let credentials = Credentials::oauth2("user", "token");
+        for (mechanism, expected) in [(Mechanism::Xoauth2, ""), (Mechanism::OAuthBearer, "\x01")] {
+            let answer = mechanism
+                .response_with_token_at_index(&credentials, Some(r#"{"status":"401"}"#), 0, None)
+                .unwrap();
+            assert_eq!(answer.as_str(), expected);
+        }
+    }
+
+    #[test]
     fn test_xoauth2() {
         let mechanism = Mechanism::Xoauth2;
 
@@ -1672,16 +1678,13 @@ mod test {
                 .as_str(),
             "user=username\x01auth=Bearer vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==\x01\x01"
         );
-        // A 334 challenge after the initial response is XOAUTH2's failed-auth
-        // shape (`334 <base64-json-error>`); like OAUTHBEARER, the encoder
-        // returns the `\x01` dummy-cancel so the server emits the tagged
-        // failure reply on the next read.
+        // XOAUTH2 requires an empty acknowledgement before the final failure.
         assert_eq!(
             mechanism
                 .response_with_token(&credentials, Some(r#"{"status":"401"}"#), Some(token))
                 .unwrap()
                 .as_str(),
-            "\x01"
+            ""
         );
     }
 

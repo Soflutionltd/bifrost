@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::client::Resource;
+use crate::etag::GraphETag;
 use crate::types::ODataCollection;
 
 use super::GraphAccount;
@@ -347,7 +348,7 @@ pub(crate) async fn update(
             .patch_if_match(
                 Resource::Outlook,
                 &path,
-                etag,
+                &GraphETag::from_odata_annotation(etag),
                 &body,
                 bifrost_net::ReplayPolicy::Never,
             )
@@ -412,7 +413,7 @@ pub(crate) async fn delete_if_version(
             .delete_if_match(
                 Resource::Outlook,
                 &path,
-                etag,
+                &GraphETag::from_odata_annotation(etag),
                 bifrost_net::ReplayPolicy::Never,
             )
             .await
@@ -715,7 +716,8 @@ fn event_from_graph(calendar_id: String, event: GraphEvent) -> CalendarEvent {
         etag: event
             .change_key
             .as_deref()
-            .map(super::inventory::graph_change_key_etag),
+            .map(super::inventory::graph_change_key_etag)
+            .map(GraphETag::into_string),
         provenance: CalendarProvenance {
             provider: ProtocolKind::Graph,
             native,

@@ -1136,16 +1136,6 @@ record. A new multi-leg operation, or a change to these two, will not update the
 list in `mod.rs`. Owner: the operation's own future reports its leg state, or at
 least declares its multi-leg-ness beside its `PartialCommit` builder.
 
-## CON-055 - Google idempotency overrides restate the shared table
-
-**Reported by:** google.
-
-`GmailErrorContext::send()` and `draft(DraftSend)` set
-`idempotency_override(Some(false))`, while `AccountOperation::is_idempotent` already
-returns `false` for `Send` and `DraftSend`. Harmless today, but a local restatement
-that will not follow the table if it changes. Delete it. Related: CON-049 (Graph's
-double declaration).
-
 ## CON-056 - Google extracts caller versions two ways
 
 **Reported by:** google.

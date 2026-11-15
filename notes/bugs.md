@@ -206,37 +206,6 @@ C9): fold it into the per-account slot as a watch,
 `EngineState::{Running, Paused(PauseReason), Stopping}`, so both resumes are one
 transition with one notification.
 
-## BUG-013 - `WriterRequest` is published, contrary to the reference
-
-**Reported by:** sync-engine (doc vs code).
-
-`reference/sync.md` ("Published surface the bounded lane added") says
-`WriterRequest` is "crate-internal - that enum is not re-exported". In fact
-`multiplexer/mod.rs` has `pub use changes::{AckRequest, ChangesEvent,
-OperatorDecision, WriterRequest, drive_changes_stream}` under a `pub mod`, with
-public variants, making it `bifrost_sync::multiplexer::WriterRequest`. Under the
-never-delete-published-API rule, the writer's internal protocol is frozen
-surface by accident. More broadly most engine internals are `pub` with public
-fields: `Multiplexer`, `InventoryFusion`, `ScopeTokens` and
-`ScopeToken::tombstone`, `drive_changes_stream`, `AckRequest`,
-`PublicationId(pub u64, pub Arc<..>)`. Narrowing them is removal and needs the
-owner; recorded because each widens what later refactors must preserve. Either
-the reference is corrected or the owner rules on narrowing.
-
-## BUG-014 - Engine passthroughs bypass pause, throttle holds and admission, and the reference's rationale for them is false
-
-**Reported by:** sync-engine.
-
-`reference/sync.md` ("Hydration passthrough") justifies forwarding explicitly
-instead of exposing `Arc<dyn Account>` as "Read surface only. Mutations stay
-funnelled through `bulk_set_flags`". `engine/passthrough.rs` forwards about 60
-methods, including `send_message`, `container_delete`, `contact_delete`,
-`filter_create`, `set_starred`, `move_thread` and `delete_thread`. None honours
-pause, consults or records throttle holds (a direct `send_message` 429 records
-no hold the polls would honour), or takes admission. The real boundary is
-"whatever someone wrote a forwarder for". Either the doc's rationale is
-corrected or the forwarders go through the gate (CON-014).
-
 ## BUG-015 - Proof generations restart at zero every attachment while ledger generations are durable
 
 **Reported by:** sync-lanes (live, by reading).
@@ -351,19 +320,6 @@ persisted `last_error` or barrier `evidence` panics the account writer.
 ("encoding a variant the codec does not know panics"), and that codec runs
 inside consumer stores. The structural cause is STR-045.
 
-## BUG-019 - An unknown `Checkpoint` variant from a provider panics fence-guarded registration
-
-**Reported by:** sync-lanes (latent).
-
-`PendingCoverage::register_in` does `lane.scope().expect("conditional
-registration of a checkpoint with no scope")` whenever `expected_fence` is
-`Some`. Fusion's `validate_checkpoint_envelope` admits any `Checkpoint` variant
-it does not recognise (`_ => Ok(())`) and publishes it through
-`publish_checkpoint_if_fence`, which maps to `Lane::UnkeyedCheckpoint` with no
-scope and hits the panic. `Checkpoint` is `#[non_exhaustive]`. The account
-boundary should refuse an unknown variant as a contract violation, as it
-already refuses `Checkpoint::Backfill`.
-
 ## BUG-020 - `PendingCoverage::retire` drops debt and strands the boundary entry; "retire a publication" has five doors
 
 **Reported by:** sync-lanes (latent foot-gun).
@@ -397,21 +353,6 @@ not, so a caller holding only the ledger retires without waking boundary
 waiters. Proposal: one `retire(id, why: RetireReason)` transition that always
 handles both halves, debt and wake, with quiescence owned by the same object
 (STR-042); the half-operations go crate-private (owner ruling: published).
-
-## BUG-021 - Destroy read-back treats any `NotFound` as proof of absence; repair refuses to
-
-**Reported by:** sync-lanes (live policy inconsistency).
-
-`mutation/readback.rs::destroy_readback_saw_absence` accepts
-`AccountErrorKind::NotFound(_)` of any `ResourceKind`, so a `NotFound(Mailbox)` or
-`NotFound(Account)` per-item failure counts as "the destroy landed" (`Skipped`).
-The repair lane takes the opposite position on the same question:
-`reference/sync.md` says "a 404 may mean deleted, moved out of scope, permission
-lost, wrongly routed, or not yet replicated", and `DefinitivelyIrrelevant` is a
-typed account conclusion, "never a status code". Owner: a `bifrost-types`
-predicate both consult (`AccountError::proves_absence_of(kind)` or a typed
-`ItemOutcome` absence variant), with the producer, which knows whether its 404
-means deleted, deciding - as repair already works.
 
 ## BUG-022 - Topology replacement resets the per-scope fence counters
 
@@ -460,21 +401,6 @@ is written with uidvalidity 0, so every reconnect silently drops QRESYNC and
 full-resyncs. Owner: the decoder (or the SELECT consumer) turns the wire number
 into `Option<UidValidity>` / `Option<ModSeq>` once, stating the "0 means absent"
 tolerance there; every downstream field is the typed value.
-
-## BUG-025 - IMAP SEARCH and APPEND date validators disagree
-
-**Reported by:** imap-protocol (live, minor).
-
-`search_helpers::validate_imap_date` (SEARCH SINCE/BEFORE/ON) compares the month
-case-SENSITIVELY against `"Jan".."Dec"` with no day-of-month check;
-`encode::validate_append_datetime` (APPEND) compares case-insensitively (RFC
-3501 section 9) with day-vs-month, leap-year and hour/minute/second/zone checks.
-`account/pim.rs::imap_date` formats a `SystemTime` into the string the first
-validator re-parses; `FetchResponse::internal_date` / `save_date` stay raw
-`String` and nothing parses INTERNALDATE. So `"13-feb-2025"` is rejected for
-SEARCH and accepted for APPEND, and `"30-Feb-2025"` is accepted for SEARCH and
-rejected for APPEND. Proposal: `ImapDate` / `ImapDateTime` types (`jiff` is
-already a dependency) with `Display` for the encoder and a decoder-side parser.
 
 ## BUG-026 - IMAP folds a neutral `$seen` keyword on one write path and not the other
 
@@ -672,19 +598,6 @@ resolver; IMAP, Sieve and SMTP select from it (owner ruling on what SMTP's publi
 `Mechanism` becomes). The SASL client layer this lives in is STR-135; where
 ManageSieve should live is STR-060.
 
-## BUG-031 - A hydrated IMAP `Message` extracts Message-IDs with two different parsers
-
-**Reported by:** imap-protocol (live, minor).
-
-`types/envelope.rs::bare_message_id` / `first_in_reply_to` use a structural
-scanner that skips `<..>` inside quoted strings and comments and falls back to a
-bare token; `bifrost_types::mime::HeaderMap::message_ids` takes the first `<`
-and next `>` naively. `account/pim.rs` builds `Message::in_reply_to` with the
-first and `Message::references` with the second, so `"\"<fake>\" <real>"` yields
-`real` in one field and `fake` in the other; the other providers use the naive
-one. Owner: `bifrost-types` mime, promoting the structural algorithm; the IMAP
-copy becomes a call.
-
 ## BUG-032 - IMAP FETCH merge collapses partial fetches of one section at different origins
 
 **Reported by:** imap-protocol (latent).
@@ -696,19 +609,6 @@ of the same section at different origins in one response collapse (the second
 is dropped); binary sections compare `Vec<u32>` exactly. Proposal: a typed
 `SectionSpec { parts: Vec<u32>, text: Option<Header | HeaderFields(..) | Text |
 Mime> }`, with origin part of the key that owns "same section".
-
-## BUG-033 - IMAP compile-fail doctests never run and import non-existent paths
-
-**Reported by:** imap-protocol (latent).
-
-`crates/imap/Cargo.toml` sets `doctest = false`. `MailboxName`'s doc carries two
-`compile_fail` blocks asserting there is no `From<String>` / `From<&str>`,
-importing `bifrost_imap::MailboxName`, which is not exported; they never run, and
-if run would pass for the wrong reason (unresolved import). The
-`types/search.rs` module example imports `bifrost_imap::types::SearchCriteria`
-(private) and links `crate::ImapConnection::search` (crate-private). The
-guarantees these blocks advertise are unpinned. Either move them to a `tests/`
-trybuild-style check against a crate-internal path or drop the claim.
 
 ## BUG-035 - Single-command and pipeline paths disagree on NOTIFY after an interleaved NOTIFICATIONOVERFLOW
 
@@ -841,19 +741,6 @@ at open, `None` when the server cannot IDLE, from which capabilities, lanes and
 admission all read. The workspace-level form of the question is CON-004.
 `supports_notify` is also stored twice, on `ImapAccountInner` and `PushState`.
 
-## BUG-044 - Standalone CardDAV and CalDAV lifecycle streams end immediately, and the engine cycles them on backoff
-
-**Reported by:** imap-account (found by comparison).
-
-IMAP's `scope_lifecycle_stream` stays pending until shutdown, on the stated
-ground that the engine treats an ended stream as a fault. CardDAV and CalDAV
-return `stream::empty()`. The multiplexer's lifecycle reader confirms IMAP's
-reading: on `None` it records a backoff failure, sleeps and re-subscribes, so a
-standalone DAV account cycles its lifecycle reader on backoff for its whole life.
-Inside an IMAP composition it is invisible, because IMAP does not merge the
-sub-accounts' lifecycle streams. Owner: a shared
-`bifrost_types::idle_lifecycle_stream(shutdown)` helper both use.
-
 ## BUG-045 - IMAP drops shared-namespace discovery failures and reports a degraded open twice
 
 **Reported by:** imap-account, net-dav (adds that IMAP's `factory.rs` comment says both DAV crates sync exactly one collection and report the rest on `skipped_scopes`, while both DAV factories return an empty skip lane and `caldav::lib` says every collection is a cursor scope; `DavAttach::Degraded.transient` is computed and carried under `allow(dead_code)`).
@@ -966,20 +853,6 @@ and changed-message payload is discarded, and the hint cursor is not advanced fr
 it: wasted wire on every hydration batch, and a policy the mutation path
 explicitly rejected. Owner: a `SelectPurpose::{Sync(cursor), Read, Mutate}`
 argument decided once per lane, replacing `(cursor, read_only)` (STR-076).
-
-## BUG-051 - IMAP `open_raw_rfc822` keeps fetching after its receiver is dropped
-
-**Reported by:** imap-account.
-
-`guarded_receiver_stream` (abort on drop) is used by `get_stream`,
-`inventory_stream` and `changes_stream`; `boxed_receiver_stream` (detached) by
-`mutation_stream`, `open_raw_rfc822` and `scope_lifecycle_stream`. The rationale on
-`guarded_receiver_stream` ("two drivers issue IMAP commands concurrently over one
-account while the older one sat on a pool checkout") applies verbatim to
-`open_raw_rfc822`, which can keep fetching a 256 MiB message for a receiver that is
-gone. Mutation may legitimately want to run to completion, but nothing says so at
-the call site. Owner: one spawn helper taking an explicit `OnDrop::{Abort,
-RunToCompletion}`.
 
 ## BUG-052 - IMAP `bulk_move` to a DAV-owned folder goes to the IMAP server while `throttle_keys` says IMAP does not own it
 
@@ -1140,19 +1013,6 @@ the placement on the `Capability` trait (`const LEVEL: CapabilityLevel`) with th
 `capability_config` and the accessors; one macro over the markers replaces the
 six account accessors, and `capability_config`'s serialize-then-deserialize round
 trip goes.
-
-## BUG-061 - A JMAP create emits `null` inside an `Id[Boolean]` set, and a test pins it
-
-**Reported by:** jmap-protocol (live wire defect).
-
-The JSON-object macro (`json_object_struct!`) gives Create and Patch identical
-setter vocabulary, so `CalendarEventCreate::calendar_id(id, false)` and
-`ContactCardCreate::address_book_id(id, false)` put `{"cal-1": null}` into a
-CREATE. An `Id[Boolean]` set in a create must contain only `true`; `null` is
-patch-only syntax. `tests.rs::patch_object_null_semantics` pins this wire-invalid
-create. Owner: a membership-set type that serializes differently in create
-(`IdSet<T>`, values always `true`) and patch (path ops) - see CON-041 and
-STR-084.
 
 ## BUG-064 - `Client::with_transport` fabricates a `Basic ` WebSocket credential; the JMAP credential is held twice
 
@@ -1392,42 +1252,6 @@ production; the scripted wire accepts any bearer. The axis belongs in net: eithe
 `TokenSource::current(&Audience)`, with Graph constructing its Outlook-origin
 requests with the Outlook audience. Related: STR-113 (cloud-aware origins).
 
-## BUG-076 - A Graph PIM write leaves the pre-write etag cached, so the next bulk write conflicts with itself; four `$batch` reconcilers disagree
-
-**Reported by:** graph (live).
-
-"Given the submitted legs and the subresponses, what is each leg's outcome, and
-what does the etag cache learn?" is answered by (1) `mutate::resolve_batch_responses`,
-`reconcile_mutation_responses` and `update_etag_cache_from_responses` (bulk
-mutation); (2) `get::reconcile_hydration_responses` (hydration), repeating the id
-resolution verbatim, both warn strings included; (3)
-`pim::messages::submit_write_batch_resource` (PIM writes); (4)
-`reactions::classify_chunk`. On invalid input, 1 and 2 discard a subresponse whose
-id is unparseable or out of range, while 3 dedupes by raw string, builds an
-outcome for an unparseable id scoped `ErrorScope::Account`, and lets an
-out-of-range numeric index into `BatchProgress::failed`. On etag maintenance, 1
-evicts on 412 and 404, evicts on move or destroy success, and installs the new
-etag on any other 2xx; 3 evicts only on destroy success.
-
-Consequence: `set_is_read`, `set_category`, `set_importance` and
-`set_extended_property` call `fetch_message_value`, which caches the pre-write
-etag, then PATCH under `If-Match`; the PATCH succeeds and moves the change key,
-and nothing refreshes or evicts the cached entry. The next `bulk_set_flags` on
-that message finds the stale etag in `EtagIndex`, sends it, and gets a 412
-`ConcurrencyConflict` against its own earlier write - a guaranteed wasted round
-trip and a spurious conflict reported to the engine.
-
-`EtagIndex` is written at five sites, each restating what an observation means:
-`inventory_stream_from` (mail only; evicted on `@removed`), `changes_stream` (the
-same rules, re-written), `get::fetch_batch` (every successful hydration body),
-`mutate::update_etag_cache_from_responses` (the 412/404/move/destroy rules), and
-`pim::messages::cache_etag_for` plus the destroy eviction in
-`submit_write_batch_resource`. Owners: one `BatchAnswers::resolve(&legs,
-responses)` (id resolution, header decoding, the absent-leg rule, etag
-observation in one place; the four front ends only project outcomes - STR-108),
-and `EtagIndex::observe(id, Observation)` with `Observation::{Live(etag), Gone,
-Superseded}` called by each lane.
-
 ## BUG-077 - Graph shared mailboxes that differ only in case become two clients and two scope sets
 
 **Reported by:** graph (live; latent in the retag half).
@@ -1492,20 +1316,6 @@ answered four ways: presence in `routing_map` (`establish_initial_cursor`,
 Owner: a typed internal scope whose `PublicFolder` variant is produced once from
 discovery state (STR-106), plus one `PublicItemRoute::resolve(id) -> Routed |
 Unrouted` every lane matches on, with one classification for `Unrouted`.
-
-## BUG-080 - A Graph delta value without an id gets two verdicts, one of them `Unsupported`
-
-**Reported by:** graph (minor misclassification plus a lane disagreement).
-
-On the same server input, `inventory_stream_from` records an
-`InventoryObligation::Region` checkpoint barrier and continues the walk, with the
-obligation's error `unsupported_account_error(SyncInventory)` claiming the
-operation is unsupported - it should be the contract violation it is - while
-`changes::changes_stream` terminates the scope with a terminal
-`Protocol(ContractViolation)`. The `changes_stream` comment explains the changes
-lane has no obligation vocabulary, a fact about `SyncEvent<Change>`, not a reason
-for different verdicts on the provider. Owner: the shared delta-walk driver
-(STR-116), deciding once and letting each lane express the verdict.
 
 ## BUG-083 - Graph's funnel tags a 503 with a mailbox budget that the classifier then never stamps
 
@@ -1585,22 +1395,6 @@ that. The hunter proposes deleting the second funnel for every Gmail caller; onl
 Drive's resumable upload (custom headers, bearer-less, redirects off) needs the raw
 builder.
 
-## BUG-089 - A Google filter `MoveTo(archive)` sends the synthetic archive id in `addLabelIds`
-
-**Reported by:** google (live, untested).
-
-`filters::action_from_filter_actions` lowers `MoveTo(c)` to "add c, remove INBOX"
-and `Delete` to "add TRASH, remove INBOX", never consulting
-`flags::move_placement_patch`. `flags.rs` documents that Gmail rejects a modify
-adding the synthetic `archive` id, and `MoveTo("INBOX")` emits INBOX in both add and
-remove; neither case is tested. Meanwhile `move_placement_patch` is shared, its
-comment saying the bulk and single-object paths "agree on the wire shape", but the
-source-folding rule (drop a redundant source if it is archive, equal to the
-destination, or already among the removals) is copied verbatim in
-`mutation::move_patch` and `pim::move_container_patch`. Owner: move the source fold
-into `flags` (`move_placement_patch(destination, source)`) and route filter moves
-through it.
-
 ## BUG-091 - Google label vocabulary disagrees on case, archive and label type
 
 **Reported by:** google (live).
@@ -1636,18 +1430,6 @@ user label; `scopes::diff_snapshots` emits renames for anything not `Some("syste
 says this is deliberate. But a lost watch costs only a gap, which push already
 signals (`gap_hint`); the history cursor is still valid. Restarting the scope throws
 away a good cursor because the error model has no push-registration kind.
-
-## BUG-095 - Non-UTF-8 bodies vanish in Google `message_hydrate`, reported complete
-
-**Reported by:** google (live).
-
-`collect_body_parts` decodes Gmail `body.data` with `String::from_utf8` and drops
-anything that fails, so a Latin-1 or ISO-2022-JP text part yields `body_text: None`
-with `incomplete: false`. This is a Gmail-only re-implementation of "which part is
-the body" (first `text/plain`, first `text/html`, `String::from_utf8` or drop)
-beside `bifrost_types::mime::select_body`, which handles charsets; it also always
-sets `Message::incomplete: false`. Owner: hydrate over the shared MIME selector
-(STR-130).
 
 ## BUG-096 - A transient Gmail `labels.list` failure terminates discovery despite a usable cache
 
@@ -1716,20 +1498,6 @@ password" on IMAP, for the same server and credential. IMAP's comment says it
 differ in the class and agree only on the message suffix. Root cause: the server
 error is prose with a magic prefix (STR-133). Owner: bifrost-sasl, via a typed
 `ScramServerError` and one `is_credential_rejection()` / `refusal_class()`.
-
-## BUG-101 - The OAuth error-continuation answer is wrong for one mechanism in each crate
-
-**Reported by:** smtp-sasl (drift).
-
-After a failed XOAUTH2 / OAUTHBEARER the server sends a continuation carrying a JSON
-error. IMAP `AuthenticateXoauth2Consumer` (shared by both mechanisms) answers with
-an empty line; SMTP `Mechanism::response_with_token_at_index` answers `\x01`
-(base64 `AQ==`) for both. RFC 7628 section 3.2.3 has the OAUTHBEARER client answer
-with `%x01`; Google's XOAUTH2 documentation has the client send an empty response.
-Each crate is right for one mechanism and wrong for the other. The OAuth-payload
-consolidation explicitly left "the RFC 7628 `\x01` error-continuation handling" in
-SMTP as "protocol command flow"; it is a per-mechanism SASL rule and belongs in
-bifrost-sasl (`oauth_error_ack(mechanism) -> &'static [u8]`).
 
 ## BUG-104 - The reverse path depends on which door sends the message
 
@@ -1937,36 +1705,6 @@ STR-145.
 bare UID and puts the extension only on the path. One decision, "new resource UID
 and file name", answered two ways.
 
-## BUG-119 - JMAP Principal query filter still spells the property `timezone`
-
-**Reported by:** resolution wave (lateral, while fixing the Principal object's
-`timeZone` decoding).
-
-`crates/jmap/src/principal/query.rs` emits `timezone` in its filter. RFC 9670 spells
-the Principal property `timeZone`; whether the filter condition follows the
-property name depends on the filter extension's contract, which was not checked.
-
-## BUG-120 - JMAP contact-move pre-read conflates explicit absence with an unanswered id
-
-**Reported by:** resolution wave (lateral, beside the single-object read helper
-`crates/jmap/src/sync/single_get.rs`).
-
-Single-object contact and event reads now tell a `notFound` answer (scoped
-`NotFound`) from an id the server never answered (`PartialResponse`). The pre-read
-in the contact move path still treats both the same way; it could use the same
-helper.
-
-## BUG-121 - A matching-scope acknowledgement clears provisional ownership before persistence succeeds
-
-**Reported by:** resolution wave (lateral, beside the `ack_checkpoint` scope check).
-
-In `crates/sync/src/engine/ack.rs` the `Ack` arm now refuses a scope that does not
-match the checkpoint, but for a matching scope it still removes the provisional
-reattach mark before publication validation and the store write have succeeded. A
-rejected or failed persist leaves the row without its provisional mark, so a later
-`ReattachAbort` no longer deletes it. Ordering the removal after a successful write
-would close it; check the reattach-abort path's expectations first.
-
 ## BUG-122 - IMAP pending LOGOUT is cleared by any tagged response, not LOGOUT's own
 
 **Reported by:** resolution wave review (lateral).
@@ -1988,13 +1726,67 @@ unrelated script change in between yields `ConcurrencyConflict`. Correct against
 the deactivate-the-wrong-filter hazard, but a new user-visible failure mode; decide
 whether one automatic re-read-and-retry belongs here.
 
-## BUG-124 - The IMAP BYE-ALERT event test does not drive the driver
+## BUG-076 - Four Graph `$batch` reconcilers disagree on invalid subresponses and etag maintenance
+
+**Reported by:** graph (live).
+
+The live symptom (a successful PIM write leaving the pre-write etag cached) is fixed:
+successful batch writes in `account/pim/messages.rs` now evict the cached validator.
+What remains is the duplication: "given the submitted legs and the subresponses,
+what is each leg's outcome, and what does the etag cache learn?" is still answered
+by `mutate::resolve_batch_responses` / `reconcile_mutation_responses` /
+`update_etag_cache_from_responses`, `get::reconcile_hydration_responses`,
+`pim::messages::submit_write_batch_resource`, and `reactions::classify_chunk`. On
+invalid input the first two discard an unparseable or out-of-range subresponse id
+while the PIM path dedupes by raw string and builds an `ErrorScope::Account`
+outcome; the etag rules are restated per lane. Owner: one `BatchAnswers::resolve`
+plus `EtagIndex::observe(id, Observation)` (STR-108).
+
+## BUG-125 - `ReattachAbort` drops provisional ownership before its delete succeeds
+
+**Reported by:** resolution wave (lateral, beside the provisional-ownership ordering
+fix in `crates/sync/src/engine/ack.rs`).
+
+The `Ack` arm now clears provisional ownership only after a durable write. The
+`ReattachAbort` arm still removes ownership before its row delete succeeds, so a
+failed delete cannot be retried by a later abort and the row survives unowned.
+
+## BUG-126 - `engine/passthrough.rs` repeats the false read-only passthrough rationale
+
+**Reported by:** resolution wave (lateral, after `reference/sync.md` was corrected).
+
+`reference/sync.md` now states that the direct passthroughs include writes and
+bypass engine pause, admission and throttle holds. A comment in
+`crates/sync/src/engine/passthrough.rs` still says the forwarders are a read
+surface with mutations funnelled through `bulk_set_flags`; reword it to match.
+
+## BUG-127 - A genuinely empty Gmail text part now marks the message incomplete
+
+**Reported by:** resolution wave review (lateral; product call).
+
+Gmail hydration (`gmail_mime_part` in `crates/google/src/account/pim.rs`) now goes
+through the shared MIME selector and marks a non-attachment text leaf with no
+`body.data` as `incomplete`. Gmail may omit `data` for an empty body (`size: 0`), so
+an empty but complete message reports `incomplete = true`. Decide whether
+`body.size == Some(0)` is treated as present-and-empty.
+
+## BUG-128 - `HeaderMap::first_message_id` is a published associated function that takes no `self`
 
 **Reported by:** resolution wave review (lateral).
 
-`logout_bye_alert_emits_both_code_and_session_end_once`
-(`crates/imap/src/connection/driver/events.rs`) re-implements the reclassification
-rule inline instead of driving the dispatch loop, so it passes regardless of the
-driver's behaviour. Drive a scripted LOGOUT with `* BYE [ALERT]` through the real
-loop instead.
+The structural Message-ID scanner was promoted into
+`crates/types/src/mime/header.rs` as `pub fn HeaderMap::first_message_id(raw: &str)`,
+which does not read the map. It is now published surface; a free function in the
+mime module, or a `&self` method reading a named header, would be the honest shape.
+Moving it before it gains downstream users avoids a later rename ruling.
+
+## BUG-129 - Provisional-row promotion keys only on a `Durable` change acknowledgement
+
+**Reported by:** resolution wave review (lateral; unverified).
+
+`crates/sync/src/engine/ack.rs` now promotes a provisional reattach row only on
+`AckPersistOutcome::Durable` for a `Change` checkpoint. Check whether any other
+outcome (an already-persisted or no-op acknowledgement) also means the cursor is
+durably committed; if one does, a later `ReattachAbort` can still delete a cursor
+the consumer persisted against.
 

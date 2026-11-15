@@ -16,6 +16,7 @@ pub mod account;
 mod api;
 mod client;
 mod error;
+mod etag;
 mod ews;
 mod origin;
 mod paging;

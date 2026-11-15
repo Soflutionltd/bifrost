@@ -875,10 +875,13 @@ mailboxes always install.
 - A bounded LRU `etag_index` of mail HTTP entity-tags (powering `If-Match`; mutation
   preflight reads refresh recency, `MESSAGE_SELECT` explicitly requests
   `changeKey`; the shared JSON projection prefers `@odata.etag` and otherwise
-  wraps the raw change key as `W/"<changeKey>"`. Successful writes record a
-  returned etag or evict when Graph returns none, 412 responses evict before
-  retry, and moves, tombstones, 404 destroy skips, and confirmed destroys evict
-  their old-id keys). It is
+  wraps the raw change key as `W/"<changeKey>"`. Bulk flag writes record a
+  returned etag or evict when Graph returns none; successful PIM batch writes
+  always evict the target's cached validator, including PATCHes, moves and
+  extended-property clears. Successful direct draft writes, deferred-send
+  stamps and scheduled-send cancellation also evict. Bulk 412 responses evict
+  before retry, and moves, tombstones, 404 destroy skips, and confirmed destroys
+  evict their old-id keys). It is
   a `HashMap<Arc<str>, _>` paired with a `BTreeMap<u64, Arc<str>>` of recency
   tickets, so insert / hit / evict are each one hash lookup plus a couple of
   tree nodes and never a scan: the write lock is taken once per hydrated page
@@ -901,6 +904,17 @@ mailboxes always install.
 - `set_priority` / `set_bandwidth_cap` delegate to `AccountNet`.
   Open attaches before account construction; same-id reattachment preserves
   the bandwidth budget, while cross-id retagging selects the destination budget.
+
+`crates/graph/src/etag.rs` defines the crate-private `GraphETag` validator.
+`from_odata_annotation` preserves an observed entity-tag; `from_change_key`
+wraps an opaque change key as `W/"<changeKey>"`. There is no implicit conversion
+from a string. `graph_etag` returns this type, preferring the OData annotation.
+The mail cache, hydration observations, mutation preflight maps and
+`MessagePatch::etag` carry typed validators. Direct conditional client helpers
+accept `&GraphETag` through the wire funnel; batch builders convert validators
+to strings only when constructing serialized headers. Shared account values
+such as `ServerVersion::ETag`, `ContactCard::etag` and `CalendarEvent::etag`
+remain strings and are explicitly converted at the Graph boundary.
 
 ### Per-batch byte accounting
 
@@ -1930,7 +1944,12 @@ Mail mutation primitives live in `pim/messages.rs`, per-message, fanning out a
 `set_category` patches `categories[]` (reserved `$flagged`/`starred` ->
 `flag.flagStatus`). `set_extended_property` patches
 `singleValueExtendedProperties` when `Some`, else `DELETE`s it (404-tolerant).
-All send `If-Match` if `changeKey` set.
+PATCH and move requests use typed `If-Match` validators from the fetched
+message. The property-clear DELETE is unconditional and 404-tolerant.
+Successful PIM batch writes evict the message's cached validator even when a
+response contains an etag, so a subsequent bulk write refreshes its observation.
+Property clears retain their parent message targets for this eviction and for
+error correlation; a tolerated 404 also evicts conservatively.
 
 `set_importance` patches the single-valued `importance` field in one
 `If-Match`-conditioned PATCH (never clear-then-set); the read side maps it back
@@ -1944,15 +1963,25 @@ Inline attachments encode into `fileAttachment` JSON; standalone
 OneDrive); `draft_update` patches mutable fields (no attachment replace).
 Scheduled send PATCHes `PidTagDeferredSendTime` (`SystemTime 0x3FEF`, ISO-8601
 UTC) onto the draft between create and send; the draft id is the
-cancel/reschedule handle.
+cancel/reschedule handle. Direct draft update, discard and send evict the
+cached validator only after HTTP success; successful sends of newly created or
+MIME-imported drafts do the same. Deferred-send stamping evicts immediately
+after its successful PATCH, even if the later send fails. Rescheduling uses
+that same stamping helper, and successful cancellation evicts after DELETE.
+The stamping helper resolves both the wire client and the cache key from the
+mailbox owner: a shared draft evicts its owner-qualified message key, leaving a
+primary message with the same native id untouched. Refused direct writes do
+not evict the previous observation.
 
 `SendRequest::send_as` (gated by `pim_methods.send_as`, which Graph advertises
 only while `shared_clients` is non-empty, so an account with no shared mailbox
 configured does not promise a path on which every request would fail; see
 `reference/jmap.md` for the JMAP foreign-submission leg)
 routes create/deferred-stamp/send through the shared mailbox's `shared_clients`
-entry (keyed by `MailboxId`); the three helpers take an explicit
-`&GraphClient`. `apply_send_as` stamps `from`/`sender`: `As` forces both to
+entry (keyed by `MailboxId`); create and send take an explicit
+`&GraphClient`, while deferred stamping takes the account and owner so it can
+route the write and invalidate the matching cache entry together.
+`apply_send_as` stamps `from`/`sender`: `As` forces both to
 the mailbox; `OnBehalfOf` keeps `from` = mailbox (honoring an explicit
 `from`), `sender` = `user_email` (omitted when `None`). An unconfigured
 mailbox is `Request(Malformed)` carrying `RequestCause::InvalidArgument`
@@ -2475,8 +2504,10 @@ Batch readers reject numeric statuses outside 100..=999 as acknowledged
 + `AttemptCause(Acknowledged)` + wire signal. Before projection, bulk mutation
 responses update the etag cache: flag writes record the returned etag or evict
 when absent, moves and destroys evict the old id, and 412 evicts so retry must
-refresh. Shared by `mutate.rs` `bulk_*`, `pim::messages::submit_write_batch`,
-`get_stream`.
+refresh. PIM batch writes instead evict every successful target, including
+property clears, through `pim::messages::submit_write_batch_resource`; the next
+bulk write cannot reuse a validator observed before that write. The outcome
+projector is shared by bulk and PIM writes.
 
 Cursor-decode failures (`CursorProtocolMismatch`, `CursorEnvelopeUnknown`,
 `SchemaIncompatible`, and `CursorError::Decode` for cursor or page-marker bytes
@@ -2504,6 +2535,8 @@ malformed value, a schema mismatch affecting many, a truncated page, or a
 response that cannot be correlated with pagination at all, and calling it a
 single-object loss would claim knowledge the walk does not have.
 
+The region obligation carries a scoped `Protocol(ContractViolation)` error,
+matching the changes lane's verdict on the same malformed provider value.
 Its `RegionRecovery` is `CheckpointBarrier`, not `DurableReplay`. The only token
 available at page granularity is the current page URL, which is a continuation of
 THIS delta session: once the walk takes its `deltaLink` and the cursor advances,
@@ -2685,9 +2718,10 @@ Thread permanentDelete aggregates earlier chunks before attaching once; a later
 chunk's whole `$batch` failure, or a local refusal while building it, is the
 primary over that chunk's ids with every earlier committed id as a step. Later
 unattempted chunks are absent. move_thread forwards add_to_container unchanged.
-The extended-property clear passes no per-request targets into the batch, so a
-successful DELETE never evicts the message's cached etag; its record names the
-messages from the caller's ids.
+The extended-property clear passes its parent message ids as per-request
+targets. A successful DELETE or tolerated 404 evicts the parent's cached etag,
+and its partial-commit record names those same messages. Every successful PIM
+batch target is evicted independently of sibling failures.
 
 OneDrive records a committed UploadSession before URL admission. Admission
 refusal is effectless and sends no cancel. Failed chunks distinguish session

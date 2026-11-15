@@ -547,7 +547,10 @@ process-wide monotonic counter; `ReattachInsert`, `ReattachAbort` and
 `ReattachCommit` all carry it, and the writer keeps a scope-to-attempt map. An
 abort deletes, and a commit promotes, only rows the named attempt owns; a later
 attempt inserting the same scope takes ownership. An acknowledged checkpoint
-still discharges a scope's provisional state whichever attempt owns it.
+discharges a scope's provisional state whichever attempt owns it only after a
+change-cursor acknowledgement is validated and durable. Rejected, withheld or
+failed acknowledgements preserve abort ownership. A durable backfill checkpoint
+does not promote the provisional change cursor for the same scope.
 
 A reattach that RESUMES a stored row (`run_establish` reading it through the
 writer's `GetChangeCursor`) passes its attempt as `claim_for`; if the row is
@@ -890,6 +893,11 @@ with its own message, so the consumer is told rather than the driver re-polling
 the same cursor for ever. Pinned by
 `a_fusion_batch_may_not_carry_a_backfill_checkpoint` and
 `the_live_driver_refuses_a_backfill_checkpoint`.
+
+Fusion also refuses any checkpoint variant it does not recognize, before
+publication. Fence-guarded registration independently refuses an unkeyed lane
+without minting a publication and returns the coverage claim to its producer:
+without a scope there is no fence it can safely compare.
 
 ### Broadcast
 
@@ -2451,7 +2459,7 @@ to hydration:
 - `open_blob(account, handle)` / `open_blob_range(account, handle, range)`
   -> the matching `Account` blob openers.
 
-Two deliberate properties:
+Forwarding has these properties:
 
 - **Always-live handle.** Every method resolves through the private
   `live_account` helper, i.e. `ArcSwap::load_full`, so a hydrate issued
@@ -2462,21 +2470,21 @@ Two deliberate properties:
   their own internal `Arc` clones, so they outlive the short-lived
   handle resolved per call; an unattached account yields
   `Error::AccountNotAttached` up front.
-- **Read surface only.** Mutations stay funnelled through
-  `bulk_set_flags` so the idempotency / read-back / recovery pipeline
-  remains the one chokepoint for writes; cursor and push driving stay
-  engine-owned. Handing out a raw `Arc<dyn Account>` would leak both the
-  write surface and the reopen-snapshot discipline, so the engine does
-  not - it forwards the read methods explicitly instead.
+- **Explicit forwarded surface.** The hydration cluster is read-only,
+  but sibling direct passthroughs also expose writes, including
+  `send_message`, `container_delete`, `contact_delete`, `filter_create`,
+  `set_starred`, `move_thread` and `delete_thread`. Forwarding individual
+  methods keeps handle resolution engine-owned; it does not make the
+  mutation pipeline a chokepoint for every write. Cursor and push
+  driving stay engine-owned.
 
-These consumer-driven calls do not pass through the `Scheduler` /
-`BudgetGate` - unlike the engine's own wire paths, which are all
-admitted (see "Scheduler + budget" below). That asymmetry is
-deliberate: the budget bounds what the ENGINE spends on an account's
-behalf, while a consumer-initiated hydrate is the consumer spending
-its own latency budget. Consumer-driven hydration and engine-driven
-backfill still share the same underlying client, where `bifrost-net`
-is the rate-limit chokepoint.
+These consumer-driven calls, including the direct write passthroughs
+below, do not pass through the `Scheduler` / `BudgetGate`, honour engine
+pause, or consult or record engine throttle holds. A rate-limit error
+returned by a direct call therefore does not install a hold for engine
+polling. These calls use the live protocol client and its own transport
+controls; those controls do not provide engine admission or coordinate
+the engine's throttle state.
 
 Alongside the read-only hydration cluster, the engine forwards sibling
 **direct passthrough** clusters that resolve through the same
@@ -3549,7 +3557,9 @@ stream termination. The engine checks envelope and hydrated identity, then
 requires FlagsOnly for flags and Metadata for moves. The account's pure
 `flag_target` judges flag state in its own write vocabulary. Move observations
 check destination membership. Destroy treats presence as unsatisfied and
-explicit NotFound as satisfied. Missing, failed, incomplete, wrong-projection,
+explicit `NotFound(Message)` as satisfied: bulk destroy targets mail messages.
+A missing mailbox, account, or any other resource kind does not prove the
+message absent and remains unresolved. Missing, failed, incomplete, wrong-projection,
 and indeterminate observations remain unresolved. Equal duplicates agree;
 disagreeing duplicates remain unresolved even if later observations agree.
 Per-item engine failures are retained alongside the observations.
@@ -4031,9 +4041,10 @@ live numbered set the slowest-reader rule is evaluated against),
 guarantee. `PublicationReceipt` gained a public field,
 `walk_watermark: Option<u64>`, which is a struct-literal break for any
 downstream constructing one. `BackfillConfig` gained `lane_capacity`, and
-`WriterRequest` a `DiscardBackfillProgress` variant (crate-internal - that enum
-is not re-exported). Everything else the lane work touched is `pub(crate)` or
-narrower.
+`WriterRequest` a `DiscardBackfillProgress` variant. The enum is public and
+re-exported as `bifrost_sync::multiplexer::WriterRequest`; its variants are
+part of the published surface. Everything else the lane work touched is
+`pub(crate)` or narrower.
 
 ## Caller versions on PIM mutations
 

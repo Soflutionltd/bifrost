@@ -6,7 +6,7 @@ use bytes::Bytes;
 
 use crate::types::{FetchAttr, MailboxName};
 
-use super::{ImapAccount, batch, boxed_receiver_stream, decode_object_id, terminated_event};
+use super::{ImapAccount, batch, decode_object_id, guarded_receiver_stream, terminated_event};
 
 pub(super) enum BlobError {
     Account(AccountError),
@@ -54,7 +54,7 @@ pub(crate) fn open_raw_rfc822(
 ) -> bifrost_types::AccountStream<SyncEvent<Bytes>> {
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     let scope_id = message.0.clone();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         match run_raw(account, message, &tx).await {
             Ok(()) => {
                 let _ = tx.send(SyncEvent::Done(None::<Checkpoint>)).await;
@@ -74,7 +74,7 @@ pub(crate) fn open_raw_rfc822(
             }
         }
     });
-    boxed_receiver_stream(rx)
+    guarded_receiver_stream(rx, task)
 }
 
 async fn run_raw(
@@ -365,4 +365,44 @@ pub(super) async fn run_fetch(
     // Judged only after the tagged completion: bytes forwarded before a
     // failed command never make the read a success.
     judged
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use crate::account::test_support::scripted_account_parts;
+    use crate::connection::test_support::{
+        driver_pair, preauth_greeting, read_line, respond, tag_of,
+    };
+
+    /// Withhold the FETCH completion so a detached reader cannot finish by itself.
+    #[tokio::test]
+    async fn dropping_raw_stream_releases_account_during_fetch() {
+        let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+        let account = ImapAccount::new(scripted_account_parts(conn, 1));
+        let pool = std::sync::Arc::downgrade(&account.pool);
+        let folder = MailboxName::new("INBOX").unwrap();
+        let stream = open_raw_rfc822(account, super::super::encode_object_id(&folder, 5, 7));
+        let select = read_line(&mut server).await;
+        assert!(select.contains("EXAMINE"), "{select}");
+        respond(
+            &mut server,
+            &format!(
+                "* FLAGS (\\Seen)\r\n* 1 EXISTS\r\n* 0 RECENT\r\n\
+                 * OK [UIDVALIDITY 5] valid\r\n{} OK [READ-ONLY] selected\r\n",
+                tag_of(&select),
+            ),
+        )
+        .await;
+        let fetch = read_line(&mut server).await;
+        assert!(fetch.contains("UID FETCH"), "{fetch}");
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while pool.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the stream must destroy its pending read task");
+    }
 }

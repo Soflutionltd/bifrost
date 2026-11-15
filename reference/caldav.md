@@ -1416,3 +1416,7 @@ default-method refusals.
 
 `push_lanes` is empty. Every lane passed to `push_stream` fails with
 `Internal(AccountContract)` because CalDAV exposes no push lane.
+
+`scope_lifecycle_stream` emits no events and stays pending until `close()`.
+Closing wakes all lifecycle subscribers; subscriptions created after close end
+immediately. Repeated close calls succeed.

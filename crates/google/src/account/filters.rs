@@ -21,6 +21,7 @@ use crate::types::{
 };
 
 use super::error::{GmailErrorContext, into_account_error};
+use super::flags;
 
 const LABEL_INBOX: &str = "INBOX";
 const LABEL_TRASH: &str = "TRASH";
@@ -457,13 +458,18 @@ fn action_from_filter_actions(
     for action in actions {
         match action {
             FilterAction::Keep => {}
-            FilterAction::Delete => {
-                push_unique(&mut gmail.add_label_ids, LABEL_TRASH);
-                push_unique(&mut gmail.remove_label_ids, LABEL_INBOX);
-            }
-            FilterAction::MoveTo(container) => {
-                push_unique(&mut gmail.add_label_ids, &container.0);
-                push_unique(&mut gmail.remove_label_ids, LABEL_INBOX);
+            FilterAction::Delete | FilterAction::MoveTo(_) => {
+                let destination = match action {
+                    FilterAction::MoveTo(container) => container.0.as_str(),
+                    _ => LABEL_TRASH,
+                };
+                let patch = flags::move_placement_patch(destination, None);
+                for id in patch.add_label_ids {
+                    push_unique(&mut gmail.add_label_ids, &id);
+                }
+                for id in patch.remove_label_ids {
+                    push_unique(&mut gmail.remove_label_ids, &id);
+                }
             }
             FilterAction::AddLabel(container) => {
                 push_unique(&mut gmail.add_label_ids, &container.0);
@@ -552,6 +558,33 @@ fn gmail_date(time: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filter_moves_use_canonical_placement() {
+        for (action, add, remove) in [
+            (
+                FilterAction::MoveTo(ContainerId("archive".into())),
+                vec![],
+                vec!["INBOX", "SPAM", "TRASH"],
+            ),
+            (
+                FilterAction::MoveTo(ContainerId("INBOX".into())),
+                vec!["INBOX"],
+                vec!["SPAM", "TRASH"],
+            ),
+            (
+                FilterAction::MoveTo(ContainerId("Label_42".into())),
+                vec!["Label_42"],
+                vec!["INBOX", "SPAM", "TRASH"],
+            ),
+            (FilterAction::Delete, vec!["TRASH"], vec!["INBOX", "SPAM"]),
+        ] {
+            let patch =
+                action_from_filter_actions(&[action], AccountOperation::FilterCreate).unwrap();
+            assert_eq!(patch.add_label_ids, add);
+            assert_eq!(patch.remove_label_ids, remove);
+        }
+    }
 
     #[test]
     fn list_mapping_preserves_native_query_as_provider_expression() {

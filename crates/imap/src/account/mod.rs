@@ -1157,6 +1157,9 @@ impl From<(Error, error::ImapErrorContext)> for TerminatedCause {
     }
 }
 
+/// Wrap output from a detached producer. State-changing work keeps its
+/// existing completion policy when the receiver leaves; read-only producers
+/// should retain their task handle with `guarded_receiver_stream` instead.
 pub(crate) fn boxed_receiver_stream<T: Send + 'static>(
     rx: tokio::sync::mpsc::Receiver<T>,
 ) -> AccountStream<T> {
@@ -1166,7 +1169,7 @@ pub(crate) fn boxed_receiver_stream<T: Send + 'static>(
 /// A receiver stream that aborts the task feeding it when the stream is
 /// dropped.
 ///
-/// `Account::changes_stream`, `inventory_stream` and `get_stream` are
+/// `Account::changes_stream`, `inventory_stream`, `get_stream` and `open_raw_rfc822` are
 /// channel-backed by a detached `tokio::spawn`. Dropping the returned stream drops only the
 /// receiver, so without this the task runs on against the account's
 /// connection until its next `tx.send` fails - and the engine now cuts a

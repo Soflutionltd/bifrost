@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::{GraphError, GraphResponseError};
+use crate::etag::GraphETag;
 use crate::origin::{AdmittedUrl, Base, ProviderLink, Refusal, UploadUrl};
 
 pub(crate) const GRAPH_API_BASE: &str = "https://graph.microsoft.com/v1.0";
@@ -986,7 +987,7 @@ impl GraphClient {
         &self,
         resource: Resource,
         path: &str,
-        etag: &str,
+        etag: &GraphETag,
         body: &B,
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<(), GraphError> {
@@ -1026,7 +1027,7 @@ impl GraphClient {
         &self,
         resource: Resource,
         path: &str,
-        etag: &str,
+        etag: &GraphETag,
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
@@ -1089,7 +1090,7 @@ impl GraphClient {
         resource: Resource,
         url: &AdmittedUrl,
         method: &str,
-        etag: &str,
+        etag: &GraphETag,
         body: Option<&B>,
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<RestResponse, GraphError> {
@@ -1103,7 +1104,7 @@ impl GraphClient {
         resource: Resource,
         url: &AdmittedUrl,
         method: &str,
-        if_match: Option<&str>,
+        if_match: Option<&GraphETag>,
         prefer: Option<&str>,
         body: Option<&B>,
         replay: bifrost_net::ReplayPolicy,
@@ -1137,7 +1138,7 @@ impl GraphClient {
         resource: Resource,
         url: &AdmittedUrl,
         method: &str,
-        if_match: Option<&str>,
+        if_match: Option<&GraphETag>,
         options: (Option<&str>, bool),
         body: Option<WireBody>,
         replay: bifrost_net::ReplayPolicy,
@@ -1148,7 +1149,13 @@ impl GraphClient {
         // answer it: the response comes back from the scripted transport
         // below, through the production retry loop.
         #[cfg(test)]
-        self.record_wire(method, url, if_match, prefer, body.as_ref());
+        self.record_wire(
+            method,
+            url,
+            if_match.map(GraphETag::as_str),
+            prefer,
+            body.as_ref(),
+        );
         let account_net = self.attached_net()?;
 
         // This funnel has no AccountOperation, and needs none: the caller
@@ -1176,7 +1183,7 @@ impl GraphClient {
             builder = builder.header("ConsistencyLevel", "eventual");
         }
         if let Some(etag) = if_match {
-            builder = builder.header("If-Match", etag);
+            builder = builder.header("If-Match", etag.as_str());
         }
         if let Some(prefer) = prefer {
             builder = builder.header("Prefer", prefer);

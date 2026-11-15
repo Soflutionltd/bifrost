@@ -28,14 +28,13 @@ impl ContactCardCreate {
             .entry("addressBookIds")
             .or_insert_with(|| json!({}));
         if let Some(map) = entry.as_object_mut() {
-            map.insert(
-                address_book_id.into().into_string(),
-                if set {
-                    serde_json::Value::Bool(true)
-                } else {
-                    serde_json::Value::Null
-                },
-            );
+            // A create carries a complete Id[Boolean] set, not patch operations.
+            let id = address_book_id.into().into_string();
+            if set {
+                map.insert(id, serde_json::Value::Bool(true));
+            } else {
+                map.remove(&id);
+            }
         }
         self
     }

@@ -139,7 +139,10 @@ pub(crate) async fn delete_thread(
                             AccountOperation::BulkDestroy,
                         )?,
                         body: None,
-                        headers: Some(HashMap::from([("If-Match".to_string(), etag.clone())])),
+                        headers: Some(HashMap::from([(
+                            "If-Match".to_string(),
+                            etag.clone().into_string(),
+                        )])),
                     })
                 })
                 .collect();

@@ -140,20 +140,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn logout_bye_alert_emits_both_code_and_session_end_once() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let mut sink = event_sink::DriverEventSink::new(tx, None);
-        let bye = status(UntaggedStatus::Bye, Some(ResponseCode::Alert));
-        assert!(emit_untagged_response_code_events(&bye, &mut sink));
-        // This is the reclassification rule used after LOGOUT finalization.
-        if !has_critical_response_code(&bye) {
-            assert!(sink.emit(bye.into()).is_ok());
-        }
-        assert!(matches!(rx.try_recv(), Ok(TypedEvent::Alert(text)) if text == "text"));
-        assert!(matches!(rx.try_recv(), Ok(TypedEvent::Bye {
+    #[tokio::test]
+    async fn logout_bye_alert_emits_both_code_and_session_end_once() {
+        use crate::connection::test_support::{
+            driver_pair, preauth_greeting, read_line, respond, tag_of,
+        };
+
+        let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+        let script = async {
+            let logout = read_line(&mut server).await;
+            assert!(logout.contains("LOGOUT"), "{logout}");
+            respond(
+                &mut server,
+                &format!(
+                    "* BYE [ALERT] text\r\n{} OK logged out\r\n",
+                    tag_of(&logout),
+                ),
+            )
+            .await;
+        };
+        let (result, ()) = tokio::join!(conn.logout(), script);
+        result.expect("BYE followed by tagged OK completes LOGOUT");
+        let events = conn.drain_events().await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(&events[0], TypedEvent::Alert(text) if text == "text"));
+        assert!(matches!(&events[1], TypedEvent::Bye {
             code: Some(ResponseCode::Alert), text,
-        }) if text == "text"));
-        assert!(rx.try_recv().is_err());
+        } if text == "text"));
     }
 }

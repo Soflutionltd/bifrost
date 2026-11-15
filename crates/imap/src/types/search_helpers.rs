@@ -92,7 +92,10 @@ pub(super) fn validate_imap_date(date: &str) -> Result<(), crate::Error> {
         )));
     }
 
-    if !VALID_MONTHS.contains(&month) {
+    if !VALID_MONTHS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(month))
+    {
         return Err(crate::Error::InvalidInput(format!(
             "invalid IMAP date month {month:?}  -  must be one of Jan, Feb, Mar, Apr, \
              May, Jun, Jul, Aug, Sep, Oct, Nov, Dec \
@@ -107,6 +110,18 @@ pub(super) fn validate_imap_date(date: &str) -> Result<(), crate::Error> {
              (RFC 3501 Section 9: date-year = 4DIGIT)"
         )));
     }
+
+    // Use the APPEND date-time validator's calendar rules as well as its
+    // case-insensitive month vocabulary. SEARCH permits an unpadded day.
+    let fixed_day = if day.len() == 1 {
+        format!("0{day}")
+    } else {
+        day.to_owned()
+    };
+    crate::codec::encode::validate_append_datetime(&format!(
+        "{fixed_day}-{month}-{year} 00:00:00 +0000"
+    ))
+    .map_err(|error| crate::Error::InvalidInput(error.to_string()))?;
 
     Ok(())
 }

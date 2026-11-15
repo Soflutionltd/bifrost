@@ -477,7 +477,7 @@ impl ImapConnection {
         let consumer = AuthenticateXoauth2Consumer::new(
             encoded,
             has_sasl_ir,
-            crate::types::AuthMechanism::XOAuth2.name(),
+            bifrost_sasl::OAuthMechanism::Xoauth2,
         );
         let deadline = tokio::time::Instant::now() + timeout;
         self.submit_with_continuations(cmd, consumer, Some(deadline))
@@ -488,9 +488,9 @@ impl ImapConnection {
     ///
     /// Uses SASL-IR (RFC 4959 Section 3) if the server advertises it. The
     /// payload framing matches XOAUTH2 on the wire (a single base64 blob
-    /// followed by an empty-line reply to any error continuation, letting the
-    /// server finish with a tagged NO/BAD), so the dispatch consumer is shared;
-    /// only the payload bytes and the mechanism token differ. The `a=`
+    /// followed by a base64 SOH reply to an error continuation, letting the
+    /// server finish with a tagged NO/BAD). The shared dispatch consumer uses
+    /// the mechanism to choose the error acknowledgement. The `a=`
     /// authorization identity is GS2-escaped inside `bifrost_sasl`.
     ///
     /// **TLS gate:** like the other direct mechanism methods, this enforces no
@@ -549,7 +549,7 @@ impl ImapConnection {
         let consumer = AuthenticateXoauth2Consumer::new(
             encoded,
             has_sasl_ir,
-            crate::types::AuthMechanism::OAuthBearer.name(),
+            bifrost_sasl::OAuthMechanism::OAuthBearer,
         );
         let deadline = tokio::time::Instant::now() + timeout;
         self.submit_with_continuations(cmd, consumer, Some(deadline))

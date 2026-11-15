@@ -9,18 +9,9 @@
 //! 6.4.4: "When multiple keys are specified, the result is the intersection
 //! (AND function) of all the messages that match those keys.").
 //!
-//! # Examples
-//!
-//! ```
-//! use bifrost_imap::types::SearchCriteria;
-//!
-//! let criteria = SearchCriteria::new()
-//!     .unseen()
-//!     .since("13-Feb-2025").unwrap()
-//!     .from("alice@example.com").unwrap();
-//!
-//! assert_eq!(criteria.as_str(), "UNSEEN SINCE 13-Feb-2025 FROM \"alice@example.com\"");
-//! ```
+//! This builder is internal to the account implementation, so external
+//! doctests cannot import it. The in-crate `chain_multiple_criteria` test
+//! exercises chaining UNSEEN, SINCE and FROM and checks the encoded string.
 
 use std::fmt;
 
@@ -63,9 +54,9 @@ impl SearchCriteria {
     }
 
     /// Return the criteria as a string slice, suitable for passing to
-    /// [`search()`](crate::ImapConnection::search),
-    /// [`uid_search()`](crate::ImapConnection::uid_search),
-    /// [`sort()`](crate::ImapConnection::sort), and similar methods.
+    /// `ImapConnection::search`,
+    /// `ImapConnection::uid_search`,
+    /// `ImapConnection::sort`, and similar methods.
     ///
     /// # References
     /// RFC 3501 Section 6.4.4 (SEARCH command)

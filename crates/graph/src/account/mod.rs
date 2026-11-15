@@ -54,6 +54,7 @@ use tokio_util::sync::CancellationToken;
 // pub: consumers build a GraphClient before registering GraphAccountFactory with the engine.
 pub use crate::client::GraphClient;
 use crate::client::Resource;
+use crate::etag::GraphETag;
 use crate::types::GraphMailFolder;
 
 // Re-exported for the client-side api-base override test, which pins that a
@@ -185,7 +186,7 @@ pub(crate) struct GraphAccount {
     pub(crate) open_folder_seed: Arc<RwLock<Option<Vec<GraphMailFolder>>>>,
 }
 
-/// Change keys are a best-effort mutation optimization. Retaining one per
+/// Entity tags are a best-effort mutation optimization. Retaining one per
 /// object forever turns a long-running high-churn account into an unbounded
 /// cache, so keep only a fixed working set.
 pub(crate) const ETAG_INDEX_MAX_ENTRIES: usize = 10_000;
@@ -194,13 +195,13 @@ pub(crate) const ETAG_INDEX_MAX_ENTRIES: usize = 10_000;
 /// detached on expiry, preserving release and recreate install-or-undo work.
 const CLOSE_WORKER_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// A change key plus the recency ticket that orders it in `EtagIndex::order`.
+/// An entity tag plus the recency ticket that orders it in `EtagIndex::order`.
 struct EtagEntry {
-    etag: String,
+    etag: GraphETag,
     seq: u64,
 }
 
-/// Bounded LRU over change keys.
+/// Bounded LRU over entity tags.
 ///
 /// Every operation is one hash lookup plus one or two `BTreeMap` node
 /// operations - no scan of the cache. That matters because the write lock
@@ -220,7 +221,7 @@ pub(crate) struct EtagIndex {
 }
 
 impl EtagIndex {
-    pub(crate) fn insert(&mut self, id: String, etag: String) {
+    pub(crate) fn insert(&mut self, id: String, etag: GraphETag) {
         // `remove_entry` hands back the owned key, so re-caching an id
         // already present does not reallocate it.
         let (key, previous) = match self.entries.remove_entry(id.as_str()) {
@@ -234,9 +235,9 @@ impl EtagIndex {
         self.entries.insert(key, EtagEntry { etag, seq });
     }
 
-    /// Reads a change key AND marks it hot. Mutation preflight is the only
+    /// Reads an entity tag AND marks it hot. Mutation preflight is the only
     /// reader, so an id being read is an id about to carry an `If-Match`.
-    pub(crate) fn get(&mut self, id: &str) -> Option<String> {
+    pub(crate) fn get(&mut self, id: &str) -> Option<GraphETag> {
         let (key, entry) = self.entries.remove_entry(id)?;
         let seq = self.promote(Arc::clone(&key), Some(entry.seq));
         let etag = entry.etag.clone();
@@ -2042,7 +2043,10 @@ mod tests {
     fn etag_cache_evicts_the_least_recently_used_entry() {
         let mut cache = EtagIndex::default();
         for index in 0..=ETAG_INDEX_MAX_ENTRIES {
-            cache.insert(format!("id-{index}"), format!("etag-{index}"));
+            cache.insert(
+                format!("id-{index}"),
+                GraphETag::from_odata_annotation(&format!("etag-{index}")),
+            );
         }
         assert_eq!(cache.len(), ETAG_INDEX_MAX_ENTRIES);
         assert!(!cache.contains_key("id-0"));
@@ -2051,7 +2055,10 @@ mod tests {
         // A read refreshes the recency position. On the next insertion the
         // oldest untouched entry must go, not the hot one.
         assert_eq!(cache.get("id-1").as_deref(), Some("etag-1"));
-        cache.insert("new".to_string(), "etag-new".to_string());
+        cache.insert(
+            "new".to_string(),
+            GraphETag::from_odata_annotation("etag-new"),
+        );
         assert!(cache.contains_key("id-1"));
         assert!(!cache.contains_key("id-2"));
         assert!(cache.contains_key("new"));
@@ -2065,11 +2072,11 @@ mod tests {
     #[test]
     fn etag_cache_keeps_one_recency_ticket_per_entry() {
         let mut cache = EtagIndex::default();
-        cache.insert("a".to_string(), "etag-a".to_string());
-        cache.insert("b".to_string(), "etag-b".to_string());
+        cache.insert("a".to_string(), GraphETag::from_odata_annotation("etag-a"));
+        cache.insert("b".to_string(), GraphETag::from_odata_annotation("etag-b"));
 
         // Re-caching an id updates it in place.
-        cache.insert("a".to_string(), "etag-a2".to_string());
+        cache.insert("a".to_string(), GraphETag::from_odata_annotation("etag-a2"));
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.order_len(), 2);
         assert_eq!(cache.get("a").as_deref(), Some("etag-a2"));
@@ -2085,7 +2092,10 @@ mod tests {
         // The oldest surviving ticket still names a live entry: refill to
         // capacity and only "b" (never touched again) may be evicted.
         for index in 0..ETAG_INDEX_MAX_ENTRIES {
-            cache.insert(format!("fill-{index}"), "etag".to_string());
+            cache.insert(
+                format!("fill-{index}"),
+                GraphETag::from_odata_annotation("etag"),
+            );
         }
         assert_eq!(cache.len(), ETAG_INDEX_MAX_ENTRIES);
         assert_eq!(cache.order_len(), ETAG_INDEX_MAX_ENTRIES);

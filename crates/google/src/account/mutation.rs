@@ -1029,7 +1029,7 @@ async fn apply_destroy(
                 .completed_effect = Some(MutationEffect::MovedToContainer(ContainerId(
                 LABEL_TRASH.to_string(),
             )));
-            let fallback = flags::move_placement_patch(LABEL_TRASH);
+            let fallback = flags::move_placement_patch(LABEL_TRASH, None);
             match apply_label_patch_tracked(
                 client,
                 ids,
@@ -1103,32 +1103,19 @@ fn move_patch(destination: &MembershipScope, source: Option<&MembershipScope>) -
             ..LabelPatch::default()
         };
     };
-    let mut patch = flags::move_placement_patch(destination_id);
-    match source {
-        None => {}
+    let source_id = match source {
+        None => None,
         Some(scope) => {
-            let Some(LabelId(source_id)) = as_label(scope) else {
+            let Some(LabelId(id)) = as_label(scope) else {
                 return LabelPatch {
                     unsupported_flags: vec!["gmail move source must be a label".to_string()],
                     ..LabelPatch::default()
                 };
             };
-            // Removing the synthetic `archive` id is a no-op (there is
-            // no such Gmail label), and a source equal to the
-            // destination would ask Gmail to add and remove the same
-            // label in one request.
-            let redundant = flags::is_archive_id(source_id)
-                || source_id.eq_ignore_ascii_case(destination_id)
-                || patch
-                    .remove_label_ids
-                    .iter()
-                    .any(|existing| existing.eq_ignore_ascii_case(source_id));
-            if !redundant {
-                patch.remove_label_ids.push(source_id.clone());
-            }
+            Some(id.as_str())
         }
-    }
-    patch
+    };
+    flags::move_placement_patch(destination_id, source_id)
 }
 
 fn as_label(scope: &MembershipScope) -> Option<&LabelId> {

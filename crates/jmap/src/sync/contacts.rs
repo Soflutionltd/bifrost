@@ -180,28 +180,27 @@ pub(crate) fn update<T: HttpTransport>(
             ));
         }
         let id = ContactCardId::new(contact.0);
-        // An address-book move is add-new plus remove-old, and the old
-        // book is only knowable from the current card. If the read did
-        // not materialize one, `None` here would silently degrade the
-        // move into an ADD - leaving the contact in both books, with no
-        // error and nothing to reconcile against later. The read failing
-        // says nothing about the card (this module documents the
-        // unanswered-id lane as a transient, not a deletion), so fail the
-        // update as a retryable `Protocol(PartialResponse)` rather than
-        // performing a different write than the caller asked for.
+        // A move must read the current membership before clearing the old
+        // book. Explicit absence is terminal; an unanswered id is retryable.
+        // Correlate the requested id before projecting any returned card.
         let current_address_book = if patch.address_book_id.is_some() {
-            get_cards(&contacts, vec![id.clone()], AccountOperation::ContactUpdate)
-                .await?
-                .cards
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    super::error::get_id_unanswered(
-                        id.as_str(),
-                        super::error::JmapErrorContext::new(AccountOperation::ContactUpdate),
-                    )
-                })?
-                .address_book_id
+            let operation = AccountOperation::ContactUpdate;
+            let response = contacts
+                .call(ContactCardGet::new().ids([id.clone()]))
+                .await
+                .map_err(to_acct_err(operation))?;
+            let not_found = response.not_found().contains(&id);
+            let card = super::single_get::require_one(
+                response.into_list(),
+                |card| card.id().is_some_and(|returned| returned == id),
+                not_found,
+                id.as_str(),
+                operation,
+                bifrost_types::ErrorScope::Contact {
+                    id: ContactId(id.as_str().to_string()),
+                },
+            )?;
+            contact_from_jmap(card, operation)?.address_book_id
         } else {
             None
         };
@@ -1062,6 +1061,7 @@ mod tests {
     async fn a_single_contact_omitted_from_the_answer_is_retryable() {
         let client = crate::client::Client::with_transport(
             UnansweredGetTransport {
+                get_answer: None,
                 sets: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             },
             contacts_session(),
@@ -1094,12 +1094,13 @@ mod tests {
         }
     }
 
-    /// Answers `ContactCard/get` with an empty `list` and an empty
+    /// By default, answers `ContactCard/get` with an empty `list` and an empty
     /// `notFound` - the unanswered-id lane this module documents as a
     /// transient - and records every `ContactCard/set` it is asked to
     /// perform, so a write issued despite the failed read is visible.
     #[derive(Clone)]
     struct UnansweredGetTransport {
+        get_answer: Option<Value>,
         sets: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     }
 
@@ -1115,11 +1116,13 @@ mod tests {
             let name = call[0].as_str().expect("method name").to_string();
             let call_id = call[2].as_str().expect("call id").to_string();
             let arguments = match name.as_str() {
-                "ContactCard/get" => json!({
-                    "accountId": "primary",
-                    "state": "s1",
-                    "list": [],
-                    "notFound": []
+                "ContactCard/get" => self.get_answer.clone().unwrap_or_else(|| {
+                    json!({
+                        "accountId": "primary",
+                        "state": "s1",
+                        "list": [],
+                        "notFound": []
+                    })
                 }),
                 "ContactCard/set" => {
                     self.sets.lock().expect("sets").push(call[1].clone());
@@ -1841,6 +1844,7 @@ mod tests {
         .expect("session parses");
         let client = crate::client::Client::with_transport(
             UnansweredGetTransport {
+                get_answer: None,
                 sets: std::sync::Arc::clone(&sets),
             },
             session,
@@ -1870,6 +1874,55 @@ mod tests {
             "no half-move may reach the wire: {:?}",
             sets.lock().expect("sets")
         );
+    }
+
+    #[tokio::test]
+    async fn a_book_move_correlates_the_read_and_distinguishes_absence() {
+        for list in [json!([]), json!([{"id": "unrelated"}])] {
+            for absent in [false, true] {
+                let sets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let client = crate::client::Client::with_transport(
+                    UnansweredGetTransport {
+                        get_answer: Some(json!({
+                            "accountId": "primary",
+                            "state": "s1",
+                            "list": list,
+                            "notFound": if absent { json!(["c1"]) } else { json!([]) }
+                        })),
+                        sets: std::sync::Arc::clone(&sets),
+                    },
+                    contacts_session(),
+                    "https://example.test/.well-known/jmap",
+                )
+                .expect("client builds");
+                let error = update(
+                    Some(ContactAccount::new(client, "primary")),
+                    ContactId("c1".into()),
+                    ContactPatch {
+                        address_book_id: Some(SharedAddressBookId("new".into())),
+                        ..ContactPatch::default()
+                    },
+                )
+                .await
+                .expect_err("no matching card may authorize a move");
+                let expected = if absent {
+                    bifrost_types::AccountErrorKind::NotFound(bifrost_types::ResourceKind::Contact)
+                } else {
+                    bifrost_types::AccountErrorKind::Protocol(
+                        bifrost_types::ProtocolErrorKind::PartialResponse,
+                    )
+                };
+                assert_eq!(error.kind(), &expected);
+                assert_eq!(error.operation(), Some(AccountOperation::ContactUpdate));
+                assert_eq!(
+                    error.scope(),
+                    Some(&bifrost_types::ErrorScope::Contact {
+                        id: ContactId("c1".into()),
+                    })
+                );
+                assert!(sets.lock().expect("sets").is_empty());
+            }
+        }
     }
 
     /// `Page::failed_ids` is what stops a consumer reading "absent from

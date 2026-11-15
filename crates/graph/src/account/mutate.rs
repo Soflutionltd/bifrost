@@ -10,6 +10,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::client::Resource;
+use crate::etag::GraphETag;
 use crate::types::{BatchRequest, BatchRequestItem};
 
 use super::GraphAccount;
@@ -70,7 +71,7 @@ pub(crate) fn bulk_set_flags_if_version_stream(
         // https://learn.microsoft.com/en-us/graph/json-batching
         let mut chunks = targets.ready_chunks(account.capabilities.batching_policy.max_items.clamp(1, 20));
         while let Some(chunk) = chunks.next().await {
-            let mut groups: Vec<(Vec<ObjectId>, HashMap<String, String>)> =
+            let mut groups: Vec<(Vec<ObjectId>, HashMap<String, GraphETag>)> =
                 vec![(Vec::new(), HashMap::new())];
             let mut rejected = Vec::new();
             for target in chunk {
@@ -78,7 +79,7 @@ pub(crate) fn bulk_set_flags_if_version_stream(
                     target.expected_version.as_ref().map(|version| {
                         version.expected_etag(
                             bifrost_types::Protocol::Graph, AccountOperation::UpdateFlags, false,
-                        ).map(str::to_owned)
+                        ).map(GraphETag::from_odata_annotation)
                     }).transpose()
                 });
                 match version {
@@ -210,7 +211,7 @@ async fn submit_batch_with_version(
     account: &GraphAccount,
     ids: &[ObjectId],
     kind: &MutationKind,
-    expected: Option<&HashMap<String, String>>,
+    expected: Option<&HashMap<String, GraphETag>>,
 ) -> Result<Vec<SyncEvent<ItemOutcome<MutationSuccess>>>, crate::error::GraphError> {
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -560,7 +561,7 @@ async fn update_etag_cache_from_responses(
                     headers
                         .iter()
                         .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
-                        .map(|(_, value)| value.clone())
+                        .map(|(_, value)| GraphETag::from_odata_annotation(value))
                 })
                 .or_else(|| response.body.as_ref().and_then(graph_etag));
             match etag {
@@ -665,7 +666,7 @@ async fn refresh_missing_etags(
     account: &GraphAccount,
     ids: &[ObjectId],
     kind: &MutationKind,
-    etags: &mut HashMap<String, String>,
+    etags: &mut HashMap<String, GraphETag>,
 ) -> Vec<ItemOutcome<MutationSuccess>> {
     if !matches!(kind, MutationKind::SetFlags(_) | MutationKind::Move(_)) {
         return Vec::new();
@@ -767,7 +768,7 @@ fn request_for_mutation(
     account: &GraphAccount,
     id: &ObjectId,
     kind: &MutationKind,
-    etags: &HashMap<String, String>,
+    etags: &HashMap<String, GraphETag>,
 ) -> Result<Option<BatchRequestItem>, crate::error::GraphError> {
     // Decode the (possibly foreign-encoded) id and route to the owning
     // mailbox: a shared-mailbox item builds `/users/{owner}/messages/{native}`,
@@ -783,7 +784,7 @@ fn request_for_mutation(
             let Some(etag) = etags.get(&id.0) else {
                 return Ok(None);
             };
-            headers.insert("If-Match".to_string(), etag.clone());
+            headers.insert("If-Match".to_string(), etag.clone().into_string());
             Ok(Some(BatchRequestItem {
                 id: "0".to_string(),
                 method: "PATCH".to_string(),
@@ -818,7 +819,7 @@ fn request_for_mutation(
             if dest.foreign().map(|f| f.mailbox.as_str()) != parsed.owner() {
                 return Ok(None);
             }
-            headers.insert("If-Match".to_string(), etag.clone());
+            headers.insert("If-Match".to_string(), etag.clone().into_string());
             Ok(Some(BatchRequestItem {
                 id: "0".to_string(),
                 method: "POST".to_string(),
@@ -834,7 +835,7 @@ fn request_for_mutation(
             // The inherited versioned door refuses caller versions before I/O;
             // mail_destroy stays false, while unversioned behavior is retained.
             if let Some(etag) = etags.get(&id.0) {
-                headers.insert("If-Match".to_string(), etag.clone());
+                headers.insert("If-Match".to_string(), etag.clone().into_string());
             }
             Ok(Some(BatchRequestItem {
                 id: "0".to_string(),
@@ -1181,8 +1182,11 @@ mod tests {
         );
         {
             let mut cache = account.etag_index.write().await;
-            cache.insert(public.0.clone(), "W/\"pub\"".into());
-            cache.insert("m2".into(), "W/\"m2\"".into());
+            cache.insert(
+                public.0.clone(),
+                GraphETag::from_odata_annotation("W/\"pub\""),
+            );
+            cache.insert("m2".into(), GraphETag::from_odata_annotation("W/\"m2\""));
         }
         account
             .client
@@ -1293,7 +1297,7 @@ mod tests {
             .etag_index
             .write()
             .await
-            .insert("m1".into(), "W/\"new\"".into());
+            .insert("m1".into(), GraphETag::from_odata_annotation("W/\"new\""));
         account.client.script_rest([crate::client::ScriptedRestResponse::json(
             reqwest::StatusCode::OK,
             json!({"responses": [
@@ -1354,11 +1358,10 @@ mod tests {
     #[tokio::test]
     async fn repeated_targets_keep_distinct_guards_and_absent_versions_use_cache() {
         let account = shared_account();
-        account
-            .etag_index
-            .write()
-            .await
-            .insert("m2".into(), "W/\"cached\"".into());
+        account.etag_index.write().await.insert(
+            "m2".into(),
+            GraphETag::from_odata_annotation("W/\"cached\""),
+        );
         account.client.script_rest([
             crate::client::ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({
                 "responses": [{"id": "0", "status": 200, "body": {"id": "m1"}}]
@@ -1562,9 +1565,9 @@ mod tests {
         encode_message_id(&scope, native)
     }
 
-    fn etag_map(id: &ObjectId) -> HashMap<String, String> {
+    fn etag_map(id: &ObjectId) -> HashMap<String, GraphETag> {
         let mut etags = HashMap::new();
-        etags.insert(id.0.clone(), "W/\"CK1\"".to_string());
+        etags.insert(id.0.clone(), GraphETag::from_change_key("CK1"));
         etags
     }
 
@@ -1683,7 +1686,7 @@ mod tests {
             .etag_index
             .write()
             .await
-            .insert("m0".to_string(), "old".to_string());
+            .insert("m0".to_string(), GraphETag::from_odata_annotation("old"));
         let responses = vec![crate::types::BatchResponseItem {
             id: "0".to_string(),
             status: 200,
@@ -1726,7 +1729,7 @@ mod tests {
             .etag_index
             .write()
             .await
-            .insert("m0".to_string(), "old".to_string());
+            .insert("m0".to_string(), GraphETag::from_odata_annotation("old"));
         let ids = [ObjectId("m0".to_string())];
         let responses = vec![crate::types::BatchResponseItem {
             id: "0".to_string(),
@@ -1759,7 +1762,7 @@ mod tests {
             .etag_index
             .write()
             .await
-            .insert("m0".to_string(), "old".to_string());
+            .insert("m0".to_string(), GraphETag::from_odata_annotation("old"));
         let ids = [ObjectId("m0".to_string())];
         let resolved = resolve_batch_responses(
             &ids,
@@ -2244,7 +2247,7 @@ mod tests {
                 .etag_index
                 .write()
                 .await
-                .insert("m1".into(), "W/\"e\"".into());
+                .insert("m1".into(), GraphETag::from_odata_annotation("W/\"e\""));
             account
                 .client
                 .script_rest([crate::client::ScriptedRestResponse::json(
@@ -2288,7 +2291,7 @@ mod tests {
             .etag_index
             .write()
             .await
-            .insert("m1".into(), "W/\"e\"".into());
+            .insert("m1".into(), GraphETag::from_odata_annotation("W/\"e\""));
         account
             .client
             .script_rest([crate::client::ScriptedRestResponse::json(
@@ -2439,7 +2442,7 @@ mod tests {
         let account = shared_account();
         let id = foreign_message_id("shared@contoso.com", "AAMkfolder", "AAMkmsg");
         let mut native_keyed = HashMap::new();
-        native_keyed.insert("AAMkmsg".to_string(), "W/\"CK1\"".to_string());
+        native_keyed.insert("AAMkmsg".to_string(), GraphETag::from_change_key("CK1"));
         assert!(
             request_for_mutation(
                 &account,
@@ -2675,11 +2678,10 @@ mod tests {
     #[tokio::test]
     async fn rejected_batch_keeps_a_failed_etag_preflight() {
         let account = shared_account();
-        account
-            .etag_index
-            .write()
-            .await
-            .insert("cached".to_string(), "etag".to_string());
+        account.etag_index.write().await.insert(
+            "cached".to_string(),
+            GraphETag::from_odata_annotation("etag"),
+        );
         account.client.script_rest([
             crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::NOT_FOUND),
             crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::BAD_REQUEST),
@@ -2727,7 +2729,7 @@ mod tests {
                 .etag_index
                 .write()
                 .await
-                .insert(id.0.clone(), "etag".to_string());
+                .insert(id.0.clone(), GraphETag::from_odata_annotation("etag"));
         }
         account
             .client

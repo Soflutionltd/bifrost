@@ -28,6 +28,9 @@ use crate::core::id::Id;
 /// and a `queryState` are both opaque and either may contain any character a
 /// delimiter could be, so a delimited pair has no unambiguous split. JSON
 /// escapes its own contents, so both fields round-trip verbatim.
+///
+/// Mail search uses `search-3:` so a cross-door cursor fails the tag check
+/// before either codec interprets the other codec's payload.
 const PAGE_CURSOR_V2_PREFIX: &str = "2:";
 
 /// A decoded page cursor: the item the next page resumes strictly after, plus

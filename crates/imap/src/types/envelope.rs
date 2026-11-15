@@ -40,22 +40,7 @@ impl Envelope {
     /// Convenience method  -  the raw value is preserved in the field.
     pub fn first_in_reply_to(&self) -> Option<&str> {
         let raw = self.in_reply_to.as_deref()?;
-        // RFC 5322 Section 3.6.4: only structural angle brackets delimit a
-        // msg-id. Broken servers may include `<...>` inside quoted or
-        // commented explanatory text, which must not displace the real id.
-        if let Some(id) = first_structural_angle_token(raw) {
-            return Some(id);
-        }
-        if find_structural_angle(raw, 0, b'<').is_some() {
-            return None;
-        }
-
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
+        bifrost_types::mime::HeaderMap::first_message_id(raw)
     }
 
     /// Return the message-id stripped of angle brackets.
@@ -63,91 +48,8 @@ impl Envelope {
     /// Convenience method  -  the raw value is preserved in the field.
     pub fn bare_message_id(&self) -> Option<&str> {
         let raw = self.message_id.as_deref()?;
-        if let Some(id) = first_structural_angle_token(raw) {
-            return Some(id);
-        }
-        if find_structural_angle(raw, 0, b'<').is_some() {
-            return None;
-        }
-
-        let trimmed = raw.trim();
-        (!trimmed.is_empty()).then_some(trimmed)
+        bifrost_types::mime::HeaderMap::first_message_id(raw)
     }
-}
-
-/// Finds the first non-empty `<...>` token outside quoted strings and comments.
-///
-/// RFC 5322 Section 3.6.4 uses angle brackets as the structural `msg-id`
-/// delimiters. Quoted strings (Section 3.2.4) and comments (Section 3.2.2)
-/// may contain literal `<` / `>` characters, so this helper ignores those
-/// contexts when extracting a consumer-facing identifier.
-fn first_structural_angle_token(raw: &str) -> Option<&str> {
-    let mut offset = 0usize;
-    while let Some(start) = find_structural_angle(raw, offset, b'<') {
-        let Some(end) = find_structural_angle(raw, start + 1, b'>') else {
-            break;
-        };
-
-        let inner = raw[start + 1..end].trim();
-        if !inner.is_empty() {
-            return Some(inner);
-        }
-        offset = end + 1;
-    }
-    None
-}
-
-/// Finds the next angle bracket outside quoted strings and comments.
-///
-/// # References
-/// - RFC 5322 Section 3.2.2
-/// - RFC 5322 Section 3.2.4
-fn find_structural_angle(raw: &str, start: usize, target: u8) -> Option<usize> {
-    let bytes = raw.as_bytes();
-    let mut idx = start;
-    let mut comment_depth = 0u32;
-    let mut in_quotes = false;
-    let mut escaped = false;
-
-    while idx < bytes.len() {
-        let byte = bytes[idx];
-        if escaped {
-            escaped = false;
-            idx += 1;
-            continue;
-        }
-
-        if in_quotes {
-            match byte {
-                b'\\' => escaped = true,
-                b'"' => in_quotes = false,
-                _ => {}
-            }
-            idx += 1;
-            continue;
-        }
-
-        if comment_depth > 0 {
-            match byte {
-                b'\\' => escaped = true,
-                b'(' => comment_depth = comment_depth.saturating_add(1),
-                b')' => comment_depth = comment_depth.saturating_sub(1),
-                _ => {}
-            }
-            idx += 1;
-            continue;
-        }
-
-        match byte {
-            b'"' => in_quotes = true,
-            b'(' => comment_depth = 1,
-            _ if byte == target => return Some(idx),
-            _ => {}
-        }
-        idx += 1;
-    }
-
-    None
 }
 
 /// A single address entry from an ENVELOPE (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).

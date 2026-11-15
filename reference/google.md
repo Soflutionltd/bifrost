@@ -498,8 +498,8 @@ Mail mutation primitives use Gmail label modification:
   in both containers.
 
 One relocation rule, shared by `flags::move_placement_patch` between
-the bulk `batchModify` driver and the single-object builders in
-`pim.rs`, so a consumer cannot get different wire semantics depending
+the bulk `batchModify` driver, single-object builders in `pim.rs`,
+and filter move/delete actions, so a consumer cannot get different wire semantics depending
 on which entry point it reached. `INBOX` / `SPAM` / `TRASH` are Gmail's
 mutually exclusive display containers: Gmail renders a message under
 whichever of them it carries, whatever else is also attached. "Move
@@ -1529,6 +1529,14 @@ filename containing `inline` does not make an attachment inline. Draft re-render
 uses the same disposition and Content-ID helpers as attachment hydration.
 Inventory and message hydration share References parsing, stripping brackets
 and discarding empty tokens.
+Full message hydration and draft rendering adapt Gmail's MIME tree to the shared
+MIME body selector. Gmail body data is base64url-decoded once and treated as
+already transfer-decoded; Content-Type parameters retain the declared charset.
+Selection respects multipart alternatives and excludes text attachments from
+body candidates. Full hydration marks missing payloads, unavailable text body
+bytes, invalid base64url and selector defects as incomplete; external body bytes
+are not fetched by this mapping.
+
 `blob_handles_for_message` remains as the
 `Vec<BlobHandle>`-only helper `open_blob`'s tests build against.
 
@@ -1545,7 +1553,8 @@ boundary converting `crate::Error` (Net / ObservedNet / Response / JsonDecode /
 Base64 / Local) into an `AccountError`. `GmailErrorContext` carries
 the calling operation so `bifrost-types::recovery::derive` produces a
 precise `RecoveryClass`; the crate keeps no local classification
-tables.
+tables. Send and draft-send contexts inherit idempotency from the shared
+operation table without a local override.
 
 Mapping highlights:
 

@@ -37,7 +37,7 @@ pub(crate) enum Filter {
         value: Type,
     },
     Timezone {
-        #[serde(rename = "timezone")]
+        #[serde(rename = "timeZone")]
         value: String,
     },
     Members {

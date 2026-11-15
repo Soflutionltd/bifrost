@@ -157,26 +157,27 @@ impl ContinuationConsumer for AuthenticatePlainConsumer {
     }
 }
 
-/// Consumer for AUTHENTICATE XOAUTH2 (Google SASL mechanism).
+/// Consumer for AUTHENTICATE XOAUTH2 and OAUTHBEARER.
 ///
 /// Implements [`ContinuationConsumer`]. The first continuation triggers
-/// the base64 credential payload. Subsequent continuations are XOAUTH2
-/// error challenges; the client MUST reply with an empty `\r\n` to let
-/// the server send the final tagged NO/BAD.
+/// the base64 credential payload. Subsequent error challenges receive the
+/// mechanism-specific acknowledgement so the server can send its tagged failure.
 pub(crate) struct AuthenticateXoauth2Consumer {
-    /// Base64-encoded XOAUTH2 payload.
+    /// Base64-encoded OAuth payload.
     encoded: SecretString,
     /// Whether the initial credential payload has been sent.
     initial_sent: bool,
     buffered: Vec<UntaggedResponse>,
-    /// Wire mechanism token this consumer is driving. The consumer is shared
-    /// by XOAUTH2 and OAUTHBEARER (identical framing), so the token cannot be
-    /// inferred from the type and has to be carried.
-    mechanism: &'static str,
+    /// Mechanism determines both the diagnostic token and the error answer.
+    mechanism: bifrost_sasl::OAuthMechanism,
 }
 
 impl AuthenticateXoauth2Consumer {
-    pub(crate) fn new(encoded: SecretString, sasl_ir_used: bool, mechanism: &'static str) -> Self {
+    pub(crate) fn new(
+        encoded: SecretString,
+        sasl_ir_used: bool,
+        mechanism: bifrost_sasl::OAuthMechanism,
+    ) -> Self {
         Self {
             encoded,
             initial_sent: sasl_ir_used,
@@ -200,7 +201,7 @@ impl Consumer for AuthenticateXoauth2Consumer {
 
     fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
         // Surrender the `Either` buffer on both arms.
-        if let Err(e) = require_ok_auth(tagged, self.mechanism) {
+        if let Err(e) = require_ok_auth(tagged, self.mechanism.name()) {
             return Finalized::failure(e, self.buffered);
         }
         Finalized::success((), self.buffered)
@@ -214,13 +215,15 @@ impl ContinuationConsumer for AuthenticateXoauth2Consumer {
         _ctx: &ConsumerContext,
     ) -> Result<ContinuationReply, Error> {
         if self.initial_sent {
-            // XOAUTH2 error continuation: the server sent a base64-encoded
-            // error as `+ <error>`. The client MUST respond with an empty
-            // `\r\n` to let the server finish the exchange with a tagged
-            // NO/BAD (Google XOAUTH2 spec, non-IETF).
-            Ok(ContinuationReply::Write(b"\r\n".to_vec()))
+            use base64::Engine;
+
+            let mut bytes = base64::engine::general_purpose::STANDARD
+                .encode(self.mechanism.error_ack().as_bytes())
+                .into_bytes();
+            bytes.extend_from_slice(b"\r\n");
+            Ok(ContinuationReply::Write(bytes))
         } else {
-            // First continuation: send the XOAUTH2 credential payload.
+            // First continuation: send the OAuth credential payload.
             self.initial_sent = true;
             let mut bytes = Vec::with_capacity(self.encoded.len() + 2);
             bytes.extend_from_slice(self.encoded.as_bytes());
@@ -584,6 +587,38 @@ mod tests {
     }
 
     #[test]
+    fn oauth_error_continuations_use_the_mechanism_answer() {
+        use bifrost_sasl::OAuthMechanism;
+
+        for (mechanism, expected) in [
+            (OAuthMechanism::Xoauth2, b"\r\n".as_slice()),
+            (OAuthMechanism::OAuthBearer, b"AQ==\r\n".as_slice()),
+        ] {
+            for sasl_ir in [false, true] {
+                let mut consumer = AuthenticateXoauth2Consumer::new(
+                    "payload".to_owned().into(),
+                    sasl_ir,
+                    mechanism,
+                );
+                let continuation = || ContinuationRequest {
+                    code: None,
+                    data: "e30=".to_owned(),
+                };
+                if !sasl_ir {
+                    let ContinuationReply::Write(bytes) = consumer
+                        .on_continuation(continuation(), &context())
+                        .unwrap();
+                    assert_eq!(bytes, b"payload\r\n");
+                }
+                let ContinuationReply::Write(bytes) = consumer
+                    .on_continuation(continuation(), &context())
+                    .unwrap();
+                assert_eq!(bytes, expected);
+            }
+        }
+    }
+
+    #[test]
     fn a_server_rejection_names_the_mechanism_it_refused() {
         // The consumer is the last place that still knows which rung was on
         // the wire. If it does not stamp the name here, "which mechanism was
@@ -656,8 +691,12 @@ mod tests {
 
         // The XOAUTH2 consumer is shared by two mechanisms, so its token is
         // carried rather than inferred; both spellings must come back out.
-        for name in ["XOAUTH2", "OAUTHBEARER"] {
-            let oauth = AuthenticateXoauth2Consumer::new("payload".to_owned().into(), true, name);
+        for mechanism in [
+            bifrost_sasl::OAuthMechanism::Xoauth2,
+            bifrost_sasl::OAuthMechanism::OAuthBearer,
+        ] {
+            let oauth =
+                AuthenticateXoauth2Consumer::new("payload".to_owned().into(), true, mechanism);
             assert_eq!(
                 mechanism_of(
                     Box::new(oauth)
@@ -666,7 +705,7 @@ mod tests {
                         .err()
                         .unwrap()
                 ),
-                Some(name),
+                Some(mechanism.name()),
             );
         }
     }

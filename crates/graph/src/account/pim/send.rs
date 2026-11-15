@@ -63,16 +63,21 @@ pub(crate) async fn send_message(
     // The draft is the send's first leg, so its failure is stamped `Send`.
     let created = post_draft_message(client, &message, AccountOperation::Send).await?;
     let draft = send_created_draft(&created, "Graph draft create did not return an id")?;
+    let owner = request
+        .send_as
+        .as_ref()
+        .map(|send_as| send_as.mailbox().0.as_str());
     if let Some(at) = scheduled {
         // Stamp PidTagDeferredSendTime on the draft before send so
         // Graph queues it for deferred delivery.
-        stamp_deferred_send_time(client, &draft, at, AccountOperation::Send)
+        stamp_deferred_send_time(&account, owner, &draft, at, AccountOperation::Send)
             .await
             .map_err(|e| send_progress_error(e, &draft, false, false))?;
     }
     send_draft_message(client, &draft)
         .await
         .map_err(|e| send_progress_error(e, &draft, scheduled.is_some(), true))?;
+    evict_draft_etag(&account, owner, &draft).await;
     // For a scheduled send-as, the draft lives in the shared mailbox, not
     // `/me`; the cancel/reschedule handle must carry the owning mailbox so
     // those ops route to the same `/users/{id}` client the draft was
@@ -112,6 +117,7 @@ pub(crate) async fn send_raw_message(
     send_draft_message(client, &draft)
         .await
         .map_err(|e| send_progress_error(e, &draft, false, true))?;
+    evict_draft_etag(&account, None, &draft).await;
     Ok(ObjectId(draft.0))
 }
 
@@ -231,11 +237,13 @@ pub(super) const DEFERRED_SEND_TIME_PROPERTY_ID: &str = "SystemTime 0x3FEF";
 /// serialized as ISO-8601 UTC. Used both by the scheduled send path and
 /// by `reschedule_send` (Graph reschedule is an in-place PATCH).
 pub(super) async fn stamp_deferred_send_time(
-    client: &GraphClient,
+    account: &GraphAccount,
+    owner: Option<&str>,
     draft: &DraftHandle,
     at: std::time::SystemTime,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
+    let client = client_for_scheduled_send_handle(account, owner)?;
     let path = format!(
         "{}/messages/{}",
         client.api_path_prefix(),
@@ -250,7 +258,9 @@ pub(super) async fn stamp_deferred_send_time(
             bifrost_net::ReplayPolicy::Idempotent,
         )
         .await
-        .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))
+        .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))?;
+    evict_draft_etag(account, owner, draft).await;
+    Ok(())
 }
 
 /// The `MessagePatch` body that stamps `PidTagDeferredSendTime` on a
@@ -287,7 +297,9 @@ pub(crate) async fn cancel_scheduled_send(
                 e,
                 GraphErrorContext::graph(AccountOperation::CancelScheduledSend),
             )
-        })
+        })?;
+    evict_draft_etag(&account, mailbox, &DraftHandle(draft_id.to_string())).await;
+    Ok(())
 }
 
 pub(crate) async fn reschedule_send(
@@ -300,9 +312,15 @@ pub(crate) async fn reschedule_send(
     // Route through the client the draft was created on (the handle's
     // owning-mailbox discriminator) and patch the native draft id.
     let (mailbox, draft_id) = decode_scheduled_send_handle(&handle.0);
-    let client = client_for_scheduled_send_handle(&account, mailbox)?;
     let draft = DraftHandle(draft_id.to_string());
-    stamp_deferred_send_time(client, &draft, scheduled, AccountOperation::RescheduleSend).await?;
+    stamp_deferred_send_time(
+        &account,
+        mailbox,
+        &draft,
+        scheduled,
+        AccountOperation::RescheduleSend,
+    )
+    .await?;
     Ok(handle)
 }
 

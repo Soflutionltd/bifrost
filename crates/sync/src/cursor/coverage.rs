@@ -754,6 +754,17 @@ impl PendingCoverage {
         expected_fence: Option<u64>,
     ) -> Result<PublicationId, CoverageClaim> {
         let lane = Lane::of(&checkpoint);
+        self.register_lane_in(checkpoint, claim, walk_watermark, expected_fence, lane)
+    }
+
+    fn register_lane_in(
+        &self,
+        checkpoint: Checkpoint,
+        claim: CoverageClaim,
+        walk_watermark: Option<u64>,
+        expected_fence: Option<u64>,
+        lane: Lane,
+    ) -> Result<PublicationId, CoverageClaim> {
         let receipt = PublicationReceipt {
             checkpoint: Some(checkpoint.clone()),
             claim: claim.clone(),
@@ -764,9 +775,11 @@ impl PendingCoverage {
         // mint and the registration, so no reset can close between a producer
         // passing it and its publication becoming visible to the invalidation.
         if let Some(expected) = expected_fence {
-            let scope = lane
-                .scope()
-                .expect("conditional registration of a checkpoint with no scope");
+            // An unknown checkpoint cannot prove which scope's fence guards it.
+            // Refuse before minting, returning its debt to the producer.
+            let Some(scope) = lane.scope() else {
+                return Err(claim);
+            };
             if Self::scope_fence_in(&ledger, scope) != expected {
                 return Err(claim);
             }
@@ -2051,7 +2064,7 @@ pub type Publications = PendingCoverage;
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaimLookup, CoverageClaim, PendingCoverage};
+    use super::{ClaimLookup, CoverageClaim, Lane, PendingCoverage};
     use bifrost_types::{
         AccountErrorBuilder, AccountErrorKind, Cause, ChangeCursor, Checkpoint, CoverageDomain,
         CursorScope, DiagnosticText, InventoryCoverageReport, InventoryObligation, ObjectId,
@@ -2060,6 +2073,25 @@ mod tests {
 
     fn scope() -> CursorScope {
         CursorScope::Type(ObjectType::Email)
+    }
+
+    #[test]
+    fn fence_registration_refuses_an_unkeyed_lane_without_minting() {
+        let pending = PendingCoverage::new();
+        // Downstream code cannot construct a future non-exhaustive variant.
+        // Inject its lane into the same registration path instead.
+        let result = pending.register_lane_in(
+            checkpoint(b"unknown"),
+            CoverageClaim::new(degraded("owed"), 7),
+            None,
+            Some(0),
+            Lane::UnkeyedCheckpoint,
+        );
+        let claim = result.expect_err("an unkeyed lane cannot pass a scope fence");
+        assert_eq!(claim.reports.len(), 1);
+        assert_eq!(claim.generation, 7);
+        assert_eq!(pending.outstanding(), 0);
+        assert_eq!(pending.pending_checkpoints(), 0);
     }
 
     #[test]
