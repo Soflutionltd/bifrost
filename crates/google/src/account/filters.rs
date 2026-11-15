@@ -22,15 +22,7 @@ use crate::types::{
 
 use super::error::{GmailErrorContext, into_account_error};
 use super::flags;
-
-const LABEL_INBOX: &str = "INBOX";
-const LABEL_TRASH: &str = "TRASH";
-const LABEL_UNREAD: &str = "UNREAD";
-const LABEL_STARRED: &str = "STARRED";
-const LABEL_SENT: &str = "SENT";
-const LABEL_DRAFT: &str = "DRAFT";
-const LABEL_SPAM: &str = "SPAM";
-const ARCHIVE_ID: &str = "archive";
+use super::flags::{LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD};
 
 pub(crate) fn list(
     client: Arc<GmailClient>,
@@ -537,15 +529,9 @@ fn query_term(value: &str) -> String {
 }
 
 fn container_query(id: &str) -> String {
-    match id {
-        LABEL_INBOX => "in:inbox".to_string(),
-        LABEL_SENT => "in:sent".to_string(),
-        LABEL_DRAFT => "in:drafts".to_string(),
-        LABEL_TRASH => "in:trash".to_string(),
-        LABEL_SPAM => "in:spam".to_string(),
-        _ if id == ARCHIVE_ID => "-in:inbox -in:sent -in:drafts -in:trash -in:spam".to_string(),
-        _ => format!("label:{}", query_term(id)),
-    }
+    super::flags::container_search_operator(id)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("label:{}", query_term(id)))
 }
 
 fn gmail_date(time: SystemTime) -> String {
@@ -558,6 +544,18 @@ fn gmail_date(time: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_queries_share_case_insensitive_system_vocabulary() {
+        for id in ["inbox", "sent", "draft", "trash", "spam", "Archive"] {
+            assert_eq!(
+                container_query(id),
+                container_query(&id.to_ascii_uppercase())
+            );
+        }
+        assert!(container_query("Archive").starts_with("-in:inbox"));
+        assert_eq!(container_query("Label_Case"), "label:Label_Case");
+    }
 
     #[test]
     fn filter_moves_use_canonical_placement() {

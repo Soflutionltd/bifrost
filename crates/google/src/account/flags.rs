@@ -4,11 +4,11 @@ use bifrost_types::FlagOp;
 
 use crate::types::GmailLabel;
 
-const LABEL_UNREAD: &str = "UNREAD";
-const LABEL_STARRED: &str = "STARRED";
-const LABEL_DRAFT: &str = "DRAFT";
-const LABEL_SENT: &str = "SENT";
-const LABEL_IMPORTANT: &str = "IMPORTANT";
+pub(crate) const LABEL_UNREAD: &str = "UNREAD";
+pub(crate) const LABEL_STARRED: &str = "STARRED";
+pub(crate) const LABEL_DRAFT: &str = "DRAFT";
+pub(crate) const LABEL_SENT: &str = "SENT";
+pub(crate) const LABEL_IMPORTANT: &str = "IMPORTANT";
 
 /// Gmail's mutually exclusive display containers.
 ///
@@ -33,6 +33,32 @@ pub(crate) const ARCHIVE_ID: &str = "archive";
 
 pub(crate) fn is_archive_id(id: &str) -> bool {
     id.eq_ignore_ascii_case(ARCHIVE_ID)
+}
+
+/// Known system ids and the synthetic archive are case-insensitive throughout
+/// the account. User ids retain their exact provider spelling.
+pub(crate) fn container_search_operator(id: &str) -> Option<&'static str> {
+    [
+        (LABEL_INBOX, "in:inbox"),
+        (LABEL_SENT, "in:sent"),
+        (LABEL_DRAFT, "in:drafts"),
+        (LABEL_TRASH, "in:trash"),
+        (LABEL_SPAM, "in:spam"),
+        (
+            ARCHIVE_ID,
+            "-in:inbox -in:sent -in:drafts -in:trash -in:spam",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(label, query)| id.eq_ignore_ascii_case(label).then_some(query))
+}
+
+/// Missing or unknown native types are not proof of user ownership. Outlook
+/// users expect system labels to survive exact flag replacement, and unknown
+/// labels must receive the same conservative treatment. Category flags remain
+/// explicitly writable through Add/Remove without becoming user-owned labels.
+pub(crate) fn label_is_user(label: &GmailLabel) -> bool {
+    label.label_type.as_deref() == Some("user")
 }
 
 /// The single Gmail relocation rule, shared by the bulk driver and the
@@ -247,10 +273,7 @@ fn patch_for_set(flags: &HashSet<String>, labels: &[GmailLabel]) -> LabelPatch {
     // every `Set` would fight it. Those flags therefore round-trip as
     // no-ops here: resolvable (so they never poison `unsupported_flags`),
     // but never added or removed by an exact-set operation.
-    for label in labels
-        .iter()
-        .filter(|label| label.label_type.as_deref() == Some("user"))
-    {
+    for label in labels.iter().filter(|label| label_is_user(label)) {
         let flag = format!("{USER_LABEL_FLAG_PREFIX}{}:{}", label.id, label.name);
         if flags.iter().any(|candidate| {
             user_label_id_from_flag(candidate, labels).as_deref() == Some(label.id.as_str())
@@ -395,10 +418,7 @@ fn user_label_id_from_flag(flag: &str, labels: &[GmailLabel]) -> Option<String> 
     let (id, _advisory_name) = flag.strip_prefix(USER_LABEL_FLAG_PREFIX)?.split_once(':')?;
     labels
         .iter()
-        .find(|label| {
-            label.id == id
-                && (label.label_type.as_deref() == Some("user") || is_category_label_id(&label.id))
-        })
+        .find(|label| label.id == id && (label_is_user(label) || is_category_label_id(&label.id)))
         .map(|label| label.id.clone())
 }
 

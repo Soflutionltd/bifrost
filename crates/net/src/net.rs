@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bifrost_types::TransmissionState;
@@ -351,7 +351,7 @@ impl Net {
                 concurrency_limit: spec.concurrency_limit,
                 user_agent: spec.user_agent,
                 follow_redirects: spec.follow_redirects,
-                priority: AtomicU8::new(Priority::Foreground as u8),
+                priority: Mutex::new(Priority::Foreground),
             }),
         }
     }
@@ -477,10 +477,9 @@ pub(crate) struct AccountNetInner {
     pub(crate) user_agent: String,
     /// Account-scoped redirect policy and trusted-host allowlist.
     pub(crate) follow_redirects: FollowRedirects,
-    /// Engine-controlled priority hint. Atomic so the hot per-request
-    /// read does not take a lock. Stored as the `Priority` enum's
-    /// discriminant byte; `priority()` converts back.
-    pub(crate) priority: AtomicU8,
+    /// Engine-controlled priority hint, stored as its actual type so a new
+    /// priority cannot silently decode as Normal.
+    pub(crate) priority: Mutex<Priority>,
     /// Shared per-id payload admission, independent of handle registration.
     pub(crate) bandwidth_budget: BandwidthBudget,
 }
@@ -641,7 +640,7 @@ impl AccountNet {
         // bytes that do not match the requested offset; assembling
         // them into the caller's blob would corrupt it silently.
         let validated = (|| {
-            if let Some(want) = want_range.as_deref() {
+            if let (Some(want), Some(requested)) = (want_range.as_deref(), range) {
                 if status != reqwest::StatusCode::PARTIAL_CONTENT {
                     return Err(Error::RangeNotHonored {
                         kind: RangeFailureKind::ResponseNotPartial,
@@ -659,7 +658,7 @@ impl AccountNet {
                     });
                 };
                 let got = got_hv.to_str().unwrap_or("");
-                if !content_range_matches(want, got) {
+                if !content_range_matches(requested, got) {
                     return Err(Error::RangeNotHonored {
                         kind: RangeFailureKind::ContentRangeMismatch,
                         message: format!("content-range mismatch: requested {want}, got {got}"),
@@ -704,24 +703,23 @@ impl AccountNet {
         &self.inner.bandwidth_budget
     }
 
-    /// Set the engine-controlled priority hint. Single atomic store.
+    /// Set the engine-controlled priority hint.
     pub fn set_priority(&self, p: Priority) {
-        self.inner.priority.store(p as u8, Ordering::Relaxed);
+        *self
+            .inner
+            .priority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = p;
     }
 
     /// Current priority hint.
     #[must_use]
     pub fn priority(&self) -> Priority {
-        match self.inner.priority.load(Ordering::Relaxed) {
-            x if x == Priority::Foreground as u8 => Priority::Foreground,
-            x if x == Priority::Normal as u8 => Priority::Normal,
-            x if x == Priority::Background as u8 => Priority::Background,
-            x if x == Priority::Bulk as u8 => Priority::Bulk,
-            // Unreachable in practice: only set_priority writes to
-            // this atomic and the enum is non-exhaustive only at the
-            // public API boundary, not on the wire.
-            _ => Priority::Normal,
-        }
+        *self
+            .inner
+            .priority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The account this handle is scoped to.
@@ -902,7 +900,7 @@ impl AccountNet {
                 concurrency_limit: self.inner.concurrency_limit.clone(),
                 user_agent: self.inner.user_agent.clone(),
                 follow_redirects: self.inner.follow_redirects.clone(),
-                priority: AtomicU8::new(self.inner.priority.load(Ordering::Relaxed)),
+                priority: Mutex::new(self.priority()),
             }),
         }
     }
@@ -926,6 +924,8 @@ pub struct AccountSpec {
     /// Default total timeout applied to requests from this account.
     /// `None` leaves requests unbounded unless a builder sets one.
     pub request_timeout: Option<Duration>,
+    // Keep this input while protocol consumers still assign it directly. A
+    // rename must migrate those consumers together; it is not a second clock.
     /// Legacy name for `response_headers_timeout`. Retained for source
     /// compatibility; new code should set `response_headers_timeout`.
     pub connect_timeout: Option<Duration>,
@@ -1037,22 +1037,15 @@ pub(crate) fn encode_range(range: ByteRange) -> Result<String, Error> {
 /// which permitted truncated bodies (e.g. server returns `bytes
 /// 0-9/100` to `bytes=0-` and the caller assembled a 10-byte slice
 /// believing it had the full resource).
-fn content_range_matches(req_range: &str, resp_range: &str) -> bool {
-    // Parse `bytes=START-END?` from the request side.
-    let Some(req_rest) = req_range.strip_prefix("bytes=") else {
-        return false;
-    };
-    let (req_start, req_end) = match req_rest.split_once('-') {
-        Some((s, e)) => (s.trim(), e.trim()),
-        None => return false,
-    };
-    let Ok(req_start_n) = req_start.parse::<u64>() else {
-        return false;
-    };
-    let req_end_n: Option<u64> = if req_end.is_empty() {
-        None
-    } else {
-        req_end.parse().ok()
+fn content_range_matches(req_range: ByteRange, resp_range: &str) -> bool {
+    let req_start_n = req_range.start;
+    let req_end_n = match req_range.length {
+        Some(0) => return false,
+        Some(length) => match req_start_n.checked_add(length - 1) {
+            Some(end) => Some(end),
+            None => return false,
+        },
+        None => None,
     };
 
     // Parse `bytes START-END/TOTAL` from the response side.
@@ -1235,7 +1228,13 @@ mod tests {
 
     #[test]
     fn content_range_rejects_inverted_response_range() {
-        assert!(!content_range_matches("bytes=100-", "bytes 100-99/100"));
+        assert!(!content_range_matches(
+            ByteRange {
+                start: 100,
+                length: None
+            },
+            "bytes 100-99/100"
+        ));
     }
 
     // ---- AccountSpec defaults -----------------------------------------
@@ -1318,13 +1317,31 @@ mod tests {
 
     #[test]
     fn content_range_rejects_end_at_or_after_total() {
-        assert!(!content_range_matches("bytes=0-99", "bytes 0-99/99"));
-        assert!(!content_range_matches("bytes=0-", "bytes 0-100/100"));
+        assert!(!content_range_matches(
+            ByteRange {
+                start: 0,
+                length: Some(100)
+            },
+            "bytes 0-99/99"
+        ));
+        assert!(!content_range_matches(
+            ByteRange {
+                start: 0,
+                length: None
+            },
+            "bytes 0-100/100"
+        ));
     }
 
     #[test]
     fn content_range_accepts_valid_open_ended_tail() {
-        assert!(content_range_matches("bytes=10-", "bytes 10-99/100"));
+        assert!(content_range_matches(
+            ByteRange {
+                start: 10,
+                length: None
+            },
+            "bytes 10-99/100"
+        ));
     }
 
     // ---- encode_range -------------------------------------------------
@@ -1413,50 +1430,144 @@ mod tests {
 
     #[test]
     fn content_range_matches_an_exact_closed_window() {
-        assert!(content_range_matches("bytes=0-99", "bytes 0-99/1000"));
-        assert!(content_range_matches("bytes=0-99", "bytes 0-99/*"));
+        assert!(content_range_matches(
+            ByteRange {
+                start: 0,
+                length: Some(100)
+            },
+            "bytes 0-99/1000"
+        ));
+        assert!(content_range_matches(
+            ByteRange {
+                start: 0,
+                length: Some(100)
+            },
+            "bytes 0-99/*"
+        ));
     }
 
     #[test]
     fn content_range_accepts_a_legally_shortened_closed_window() {
-        assert!(content_range_matches("bytes=0-99", "bytes 0-49/50"));
+        assert!(content_range_matches(
+            ByteRange {
+                start: 0,
+                length: Some(100)
+            },
+            "bytes 0-49/50"
+        ));
     }
 
     #[test]
     fn content_range_rejects_a_short_window_before_the_resource_tail() {
-        assert!(!content_range_matches("bytes=0-99", "bytes 0-49/1000"));
+        assert!(!content_range_matches(
+            ByteRange {
+                start: 0,
+                length: Some(100)
+            },
+            "bytes 0-49/1000"
+        ));
     }
 
     #[test]
     fn content_range_rejects_a_shifted_start() {
-        assert!(!content_range_matches("bytes=10-19", "bytes 11-19/100"));
-        assert!(!content_range_matches("bytes=10-", "bytes 11-99/100"));
+        assert!(!content_range_matches(
+            ByteRange {
+                start: 10,
+                length: Some(10)
+            },
+            "bytes 11-19/100"
+        ));
+        assert!(!content_range_matches(
+            ByteRange {
+                start: 10,
+                length: None
+            },
+            "bytes 11-99/100"
+        ));
     }
 
     #[test]
     fn content_range_rejects_malformed_syntax_on_either_side() {
-        assert!(!content_range_matches("0-99", "bytes 0-99/100"));
-        assert!(!content_range_matches("bytes=0-99", "bytes=0-99/100"));
-        assert!(!content_range_matches("bytes=0-99", "bytes 0-99"));
-        assert!(!content_range_matches("bytes=0-99", "bytes 0/100"));
-        assert!(!content_range_matches("bytes=abc-99", "bytes 0-99/100"));
-        assert!(!content_range_matches("bytes=0-99", "bytes 0-xyz/100"));
-        assert!(!content_range_matches("bytes=0-99", "bytes 0-99/xyz"));
-        assert!(!content_range_matches("bytes=0-99", ""));
+        assert!(!content_range_matches(
+            ByteRange {
+                start: 0,
+                length: Some(100)
+            },
+            "bytes=0-99/100"
+        ));
+        assert!(!content_range_matches(
+            ByteRange {
+                start: 0,
+                length: Some(100)
+            },
+            "bytes 0-99"
+        ));
+        assert!(!content_range_matches(
+            ByteRange {
+                start: 0,
+                length: Some(100)
+            },
+            "bytes 0/100"
+        ));
+        assert!(!content_range_matches(
+            ByteRange {
+                start: 0,
+                length: Some(100)
+            },
+            "bytes 0-xyz/100"
+        ));
+        assert!(!content_range_matches(
+            ByteRange {
+                start: 0,
+                length: Some(100)
+            },
+            "bytes 0-99/xyz"
+        ));
+        assert!(!content_range_matches(
+            ByteRange {
+                start: 0,
+                length: Some(100)
+            },
+            ""
+        ));
     }
 
     /// An open-ended request against an unknown total cannot be
     /// verified, so any end at or past the start is accepted.
     #[test]
     fn content_range_open_ended_with_unknown_total_accepts_any_tail() {
-        assert!(content_range_matches("bytes=10-", "bytes 10-10/*"));
-        assert!(content_range_matches("bytes=10-", "bytes 10-999999/*"));
-        assert!(!content_range_matches("bytes=10-", "bytes 10-9/*"));
+        assert!(content_range_matches(
+            ByteRange {
+                start: 10,
+                length: None
+            },
+            "bytes 10-10/*"
+        ));
+        assert!(content_range_matches(
+            ByteRange {
+                start: 10,
+                length: None
+            },
+            "bytes 10-999999/*"
+        ));
+        assert!(!content_range_matches(
+            ByteRange {
+                start: 10,
+                length: None
+            },
+            "bytes 10-9/*"
+        ));
     }
 
     #[test]
     fn content_range_rejects_a_zero_total_resource() {
-        assert!(!content_range_matches("bytes=0-", "bytes 0-0/0"));
+        assert!(!content_range_matches(
+            ByteRange {
+                start: 0,
+                length: None
+            },
+            "bytes 0-0/0"
+        ));
     }
 
     fn build_net() -> Net {

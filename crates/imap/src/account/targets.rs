@@ -45,6 +45,10 @@ use crate::types::{MailboxName, Uid, UidSet};
 /// Every operand in the account layer is built from this and nothing else,
 /// so the set of UIDs a command names and the set of UIDs a caller believes
 /// it named cannot disagree.
+// Keep this wire admission separate from text decoding and cache observation:
+// operands report excluded targets, decoders reject malformed handles, compact
+// sets discard invalid observations, and poll's conversion asserts a prior
+// decoder guarantee. Sharing their failure policy would erase those contracts.
 fn operand_uid(uid: u32) -> Option<Uid> {
     Uid::new(uid)
 }

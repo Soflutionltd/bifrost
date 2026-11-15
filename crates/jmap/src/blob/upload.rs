@@ -6,7 +6,7 @@ use crate::{
     client::Client,
     core::{
         id::{AccountId, BlobId},
-        session::{URLPart, encode_template_value_at},
+        session::{TemplateValue, expand},
         transport::HttpTransport,
     },
 };
@@ -58,20 +58,12 @@ impl<Tr: HttpTransport> Client<Tr> {
                 size: data.len(),
             });
         }
-        let mut upload_url =
-            String::with_capacity(state.session().upload_url().len() + account_id.as_str().len());
-
-        for part in state.upload_url() {
-            match part {
-                URLPart::Value(value) => upload_url.push_str(value),
-                URLPart::Parameter(param) => {
-                    if let super::URLParameter::AccountId = param {
-                        upload_url
-                            .push_str(&encode_template_value_at(account_id.as_str(), &upload_url));
-                    }
-                }
-            }
-        }
+        let upload_url = expand(state.upload_url(), |param| {
+            TemplateValue::Scalar(match param {
+                super::URLParameter::AccountId => account_id.as_str().into(),
+                _ => "".into(),
+            })
+        });
 
         let bytes = self
             .transport()

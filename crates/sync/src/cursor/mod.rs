@@ -447,6 +447,12 @@ impl CursorRegistry {
         // reach keeps every shape seen before it, merged under this write lock
         // so a shape recorded on the live registry while the replacement was
         // staged is not lost.
+        // Drive fences belong to the live registry, including deleted scopes:
+        // reintroducing a scope must never roll its delete counter backwards.
+        // The registry-wide bump fences this cutover independently.
+        replacement
+            .scope_generations
+            .clone_from(&current.scope_generations);
         replacement.reach.merge(&current.reach);
         *current = replacement;
     }
@@ -685,6 +691,23 @@ mod tests {
             live.scopes_for_membership(&MembershipScope::Mailbox(MailboxId("old".into())))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn topology_replacement_preserves_deleted_scope_fences() {
+        let live = CursorRegistry::new();
+        let scope = CursorScope::Account;
+        live.put(cursor(scope.clone(), b"first"));
+        live.delete(&scope);
+        let generation = live.drive_generation(&scope).scope;
+        let replacement = CursorRegistry::new();
+        live.replace_topology_preserving_cursors(&replacement);
+        assert_eq!(live.drive_generation(&scope).scope, generation);
+        replacement.put(cursor(scope.clone(), b"staged"));
+        live.replace_topology_preserving_cursors(&replacement);
+        assert_eq!(live.drive_generation(&scope).scope, generation);
+        live.delete(&scope);
+        assert_eq!(live.drive_generation(&scope).scope, generation + 1);
     }
 
     #[test]

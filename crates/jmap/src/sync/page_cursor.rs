@@ -120,9 +120,11 @@ pub(super) trait PageKind {
     /// deliberately, an anchor-only payload: a cursor with no pinned
     /// `queryState` cannot be checked for reordering, so honouring it would
     /// be exactly the unchecked paging the pin exists to end.
-    /// `SyncState(SchemaIncompatible)` is the crate's standing answer for an
-    /// older cursor payload version (see the mail search cursor), and it
-    /// tells the consumer what to do: restart from the first page.
+    /// The refusal is [`cursor_error`]: `Request(Malformed)` with
+    /// `RequestCause::InvalidArgument { field: Some("page_cursor") }`, the
+    /// crate's standing answer for an older cursor payload version (see the
+    /// mail search cursor). The `page_cursor` field, not the kind, is what
+    /// tells the consumer to restart paging from the first page.
     fn decode_page_cursor(
         page_cursor: Option<Vec<u8>>,
         operation: AccountOperation,
@@ -432,9 +434,9 @@ fn is_anchor_not_found(error: &crate::Error) -> bool {
 ///   walk and it will work". Here the state did NOT move, so a repeat
 ///   re-issues the identical request and gets the identical broken envelope;
 ///   the caller would spin.
-/// - `SyncState(SchemaIncompatible)` (what a stale cursor payload gets) also
-///   directs a restart, and it points the blame at OUR cursor when the defect
-///   is in the response.
+/// - `Request(Malformed)` with field `page_cursor` (what a stale cursor
+///   payload gets) directs a restart from page one, and it points the blame
+///   at the caller's cursor when the defect is in the response.
 ///
 /// `ProviderContractViolation` is the one a consumer can act on: it is
 /// terminal for this walk and it names the server.
@@ -442,18 +444,35 @@ fn page_envelope_violation(operation: AccountOperation, message: String) -> Acco
     super::error::contract_violation(operation, None, message)
 }
 
-/// A cursor payload this crate cannot honour: an older or malformed encoding.
-/// `SyncState(SchemaIncompatible)` tells the consumer to restart the walk.
-fn cursor_error(operation: AccountOperation, message: String) -> AccountError {
+/// A cursor payload this crate cannot honour: an older, retired, malformed or
+/// out-of-range encoding.
+///
+/// Classified `Request(Malformed)` (recovery `ClientBug`, so the ENGINE takes
+/// no action) with `RequestCause::InvalidArgument { field: Some("page_cursor") }`.
+/// That field is the contract: a consumer seeing it restarts this paging walk
+/// from page one, silently - an Outlook user whose saved search page went
+/// stale after an upgrade expects the results to reload, not an error.
+pub(super) fn cursor_error(operation: AccountOperation, message: String) -> AccountError {
+    // Restart only this caller-owned walk. Invalid page state must never clear
+    // an enterprise user's account-wide durable mail or sync checkpoints, which
+    // is what `SyncState(SchemaIncompatible)` would have directed the engine to do.
+    invalid_argument(operation, "page_cursor", message)
+}
+
+pub(super) fn invalid_argument(
+    operation: AccountOperation,
+    field: &'static str,
+    message: String,
+) -> AccountError {
     bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::SyncState(
-            bifrost_types::SyncStateErrorKind::SchemaIncompatible,
-        ),
-        bifrost_types::Cause::State(bifrost_types::StateCause::SchemaIncompatible),
+        bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+        bifrost_types::Cause::Request(bifrost_types::RequestCause::InvalidArgument {
+            field: Some(field),
+            message: Some(DiagnosticText::support_only(message)),
+        }),
     )
     .protocol(bifrost_types::Protocol::Jmap)
     .operation(operation)
-    .text(DiagnosticText::support_only(message))
     .try_build()
     .expect("valid account error classification")
 }
@@ -461,6 +480,19 @@ fn cursor_error(operation: AccountOperation, message: String) -> AccountError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_page_state_has_no_engine_recovery_directive() {
+        let error = cursor_error(AccountOperation::Search, "retired cursor".to_string());
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::ClientBug
+        ));
+    }
 
     enum TestMarker {}
 
@@ -740,19 +772,17 @@ mod tests {
             assert!(
                 matches!(
                     error.kind(),
-                    bifrost_types::AccountErrorKind::SyncState(
-                        bifrost_types::SyncStateErrorKind::SchemaIncompatible
+                    bifrost_types::AccountErrorKind::Request(
+                        bifrost_types::RequestErrorKind::Malformed
                     )
                 ),
-                "{refused} must be refused as SchemaIncompatible"
+                "{refused} must be refused as a caller error"
             );
         }
         let non_utf8 = decode(Some(vec![0xff, 0xfe])).expect_err("not UTF-8");
         assert!(matches!(
             non_utf8.kind(),
-            bifrost_types::AccountErrorKind::SyncState(
-                bifrost_types::SyncStateErrorKind::SchemaIncompatible
-            )
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
         ));
         assert_eq!(decode(None).expect("no cursor is a first page"), None);
     }
@@ -864,7 +894,9 @@ mod tests {
         assert!(empty.contains("Widget/query"), "{empty}");
         assert!(empty.contains("sprocket"), "{empty}");
 
-        let undecodable = text(&decode(Some(b"100".to_vec())).expect_err("v1 cursor"));
+        // Like the envelope violation, a refused cursor now carries its
+        // message in the `InvalidArgument` cause, so read the debug form.
+        let undecodable = format!("{:?}", decode(Some(b"100".to_vec())).expect_err("v1 cursor"));
         assert!(undecodable.contains("widget"), "{undecodable}");
     }
 }

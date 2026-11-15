@@ -312,7 +312,7 @@ pub(crate) fn set_importance(
         set_flag(
             &account,
             ids,
-            imap_flag_for_keyword("$important"),
+            imap_flag_for_keyword(IMPORTANCE_KEYWORD),
             important,
             AccountOperation::SetImportance,
         )
@@ -322,7 +322,9 @@ pub(crate) fn set_importance(
     })
 }
 
-/// IMAP's two-valued importance mapping: `High` sets the `$important`
+const IMPORTANCE_KEYWORD: &str = "$important";
+
+/// IMAP's two-valued importance mapping: `High` sets the importance
 /// keyword, `Normal`/`Low` clear it.
 fn importance_sets_important_keyword(level: Importance) -> bool {
     matches!(level, Importance::High)
@@ -1761,7 +1763,10 @@ async fn hydrate_decoded(
             )
             .await
             .map_err(err)?;
-        let merged = merge_requested_fetches(fetches, operand.uids());
+        let merged = super::get::merge_requested_fetches(fetches, operand.uids(), |_, _| {
+            Ok::<(), crate::Error>(())
+        })
+        .map_err(err)?;
         messages.extend(
             merged
                 .into_values()
@@ -1770,43 +1775,6 @@ async fn hydrate_decoded(
     }
     messages.sort_by(|a, b| a.id.0.cmp(&b.id.0));
     Ok(messages)
-}
-
-/// Fold a UID FETCH's collected responses into one response per REQUESTED
-/// UID.
-///
-/// The connection hands back every FETCH seen during the command, and two
-/// kinds are not the answer: an unsolicited FETCH for a UID nobody asked
-/// about (another client's flag change), which would otherwise hydrate as a
-/// message the caller never requested, and a second response for a requested
-/// UID - the server may split data items across responses, or append a
-/// FLAGS-only update - which would otherwise hydrate as a duplicate, possibly
-/// bodiless, copy. Responses without a UID cannot be attributed and are
-/// dropped. The fold is `get`'s `merge_fetch_response`: later data fills gaps
-/// and never blanks what an earlier response carried.
-fn merge_requested_fetches(
-    fetches: Vec<crate::types::FetchResponse>,
-    requested: &[u32],
-) -> HashMap<u32, crate::types::FetchResponse> {
-    let requested: std::collections::HashSet<u32> = requested.iter().copied().collect();
-    let mut by_uid: HashMap<u32, crate::types::FetchResponse> = HashMap::new();
-    for fetch in fetches {
-        let Some(uid) = fetch.uid else {
-            continue;
-        };
-        if !requested.contains(&uid) {
-            continue;
-        }
-        match by_uid.entry(uid) {
-            std::collections::hash_map::Entry::Occupied(mut held) => {
-                super::get::merge_fetch_response(held.get_mut(), fetch);
-            }
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(fetch);
-            }
-        }
-    }
-    by_uid
 }
 
 fn decoded_targets(
@@ -2009,6 +1977,13 @@ fn criteria_from_filter(
         SearchFilter::From(value) => leaf(SearchCriteria::new().from(value), op),
         SearchFilter::To(value) => leaf(SearchCriteria::new().to(value), op),
         SearchFilter::Subject(value) => leaf(SearchCriteria::new().subject(value), op),
+        // Has currently preserves the existing BODY approximation, which can
+        // match prose and miss encoded attachment filenames. It does not meet
+        // the attachment filename/type contract: enterprise users expect actual
+        // attachments. Correct support needs attachment-aware evaluation (also
+        // through AND/OR/NOT and pagination), not another SEARCH string alias.
+        // Do not replace this with Unsupported without owner authorization:
+        // that would remove the existing search path rather than repair it.
         SearchFilter::Body(value) | SearchFilter::Has(value) => {
             leaf(SearchCriteria::new().body(value), op)
         }
@@ -2755,8 +2730,13 @@ fn fetch_to_message(
         || decoded
             .as_ref()
             .is_some_and(|body| body.defects.iter().any(is_incomplete_defect));
+    // Unlike inventory and hydration, a PIM read is a one-off display answer
+    // that writes no cached flag state, so a reply missing FLAGS still shows
+    // the message (with no flags) rather than hiding it: an enterprise user
+    // asking for a message expects to see it. The sync lanes, whose output
+    // would overwrite cached read/flagged state, are the strict ones.
     let flags = super::inventory::flags_set(fetch.flags.as_deref().unwrap_or(&[]));
-    let importance = if flags.contains("$important") {
+    let importance = if flags.contains(IMPORTANCE_KEYWORD) {
         Importance::High
     } else {
         Importance::Normal
@@ -3765,7 +3745,7 @@ body text\r\n";
             Flag::Custom("$MDNSent".to_owned())
         );
         assert_eq!(
-            imap_flag_for_keyword("$important"),
+            imap_flag_for_keyword(IMPORTANCE_KEYWORD),
             Flag::Custom("$important".to_owned())
         );
     }

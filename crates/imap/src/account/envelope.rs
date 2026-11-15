@@ -397,26 +397,45 @@ fn decode_len_prefixed(
         .strip_prefix(prefix)
         .and_then(|v| v.strip_prefix(':'))
         .ok_or_else(|| malformed("invalid IMAP id prefix", op))?;
-    let Some((len, rest)) = value.split_once(':') else {
-        return Err(malformed("invalid IMAP id length", op));
-    };
-    let len = len
-        .parse::<usize>()
-        .map_err(|_| malformed("invalid IMAP id length", op))?;
-    let folder = rest
-        .get(..len)
-        .ok_or_else(|| malformed("invalid IMAP id folder length", op))?;
-    let after = rest
-        .get(len..)
-        .and_then(|v| v.strip_prefix(':'))
-        .ok_or_else(|| malformed("invalid IMAP id separator", op))?;
-    let folder = if wire_identity {
+    let (folder, after) = length_prefixed(value, "invalid IMAP id folder length", op)?;
+    let after = after.ok_or_else(|| malformed("invalid IMAP id separator", op))?;
+    let folder = decode_folder_identity(folder, wire_identity, op)?;
+    Ok((folder, after.to_owned()))
+}
+
+// All legacy handles carry literal folder text; current handles carry the
+// account's wire-preserving identity. Keep this choice shared across codecs.
+pub(super) fn decode_folder_identity(
+    folder: &str,
+    wire_identity: bool,
+    op: AccountOperation,
+) -> Result<MailboxName, AccountError> {
+    if wire_identity {
         MailboxName::from_account_id(folder)
     } else {
         MailboxName::new(folder)
     }
-    .map_err(|e| malformed(&e.to_string(), op))?;
-    Ok((folder, after.to_owned()))
+    .map_err(|err| malformed(&err.to_string(), op))
+}
+
+/// Read a byte-counted field without splitting a UTF-8 code point.
+pub(super) fn length_prefixed<'a>(
+    rest: &'a str,
+    detail: &str,
+    op: AccountOperation,
+) -> Result<(&'a str, Option<&'a str>), AccountError> {
+    let (len, rest) = rest.split_once(':').ok_or_else(|| malformed(detail, op))?;
+    let len = len.parse::<usize>().map_err(|_| malformed(detail, op))?;
+    let value = rest.get(..len).ok_or_else(|| malformed(detail, op))?;
+    let tail = rest.get(len..).ok_or_else(|| malformed(detail, op))?;
+    if tail.is_empty() {
+        Ok((value, None))
+    } else {
+        let tail = tail
+            .strip_prefix(':')
+            .ok_or_else(|| malformed(detail, op))?;
+        Ok((value, Some(tail)))
+    }
 }
 
 fn parse_u32(value: Option<&str>, op: AccountOperation) -> Result<u32, AccountError> {
@@ -434,7 +453,7 @@ fn parse_u32(value: Option<&str>, op: AccountOperation) -> Result<u32, AccountEr
 /// group so its ids get no outcome at all. The operand layer refuses a 0
 /// independently (`UidOperand` reports it as excluded, and the callers turn
 /// that into a failure), so neither boundary depends on the other.
-fn parse_nonzero_u32(
+pub(super) fn parse_nonzero_u32(
     value: Option<&str>,
     what: &str,
     op: AccountOperation,

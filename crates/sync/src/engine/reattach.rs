@@ -724,14 +724,14 @@ async fn handle_schema_incompatible(
         *entry = (*entry).max(epoch);
         ctx.cursors.delete(&scope);
     }
-    let mut delay = REOPEN_BACKOFF_INITIAL;
+    let mut backoff = crate::backoff::ReconnectBackoff::new(*REOPEN_BACKOFF);
     let mut last = None;
-    for attempt in 0..REOPEN_RETRY_BUDGET {
+    for attempt in 0..REOPEN_RETRY_BUDGET.0 {
         if attempt > 0 {
-            if !sleep_unless_shutdown(jittered(delay), ctx.shutdown).await {
+            let sleep_for = backoff.record_failure(crate::backoff::jitter_seed());
+            if !sleep_unless_shutdown(sleep_for, ctx.shutdown).await {
                 return RecoveryFollowUp::None;
             }
-            delay = delay.saturating_mul(2).min(REOPEN_BACKOFF_CAP);
         }
         match ctx.writer.reset_account_for_schema_recovery().await {
             Ok(()) => {
@@ -784,7 +784,8 @@ async fn handle_schema_incompatible(
 /// operator-attention errors remain intact; retry, reconcile, and other
 /// engine-action errors are converted to operator attention because the
 /// automatic reopen budget is spent.
-const REOPEN_RETRY_BUDGET: u32 = 3;
+struct AttemptBudget(u32);
+const REOPEN_RETRY_BUDGET: AttemptBudget = AttemptBudget(3);
 
 /// Wait out a recovery backoff, unless the account is being torn down.
 ///
@@ -799,8 +800,14 @@ pub(super) async fn sleep_unless_shutdown(delay: Duration, shutdown: &Cancellati
     }
 }
 
-const REOPEN_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
-const REOPEN_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
+// BackoffPolicy::new is not const upstream; keep named policies lazy rather
+// than duplicating its validation or changing the types crate from this layer.
+static REOPEN_BACKOFF: std::sync::LazyLock<bifrost_types::BackoffPolicy> =
+    std::sync::LazyLock::new(|| {
+        bifrost_types::BackoffPolicy::new(Duration::from_secs(1), Duration::from_secs(300), true)
+    });
+struct CumulativeWaitBudget(Duration);
+const REPAIR_WAIT_BUDGET: CumulativeWaitBudget = CumulativeWaitBudget(Duration::from_secs(300));
 
 /// Pacing belongs to the entire repair, including discarded replacements.
 #[derive(Default)]
@@ -816,7 +823,7 @@ struct RepairPacing {
 
 impl RepairPacing {
     fn exhaust_wait_budget(&mut self) -> Error {
-        self.waited = REOPEN_BACKOFF_CAP;
+        self.waited = REPAIR_WAIT_BUDGET.0;
         self.exhausted = true;
         Error::EstablishCursorFailed("recovery wait budget exhausted".into())
     }
@@ -875,7 +882,7 @@ impl RepairPacing {
             if wait.is_zero() {
                 return Ok(());
             }
-            let remaining = REOPEN_BACKOFF_CAP.saturating_sub(self.waited);
+            let remaining = REPAIR_WAIT_BUDGET.0.saturating_sub(self.waited);
             tokio::select! {
                 biased;
                 () = ctx.shutdown.cancelled() => return Err(Error::ShuttingDown),
@@ -1021,16 +1028,15 @@ async fn re_establish_scope_with_backoff(
     control: &SyncControl,
     walk_fence: u64,
 ) {
-    let mut delay = REOPEN_BACKOFF_INITIAL;
+    let mut backoff = crate::backoff::ReconnectBackoff::new(*REOPEN_BACKOFF);
     let mut last_account_error: Option<AccountError> = None;
     let mut pacing = RepairPacing::default();
-    for attempt in 0..REOPEN_RETRY_BUDGET {
+    for attempt in 0..REOPEN_RETRY_BUDGET.0 {
         if attempt > 0 && pacing.local_deadline.is_none() {
-            let sleep_for = jittered(delay);
+            let sleep_for = backoff.record_failure(crate::backoff::jitter_seed());
             if !sleep_unless_shutdown(sleep_for, ctx.shutdown).await {
                 return;
             }
-            delay = (delay.saturating_mul(2)).min(REOPEN_BACKOFF_CAP);
         }
         let acc_arc = ctx.current.load_full();
         let acc: &dyn Account = acc_arc.as_ref().as_ref();
@@ -1151,7 +1157,8 @@ async fn re_establish_scope_with_backoff(
             "scope re-establishment retry budget exhausted",
         )
         .with_protocol_detail(DiagnosticText::support_only(format!(
-            "scope: {scope:?}; attempts: {REOPEN_RETRY_BUDGET}"
+            "scope: {scope:?}; attempts: {}",
+            REOPEN_RETRY_BUDGET.0
         ))),
     );
 }
@@ -2203,11 +2210,11 @@ pub(super) fn accepted_push_scopes(result: &bifrost_types::PushSubscription) -> 
 /// caller must not run follow-up repairs against an account that did not
 /// restart.
 async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
-    let mut delay = REOPEN_BACKOFF_INITIAL;
+    let mut backoff = crate::backoff::ReconnectBackoff::new(*REOPEN_BACKOFF);
     let mut last_error: Option<AccountError> = None;
     let mut attempt = 0;
     let mut pacing = RepairPacing::default();
-    'restart: while attempt < REOPEN_RETRY_BUDGET {
+    'restart: while attempt < REOPEN_RETRY_BUDGET.0 {
         // A consumer pause is a quiescence boundary. Keep this recovery
         // request queued until resume instead of opening a replacement while
         // the account has promised to be idle.
@@ -2215,11 +2222,10 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
             return false;
         }
         if attempt > 0 && pacing.local_deadline.is_none() {
-            let sleep_for = jittered(delay);
+            let sleep_for = backoff.record_failure(crate::backoff::jitter_seed());
             if !sleep_unless_shutdown(sleep_for, ctx.shutdown).await {
                 return false;
             }
-            delay = (delay.saturating_mul(2)).min(REOPEN_BACKOFF_CAP);
         }
         if pacing.wait(ctx, None, None).await.is_err() {
             if pacing.exhausted {
@@ -2370,20 +2376,6 @@ pub(super) fn log_open_skips(account_id: &AccountId, skips: &[SkippedScope], pha
             "open skipped a degraded scope; primary surface attached without it"
         );
     }
-}
-
-pub(super) fn jittered(base: Duration) -> Duration {
-    // +/-20% jitter to break thundering-herd reopen lockstep. Entropy
-    // comes from the workspace UUID RNG (the same source bifrost-net's
-    // backoff uses) rather than `SystemTime::now()`: a wall-clock jump
-    // or low-resolution clock must not influence the jitter, and a
-    // clock running backwards would otherwise collapse the spread.
-    let entropy = i64::try_from(uuid::Uuid::new_v4().as_u128() % 401).unwrap_or(0);
-    let percent_offset = entropy - 200; // [-200, +200] basis points
-    let base_ms = i64::try_from(base.as_millis()).unwrap_or(i64::MAX);
-    let delta_ms = (base_ms * percent_offset) / 1_000;
-    let total = u64::try_from((base_ms + delta_ms).max(0)).unwrap_or(0);
-    Duration::from_millis(total)
 }
 
 fn broadcast_terminated(

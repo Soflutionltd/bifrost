@@ -112,8 +112,10 @@ APPEND resolves APPENDLIMIT (RFC 7889) before writing anything: a numeric `APPEN
 CAPABILITY advertisements (including response-code form) and ENABLED lists are
 adopted immediately on arrival, even when the enclosing command later returns
 NO or BAD. Command consumers report that refusal without rolling back the
-advertised capabilities or enabled wire mode. A refused LOGOUT clears its
-pending transition, so a later command's OK cannot end the session.
+advertised capabilities or enabled wire mode. A pending LOGOUT retains its
+command tag, and only that tag's completion consumes the pending effect: OK
+transitions to `Logout`, NO/BAD clears the attempt, so a later command's OK
+cannot end the session.
 During LOGOUT, a BYE carrying a critical response code publishes both the code's
 event and the distinct Bye event, once each.
 
@@ -177,10 +179,12 @@ abandoned it.
 `PooledConn::drop` parks only a member that `is_reusable()` (alive AND not
 abandoned). Without this, the next checkout queues behind the still running
 claimed command and times out in turn, so one slow command cascades into a
-run of spurious timeouts on the same connection. `Pipeline` execution admits
-the same way without a deadline: dropping it while it waits for channel
-capacity submits nothing and does not abandon the connection, and dropping
-it while queued withdraws the batch. IDLE follows the same arbiter: its
+run of spurious timeouts on the same connection. `Pipeline::execute(timeout)`
+and `execute_dynamic(timeout)` use the shared submission helper with one
+deadline covering admission and execution. Expiry returns
+`PipelineError::Timeout`: withdrawal before commit is `Unsent` and preserves
+reuse; an unanswered committed batch is `InFlight` and abandons the
+connection. A caller timeout returns no per-command results. IDLE follows the same arbiter: its
 admission races capacity against the cancel token and the event deadline,
 and every departure from its wait that would send DONE (an event, `Cancelled`,
 `Timeout`) first withdraws, returning the departure's value with nothing
@@ -426,6 +430,11 @@ parser builds an owned response and treats truncated input as a parse error.
 Likewise, standalone borrowed-input parsers must copy body octets to return
 owned `Bytes`; callers with owned backing already have `parse_response_bytes`.
 Generic string fields still decode into owned values.
+
+Pipeline response reads and synchronizing-literal continuation waits enforce
+the strictest remaining budget among eligible active consumers (commands
+already sent), excluding completed and unsent commands. Single-command literal
+negotiation uses its consumer's budget. IDLE has no consumer literal budget.
 
 The literal budget deliberately measures declared payload octets. Charging
 syntax against that same number would change its meaning, including refusing
@@ -692,6 +701,13 @@ recovery open is a fresh connection, which is safe whatever this one reached.
 
 `SyncFetchRequest` / `SyncFetchResult` wrap UID FETCH with `CHANGEDSINCE` and `VANISHED`; `sync_fetch()` surfaces both VANISHED ranges and per-UID FETCH responses.
 
+Inventory and the three change strategies deliberately do NOT refuse a
+UIDNOTSTICKY folder (only the poller does). Refusing would hide that folder's
+mail from the user entirely, which removes a capability and needs an owner
+ruling. Its UIDs do not persist across selections, so its cursor is
+re-established whenever UIDVALIDITY moves; a cursor-free sync mode for such
+folders is an open follow-up, not current behaviour.
+
 `SelectedMailbox` carries `highest_mod_seq`, `uid_validity`, `uid_next`, `no_mod_seq`, and the SELECT-side VANISHED list. A missing `UIDVALIDITY` is a protocol error rather than a silent 0: the account layer judges it through one helper, `selected_uidvalidity`, at every site (sync lanes, PIM primitives, search, raw-body read), as `Error::ProtocolMissing` (`Protocol(MissingField)`, `ProviderContractViolation`) - the server's omission, never a caller-blaming `Request(Malformed)`; a `MODSEQ 0` in a FETCH response is rejected for the same reason.
 
 ## Account layer
@@ -815,6 +831,12 @@ race cannot be closed by this client.
 - Keywords: `set_keyword` via UID STORE; convenience keywords `$flagged`/`$answered`/`$seen` map to `\Flagged`/`\Answered`/`\Seen`. `$forwarded` and `$MDNSent` stay IMAP keywords; `mdn_sent_via_keyword` is true, so `mark_mdn_sent` flips `$MDNSent`.
 - Read state: `set_is_read` via `\Seen`.
 - Importance: `set_importance` maps onto the `$important` keyword (no native IMAP field). Two-valued/exclusive: `High` sets it, `Normal`/`Low` clear it (one STORE); the read side maps `$important` presence to `Message.importance`.
+- Attachment search limitation: `SearchFilter::Has` currently compiles to BODY,
+  so prose can match and encoded attachment names can be missed. This does not
+  satisfy the filename/type contract. Enterprise users expect actual attachment
+  matches. Repair requires attachment-aware evaluation through boolean filters
+  and paging; replacing the existing path with Unsupported requires an owner
+  decision because it removes behavior.
 - Search messages: UID SEARCH across selectable folders, `SearchFilter::In` restricting the selected mailbox. Thread search is advertised only with `THREAD=REFERENCES`, returning synthetic thread ids containing folder, UIDVALIDITY, and member UIDs.
 - Search paging (`pim::SearchPager`): every page call re-runs the search, so the page cursor is a position, never an offset - an offset into a re-run result skips the boundary survivor whenever an earlier result is expunged between pages. The walk is ordered by folder (`MailboxName::cmp_account_order`) and then by key UID ascending (the message UID; for threads, the lowest member UID), and the cursor (`imapsearch1:` plus the canonical `imap2` id of the last returned position) resumes strictly after it. Folders ordered before the cursor's are not searched again, and once one item past the page is known no later folder is searched. A changed UIDVALIDITY on the cursor's folder fails `ConcurrencyConflict` (repeat the walk); an undecodable cursor, a cursor outside the `SearchFilter::In` restriction, and a zero limit are `Request(Malformed)`. `estimated_total` is set only when one call enumerated the whole result from the start. Not promised: items moved, or folders created or renamed, behind the cursor are not returned, and a thread whose membership changed between pages may repeat under a new id or be passed.
 - Containers: LIST-backed enumeration plus CREATE, RENAME-as-rename, RENAME-as-move, and guarded DELETE (checks `STATUS MESSAGES`, refuses non-empty mailboxes).
@@ -828,7 +850,7 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
 
 `ImapAccountConfig::with_submission(SmtpSubmissionConfig)` makes the account own a `bifrost-smtp` transport (`submission.rs`, `SubmissionTransport`), built at open and stored on `ImapAccountInner.submission`. `build_capabilities(.., submission_configured)` flips `send_message` / `draft_send` true together with the impls. `attachment_upload` stays false (A6).
 
-- `SmtpSubmissionConfig` carries host, `SubmissionTls` (Implicit 465 / StartTls 587 / Plaintext 587, mapped to SMTP `relay` / `starttls_relay` / `builder_dangerous`), optional port/timeout/pool, default From, `save_to_sent_default`, optional `SubmissionCredentials`. `Clone`, not `Eq`/serde.
+- `SmtpSubmissionConfig` carries host, `SubmissionTls` (Implicit 465 / StartTls 587 / Plaintext 587, the RFC 6409 submission defaults from `bifrost_smtp::transport::smtp::default_submission_port` rather than the relay port 25 a plain SMTP builder defaults to; mapped to SMTP `relay` / `starttls_relay` / `builder_dangerous`), optional port/timeout/pool, default From, `save_to_sent_default`, optional `SubmissionCredentials`. `Clone`, not `Eq`/serde.
 - Credential reuse: when `credentials` is `None`, SMTP creds derive from the IMAP
   `Credentials` via `credentials.kind()` (password->password, or OAuth identity +
   the *same* `Arc<dyn TokenSource>` cloned across the boundary); an override
@@ -940,6 +962,17 @@ Containers use native mailbox paths as primitive/provenance ids. `containers_lis
 
 `container_from_folder_entry` also projects the shared-namespace metadata: a folder with a `shared_owner` gets `namespace = Shared`, `owner = MailboxId(owner)`, and `owner_local_id` = the full mailbox path (IMAP has no separate per-owner id space - the path IS the native id in every namespace, so `native_id` stays byte-identical to the `CursorScope::Folder` string discovery emits). `rights` projects the MYRIGHTS set `discover_shared_folders` captured at open (`rights_from_myrights`, RFC 4314 Section 4: `l`+`r` -> read, `i` -> add, `t` -> remove, `s` -> seen, `w` -> keywords, `k`/`c` -> create child, `x`/`d` -> rename+delete, `p` -> submit). The rights set is now RETAINED on `FolderEntry`, not just used as the discovery read-gate - without it a read-only share is indistinguishable from a writable one downstream. `None` means unreported (a personal folder we never probed, or a server without ACL), which is distinct from an explicit empty rights set. A rename/recreate inherits both the owner tag and the rights, since a LIST/IDLE `MailboxInfo` carries neither.
 
+### Shared account decisions
+
+Object/thread ids and part handles share the byte-counted field parser and
+legacy-literal versus current wire-identity folder decoder in `envelope.rs`.
+Their positive integer text fields share the nonzero decoder. Wire operand
+admission, compact-set observation filtering, cache generation checks and the
+poller's assertion of already-decoded values retain their distinct failure
+policies. Importance reads and writes share one keyword constant in `pim.rs`.
+Both hydration lanes use `merge_requested_fetches` to filter and merge replies
+for requested UIDs; later mutable fields win and immutable data fills gaps.
+
 ### Hydration accounting (`get.rs`)
 
 `get_stream` and the bulk mutation streams retain at most `TARGET_BUFFER_ITEMS` (256, in `account/mod.rs`) decoded target ids at once. A full window flushes immediately and a partial window flushes when input closes; 256 is two `BATCH_ITEMS` pages, small enough that a caller streaming millions of ids never materializes them all and large enough that a per-folder UID command still covers a useful range rather than degenerating into one command per id. Each window is grouped into per-folder UID commands, with folders visited by display name and wire identity within that window.
@@ -947,6 +980,11 @@ Containers use native mailbox paths as primitive/provenance ids. `containers_lis
 Output ordering is therefore input-window order, then folder display-name order with wire identity breaking ties within a window; FETCH response order within a folder remains server-driven. This is weaker than the previous guarantee, which drained the whole input before visiting folders lexically, so ids for one folder could previously never be split across batches. bifrost-sync tolerates the weaker contract because it keys results by `ObjectId` rather than by arrival position, and `BatchOutcome` carries its own submission-order index (`reference/error-model.md`); nothing downstream may start depending on cross-window ordering. Every requested id is still answered exactly once. Command response bodies retain their separate byte budgets.
 
 - Ids whose UIDVALIDITY no longer matches the selected mailbox are `Failed(Request(Malformed))` and are published *before* the hydration FETCH is issued. They are known truth already; buffering them behind a fallible command would relabel them uncertain whenever that command fails. The per-folder error path in turn only downgrades ids that still lack a published outcome (`run_folder_get` prunes the caller's unresolved set as it publishes), so a FETCH failure after the stale batch cannot put one id in two lanes.
+- Wire selection and conversion kind are chosen together by one projection
+  plan. Unknown projections fail each item as Unsupported before any folder
+  checkout; MIME projections whose
+  replies omit the requested body fail with Protocol MissingField, rather than
+  inventing an empty message. Explicit empty body bytes are valid.
 - A requested UID the server never returns is `Failed(NotFound(Message))` rather than being silently dropped.
 - The valid (non-stale) ids of a folder become a `TargetBatch`, so the FETCH operand and the set the loop attributes results to are the same object. Its excluded lane is published alongside the stale failures, before the FETCH: like them it is known truth already, and unlike them it must never be able to reach the FETCH and be reported as hydrated.
 - FETCH responses are merged per UID before conversion. A server may follow the solicited response with unsolicited FLAGS-only FETCHes for the same UID; the merge adopts later `FLAGS` / `MODSEQ` and Gmail labels (mutable state, so the fresher report wins) and fills gaps in every other item (preview, EMAILID / THREADID, the Gmail message and thread ids, body and BINARY sections, per-section `BINARY.SIZE`), but never blanks a data item or body section the earlier response carried, so a trailing partial response cannot turn a complete hydration into an empty one. `merge_fetch_response` is shared with the PIM lane: `pim::hydrate_decoded` folds the FETCH's responses into exactly one per REQUESTED UID (`merge_requested_fetches`), dropping unsolicited FETCHes for UIDs nobody asked about and responses without a UID, so a split or FLAGS-only-follow-up response can no longer hydrate as a duplicate, possibly bodiless, message.
@@ -1456,8 +1494,18 @@ compound behavior.
 ## Flag observation and reassertion capability
 
 The account declares flag and destroy desired-state reassertion safe on its
-folder/UIDVALIDITY/UID identities. FlagsOnly FETCH responses lacking FLAGS
+folder/UIDVALIDITY/UID identities. FlagsOnly and Metadata FETCH responses lacking FLAGS
 fail per item with Protocol MissingField after response fragments are merged.
+Inventory entry conversion likewise requires FLAGS and a nonzero UID,
+returning Protocol MissingField for omissions. In the streaming inventory walk
+a response for a known UID that lacks FLAGS fails only that message: no entry
+is emitted, and an `InventoryObligation::Object` (keyed by its object id,
+carrying the MissingField error) degrades that page's coverage and the walk's
+`Done` coverage, so the engine keeps the message's prior state and repairs it
+by id instead of treating it as gone. The rest of the folder still syncs.
+Responses without a nonzero UID cannot be attributed and remain ignored.
+An explicit empty FLAGS list remains a valid observation. Enterprise users
+expect missing server data to preserve cached flag state, not clear it.
 The flag judge compares ASCII-case-insensitively, ignores server-owned
 `\Recent` in observed Set equality, and returns Indeterminate for operations
 explicitly naming `\Recent`.

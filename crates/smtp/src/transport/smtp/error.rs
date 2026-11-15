@@ -447,7 +447,9 @@ pub(crate) fn status(response: Response) -> Error {
         Severity::PermanentNegativeCompletion => {
             Error::without_source(ErrorKind::Permanent(response))
         }
-        _ => internal(format!(
+        // A reply of the wrong class is malformed peer behavior, not a
+        // client invariant failure. Callers have already checked their phase.
+        _ => parse(format!(
             "unexpected positive SMTP reply {}",
             response.code()
         )),

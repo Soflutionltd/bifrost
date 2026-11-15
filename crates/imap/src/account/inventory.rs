@@ -57,8 +57,10 @@ pub(crate) fn inventory_stream(
     let domain = bifrost_types::CoverageDomain::full(scope.clone());
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     let ticket = QresyncWarningTicket::new(account.clone(), tx.clone());
+    let ledger = ObligationLedger::default();
+    let task_ledger = ledger.clone();
     let task = tokio::spawn(async move {
-        match run_inventory(account, scope.clone(), tx.clone(), &ticket).await {
+        match run_inventory(account, scope.clone(), tx.clone(), &ticket, &task_ledger).await {
             Ok(()) | Err(InventoryError::ChannelDropped) => {}
             Err(InventoryError::Imap(err)) => {
                 let _ = tx
@@ -79,13 +81,85 @@ pub(crate) fn inventory_stream(
         }
     });
     // The channel carries `SyncEvent<InventoryEntry>` internally; this walk
-    // terminates wholesale on failure, so COMPLETE coverage is accurate.
+    // terminates wholesale on a wire failure, so coverage is COMPLETE except
+    // for the per-object obligations `run_inventory` records in the ledger
+    // (a FETCH response missing a data item the entry needs). Those are
+    // attached to the next page and, cumulatively, to `Done`.
     // Abort-on-drop for the same reason as `changes_stream`: a dropped
     // stream must stop the work and release the pooled connection rather
     // than leave a second driver running against the same account.
-    Box::pin(
-        super::guarded_receiver_stream(rx, task).map(bifrost_types::lift_complete_walk(domain)),
-    )
+    let mut lift = bifrost_types::lift_complete_walk(domain.clone());
+    let mut walk: Vec<bifrost_types::InventoryObligation> = Vec::new();
+    Box::pin(super::guarded_receiver_stream(rx, task).map(move |event| {
+        let mut lifted = lift(event);
+        // Object obligations are never barriers, so replacing the
+        // coverage leaves the derived `PageCheckpoint` variant valid.
+        match &mut lifted {
+            bifrost_types::InventoryEvent::Batch(page) => {
+                let fresh = ledger.drain();
+                walk.extend(fresh.iter().cloned());
+                page.coverage = bifrost_types::InventoryCoverageReport::from_obligations(
+                    domain.clone(),
+                    &fresh,
+                );
+            }
+            bifrost_types::InventoryEvent::Done(completion) => {
+                walk.extend(ledger.drain());
+                completion.coverage =
+                    bifrost_types::InventoryCoverageReport::from_obligations(domain.clone(), &walk);
+            }
+            _ => {}
+        }
+        lifted
+    }))
+}
+
+/// Per-object obligations a walk recorded, handed from the FETCH task to the
+/// stream adapter that stamps page coverage.
+#[derive(Clone, Default)]
+struct ObligationLedger(std::sync::Arc<std::sync::Mutex<Vec<bifrost_types::InventoryObligation>>>);
+
+impl ObligationLedger {
+    fn record(&self, obligation: bifrost_types::InventoryObligation) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(obligation);
+    }
+
+    fn drain(&self) -> Vec<bifrost_types::InventoryObligation> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+/// A FETCH response for a known UID that lacked a data item the entry needs
+/// (FLAGS). The message exists, so it is neither emitted with invented state
+/// nor silently dropped: an Object obligation tells the engine the walk did
+/// not represent it, so its prior state is kept and repaired by id later.
+fn unrepresented_object(
+    folder: &MailboxName,
+    uidvalidity: u32,
+    uid: u32,
+    error: crate::Error,
+) -> bifrost_types::InventoryObligation {
+    let id = encode_object_id(folder, uidvalidity, uid);
+    bifrost_types::InventoryObligation::Object {
+        key: bifrost_types::ObligationKey(id.0.as_bytes().to_vec()),
+        id,
+        error: super::account_error_with(
+            error,
+            super::error::ImapErrorContext::operation(
+                bifrost_types::AccountOperation::SyncInventory,
+            )
+            .with_folder_scope(folder),
+        ),
+        repair: Vec::new(),
+    }
 }
 
 /// Ownership ticket for the account-level QRESYNC negotiation one-shot.
@@ -163,6 +237,7 @@ async fn run_inventory(
     scope: CursorScope,
     tx: tokio::sync::mpsc::Sender<SyncEvent<InventoryEntry>>,
     qresync_warning: &QresyncWarningTicket,
+    obligations: &ObligationLedger,
 ) -> Result<(), InventoryError> {
     if let Some(reason) = qresync_warning.take() {
         tx.send(SyncEvent::Warning(
@@ -209,6 +284,11 @@ async fn run_inventory(
         }
         Err(err) => return Err(err.into()),
     };
+    // A UIDNOTSTICKY folder is deliberately NOT refused here or in the change
+    // lanes. Refusing would hide the folder's mail from an enterprise user
+    // entirely - removing a capability, which needs an owner ruling. Its UIDs
+    // do not persist, so its cursor is re-established on UIDVALIDITY change;
+    // a cursor-free sync mode for such folders is filed separately.
     let uidvalidity = super::selected_uidvalidity(&selected.mailbox)?;
     let include_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
     let attrs = inventory_attrs(include_modseq);
@@ -232,19 +312,35 @@ async fn run_inventory(
             item = fetch_rx.recv() => {
                 match item {
                     Some(Ok(fetch)) => {
-                        if let Some(uid) = fetch.uid {
+                        // A response without a nonzero UID cannot be
+                        // attributed to any message and is ignored.
+                        if let Some(uid) = fetch.uid.filter(|uid| *uid != 0) {
                             if let Some(modseq) = fetch.mod_seq {
                                 account
                                     .folders
                                     .record_modseq(&folder, uidvalidity, uid, modseq)?;
                             }
                             known.push(uid);
-                            batch_items.push(fetch_to_inventory(
+                            // One response missing FLAGS fails only that
+                            // message: an enterprise user expects the rest
+                            // of the folder to sync, and that message's
+                            // cached read/flagged state to stay as it was
+                            // rather than be cleared. The obligation tells
+                            // the engine this walk did not represent it.
+                            match fetch_to_inventory(
                                 &folder,
                                 uidvalidity,
                                 fetch,
                                 shared_owner.as_ref(),
-                            ));
+                            ) {
+                                Ok(entry) => batch_items.push(entry),
+                                Err(error) => obligations.record(unrepresented_object(
+                                    &folder,
+                                    uidvalidity,
+                                    uid,
+                                    error,
+                                )),
+                            }
                             if batch_items.len() >= BATCH_ITEMS {
                                 let out = std::mem::take(&mut batch_items);
                                 let bytes_in = super::measured_bytes_in(
@@ -345,8 +441,16 @@ pub(crate) fn fetch_to_inventory(
     uidvalidity: u32,
     fetch: FetchResponse,
     shared_owner: Option<&bifrost_types::MailboxId>,
-) -> InventoryEntry {
-    let flags_hash = flags_hash(fetch.flags.as_deref().unwrap_or(&[]));
+) -> Result<InventoryEntry, crate::Error> {
+    // Missing observation is not an empty flag set: inventing it can make
+    // an enterprise client's cached read/flagged state silently regress.
+    let uid = fetch.uid.filter(|uid| *uid != 0).ok_or_else(|| {
+        crate::Error::ProtocolMissing("FETCH response lacked a nonzero UID".into())
+    })?;
+    let flags = fetch.flags.as_deref().ok_or_else(|| {
+        crate::Error::ProtocolMissing(format!("FETCH response lacked FLAGS for UID {uid}"))
+    })?;
+    let flags_hash = flags_hash(flags);
     let envelope = fetch.envelope;
     // A shared/other-user folder's inventory item carries both its
     // `Folder` membership and its owning `Mailbox(owner)` membership so
@@ -355,8 +459,8 @@ pub(crate) fn fetch_to_inventory(
     if let Some(owner) = shared_owner {
         memberships.push(bifrost_types::MembershipScope::Mailbox(owner.clone()));
     }
-    InventoryEntry {
-        id: encode_object_id(folder, uidvalidity, fetch.uid.unwrap_or_default()),
+    Ok(InventoryEntry {
+        id: encode_object_id(folder, uidvalidity, uid),
         memberships,
         size: fetch.rfc822_size,
         blob_id: None,
@@ -379,7 +483,7 @@ pub(crate) fn fetch_to_inventory(
         in_reply_to: envelope
             .as_ref()
             .and_then(|env| env.first_in_reply_to().map(str::to_owned)),
-    }
+    })
 }
 
 pub(crate) fn flags_hash(flags: &[crate::types::Flag]) -> u64 {
@@ -613,15 +717,19 @@ mod tests {
                 known_uids: CompactUidSet::from_uids([1]),
             };
             let items = if has_items {
-                vec![fetch_to_inventory(
-                    &folder,
-                    7,
-                    FetchResponse {
-                        uid: Some(1),
-                        ..Default::default()
-                    },
-                    None,
-                )]
+                vec![
+                    fetch_to_inventory(
+                        &folder,
+                        7,
+                        FetchResponse {
+                            flags: Some(Vec::new()),
+                            uid: Some(1),
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .unwrap(),
+                ]
             } else {
                 Vec::new()
             };
@@ -705,14 +813,35 @@ mod tests {
     }
 
     #[test]
+    fn inventory_requires_uid_and_flags_observations() {
+        for uid in [None, Some(0), Some(1)] {
+            for flags in [None, Some(Vec::new())] {
+                let valid = uid == Some(1) && flags.is_some();
+                let fetch = FetchResponse {
+                    uid,
+                    flags,
+                    ..Default::default()
+                };
+                let result = fetch_to_inventory(&folder(), 9, fetch, None);
+                if valid {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(matches!(result, Err(crate::Error::ProtocolMissing(_))));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn inventory_entry_carries_owner_membership_only_for_a_shared_folder() {
         let fetch = FetchResponse {
+            flags: Some(Vec::new()),
             uid: Some(42),
             mod_seq: Some(7),
             rfc822_size: Some(1024),
             ..Default::default()
         };
-        let personal = fetch_to_inventory(&folder(), 9, fetch.clone(), None);
+        let personal = fetch_to_inventory(&folder(), 9, fetch.clone(), None).unwrap();
         assert_eq!(
             personal.memberships,
             vec![bifrost_types::MembershipScope::Folder(
@@ -727,7 +856,7 @@ mod tests {
         );
 
         let owner = bifrost_types::MailboxId("alice".to_owned());
-        let shared = fetch_to_inventory(&folder(), 9, fetch, Some(&owner));
+        let shared = fetch_to_inventory(&folder(), 9, fetch, Some(&owner)).unwrap();
         assert!(
             shared
                 .memberships
@@ -743,10 +872,11 @@ mod tests {
     #[test]
     fn inventory_entry_without_modseq_reports_an_unavailable_server_version() {
         let fetch = FetchResponse {
+            flags: Some(Vec::new()),
             uid: Some(1),
             ..Default::default()
         };
-        let entry = fetch_to_inventory(&folder(), 9, fetch, None);
+        let entry = fetch_to_inventory(&folder(), 9, fetch, None).unwrap();
         assert_eq!(entry.fingerprint.server_version, ServerVersion::Unavailable);
         assert_eq!(entry.size, None);
         assert_eq!(entry.fingerprint.size, None);
@@ -755,20 +885,22 @@ mod tests {
     #[test]
     fn inventory_entry_prefers_objectid_threadid_over_the_gmail_one() {
         let both = FetchResponse {
+            flags: Some(Vec::new()),
             uid: Some(1),
             thread_id: Some("T-objectid".to_owned()),
             gmail_thread_id: Some(1234),
             ..Default::default()
         };
-        let entry = fetch_to_inventory(&folder(), 9, both, None);
+        let entry = fetch_to_inventory(&folder(), 9, both, None).unwrap();
         assert_eq!(entry.thread_id, Some(ThreadId("T-objectid".to_owned())));
 
         let gmail_only = FetchResponse {
+            flags: Some(Vec::new()),
             uid: Some(1),
             gmail_thread_id: Some(1234),
             ..Default::default()
         };
-        let entry = fetch_to_inventory(&folder(), 9, gmail_only, None);
+        let entry = fetch_to_inventory(&folder(), 9, gmail_only, None).unwrap();
         assert_eq!(entry.thread_id, Some(ThreadId("1234".to_owned())));
     }
 
@@ -780,11 +912,12 @@ mod tests {
             ..Default::default()
         };
         let fetch = FetchResponse {
+            flags: Some(Vec::new()),
             uid: Some(1),
             envelope: Some(envelope),
             ..Default::default()
         };
-        let entry = fetch_to_inventory(&folder(), 9, fetch, None);
+        let entry = fetch_to_inventory(&folder(), 9, fetch, None).unwrap();
         assert_eq!(entry.message_id.as_deref(), Some("abc@example.test"));
         assert_eq!(entry.in_reply_to.as_deref(), Some("parent@example.test"));
         // IMAP ENVELOPE has no References field, so the list stays empty.

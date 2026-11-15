@@ -1,6 +1,6 @@
 //! Engine-owned consecutive-failure pacing.
 use bifrost_types::BackoffPolicy;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 pub(crate) struct ReconnectBackoff {
     policy: BackoffPolicy,
@@ -44,11 +44,9 @@ impl ReconnectBackoff {
 }
 
 pub(crate) fn jitter_seed() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos()
-        .into()
+    // Clock resolution and wall-clock corrections must not synchronize retries.
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    u64::from_le_bytes(bytes[..8].try_into().expect("eight UUID bytes"))
 }
 
 #[cfg(test)]
@@ -67,6 +65,18 @@ mod tests {
         backoff.reset();
         assert_eq!(backoff.record_failure(0), Duration::from_secs(1));
     }
+    #[test]
+    fn backfill_policy_reaches_its_declared_ceiling() {
+        let mut backoff = ReconnectBackoff::new(BackoffPolicy::new(
+            Duration::from_secs(5),
+            Duration::from_secs(300),
+            false,
+        ));
+        for seconds in [5, 10, 20, 40, 80, 160, 300, 300] {
+            assert_eq!(backoff.record_failure(0), Duration::from_secs(seconds));
+        }
+    }
+
     #[test]
     fn reconnect_backoff_jitter_stays_within_a_quarter() {
         for seed in [0, 1, 250, 251, u64::MAX] {

@@ -79,11 +79,16 @@ pub(crate) struct RecipientProgress {
 pub(crate) struct SendProgress {
     pub(crate) protocol: Protocol,
     pub(crate) recipients: Vec<RecipientProgress>,
-    pub(crate) body_started: bool,
-    pub(crate) body_finished: bool,
-    /// SMTP-only: the final DATA/BDAT reply applies to all accepted
-    /// recipients. None for LMTP (which has per-recipient final replies).
-    pub(crate) data_response: Option<Response>,
+    phase: SendPhase,
+}
+
+#[derive(Clone, Debug)]
+enum SendPhase {
+    Envelope,
+    DataIssued,
+    BodyStarted,
+    BodySent,
+    FinalReply(Response),
 }
 
 impl SendProgress {
@@ -98,9 +103,7 @@ impl SendProgress {
                     rcpt: RcptProgress::Pending,
                 })
                 .collect(),
-            body_started: false,
-            body_finished: false,
-            data_response: None,
+            phase: SendPhase::Envelope,
         }
     }
 
@@ -158,29 +161,20 @@ impl SendProgress {
         }
     }
 
-    /// Mark all `Accepted` recipients as `Uncertain` with the given error.
-    ///
-    /// Used when an error leaves accepted recipients in an ambiguous state
-    /// (e.g. transport drop after DATA body was sent, or DATA command transport
-    /// error where we cannot attribute the failure per-recipient).
-    pub(crate) fn mark_accepted_uncertain(&mut self, error_factory: impl Fn() -> AccountError) {
-        for rec in &mut self.recipients {
-            if matches!(rec.rcpt, RcptProgress::Accepted) {
-                rec.rcpt = RcptProgress::Uncertain(error_factory());
-            }
-        }
+    pub(crate) fn set_data_issued(&mut self) {
+        self.phase = SendPhase::DataIssued;
     }
 
     pub(crate) fn set_body_started(&mut self) {
-        self.body_started = true;
+        self.phase = SendPhase::BodyStarted;
     }
 
     pub(crate) fn set_body_finished(&mut self) {
-        self.body_finished = true;
+        self.phase = SendPhase::BodySent;
     }
 
     pub(crate) fn set_data_response(&mut self, response: Response) {
-        self.data_response = Some(response);
+        self.phase = SendPhase::FinalReply(response);
     }
 
     /// Build the `BatchOutcome<()>` from the recorded progress. Lane order
@@ -188,10 +182,24 @@ impl SendProgress {
     pub(crate) fn resolve(self) -> BatchOutcome<()> {
         let mut builder = bifrost_types::BatchOutcomeBuilder::<()>::new();
         let protocol = self.protocol;
-        let smtp_final = self.data_response.clone();
+        // An Outlook user may retry a send that never offered message content.
+        // Derive that evidence here, even if an envelope exit forgot a mark call.
+        let pre_body = matches!(self.phase, SendPhase::Envelope | SendPhase::DataIssued);
+        let smtp_final = match self.phase {
+            SendPhase::FinalReply(response) => Some(response),
+            _ => None,
+        };
         let ids: Vec<_> = self.recipients.iter().map(|r| r.id.clone()).collect();
         for rec in self.recipients {
             match rec.rcpt {
+                RcptProgress::Accepted | RcptProgress::Pending if pre_body => {
+                    let err = into_account_error(
+                        super::error::connection("submission ended before the body write")
+                            .with_attempt(SmtpTransmissionState::Unsent),
+                        SmtpErrorContext::send(protocol),
+                    );
+                    builder.push_failed(rec.id, with_recipient_text(err, &rec.address));
+                }
                 RcptProgress::Accepted => {
                     // SMTP: all accepted recipients share the DATA-final
                     // outcome. LMTP: per-recipient final reply is required;
@@ -202,8 +210,13 @@ impl SendProgress {
                     // and the defensive partial-completion fallback keeps
                     // the lane from silently disappearing in release.
                     if let Some(resp) = &smtp_final {
-                        if resp.is_positive() {
+                        if resp.is_completion() {
                             builder.push_succeeded(rec.id, ());
+                        } else if resp.is_intermediate() {
+                            builder.push_uncertain(
+                                rec.id,
+                                partial_completion_error(protocol, &rec.address),
+                            );
                         } else {
                             // Negative final reply after a successful body
                             // upload: classify under `DataFinal`, not
@@ -238,8 +251,13 @@ impl SendProgress {
                     builder.push_failed(rec.id, with_recipient_text(err, &rec.address));
                 }
                 RcptProgress::Final(resp) => {
-                    if resp.is_positive() {
+                    if resp.is_completion() {
                         builder.push_succeeded(rec.id, ());
+                    } else if resp.is_intermediate() {
+                        builder.push_uncertain(
+                            rec.id,
+                            partial_completion_error(protocol, &rec.address),
+                        );
                     } else {
                         let err = response_to_account_error(
                             &resp,
@@ -450,6 +468,44 @@ mod tests {
         };
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].reason, BatchInputInvalidReason::Duplicate);
+    }
+
+    #[test]
+    fn pre_body_resolution_needs_no_recipient_mark() {
+        for data_issued in [false, true] {
+            let mut progress = SendProgress::new(
+                Protocol::Smtp,
+                vec![recip("a", "a@x.com"), recip("b", "b@x.com")],
+            );
+            progress.record_rcpt_accepted(0);
+            if data_issued {
+                progress.set_data_issued();
+            }
+            let outcome = progress.resolve();
+            assert_eq!(outcome.failed().len(), 2);
+            assert!(outcome.uncertain().is_empty());
+            for failed in outcome.failed() {
+                assert!(!failed.error.recovery().requires_reconciliation());
+            }
+        }
+    }
+
+    #[test]
+    fn intermediate_final_reply_does_not_claim_delivery() {
+        let mut progress = SendProgress::new(Protocol::Smtp, vec![recip("a", "a@x.com")]);
+        progress.record_rcpt_accepted(0);
+        progress.set_body_started();
+        progress.set_data_response(Response::new(
+            Code::new(
+                Severity::PositiveIntermediate,
+                Category::MailSystem,
+                Detail::Four,
+            ),
+            vec!["continue".to_owned()],
+        ));
+        let outcome = progress.resolve();
+        assert!(outcome.succeeded().is_empty());
+        assert_eq!(outcome.uncertain().len(), 1);
     }
 
     #[test]
@@ -800,11 +856,8 @@ mod tests {
     }
 
     #[test]
-    fn lmtp_data_command_transport_drop_marks_recipients_uncertain_inflight() {
-        // smtp-D1: transport drop on the LMTP DATA-command write/read uses
-        // `InFlight` + `DataCommand`. Accepted recipients become
-        // `Uncertain` with recovery `Reconcile(TransportDropAfterSend)`
-        // because Send is non-idempotent.
+    fn lmtp_data_command_transport_drop_marks_recipients_unsent() {
+        // No body write was issued: a lost DATA-command reply cannot deliver.
         use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
         use crate::transport::smtp::error::{Error as SmtpError, ErrorKind};
         let mut progress = SendProgress::new(
@@ -822,26 +875,18 @@ mod tests {
                 "connection reset",
             )),
         )
-        .with_attempt(SmtpTransmissionState::InFlight)
+        .with_attempt(SmtpTransmissionState::Unsent)
         .with_phase(SmtpCommandPhase::DataCommand);
         let ae = into_account_error(smtp_err, SmtpErrorContext::send(Protocol::Lmtp));
         let ae2 = ae.clone();
-        progress.mark_accepted_uncertain(|| ae2.clone());
+        progress.mark_unresolved_unsent(|| ae2.clone());
 
         let outcome = progress.resolve();
-        assert_eq!(outcome.uncertain().len(), 2);
-        assert_eq!(outcome.succeeded().len(), 0);
-        assert_eq!(outcome.failed().len(), 0);
-        for unc in outcome.uncertain() {
-            let recovery = unc.error.recovery();
-            assert!(
-                matches!(
-                    recovery,
-                    RecoveryClass::Reconcile(advice)
-                        if matches!(advice.reason, ReconcileReason::TransportDropAfterSend)
-                ),
-                "LMTP DataCommand transport drop must be Reconcile(TransportDropAfterSend): {recovery:?}"
-            );
+        assert_eq!(outcome.failed().len(), 2);
+        assert!(outcome.uncertain().is_empty());
+        assert!(outcome.succeeded().is_empty());
+        for failed in outcome.failed() {
+            assert!(!failed.error.recovery().requires_reconciliation());
         }
     }
 

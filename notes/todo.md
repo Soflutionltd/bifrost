@@ -22,8 +22,9 @@ has not made, and ruled work that has not landed. Nothing else.
 - Verify every item against the code before working it. This file has no
   truth guarantee; `reference/` and passing tests are authoritative and a
   finding that contradicts them loses. Fix only what is named and
-  confirmed; a change that removes or renames a published item stops and
-  asks the owner, whatever the argument. A shared-crate change (`types`,
+  confirmed; breaking, renaming or moving published API is fine, but a
+  change that removes a capability entirely stops and asks the owner,
+  whatever the argument. A shared-crate change (`types`,
   `net`, `sasl`, `sync`) is verified with the full-workspace `brokkr
   check`, never `-p`.
 - An existing test you must modify is a red flag; justify it explicitly.

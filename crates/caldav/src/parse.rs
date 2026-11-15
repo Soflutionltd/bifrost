@@ -535,7 +535,7 @@ impl MultiStatusSink for MultigetSink {
             // apart from a refusal.
             self.report.failed.push(CalDavFailedResource {
                 href: href.to_string(),
-                status: Some(status),
+                status,
             });
         } else if let Some(href) = parts.missing_data_href() {
             self.report.missing_data.push(href.to_string());
@@ -1350,18 +1350,18 @@ END:VCALENDAR</C:calendar-data>
             .find(|resource| resource.href == "/cal/terse.ics")
             .expect("a protocol-less status line still classifies");
         assert_eq!(terse.status, Some(404));
-        // The refusal is still honoured - no property is committed - but
-        // with no readable code the resource carries no status to report,
-        // so it surfaces in the absent-data lane rather than being
-        // labelled with a code the server never sent.
-        assert!(
-            !report
-                .failed
-                .iter()
-                .any(|resource| resource.href == "/cal/prose.ics"),
-            "prose must not be mined for a status the server never sent"
-        );
-        assert_eq!(report.missing_data, vec!["/cal/prose.ics"]);
+        // The refusal is still honoured - no property is committed - and an
+        // unreadable refusal is reported as a refusal, not as absent data.
+        // The prose is not mined for its "404": the resource carries no
+        // status at all. An unreadable refusal is
+        // per-resource news only: it never fails the whole page.
+        let prose = report
+            .failed
+            .iter()
+            .find(|resource| resource.href == "/cal/prose.ics")
+            .expect("an unreadable refusal stays in the failed lane");
+        assert_eq!(prose.status, None);
+        assert!(report.missing_data.is_empty());
         assert_eq!(report.classify(), MultigetOutcome::Usable);
     }
 

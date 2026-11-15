@@ -570,7 +570,10 @@ pub(super) async fn move_messages(
         let source_owner = crate::account::foreign::parse_message_id(id)
             .owner()
             .map(str::to_string);
-        if dest.foreign().map(|f| f.mailbox.as_str()) != source_owner.as_deref() {
+        if !crate::account::foreign::same_owner(
+            dest.foreign().map(|f| f.mailbox.as_str()),
+            source_owner.as_deref(),
+        ) {
             return Err(crate::account::graph_error::invalid_item_error(
                 operation,
                 ErrorScope::Message {

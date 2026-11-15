@@ -530,8 +530,10 @@ pub(super) fn container_is_trash(
         return true;
     }
     let folder = bifrost_types::FolderId(current.0.clone());
-    crate::account::foreign::folder_owner(&folder).as_deref() == owner
-        && crate::account::foreign::parse_folder(&folder)
-            .native_id()
-            .eq_ignore_ascii_case(DELETED_ITEMS)
+    crate::account::foreign::same_owner(
+        crate::account::foreign::folder_owner(&folder).as_deref(),
+        owner,
+    ) && crate::account::foreign::parse_folder(&folder)
+        .native_id()
+        .eq_ignore_ascii_case(DELETED_ITEMS)
 }

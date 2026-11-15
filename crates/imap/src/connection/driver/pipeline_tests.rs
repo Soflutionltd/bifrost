@@ -59,7 +59,7 @@ async fn an_earlier_commands_untagged_response_reaches_its_consumer_mid_literal(
                 MailboxName::new("INBOX").unwrap(),
                 LITERAL_IDENTIFIER.to_owned(),
             )
-            .execute_dynamic()
+            .execute_dynamic(std::time::Duration::from_secs(30))
             .await
     });
 
@@ -124,7 +124,7 @@ async fn an_earlier_commands_tagged_no_lands_in_its_own_result_slot() {
                 MailboxName::new("INBOX").unwrap(),
                 LITERAL_IDENTIFIER.to_owned(),
             )
-            .execute_dynamic()
+            .execute_dynamic(std::time::Duration::from_secs(30))
             .await
     });
 
@@ -190,7 +190,7 @@ async fn the_sending_commands_own_rejection_is_its_result_not_a_batch_error() {
                 MailboxName::new("INBOX").unwrap(),
                 LITERAL_IDENTIFIER.to_owned(),
             )
-            .execute_dynamic()
+            .execute_dynamic(std::time::Duration::from_secs(30))
             .await
     });
 
@@ -274,7 +274,7 @@ async fn a_tagged_ok_before_the_literal_continuation_is_that_commands_missing_re
                 LITERAL_IDENTIFIER.to_owned(),
             )
             .get_acl(MailboxName::new("INBOX").unwrap())
-            .execute_dynamic()
+            .execute_dynamic(std::time::Duration::from_secs(30))
             .await
     });
 
@@ -335,7 +335,7 @@ async fn a_completion_for_an_unsent_command_is_a_protocol_error() {
                 LITERAL_IDENTIFIER.to_owned(),
             )
             .get_acl(MailboxName::new("INBOX").unwrap())
-            .execute_dynamic()
+            .execute_dynamic(std::time::Duration::from_secs(30))
             .await;
         (conn, results)
     });
@@ -387,7 +387,7 @@ async fn two_pipelined_searches_run_as_sequential_sub_batches() {
         conn.pipeline()
             .uid_search("ALL".to_owned())
             .uid_search_return("ALL".to_owned(), vec!["ALL".to_owned()])
-            .execute_dynamic()
+            .execute_dynamic(std::time::Duration::from_secs(30))
             .await
     });
 
@@ -454,7 +454,7 @@ async fn a_surplus_esearch_for_a_finalized_search_is_dropped_not_published() {
             .pipeline()
             .uid_search_return("ALL".to_owned(), vec!["ALL".to_owned()])
             .noop()
-            .execute_dynamic()
+            .execute_dynamic(std::time::Duration::from_secs(30))
             .await;
         (conn, results)
     });
@@ -539,7 +539,7 @@ async fn a_pipelined_command_refused_at_its_second_marker_is_its_own_result(
                 ],
             )
             .get_acl(MailboxName::new("INBOX").unwrap())
-            .execute_dynamic()
+            .execute_dynamic(std::time::Duration::from_secs(30))
             .await
     });
 
@@ -672,7 +672,7 @@ async fn a_later_sub_batch_failure_keeps_the_earlier_sub_batch_results() {
             crate::types::SequenceSet::new("2").unwrap(),
             MailboxName::new("Archive").unwrap(),
         )
-        .execute_dynamic()
+        .execute_dynamic(std::time::Duration::from_secs(30))
         .await
         .expect("a failure after the first byte is reported per command");
     script.await.unwrap();
@@ -721,7 +721,7 @@ async fn an_unanswered_command_is_in_flight_and_the_answered_one_keeps_its_resul
         .pipeline()
         .my_rights(MailboxName::new("INBOX").unwrap())
         .get_acl(MailboxName::new("INBOX").unwrap())
-        .execute_dynamic()
+        .execute_dynamic(std::time::Duration::from_secs(30))
         .await
         .expect("a failure after the first byte is reported per command");
     script.await.unwrap();
@@ -767,7 +767,7 @@ async fn an_encoding_refusal_in_a_later_sub_batch_refuses_the_batch_before_any_b
             crate::types::SequenceSet::new("1").unwrap(),
             MailboxName::new("Archive").unwrap(),
         )
-        .execute_dynamic();
+        .execute_dynamic(std::time::Duration::from_secs(30));
     let err = tokio::time::timeout(std::time::Duration::from_secs(5), refused)
         .await
         .expect("the batch went on the wire instead of being refused before its first byte")

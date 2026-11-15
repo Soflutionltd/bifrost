@@ -943,7 +943,11 @@ pub(crate) fn merge_shared_mailboxes(
     );
     let mut merged: Vec<String> = Vec::new();
     for candidate in candidates {
-        if !candidate.is_empty() && !merged.iter().any(|existing| existing == &candidate) {
+        if !candidate.is_empty()
+            && !merged
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&candidate))
+        {
             merged.push(candidate);
         }
     }
@@ -2156,6 +2160,15 @@ mod tests {
             merged,
             vec!["shared@contoso.com", "eng@contoso.com", "sales@contoso.com"]
         );
+    }
+
+    #[test]
+    fn merge_folds_configured_and_discovered_address_case() {
+        let merged = merge_shared_mailboxes(
+            &["Shared@Contoso.com".into(), "SHARED@CONTOSO.COM".into()],
+            &[shared("shared@contoso.com", "Delegate")],
+        );
+        assert_eq!(merged, vec!["Shared@Contoso.com"]);
     }
 
     #[test]

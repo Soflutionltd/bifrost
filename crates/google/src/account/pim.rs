@@ -34,15 +34,15 @@ use super::blobs;
 use super::blobs::{content_disposition_inline, content_id_value};
 use super::error;
 use super::flags;
-use super::flags::{ARCHIVE_ID, LABEL_INBOX, LABEL_SPAM, LABEL_TRASH, is_archive_id};
+use super::flags::{
+    ARCHIVE_ID, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_TRASH, LABEL_UNREAD,
+    is_archive_id,
+};
 use super::scopes::{
     ScopeCache, invalidate_scope_snapshot, labels_for_flags, refresh_scope_snapshot,
 };
 use crate::headers::references_from_header;
 
-const LABEL_SENT: &str = "SENT";
-const LABEL_DRAFT: &str = "DRAFT";
-const LABEL_UNREAD: &str = "UNREAD";
 const MAX_GMAIL_PAGE_SIZE: u32 = 500;
 
 pub(crate) fn add_to_container(
@@ -877,15 +877,9 @@ fn query_term(value: &str) -> String {
 }
 
 fn container_query(id: &str) -> String {
-    match id {
-        LABEL_INBOX => "in:inbox".to_string(),
-        LABEL_SENT => "in:sent".to_string(),
-        LABEL_DRAFT => "in:drafts".to_string(),
-        LABEL_TRASH => "in:trash".to_string(),
-        LABEL_SPAM => "in:spam".to_string(),
-        _ if is_archive_id(id) => "-in:inbox -in:sent -in:drafts -in:trash -in:spam".to_string(),
-        _ => format!("label:{}", query_term(id)),
-    }
+    super::flags::container_search_operator(id)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("label:{}", query_term(id)))
 }
 
 fn gmail_date(time: SystemTime) -> String {
@@ -915,7 +909,7 @@ fn archive_container() -> Container {
 }
 
 fn container_from_label(label: &GmailLabel) -> Container {
-    let role = match label.id.as_str() {
+    let role = match label.id.to_ascii_uppercase().as_str() {
         LABEL_INBOX => Some(FolderRole::Inbox),
         LABEL_SENT => Some(FolderRole::Sent),
         LABEL_DRAFT => Some(FolderRole::Drafts),
@@ -1554,6 +1548,18 @@ mod tests {
     }
 
     #[test]
+    fn container_queries_share_case_insensitive_system_vocabulary() {
+        for id in ["inbox", "sent", "draft", "trash", "spam", "Archive"] {
+            assert_eq!(
+                container_query(id),
+                container_query(&id.to_ascii_uppercase())
+            );
+        }
+        assert!(container_query("Archive").starts_with("-in:inbox"));
+        assert_eq!(container_query("Label_Case"), "label:Label_Case");
+    }
+
+    #[test]
     fn draft_attachment_disposition_uses_only_the_type() {
         let part: crate::types::GmailPayload = serde_json::from_value(serde_json::json!({
             "mimeType": "image/png", "filename": "inline.png",
@@ -1949,6 +1955,11 @@ mod tests {
         assert_eq!(container.role, Some(FolderRole::Inbox));
         assert_eq!(container.native_id, LABEL_INBOX);
         assert!(matches!(container.kind, ContainerKind::Label));
+        let lower = GmailLabel {
+            id: "inbox".into(),
+            ..label
+        };
+        assert_eq!(container_from_label(&lower).role, Some(FolderRole::Inbox));
     }
 
     #[test]

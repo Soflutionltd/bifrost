@@ -657,6 +657,10 @@ async fn scope_barrier_blocked(writer: &mpsc::Sender<WriterRequest>, scope: Curs
 /// complete, and the ceiling the delay doubles towards.
 pub(super) const BACKFILL_RETRY_INITIAL: Duration = Duration::from_secs(5);
 pub(super) const BACKFILL_RETRY_CAP: Duration = Duration::from_secs(300);
+static BACKFILL_BACKOFF: std::sync::LazyLock<bifrost_types::BackoffPolicy> =
+    std::sync::LazyLock::new(|| {
+        bifrost_types::BackoffPolicy::new(BACKFILL_RETRY_INITIAL, BACKFILL_RETRY_CAP, false)
+    });
 
 /// Which scope incarnations the orchestrator's rescan still owes a
 /// cold-start pass.
@@ -702,7 +706,7 @@ pub(super) struct BackfillScan {
     /// re-establishment and gets its own pass.
     fusion_skipped: HashSet<CursorScope>,
     /// Failure count plus earliest next attempt, per incarnation.
-    failed: HashMap<(CursorScope, u64), (u32, tokio::time::Instant)>,
+    failed: HashMap<(CursorScope, u64), (crate::backoff::ReconnectBackoff, tokio::time::Instant)>,
     /// The undelivered reading each incarnation's walk BEGAN under, recorded by
     /// [`BackfillScan::begin_walk`].
     ///
@@ -924,12 +928,14 @@ impl BackfillScan {
         // raised with nothing to repair it. It is pruned with the rest when the
         // incarnation leaves the registry, and overwritten by `begin_walk` when
         // the retry starts.
-        let failures = self.failed.get(&key).map_or(0, |(count, _)| *count) + 1;
-        let delay = BACKFILL_RETRY_INITIAL
-            .saturating_mul(1_u32 << failures.min(6).saturating_sub(1))
-            .min(BACKFILL_RETRY_CAP);
-        self.failed
-            .insert(key, (failures, tokio::time::Instant::now() + delay));
+        let (backoff, until) = self.failed.entry(key).or_insert_with(|| {
+            (
+                crate::backoff::ReconnectBackoff::new(*BACKFILL_BACKOFF),
+                tokio::time::Instant::now(),
+            )
+        });
+        let delay = backoff.record_failure(crate::backoff::jitter_seed());
+        *until = tokio::time::Instant::now() + delay;
     }
 }
 

@@ -54,11 +54,23 @@ async fn run_committed_idle(
     wire: &crate::codec::encode::WireCommand,
     done_rx: oneshot::Receiver<()>,
 ) -> Result<IdleTermination, Error> {
+    // IDLE has no retaining consumer and therefore no consumer literal budget.
+    // Keep its event reads unbudgeted rather than inventing a per-event ceiling
+    // unrelated to the caller's FETCH memory budget.
     let baseline = wire_reader.written();
     // IDLE has no literal, so there is no continuation wait in the send and
     // the outcome is always `Sent`.
-    let SendOutcome::Sent =
-        send_wire_command(wire_reader, state, event_sink, wire, tag, baseline, None).await?
+    let SendOutcome::Sent = send_wire_command(
+        wire_reader,
+        state,
+        event_sink,
+        wire,
+        tag,
+        baseline,
+        None,
+        None,
+    )
+    .await?
     else {
         return Err(Error::internal_mid_exchange(
             "IDLE reported a refused literal it does not have",

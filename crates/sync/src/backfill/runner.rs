@@ -376,6 +376,9 @@ impl BackfillRunner {
         let mut seen_total: u64 = 0;
         let mut kept_total: u64 = 0;
         let mut complete = true;
+        // At most one page-level incompleteness warning per partition walk;
+        // the terminal summary reports the walk as a whole.
+        let mut warned_incomplete = false;
         let mut scope_walk = ScopeWalkStep::RequestNextPartition;
         let mut end = None;
         let mut walk = InventoryWalk::default();
@@ -517,6 +520,14 @@ impl BackfillRunner {
                         });
                     }
 
+                    if !crossed
+                        && !warned_incomplete
+                        && !batch.coverage.is_complete()
+                        && let Some(tx) = &changes_tx
+                    {
+                        warn_incomplete(tx, &scope, &batch.coverage);
+                        warned_incomplete = true;
+                    }
                     // Forward the page as a synthetic Batch carrying a
                     // BackfillCheckpoint. Durable persistence awaits the
                     // consumer ack (see module docs); the runner never
@@ -704,6 +715,9 @@ impl BackfillRunner {
                         break;
                     }
                     if !completion.coverage.is_complete() && !crossed {
+                        if let Some(tx) = &changes_tx {
+                            warn_incomplete(tx, &scope, &completion.coverage);
+                        }
                         complete = false;
                         // The terminal summary has no checkpoint of its own to
                         // ride, so its obligations reach the ledger directly -
@@ -789,6 +803,33 @@ impl BackfillRunner {
             end,
         })
     }
+}
+
+// An enterprise mail user needs to know that a live folder is incomplete,
+// even when replay can eventually repair it. Report the FIRST incomplete page
+// of a partition walk (a provider may terminate before sending its terminal
+// summary) and the terminal summary itself, but not every page: one warning
+// per page of a large degraded folder is noise the user cannot act on.
+fn warn_incomplete(
+    tx: &broadcast::Sender<MultiplexerEvent>,
+    scope: &CursorScope,
+    coverage: &bifrost_types::InventoryCoverageReport,
+) {
+    if coverage.is_complete() {
+        return;
+    }
+    let warning = bifrost_types::Warning::user_safe(
+        bifrost_types::WarningKind::OperatorAttentionNeeded,
+        format!(
+            "inventory reported {} object(s) or region(s) it could not represent; \
+             the scope is live but incomplete",
+            coverage.obligations().len()
+        ),
+    );
+    let _ = tx.send(MultiplexerEvent::unacked(
+        scope.clone(),
+        Arc::new(SyncEvent::Warning(warning)),
+    ));
 }
 
 fn warn_barrier(

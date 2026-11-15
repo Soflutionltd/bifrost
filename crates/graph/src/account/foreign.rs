@@ -69,7 +69,7 @@ impl ParsedFolder {
 /// Encode a `(mailbox, native folder)` pair into the namespaced
 /// `FolderId` carried in a foreign scope.
 pub(crate) fn encode_foreign(mailbox: &str, folder: &str) -> FolderId {
-    FolderId(format!("{mailbox}{FOREIGN_SEP}{folder}"))
+    FolderId(qualify_with_owner(Some(mailbox), folder))
 }
 
 /// Parse a `FolderId` back into a `ParsedFolder`. Splits on the first
@@ -211,8 +211,23 @@ impl ParsedThreadId {
 /// native id, which is the primary mailbox's only wire form.
 pub(crate) fn qualify_with_owner(owner: Option<&str>, native: &str) -> String {
     match owner {
+        // The owner spelling is kept verbatim. Ids are durable identities a
+        // consumer has already stored; re-spelling the owner would make every
+        // shared-mailbox object look new. One canonical spelling per mailbox
+        // is chosen once, at configuration (`shared_clients_map`), and only
+        // routing and throttle budgets compare case-insensitively.
         Some(mailbox) => format!("{mailbox}{FOREIGN_SEP}{native}"),
         None => native.to_string(),
+    }
+}
+
+/// Compare mailbox owners without treating differently cased old owner tags
+/// as a cross-mailbox move. None remains the primary route, not a wildcard.
+pub(crate) fn same_owner(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        _ => false,
     }
 }
 
@@ -310,6 +325,33 @@ pub(crate) fn parse_public_event(id: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_comparison_folds_ascii_case_but_ids_keep_their_spelling() {
+        assert!(same_owner(
+            Some("Shared@Contoso.com"),
+            Some("shared@contoso.com")
+        ));
+        assert!(!same_owner(None, Some("shared@contoso.com")));
+        assert!(!same_owner(Some("a@contoso.com"), Some("b@contoso.com")));
+        // Ids are durable: the configured spelling is never rewritten.
+        assert_eq!(
+            encode_foreign("Shared@Contoso.com", "Folder").0,
+            format!("Shared@Contoso.com{FOREIGN_SEP}Folder")
+        );
+        assert_eq!(
+            qualify_with_owner(Some("Shared@Contoso.com"), "Item"),
+            format!("Shared@Contoso.com{FOREIGN_SEP}Item")
+        );
+        assert_eq!(
+            owner_tag("Shared@Contoso.com"),
+            MembershipScope::Mailbox(MailboxId("Shared@Contoso.com".into()))
+        );
+        assert!(!same_owner(
+            Some("\u{c4}@contoso.com"),
+            Some("\u{e4}@contoso.com")
+        ));
+    }
 
     #[test]
     fn public_item_ids_require_both_identity_components() {

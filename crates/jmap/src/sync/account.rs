@@ -1242,10 +1242,13 @@ impl Account for JmapAccount {
         parent: Option<ContainerId>,
         style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<ContainerId, AccountError>> {
+        let mail = parent.as_ref().map_or(&self.mail, |id| {
+            route_object_id(&id.0, &self.mail, &self.foreign_mail)
+        });
         pim::container_create(
-            self.mail.clone(),
+            mail.clone(),
             Arc::clone(&self.mailbox_states),
-            self.mail.id_str().to_string(),
+            mail.id_str().to_string(),
             kind,
             name,
             parent,
@@ -1259,10 +1262,11 @@ impl Account for JmapAccount {
         name: String,
         style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<(), AccountError>> {
+        let mail = route_object_id(&container.0, &self.mail, &self.foreign_mail);
         pim::container_rename(
-            self.mail.clone(),
+            mail.clone(),
             Arc::clone(&self.mailbox_states),
-            self.mail.id_str().to_string(),
+            mail.id_str().to_string(),
             container,
             name,
             style,
@@ -1274,20 +1278,22 @@ impl Account for JmapAccount {
         container: ContainerId,
         new_parent: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
+        let mail = route_object_id(&container.0, &self.mail, &self.foreign_mail);
         pim::container_move(
-            self.mail.clone(),
+            mail.clone(),
             Arc::clone(&self.mailbox_states),
-            self.mail.id_str().to_string(),
+            mail.id_str().to_string(),
             container,
             new_parent,
         )
     }
 
     fn container_delete(&self, container: ContainerId) -> AccountFuture<Result<(), AccountError>> {
+        let mail = route_object_id(&container.0, &self.mail, &self.foreign_mail);
         pim::container_delete(
-            self.mail.clone(),
+            mail.clone(),
             Arc::clone(&self.mailbox_states),
-            self.mail.id_str().to_string(),
+            mail.id_str().to_string(),
             container,
         )
     }

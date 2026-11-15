@@ -448,15 +448,11 @@ enum BlobFetchError {
 
 impl From<crate::error::GraphError> for BlobFetchError {
     fn from(error: crate::error::GraphError) -> Self {
-        match error {
-            crate::error::GraphError::Net(bifrost_net::Error::Status { code, .. })
-                if code == reqwest::StatusCode::METHOD_NOT_ALLOWED =>
-            {
-                Self::MethodNotAllowed
-            }
-            // Everything else, a client-side failure included, flows
-            // through the typed GraphError boundary.
-            other => Self::Failed(Box::new(other)),
+        // Mailbox routing context must not hide a range-method refusal.
+        if error.response_status() == Some(reqwest::StatusCode::METHOD_NOT_ALLOWED) {
+            Self::MethodNotAllowed
+        } else {
+            Self::Failed(Box::new(error))
         }
     }
 }

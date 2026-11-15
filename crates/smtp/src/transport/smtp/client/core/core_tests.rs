@@ -51,7 +51,7 @@ fn rejection() -> Response {
 }
 
 fn intermediate() -> Response {
-    reply(Severity::PositiveIntermediate, "send body")
+    "354 send body\r\n".parse().expect("valid DATA invitation")
 }
 
 /// `421`: the peer is closing the transmission channel.
@@ -355,6 +355,7 @@ fn selected(selector: &str, pattern: &str) -> bool {
 /// keeps the op stream for assertions.
 struct Harness {
     script: Vec<OpOutcome>,
+    automatic_data_reply: bool,
     ops: Vec<String>,
     /// A failure aimed at one op rather than queued in the script.
     aim: Option<Aim>,
@@ -366,6 +367,7 @@ impl Harness {
     fn new(script: Vec<OpOutcome>) -> Self {
         Self {
             script,
+            automatic_data_reply: false,
             ops: Vec::new(),
             aim: None,
             seen: Vec::new(),
@@ -374,7 +376,9 @@ impl Harness {
 
     /// A script of positive replies long enough that reads never run out.
     fn positive(len: usize) -> Self {
-        Self::new((0..len).map(|_| OpOutcome::Reply(ok_reply())).collect())
+        let mut harness = Self::new((0..len).map(|_| OpOutcome::Reply(ok_reply())).collect());
+        harness.automatic_data_reply = true;
+        harness
     }
 
     /// Fail exactly the op `aim` names, leaving the reply script untouched.
@@ -428,7 +432,17 @@ impl Harness {
                         // Writes and group boundaries answer `Done` unless the
                         // script says otherwise; reads always consume a step.
                         Op::ReadGrouped | Op::ReadSingle => {
-                            self.next().unwrap_or_else(|| OpOutcome::Reply(ok_reply()))
+                            let reply = self.next().unwrap_or_else(|| OpOutcome::Reply(ok_reply()));
+                            if self.automatic_data_reply
+                                && self
+                                    .ops
+                                    .get(self.ops.len().saturating_sub(2))
+                                    .is_some_and(|op| op == "W:DATA|")
+                            {
+                                OpOutcome::Reply(intermediate())
+                            } else {
+                                reply
+                            }
                         }
                         _ => self.next_non_reply(),
                     };
@@ -1123,4 +1137,26 @@ fn an_aimed_failure_lands_on_the_op_it_names() {
     assert_eq!(harness.ops[4], "W:DATA|", "ops: {:?}", harness.ops);
     assert_eq!(error.phase(), Some(SmtpCommandPhase::DataCommand));
     assert_eq!(harness.ops.last().map(String::as_str), Some("ABORT"));
+}
+
+#[test]
+fn data_requires_354_instead_of_any_positive_reply() {
+    for response in [ok_reply(), "350 continue\r\n".parse().unwrap()] {
+        let mut machine = DirectSmtp::new(mail(), rcpts(1), false, BodyKind::Data);
+        let mut harness = Harness::new(vec![
+            OpOutcome::Reply(ok_reply()),
+            OpOutcome::Reply(ok_reply()),
+            OpOutcome::Reply(response),
+            OpOutcome::Reply(ok_reply()),
+        ]);
+        assert!(harness.run(&mut machine).is_err());
+        assert!(!harness.ops.iter().any(|op| op == "BODY"));
+    }
+}
+
+#[test]
+fn intermediate_reset_reply_aborts_the_connection() {
+    let epilogue = Epilogue::ResetReading(());
+    let result = epilogue.advance(OpOutcome::Reply(intermediate()));
+    assert!(matches!(result, Ok((Epilogue::Aborting(()), Op::Abort))));
 }

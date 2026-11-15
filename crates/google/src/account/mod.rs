@@ -473,6 +473,7 @@ impl Account for GoogleAccount {
             Arc::clone(&self.client),
             self.shutdown.clone(),
             Arc::clone(&self.lifecycle_baseline),
+            Arc::clone(&self.scope_cache),
         )
     }
 

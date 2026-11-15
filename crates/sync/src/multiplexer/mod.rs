@@ -750,6 +750,12 @@ enum LifecycleTermination {
 const LIFECYCLE_RECONNECT_MIN: Duration = Duration::from_secs(30);
 const LIFECYCLE_RECONNECT_MAX: Duration = Duration::from_secs(480);
 
+// The shared policy constructor validates at runtime, so this named policy is lazy.
+static LIFECYCLE_BACKOFF: std::sync::LazyLock<bifrost_types::BackoffPolicy> =
+    std::sync::LazyLock::new(|| {
+        bifrost_types::BackoffPolicy::new(LIFECYCLE_RECONNECT_MIN, LIFECYCLE_RECONNECT_MAX, false)
+    });
+
 fn lifecycle_retry_wait(
     error: &AccountError,
     fallback: Duration,
@@ -979,12 +985,7 @@ impl Multiplexer {
         // full channel behind a busy listener never outlives the multiplexer.
         // A plain `JoinHandle` would detach the reader on drop instead.
         let _lifecycle_guard = AbortOnDrop(tokio::spawn(async move {
-            let mut backoff =
-                crate::backoff::ReconnectBackoff::new(bifrost_types::BackoffPolicy::new(
-                    LIFECYCLE_RECONNECT_MIN,
-                    LIFECYCLE_RECONNECT_MAX,
-                    false,
-                ));
+            let mut backoff = crate::backoff::ReconnectBackoff::new(*LIFECYCLE_BACKOFF);
             let mut carry = false;
             loop {
                 if carry {

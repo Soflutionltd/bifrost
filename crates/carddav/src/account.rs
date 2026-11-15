@@ -1213,9 +1213,12 @@ impl Account for CardDavAccount {
                 AccountOperation::ContactCreate,
             )?;
             client.refuse_directory_access(&addressbook, AccountOperation::ContactCreate)?;
-            let id = format!("{}.vcf", Uuid::new_v4());
-            let url = append_path(&addressbook, &id);
-            let data = vcard_from_create(&contact, &id)
+            // Keep contact identity independent of the resource filename, as
+            // CalDAV does: users expect the same contact after a rename or move.
+            let uid = Uuid::new_v4().to_string();
+            let path = format!("{uid}.vcf");
+            let url = append_path(&addressbook, &path);
+            let data = vcard_from_create(&contact, &uid)
                 .map_err(|error| write_error(AccountOperation::ContactCreate, error))?;
             client
                 .put_vcard(

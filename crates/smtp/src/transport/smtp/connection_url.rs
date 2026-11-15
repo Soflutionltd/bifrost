@@ -4,10 +4,8 @@ use url::Url;
 
 #[cfg(feature = "tokio")]
 use super::AsyncSmtpTransportBuilder;
-use super::{
-    Error, SMTP_PORT, SmtpTransportBuilder, authentication::Credentials, error, extension::ClientId,
-};
-use super::{SUBMISSION_PORT, SUBMISSIONS_PORT};
+use super::{Error, SmtpTransportBuilder, authentication::Credentials, error, extension::ClientId};
+use super::{PortTls, default_port};
 use super::{Tls, TlsParameters};
 
 pub(crate) trait TransportBuilder {
@@ -65,7 +63,9 @@ impl TransportBuilder for AsyncSmtpTransportBuilder {
 
 /// Create a new `SmtpTransportBuilder` or `AsyncSmtpTransportBuilder` from a connection URL
 pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> Result<B, Error> {
-    let connection_url = Url::parse(connection_url).map_err(error::connection)?;
+    // These are local configuration faults. Retrying them like network outages
+    // would leave an enterprise user's send queue stuck until manual repair.
+    let connection_url = Url::parse(connection_url).map_err(error::invalid_input)?;
     let tls: Option<String> = connection_url
         .query_pairs()
         .find(|(k, _)| k == "tls")
@@ -73,41 +73,68 @@ pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> 
 
     let host = connection_url
         .host_str()
-        .ok_or_else(|| error::connection("smtp host undefined"))?;
+        // `smtp://` is a non-special scheme, so WHATWG parsing yields an
+        // EMPTY host rather than none; both are the same missing host.
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| error::invalid_input("smtp host undefined"))?;
 
     let mut builder = B::new(host);
 
     match (connection_url.scheme(), tls.as_deref()) {
         ("smtp", None) => {
-            builder = builder.port(connection_url.port().unwrap_or(SMTP_PORT));
+            builder = builder.port(connection_url.port().unwrap_or(default_port(
+                bifrost_types::error::Protocol::Smtp,
+                PortTls::Plaintext,
+            )));
         }
         ("smtp", Some("required")) => {
             builder = builder
-                .port(connection_url.port().unwrap_or(SUBMISSION_PORT))
+                .port(connection_url.port().unwrap_or(default_port(
+                    bifrost_types::error::Protocol::Smtp,
+                    PortTls::StartTls,
+                )))
                 .tls(Tls::Required(TlsParameters::new(host.into())?));
         }
         ("smtp", Some("opportunistic")) => {
             builder = builder
-                .port(connection_url.port().unwrap_or(SUBMISSION_PORT))
+                .port(connection_url.port().unwrap_or(default_port(
+                    bifrost_types::error::Protocol::Smtp,
+                    PortTls::StartTls,
+                )))
                 .tls(Tls::Opportunistic(TlsParameters::new(host.into())?));
         }
         ("smtps", _) => {
             builder = builder
-                .port(connection_url.port().unwrap_or(SUBMISSIONS_PORT))
+                .port(connection_url.port().unwrap_or(default_port(
+                    bifrost_types::error::Protocol::Smtp,
+                    PortTls::Implicit,
+                )))
                 .tls(Tls::Wrapper(TlsParameters::new(host.into())?));
         }
         (scheme, tls) => {
-            return Err(error::connection(format!(
+            return Err(error::invalid_input(format!(
                 "Unknown scheme '{scheme}' or tls parameter '{tls:?}'"
             )));
         }
     }
 
     let percent_decode = |s: &str| {
+        for (index, byte) in s.bytes().enumerate() {
+            if byte == b'%'
+                && !s
+                    .as_bytes()
+                    .get(index + 1..index + 3)
+                    .is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit))
+            {
+                return Err(error::invalid_input(
+                    "invalid percent escape in connection URL",
+                ));
+            }
+        }
         percent_encoding::percent_decode_str(s)
             .decode_utf8()
             .map(Cow::into_owned)
-            .map_err(error::connection)
+            .map_err(error::invalid_input)
     };
 
     // use the path segment of the URL as name in the name in the HELO / EHLO command
@@ -128,7 +155,7 @@ pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> 
         }
         ("", None) => {}
         (_, None) => {
-            return Err(error::connection(
+            return Err(error::invalid_input(
                 "connection URL has a username but no password",
             ));
         }

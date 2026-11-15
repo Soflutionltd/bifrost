@@ -308,7 +308,7 @@ pub(super) fn next_search_owner(account: &GraphAccount, owner: Option<&str>) -> 
         None => mailboxes.into_iter().next(),
         Some(owner) => mailboxes
             .into_iter()
-            .skip_while(|mailbox| mailbox != owner)
+            .skip_while(|mailbox| !mailbox.eq_ignore_ascii_case(owner))
             .nth(1),
     }
 }

@@ -816,7 +816,10 @@ fn request_for_mutation(
             // one - returning `None` routes through the caller's
             // `Request(Malformed)` lane.
             let dest = super::foreign::parse_folder(&folder);
-            if dest.foreign().map(|f| f.mailbox.as_str()) != parsed.owner() {
+            if !super::foreign::same_owner(
+                dest.foreign().map(|f| f.mailbox.as_str()),
+                parsed.owner(),
+            ) {
                 return Ok(None);
             }
             headers.insert("If-Match".to_string(), etag.clone().into_string());

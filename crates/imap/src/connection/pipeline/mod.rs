@@ -654,7 +654,7 @@ impl<'conn, T> Pipeline<'conn, T> {
 
 impl<Accumulated: UnfoldTuple> Pipeline<'_, Accumulated> {
     /// Submit the accumulated commands as a single batch and await the
-    /// typed result tuple.
+    /// typed result tuple. The timeout covers admission and execution.
     ///
     /// Each element in the returned tuple is `Result<T, Error>` where
     /// `T` is the command's consumer output type. Per-command errors
@@ -671,13 +671,18 @@ impl<Accumulated: UnfoldTuple> Pipeline<'_, Accumulated> {
     /// # Errors
     ///
     /// - [`PipelineError::Disconnected`]  -  the driver task has exited.
+    /// - [`PipelineError::Timeout`]  -  the admission/execution deadline elapsed;
+    ///   transmission evidence says whether the batch may have been sent.
     /// - [`PipelineError::Driver`]  -  the batch was refused before any
     ///   byte was written (a command the session does not permit, an
     ///   encoding refusal); nothing ran.
     /// - [`PipelineError::TypeMismatch`]  -  internal bug in the
     ///   command-to-consumer mapping.
-    pub async fn execute(self) -> Result<Accumulated::Output, PipelineError> {
-        let results = self.execute_raw().await?;
+    pub async fn execute(
+        self,
+        timeout: std::time::Duration,
+    ) -> Result<Accumulated::Output, PipelineError> {
+        let results = self.execute_raw(timeout).await?;
         Accumulated::unfold(results)
     }
 }
@@ -690,11 +695,13 @@ impl<T> Pipeline<'_, T> {
     /// push order. Callers must downcast `Box<dyn Any + Send>` to the
     /// expected consumer output type.
     ///
+    /// The timeout covers admission and execution.
     /// Prefer [`execute`](Pipeline::execute) for type-safe access.
     pub async fn execute_dynamic(
         self,
+        timeout: std::time::Duration,
     ) -> Result<Vec<Result<Box<dyn Any + Send>, Error>>, PipelineError> {
-        self.execute_raw().await
+        self.execute_raw(timeout).await
     }
 
     /// Internal: send the pipeline to the driver and await the results.
@@ -705,38 +712,36 @@ impl<T> Pipeline<'_, T> {
     /// is caller sequencing (`InvalidState`), refused before anything is
     /// submitted; the driver checks again at the head of its queue.
     ///
-    /// Admission is strict and unbounded: a channel slot is reserved before
+    /// Admission shares the execution deadline: a channel slot is reserved before
     /// anything is submitted, so dropping this future while it waits for
     /// capacity submits nothing and leaves the connection alone. Dropping it
-    /// after submission but before the driver claims the batch withdraws it
-    /// (never written, connection reusable); dropping it after the claim
+    /// after submission but before the driver commits the batch withdraws it
+    /// (never written, connection reusable); dropping it after the commit
     /// without an answer marks the connection abandoned.
-    async fn execute_raw(self) -> Result<Vec<Result<Box<dyn Any + Send>, Error>>, PipelineError> {
+    async fn execute_raw(
+        self,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<Result<Box<dyn Any + Send>, Error>>, PipelineError> {
         for cmd in &self.commands {
             self.conn
                 .require_state(cmd.kind())
                 .map_err(PipelineError::Driver)?;
         }
-        let permit = match self.conn.cmd_tx.reserve().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                return Err(PipelineError::Disconnected(
-                    self.conn
-                        .observe_driver_panic(bifrost_types::TransmissionState::Unsent)
-                        .await,
-                ));
-            }
-        };
-        let (reply, mut pending) =
-            super::reply::reply_channel((self.commands, self.pending), &self.conn.abandoned);
-        permit.send(super::driver::DriverCommand::Pipeline { reply });
-        match pending.recv().await {
-            Ok(Ok(results)) => Ok(results),
-            Ok(Err(e)) => Err(PipelineError::Driver(e)),
-            Err(phase) => Err(PipelineError::Disconnected(
-                self.conn.observe_driver_panic(phase.attempt()).await,
-            )),
-        }
+        // One deadline covers queue admission and the wire exchange. A user
+        // waiting on a batch expects the same bounded wait as a single command.
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.conn
+            .submit_driver_command((self.commands, self.pending), Some(deadline), |reply| {
+                super::driver::DriverCommand::Pipeline { reply }
+            })
+            .await
+            .map_err(|error| match error {
+                Error::DriverGone { .. } | Error::DriverPanicked { .. } => {
+                    PipelineError::Disconnected(error)
+                }
+                Error::Timeout { .. } => PipelineError::Timeout(error),
+                _ => PipelineError::Driver(error),
+            })
     }
 }
 

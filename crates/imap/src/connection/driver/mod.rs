@@ -799,7 +799,7 @@ pub(in crate::connection) async fn run_prepared_command(
     // the tagged OK. Must be set before the dispatch loop so the
     // side-effect handler sees it when the tagged response arrives.
     if matches!(cmd, Command::Logout) {
-        state.set_in_logout(true);
+        state.set_in_logout(tag.clone());
     }
 
     // RFC 3501 Section6.2.2, Section6.2.3: tell apply_tagged to transition to
@@ -846,7 +846,18 @@ pub(in crate::connection) async fn run_prepared_command(
     // no routing context; a refused literal comes back as that command's own
     // error. Write failures are stamped from socket progress since here.
     let baseline = wire_reader.written();
-    match send_wire_command(wire_reader, state, event_sink, &wire, &tag, baseline, None).await? {
+    match send_wire_command(
+        wire_reader,
+        state,
+        event_sink,
+        &wire,
+        &tag,
+        baseline,
+        None,
+        consumer.literal_budget(),
+    )
+    .await?
+    {
         SendOutcome::Sent => {}
         SendOutcome::Rejected => {
             // `send_wire_command` reports `Rejected` only with routing.

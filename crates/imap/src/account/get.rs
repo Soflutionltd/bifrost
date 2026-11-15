@@ -8,7 +8,9 @@ use bifrost_types::{
 };
 use futures::StreamExt;
 
-use crate::types::{FetchAttr, FetchResponse, MailboxName};
+#[cfg(test)]
+use crate::types::FetchAttr;
+use crate::types::{FetchResponse, MailboxName};
 
 use super::hydration::{BodySelection, FetchSelection, decode_body};
 use super::inventory::{fetch_to_inventory, flags_set};
@@ -34,6 +36,25 @@ pub(crate) fn get_stream(
     mut ids: AccountStream<bifrost_types::ObjectId>,
     projection: Projection,
 ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
+    if projection_plan(projection, false).is_none() {
+        // A projection this client cannot represent is a local per-item
+        // refusal, established before any folder checkout or FETCH.
+        let error = super::error::unsupported(AccountOperation::Hydrate);
+        return Box::pin(
+            ids.map(move |id| {
+                batch(
+                    vec![ItemOutcome::Failed(BatchFailure::new(
+                        BatchItemId(id.0),
+                        error.clone(),
+                    ))],
+                    PageBoundary::Page,
+                    None,
+                    0,
+                )
+            })
+            .chain(futures::stream::once(async { SyncEvent::Done(None) })),
+        );
+    }
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     let task = tokio::spawn(async move {
         let mut grouped: HashMap<String, (MailboxName, Vec<DecodedObjectId>)> = HashMap::new();
@@ -284,6 +305,11 @@ async fn run_folder_get(
         let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
         GetError::Imap(err, bytes_in)
     })?;
+    let include_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
+    let plan = projection_plan(projection, include_modseq).ok_or_else(|| {
+        GetError::Account(super::error::unsupported(AccountOperation::Hydrate), 0)
+    })?;
+    let selection = plan.0;
     // `pending` is drained only now: a checkout or SELECT failure above
     // must leave every id in the caller's unresolved set.
     let (valid, stale): (Vec<_>, Vec<_>) = pending
@@ -295,7 +321,7 @@ async fn run_folder_get(
     // able to reach the FETCH path and be reported as hydrated.
     let target_batch = TargetBatch::new(valid);
     let uid_set = target_batch.uid_set().cloned();
-    let requested_uids: HashSet<u32> = target_batch.uids().iter().copied().collect();
+    let requested_uids = target_batch.uids().to_vec();
     let (valid, excluded_outcomes) =
         target_batch.settle_streaming(bifrost_types::AccountOperation::Hydrate, folder);
     // The permits are the only way to answer for these ids; `pending` keeps
@@ -321,8 +347,6 @@ async fn run_folder_get(
     let Some(uid_set) = uid_set else {
         return Ok(());
     };
-    let include_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
-    let selection = selection_for_projection(projection, include_modseq);
     let attrs = selection.attributes();
     // A body-bearing projection buffers whole messages, so it runs under an
     // explicit byte budget: `uid_fetch` has none, and a hydration batch of
@@ -352,52 +376,32 @@ async fn run_folder_get(
     // one plus unsolicited FLAGS updates that carry none of the requested
     // data items. Merge them per UID before conversion so a trailing partial
     // response cannot replace the complete one.
-    let mut fetched_by_uid: HashMap<u32, FetchResponse> = HashMap::new();
-    for fetch in fetches {
-        let Some(uid) = fetch.uid else {
-            continue;
-        };
-        if !requested_uids.contains(&uid) {
-            continue;
-        }
+    let fetched_by_uid = merge_requested_fetches(fetches, &requested_uids, |uid, fetch| {
+        // Observe each accepted fragment in wire order, before later mutable
+        // fields replace it. In particular a later ignored MODSEQ 0 must not
+        // erase an earlier valid cache observation.
         if let Some(modseq) = fetch.mod_seq {
             account
                 .folders
-                .record_modseq(folder, uidvalidity, uid, modseq)
-                .map_err(|err| GetError::Imap(err, page_bytes_in))?;
+                .record_modseq(folder, uidvalidity, uid, modseq)?;
         }
-        match fetched_by_uid.entry(uid) {
-            std::collections::hash_map::Entry::Occupied(mut existing) => {
-                merge_fetch_response(existing.get_mut(), fetch);
-            }
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(fetch);
-            }
-        }
-    }
+        Ok::<(), crate::Error>(())
+    })
+    .map_err(|err| GetError::Imap(err, page_bytes_in))?;
     let hydrated_by_uid: HashMap<u32, Result<HydratedObject, AccountError>> = fetched_by_uid
         .into_iter()
-        .filter_map(|(uid, fetch)| {
-            if matches!(projection, Projection::FlagsOnly) && fetch.flags.is_none() {
-                return Some((
-                    uid,
-                    Err(super::account_error_with(
-                        crate::Error::ProtocolMissing(format!(
-                            "FETCH response lacked FLAGS for UID {uid}"
-                        )),
+        .map(|(uid, fetch)| {
+            let object = hydrate_planned(folder, uidvalidity, fetch, plan.1, shared_owner.as_ref());
+            (
+                uid,
+                object.map_err(|err| {
+                    super::account_error_with(
+                        err,
                         super::error::ImapErrorContext::operation(AccountOperation::Hydrate)
                             .with_folder_scope(folder),
-                    )),
-                ));
-            }
-            let object = fetch_to_hydrated(
-                folder,
-                uidvalidity,
-                fetch,
-                projection,
-                shared_owner.as_ref(),
-            )?;
-            Some((uid, Ok(object)))
+                    )
+                }),
+            )
         })
         .collect();
     for target in valid {
@@ -428,62 +432,94 @@ async fn run_folder_get(
     Ok(())
 }
 
+#[cfg(test)]
 fn attrs_for_projection(projection: Projection, include_modseq: bool) -> Vec<FetchAttr> {
     selection_for_projection(projection, include_modseq).attributes()
 }
 
+#[derive(Clone, Copy)]
+enum HydrationKind {
+    Flags,
+    Metadata,
+    Mime,
+}
+
+fn projection_plan(
+    projection: Projection,
+    include_modseq: bool,
+) -> Option<(FetchSelection, HydrationKind)> {
+    Some(match projection {
+        Projection::FlagsOnly => (
+            FetchSelection {
+                flags: true,
+                envelope: false,
+                size: false,
+                modseq: include_modseq,
+                body: BodySelection::None,
+            },
+            HydrationKind::Flags,
+        ),
+        Projection::Metadata => (
+            FetchSelection {
+                flags: true,
+                envelope: true,
+                size: true,
+                modseq: include_modseq,
+                body: BodySelection::None,
+            },
+            HydrationKind::Metadata,
+        ),
+        Projection::Headers => (
+            FetchSelection {
+                flags: false,
+                envelope: false,
+                size: false,
+                modseq: false,
+                body: BodySelection::Headers,
+            },
+            HydrationKind::Mime,
+        ),
+        Projection::Preview(count) => (
+            FetchSelection {
+                flags: false,
+                envelope: false,
+                size: false,
+                modseq: false,
+                body: BodySelection::Preview(count),
+            },
+            HydrationKind::Mime,
+        ),
+        Projection::TextOnly => (
+            FetchSelection {
+                flags: false,
+                envelope: false,
+                size: false,
+                modseq: false,
+                body: BodySelection::Whole,
+            },
+            HydrationKind::Mime,
+        ),
+        Projection::Full | Projection::FullWithBlobs => (
+            FetchSelection {
+                flags: false,
+                envelope: false,
+                size: true,
+                modseq: false,
+                body: BodySelection::Whole,
+            },
+            HydrationKind::Mime,
+        ),
+        // Future projections require an explicit wire selection and converter;
+        // asking only for FLAGS must never fabricate a successful empty body.
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
 fn selection_for_projection(projection: Projection, include_modseq: bool) -> FetchSelection {
-    match projection {
-        Projection::FlagsOnly => FetchSelection {
-            flags: true,
-            envelope: false,
-            size: false,
-            modseq: include_modseq,
-            body: BodySelection::None,
-        },
-        Projection::Metadata => FetchSelection {
-            flags: true,
-            envelope: true,
-            size: true,
-            modseq: include_modseq,
-            body: BodySelection::None,
-        },
-        Projection::Headers => FetchSelection {
-            flags: false,
-            envelope: false,
-            size: false,
-            modseq: false,
-            body: BodySelection::Headers,
-        },
-        Projection::Preview(count) => FetchSelection {
-            flags: false,
-            envelope: false,
-            size: false,
-            modseq: false,
-            body: BodySelection::Preview(count),
-        },
-        Projection::TextOnly => FetchSelection {
-            flags: false,
-            envelope: false,
-            size: false,
-            modseq: false,
-            body: BodySelection::Whole,
-        },
-        Projection::Full | Projection::FullWithBlobs => FetchSelection {
-            flags: false,
-            envelope: false,
-            size: true,
-            modseq: false,
-            body: BodySelection::Whole,
-        },
-        _ => FetchSelection {
-            flags: true,
-            envelope: false,
-            size: false,
-            modseq: false,
-            body: BodySelection::None,
-        },
-    }
+    projection_plan(projection, include_modseq)
+        .expect("supported projection")
+        .0
 }
 
 /// Rename a hydrated object to the id its target was submitted under. The
@@ -499,32 +535,93 @@ fn answer_as(mut object: HydratedObject, id: &bifrost_types::ObjectId) -> Hydrat
     object
 }
 
-fn fetch_to_hydrated(
+fn hydrate_planned(
     folder: &MailboxName,
     uidvalidity: u32,
     mut fetch: FetchResponse,
-    projection: Projection,
+    kind: HydrationKind,
     shared_owner: Option<&bifrost_types::MailboxId>,
-) -> Option<HydratedObject> {
-    let uid = fetch.uid?;
+) -> Result<HydratedObject, crate::Error> {
+    let uid = fetch.uid.filter(|uid| *uid != 0).ok_or_else(|| {
+        crate::Error::ProtocolMissing("FETCH response lacked a nonzero UID".into())
+    })?;
     let id = super::encode_object_id(folder, uidvalidity, uid);
-    let kind = match projection {
-        Projection::FlagsOnly => {
-            HydratedObjectKind::FlagsOnly(flags_set(fetch.flags.as_deref().unwrap_or(&[])))
+    let kind = match kind {
+        HydrationKind::Flags => {
+            let flags = fetch.flags.as_deref().ok_or_else(|| {
+                crate::Error::ProtocolMissing("FETCH response lacked FLAGS".into())
+            })?;
+            HydratedObjectKind::FlagsOnly(flags_set(flags))
         }
-        Projection::Metadata => HydratedObjectKind::Metadata(fetch_to_inventory(
+        HydrationKind::Metadata => HydratedObjectKind::Metadata(fetch_to_inventory(
             folder,
             uidvalidity,
             fetch,
             shared_owner,
-        )),
-        _ => HydratedObjectKind::RawMime(decode_body(&mut fetch).unwrap_or_default()),
+        )?),
+        HydrationKind::Mime => {
+            let body = decode_body(&mut fetch).ok_or_else(|| {
+                crate::Error::ProtocolMissing("FETCH response lacked the requested body".into())
+            })?;
+            HydratedObjectKind::RawMime(body)
+        }
     };
-    Some(HydratedObject {
+    Ok(HydratedObject {
         id,
         kind,
         blobs: Vec::new(),
     })
+}
+
+#[cfg(test)]
+fn fetch_to_hydrated(
+    folder: &MailboxName,
+    uidvalidity: u32,
+    fetch: FetchResponse,
+    projection: Projection,
+    shared_owner: Option<&bifrost_types::MailboxId>,
+) -> Option<HydratedObject> {
+    let (_, kind) = projection_plan(projection, false)?;
+    hydrate_planned(folder, uidvalidity, fetch, kind, shared_owner).ok()
+}
+
+/// Fold a UID FETCH's collected responses into one response per REQUESTED
+/// UID.
+///
+/// The connection hands back every FETCH seen during the command, and two
+/// kinds are not the answer: an unsolicited FETCH for a UID nobody asked
+/// about (another client's flag change), which would otherwise hydrate as a
+/// message the caller never requested, and a second response for a requested
+/// UID - the server may split data items across responses, or append a
+/// FLAGS-only update - which would otherwise hydrate as a duplicate, possibly
+/// bodiless, copy. Responses without a UID cannot be attributed and are
+/// dropped. The fold is `get`'s `merge_fetch_response`: later data fills gaps
+/// and never blanks what an earlier response carried.
+pub(super) fn merge_requested_fetches<E>(
+    fetches: Vec<crate::types::FetchResponse>,
+    requested: &[u32],
+    mut observe: impl FnMut(u32, &FetchResponse) -> Result<(), E>,
+) -> Result<HashMap<u32, FetchResponse>, E> {
+    let requested: HashSet<u32> = requested.iter().copied().collect();
+    let mut by_uid: HashMap<u32, crate::types::FetchResponse> = HashMap::new();
+    for fetch in fetches {
+        let Some(uid) = fetch.uid else {
+            continue;
+        };
+        if !requested.contains(&uid) {
+            continue;
+        }
+        observe(uid, &fetch)?;
+        match by_uid.entry(uid) {
+            std::collections::hash_map::Entry::Occupied(mut held) => {
+                merge_fetch_response(held.get_mut(), fetch);
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(fetch);
+            }
+        }
+    }
+    Ok(by_uid)
 }
 
 /// Fold a later FETCH response for the same UID into the one already held.
@@ -722,6 +819,66 @@ mod tests {
     }
 
     #[test]
+    fn requested_fetch_fold_filters_and_observes_fragments_before_merging() {
+        let response = |uid, mod_seq| FetchResponse {
+            uid,
+            mod_seq,
+            ..Default::default()
+        };
+        let mut observed = Vec::new();
+        let merged = merge_requested_fetches(
+            vec![
+                response(None, Some(1)),
+                response(Some(99), Some(2)),
+                response(Some(3), Some(7)),
+                response(Some(3), Some(0)),
+            ],
+            &[3],
+            |uid, fetch| {
+                observed.push((uid, fetch.mod_seq));
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(observed, vec![(3, Some(7)), (3, Some(0))]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[&3].mod_seq, Some(0));
+    }
+
+    #[test]
+    fn flag_bearing_hydration_requires_an_observation() {
+        for projection in [Projection::FlagsOnly, Projection::Metadata] {
+            let (_, kind) = projection_plan(projection, false).unwrap();
+            let missing = FetchResponse {
+                uid: Some(3),
+                ..Default::default()
+            };
+            assert!(matches!(
+                hydrate_planned(&folder(), 9, missing, kind, None),
+                Err(crate::Error::ProtocolMissing(_))
+            ));
+            let empty = FetchResponse {
+                uid: Some(3),
+                flags: Some(Vec::new()),
+                ..Default::default()
+            };
+            assert!(hydrate_planned(&folder(), 9, empty, kind, None).is_ok());
+        }
+    }
+
+    #[test]
+    fn mime_hydration_requires_a_body_observation() {
+        let fetch = FetchResponse {
+            uid: Some(3),
+            ..Default::default()
+        };
+        assert!(matches!(
+            hydrate_planned(&folder(), 9, fetch, HydrationKind::Mime, None),
+            Err(crate::Error::ProtocolMissing(_))
+        ));
+    }
+
+    #[test]
     fn flags_only_hydration_lowercases_the_flag_set() {
         let fetch = FetchResponse {
             uid: Some(3),
@@ -748,6 +905,7 @@ mod tests {
     fn answering_as_a_submitted_id_renames_the_metadata_entry_too() {
         let fetch = FetchResponse {
             uid: Some(3),
+            flags: Some(Vec::new()),
             rfc822_size: Some(77),
             ..Default::default()
         };
@@ -766,6 +924,7 @@ mod tests {
     fn metadata_hydration_reuses_the_inventory_projection_and_owner_tag() {
         let fetch = FetchResponse {
             uid: Some(3),
+            flags: Some(Vec::new()),
             rfc822_size: Some(77),
             ..Default::default()
         };
@@ -786,20 +945,16 @@ mod tests {
         }
     }
 
-    // A raw-MIME projection with no returned section yields empty bytes
-    // rather than dropping the item: the id still reaches the consumer.
+    // A raw-MIME projection with no returned section is not an empty
+    // message: it must not hydrate as a successful empty body. The caller's
+    // per-UID lane reports it as a failure instead.
     #[test]
-    fn raw_mime_hydration_tolerates_a_missing_section() {
+    fn raw_mime_hydration_refuses_a_missing_section() {
         let fetch = FetchResponse {
             uid: Some(3),
             ..Default::default()
         };
-        let object =
-            fetch_to_hydrated(&folder(), 9, fetch, Projection::Full, None).expect("uid present");
-        match object.kind {
-            HydratedObjectKind::RawMime(bytes) => assert!(bytes.is_empty()),
-            other => panic!("expected RawMime, got {other:?}"),
-        }
+        assert!(fetch_to_hydrated(&folder(), 9, fetch, Projection::Full, None).is_none());
     }
 
     // A preview is a prefix of the whole message, so what comes back is a

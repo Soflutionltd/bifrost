@@ -269,6 +269,42 @@ pub const SUBMISSION_PORT: u16 = 587;
 // pub: callers use the standard implicit-TLS submission port in configs.
 pub const SUBMISSIONS_PORT: u16 = 465;
 
+/// TLS mode used to select a default TCP port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PortTls {
+    /// Plaintext SMTP or LMTP.
+    Plaintext,
+    /// Required or opportunistic STARTTLS.
+    StartTls,
+    /// TLS from connection establishment.
+    Implicit,
+}
+
+/// Default TCP port shared by transport builders, URLs and composed accounts.
+/// LMTP has no assigned TLS ports and retains its deployed port 24 convention.
+pub const fn default_port(protocol: Protocol, tls: PortTls) -> u16 {
+    match (protocol, tls) {
+        (Protocol::Lmtp, _) => LMTP_PORT,
+        (_, PortTls::Plaintext) => SMTP_PORT,
+        (_, PortTls::StartTls) => SUBMISSION_PORT,
+        (_, PortTls::Implicit) => SUBMISSIONS_PORT,
+    }
+}
+
+/// Default TCP port for client message submission (RFC 6409), as opposed to
+/// the relay default [`default_port`] gives a plain `smtp` builder or URL.
+///
+/// Plaintext submission stays on 587, not the port 25 relay port: a user
+/// configuring a mail account against an internal relay without TLS expects
+/// the submission service, and client networks commonly block outbound 25.
+pub const fn default_submission_port(tls: PortTls) -> u16 {
+    match tls {
+        PortTls::Implicit => SUBMISSIONS_PORT,
+        PortTls::Plaintext | PortTls::StartTls => SUBMISSION_PORT,
+    }
+}
+
 /// Default timeout
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -314,7 +350,7 @@ impl Default for SmtpInfo {
         Self {
             protocol: Protocol::Smtp,
             server: "localhost".to_owned(),
-            port: SMTP_PORT,
+            port: default_port(Protocol::Smtp, PortTls::Plaintext),
             unix_socket: None,
             hello_name: ClientId::default(),
             credentials: None,
@@ -332,11 +368,7 @@ impl Default for SmtpInfo {
 
 impl SmtpInfo {
     fn new<T: Into<String>>(server: T, protocol: Protocol) -> Self {
-        let port = match protocol {
-            Protocol::Smtp => SMTP_PORT,
-            Protocol::Lmtp => LMTP_PORT,
-            _ => SMTP_PORT,
-        };
+        let port = default_port(protocol, PortTls::Plaintext);
         Self {
             protocol,
             server: server.into(),

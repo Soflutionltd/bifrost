@@ -37,7 +37,7 @@ pub(crate) struct GraphErrorContext {
     pub(crate) idempotency_override: Option<bool>,
     /// The Outlook mailbox budget the request was charged to, when the call
     /// site knows the client that sent it (a `$batch` subresponse) or the
-    /// REST funnel tagged the failure (`GraphError::MailboxThrottled`).
+    /// REST funnel tagged the failure (`GraphError::MailboxContext`).
     /// Stamped on the error only when it classifies as a throttle.
     pub(crate) budget: Option<bifrost_types::ThrottleBudget>,
 }
@@ -142,7 +142,7 @@ pub(crate) fn into_account_error(error: GraphError, ctx: GraphErrorContext) -> A
             ),
             &ctx,
         ),
-        GraphError::MailboxThrottled { budget, source } => {
+        GraphError::MailboxContext { budget, source } => {
             into_account_error(*source, ctx.with_budget(budget))
         }
         GraphError::Net(net) => net_to_account_error(net, &ctx),
@@ -259,6 +259,13 @@ fn net_to_account_error(net: bifrost_net::Error, ctx: &GraphErrorContext) -> Acc
     )
 }
 
+fn is_throttle(kind: &AccountErrorKind) -> bool {
+    matches!(
+        kind,
+        AccountErrorKind::Server(ServerErrorKind::RateLimited | ServerErrorKind::QuotaExhausted)
+    )
+}
+
 /// Stamp the context's mailbox budget on an error `bifrost-net` built, when
 /// it classified as a throttle. The response path stamps it at construction;
 /// this covers a 429 whose body was not Graph's, which bifrost-net
@@ -268,10 +275,7 @@ fn stamp_budget(error: AccountError, ctx: &GraphErrorContext) -> AccountError {
     let Some(budget) = ctx.budget.as_ref() else {
         return error;
     };
-    if !matches!(
-        error.kind(),
-        AccountErrorKind::Server(ServerErrorKind::RateLimited | ServerErrorKind::QuotaExhausted)
-    ) {
+    if !is_throttle(error.kind()) {
         return error;
     }
     error
@@ -402,21 +406,14 @@ fn soap_fault_to_account_error(
     // Cursor scopes deliberately do not imply Mailbox here: that would turn
     // folder-scoped 404s into object-not-found errors and change recovery.
     let resource = ctx.scope.as_ref().and_then(ErrorScope::resource);
-    // The third element flags a throttle path (rate-limit / quota): the
-    // engine needs a `throttle_scope` so it buckets the EWS backoff (at the
-    // account, see `throttle_scope_for`). Without it `ErrorServerBusy` ->
-    // `RateLimited` carries no scope, so no engine hold paces the EWS lane's
-    // next session the way the REST 429 path is paced.
-    let (kind, cause, throttle) = match code {
+    let (kind, cause) = match code {
         SoapFaultCode::Server => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
             Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-            false,
         ),
         SoapFaultCode::Client | SoapFaultCode::MustUnderstand | SoapFaultCode::VersionMismatch => (
             AccountErrorKind::Server(ServerErrorKind::Error { status: Some(400) }),
             Cause::Server(ServerCause::Error { status: Some(400) }),
-            false,
         ),
         // Microsoft EWS specific faults the convergence audit
         // identified as recoverable but previously collapsed to
@@ -424,17 +421,14 @@ fn soap_fault_to_account_error(
         SoapFaultCode::ErrorAccessDenied => (
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied { resource }),
-            false,
         ),
         SoapFaultCode::ErrorImpersonateUserDenied => (
             AccountErrorKind::Authorization(AccessErrorKind::ConditionalAccessBlocked),
             Cause::Access(AccessCause::ConditionalAccessBlocked),
-            false,
         ),
         SoapFaultCode::ErrorServerBusy => (
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
             Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-            true,
         ),
         SoapFaultCode::ErrorMailboxStoreUnavailable | SoapFaultCode::ErrorMailboxMoveInProgress => {
             (
@@ -444,7 +438,6 @@ fn soap_fault_to_account_error(
                 Cause::Access(AccessCause::MailboxUnavailable {
                     kind: MailboxUnavailableKind::Transient,
                 }),
-                false,
             )
         }
         SoapFaultCode::ErrorNonExistentMailbox => (
@@ -457,7 +450,6 @@ fn soap_fault_to_account_error(
                     .and_then(ErrorScope::object_id)
                     .map(str::to_owned),
             }),
-            false,
         ),
         SoapFaultCode::ErrorItemNotFound => {
             // Unscoped streaming and folder walks retain the historical item
@@ -473,7 +465,6 @@ fn soap_fault_to_account_error(
                         .and_then(ErrorScope::object_id)
                         .map(str::to_owned),
                 }),
-                false,
             )
         }
         // A streaming subscription is intentionally short lived. These
@@ -483,7 +474,6 @@ fn soap_fault_to_account_error(
         SoapFaultCode::ErrorStreamingSubscriptionInvalid => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
             Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-            false,
         ),
         SoapFaultCode::Unknown => (
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
@@ -491,9 +481,9 @@ fn soap_fault_to_account_error(
                 protocol: ctx.protocol,
                 detail: Some(detail.clone()),
             }),
-            false,
         ),
     };
+    let throttle = is_throttle(&kind);
     let mut builder = base_builder(ctx, kind, cause).text(detail);
     builder = push_attempt(builder, TransmissionState::Acknowledged);
     if throttle && let Some(scope) = throttle_scope_for(ctx) {
@@ -576,17 +566,15 @@ fn autodiscover_error(
 ) -> AccountError {
     let code = native_code;
     let is = |name: &str| classify_as.eq_ignore_ascii_case(name);
-    let (kind, cause, throttle) = if is("ServerBusy") {
+    let (kind, cause) = if is("ServerBusy") {
         (
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
             Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-            true,
         )
     } else if is("InternalServerError") {
         (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
             Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-            false,
         )
     } else if is("InvalidUser") {
         (
@@ -595,7 +583,6 @@ fn autodiscover_error(
                 what: ResourceKind::Mailbox,
                 id: None,
             }),
-            false,
         )
     } else if is("InvalidRequest") || is("InvalidSetting") {
         (
@@ -603,13 +590,11 @@ fn autodiscover_error(
             Cause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only(format!("{what} refused the request: {code}")),
             }),
-            false,
         )
     } else {
         (
             AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
             Cause::Server(ServerCause::Error { status: None }),
-            false,
         )
     };
     let shown = if code.is_empty() {
@@ -621,6 +606,7 @@ fn autodiscover_error(
         Some(message) => format!("{what} error {shown}: {message}"),
         None => format!("{what} error {shown}"),
     };
+    let throttle = is_throttle(&kind);
     let mut builder = base_builder(ctx, kind, cause).text(DiagnosticText::support_only(detail));
     if !code.is_empty() {
         builder = builder.native_code(code.to_string());
@@ -730,11 +716,12 @@ fn response_to_account_error(
     // envelope; that is provider contract violation territory unless
     // the status code itself carries enough information (5xx with no
     // body is plenty; 400 with no body is malformed-response).
-    let (kind, cause, throttle) = match signal.as_ref() {
+    let (kind, cause) = match signal.as_ref() {
         Some(signal) => classify(ctx, code, signal, retry_hint),
         None => classify_no_envelope(ctx, code, retry_hint, &body),
     };
 
+    let throttle = is_throttle(&kind);
     let mut builder = base_builder(ctx, kind, cause.clone());
     // Attach the GraphSignal as an inner wire cause whenever the
     // primary cause is not itself a wire cause, so support tooling
@@ -771,7 +758,7 @@ fn response_to_account_error(
 
     // The retry hint already lives structurally on `ServerCause`; no
     // builder side-channel is needed. `throttle_scope` annotation
-    // applies only on rate-limit / quota / 503 paths.
+    // applies only on rate-limit / quota paths. A plain 503 is unavailable.
     if throttle && let Some(scope) = throttle_scope_for(ctx) {
         builder = builder.throttle_scope(scope);
         if let Some(budget) = ctx.budget.as_ref() {
@@ -790,36 +777,31 @@ fn classify(
     code: u16,
     signal: &GraphSignal,
     retry_hint: Option<RetryHint>,
-) -> (AccountErrorKind, Cause, bool) {
+) -> (AccountErrorKind, Cause) {
     match signal {
         GraphSignal::InvalidAuthenticationToken => (
             AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
             Cause::Auth(AuthCause::ReauthorizationRequired),
-            false,
         ),
         GraphSignal::AccessDenied | GraphSignal::Forbidden => (
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied {
                 resource: ctx.scope.as_ref().and_then(ErrorScope::resource),
             }),
-            false,
         ),
         GraphSignal::AccessRestricted | GraphSignal::ConditionalAccessBlocked => (
             AccountErrorKind::Authorization(AccessErrorKind::ConditionalAccessBlocked),
             Cause::Access(AccessCause::ConditionalAccessBlocked),
-            false,
         ),
         GraphSignal::AdminConsentRequired => (
             AccountErrorKind::Authorization(AccessErrorKind::AdminConsentRequired),
             Cause::Access(AccessCause::AdminConsentRequired {
                 needed: "admin-consent",
             }),
-            false,
         ),
         GraphSignal::MailboxNotEnabledForRestApi => (
             AccountErrorKind::Authorization(AccessErrorKind::MailboxNotLicensed),
             Cause::Access(AccessCause::MailboxNotLicensed),
-            false,
         ),
         GraphSignal::MailboxStoreUnavailable => (
             AccountErrorKind::Authorization(AccessErrorKind::MailboxUnavailable {
@@ -828,7 +810,6 @@ fn classify(
             Cause::Access(AccessCause::MailboxUnavailable {
                 kind: MailboxUnavailableKind::Transient,
             }),
-            false,
         ),
         GraphSignal::ResyncRequired
         | GraphSignal::InvalidDeltaToken
@@ -836,17 +817,14 @@ fn classify(
         GraphSignal::TooManyRequests => (
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
             Cause::Server(ServerCause::RateLimited { retry_hint }),
-            true,
         ),
         GraphSignal::GenericFileError => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
             Cause::Server(ServerCause::Unavailable { retry_hint }),
-            false,
         ),
         GraphSignal::PreconditionFailed => (
             AccountErrorKind::ConcurrencyConflict,
             Cause::State(StateCause::ConcurrencyConflict),
-            false,
         ),
         GraphSignal::Gone => gone_410(ctx),
         GraphSignal::NotFound => match ctx.scope.as_ref().and_then(ErrorScope::resource) {
@@ -860,7 +838,6 @@ fn classify(
                         .and_then(ErrorScope::object_id)
                         .map(str::to_owned),
                 }),
-                false,
             ),
             None => server_error_tuple(404),
         },
@@ -879,12 +856,11 @@ fn classify(
 /// that hit this path without a cursor scope have a bug; we
 /// down-route to `Protocol(ContractViolation)` so the audit surfaces
 /// the producer rather than crashing in `try_build`.
-fn cursor_invalid_or_protocol(ctx: &GraphErrorContext) -> (AccountErrorKind, Cause, bool) {
+fn cursor_invalid_or_protocol(ctx: &GraphErrorContext) -> (AccountErrorKind, Cause) {
     if matches!(ctx.scope, Some(ErrorScope::Cursor(_))) {
         (
             AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
             Cause::State(StateCause::CursorInvalid),
-            false,
         )
     } else {
         // Should be unreachable in correctly-wired call sites. Keep
@@ -904,7 +880,6 @@ fn cursor_invalid_or_protocol(ctx: &GraphErrorContext) -> (AccountErrorKind, Cau
                     "Graph CursorInvalid signal raised outside cursor scope".to_string(),
                 )),
             }),
-            false,
         )
     }
 }
@@ -913,7 +888,7 @@ fn cursor_invalid_or_protocol(ctx: &GraphErrorContext) -> (AccountErrorKind, Cau
 /// and the status-fallback `410` arms cannot drift. On a cursor scope it
 /// is the canonical `SyncState(CursorInvalid)` -> `Engine(RestartScope)`
 /// signal; outside cursor context it is a permanent server error.
-fn gone_410(ctx: &GraphErrorContext) -> (AccountErrorKind, Cause, bool) {
+fn gone_410(ctx: &GraphErrorContext) -> (AccountErrorKind, Cause) {
     if matches!(ctx.scope, Some(ErrorScope::Cursor(_))) {
         cursor_invalid_or_protocol(ctx)
     } else {
@@ -925,7 +900,7 @@ fn classify_by_status(
     ctx: &GraphErrorContext,
     code: u16,
     retry_hint: Option<RetryHint>,
-) -> (AccountErrorKind, Cause, bool) {
+) -> (AccountErrorKind, Cause) {
     match code {
         // A novel, not-yet-typed 400-coded signal on a cursor scope is
         // almost certainly a delta-token rejection Graph added after this
@@ -942,19 +917,16 @@ fn classify_by_status(
             Cause::Request(RequestCause::Malformed {
                 detail: DiagnosticText::support_only(format!("HTTP {code}")),
             }),
-            false,
         ),
         401 => (
             AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
             Cause::Auth(AuthCause::ReauthorizationRequired),
-            false,
         ),
         403 => (
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied {
                 resource: ctx.scope.as_ref().and_then(ErrorScope::resource),
             }),
-            false,
         ),
         404 => match ctx.scope.as_ref().and_then(ErrorScope::resource) {
             Some(resource) => (
@@ -967,30 +939,25 @@ fn classify_by_status(
                         .and_then(ErrorScope::object_id)
                         .map(str::to_owned),
                 }),
-                false,
             ),
             None => server_error_tuple(code),
         },
         409 | 412 => (
             AccountErrorKind::ConcurrencyConflict,
             Cause::State(StateCause::ConcurrencyConflict),
-            false,
         ),
         410 => gone_410(ctx),
         408 | 502 | 503 | 504 => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
             Cause::Server(ServerCause::Unavailable { retry_hint }),
-            false,
         ),
         429 => (
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
             Cause::Server(ServerCause::RateLimited { retry_hint }),
-            true,
         ),
         507 => (
             AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
             Cause::Server(ServerCause::QuotaExhausted { retry_hint }),
-            true,
         ),
         _ => server_error_tuple(code),
     }
@@ -1008,7 +975,7 @@ fn classify_no_envelope(
     code: u16,
     retry_hint: Option<RetryHint>,
     body: &bytes::Bytes,
-) -> (AccountErrorKind, Cause, bool) {
+) -> (AccountErrorKind, Cause) {
     // 500-class without an envelope is still a server problem.
     // 4xx/other land on the existing status fallback, which will pick
     // the appropriate Auth/Authorization/etc. mapping based on the
@@ -1030,18 +997,16 @@ fn classify_no_envelope(
                     "HTTP {code} with non-envelope body",
                 ))),
             }),
-            false,
         )
     } else {
         classify_by_status(ctx, code, retry_hint)
     }
 }
 
-fn server_error_tuple(code: u16) -> (AccountErrorKind, Cause, bool) {
+fn server_error_tuple(code: u16) -> (AccountErrorKind, Cause) {
     (
         AccountErrorKind::Server(ServerErrorKind::Error { status: Some(code) }),
         Cause::Server(ServerCause::Error { status: Some(code) }),
-        false,
     )
 }
 

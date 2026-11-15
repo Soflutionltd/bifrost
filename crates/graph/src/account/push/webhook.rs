@@ -136,7 +136,7 @@ pub(super) async fn subscribe_graph(
     mut outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
     expected: &[bifrost_types::BatchItemId],
 ) -> Result<ArmOutcome, AccountError> {
-    let Some(endpoint) = account.push_endpoint.clone() else {
+    let Some(endpoint) = account.push_config.endpoint().cloned() else {
         return Err(unsupported_push_error());
     };
     // Graph webhooks reject any subscription whose `resource` we cannot

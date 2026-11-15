@@ -15,7 +15,7 @@ mod ews_stream;
 mod filters;
 mod foreign;
 mod get;
-mod graph_error;
+pub(crate) mod graph_error;
 mod groups;
 mod inventory;
 mod mutate;
@@ -74,11 +74,31 @@ pub use self::public_folder::PublicFolderScope;
 /// answer for any folder that is not mixed-class.
 pub(crate) const PUBLIC_ITEM_CLASS_CACHE_CAP: usize = cursor::PUBLIC_FOLDER_LIVE_IDS_CAP;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) enum PushMode {
     GraphSubscriptions,
     EwsStreaming,
+}
+
+/// One configured push surface. An Outlook user without a receiver keeps
+/// polling; advertising push in that case would promise updates we cannot deliver.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub(crate) enum PushConfig {
+    None,
+    Webhook(PushEndpoint),
+    EwsStreaming,
+}
+
+impl PushConfig {
+    pub(crate) fn endpoint(&self) -> Option<&PushEndpoint> {
+        match self {
+            Self::Webhook(endpoint) => Some(endpoint),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -93,8 +113,7 @@ pub(crate) struct GraphAccount {
     /// construction.
     pub(crate) shared_clients: Arc<HashMap<String, GraphClient>>,
     pub(crate) capabilities: AccountCapabilities,
-    pub(crate) push_endpoint: Option<PushEndpoint>,
-    pub(crate) push_mode: PushMode,
+    pub(crate) push_config: PushConfig,
     pub(crate) push_lease: bifrost_types::LaneLease,
     pub(crate) push_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     pub(crate) graph_topology: Arc<watch::Sender<u64>>,
@@ -321,8 +340,7 @@ impl GraphAccount {
 
     pub(crate) fn new(
         client: GraphClient,
-        push_mode: PushMode,
-        push_endpoint: Option<PushEndpoint>,
+        push_config: PushConfig,
         shared_mailboxes: &[String],
         public_folders: Option<PublicFolderScope>,
         user_email: Option<String>,
@@ -336,9 +354,8 @@ impl GraphAccount {
         Self {
             shared_clients: Arc::new(shared_clients),
             client,
-            capabilities: capabilities::build_capabilities(push_mode, has_shared_mailboxes),
-            push_endpoint,
-            push_mode,
+            capabilities: capabilities::build_capabilities(&push_config, has_shared_mailboxes),
+            push_config,
             push_lease: bifrost_types::LaneLease::new(),
             push_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
             graph_topology: Arc::new(watch::Sender::new(0)),
@@ -376,7 +393,7 @@ impl GraphAccount {
 
     #[cfg(test)]
     pub(crate) fn new_for_tests(client: GraphClient, push_mode: PushMode) -> Self {
-        Self::new(client, push_mode, None, &[], None, None)
+        Self::new(client, test_push_config(push_mode), &[], None, None)
     }
 
     #[cfg(test)]
@@ -385,7 +402,13 @@ impl GraphAccount {
         push_mode: PushMode,
         shared_mailboxes: &[String],
     ) -> Self {
-        Self::new(client, push_mode, None, shared_mailboxes, None, None)
+        Self::new(
+            client,
+            test_push_config(push_mode),
+            shared_mailboxes,
+            None,
+            None,
+        )
     }
 
     /// Install an explicit shared-client map instead of deriving one from
@@ -408,7 +431,7 @@ impl GraphAccount {
         push_mode: PushMode,
         shared_clients: HashMap<String, GraphClient>,
     ) -> Self {
-        let mut account = Self::new(client, push_mode, None, &[], None, None);
+        let mut account = Self::new(client, test_push_config(push_mode), &[], None, None);
         account.shared_clients = Arc::new(shared_clients);
         account.refresh_shared_mailbox_capabilities();
         account
@@ -486,7 +509,7 @@ impl GraphAccount {
     ) -> Result<&GraphClient, crate::error::GraphError> {
         match owner {
             None => Ok(&self.client),
-            Some(mailbox) => self.shared_clients.get(mailbox).ok_or_else(|| {
+            Some(mailbox) => shared_client(&self.shared_clients, mailbox).ok_or_else(|| {
                 crate::error::GraphError::Configuration {
                     message: format!("shared mailbox not configured on this account: {mailbox}"),
                 }
@@ -676,8 +699,7 @@ impl GraphAccount {
 // pub: sync-engine consumers register this factory so reopen can mint fresh Graph accounts.
 pub struct GraphAccountFactory {
     client: GraphClient,
-    push_mode: PushMode,
-    push_endpoint: Option<PushEndpoint>,
+    push_config: PushConfig,
     shared_mailboxes: Vec<String>,
     public_folders: Option<PublicFolderScope>,
     delegate_discovery: bool,
@@ -691,8 +713,7 @@ impl GraphAccountFactory {
     pub fn new(client: GraphClient) -> Self {
         Self {
             client,
-            push_mode: PushMode::GraphSubscriptions,
-            push_endpoint: None,
+            push_config: PushConfig::None,
             shared_mailboxes: Vec::new(),
             public_folders: None,
             delegate_discovery: false,
@@ -767,18 +788,16 @@ impl GraphAccountFactory {
         webhook_url: impl Into<String>,
         client_state: impl Into<String>,
     ) -> Self {
-        self.push_endpoint = Some(PushEndpoint {
+        self.push_config = PushConfig::Webhook(PushEndpoint {
             webhook_url: webhook_url.into(),
             client_state: client_state.into(),
         });
-        self.push_mode = PushMode::GraphSubscriptions;
         self
     }
 
     // pub: consumers without a reachable webhook endpoint can select in-process EWS streaming.
     pub fn with_ews_streaming(mut self) -> Self {
-        self.push_endpoint = None;
-        self.push_mode = PushMode::EwsStreaming;
+        self.push_config = PushConfig::EwsStreaming;
         self
     }
 }
@@ -789,8 +808,7 @@ impl AccountFactory for GraphAccountFactory {
         account_id: bifrost_types::AccountId,
     ) -> AccountFuture<Result<OpenedAccount, AccountError>> {
         let client = self.client.clone();
-        let push_mode = self.push_mode;
-        let push_endpoint = self.push_endpoint.clone();
+        let push_config = self.push_config.clone();
         let shared_mailboxes = self.shared_mailboxes.clone();
         let public_folders = self.public_folders.clone();
         let delegate_discovery = self.delegate_discovery;
@@ -813,8 +831,7 @@ impl AccountFactory for GraphAccountFactory {
             client.set_primary_address(user_email.clone());
             let mut account = GraphAccount::new(
                 client.clone(),
-                push_mode,
-                push_endpoint,
+                push_config,
                 &shared_mailboxes,
                 public_folders,
                 user_email.clone(),
@@ -1739,8 +1756,44 @@ fn shared_clients_map(client: &GraphClient, mailboxes: &[String]) -> HashMap<Str
     mailboxes
         .iter()
         .filter(|mailbox| !mailbox.is_empty())
-        .map(|mailbox| (mailbox.clone(), client.for_shared_mailbox(mailbox.clone())))
-        .collect()
+        // Outlook users expect one shared mailbox regardless of address case,
+        // and stable ids for the mail in it. The FIRST configured spelling is
+        // the mailbox's canonical spelling: it keys this map and is the owner
+        // written into every id, so ids never change spelling. Later case
+        // aliases fold into it; lookups (`shared_client`) are ASCII
+        // case-insensitive, and the client routes and budgets in lowercase.
+        .fold(HashMap::new(), |mut map, mailbox| {
+            if !map
+                .keys()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(mailbox))
+            {
+                map.insert(mailbox.clone(), client.for_shared_mailbox(mailbox.clone()));
+            }
+            map
+        })
+}
+
+/// The configured client for a shared mailbox, matched ASCII
+/// case-insensitively so an id or send-as address spelled differently from
+/// the configuration still routes to the one mailbox.
+pub(crate) fn shared_client<'a>(
+    clients: &'a HashMap<String, GraphClient>,
+    mailbox: &str,
+) -> Option<&'a GraphClient> {
+    clients.get(mailbox).or_else(|| {
+        clients
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(mailbox))
+            .map(|(_, client)| client)
+    })
+}
+
+#[cfg(test)]
+fn test_push_config(mode: PushMode) -> PushConfig {
+    match mode {
+        PushMode::GraphSubscriptions => PushConfig::None,
+        PushMode::EwsStreaming => PushConfig::EwsStreaming,
+    }
 }
 
 fn sync_event_stream<T, F>(future: F) -> AccountStream<SyncEvent<T>>
@@ -1764,6 +1817,37 @@ mod tests {
         PublicFolderRouting, encode_cursor, kind_for_scope,
     };
     use super::*;
+
+    #[test]
+    fn mailbox_case_aliases_have_one_client_and_accept_old_owner_tags() {
+        let account = GraphAccount::new_for_tests_with_shared(
+            GraphClient::new("token"),
+            PushMode::GraphSubscriptions,
+            &["Shared@Contoso.com".into(), "shared@contoso.com".into()],
+        );
+        assert_eq!(account.shared_clients.len(), 1);
+        // The first configured spelling is canonical and keys the map.
+        assert!(account.shared_clients.contains_key("Shared@Contoso.com"));
+        assert!(std::ptr::eq(
+            account
+                .client_for_owner(Some("SHARED@CONTOSO.COM"))
+                .unwrap(),
+            account
+                .client_for_owner(Some("shared@contoso.com"))
+                .unwrap(),
+        ));
+    }
+
+    #[test]
+    fn default_factory_has_no_push_capability_or_lane() {
+        let factory = GraphAccountFactory::new(GraphClient::new("token"));
+        let account = GraphAccount::new(factory.client, factory.push_config, &[], None, None);
+        assert_eq!(
+            account.capabilities.push,
+            bifrost_types::PushCapability::None
+        );
+        assert!(push_stream::push_lanes(&account).is_empty());
+    }
 
     fn account() -> GraphAccount {
         GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions)
@@ -1822,7 +1906,7 @@ mod tests {
         );
 
         let stamped = graph_error::into_account_error(
-            crate::error::GraphError::MailboxThrottled {
+            crate::error::GraphError::MailboxContext {
                 budget: budget_of("a@contoso.com"),
                 source: Box::new(crate::error::GraphError::Response(
                     crate::error::GraphResponseError::from_response(

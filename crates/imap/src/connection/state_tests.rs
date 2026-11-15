@@ -448,7 +448,7 @@ fn refused_logout_does_not_complete_on_a_later_commands_ok() {
                 text: "ready".into(),
             })
             .unwrap();
-        state.set_in_logout(true);
+        state.set_in_logout("A1".into());
         let _ = state.apply_side_effects(&Response::Tagged(TaggedResponse {
             tag: "A1".into(),
             status: refusal,
@@ -462,7 +462,7 @@ fn refused_logout_does_not_complete_on_a_later_commands_ok() {
             text: "NOOP completed".into(),
         }));
         assert_eq!(state.session_state(), SessionState::Authenticated);
-        assert!(!state.in_logout);
+        assert!(state.in_logout.is_none());
     }
 }
 
@@ -538,4 +538,35 @@ fn snapshot_tracks_selected_mailbox_identity() {
     state.set_in_unauthenticate(true);
     let _ = state.apply_side_effects(&reply(StatusKind::Ok));
     assert_eq!(state.snapshot().selected, None);
+}
+
+#[test]
+fn foreign_tagged_responses_do_not_complete_or_disarm_logout() {
+    for status in [StatusKind::Ok, StatusKind::No, StatusKind::Bad] {
+        let mut state = ProtocolState::new();
+        state
+            .apply_greeting(&GreetingResponse {
+                status: GreetingStatus::PreAuth,
+                code: None,
+                text: "ready".into(),
+            })
+            .unwrap();
+        state.set_in_logout("logout".into());
+        let _ = state.apply_side_effects(&Response::Tagged(TaggedResponse {
+            tag: "foreign".into(),
+            status,
+            code: None,
+            text: "unrelated completion".into(),
+        }));
+        assert_eq!(state.session_state(), SessionState::Authenticated);
+        assert_eq!(state.in_logout.as_deref(), Some("logout"));
+        let _ = state.apply_side_effects(&Response::Tagged(TaggedResponse {
+            tag: "logout".into(),
+            status: StatusKind::Ok,
+            code: None,
+            text: "logout complete".into(),
+        }));
+        assert_eq!(state.session_state(), SessionState::Logout);
+        assert!(state.in_logout.is_none());
+    }
 }

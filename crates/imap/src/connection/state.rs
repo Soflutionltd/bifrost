@@ -55,9 +55,9 @@ pub(crate) struct ProtocolState {
     mailbox_selected: bool,
     /// Successfully `ENABLE`d extensions (RFC 5161 Section3.2).
     enabled: Vec<String>,
-    /// `true` while a LOGOUT command is in flight. Consulted by
+    /// The tag of an in-flight LOGOUT command. Consulted by
     /// `apply_tagged` to transition to `Logout` on tagged OK.
-    in_logout: bool,
+    in_logout: Option<String>,
     /// `true` while a LOGIN or AUTHENTICATE command is in flight.
     /// Consulted by `apply_tagged` to transition to `Authenticated`
     /// on tagged OK (RFC 3501 Section6.2.2, Section6.2.3).
@@ -109,7 +109,7 @@ impl ProtocolState {
             selected: None,
             mailbox_selected: false,
             enabled: Vec::new(),
-            in_logout: false,
+            in_logout: None,
             in_auth: false,
             in_select: None,
             in_close: false,
@@ -242,8 +242,8 @@ impl ProtocolState {
     // directly  -  they set flags that `apply_side_effects` reads.
 
     /// Mark a LOGOUT command as in-flight.
-    pub(crate) fn set_in_logout(&mut self, val: bool) {
-        self.in_logout = val;
+    pub(crate) fn set_in_logout(&mut self, tag: String) {
+        self.in_logout = Some(tag);
     }
 
     /// Mark a LOGIN or AUTHENTICATE command as in-flight.
@@ -304,7 +304,7 @@ impl ProtocolState {
     /// withheld. A `NO`/`BAD` must not take this path: a refused SELECT
     /// legitimately deselects (RFC 3501 Section 6.3.1).
     pub(in crate::connection) fn disarm_pending_effects(&mut self) {
-        self.in_logout = false;
+        self.in_logout = None;
         self.in_auth = false;
         self.in_select = None;
         self.in_close = false;
@@ -432,13 +432,19 @@ impl ProtocolState {
         // RFC 3501 Section6.1.3: tagged OK for LOGOUT confirms the session
         // has ended. Transition to Logout state. (BYE already did this
         // via apply_untagged; this is a belt-and-suspenders confirmation.)
-        if self.in_logout {
+        // LOGOUT is not pipelinable and the driver drains earlier batches
+        // before sending it. Still correlate here: a stray foreign completion
+        // must not consume the effect of a different command.
+        // Only this command's completion may consume its pending effect. A
+        // foreign tagged refusal must not prevent LOGOUT's own OK from closing
+        // the session, nor may a foreign OK close it prematurely.
+        if self.in_logout.as_deref() == Some(t.tag.as_str()) {
             if t.status == crate::types::response::StatusKind::Ok {
                 self.state = SessionState::Logout;
             }
             // A refusal completes this attempt too; a later command's OK
             // must not complete a LOGOUT that the server already rejected.
-            self.in_logout = false;
+            self.in_logout = None;
         }
 
         // RFC 3501 Section6.2.2, Section6.2.3: tagged OK for LOGIN or AUTHENTICATE

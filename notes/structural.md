@@ -2,8 +2,10 @@
 
 Shape and placement: the axes that should be types, and the moves, splits and
 rewrites, each with the payoff it buys. Each entry is the hunters' account,
-unverified. Entries that remove or rename a published item need the
-repository owner's ruling before anyone builds them, whatever the entry argues.
+unverified. Renaming, moving and reshaping published items is ruled fine; an
+entry that would remove a capability entirely (something a consumer could do
+that would no longer be possible) needs the repository owner's ruling before
+anyone builds it, whatever the entry argues.
 
 1. An entry is removed entirely when completely resolved. No historical record
    stays here.
@@ -2999,8 +3001,10 @@ unrepresentable. Related: CON-047.
 
 **Reported by:** net-dav.
 
-- `RequestBuilderInner.timeout: Option<Option<Duration>>` encodes "unset, explicitly
-  none, or a value"; an enum would say so.
+The timeout enum, typed `ByteRange` validation and typed priority landed. The
+two public reshapes below were deferred because they need consumer-crate
+migration; do them as one change that also edits the consumers.
+
 - `AccountSpec::connect_timeout` is a legacy alias for `response_headers_timeout`,
   so two fields carry one meaning and a precedence rule lives in `attach_account`
   (reshaping is ruled fine; removing the field needs the owner).
@@ -3008,11 +3012,14 @@ unrepresentable. Related: CON-047.
   the bool silently overrides the set, and in that mode `allows_host` returns false
   for every host including the departing one, as the docs warn. Type fix:
   `CrossOrigin { Any, AllowList(set), Forbidden }`.
-- `encode_range(ByteRange) -> String`, then `content_range_matches(&str, &str)`
-  parses the string back to recover the numbers; the typed `ByteRange` should reach
-  the validator.
-- `AccountNetInner.priority` is an `AtomicU8` decoded with an `_ => Normal`
-  fallback.
+
+## STR-156 - `BackoffPolicy` has no const constructor
+
+**Reported by:** wave 1 fixer (sync).
+
+The engine's retry loops now share `ReconnectBackoff`, but their named policies
+are lazy statics because `bifrost_types::BackoffPolicy` cannot be built in a
+`const`. A `const fn` constructor lets each policy be a plain `const`.
 
 ## STR-148 - DAV status and failure carriers are stringly
 

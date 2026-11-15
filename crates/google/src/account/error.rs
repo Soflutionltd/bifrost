@@ -704,9 +704,16 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
         .or_else(|| {
             resp.headers
                 .retry_after
-                .and(resp.headers.retry_at)
                 .filter(|_| is_retry_after_applicable(status, &signal))
-                .map(RetryHint::At)
+                .map(|hint| {
+                    resp.headers
+                        .retry_at
+                        .map(RetryHint::At)
+                        .unwrap_or_else(|| match hint {
+                            crate::error::RetryAfter::Delta(delta) => RetryHint::After(delta),
+                            crate::error::RetryAfter::At(at) => RetryHint::At(at),
+                        })
+                })
         });
 
     let (kind, cause) = classify_response(status, &signal, ctx, retry_hint);
@@ -2287,6 +2294,22 @@ mod tests {
             .retry_hint
             .expect("retry hint flows from Retry-After");
         assert_eq!(hint.min_delay(now), std::time::Duration::from_secs(42));
+
+        let resp = GmailResponseError {
+            service: crate::error::GmailService::GmailApi,
+            status: 429,
+            headers: crate::error::GmailResponseHeaders::from_headers(&headers),
+            body: bytes::Bytes::copy_from_slice(body.as_bytes()),
+            envelope: super::parse_envelope(body.as_bytes()),
+        };
+        let unobserved = translate_response(resp, &GmailErrorContext::inventory());
+        let RecoveryClass::Retry(advice) = unobserved.recovery() else {
+            panic!("expected retry");
+        };
+        assert_eq!(
+            advice.retry_hint,
+            Some(RetryHint::After(std::time::Duration::from_secs(42)))
+        );
     }
 
     /// a 401 from Pub/Sub watch translates as terminal so

@@ -3098,26 +3098,28 @@ fn rejected_push_scopes_are_not_treated_as_covered() {
 }
 
 #[test]
-fn jittered_stays_within_plus_minus_20_percent() {
-    use super::reattach::jittered;
+fn reconnect_jitter_zero_base_earns_no_carried_delay() {
     use std::time::Duration;
-    // Entropy comes from a fresh UUID per call; sample enough draws
-    // that the ±20% envelope is exercised without depending on the
-    // clock. The math must keep every draw inside [0.8x, 1.2x].
-    let base = Duration::from_millis(1_000);
-    let lo = Duration::from_millis(800);
-    let hi = Duration::from_millis(1_200);
-    for _ in 0..10_000 {
-        let j = jittered(base);
-        assert!(j >= lo && j <= hi, "jitter {j:?} outside ±20% of {base:?}");
-    }
+    let backoff = crate::backoff::ReconnectBackoff::new(bifrost_types::BackoffPolicy::new(
+        Duration::from_secs(1),
+        Duration::from_secs(300),
+        true,
+    ));
+    assert_eq!(backoff.carried_delay(), Duration::ZERO);
 }
 
 #[test]
-fn jittered_zero_base_is_zero() {
-    use super::reattach::jittered;
+fn reconnect_jitter_stays_within_policy_envelope() {
     use std::time::Duration;
-    assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
+    for seed in [0, 1, 250, 251, u64::MAX] {
+        let mut backoff = crate::backoff::ReconnectBackoff::new(bifrost_types::BackoffPolicy::new(
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+            true,
+        ));
+        let delay = backoff.record_failure(seed);
+        assert!((Duration::from_secs(1)..=Duration::from_millis(1250)).contains(&delay));
+    }
 }
 
 #[test]

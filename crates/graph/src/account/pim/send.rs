@@ -51,10 +51,10 @@ pub(crate) async fn send_message(
                 AccountOperation::Send,
             ));
         }
-        Some(send_as) => account
-            .shared_clients
-            .get(&send_as.mailbox().0)
-            .ok_or_else(|| send_as_unknown_mailbox(send_as.mailbox()))?,
+        Some(send_as) => {
+            crate::account::shared_client(&account.shared_clients, &send_as.mailbox().0)
+                .ok_or_else(|| send_as_unknown_mailbox(send_as.mailbox()))?
+        }
     };
     let mut message = message_from_send_request(&request)?;
     if let Some(send_as) = &request.send_as {
@@ -156,9 +156,7 @@ pub(super) fn client_for_scheduled_send_handle<'a>(
 ) -> Result<&'a GraphClient, AccountError> {
     match mailbox {
         None => Ok(&account.client),
-        Some(mailbox) => account
-            .shared_clients
-            .get(mailbox)
+        Some(mailbox) => crate::account::shared_client(&account.shared_clients, mailbox)
             .ok_or_else(|| send_as_unknown_mailbox(&MailboxId(mailbox.to_string()))),
     }
 }

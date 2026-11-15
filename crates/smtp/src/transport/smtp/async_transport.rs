@@ -126,12 +126,15 @@ where
     /// to validate TLS certificates.
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub fn relay(relay: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
-        use super::{SUBMISSIONS_PORT, Tls, TlsParameters};
+        use super::{PortTls, Tls, TlsParameters, default_port};
 
         let tls_parameters = TlsParameters::new(relay.into())?;
 
         Ok(Self::builder_dangerous(relay)
-            .port(SUBMISSIONS_PORT)
+            .port(default_port(
+                bifrost_types::error::Protocol::Smtp,
+                PortTls::Implicit,
+            ))
             .tls(Tls::Wrapper(tls_parameters)))
     }
 
@@ -148,12 +151,15 @@ where
     /// or emails will be sent to the server, protecting from downgrade attacks.
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub fn starttls_relay(relay: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
-        use super::{SUBMISSION_PORT, Tls, TlsParameters};
+        use super::{PortTls, Tls, TlsParameters, default_port};
 
         let tls_parameters = TlsParameters::new(relay.into())?;
 
         Ok(Self::builder_dangerous(relay)
-            .port(SUBMISSION_PORT)
+            .port(default_port(
+                bifrost_types::error::Protocol::Smtp,
+                PortTls::StartTls,
+            ))
             .tls(Tls::Required(tls_parameters)))
     }
 
@@ -210,7 +216,7 @@ where
     /// | `smtps` | unset                 | `smtps://user:pass@hostname:port`                  | 465          | SMTP over TLS, recommended method                                                                                                     |
     /// | `smtp`  | `required`            | `smtp://user:pass@hostname:port?tls=required`      | 587          | SMTP with STARTTLS required, when SMTP over TLS is not available                                                                      |
     /// | `smtp`  | `opportunistic`       | `smtp://user:pass@hostname:port?tls=opportunistic` | 587          | SMTP with optionally STARTTLS when supported by the server. Not suitable for production use: vulnerable to a man-in-the-middle attack |
-    /// | `smtp`  | unset                 | `smtp://user:pass@hostname:port`                   | 587          | Always unencrypted SMTP. Credentials are refused by default; message data is still unencrypted                                        |
+    /// | `smtp`  | unset                 | `smtp://user:pass@hostname:port`                   | 25           | Always unencrypted SMTP. Credentials are refused by default; message data is still unencrypted                                        |
     ///
     /// IMPORTANT: some parameters like `user` and `pass` cannot simply
     /// be concatenated to construct the final URL because special characters

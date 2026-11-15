@@ -19,6 +19,24 @@ All crates are pre-1.0, API stabilization phase.
 
 CalDAV composes into IMAP-shaped accounts when configured.
 
+### Who this is for: the product yardstick
+
+ratatoskr is an enterprise mail, calendar and contacts client - think Outlook in
+a corporate deployment - and it does what bifrost says it should. There is no
+separate consumer contract to discover: when a behaviour question has no
+technical answer (what a vanished target means for a move, whether a partial
+failure is reported or absorbed, which address a message is sent from, how loud
+an error should be), decide it by asking **what an enterprise Outlook user would
+expect to see**, and implement that. A user who moves a message deleted elsewhere
+wants it gone from view, not an error and not a false "moved"; a user sending on
+behalf of a shared mailbox expects the mailbox on the envelope; a user who loses
+network expects a retry, not a demand to re-enter their password.
+
+Such a decision needs no owner ruling. Record it where it lives - a comment at
+the code that implements it, and the crate's `reference/` doc where a consumer
+relies on it - stating the choice and the user expectation that settled it, so a
+later reader can disagree with a reason rather than rediscover the question.
+
 ## Rules
 
 ### General rules
@@ -223,7 +241,7 @@ Things this project has paid for. Preserved from the bug-hunt arcs of August
 2026, whose per-scope ledgers were closed out and deleted once their durable
 content reached `reference/` and the code.
 
-### Never delete published API on your own judgment
+### Never delete a capability on your own judgment
 
 This is the most expensive mistake made here, and it was made twice in one
 session: one commit deleted `bifrost-smtp`'s entire blocking transport half
@@ -251,15 +269,20 @@ restored at the owner's instruction. Three separate things went wrong:
   is at least as good an answer as "delete the field". Where a finding proposes
   removing something, look for the fix that keeps it.
 
-The rule: **a change that removes or renames a published item stops and asks the
-repository owner**, no matter which document recommends it and no matter how
-confident the argument. "Build, don't defer" settles build-versus-defer. It does
-not settle delete-versus-keep.
+The rule: **a change that removes a capability entirely - something a consumer
+could do that would no longer be possible - stops and asks the repository
+owner**, no matter which document recommends it and no matter how confident the
+argument. "Nothing in the workspace calls it" is never the argument that settles
+it. "Build, don't defer" settles build-versus-defer. It does not settle
+delete-versus-keep.
 
-Changing the SHAPE of a published type is ruled fine (2026-09-30): adding or
-reshaping fields or variants, turning a unit variant into a struct variant, and
-the like need no ruling, and no compatibility variant or shim is kept for the
-old shape. The crates are pre-1.0. Removal and renaming still stop and ask.
+Breaking the published API is ruled fine (2026-11-15), and needs no ruling:
+renaming, moving an item between modules or crates, narrowing an engine-internal
+item's visibility, collapsing duplicate types, reshaping fields, variants and
+signatures, and dropping an alias, shim or redundant second door to something
+that stays reachable. No compatibility variant or shim is kept for the old shape.
+The crates are pre-1.0. The test is whether the consumer can still do the thing,
+not whether the old spelling still compiles.
 
 ### The recurring defect shape is a fix that opens a new hole one layer up
 

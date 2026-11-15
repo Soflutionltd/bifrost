@@ -283,20 +283,6 @@ At(PartitionKey) }`, or the store returns rows and the engine selects. Trait
 change, needs the owner. `BackfillProgress::items_done` goes back to meaning a
 count.
 
-## BUG-017 - Backfill never tells the consumer about degraded coverage; fusion does
-
-**Reported by:** sync-lanes (live divergence).
-
-`InventoryFusion::warn_degraded` broadcasts `OperatorAttentionNeeded`
-("completed with N object(s) or region(s) it could not represent") at a degraded
-`Done`. `BackfillRunner::run_partition` warns only for barriers
-(`warn_barrier`); a degraded page or completion clears `complete`, registers the
-claim or sends `RecordDebt`, and announces nothing. `reference/sync.md` says
-"Degraded coverage is surfaced to the consumer as a
-`Warning::OperatorAttentionNeeded`" - true for one front end only, and backfill
-is the one every `Ready`-cursor cold start rides (Gmail, JMAP Email). The
-underlying duplication of per-page front-end logic is CON-024.
-
 ## BUG-018 - The ledger and cursor codecs panic on a `bifrost-types` variant they have not learned
 
 **Reported by:** sync-lanes (latent).
@@ -343,19 +329,6 @@ not, so a caller holding only the ledger retires without waking boundary
 waiters. Proposal: one `retire(id, why: RetireReason)` transition that always
 handles both halves, debt and wake, with quiescence owned by the same object
 (STR-042); the half-operations go crate-private (owner ruling: published).
-
-## BUG-022 - Topology replacement resets the per-scope fence counters
-
-**Reported by:** sync-lanes (latent fragility).
-
-`CursorRegistry::replace_topology_preserving_cursors` installs the staging
-registry's `RegistryState` wholesale (`*current = replacement`), including its
-`scope_generations`, which are usually empty, so every scope's delete counter
-drops to zero. Safe today only because the same call bumps `registry_generation`,
-fencing every pre-swap `DriveGeneration`. A counter documented as a fence should
-be monotonic, not resettable by a merge; incarnations and cancel tokens are
-carried across explicitly, so this field was missed. Proposal (with STR-048):
-merge per-scope state field by field rather than adopting the staging copy.
 
 ## BUG-023 - A `Fixed` backfill plan with zero partitions writes a durable completion without any inventory call
 
@@ -617,17 +590,6 @@ Option<PendingEffect>` in `types/command.rs` beside `legal_states`, with
 `pipelinable` derived from it, the armed effect keyed by tag (STR-065), and both
 paths arming through the one function before the first byte.
 
-## BUG-037 - IMAP literal budgets are not enforced on the pipeline, IDLE or continuation-wait read loops
-
-**Reported by:** imap-connection (latent).
-
-Only `dispatch_response_loop` calls `read_one_limited(utf8,
-consumer.literal_budget())`; every other loop calls `read_one(utf8)`. No
-pipelined consumer has a budget today (`FetchConsumer::new()`), so nothing
-breaks, but `ConsumerErased::literal_budget` is part of the pipeline consumer
-contract and is silently ignored there. Structural fix: one read-loop engine
-(CON-034).
-
 ## BUG-038 - IMAP APPENDLIMIT has two answers for one advertisement
 
 **Reported by:** imap-connection (live disagreement).
@@ -666,22 +628,6 @@ stream, while `build_selected_mailbox` uses only the select codes. Owner: one
 cuts on `[CLOSED]` once, assigns each response to exactly one side, and whose
 `SelectInputs` constructor judges mandatoriness (UIDVALIDITY included); the
 helpers belong in `dispatch/select.rs`, not `mod.rs` (STR-068).
-
-## BUG-041 - `Pipeline::execute_raw` waits unbounded, contradicting "no infinite waits"
-
-**Reported by:** imap-connection.
-
-`auth::submit_driver_command` is "the one submission body behind the four
-helpers", with strict admission and the withdraw/commit race. Three more
-submission paths have their own rules: `Pipeline::execute_raw`
-(`cmd_tx.reserve().await` with no deadline - the only command-carrying call with
-no bound, contradicting the `ImapConnection` doc's "no infinite waits");
-`ImapConnection::idle` (its own `select!` over cancel, deadline and `reserve` -
-with reason, though its admission half could be `submit_driver_command`'s); and
-`set_keepalive` / `peer_certificate_der` (`cmd_tx.send(..).await` with no reply
-cell and no deadline, queued behind any command; the callers wrap them in
-`in_flight()` or `timeout_at`). `execute_raw` and the two non-wire requests have
-no reason to differ.
 
 ## BUG-042 - IMAP `native_code` is `"OTHER"` for every unknown response code
 
@@ -795,15 +741,6 @@ two need different types (a grouping key vs a redeemable handle) or IMAP mints o
 redeemable form for both lanes; `bifrost-types` cannot currently express the
 difference, which is why nothing caught it.
 
-## BUG-048 - IMAP sync lanes ignore `UIDNOTSTICKY`
-
-**Reported by:** imap-account.
-
-Only the poller and its raw read check `uid_not_sticky`. Inventory and changes on
-such a folder mint cursors the next SELECT voids, so the scope cycles
-CursorInvalid -> re-inventory indefinitely. The poller's refusal (`Unsupported`,
-folder-scoped) is the answer the sync lanes should share.
-
 ## BUG-049 - `describe_cursor` reports an incomplete QRESYNC cursor as cheap QRESYNC, which `run_changes` refuses
 
 **Reported by:** imap-account (live).
@@ -852,29 +789,16 @@ error. Smaller: `route_scope` produces a validated `MailboxName` that
 `inventory_stream` and `changes_stream` discard (`Ok(ScopeHandler::Folder(_)) =>
 {}`) and recompute with `folder_from_scope` inside the task.
 
-## BUG-053 - Missing FLAGS hashes as "no flags" on IMAP Metadata and inventory, and an unknown projection hydrates as an empty body
-
-**Reported by:** imap-account.
-
-`get::run_folder_get` enforces the `bifrost-types` rule for
-`Projection::FlagsOnly` (missing FLAGS -> `Failed(Protocol(MissingField))`).
-`Projection::Metadata` and `inventory::fetch_to_inventory` carry the same flag
-state as `Fingerprint::flags_hash`, and there a missing FLAGS silently becomes
-`flags_hash(&[])`, a fingerprint claiming "no flags" - the rule enforced on one
-sibling arm and not the other. `get::selection_for_projection` and
-`get::fetch_to_hydrated` each match `Projection` independently and their wildcard
-arms disagree: the selection asks only for FLAGS, the conversion emits
-`RawMime(decode_body(..).unwrap_or_default())`, so a future projection variant
-hydrates as a successful empty MIME body. One `match` producing both the
-attributes and the converter closes it. Also `fetch_to_inventory` mints
-`fetch.uid.unwrap_or_default()`, a UID 0 object id, because nothing in the type
-says the caller already checked.
-
 ## BUG-055 - IMAP `SearchFilter::Has` (attachment filename or type) compiles to a full-text `BODY` search
 
 **Reported by:** imap-account.
 
-It returns messages that merely mention the string.
+It returns messages that merely mention the string. Refusing the filter as
+`Unsupported` would take away a search path that works today; a correct fix
+needs attachment-aware evaluation that composes with boolean filters and
+position paging (for example BODYSTRUCTURE-based post-filtering of the
+candidate set). The defect is now documented at the `pim.rs` arm and in
+`reference/imap.md`.
 
 ## BUG-056 - "Was this JMAP id answered?" is decided per response and per caller, and an omitted `Blob/copy` answer is terminal
 
@@ -963,69 +887,6 @@ already acted on the session unvalidated; they belong in `core/session.rs` as
 `SessionState::derive -> ValidatedSession`, with `sync/capabilities.rs` keeping
 only the mapping.
 
-## BUG-058 - JMAP blob capabilities are read from the session level, which RFC 9404 leaves empty
-
-**Reported by:** jmap-protocol (latent; no production reader yet).
-
-Which capability URIs are read from `session.capabilities` and which from the
-primary account's `accountCapabilities` is decided in four places:
-`deserialize_session_capabilities_map` (core, websocket, quota, blob at session
-level; mail, submission, sieve, contacts, calendars, principals, principals:owner
-as account-level markers); `Session::capability_config` (its own copy of the
-four-URI list); the `session_cap_accessor!` invocations
-(`blob_capabilities` / `quota_capabilities` / `websocket_capabilities` /
-`core_capabilities` read the session map) against six hand-written
-`*_capability_state` methods reading the primary account, each repeating the same
-"session-level Malformed check, then primary lookup" body; and
-`core/capability.rs`'s trait doc ("`Config` describes the session object for Core
-and WebSocket and the account object for account-scoped extensions"), which
-disagrees with the code for quota and blob. RFC 9404 section 3 makes the
-session-level `urn:ietf:params:jmap:blob` value an empty object and puts
-`maxSizeBlobSet`, `maxDataSources`, `supportedTypeNames`,
-`supportedDigestAlgorithms` in `accountCapabilities`, so
-`Session::blob_capabilities` always returns all-defaults; any future
-`Blob/upload` size gate would read `None`. The comment in
-`deserialize_session_capabilities_map` states the rule the blob arm breaks. Owner:
-the placement on the `Capability` trait (`const LEVEL: CapabilityLevel`) with the
-`Capabilities` variant it decodes into, driving the deserializer,
-`capability_config` and the accessors; one macro over the markers replaces the
-six account accessors, and `capability_config`'s serialize-then-deserialize round
-trip goes.
-
-## BUG-064 - `Client::with_transport` fabricates a `Basic ` WebSocket credential; the JMAP credential is held twice
-
-**Reported by:** jmap-protocol.
-
-What credential a request presents: HTTP bearer is injected by `AccountNet` from
-the token source; HTTP Basic is formatted by `ReqwestTransport::build_request`;
-SSE (`ReqwestTransport::open_sse`) repeats the default-header loop and the Basic
-branch of `build_request` line for line; WebSocket (`Client::connect_ws`) reads the
-bearer source itself, formats the header, and runs its own one-shot 401
-`refresh_if_unchanged` retry, with Basic through `Authorization::header_value`.
-The `Authorization` value is held twice, inside `ReqwestTransport` (HTTP) and on
-`ClientInner` (WS); `ClientBuilder::connect` clones one into both, but
-`Client::with_transport` fabricates `Authorization::Basic(String::new())` for the
-WS copy, so a client built that way presents `Basic ` on the WebSocket whatever
-the transport uses for HTTP (reachable only by combining `with_transport` with
-`connect_ws`). Owner: the transport owns the credential and exposes one
-`authorize(builder)` for all three HTTP doors and a `ws_authorization()` for the
-handshake; `ClientInner::authorization` is deleted.
-
-## BUG-066 - JMAP container rename, move, delete and child-create on a shared mailbox are unroutable
-
-**Reported by:** jmap-account (live, P2).
-
-`containers_list` returns shared mailboxes with `ContainerRights` (`may_rename`,
-`may_delete`, `may_create_child` from `myRights`), and
-`pim_methods.container_rename / move / delete / create` are unconditionally
-`true`, but the container doors run on `self.mail` with
-`MailboxId::new(container.0)` - no routing, no stripping. Renaming, moving or
-deleting a shared folder sends the qualified id to the primary account, which
-answers `notFound`, and because the door attaches no scope that becomes
-`Protocol(Unknown)` (`UnknownPermanent`). Creating a child under a shared parent
-fails the same way. The flag-vs-gate duplication behind it is CON-006; the routing
-type that would prevent it is STR-097.
-
 ## BUG-068 - The JMAP state cache advances from its cached state instead of `oldState`, laundering concurrent changes into the next guard
 
 **Reported by:** jmap-account (latent, P2).
@@ -1052,26 +913,6 @@ own `lifecycle_mailbox_states`), and the shared accounts' entries are seeded for
 scope type (shared Mailbox) that does not exist. Owner: a `StateCell` per `(Slot,
 ObjectType)` owning `observe_set(old, new)`, `observe_changes(since, new)`,
 `observe_probe(s)`, `guard() -> Option<IfInState>`; delete `mailbox_states`.
-
-## BUG-069 - JMAP page-cursor faults derive the account-wide schema-clear directive
-
-**Reported by:** jmap-account (live, P2).
-
-A malformed, retired or overflowing search / contact / calendar page cursor is
-`SyncState(SchemaIncompatible)` (`pim::schema_incompatible_search_cursor`,
-`page_cursor::cursor_error`), which derives
-`Engine(EngineDirective::SchemaIncompatible)` unconditionally - the account-wide
-durable-state clear - for a cursor the engine never holds.
-`error::search_result_set_superseded`'s own comment explains why `CursorInvalid` is
-wrong for page cursors (reserved for engine cursor scopes); the same reasoning
-rules out `SchemaIncompatible`. A page-cursor fault is a caller-state fault and
-wants its own kind or `Request(InvalidArgument)`. Also `result_set_superseded`
-exists twice (`error.rs` for mail search, `PageKind` for contacts/calendars) with
-the same classification, and `anchorNotFound` is decided twice: `convert_method`
-maps it by the `anchored_query` flag plus a cursor scope (inventory), and
-`PageKind::page_call_err` pre-intercepts it before `into_account_error` to map it
-to `ConcurrencyConflict` (page walks), because the context cannot express
-"anchored page walk" (STR-100). The two page-cursor codecs are STR-101.
 
 ## BUG-070 - The same JMAP `notFound` is success through `bulk_set_flags` and terminal through `set_keyword`; providers disagree on vanished targets
 
@@ -1230,45 +1071,16 @@ production; the scripted wire accepts any bearer. The axis belongs in net: eithe
 `TokenSource::current(&Audience)`, with Graph constructing its Outlook-origin
 requests with the Outlook audience. Related: STR-113 (cloud-aware origins).
 
-## BUG-077 - Graph shared mailboxes that differ only in case become two clients and two scope sets
-
-**Reported by:** graph (live; latent in the retag half).
-
-"Which mailbox is this" and "are these two the same mailbox" are answered by
-`GraphAccount::shared_clients: HashMap<String, GraphClient>` and
-`client_for_owner` (exact byte equality), `autodiscover::merge_shared_mailboxes`
-(exact equality), `GraphClient::concurrency_key` (`eq_ignore_ascii_case` against
-the primary address, then Unicode `to_lowercase`), and
-`GraphClient::mailbox_budget` (Unicode `to_lowercase`). If
-`with_shared_mailbox("Shared@contoso.com")` is configured and delegate
-Autodiscover returns `shared@contoso.com`, the account gets two shared clients,
-two complete sets of discovered folder scopes for one mailbox (duplicate sync,
-duplicate ids differing only in owner-tag case), and one throttle budget for both.
-Also `ClientInner::mailbox_id: Option<String>` (`None` meaning `/me`) is `enum
-MailboxRoute { Primary, Shared(MailboxKey) }`; and `primary_account` is
-first-write-wins (`fix_primary_account`) while `mailbox_budget`'s fallback reads
-`account_net().account()`, which `retag` changes, so after a retag on the
-`with_account_net` path the concurrency key and the throttle budget name different
-accounts. Owner: a `MailboxKey` newtype with case-insensitive `Eq`/`Hash`, minted
-once at configuration and discovery, and one `MailboxIdentity` per client yielding
-both the concurrency key and the throttle budget.
-
 ## BUG-078 - A default-constructed Graph account advertises webhook push with no lane and refuses every subscribe
 
 **Reported by:** graph (live).
 
-`GraphAccountFactory::new` defaults to `PushMode::GraphSubscriptions` with
-`push_endpoint: None`. `capabilities::build_capabilities` reads `push_mode` only
-and advertises `PushCapability::WebhookOrEwsStream`; `push_stream::push_lanes`
-reads mode and endpoint and declares no lane; `webhook::subscribe_graph` reads the
-endpoint and returns `Unsupported(PushSubscribe)`. Owner: one value, `enum
-PushConfig { None, Webhook(PushEndpoint), EwsStreaming }`, with capability, lanes
-and subscribe all functions of it and `None` mapping to `PushCapability::None`;
-the public builders (`with_push_endpoint_client_state`, `with_ews_streaming`) keep
-their names. Related naming smell: `PushCapability::WebhookOrEwsStream` is
-documented as Graph webhooks only, and Graph's EWS streaming maps to `InProcess`,
-so "OrEwsStream" in the published name is false; renaming needs the owner.
-The workspace-level form is CON-004.
+The advertise-without-a-lane defect is fixed (Graph now derives capability,
+lanes and subscribe from one `PushConfig`). Residue, a naming fix in
+`bifrost-types`: `PushCapability::WebhookOrEwsStream` is documented as Graph
+webhooks only, and Graph's EWS streaming maps to `InProcess`, so "OrEwsStream"
+in the published name is false. Rename it (renaming is ruled fine). The
+workspace-level form is CON-004.
 
 ## BUG-079 - Graph reads back an unrouted public-folder item as deleted
 
@@ -1294,22 +1106,6 @@ answered four ways: presence in `routing_map` (`establish_initial_cursor`,
 Owner: a typed internal scope whose `PublicFolder` variant is produced once from
 discovery state (STR-106), plus one `PublicItemRoute::resolve(id) -> Routed |
 Unrouted` every lane matches on, with one classification for `Unrouted`.
-
-## BUG-083 - Graph's funnel tags a 503 with a mailbox budget that the classifier then never stamps
-
-**Reported by:** graph (live disagreement; comment contradicts code).
-
-"Is this status a throttle?": `GraphClient::tag_throttle` treats 429, 503 and 507
-as throttle-shaped and wraps the failure in `MailboxThrottled { budget }`;
-`graph_error::classify_by_status` returns throttle `true` for 429 and 507 and
-`false` for 503 (`Server(Unavailable)`); `stamp_budget`, on the net-classified
-path, decides from the kind (`RateLimited | QuotaExhausted`). A 503 is tagged at
-the funnel and never stamped. The comment in `response_to_account_error` claims
-the annotation "applies only on rate-limit / quota / 503 paths". Graph's
-classifiers also return `(AccountErrorKind, Cause, bool)` where the bool means
-"this is a throttle" - a function of the kind that `stamp_budget` re-derives
-independently. Owner: the classifier; the funnel carries the budget
-unconditionally as context, and the throttle decision is made once from the kind.
 
 ## BUG-086 - Google stamps Calendar, People and Drive errors as Gmail, and names the wrong OAuth scope for them
 
@@ -1373,32 +1169,6 @@ that. The hunter proposes deleting the second funnel for every Gmail caller; onl
 Drive's resumable upload (custom headers, bearer-less, redirects off) needs the raw
 builder.
 
-## BUG-091 - Google label vocabulary disagrees on case, archive and label type
-
-**Reported by:** google (live).
-
-System label ids are declared three times as `const`s in `flags.rs`, `pim.rs` and
-`filters.rs`, each a different subset, with `ARCHIVE_ID` in both `flags.rs` and
-`filters.rs`. The facts about a system label are spread across files: exclusive
-display container (`flags::EXCLUSIVE_CONTAINERS`), read-only projection
-(`flags::is_read_only_label`), maps-to-a-flag (`canonical_flags_indexed`,
-`flag_to_add_label`, `flag_to_remove_label`, `gmail_flag_target`, and the
-hard-coded `pim::set_is_read`), hidden from flags (`canonical_flags_indexed`'s
-inline skip list, which alone includes `"CHAT"`), folder role
-(`pim::container_from_label`), search operator (`pim::container_query` and
-`filters::container_query`), and system or user (`GmailLabel.label_type:
-Option<String>` compared against `"user"` / `"system"`). Disagreements: CASE -
-`flags.rs` and `pim::delete_thread` compare label ids ASCII-case-insensitively,
-while `pim::container_from_label` and both `container_query` copies match
-`LABEL_INBOX` etc. exactly. ARCHIVE - `pim::container_query` tests archive with
-`is_archive_id` (case-insensitive), `filters::container_query` tests `id ==
-ARCHIVE_ID`, so `SearchFilter::In("Archive")` becomes the archive expression while
-`FilterCondition::InContainer("Archive")` becomes `label:Archive`. LABEL TYPE -
-`flags::patch_for_set` and `user_label_id_from_flag` treat only `Some("user")` as a
-user label; `scopes::diff_snapshots` emits renames for anything not `Some("system")`
-(counting `None` as user); `pim::label_is_system` requires `Some("system")`. Owner:
-`GmailLabelId` (STR-125). The query encoders behind the archive split are CON-053.
-
 ## BUG-094 - A Gmail Pub/Sub registration loss is classified as a cursor loss
 
 **Reported by:** google (needs a ruling: a classification chosen for lack of vocabulary).
@@ -1408,32 +1178,6 @@ user label; `scopes::diff_snapshots` emits renames for anything not `Some("syste
 says this is deliberate. But a lost watch costs only a gap, which push already
 signals (`gap_hint`); the history cursor is still valid. Restarting the scope throws
 away a good cursor because the error model has no push-registration kind.
-
-## BUG-096 - A transient Gmail `labels.list` failure terminates discovery despite a usable cache
-
-**Reported by:** google.
-
-`scopes::labels_for_flags` and `scopes::scope_snapshot_or_refresh` are the same
-single-flight staleness check with different failure policies: the first returns the
-stale vocabulary when a refresh fails, the second propagates the error.
-`discover_memberships` uses the second. Separately, the lifecycle poller
-(`scope_lifecycle_stream_with_baseline`) fetches `labels.list` every 30s into its own
-baseline and never feeds `ScopeCache`, so two label views run side by side: the
-lifecycle stream can announce `Created(Label(x))` while flag translation still lacks
-`x` and treats it as unsupported until the next refresh, costing a second
-`labels.list` round trip the poll already paid for. Owner: one vocabulary actor that
-the poller refreshes, with lifecycle diffs a view over its snapshots.
-
-## BUG-098 - Google resolves retry hints against the injected clock on one path and the real clock on others
-
-**Reported by:** google.
-
-The wall clock is injectable (`GmailClient::wall_clock`) and the observer uses it,
-but `GmailResponseHeaders::from_headers` calls `SystemTime::now()` and is used by
-`parse_json_response`, `check_response_status`, `post_empty_json`,
-`cloud::response_error` and the refine path in `account/error.rs`, so `retry_at` is
-resolved against the injected clock on one path and the real clock on the others.
-Thread the client's clock, or resolve retry hints only in the observer.
 
 ## BUG-099 - IMAP and ManageSieve turn every OAuth token-source failure into server-acknowledged `AuthLost`
 
@@ -1497,29 +1241,6 @@ no Message-ID, `parse_draft_for_submission` falls back to the constant
 which then becomes the "stable fallback id" on the receipt
 (`append_to_sent_or_fallback`) - not unique by construction.
 
-## BUG-105 - SMTP `SendProgress` phase flags are written and never read; "positive" accepts a 3yz final reply
-
-**Reported by:** smtp-sasl (defect).
-
-`SendProgress { body_started: bool, body_finished: bool, data_response:
-Option<Response> }`: `core.rs` calls `set_body_started` / `set_body_finished`, and
-nothing in production reads either. `resolve` decides every `Accepted` recipient's
-lane from `data_response` alone - `Some(positive)` succeeded, `Some(negative)`
-failed, `None` uncertain with an `InFlight` partial-completion error - and that last
-arm is correct only when the body may have left, so a pre-body exit depends on the
-machine having already called `mark_unresolved_unsent`. The flags look meant to
-gate exactly that default and never got wired; the batch tests set them, so the
-suite reads as though they matter. Also `Response::is_positive` (and
-`Code::is_positive`) is true for 2yz and 3yz and is used for "DATA accepted" (wants
-354), "message accepted" (wants 250), "RSET acknowledged"
-(`Epilogue::ResetReading`) and, in `resolve`, "the recipient's message was
-delivered" - so a 3yz final reply after end-of-data resolves as delivered. Owner: a
-transaction-phase enum the machine advances and `resolve` matches (`Envelope ->
-DataIssued -> BodySent -> FinalReply(Response)`, `Envelope` -> `Unsent`, `BodySent`
--> `Uncertain`), and `Response::is_completion()` / `is_intermediate()` (or an
-`expect(ReplyClass)` at each read). The hunter asks that the phase enum be audited
-for bite: pre-body exits should stop depending on a separate `mark_*` call.
-
 ## BUG-106 - bifrost-smtp's `account-error` feature cannot be turned off
 
 **Reported by:** smtp-sasl (defect: a promise to consumers the build does not keep).
@@ -1541,34 +1262,6 @@ allow(dead_code))]` to keep an async-only helper compiled in blocking builds, an
 `test-support` exposes `ScriptedConnector`/`Transcript`, usable only by the async
 executor path, so a downstream crate cannot script the published blocking
 transport.
-
-## BUG-107 - SMTP default ports disagree between code, docs and IMAP
-
-**Reported by:** smtp-sasl (drift).
-
-`SmtpTransport::relay` sets 465, `starttls_relay` 587, `builder_dangerous` 25 (SMTP)
-/ 24 (LMTP). `connection_url::from_connection_url` gives `smtp` with no `tls`
-`SMTP_PORT` (25), while the doc table on `SmtpTransport::from_url` (and its async
-twin) says that row defaults to 587. IMAP `SubmissionTls::default_port` gives
-Implicit 465, StartTls 587, Plaintext 587, and then always calls `.port(port)` over
-whatever `relay` / `starttls_relay` / `builder_dangerous` already chose. Owner: one
-`default_port(dialect, tls_mode)` in bifrost-smtp consumed by the builders, the URL
-parser and IMAP.
-
-## BUG-108 - SMTP configuration errors are classified as retryable transport failures
-
-**Reported by:** smtp-sasl (drift with bifrost-net).
-
-`from_connection_url` reports a malformed URL, a missing host, an unknown scheme and
-a bad percent-encoding as `error::connection(..)`, which `into_account_error` maps
-to `Transport(Network)` - retryable, so a config typo is retried forever as a
-network outage. `TlsParametersBuilder::build`, `Certificate::from_pem/from_der` and
-`Identity::from_pem` map native-tls parse failures to `error::tls`, i.e.
-`Transport(Tls)`, while bifrost-net classifies the identical failure (corrupt root
-cert DER at client construction) as `InvalidRequest` -> `Request(Malformed)`, "not
-as a retryable transport setup failure" (`reference/net.md`). And IMAP
-`SubmissionTransport::build_with_connector` maps any bifrost-smtp builder error to
-`crate::Error::InvalidInput(e.to_string())`, discarding the kind entirely.
 
 ## BUG-110 - "May this logical request have committed?" is decided four ways in net and DAV, and they disagree
 
@@ -1620,6 +1313,76 @@ the same gap. Type fix: a `CoordinatedTokenSource` newtype mintable only by
 JMAP and DAV, making `is_coordinating()` unnecessary; DAV can keep minting headers
 itself through `AccountNet::bearer()` if it attaches the source to its spec.
 
+## BUG-134 - A failed Gmail label refresh lets every queued reader repeat it
+
+**Reported by:** wave 1 fixer (google, lateral).
+
+After the label-cache readers were unified, a refresh that fails leaves the
+cache stale, so readers queued behind the single-flight each issue their own
+`labels.list` in turn during an outage. A failure backoff (or sharing the
+failed result with the waiters) would bound it.
+
+## BUG-135 - JMAP container rename and move accept an omitted `updated` answer as success
+
+**Reported by:** wave 1 fixer (jmap-account, lateral).
+
+The container rename / move doors use `unwrap_update_errors()` without checking
+that the requested id appears in `updated`, so a server that answers neither
+`updated` nor `notUpdated` for it reads as success.
+
+## BUG-048 - IMAP sync lanes cycle on a `UIDNOTSTICKY` folder
+
+**Reported by:** imap-account; reopened by the wave 1 review.
+
+Inventory and changes on a `UIDNOTSTICKY` folder mint cursors the next SELECT
+voids, so the scope cycles CursorInvalid -> re-inventory. Refusing the folder
+(as the poller does) was tried and reverted: it would make the folder's mail
+vanish from the user's view, which removes a capability. The remaining fix is a
+cursor-free sync mode for such folders (re-inventory on each poll, no durable
+UID cursor, no CursorInvalid loop); the inventory site and `reference/imap.md`
+say so.
+
+## BUG-136 - `reference/imap.md` says MODSEQ 0 is rejected; the registry ignores it
+
+**Reported by:** wave 1 fixer (imap-account, lateral).
+
+`folder_registry::record_modseq` silently skips modseq 0 while the reference
+says it is rejected. One of the two is wrong.
+
+## BUG-140 - IMAP's search pager does not mark a stale cursor as a page-cursor fault
+
+**Reported by:** wave 1 review (lateral).
+
+JMAP's stale page cursors are now `Request(Malformed)` with cause
+`InvalidArgument { field: Some("page_cursor") }`, the documented "restart from
+page one" signal. IMAP's search pager uses `Request(Malformed)` without that
+field, so a consumer cannot key on one signal across providers.
+
+## BUG-137 - Graph `classify_no_envelope` makes malformed 5xx subresponses terminal
+
+**Reported by:** wave 1 fixer (graph, lateral).
+
+`graph_error.rs::classify_no_envelope` documents status-based recovery for 5xx,
+but a nonempty non-envelope body becomes `ContractViolation`, so a malformed 5xx
+`$batch` subresponse may be terminal instead of retryable.
+
+## BUG-138 - JMAP blob capability and upload template gaps
+
+**Reported by:** wave 1 fixer (jmap-protocol, lateral).
+
+`core/session.rs::BlobCapabilities` does not model RFC 9404 `maxDataSources`,
+and `blob/upload.rs` accepts download-only URI template parameters and expands
+them to empty strings.
+
+## BUG-139 - IMAP `set_keepalive` and `peer_certificate_der` submit without a bound
+
+**Reported by:** wave 1 fixer (imap-connection, lateral).
+
+After the pipeline gained a deadline, these two non-wire requests are the last
+`cmd_tx.send(..).await` calls with no deadline of their own; their callers wrap
+them in `in_flight()` or `timeout_at`, so this is the residue of the "no
+infinite waits" promise rather than a live hang.
+
 ## BUG-112 - Two DAV hrefs naming one resource both land on a page
 
 **Reported by:** net-dav (live).
@@ -1638,21 +1401,6 @@ Consequence: two spellings of one resource a query returns survive
 while identity is on the key. Type fix: a parsed `DavHref` with its key and order
 derived once, and an `Origin` newtype in bifrost-net both redirect walkers and the
 DAV gate compare on (STR-146).
-
-## BUG-113 - One unparseable multistatus status line gets two verdicts in two DAV lanes
-
-**Reported by:** net-dav.
-
-`ResponseParts` exposes `entry_href`, `failed_href`, `failed_member`, `fetched`,
-`failed_resource`, `missing_data_href` and `member_status_code`, each recomputing
-the lane from the same flags. For a response whose only propstat failed with an
-unparseable status line: the listing lane's `failed_member` returns a member with
-`status: None`, which `classify_207` reads as "not a missing resource", so the
-input can drive a `CompleteFailure`; the multiget lane's `failed_resource` returns
-`None`, so the same response falls into `missing_data_href`, the benign lane (the
-"accepted edge" comment on `failed_resource` documents this for multiget only).
-Owner: `ResponseParts::lane() -> ResponseLane { Collection, Entry, Failed { status
-}, MissingData }`, computed once, every accessor reading it.
 
 ## BUG-116 - The HTTP bandwidth meter cannot be handed to the engine or IMAP
 
@@ -1674,24 +1422,6 @@ registry, meter }` (or `NetResources`) shared by Net, the engine and the IMAP
 factory, and behind it an `AccountRegistration` value owning every per-account
 entry, so detach and retag are one operation each. The string-keyed registries are
 STR-145.
-
-## BUG-117 - CardDAV writes the file extension into the vCard UID
-
-**Reported by:** net-dav (cross-dialect divergence).
-
-`contact_create` builds `id = "{uuid}.vcf"` and passes that as the UID; CalDAV uses a
-bare UID and puts the extension only on the path. One decision, "new resource UID
-and file name", answered two ways.
-
-## BUG-122 - IMAP pending LOGOUT is cleared by any tagged response, not LOGOUT's own
-
-**Reported by:** resolution wave review (lateral).
-
-`ProtocolState::apply_tagged` (`crates/imap/src/connection/state.rs`) now clears
-`in_logout` on NO/BAD, but the check is not tag-aware: a pipelined earlier
-command's tagged NO/BAD arriving after LOGOUT was sent clears the flag, and
-LOGOUT's own OK then does not move the session to `Logout` (BYE still does). The
-tagged pending-effect shape in STR-065 closes it.
 
 ## BUG-123 - JMAP filter deactivation can now fail on an unrelated script change
 

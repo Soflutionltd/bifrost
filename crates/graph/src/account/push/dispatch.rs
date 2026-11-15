@@ -4,7 +4,7 @@
 use bifrost_types::{AccountError, AccountOperation, CursorScope, SubscriptionHandle};
 
 use crate::account::graph_error::{GraphErrorContext, into_account_error, invalid_account_error};
-use crate::account::{GraphAccount, PushMode};
+use crate::account::{GraphAccount, PushConfig};
 use crate::error::GraphError;
 
 use super::common::{
@@ -78,11 +78,10 @@ pub(super) async fn subscribe_eligible(
     outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
     expected: &[bifrost_types::BatchItemId],
 ) -> Result<bifrost_types::PushSubscription, AccountError> {
-    let (handle, outcomes) = match account.push_mode {
-        PushMode::GraphSubscriptions => {
-            subscribe_graph(account, eligible, outcomes, expected).await?
-        }
-        PushMode::EwsStreaming => subscribe_ews(account, eligible, outcomes, expected).await?,
+    let (handle, outcomes) = match &account.push_config {
+        PushConfig::Webhook(_) => subscribe_graph(account, eligible, outcomes, expected).await?,
+        PushConfig::EwsStreaming => subscribe_ews(account, eligible, outcomes, expected).await?,
+        PushConfig::None => return Err(unsupported_push_error()),
     };
     // The arm produced no handle, which it does only when every eligible
     // scope ended up on the failed lane. That is the same "no scope was
@@ -146,12 +145,12 @@ pub(crate) async fn push_unsubscribe(
     // reopen can change the push mode, and a webhook handle retried on an EWS
     // instance would otherwise be dropped with its Graph subscription alive.
     // A handle of neither shape falls back to the mode.
-    match (decode_handle(&handle), account.push_mode) {
+    match (decode_handle(&handle), &account.push_config) {
         (DecodedHandle::Graph { .. }, _)
-        | (DecodedHandle::Unrecognized, PushMode::GraphSubscriptions) => {
+        | (DecodedHandle::Unrecognized, PushConfig::Webhook(_) | PushConfig::None) => {
             unsubscribe_graph(account, handle).await
         }
-        (DecodedHandle::Ews, _) | (DecodedHandle::Unrecognized, PushMode::EwsStreaming) => {
+        (DecodedHandle::Ews, _) | (DecodedHandle::Unrecognized, PushConfig::EwsStreaming) => {
             unsubscribe_ews(account, handle).await
         }
     }

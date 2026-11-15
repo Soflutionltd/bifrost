@@ -110,7 +110,7 @@ async fn webhook_creation_rolls_back_each_already_created_subscription() {
         ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
     ]);
     let mut account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
-    account.push_endpoint = Some(PushEndpoint {
+    account.push_config = crate::account::PushConfig::Webhook(PushEndpoint {
         webhook_url: "https://example.test/hook".to_string(),
         client_state: "secret".to_string(),
     });
@@ -760,7 +760,11 @@ async fn an_orphan_teardown_reaches_a_subscription_recreated_on_the_old_instance
         handle.clone(),
         GraphSubscriptionGroup::live(vec![state("original", "/me/events")]),
     );
-    let endpoint = old.push_endpoint.clone().expect("webhook endpoint");
+    let endpoint = old
+        .push_config
+        .endpoint()
+        .cloned()
+        .expect("webhook endpoint");
     let outcome = replace_gone_subscription(
         &old,
         &endpoint,

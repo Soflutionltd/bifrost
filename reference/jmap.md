@@ -32,10 +32,14 @@ With the `sync` feature enabled, consumers may use:
 
 Everything else in `crates/jmap/src/` is `pub(crate)` or narrower. Consumers reach JMAP by constructing the factory, opening an `Arc<dyn Account>`, and calling `bifrost-types::Account` methods.
 
-Session-level Mail, Submission, Sieve, Calendars, Contacts and Principals
-objects are support markers. Their typed configuration lives on session
-accounts. Convenience session readers select the capability's primary account;
-callers handling a foreign account use that account's readers directly. The
+Session-level Mail, Submission, Sieve, Calendars, Contacts, Principals and
+Blob objects are support markers. Their typed configuration lives on session
+accounts; Blob configuration readers select the primary Blob account's
+`accountCapabilities` object. Convenience session readers select the
+capability's primary account; account readers support explicit foreign-account
+selection. Capability markers declare their placement, and generic
+configuration readers clone the decoded configuration without reserializing
+it. The
 Absent / Malformed / Present distinction applies to the selected account's
 object. Self-alias discovery reads the current user from the primary Principals
 account, or the owner extension from the primary mail account, and uses that
@@ -73,10 +77,12 @@ Adding a new method: define a struct, use `define_get_method!` / `define_set_met
 that snapshot, which remains attached through send. It refuses the first call
 that would exceed the limit, before serializing or appending that method. The
 guard covers tuple batches, explicit result-reference flows, and WebSocket
-requests through the same `call` door. The WebSocket encoder's separate
-`maxSizeRequest` check still reads the client's current session at encode time,
-so a refresh between request construction and WebSocket encoding can pair the
-request snapshot with the newer frame-size limit.
+requests through the same `call` door. HTTP request-size enforcement and
+WebSocket frame-size enforcement use the request session snapshot; both refuse
+encoded requests exceeding a positive advertised `maxSizeRequest`. HTTP send
+raises `RequestSizeLimit` for an oversized encoded request;
+`send_methods_within` returns `Ok(None)` when the request exceeds either the
+caller-supplied bound or the snapshot's positive advertised bound.
 
 The snapshot is a three-state `CallLimit`, not a number: `Unadvertised` (no
 `urn:ietf:params:jmap:core` block, or a block that omits `maxCallsInRequest`),
@@ -205,6 +211,9 @@ order; swapping the tail into the vacated slot reorders later lookups.
   over-1 MiB comment line is worth, and nothing suggests such comments are a
   normal interoperability requirement.
 - `ReqwestTransport` - default implementation with a pooled reqwest::Client.
+  It owns the credential used by HTTP, SSE and WebSocket; HTTP and SSE share
+  authorization preparation, and WebSocket reads the transport credential and
+  retains its one-shot bearer refresh retry.
 - `blob::download::BlobTransport` extends the buffered transport with an
   incremental download door. `Client::download_stream(blob, max_bytes)` yields
   byte chunks and records request-local inbound traffic as they are polled.
@@ -905,13 +914,32 @@ Scheduled send rides RFC 8621/4865 FUTURERELEASE: when `SendRequest::scheduled` 
 
 Search maps the shared `SearchRequest` AST to `Email/query` (query text as a JMAP `text` filter). `search_messages` returns native email ids; `search` uses `collapseThreads = true`, hydrates the emails' `threadId`, returns thread ids. That projection accounts for every submitted email id (`reconcile_search_threads`): an id declared `notFound`, an id answered in neither list, and an email returned without the mandatory `threadId` all ride `Page::failed_ids` instead of being dropped, which used to leave the page silently short of its own result count. Thread ids are deduplicated, since `collapseThreads` is not a guarantee that the server collapsed them. Every known `SearchFilter` variant is translated recursively; the required non-exhaustive catch-all returns `Unsupported(Search)` so a future shared variant cannot silently become an empty JMAP `AND` that matches everything. Page cursors are opaque position bytes, so the search query pins `receivedAt` desc exactly as the inventory walks do: RFC 8621 gives an unsorted `Email/query` a server-defined order with no cross-call stability guarantee, and paging an unstable order by integer position duplicates and skips results. `route_search` picks the account before the query is built, from the owners of the filter's `In` containers (`search_owner` walks And/Or/Not): no `In` or a primary `In` is primary-only, one foreign owner routes both legs to that share and re-qualifies the result ids, two owners or an unreachable owner are refused. The `In` arm therefore strips the owner qualifier on the wire - the native part is a mailbox id in exactly the account the query addresses - and the cursor carries the owner so a resume cannot cross accounts. See "Foreign (shared/delegate) accounts".
 
-Container CRUD is `Mailbox/get`/`set`. Mailboxes surface as `ContainerKind::Folder` (native mailbox id); `Mailbox.role` maps to `FolderRole` (`inbox`->INBOX, `sent`->SENT, `drafts`->DRAFT, `trash`->TRASH, `junk`->SPAM). `container_delete` leaves `onDestroyRemoveEmails = false`, so non-empty deletion fails rather than dropping messages.
+Container CRUD is `Mailbox/get`/`set`. Rename, move and delete select the
+registered owner from the qualified container id; child creation selects its
+parent's owner. Wire ids are stripped only for that selected owner, and a
+created child returns an owner-qualified id. Moving to the root keeps the
+folder in its current account; naming a parent in another account is refused
+as `Request(Malformed)` with an InvalidArgument cause, since one Mailbox/set
+cannot span accounts. This matches the user's expectation that manipulating
+a shared folder acts inside that share. An unreachable owner stays literal
+on the primary route to prevent native-id collisions. Mailboxes surface as `ContainerKind::Folder` (native mailbox id); `Mailbox.role` maps to `FolderRole` (`inbox`->INBOX, `sent`->SENT, `drafts`->DRAFT, `trash`->TRASH, `junk`->SPAM). `container_delete` leaves `onDestroyRemoveEmails = false`, so non-empty deletion fails rather than dropping messages.
 
 Settings use `Identity/get`/`set`, `VacationResponse/get`/`set` (`singleton` id), and `Quota/get`. `identity_update` supports name/signatures/reply-to; default-identity selection is unsupported.
 
 `thread_hydrate` does `Thread/get` then `Email/get` in order. `message_hydrate` selects headers / preview / full projections and returns blob handles without pre-downloading. `move_thread` and `delete_thread` from elsewhere add-to-target then remove-from-source. When the caller says the thread is already in Trash, `delete_thread` expands the thread and reads each member's active `mailboxIds`; only members present in the resolved Trash mailbox are destroyed, so Sent, Inbox, and other copies survive. The move path resolves the thread once and both membership legs use that fixed id set (`patch_mailbox_membership_of`); the cross-account container check runs for both containers before the resolve. Each leg used to run its own `Thread/get`, so a message delivered to the thread between the two resolves was removed from the source having never been added to the target - it lost its source membership and gained nothing. The two-leg non-atomicity itself is the documented cross-provider shape and remains; each leg now applies the same fixed id set in bounded `Email/set` batches.
 
 ### PIM page cursors
+
+Malformed, retired and out-of-range page cursors are caller state errors:
+`Request(Malformed)` with `RequestCause::InvalidArgument`, field `page_cursor`.
+This applies to mail search and both contact/calendar codecs. The recovery
+class is `ClientBug`, so the ENGINE takes no action; the `page_cursor` field is
+the consumer-facing contract, and a consumer seeing it restarts that walk from
+page one without surfacing an error (an Outlook user whose saved search page
+went stale after an upgrade expects the results to reload). No engine
+schema-clear or scope-restart directive is derived.
+An enterprise user expects a broken search to leave durable mail and sync
+checkpoints intact. Moved result sets still use `ConcurrencyConflict`.
 
 The crate has TWO page-cursor encodings serving three families of walk. Both
 use distinct tags: `search-3:` for mail search and `2:` for anchored walks.
@@ -954,7 +982,7 @@ escapes its own contents and both halves round-trip verbatim.
   search's client-side calendar filter, or by `events_in_range`'s local
   overlap predicate, or by hydration, still names where the server continues
   from and the walk goes on correctly.
-- A non-v2 payload is refused `SyncState(SchemaIncompatible)` ("restart from
+- A non-v2 payload is refused `Request(Malformed)` ("restart from
   the first page"), not reinterpreted: that covers the v1 bare integer (which
   under anchored paging would read as either a stale offset or an id named
   "100") and, just as deliberately, an anchor with no pinned state, since
@@ -1036,7 +1064,7 @@ on: a negative echoed `position` (the response field is an UnsignedInt); a
 nonempty page with `position + served > total`; and, in the anchored walks, an
 empty id where a continuation anchor would go. `ProviderContractViolation` is
 deliberate over the two neighbouring classes - `ConcurrencyConflict` and
-`SyncState(SchemaIncompatible)` both direct the caller to restart, and a
+`Request(Malformed)` both prevent continuation, and a
 restart re-issues the identical request to the identical broken server, so
 the caller would spin. An EMPTY page is exempt from the content rules: with no
 first id there is nothing for `position` to index, so a position past the end
@@ -1419,7 +1447,7 @@ a whole new share still waits for reopen.
   owner-qualified for a share. It is the POSITIONAL encoding; the contact and
   calendar page walks use the `2:` tag (anchored, see "PIM page
   cursors"), and each decoder rejects the other tag. Old search cursors with
-  the shared `2:` tag are refused as `SyncState(SchemaIncompatible)` and
+  the shared `2:` tag are refused as `Request(Malformed)` and
   require restarting the search. Two things ride in it because a bare position
   means nothing without either. The account, because the order is
   account-scoped (above); and the `queryState`, because the order is not
@@ -1431,7 +1459,7 @@ a whole new share still waits for reopen.
   and it is not terminal. `SyncState(CursorInvalid)` is unavailable here on
   purpose - it requires an `ErrorScope::Cursor`, and a search page cursor is
   not an engine cursor scope. A v1 cursor (the bare integer position that
-  carried no pin) is refused `SyncState(SchemaIncompatible)` rather than
+  carried no pin) is refused `Request(Malformed)` rather than
   resumed, since resuming it is exactly the unpinned paging the bump exists
   to stop; the two shapes are unambiguous (a v1 payload is all digits).
 - Whether a next page exists is decided by `position` plus `total`, not by the

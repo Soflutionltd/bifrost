@@ -727,6 +727,9 @@ Supported calendar primitives:
   projected through the tzdb; an unknown zone falls back to the UTC wall
   clock): emitting the UTC wall clock under a TZID would shift the event by
   the zone offset on the wire.
+  The UID is the bare UUID, with `.ics` only in the resource path. CardDAV
+  uses the same separation for new contacts; existing contact UIDs retain
+  their original spelling so edits and moves preserve identity for peers.
 - `event_update` - fetches the current resource to preserve its content and
   applies `EventPatch`. `expected_version: Some(ServerVersion::ETag(...))`
   sends the caller's strong validator as `If-Match`, accepting the unquoted
@@ -1368,6 +1371,28 @@ mints no body text, and the event scope is attached by the caller
 real difference in what each error is built from, not drift, and flattening it
 would have changed what consumers receive - so each crate keeps its own entry
 point.
+
+### Observation and refusal decisions (shared with CardDAV)
+
+Snapshot diffing, preservation and token advancement share an internal
+`Observed` decision. An empty listing against a populated snapshot is no
+observation: preserve entries and the prior token. This protects an enterprise
+user from losing the local collection after a transient empty response. A real
+mass deletion is also suppressed on this polling lane because it is
+indistinguishable on the wire.
+
+Listing and multiget lanes both treat an unreadable refusal status as a
+per-resource failure: the item is reported as not fetched, never as a
+successful empty result, and its local copy is preserved.
+`ResponseParts::failed_resource` returns `(href, Option<u16>)`; `None` means
+the refusal's status line was unreadable, and no code is invented for it.
+`classify_207` ignores such unreadable refusals when deciding a complete
+failure, so a single garbage status line from a proxy cannot turn an
+enterprise user's whole folder into an error; a page whose only failures are
+unreadable or missing stays `Usable`, with those resources in the failed lane
+(which also withholds the collection token). Failed responses cannot also
+yield fetched data or enter the benign missing-data lane. Successful propstats
+still admit a resource despite refused optional properties.
 
 ## This crate and bifrost-carddav are near-duplicates, and drift is the defect
 

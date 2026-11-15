@@ -102,7 +102,7 @@ fn three_command_pipeline_builds() {
 /// A wrapper that creates a `Pipeline` without a live `ImapConnection`.
 ///
 /// The pipeline holds a reference to a dummy connection. This is safe
-/// because tests never call `execute` or `execute_dynamic` (which need
+/// because detached builder tests never call execution methods (which need
 /// the driver channel). Only builder methods and type-level assertions
 /// are exercised.
 struct DetachedPipeline;
@@ -132,5 +132,95 @@ impl DetachedPipeline {
         // Fine for tests  -  the leak is bounded.
         let conn_ref: &'a super::super::ImapConnection = Box::leak(Box::new(conn));
         Pipeline::new(conn_ref)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pipeline_zero_deadline_submits_nothing() {
+    let (conn, _server) = crate::connection::test_support::driver_pair(
+        &crate::connection::test_support::preauth_greeting("IMAP4rev1"),
+    )
+    .await;
+    let capacity = conn.cmd_tx.capacity();
+    let error = conn
+        .pipeline()
+        .noop()
+        .execute(std::time::Duration::ZERO)
+        .await
+        .unwrap_err();
+    let PipelineError::Timeout(error) = error else {
+        panic!("expected pipeline timeout, got {error:?}");
+    };
+    assert_eq!(
+        error.attempt(),
+        Some(bifrost_types::TransmissionState::Unsent)
+    );
+    assert_eq!(conn.cmd_tx.capacity(), capacity);
+    assert!(conn.is_reusable());
+}
+
+#[tokio::test(start_paused = true)]
+async fn pipeline_deadline_after_write_is_inflight() {
+    use crate::connection::test_support::{driver_pair, preauth_greeting, read_line};
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let batch = conn
+        .pipeline()
+        .noop()
+        .execute(std::time::Duration::from_secs(1));
+    let server_read = async {
+        let line = read_line(&mut server).await;
+        assert!(line.contains(" NOOP"));
+    };
+    let (result, ()) = tokio::join!(batch, server_read);
+    let PipelineError::Timeout(error) = result.unwrap_err() else {
+        panic!("expected pipeline timeout");
+    };
+    assert_eq!(
+        error.attempt(),
+        Some(bifrost_types::TransmissionState::InFlight)
+    );
+    assert!(!conn.is_reusable());
+}
+
+/// The peer sends only a declaration, never its payload. Both read loops
+/// must reject it before waiting for or allocating the declared body.
+#[tokio::test]
+async fn pipeline_literal_budget_applies_during_responses_and_continuations() {
+    use crate::connection::test_support::{
+        driver_pair, preauth_greeting, read_line, respond, select_inbox,
+    };
+    for continuation in [false, true] {
+        let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 ACL")).await;
+        select_inbox(&conn, &mut server).await;
+        let mut batch =
+            conn.pipeline()
+                .fetch(SequenceSet::new("1").unwrap(), "(BODY[])".into(), None);
+        batch.pending[0] = Box::new(dispatch::FetchConsumer::with_limit(3));
+        // Dynamic execution deliberately permits replacing the consumer here:
+        // its output is Vec<FetchResponse>, with no typed tuple to unfold.
+        let commands = async {
+            let results = if continuation {
+                batch
+                    .list_rights(MailboxName::new("INBOX").unwrap(), "\u{fc}ser".into())
+                    .execute_dynamic(std::time::Duration::from_secs(30))
+                    .await
+            } else {
+                batch
+                    .execute_dynamic(std::time::Duration::from_secs(30))
+                    .await
+            }
+            .unwrap();
+            assert!(matches!(results[0], Err(Error::FetchLiteralLimit { .. })));
+        };
+        let peer = async {
+            let fetch = read_line(&mut server).await;
+            assert!(fetch.contains(" FETCH "));
+            if continuation {
+                let literal = read_line(&mut server).await;
+                assert!(literal.ends_with("{5}\r\n"));
+            }
+            respond(&mut server, "* 1 FETCH (BODY[] {4}\r\n").await;
+        };
+        tokio::join!(commands, peer);
     }
 }

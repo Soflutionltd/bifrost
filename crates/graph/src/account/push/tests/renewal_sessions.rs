@@ -498,7 +498,7 @@ async fn a_recreate_landing_after_its_session_dropped_is_invalidated_by_the_next
         .insert(handle.clone(), GraphSubscriptionGroup::live(vec![row]));
     let held = account.graph_subscriptions.write().await;
     let owner = account.clone();
-    let endpoint = account.push_endpoint.clone().unwrap();
+    let endpoint = account.push_config.endpoint().cloned().unwrap();
     let task = tokio::spawn(async move {
         replace_gone_subscription(&owner, &endpoint, &handle, "old", "/me/messages", &scopes).await
     });

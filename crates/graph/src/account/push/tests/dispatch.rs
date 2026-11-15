@@ -26,7 +26,7 @@ async fn an_unresolvable_scope_is_reported_and_not_covered_by_the_handle() {
         serde_json::json!({"id":"first","expirationDateTime":"2099-01-01T00:00:00Z"}),
     )]);
     let mut account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
-    account.push_endpoint = Some(PushEndpoint {
+    account.push_config = crate::account::PushConfig::Webhook(PushEndpoint {
         webhook_url: "https://example.test/webhook".to_string(),
         client_state: "secret".to_string(),
     });
@@ -93,7 +93,7 @@ async fn a_poll_only_public_folder_does_not_sink_its_valid_siblings() {
         serde_json::json!({"id":"first","expirationDateTime":"2099-01-01T00:00:00Z"}),
     )]);
     let mut account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
-    account.push_endpoint = Some(PushEndpoint {
+    account.push_config = crate::account::PushConfig::Webhook(PushEndpoint {
         webhook_url: "https://example.test/webhook".to_string(),
         client_state: "secret".to_string(),
     });
@@ -217,7 +217,7 @@ async fn a_webhook_request_whose_every_scope_dies_in_the_arm_is_a_whole_request_
     // dispatcher, which is the assertion that no resource was resolved.
     client.script_rest([]);
     let mut account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
-    account.push_endpoint = Some(PushEndpoint {
+    account.push_config = crate::account::PushConfig::Webhook(PushEndpoint {
         webhook_url: "https://example.test/webhook".to_string(),
         client_state: "secret".to_string(),
     });
@@ -273,7 +273,7 @@ async fn a_ledger_that_cannot_close_leaves_nothing_registered_in_either_mode() {
         ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
     ]);
     let mut account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
-    account.push_endpoint = Some(PushEndpoint {
+    account.push_config = crate::account::PushConfig::Webhook(PushEndpoint {
         webhook_url: "https://example.test/webhook".to_string(),
         client_state: "secret".to_string(),
     });

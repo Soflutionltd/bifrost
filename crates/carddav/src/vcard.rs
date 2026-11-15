@@ -190,6 +190,12 @@ pub(crate) fn vcard_from_create(
     Ok(fold_vcard_lines(lines))
 }
 
+/// Apply `patch` to the source card, rewriting only the patched properties.
+///
+/// UID is not a patchable property, so it passes through verbatim with the
+/// other unmodeled lines - including older locally-created values ending in
+/// `.vcf`. Users expect an edit or move to keep the contact's identity in
+/// other clients; stripping a filename-like suffix would change it for peers.
 pub(crate) fn vcard_from_patch(
     current: &ContactCard,
     source: &str,
@@ -1836,7 +1842,7 @@ mod tests {
 
     #[test]
     fn vcard_from_patch_preserves_unmodeled_properties() {
-        let source = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ada\r\nN:Lovelace;Ada;;;\r\nBDAY:18151210\r\nX-CUSTOM:value\r\nEMAIL;TYPE=work:old@example.test\r\nEND:VCARD\r\n";
+        let source = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:legacy-contact.vcf\r\nFN:Ada\r\nN:Lovelace;Ada;;;\r\nBDAY:18151210\r\nX-CUSTOM:value\r\nEMAIL;TYPE=work:old@example.test\r\nEND:VCARD\r\n";
         let current = parse_contact(
             "/ab/1.vcf".to_string(),
             Some(AddressBookId("/ab/".to_string())),
@@ -1854,6 +1860,7 @@ mod tests {
 
         let data = vcard_from_patch(&current, source, &patch);
 
+        assert!(data.contains("\r\nUID:legacy-contact.vcf\r\n"));
         assert!(data.contains("N:Lovelace;Ada;;;"));
         assert!(data.contains("BDAY:18151210"));
         assert!(data.contains("X-CUSTOM:value"));

@@ -503,7 +503,7 @@ pub(crate) async fn directory_search(
 // 400, an invalid search expression, or a local malformed request must surface.
 fn advanced_query_rejected(error: &crate::error::GraphError) -> bool {
     use crate::error::GraphError;
-    let evidence = match error {
+    let evidence = match error.terminal() {
         GraphError::Response(response) => Some((response.status, response.body.clone())),
         GraphError::Net(net) => match net.terminal() {
             bifrost_net::Error::Status { code, body, .. } => Some((*code, body.clone())),

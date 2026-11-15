@@ -46,9 +46,9 @@ arrived with cursor envelope v2, which forces a reseed.
 
 `crates/graph/src/account/`:
 
-- `mod.rs` - `GraphAccount`, `GraphAccountFactory`, `PushMode`,
+- `mod.rs` - `GraphAccount`, `GraphAccountFactory`, `PushConfig`,
   the `impl Account` surface.
-- `capabilities.rs` - `build_capabilities` per `PushMode`.
+- `capabilities.rs` - `build_capabilities` per `PushConfig`.
 - `cursor.rs` - `GraphCursorKind`, `GraphCursorPayload`,
   `GraphPageMarker`, envelope encode/decode, scope/kind mapping.
 - `scopes.rs` - `discover_cursor_scope_events`,
@@ -79,7 +79,7 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   `PushEndpoint`, `GraphSubscriptionGroup`, `EwsSubscriptionState` /
   `EwsSubscriptionScope`); everything else is `pub(super)` inside `push`.
   - `push/dispatch.rs` - the two `Account` doors: the empty-scope refusal, the
-    per-scope poll-only split, the `PushMode` dispatch (`subscribe_eligible`),
+    per-scope poll-only split, the `PushConfig` dispatch (`subscribe_eligible`),
     and the positional three-lane outcome ledger (`push_item_ids` /
     `finalize_push_outcomes`). The dispatcher builds the ledger; each arm
     closes it itself, before it registers anything.
@@ -639,21 +639,37 @@ against the same counters. When the client was built with
 `with_account_net` there is no parent `Net` and the existing handle is
 retagged instead, which moves its token rather than minting a new one.
 
-`GraphAccountFactory` carries a `GraphClient`, a `PushMode`, an optional
-`PushEndpoint`, a `shared_mailboxes: Vec<String>`, and
+`GraphAccountFactory` carries a `GraphClient`, a `PushConfig`,
+a `shared_mailboxes: Vec<String>`, and
 `public_folders: Option<PublicFolderScope>`.
 `with_push_endpoint_client_state(url, secret)` is the ONLY webhook-mode
-constructor: it selects `GraphSubscriptions` and sends the caller-owned
+constructor: it selects `Webhook(PushEndpoint)` and sends the caller-owned
 account-wide secret on every resource so the out-of-process receiver can
 validate Graph notifications. `PushEndpoint::client_state` is a `String`, not
 an `Option`. The removed `with_push_endpoint(url)` let `create_subscription`
 mint a random per-resource value and drop it on the floor, producing
 subscriptions no receiver could authenticate; nothing in the crate generates a
 `clientState` any more. `with_ews_streaming()` selects `EwsStreaming`
-and clears the endpoint; default webhook-mode without an endpoint makes
-`push_subscribe` fail with `Unsupported(PushSubscribe)`.
+and replaces the webhook configuration. The default is `PushConfig::None`:
+no push capability, no lane, and `Unsupported(PushSubscribe)` on subscription.
+An Outlook user without a configured receiver expects polling to continue,
+so the account must not advertise a push surface it cannot deliver.
+Capability, lane and subscribe dispatch all read the same configuration.
 `with_shared_mailbox(id)` registers a delegate/shared mailbox by its
-`/users/{id}` routing key. `with_public_folders(scope)` opts in to
+`/users/{id}` routing key.
+Configuration and delegate discovery deduplicate ASCII case variants, keeping
+the FIRST configured spelling as the mailbox's canonical spelling. That
+spelling keys `shared_clients` and is the owner written into every item,
+folder, thread and owner-tag id; ids are never re-spelled, because they are
+durable identities a consumer has stored and re-spelling would make every
+shared-mailbox object look new. Only routing and throttle budgets compare
+case-insensitively: the shared client routes `/users/{id}` and budgets in ASCII
+lowercase, and owner lookups (`shared_client`), send-as, scheduled-send lookup
+and same-mailbox move checks (`same_owner`) match any case variant. An Outlook
+user expects a shared mailbox configured and discovered with different address
+case to appear once, with one scope set, one mailbox budget and stable ids. Non-ASCII bytes are
+preserved rather than inventing Unicode equivalences for provider identifiers.
+`with_public_folders(scope)` opts in to
 public-folder discovery (default off) and says which folders may SYNC:
 `PublicFolderScope::hierarchy_only()` projects the hierarchy and syncs
 nothing, `PublicFolderScope::pinned(ids)` syncs exactly those folders. The
@@ -991,18 +1007,19 @@ session's start or `close()`.
 
 ## Capabilities
 
-`build_capabilities(push_mode)` in `capabilities.rs`:
+`build_capabilities(push_config, has_shared_mailboxes)` in `capabilities.rs`:
 
 - `cursor_freshness: ServerIssued`. Graph mints `@odata.deltaLink`; the engine
   persists and resumes it.
 - `blob_range: Conditional` (per-handle: fileAttachments support `Range` against
   `/$value`, item/referenceAttachments do not, carried by
   `BlobHandle::capabilities::supports_range`); `blob_digest_pre_download: false`.
-- `push` depends on `PushMode`: `GraphSubscriptions` -> `WebhookOrEwsStream`
+- `push` depends on `PushConfig`: `None` -> `None`, `Webhook(endpoint)` -> `WebhookOrEwsStream`
   (out-of-process: subscription CRUD on the Account, HTTPS receiver wired by the
   consumer into the engine `InvalidationSink`; `push_in_process()` false);
   `EwsStreaming` -> `InProcess` (the EWS `Connection` lane's sessions yield
-  `Invalidated` from `push_stream`; `push_in_process()` true).
+  `Invalidated` from `push_stream`; `push_in_process()` true). The shared
+  `WebhookOrEwsStream` spelling is retained, but Graph uses it only for webhooks.
 - `mutation.concurrency: ExpectedVersion` enables mail flags and contact/event
   update and delete, with mail move/destroy disabled.
   `bulk_set_flags_if_version` sends the target's ETag in the message PATCH's
@@ -1510,7 +1527,7 @@ folder-qualified message id, so `GraphBlobKind::Ews` fetches via SOAP
 Push has two modes, selected on the factory and reflected in the
 capability surface.
 
-### Webhook mode (`PushMode::GraphSubscriptions`)
+### Webhook mode (`PushConfig::Webhook`)
 
 `push_subscribe(scopes)` rejects an EMPTY scope list as `Request(Malformed)`
 before mode dispatch, so in both modes (a subscription covering nothing
@@ -1709,7 +1726,7 @@ A dropped session cannot cancel the task or erase its committed gap. Close
 awaits tracked tasks under one bounded join, dropping remaining handles
 without aborting the effects if the bound expires.
 
-### EWS streaming mode (`PushMode::EwsStreaming`)
+### EWS streaming mode (`PushConfig::EwsStreaming`)
 
 EWS mode exposes one Connection lane with 5s to 320s engine backoff and
 quarter jitter. Subscribe translates REST IDs, commits scopes and bumps
@@ -2426,14 +2443,18 @@ the engine then records ALONE.
   queries and Autodiscover are
   `Unmetered`. This means no Outlook claim or mailbox throttle tag; account
   rate limits and any injected account concurrency claim still apply.
-  `execute_wire` and `download_stream` wrap Outlook 429 / 503 / 507 failures
-  as `GraphError::MailboxThrottled { budget, source }` using the unchanged
-  `mailbox_budget` string. The budget survives classification only for
+  `execute_wire` and `download_stream` carry every Outlook failure's routing
+  context as `GraphError::MailboxContext { budget, source }`. The funnel does
+  not decide whether a failure is throttling; one predicate on the classified
+  kind decides scope and budget stamping, including EWS and Autodiscover.
+  The budget survives classification only for
   `Server(RateLimited | QuotaExhausted)`; a plain 503 remains `Unavailable`.
   Unmetered failures and outer `$batch` failures stay untagged and fall back
   to the account key. Per-item batch stamps remain independent of the outer
   POST. `response_status` sees through the wrapper; `into_account_error`
-  unwraps it into `GraphErrorContext::budget`.
+  unwraps it into `GraphErrorContext::budget`. An unavailable server should
+  retry without pretending a mailbox quota is exhausted, as an Outlook user
+  expects; a bare 503 therefore receives no throttle budget.
 - **Concurrency.** Buffered Outlook requests add a weight-1 claim on a
   `ConcurrencyLimit` of 4, Microsoft's documented concurrent-request limit
   per app per mailbox. `AccountNet::shared_concurrency_limit` shares the
@@ -2444,7 +2465,10 @@ the engine then records ALONE.
   a case-insensitive match resolves to the primary key, otherwise the key is
   `graph-outlook|ORIGIN|mailbox:LOWERCASED_ID`. ORIGIN excludes the API path,
   so v1.0 and beta share a budget. These concurrency keys are separate from
-  throttle budget strings, whose identity remains unchanged.
+  throttle budget strings. One `MailboxIdentity` derives both views from the
+  canonical owner, primary address and fixed account. Both use the first attached account identity for
+  the primary fallback, including injected `AccountNet` clients after retagging;
+  retagging changes transport accounting without splitting mailbox identity.
 - **Batch admission.** Each subrequest carries its owning client, resolved
   from the same object routing as its URL. The outer POST merges owners by
   final concurrency key and adds one weighted claim per merged group,

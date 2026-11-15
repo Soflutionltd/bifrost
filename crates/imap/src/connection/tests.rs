@@ -2575,7 +2575,7 @@ async fn a_pipeline_is_admitted_against_the_session_state_at_execution() {
         .pipeline()
         .noop()
         .uid_search("ALL".to_owned())
-        .execute_dynamic()
+        .execute_dynamic(std::time::Duration::from_secs(30))
         .await
         .expect_err("UID SEARCH needs a selected mailbox");
     assert!(
@@ -3009,7 +3009,7 @@ mod withdrawal {
             conn.pipeline()
                 .noop()
                 .list(String::new(), "*".into())
-                .execute(),
+                .execute(Duration::from_secs(30)),
         );
         assert!(futures::poll!(&mut b).is_pending());
         assert_eq!(conn.cmd_tx.capacity(), one_queued(&conn));

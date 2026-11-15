@@ -1,12 +1,12 @@
 //! Session dispatch; the engine owns recovery and pacing.
-use super::{GraphAccount, PushMode};
+use super::{GraphAccount, PushConfig};
 use bifrost_types::{
     AccountStream, BackoffPolicy, PushGate, PushLane, PushLaneKind, PushLaneSpec, PushSessionEvent,
     SessionStop,
 };
 pub(crate) fn push_lanes(account: &GraphAccount) -> Vec<PushLaneSpec> {
-    let (kind, backoff) = match account.push_mode {
-        PushMode::EwsStreaming => (
+    let (kind, backoff) = match &account.push_config {
+        PushConfig::EwsStreaming => (
             PushLaneKind::Connection,
             BackoffPolicy::new(
                 std::time::Duration::from_secs(5),
@@ -14,7 +14,7 @@ pub(crate) fn push_lanes(account: &GraphAccount) -> Vec<PushLaneSpec> {
                 true,
             ),
         ),
-        PushMode::GraphSubscriptions if account.push_endpoint.is_some() => (
+        PushConfig::Webhook(_) => (
             PushLaneKind::Registration,
             BackoffPolicy::new(
                 super::push::renewal::RENEWAL_CHECK_INTERVAL,
@@ -45,8 +45,8 @@ pub(crate) fn push_stream(
             ))
         }));
     }
-    match account.push_mode {
-        PushMode::EwsStreaming => super::ews_stream::streaming_session(account, stop),
+    match &account.push_config {
+        PushConfig::EwsStreaming => super::ews_stream::streaming_session(account, stop),
         _ => super::push::renewal::renewal_session(account, stop, gate),
     }
 }

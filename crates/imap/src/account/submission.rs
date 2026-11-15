@@ -42,11 +42,16 @@ pub enum SubmissionTls {
 }
 
 impl SubmissionTls {
+    /// Message-submission defaults, not relay defaults: plaintext stays on
+    /// 587 (see `default_submission_port`).
     const fn default_port(self) -> u16 {
-        match self {
-            Self::Implicit => 465,
-            Self::StartTls | Self::Plaintext => 587,
-        }
+        use bifrost_smtp::transport::smtp::{PortTls, default_submission_port};
+        let tls = match self {
+            Self::Implicit => PortTls::Implicit,
+            Self::StartTls => PortTls::StartTls,
+            Self::Plaintext => PortTls::Plaintext,
+        };
+        default_submission_port(tls)
     }
 }
 
@@ -210,6 +215,8 @@ impl SubmissionTransport {
         // A builder error here is a local submission-config fault (bad TLS
         // SNI / host), not a wire failure: surface it as InvalidInput so the
         // account boundary classifies it as a client-side request error.
+        // Keep this conversion: relay/starttls_relay only construct local TLS
+        // parameters, and cannot produce a network or handshake failure.
         let smtp_config_err =
             |e: bifrost_smtp::transport::smtp::Error| crate::Error::InvalidInput(e.to_string());
         let mut builder = match cfg.tls {

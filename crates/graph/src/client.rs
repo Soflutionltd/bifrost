@@ -48,6 +48,12 @@ pub struct GraphClient {
     tally: Option<ByteTally>,
 }
 
+/// Both admission and throttle attribution are views of this same mailbox.
+struct MailboxIdentity {
+    budget: bifrost_types::ThrottleBudget,
+    concurrency_key: String,
+}
+
 struct ClientInner {
     net: Option<Net>,
     account_net: RwLock<Option<AccountNet>>,
@@ -703,53 +709,60 @@ impl GraphClient {
     /// too widely. Each deadline is in memory and expires on its own; the
     /// cost is pacing, never a misrouted request.
     pub(crate) fn mailbox_budget(&self) -> bifrost_types::ThrottleBudget {
-        let mailbox = match &self.inner.mailbox_id {
-            Some(id) => format!("mailbox:{}", id.to_lowercase()),
-            None => match self.primary_address() {
-                Some(address) => format!("mailbox:{}", address.to_lowercase()),
-                None => format!(
-                    "account:{}",
-                    self.account_net()
-                        .map(|net| net.account().0.clone())
-                        .unwrap_or_default()
-                ),
-            },
-        };
-        // ORIGIN only, not the base path: `/v1.0` and `/beta` against one
-        // mailbox are one provider budget.
-        let origin = match self.inner.api_base.url() {
-            Some(url) => url.origin().ascii_serialization(),
-            None => self.inner.api_base.as_str().to_owned(),
-        };
-        bifrost_types::ThrottleBudget::new(format!("graph-outlook|{origin}|{mailbox}"))
+        self.mailbox_identity().budget
     }
 
-    fn fix_primary_account(&self, account: &str) -> String {
+    fn fix_primary_account(&self, account: &str) {
         let mut slot = self
             .inner
             .primary_account
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        slot.get_or_insert_with(|| account.to_owned()).clone()
+        slot.get_or_insert_with(|| account.to_owned());
     }
 
-    fn concurrency_key(&self, net: &AccountNet) -> String {
-        let primary = self.fix_primary_account(&net.account().0);
-        let mailbox = match self.inner.mailbox_id.as_deref() {
-            Some(id)
-                if !self
-                    .primary_address()
-                    .is_some_and(|address| address.eq_ignore_ascii_case(id)) =>
-            {
-                format!("mailbox:{}", id.to_lowercase())
-            }
+    fn mailbox_identity(&self) -> MailboxIdentity {
+        // Retagging changes transport accounting, not mailbox identity. Both
+        // admission and throttle fallback retain the first attached account.
+        let primary = self
+            .inner
+            .primary_account
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            // Before the first admission has fixed the primary account, fall
+            // back to the attached account rather than an empty tag that every
+            // unaddressed client on this origin would share.
+            .or_else(|| self.account_net().map(|net| net.account().0.clone()))
+            .unwrap_or_default();
+        let address = self
+            .primary_address()
+            .map(|address| address.to_ascii_lowercase());
+        let owner = self.inner.mailbox_id.as_ref();
+        let budget_owner = owner.or(address.as_ref()).map_or_else(
+            || format!("account:{primary}"),
+            |id| format!("mailbox:{id}"),
+        );
+        let concurrency_owner = match owner {
+            Some(id) if Some(id) != address.as_ref() => format!("mailbox:{id}"),
             _ => format!("primary|{primary}"),
         };
+        // Origin only: v1.0 and beta share one provider mailbox budget.
         let origin = self.inner.api_base.url().map_or_else(
             || self.inner.api_base.as_str().to_owned(),
             |url| url.origin().ascii_serialization(),
         );
-        format!("graph-outlook|{origin}|{mailbox}")
+        MailboxIdentity {
+            budget: bifrost_types::ThrottleBudget::new(format!(
+                "graph-outlook|{origin}|{budget_owner}"
+            )),
+            concurrency_key: format!("graph-outlook|{origin}|{concurrency_owner}"),
+        }
+    }
+
+    fn concurrency_key(&self, net: &AccountNet) -> String {
+        self.fix_primary_account(&net.account().0);
+        self.mailbox_identity().concurrency_key
     }
 
     fn claims(
@@ -777,20 +790,14 @@ impl GraphClient {
 
     /// Outer batch failures have no single owning mailbox; subresponses
     /// are stamped by their per-item classifiers instead.
-    fn tag_throttle(&self, resource: &Resource, error: GraphError) -> GraphError {
-        if !matches!(resource, Resource::Outlook)
-            || !matches!(
-                error.response_status(),
-                Some(
-                    reqwest::StatusCode::TOO_MANY_REQUESTS
-                        | reqwest::StatusCode::SERVICE_UNAVAILABLE
-                        | reqwest::StatusCode::INSUFFICIENT_STORAGE
-                )
-            )
-        {
+    fn with_mailbox_context(&self, resource: &Resource, error: GraphError) -> GraphError {
+        // Carry routing context on every Outlook failure. Only classification
+        // decides whether it is a throttle; an unavailable server must retry
+        // without holding unrelated work as if a mailbox quota were exhausted.
+        if !matches!(resource, Resource::Outlook) {
             return error;
         }
-        GraphError::MailboxThrottled {
+        GraphError::MailboxContext {
             budget: self.mailbox_budget(),
             source: Box::new(error),
         }
@@ -807,7 +814,7 @@ impl GraphClient {
                 outlook_base: self.inner.outlook_base.clone(),
                 rate_limit_host: self.inner.rate_limit_host.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
-                mailbox_id: Some(mailbox_id.into()),
+                mailbox_id: Some(mailbox_id.into().to_ascii_lowercase()),
                 primary_address: Arc::clone(&self.inner.primary_address),
                 primary_account: Arc::clone(&self.inner.primary_account),
                 #[cfg(test)]
@@ -1202,7 +1209,7 @@ impl GraphClient {
         let sent = builder.count_bytes_into(counter.clone()).send().await;
         self.record_bytes(&counter);
         let response =
-            sent.map_err(|error| self.tag_throttle(&resource, GraphError::Net(error)))?;
+            sent.map_err(|error| self.with_mailbox_context(&resource, GraphError::Net(error)))?;
         Ok(RestResponse::from(response))
     }
 
@@ -1278,7 +1285,7 @@ impl GraphClient {
             .await;
         self.record_bytes(&counter);
         let response =
-            sent.map_err(|error| self.tag_throttle(&resource, GraphError::Net(error)))?;
+            sent.map_err(|error| self.with_mailbox_context(&resource, GraphError::Net(error)))?;
         Ok(RestResponse::from(response))
     }
 
@@ -1353,7 +1360,7 @@ impl GraphClient {
         account_net
             .download_stream(url, range)
             .await
-            .map_err(|error| self.tag_throttle(&resource, GraphError::Net(error)))
+            .map_err(|error| self.with_mailbox_context(&resource, GraphError::Net(error)))
     }
 
     /// The transport a wire call should use: the scripted one under test
@@ -1963,10 +1970,49 @@ mod tests {
         assert!(!prefix.contains('@'), "{prefix}");
         assert!(!prefix.contains('+'), "{prefix}");
         assert!(prefix.starts_with("/users/"), "{prefix}");
-        // The stored key stays verbatim - it is the map key every routing
-        // site (`client_for_owner`, `encode_foreign`) looks up.
+        // The stored key uses the same ASCII canonical form as routing maps.
         assert_eq!(client.mailbox_id(), Some("a+tag@contoso.com"));
         assert!(!client.uses_default_mailbox());
+    }
+
+    #[test]
+    fn routed_error_context_leaves_throttle_decisions_to_classification() {
+        let client = GraphClient::new("token").for_shared_mailbox("Shared@Contoso.com");
+        let budget = client.mailbox_budget();
+        for (status, body, throttled) in [
+            (503, "", false),
+            (429, "", true),
+            (507, "", true),
+            (400, r#"{"error":{"code":"TooManyRequests"}}"#, true),
+            (503, r#"{"error":{"code":"TooManyRequests"}}"#, true),
+        ] {
+            let source = GraphError::Response(crate::error::GraphResponseError::from_response(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                reqwest::header::HeaderMap::new(),
+                Bytes::from(body),
+            ));
+            let error = crate::account::graph_error::into_account_error(
+                client.with_mailbox_context(&Resource::Outlook, source),
+                crate::account::graph_error::GraphErrorContext::graph(
+                    bifrost_types::AccountOperation::SyncChanges,
+                ),
+            );
+            assert_eq!(
+                !error.throttle_budgets().is_empty(),
+                throttled,
+                "{status}: {body}"
+            );
+            if throttled {
+                assert_eq!(error.throttle_budgets(), std::slice::from_ref(&budget));
+            } else {
+                assert!(matches!(
+                    error.kind(),
+                    bifrost_types::AccountErrorKind::Server(
+                        bifrost_types::ServerErrorKind::Unavailable
+                    )
+                ));
+            }
+        }
     }
 
     /// A throttle is tagged with the budget of the mailbox the request was
@@ -2003,7 +2049,7 @@ mod tests {
             )
             .await
         {
-            Err(GraphError::MailboxThrottled { budget, .. }) => {
+            Err(GraphError::MailboxContext { budget, .. }) => {
                 assert_eq!(budget, shared.mailbox_budget());
                 assert!(
                     budget.as_str().ends_with("mailbox:shared@contoso.com"),
@@ -2046,7 +2092,7 @@ mod tests {
                     bifrost_net::ReplayPolicy::Idempotent
                 )
                 .await,
-            Err(GraphError::MailboxThrottled { .. })
+            Err(GraphError::MailboxContext { .. })
         ));
 
         for path in ["/subscriptions", "/$batch"] {
@@ -2380,9 +2426,9 @@ mod tests {
                     "/me/messages",
                     "/me/messages",
                     "/me/messages",
-                    "/users/ME%40CONTOSO.COM/messages",
-                    "/users/ME%40CONTOSO.COM/messages",
-                    "/users/ME%40CONTOSO.COM/messages",
+                    "/users/me%40contoso.com/messages",
+                    "/users/me%40contoso.com/messages",
+                    "/users/me%40contoso.com/messages",
                 ],
             ),
         ] {
@@ -2434,7 +2480,7 @@ mod tests {
             ScriptedRestResponse::empty(reqwest::StatusCode::TOO_MANY_REQUESTS),
         ]);
         match shared.list_mail_folders().await {
-            Err(GraphError::MailboxThrottled { budget, .. }) => {
+            Err(GraphError::MailboxContext { budget, .. }) => {
                 assert_eq!(budget, shared.mailbox_budget());
                 assert_ne!(budget, primary.mailbox_budget());
             }
@@ -2511,7 +2557,12 @@ mod tests {
             "https://graph.microsoft.com/v1.0",
             Arc::new(StaticTokenSource::new("token", None)),
         );
+        let budget = client.mailbox_budget();
+        let key = client.concurrency_key(&source);
         client.attach_account(destination_id.clone());
+        // Retagging changes accounting, not which mailbox this client names.
+        assert_eq!(client.mailbox_budget(), budget);
+        assert_eq!(client.concurrency_key(&source), key);
         let attached = client.account_net().unwrap();
         assert_eq!(attached.account(), &destination_id);
         assert_eq!(attached.bandwidth_cap(), Some(2222));
@@ -2679,9 +2730,13 @@ mod tests {
                 .is_ok()
         );
 
-        match outcome_for([ScriptedRestResponse::empty(StatusCode::NOT_FOUND)]).await {
+        match outcome_for([ScriptedRestResponse::empty(StatusCode::NOT_FOUND)])
+            .await
+            .as_ref()
+            .map_err(GraphError::terminal)
+        {
             Err(GraphError::Net(bifrost_net::Error::Status { code, .. })) => {
-                assert_eq!(code, StatusCode::NOT_FOUND);
+                assert_eq!(*code, StatusCode::NOT_FOUND);
             }
             _ => panic!("a terminal 4xx is Error::Status"),
         }
@@ -2693,7 +2748,7 @@ mod tests {
             .with_header("Retry-After", "5")])
         .await
         {
-            Err(GraphError::MailboxThrottled { source, .. }) => match *source {
+            Err(GraphError::MailboxContext { source, .. }) => match *source {
                 GraphError::Net(bifrost_net::Error::RateLimited {
                     retry_after,
                     final_response,
@@ -2710,6 +2765,8 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR,
         )])
         .await
+        .as_ref()
+        .map_err(GraphError::terminal)
         {
             Err(GraphError::Net(bifrost_net::Error::RetryBudgetExhausted {
                 final_response: Some(final_response),
@@ -2743,6 +2800,8 @@ mod tests {
             ScriptedRestResponse::empty(StatusCode::UNAUTHORIZED),
         ])
         .await
+        .as_ref()
+        .map_err(GraphError::terminal)
         {
             Err(GraphError::Net(error)) => {
                 let bifrost_net::Error::AuthLost {

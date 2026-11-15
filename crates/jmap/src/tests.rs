@@ -688,8 +688,11 @@ mod session_capabilities_deserialization {
             "eventSourceUrl": "https://jmap.example.org/eventsource/",
             "state": "s0"
         });
+        // RFC 9404's Blob limits live on the account, like the others here;
+        // the session object is only the empty support marker.
         for uri in [
             "urn:ietf:params:jmap:mail",
+            "urn:ietf:params:jmap:blob",
             "urn:ietf:params:jmap:calendars",
             "urn:ietf:params:jmap:contacts",
             "urn:ietf:params:jmap:principals",

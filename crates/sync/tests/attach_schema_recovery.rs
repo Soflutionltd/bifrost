@@ -2701,7 +2701,7 @@ impl AccountFactory for ExhaustingFactory {
 /// Run under paused time so the backoff schedule is exact: the gap between
 /// two recorded opens IS the slept delay, with no wall-clock noise. The
 /// asserted windows are the documented base delays (1s, then 2s) widened by
-/// the engine's +/-20% jitter.
+/// the engine's +0..25% jitter.
 #[tokio::test(start_paused = true)]
 async fn three_failed_reopens_terminate_and_pause_the_account() {
     use bifrost_types::{StateCause, SyncStateErrorKind};
@@ -2811,14 +2811,14 @@ async fn three_failed_reopens_terminate_and_pause_the_account() {
     let first_backoff = instants[2] - instants[1];
     let second_backoff = instants[3] - instants[2];
     assert!(
-        (std::time::Duration::from_millis(800)..=std::time::Duration::from_millis(1200))
+        (std::time::Duration::from_millis(1000)..=std::time::Duration::from_millis(1250))
             .contains(&first_backoff),
-        "the second attempt waits the 1s base delay +/-20% jitter: {first_backoff:?}"
+        "the second attempt waits the 1s base delay +0..25% jitter: {first_backoff:?}"
     );
     assert!(
-        (std::time::Duration::from_millis(1600)..=std::time::Duration::from_millis(2400))
+        (std::time::Duration::from_millis(2000)..=std::time::Duration::from_millis(2500))
             .contains(&second_backoff),
-        "the third attempt waits the doubled 2s delay +/-20% jitter: {second_backoff:?}"
+        "the third attempt waits the doubled 2s delay +0..25% jitter: {second_backoff:?}"
     );
 
     engine

@@ -2,6 +2,46 @@
 
 Current architecture of the SMTP client crate. Descended from lettre 0.11.22; the bifrost fork has substantially diverged. Native-tls only.
 
+## Port defaults and local configuration
+
+`default_port(protocol, PortTls)` owns the TCP defaults used by blocking and
+async builders and connection URLs: SMTP plaintext 25 (relay),
+STARTTLS (required or opportunistic) 587, implicit TLS 465. LMTP retains its
+port 24 convention. Explicit port overrides take precedence.
+`default_submission_port(PortTls)` owns the client message-submission defaults
+(RFC 6409) that IMAP-composed accounts use: plaintext and STARTTLS 587,
+implicit TLS 465. Plaintext submission deliberately does not fall to the relay
+port 25: a user configuring a mail account against an internal non-TLS relay
+expects the submission service, and client networks commonly block outbound 25.
+
+Malformed connection URLs, missing hosts, unsupported schemes or TLS query
+values, missing URL passwords, invalid percent escapes or UTF-8, malformed
+certificates and identities, and TLS connector construction failures are local
+`InvalidInput` errors, translated as `Request(Malformed)`. They need repair by
+the user or administrator; an enterprise send queue must not retry a typo as a
+network outage. Runtime TLS handshakes remain transport errors. IMAP's builder
+conversion to its own `InvalidInput` is intentional: those builder calls only
+construct local TLS parameters and perform no network I/O.
+
+## Submission progress and reply classes
+
+`SendProgress` holds one phase: `Envelope`, `DataIssued`, `BodyStarted`,
+`BodySent`, or `FinalReply(Response)`. Resolution classifies still-pending or
+accepted recipients before body admission as failed with `Unsent` evidence,
+even when an exit forgot to mark them. A lost DATA-command reply is likewise
+unsent: the machine has issued no body write. Once a body write is issued,
+missing final replies remain uncertain. This lets an Outlook user retry an
+unsent message without risking duplicates after an ambiguous upload.
+
+The send core requires exactly 354 before writing a DATA body, and 2yz
+completion replies at envelope, reset and final-completion boundaries.
+`Code` and `Response` expose `is_completion` and `is_intermediate` alongside
+`is_positive`, which remains useful for authentication exchanges. A 3yz final
+reply never proves delivery: SMTP batch resolution returns uncertain lanes,
+and direct SMTP and LMTP abort with a parse error carrying in-flight evidence.
+LMTP batches preserve earlier definitive statuses and mark unresolved recipients
+uncertain before aborting on an intermediate final status.
+
 ## Transport types
 
 Sync and async, SMTP and LMTP:
@@ -472,12 +512,11 @@ the other end. The peer read the whole message and refused it, so the
 transaction is complete (RFC 5321 4.1.1.4), there is nothing to reset, and the
 connection stays reusable: `DirectSmtp` finishes with the status error and no
 abort, and `BatchSmtp` (which is DATA-only) records the reply through
-`set_body_finished` + `set_data_response` and finishes `Ok(progress)`, so
+`set_data_response` after recording body completion at the write boundary and finishes `Ok(progress)`, so
 `resolve` fans it out as `DataFinal` `failed` lanes carrying `Acknowledged`.
 Routing it through the transport-failure arm instead put every accepted
 recipient in the `uncertain` lane - asking the caller to reconcile a delivery
-the server had explicitly refused - and aborted a healthy connection. Only a
-genuine I/O or parse failure at that boundary aborts. Pinned in both halves by
+the server had explicitly refused - and aborted a healthy connection. An I/O failure, parse failure or intermediate reply at that boundary aborts. Pinned in both halves by
 `a_rejected_data_final_reply_fails_the_recipients_and_keeps_the_connection` and
 `a_rejected_data_final_reply_keeps_the_direct_connection_reusable`.
 
@@ -877,7 +916,7 @@ negative completion, and `bifrost-types`' `derive_server` reads the protocol
 from the `Cause::Wire(WireCause::Smtp(_))` every classified reply carries, so a
 554 at the terminator is `ProviderRefused` rather than the HTTP 5xx
 `Retry(SameRequest)` it derived before (smtp-CR10, 2026-09-07; see
-`reference/error-model.md`, the Server row). LMTP `Accepted` at resolve time without a per-recipient `Final` is a programming bug caught by `debug_assert!` in debug builds and falls back to an `Uncertain` lane in release. Every failed and uncertain lane carries the envelope recipient as `DiagnosticText::support_only` so support exports preserve per-recipient correlation when N lanes share the same wire response text.
+`reference/error-model.md`, the Server row). After the body starts, LMTP `Accepted` at resolve time without a per-recipient `Final` is a programming bug caught by `debug_assert!` in debug builds and falls back to an `Uncertain` lane in release. Every failed and uncertain lane carries the envelope recipient as `DiagnosticText::support_only` so support exports preserve per-recipient correlation when N lanes share the same wire response text.
 
 ## Connection test harness
 

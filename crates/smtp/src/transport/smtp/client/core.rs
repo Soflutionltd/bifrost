@@ -122,7 +122,7 @@ impl<T> Epilogue<T> {
                 _ => Ok((Epilogue::ResetReading(value), Op::ReadSingle)),
             },
             Epilogue::ResetReading(value) => match outcome {
-                OpOutcome::Reply(response) if response.is_positive() => Err(value),
+                OpOutcome::Reply(response) if response.is_completion() => Err(value),
                 _ => Ok(Epilogue::abort(value)),
             },
         }
@@ -355,7 +355,7 @@ impl ProtocolMachine for DirectSmtp {
                     let value = phased(SmtpCommandPhase::MailFrom, error);
                     self.begin_epilogue(Epilogue::abort(value))
                 }
-                OpOutcome::Reply(response) if response.is_positive() => {
+                OpOutcome::Reply(response) if response.is_completion() => {
                     if self.recipients.is_empty() {
                         return self.after_envelope();
                     }
@@ -379,7 +379,7 @@ impl ProtocolMachine for DirectSmtp {
                     let value = phased(SmtpCommandPhase::RcptTo, error);
                     self.begin_epilogue(Epilogue::abort(value))
                 }
-                OpOutcome::Reply(response) if response.is_positive() => {
+                OpOutcome::Reply(response) if response.is_completion() => {
                     let next = index + 1;
                     if next >= self.recipients.len() {
                         return self.after_envelope();
@@ -442,7 +442,7 @@ impl ProtocolMachine for DirectSmtp {
                     let value = phased(SmtpCommandPhase::MailFrom, error);
                     self.begin_epilogue(Epilogue::abort(value))
                 }
-                OpOutcome::Reply(response) if response.is_positive() => {
+                OpOutcome::Reply(response) if response.is_completion() => {
                     self.stage = DirectSmtpStage::RcptWindowReply {
                         end,
                         next: 0,
@@ -552,7 +552,7 @@ impl ProtocolMachine for DirectSmtp {
                     let closing = closing || closing_channel(&response);
                     let failure = match failure {
                         Some(failure) => Some(failure),
-                        None if !response.is_positive() => Some(response),
+                        None if !response.is_completion() => Some(response),
                         None => None,
                     };
                     let next = next + 1;
@@ -599,7 +599,7 @@ impl ProtocolMachine for DirectSmtp {
                     let value = phased(SmtpCommandPhase::DataCommand, error);
                     self.begin_epilogue(Epilogue::abort(value))
                 }
-                OpOutcome::Reply(response) if response.is_positive() => {
+                OpOutcome::Reply(response) if response.has_code(354) => {
                     self.stage = DirectSmtpStage::BodyWritten;
                     Step::Run(self.body.write_op())
                 }
@@ -625,7 +625,20 @@ impl ProtocolMachine for DirectSmtp {
                 }
             },
             DirectSmtpStage::FinalReply => match outcome {
-                OpOutcome::Reply(response) if response.is_positive() => Step::Finish(Ok(response)),
+                OpOutcome::Reply(response) if response.is_intermediate() => {
+                    let value = phased(
+                        match self.body {
+                            BodyKind::Data => SmtpCommandPhase::DataFinal,
+                            BodyKind::Bdat => SmtpCommandPhase::BdatBody,
+                        },
+                        error::parse("intermediate reply after message body")
+                            .with_attempt(SmtpTransmissionState::InFlight),
+                    );
+                    self.begin_epilogue(Epilogue::abort(value))
+                }
+                OpOutcome::Reply(response) if response.is_completion() => {
+                    Step::Finish(Ok(response))
+                }
                 OpOutcome::Reply(response) => {
                     // `DataFinal` names the reply to the dot terminator, which
                     // is what the batch path already tags. BDAT has no
@@ -807,7 +820,7 @@ impl ProtocolMachine for DirectLmtp {
             }
             DirectLmtpStage::MailReply => match outcome {
                 OpOutcome::Failed(error) => self.abort_with(SmtpCommandPhase::MailFrom, error),
-                OpOutcome::Reply(response) if response.is_positive() => {
+                OpOutcome::Reply(response) if response.is_completion() => {
                     if self.recipients.is_empty() {
                         return self.after_envelope();
                     }
@@ -837,7 +850,7 @@ impl ProtocolMachine for DirectLmtp {
                     if closing_channel(&response) {
                         return self.abort_with(SmtpCommandPhase::RcptTo, error::status(response));
                     }
-                    if response.is_positive() {
+                    if response.is_completion() {
                         self.accepted += 1;
                         self.statuses.push(None);
                     } else {
@@ -854,7 +867,7 @@ impl ProtocolMachine for DirectLmtp {
             },
             DirectLmtpStage::DataReply => match outcome {
                 OpOutcome::Failed(error) => self.abort_with(SmtpCommandPhase::DataCommand, error),
-                OpOutcome::Reply(response) if response.is_positive() => {
+                OpOutcome::Reply(response) if response.has_code(354) => {
                     self.stage = DirectLmtpStage::BodyWritten;
                     Step::Run(self.body.write_op())
                 }
@@ -899,6 +912,11 @@ impl ProtocolMachine for DirectLmtp {
                 }
             },
             DirectLmtpStage::FinalStatus(index) => match outcome {
+                OpOutcome::Reply(response) if response.is_intermediate() => self.abort_with(
+                    SmtpCommandPhase::LmtpFinalStatus,
+                    error::parse("intermediate LMTP final status")
+                        .with_attempt(SmtpTransmissionState::InFlight),
+                ),
                 OpOutcome::Failed(error) => {
                     self.abort_with(SmtpCommandPhase::LmtpFinalStatus, error)
                 }
@@ -1042,6 +1060,7 @@ impl BatchSmtp {
         if !self.any_accepted() {
             return self.begin_epilogue(Epilogue::reset(BatchExit::Progress));
         }
+        self.progress().set_data_issued();
         self.write_then(BatchSmtpStage::DataReply, Data.to_string())
     }
 
@@ -1100,7 +1119,7 @@ impl ProtocolMachine for BatchSmtp {
                 self.write_then(BatchSmtpStage::MailReply, bytes)
             }
             BatchSmtpStage::MailReply => match outcome {
-                OpOutcome::Reply(response) if response.is_positive() => {
+                OpOutcome::Reply(response) if response.is_completion() => {
                     if self.recipients.is_empty() {
                         return self.after_envelope();
                     }
@@ -1125,7 +1144,7 @@ impl ProtocolMachine for BatchSmtp {
             },
             BatchSmtpStage::RcptReply(index) => match outcome {
                 OpOutcome::Reply(response) => {
-                    if response.is_positive() {
+                    if response.is_completion() {
                         self.progress().record_rcpt_accepted(index);
                     } else if closing_channel(&response) {
                         return self.closing_during_envelope(index, response);
@@ -1216,7 +1235,7 @@ impl ProtocolMachine for BatchSmtp {
                         .with_phase(SmtpCommandPhase::MailFrom);
                     self.begin_epilogue(Epilogue::abort(BatchExit::Error(error)))
                 }
-                OpOutcome::Reply(response) if response.is_positive() => {
+                OpOutcome::Reply(response) if response.is_completion() => {
                     self.stage = BatchSmtpStage::RcptWindowReply { end, next: 0 };
                     Step::Run(Op::ReadGrouped)
                 }
@@ -1230,7 +1249,7 @@ impl ProtocolMachine for BatchSmtp {
             },
             BatchSmtpStage::RcptWindowReply { end, next } => match outcome {
                 OpOutcome::Reply(response) => {
-                    if response.is_positive() {
+                    if response.is_completion() {
                         self.progress().record_rcpt_accepted(next);
                     } else if closing_channel(&response) {
                         return self.closing_during_envelope(next, response);
@@ -1272,7 +1291,7 @@ impl ProtocolMachine for BatchSmtp {
                 _ => self.start_window(end),
             },
             BatchSmtpStage::DataReply => match outcome {
-                OpOutcome::Reply(response) if response.is_positive() => {
+                OpOutcome::Reply(response) if response.has_code(354) => {
                     self.progress().set_body_started();
                     self.stage = BatchSmtpStage::BodyWritten;
                     Step::Run(Op::WriteBody)
@@ -1292,20 +1311,12 @@ impl ProtocolMachine for BatchSmtp {
                 OpOutcome::Failed(error) => {
                     let account_error = Self::account_error(
                         error
-                            .with_attempt(SmtpTransmissionState::InFlight)
+                            .with_attempt(SmtpTransmissionState::Unsent)
                             .with_phase(SmtpCommandPhase::DataCommand),
                     );
-                    // The pipelined and non-pipelined paths differ here by
-                    // design: without PIPELINING only the accepted recipients
-                    // are in doubt, while the pipelined path has unresolved
-                    // lanes of its own to sweep.
-                    if self.pipelined {
-                        self.progress()
-                            .mark_uncertain_unresolved(|| account_error.clone());
-                    } else {
-                        self.progress()
-                            .mark_accepted_uncertain(|| account_error.clone());
-                    }
+                    // No body write was issued, so retry cannot duplicate delivery.
+                    self.progress()
+                        .mark_unresolved_unsent(|| account_error.clone());
                     self.begin_epilogue(Epilogue::abort(BatchExit::Progress))
                 }
                 OpOutcome::Done => unreachable!("a read op yields a reply or a failure"),
@@ -1322,6 +1333,7 @@ impl ProtocolMachine for BatchSmtp {
                     self.begin_epilogue(Epilogue::abort(BatchExit::Progress))
                 }
                 _ => {
+                    self.progress().set_body_finished();
                     self.stage = BatchSmtpStage::FinalReply;
                     Step::Run(Op::ReadSingle)
                 }
@@ -1336,8 +1348,7 @@ impl ProtocolMachine for BatchSmtp {
                         // `uncertain`. The response is recorded either way and
                         // `resolve` fans it out - succeeded on a positive
                         // reply, `DataFinal` `failed` lanes on a rejection.
-                        let closing = closing_channel(&response);
-                        self.progress().set_body_finished();
+                        let closing = closing_channel(&response) || response.is_intermediate();
                         self.progress().set_data_response(response);
                         if !closing {
                             let progress = self.take_progress();
@@ -1449,6 +1460,7 @@ impl BatchLmtp {
         if self.accepted == 0 {
             return self.begin_epilogue(Epilogue::reset(BatchExit::Progress));
         }
+        self.progress().set_data_issued();
         self.write_then(BatchLmtpStage::DataReply, Data.to_string())
     }
 }
@@ -1494,7 +1506,7 @@ impl ProtocolMachine for BatchLmtp {
                 self.write_then(BatchLmtpStage::MailReply, bytes)
             }
             BatchLmtpStage::MailReply => match outcome {
-                OpOutcome::Reply(response) if response.is_positive() => {
+                OpOutcome::Reply(response) if response.is_completion() => {
                     if self.recipients.is_empty() {
                         return self.after_envelope();
                     }
@@ -1517,7 +1529,7 @@ impl ProtocolMachine for BatchLmtp {
             },
             BatchLmtpStage::RcptReply(index) => match outcome {
                 OpOutcome::Reply(response) => {
-                    if response.is_positive() {
+                    if response.is_completion() {
                         self.progress().record_rcpt_accepted(index);
                         self.accepted += 1;
                     } else if closing_channel(&response) {
@@ -1545,7 +1557,7 @@ impl ProtocolMachine for BatchLmtp {
                 OpOutcome::Done => unreachable!("a read op yields a reply or a failure"),
             },
             BatchLmtpStage::DataReply => match outcome {
-                OpOutcome::Reply(response) if response.is_positive() => {
+                OpOutcome::Reply(response) if response.has_code(354) => {
                     self.progress().set_body_started();
                     self.stage = BatchLmtpStage::BodyWritten;
                     Step::Run(Op::WriteBody)
@@ -1566,11 +1578,11 @@ impl ProtocolMachine for BatchLmtp {
                 OpOutcome::Failed(error) => {
                     let account_error = Self::account_error(
                         error
-                            .with_attempt(SmtpTransmissionState::InFlight)
+                            .with_attempt(SmtpTransmissionState::Unsent)
                             .with_phase(SmtpCommandPhase::DataCommand),
                     );
                     self.progress()
-                        .mark_accepted_uncertain(|| account_error.clone());
+                        .mark_unresolved_unsent(|| account_error.clone());
                     self.begin_epilogue(Epilogue::abort(BatchExit::Progress))
                 }
                 OpOutcome::Done => unreachable!("a read op yields a reply or a failure"),
@@ -1625,6 +1637,16 @@ impl ProtocolMachine for BatchLmtp {
                 },
             },
             BatchLmtpStage::FinalStatus(index) => match outcome {
+                OpOutcome::Reply(response) if response.is_intermediate() => {
+                    let account_error = Self::account_error(
+                        error::parse("intermediate LMTP final status")
+                            .with_attempt(SmtpTransmissionState::InFlight)
+                            .with_phase(SmtpCommandPhase::LmtpFinalStatus),
+                    );
+                    self.progress()
+                        .mark_uncertain_unresolved(|| account_error.clone());
+                    self.begin_epilogue(Epilogue::abort(BatchExit::Progress))
+                }
                 OpOutcome::Reply(response) => {
                     self.progress().record_lmtp_final(index, response);
                     match self.next_accepted(index + 1) {

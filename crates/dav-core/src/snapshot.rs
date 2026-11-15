@@ -102,7 +102,8 @@ pub fn diff_snapshots(
     current: &[SnapshotEntry],
     current_failed: &[String],
 ) -> Vec<Change> {
-    if current.is_empty() && !previous.is_empty() {
+    let observation = Observed::new(previous, current, current_failed);
+    if observation.empty {
         return Vec::new();
     }
     let failed: HashSet<DavHrefKey> = current_failed
@@ -187,6 +188,23 @@ fn push_destroyed_unless_failed(
     changes.push(object_change(uri, ObjectChangeKind::Destroyed));
 }
 
+// One decision for diffing, preservation and token advancement. An empty
+// listing cannot justify wiping an enterprise user's populated local store.
+struct Observed {
+    empty: bool,
+    complete: bool,
+}
+
+impl Observed {
+    fn new(previous: &[SnapshotEntry], current: &[SnapshotEntry], failed: &[String]) -> Self {
+        let empty = current.is_empty() && !previous.is_empty();
+        Self {
+            empty,
+            complete: !empty && failed.is_empty(),
+        }
+    }
+}
+
 /// Whether a listing observed enough ground to advance its collection token.
 /// Returned by the preservation helper so both DAV dialects use the same rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,11 +239,12 @@ pub fn preserve_unobserved_entries(
     current: &mut Vec<SnapshotEntry>,
     current_failed: &[String],
 ) -> Observation {
+    let observed = Observed::new(previous, current, current_failed);
     let observation = Observation {
-        complete: current_failed.is_empty() && (!current.is_empty() || previous.is_empty()),
+        complete: observed.complete,
         pending: current_failed.to_vec(),
     };
-    if current.is_empty() && !previous.is_empty() {
+    if observed.empty {
         current.clear();
         current.extend_from_slice(previous);
         return observation;

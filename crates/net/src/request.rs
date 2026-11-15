@@ -106,6 +106,22 @@ pub fn request_is_replayable(
         .permits_replay(method, headers)
 }
 
+enum TimeoutOverride {
+    Inherit,
+    Unbounded,
+    Bounded(Duration),
+}
+
+impl TimeoutOverride {
+    fn resolve(self, inherited: Option<Duration>) -> Option<Duration> {
+        match self {
+            Self::Inherit => inherited,
+            Self::Unbounded => None,
+            Self::Bounded(duration) => Some(duration),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RequestDeadline(Option<tokio::time::Instant>);
 
@@ -376,7 +392,7 @@ struct RequestBuilderInner {
     /// Optional per-request retry policy override.
     retry: Option<RetryPolicy>,
     /// Optional per-request timeout override.
-    timeout: Option<Option<Duration>>,
+    timeout: TimeoutOverride,
     /// Optional per-request redirect policy override. `None` uses the
     /// account's `AccountSpec::follow_redirects`.
     follow_redirects: Option<FollowRedirects>,
@@ -475,7 +491,7 @@ impl RequestBuilder {
                 cost: None,
                 quota_scope: None,
                 retry: None,
-                timeout: None,
+                timeout: TimeoutOverride::Inherit,
                 follow_redirects: None,
                 replay: None,
                 bearer_auth: true,
@@ -641,7 +657,7 @@ impl RequestBuilder {
     /// Override the per-request timeout.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.inner.timeout = Some(Some(timeout));
+        self.inner.timeout = TimeoutOverride::Bounded(timeout);
         self
     }
 
@@ -665,7 +681,7 @@ impl RequestBuilder {
     /// Header and body inactivity timeouts still apply.
     #[must_use]
     pub fn without_timeout(mut self) -> Self {
-        self.inner.timeout = Some(None);
+        self.inner.timeout = TimeoutOverride::Unbounded;
         self
     }
 
@@ -1092,8 +1108,7 @@ pub(crate) async fn send_streaming_inner(
     let policy = retry.unwrap_or_else(|| account.default_retry().clone());
     let retry_attempt_limit = policy.max_attempts;
     let redirect_policy = redirect_override.unwrap_or_else(|| account.follow_redirects().clone());
-    let deadline =
-        RequestDeadline::from_timeout(timeout.unwrap_or_else(|| account.request_timeout()));
+    let deadline = RequestDeadline::from_timeout(timeout.resolve(account.request_timeout()));
     // Claims for the whole logical request, taken before the first attempt
     // and bounded by the same total deadline as every other wait, so an
     // expiry here is `Timeout { Unsent }`. Held across retries and redirect

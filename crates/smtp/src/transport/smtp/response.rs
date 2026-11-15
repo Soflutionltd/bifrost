@@ -126,6 +126,16 @@ impl Code {
         }
     }
 
+    /// Whether this is a 2yz completion reply.
+    pub fn is_completion(self) -> bool {
+        matches!(self.severity, Severity::PositiveCompletion)
+    }
+
+    /// Whether this is a 3yz intermediate reply.
+    pub fn is_intermediate(self) -> bool {
+        matches!(self.severity, Severity::PositiveIntermediate)
+    }
+
     /// Tells if the response is positive
     pub fn is_positive(self) -> bool {
         matches!(
@@ -201,6 +211,16 @@ impl Response {
     /// Creates a new `Response`
     pub fn new(code: Code, message: Vec<String>) -> Response {
         Response { code, message }
+    }
+
+    /// Whether this is a 2yz completion reply.
+    pub fn is_completion(&self) -> bool {
+        self.code.is_completion()
+    }
+
+    /// Whether this is a 3yz intermediate reply.
+    pub fn is_intermediate(&self) -> bool {
+        self.code.is_intermediate()
     }
 
     /// Tells if the response is positive

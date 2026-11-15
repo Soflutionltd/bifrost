@@ -200,7 +200,7 @@ impl TlsParametersBuilder {
             TlsVersion::Tlsv11 => Protocol::Tlsv11,
             TlsVersion::Tlsv12 => Protocol::Tlsv12,
             TlsVersion::Tlsv13 => {
-                return Err(error::tls(
+                return Err(error::invalid_input(
                     "min tls version Tlsv13 is not supported by native-tls",
                 ));
             }
@@ -211,7 +211,9 @@ impl TlsParametersBuilder {
             tls_builder.identity(identity.native_tls);
         }
 
-        let connector = tls_builder.build().map_err(error::tls)?;
+        // Construction failures need configuration repair, not a retry of the
+        // user's queued send. Handshake failures remain transport TLS errors.
+        let connector = tls_builder.build().map_err(error::invalid_input)?;
         Ok(TlsParameters {
             connector,
             domain: self.domain,
@@ -262,14 +264,14 @@ impl Certificate {
     /// Create a [`Certificate`] from a DER encoded certificate.
     pub fn from_der(der: Vec<u8>) -> Result<Self, Error> {
         Ok(Self {
-            native_tls: native_tls::Certificate::from_der(&der).map_err(error::tls)?,
+            native_tls: native_tls::Certificate::from_der(&der).map_err(error::invalid_input)?,
         })
     }
 
     /// Create a [`Certificate`] from a PEM encoded certificate.
     pub fn from_pem(pem: &[u8]) -> Result<Self, Error> {
         Ok(Self {
-            native_tls: native_tls::Certificate::from_pem(pem).map_err(error::tls)?,
+            native_tls: native_tls::Certificate::from_pem(pem).map_err(error::invalid_input)?,
         })
     }
 
@@ -308,7 +310,7 @@ impl Debug for Identity {
 impl Identity {
     pub fn from_pem(pem: &[u8], key: &[u8]) -> Result<Self, Error> {
         Ok(Self {
-            native_tls: native_tls::Identity::from_pkcs8(pem, key).map_err(error::tls)?,
+            native_tls: native_tls::Identity::from_pkcs8(pem, key).map_err(error::invalid_input)?,
         })
     }
 
@@ -334,5 +336,29 @@ mod tests {
         let parameters = TlsParameters::from(("smtp.example.com".to_owned(), connector));
 
         assert_eq!(parameters.domain(), "smtp.example.com");
+    }
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_security_material_is_invalid_input() {
+        assert!(
+            Certificate::from_der(b"invalid".to_vec())
+                .unwrap_err()
+                .is_invalid_input()
+        );
+        assert!(
+            Certificate::from_pem(b"invalid")
+                .unwrap_err()
+                .is_invalid_input()
+        );
+        assert!(
+            Identity::from_pem(b"invalid", b"invalid")
+                .unwrap_err()
+                .is_invalid_input()
+        );
     }
 }

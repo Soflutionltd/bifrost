@@ -25,23 +25,13 @@ fn to_acct_err(op: AccountOperation) -> impl Fn(crate::Error) -> AccountError {
     move |err| super::error::into_account_error(err, super::error::JmapErrorContext::new(op))
 }
 
-/// Local helper for search-cursor decode failures: the page cursor
-/// JMAP stores is opaque, and a malformed value is a schema mismatch
-/// from the caller's point of view. Maps to `SyncState(SchemaIncompatible)`.
-fn schema_incompatible_search_cursor(op: AccountOperation) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::SyncState(
-            bifrost_types::SyncStateErrorKind::SchemaIncompatible,
-        ),
-        bifrost_types::Cause::State(bifrost_types::StateCause::SchemaIncompatible),
+/// Page cursors belong to the caller, never the engine's durable sync state.
+/// An Outlook user expects a broken search to restart without clearing mail.
+fn invalid_search_cursor(op: AccountOperation) -> AccountError {
+    super::page_cursor::cursor_error(
+        op,
+        "search page cursor is malformed, retired or out of range".to_string(),
     )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(op)
-    .text(bifrost_types::DiagnosticText::support_only(
-        "search page cursor was malformed or from an older cursor version",
-    ))
-    .try_build()
-    .expect("valid account error classification")
 }
 use bytes::Bytes;
 use futures::StreamExt;
@@ -1654,6 +1644,15 @@ pub(crate) fn containers_list<T: HttpTransport>(
     })
 }
 
+// Strip only for the selected owner. A departed share stays literal on the
+// primary route, so an identical native id cannot mutate an unrelated folder.
+fn container_wire_id(id: &ContainerId, account_id: &str) -> MailboxId {
+    let native = super::foreign::parse_object(&id.0)
+        .filter(|(owner, _)| *owner == account_id)
+        .map_or(id.0.as_str(), |(_, native)| native);
+    MailboxId::new(native.to_string())
+}
+
 pub(crate) fn container_create<T: HttpTransport>(
     mail: MailAccount<T>,
     mailbox_states: StateMap,
@@ -1673,10 +1672,17 @@ pub(crate) fn container_create<T: HttpTransport>(
                 "JMAP only supports folder containers",
             ));
         }
+        // Child creation follows the shared parent. Users expect the new row
+        // to remain in that share, including the returned container identity.
+        let owner = parent
+            .as_ref()
+            .and_then(|id| super::foreign::owner_of(&id.0))
+            .filter(|owner| *owner == mail.id_str())
+            .map(str::to_string);
         let mut set = MailboxSet::new();
         let mut create = crate::mailbox::MailboxCreate::new(None);
         create.name(name);
-        create.parent_id(parent.map(|id| MailboxId::new(id.0)));
+        create.parent_id(parent.map(|id| container_wire_id(&id, &account_id)));
         let create_id = set.create_item(create);
         let mut response = mail
             .call(set)
@@ -1698,7 +1704,7 @@ pub(crate) fn container_create<T: HttpTransport>(
             AccountOperation::ContainerCreate,
             "Mailbox/set",
         )
-        .map(ContainerId)
+        .map(|id| ContainerId(qualify(owner.as_deref(), id)))
     })
 }
 
@@ -1712,7 +1718,7 @@ pub(crate) fn container_rename<T: HttpTransport>(
     _style: Option<bifrost_types::ContainerStyle>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let mailbox = MailboxId::new(container.0);
+        let mailbox = container_wire_id(&container, &account_id);
         let mut set = MailboxSet::new();
         set.update(mailbox).name(name);
         let response = mail
@@ -1737,10 +1743,21 @@ pub(crate) fn container_move<T: HttpTransport>(
     new_parent: Option<ContainerId>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let mailbox = MailboxId::new(container.0);
+        // A root move retains the share. A parent in another account cannot
+        // be expressed by Mailbox/set; never risk resolving a colliding id.
+        if let Some(parent) = &new_parent
+            && super::foreign::owner_of(&container.0) != super::foreign::owner_of(&parent.0)
+        {
+            return Err(super::page_cursor::invalid_argument(
+                AccountOperation::ContainerMove,
+                "parent",
+                "Mailbox/set cannot move a folder between accounts".to_string(),
+            ));
+        }
+        let mailbox = container_wire_id(&container, &account_id);
         let mut set = MailboxSet::new();
         set.update(mailbox)
-            .parent_id(new_parent.map(|id| MailboxId::new(id.0)));
+            .parent_id(new_parent.map(|id| container_wire_id(&id, &account_id)));
         let response = mail
             .call(set)
             .await
@@ -1762,7 +1779,7 @@ pub(crate) fn container_delete<T: HttpTransport>(
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let mailbox = MailboxId::new(container.0);
+        let mailbox = container_wire_id(&container, &account_id);
         let mut response = mail
             .call(
                 MailboxSet::new()
@@ -3440,7 +3457,7 @@ async fn search_email_ids<T: HttpTransport>(
 /// unmoved state is a server contract violation, not a long list.
 ///
 /// A count or sum that does not fit the cursor's `i32` position is
-/// `SyncState(SchemaIncompatible)`: it is the CURSOR representation that
+/// `Request(Malformed)`: it is the CURSOR representation that
 /// cannot carry the value, and the caller's answer is to restart the search
 /// rather than to conclude anything about the server.
 fn validate_search_page(
@@ -3467,10 +3484,10 @@ fn validate_search_page(
             ),
         ));
     }
-    let served_i32 = i32::try_from(served).map_err(|_| schema_incompatible_search_cursor(op))?;
+    let served_i32 = i32::try_from(served).map_err(|_| invalid_search_cursor(op))?;
     let next_position = served_from
         .checked_add(served_i32)
-        .ok_or_else(|| schema_incompatible_search_cursor(op))?;
+        .ok_or_else(|| invalid_search_cursor(op))?;
     if served > 0 {
         if let Some(total) = total
             && u64::from(next_position.unsigned_abs()) > total
@@ -3577,7 +3594,7 @@ fn encode_position(position: i32, query_state: &str, owner: Option<&str>) -> Vec
 /// this version exists to stop, and silently treating it as pinned-to-
 /// whatever-comes-back would launder the defect into the new shape. That is
 /// the crate's standing cursor policy: an older payload version is
-/// `SyncState(SchemaIncompatible)` and the caller restarts the walk.
+/// `Request(Malformed)` and the caller restarts the walk.
 fn decode_position(
     cursor: Option<&[u8]>,
     owner: Option<&str>,
@@ -3589,7 +3606,7 @@ fn decode_position(
             query_state: None,
         });
     };
-    let text = std::str::from_utf8(bytes).map_err(|_| schema_incompatible_search_cursor(op))?;
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid_search_cursor(op))?;
     let (cursor_owner, payload) = match super::foreign::parse_object(text) {
         Some((account_id, payload)) => (Some(account_id), payload),
         None => (None, text),
@@ -3605,15 +3622,15 @@ fn decode_position(
         .strip_prefix(SEARCH_CURSOR_TAG)
         .and_then(|tail| tail.strip_prefix(SEARCH_CURSOR_SEP))
     else {
-        return Err(schema_incompatible_search_cursor(op));
+        return Err(invalid_search_cursor(op));
     };
     let Some((position, query_state)) = payload.split_once(SEARCH_CURSOR_SEP) else {
-        return Err(schema_incompatible_search_cursor(op));
+        return Err(invalid_search_cursor(op));
     };
     Ok(SearchCursor {
         position: position
             .parse::<i32>()
-            .map_err(|_| schema_incompatible_search_cursor(op))?,
+            .map_err(|_| invalid_search_cursor(op))?,
         query_state: Some(query_state.to_string()),
     })
 }
@@ -4777,6 +4794,10 @@ mod tests {
             assert!(method.ends_with("/set"), "unexpected {method}");
             let mut answer =
                 serde_json::json!({"accountId": "primary", "oldState": "s1", "newState": "s2"});
+            answer["accountId"] = call[1]["accountId"].clone();
+            if call[1]["accountId"] == "shared" {
+                assert_eq!(call[1]["create"]["c0"]["parentId"], "parent");
+            }
             if let Some(created) = &self.created {
                 answer["created"] = created.clone();
             }
@@ -4809,6 +4830,69 @@ mod tests {
         ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
             Err(crate::core::transport::TransportError::new("no session"))
         }
+    }
+
+    #[test]
+    fn container_wire_ids_strip_only_the_selected_owner() {
+        let shared = ContainerId(super::super::foreign::encode_foreign("shared", "mbx").0);
+        assert_eq!(container_wire_id(&shared, "shared").as_str(), "mbx");
+        assert_eq!(container_wire_id(&shared, "primary").as_str(), shared.0);
+        assert_eq!(
+            container_wire_id(&ContainerId("mbx".into()), "primary").as_str(),
+            "mbx"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_move_refuses_a_parent_in_another_account() {
+        let client = crate::client::Client::with_transport(
+            OmittingSetTransport::default(),
+            search_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let error = container_move(
+            crate::account::Account::new(client, "shared"),
+            send_state_map(),
+            "shared".to_string(),
+            ContainerId(super::super::foreign::encode_foreign("shared", "mbx").0),
+            Some(ContainerId("parent".into())),
+        )
+        .await
+        .expect_err("different owners");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_child_create_returns_a_qualified_container() {
+        let client = crate::client::Client::with_transport(
+            OmittingSetTransport {
+                created: Some(serde_json::json!({"c0": {"id": "child"}})),
+            },
+            search_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let child = container_create(
+            crate::account::Account::new(client, "shared"),
+            send_state_map(),
+            "shared".to_string(),
+            ContainerKind::Folder,
+            "new".to_string(),
+            Some(ContainerId(
+                super::super::foreign::encode_foreign("shared", "parent").0,
+            )),
+            None,
+        )
+        .await
+        .expect("created");
+        assert_eq!(
+            child.0,
+            super::super::foreign::encode_foreign("shared", "child").0
+        );
     }
 
     /// The direct single-id mail writes classify an omitted set answer as a
@@ -6016,8 +6100,8 @@ mod tests {
                         .expect_err("a cursor with the anchored codec's tag must be refused");
                 assert_eq!(
                     error.kind(),
-                    &bifrost_types::AccountErrorKind::SyncState(
-                        bifrost_types::SyncStateErrorKind::SchemaIncompatible
+                    &bifrost_types::AccountErrorKind::Request(
+                        bifrost_types::RequestErrorKind::Malformed
                     )
                 );
             }
@@ -6028,14 +6112,12 @@ mod tests {
     /// not silently upgraded: continuing it is exactly the unpinned paging
     /// the version bump exists to stop.
     #[test]
-    fn a_v1_search_cursor_is_refused_as_schema_incompatible() {
+    fn a_v1_search_cursor_is_refused_as_invalid_argument() {
         let error = decode_position(Some(b"7"), None, AccountOperation::Search)
             .expect_err("a v1 cursor must not resume");
         assert_eq!(
             error.kind(),
-            &bifrost_types::AccountErrorKind::SyncState(
-                bifrost_types::SyncStateErrorKind::SchemaIncompatible
-            )
+            &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
         );
 
         let foreign = super::super::foreign::encode_object("shared", "7").into_bytes();
@@ -6043,9 +6125,7 @@ mod tests {
             .expect_err("a foreign v1 cursor must not resume either");
         assert_eq!(
             error.kind(),
-            &bifrost_types::AccountErrorKind::SyncState(
-                bifrost_types::SyncStateErrorKind::SchemaIncompatible
-            )
+            &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
         );
     }
 

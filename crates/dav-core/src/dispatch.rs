@@ -1364,7 +1364,7 @@ impl std::fmt::Debug for DavDispatch {
 /// state the DELETE was asking for. 404 and 410 both say so; nothing else does.
 #[must_use]
 pub fn delete_target_already_gone(status: StatusCode) -> bool {
-    status == StatusCode::NOT_FOUND || status == StatusCode::GONE
+    crate::multistatus::is_missing_status(status.as_u16())
 }
 
 fn response_read_error_with_history(

@@ -106,6 +106,17 @@ pub(super) struct PipelineRouting<'a> {
 }
 
 impl PipelineRouting<'_> {
+    /// Before framing identifies an owner, use the strictest remaining budget
+    /// of commands already sent. Unsent and completed commands own no data.
+    /// This deliberately also bounds unsolicited literals, like single-command
+    /// dispatch: a corrupt peer must not bypass the memory guard with events.
+    pub(super) fn literal_budget(&self) -> Option<usize> {
+        self.consumers[..self.untagged_bound()]
+            .iter()
+            .filter_map(|consumer| consumer.as_ref()?.literal_budget())
+            .min()
+    }
+
     /// The exclusive bound on consumers eligible to own an untagged response.
     fn untagged_bound(&self) -> usize {
         self.sending.unwrap_or(self.consumers.len())
@@ -831,6 +842,7 @@ async fn run_pipeline_batch(
                 &tags[i],
                 baseline,
                 Some(&mut routing),
+                None,
             )
             .await
             {
@@ -856,11 +868,6 @@ async fn run_pipeline_batch(
     let fail = |error: Error| BatchFailure { error, sent: count };
     while completed < count {
         let utf8 = super::utf8_mode(state);
-        // The batch is on the wire: a transport failure here is InFlight.
-        let resp = wire_reader
-            .read_one(utf8)
-            .await
-            .map_err(|e| fail(e.with_attempt(TransmissionState::InFlight)))?;
         let mut routing = PipelineRouting {
             sending: None,
             tag_to_idx: &tag_to_idx,
@@ -872,6 +879,11 @@ async fn run_pipeline_batch(
             results: &mut *results,
             completed: &mut completed,
         };
+        // The batch is on the wire: a transport failure here is InFlight.
+        let resp = wire_reader
+            .read_one_limited(utf8, routing.literal_budget())
+            .await
+            .map_err(|e| fail(e.with_attempt(TransmissionState::InFlight)))?;
         match route_pipeline_response(state, event_sink, &mut routing, resp).map_err(fail)? {
             Routed::Continuation => {
                 // Pipelinable commands do not take continuations

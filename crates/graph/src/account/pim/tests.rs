@@ -1606,7 +1606,7 @@ fn scheduled_send_deferred_body_shape() {
 #[test]
 fn scheduled_send_capability_is_true() {
     let caps = crate::account::capabilities::build_capabilities(
-        crate::account::PushMode::GraphSubscriptions,
+        &crate::account::PushConfig::None,
         true,
     );
     assert!(caps.pim_methods.scheduled_send);

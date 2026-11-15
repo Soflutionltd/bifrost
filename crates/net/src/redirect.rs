@@ -76,6 +76,8 @@ pub struct RedirectPolicy {
     /// `Error::RedirectLoop`.
     pub max_hops: u8,
     /// Refuse every hop that changes scheme, host, or effective port.
+    // These are independently writable public inputs. Replacing them with an
+    // enum requires consumer migration; admits_hop owns their precedence.
     pub same_origin_only: bool,
     /// Cross-host targets that the policy accepts. Empty means
     /// "every host is allowed"; populated means strict allowlist.

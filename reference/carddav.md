@@ -390,7 +390,11 @@ Supported contact primitives:
   `contact_get_addresses_the_resource_with_a_plain_get`, which asserts the
   method and URL against the request transcript.
 - `contact_create` - creates a vCard 4.0 resource with a UUID-backed
-  `.vcf` path using `PUT`.
+  `.vcf` path using `PUT`. The UID is the bare UUID; the extension belongs
+  only to the resource path, matching CalDAV's separation of identity and name.
+  Existing UIDs, including values ending in `.vcf` created by earlier versions,
+  are preserved verbatim on updates and moves. Users expect those operations
+  to retain the contact's identity in other clients, so no UID migration runs.
 - `contact_update` - fetches the current resource to preserve its content and
   applies `ContactPatch`. `expected_version: Some(ServerVersion::ETag(...))`
   sends the caller's strong validator as `If-Match`, accepting the unquoted
@@ -775,7 +779,9 @@ failure lanes.
 
 The protocol-neutral half of this crate lives in `bifrost-dav-core`, a private
 shared crate. Nothing published moved. See `reference/caldav.md` for the full
-inventory of what was extracted and why the two dialects reduce to a single
+inventory of what was extracted (including the shared "Observation and refusal
+decisions": empty-listing preservation and unreadable-refusal handling) and why
+the two dialects reduce to a single
 `DavProtocol` parameter; this crate binds it as
 `const DAV: DavProtocol = DavProtocol::CardDav`, pinned by
 `every_error_this_crate_mints_is_stamped_carddav`.

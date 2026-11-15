@@ -6,6 +6,8 @@ use bifrost_types::{
     PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape,
 };
 
+use super::PushConfig;
+#[cfg(test)]
 use super::PushMode;
 
 /// Build the capability snapshot for a Graph account.
@@ -27,16 +29,19 @@ use super::PushMode;
 /// every request on that path would be `Request(Malformed)` - which described
 /// the bug rather than the contract.
 pub(crate) fn build_capabilities(
-    push_mode: PushMode,
+    push_config: &PushConfig,
     has_shared_mailboxes: bool,
 ) -> AccountCapabilities {
     AccountCapabilities {
         cursor_freshness: CursorFreshness::ServerIssued,
         blob_range: BlobRangeSupport::Conditional,
         blob_digest_pre_download: false,
-        push: match push_mode {
-            PushMode::GraphSubscriptions => PushCapability::WebhookOrEwsStream,
-            PushMode::EwsStreaming => PushCapability::InProcess,
+        push: match push_config {
+            PushConfig::None => PushCapability::None,
+            // This shared capability name denotes webhook delivery here;
+            // EWS streaming is the separate in-process arm below.
+            PushConfig::Webhook(_) => PushCapability::WebhookOrEwsStream,
+            PushConfig::EwsStreaming => PushCapability::InProcess,
         },
         mutation: MutationCapabilities {
             concurrency: MutationConcurrency::ExpectedVersion {
@@ -165,8 +170,18 @@ mod tests {
     /// fully configured account, so it shadows the real constructor with the
     /// shared-mailbox arm fixed. The `send_as` tests call `super::` directly
     /// and pin both arms.
+    fn configured_push(mode: PushMode) -> PushConfig {
+        match mode {
+            PushMode::GraphSubscriptions => PushConfig::Webhook(super::super::PushEndpoint {
+                webhook_url: "https://receiver.example/push".to_owned(),
+                client_state: "secret".to_owned(),
+            }),
+            PushMode::EwsStreaming => PushConfig::EwsStreaming,
+        }
+    }
+
     fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
-        super::build_capabilities(push_mode, true)
+        super::build_capabilities(&configured_push(push_mode), true)
     }
 
     #[test]
@@ -175,8 +190,16 @@ mod tests {
         // Advertised with an empty table it would promise a send path on
         // which `send_as_unknown_mailbox` rejects EVERY request.
         for mode in [PushMode::GraphSubscriptions, PushMode::EwsStreaming] {
-            assert!(!super::build_capabilities(mode, false).pim_methods.send_as);
-            assert!(super::build_capabilities(mode, true).pim_methods.send_as);
+            assert!(
+                !super::build_capabilities(&configured_push(mode), false)
+                    .pim_methods
+                    .send_as
+            );
+            assert!(
+                super::build_capabilities(&configured_push(mode), true)
+                    .pim_methods
+                    .send_as
+            );
         }
     }
 

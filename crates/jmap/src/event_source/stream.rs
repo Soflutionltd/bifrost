@@ -4,7 +4,7 @@ use crate::{
     DataType, PushObject,
     client::Client,
     core::{
-        session::URLPart,
+        session::{TemplateValue, expand},
         transport::{HttpTransport, SseTransport},
     },
     event_source::{
@@ -122,7 +122,6 @@ impl<T: HttpTransport + SseTransport> Client<T> {
         last_event_id: Option<&str>,
     ) -> crate::Result<impl Stream<Item = crate::Result<PushNotification>> + Unpin> {
         let state = self.session_state();
-        let mut event_source_url = String::with_capacity(state.session().event_source_url().len());
         let types = types.map(|types| types.into_iter().collect::<Vec<_>>());
         if types.as_ref().is_some_and(Vec::is_empty) {
             return Err(crate::Error::InvalidUrl(
@@ -130,53 +129,18 @@ impl<T: HttpTransport + SseTransport> Client<T> {
             ));
         }
 
-        for part in state.event_source_url()? {
-            match part {
-                URLPart::Value(value) => {
-                    event_source_url.push_str(value);
-                }
-                URLPart::Parameter(param) => match param {
-                    super::URLParameter::Types => {
-                        if let Some(types) = types.as_ref() {
-                            // Each name uses its own substitution position,
-                            // while the commas separating names remain
-                            // literal RFC 6570 expansion delimiters.
-                            let expanded = types
-                                .iter()
-                                .map(|type_name| {
-                                    let name = type_name.to_string();
-                                    if event_source_url.contains('?')
-                                        || event_source_url.contains('#')
-                                    {
-                                        crate::core::session::encode_template_value(&name)
-                                            .to_string()
-                                    } else {
-                                        crate::core::session::encode_template_value_at(
-                                            &name,
-                                            &event_source_url,
-                                        )
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join(",");
-                            event_source_url.push_str(&expanded);
-                        } else {
-                            event_source_url.push('*');
-                        }
-                    }
-                    super::URLParameter::CloseAfter => {
-                        event_source_url.push_str(if close_after_state { "state" } else { "no" });
-                    }
-                    super::URLParameter::Ping => {
-                        if let Some(ping) = ping {
-                            event_source_url.push_str(&ping.to_string());
-                        } else {
-                            event_source_url.push('0');
-                        }
-                    }
-                },
+        let event_source_url = expand(state.event_source_url()?, |param| match param {
+            super::URLParameter::Types => match types.as_ref() {
+                Some(types) => TemplateValue::List(types.iter().map(ToString::to_string).collect()),
+                None => TemplateValue::Wildcard,
+            },
+            super::URLParameter::CloseAfter => {
+                TemplateValue::Scalar(if close_after_state { "state" } else { "no" }.into())
             }
-        }
+            super::URLParameter::Ping => {
+                TemplateValue::Scalar(ping.unwrap_or(0).to_string().into())
+            }
+        });
 
         let mut stream = self
             .transport()

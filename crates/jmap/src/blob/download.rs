@@ -2,7 +2,7 @@ use crate::{
     blob::BlobRef,
     client::Client,
     core::{
-        session::{URLPart, encode_template_value_at},
+        session::{TemplateValue, expand},
         transport::HttpTransport,
     },
 };
@@ -123,40 +123,18 @@ impl<Tr: HttpTransport> Client<Tr> {
 
     fn blob_download_url(&self, blob: &BlobRef) -> String {
         let state = self.session_state();
-        let mut download_url = String::with_capacity(state.session().download_url().len() + 64);
-
-        for part in state.download_url() {
-            match part {
-                URLPart::Value(value) => download_url.push_str(value),
-                URLPart::Parameter(param) => match param {
-                    super::URLParameter::AccountId => {
-                        download_url.push_str(&encode_template_value_at(
-                            blob.account_id.as_str(),
-                            &download_url,
-                        ));
-                    }
-                    super::URLParameter::BlobId => {
-                        download_url.push_str(&encode_template_value_at(
-                            blob.blob_id.as_str(),
-                            &download_url,
-                        ));
-                    }
-                    super::URLParameter::Name => {
-                        let name = blob.name.as_deref().unwrap_or("download");
-                        download_url.push_str(&encode_template_value_at(name, &download_url));
-                    }
-                    super::URLParameter::Type => {
-                        let ctype = blob
-                            .content_type
-                            .as_deref()
-                            .unwrap_or("application/octet-stream");
-                        download_url.push_str(&encode_template_value_at(ctype, &download_url));
-                    }
-                },
-            }
-        }
-
-        download_url
+        expand(state.download_url(), |param| {
+            TemplateValue::Scalar(match param {
+                super::URLParameter::AccountId => blob.account_id.as_str().into(),
+                super::URLParameter::BlobId => blob.blob_id.as_str().into(),
+                super::URLParameter::Name => blob.name.as_deref().unwrap_or("download").into(),
+                super::URLParameter::Type => blob
+                    .content_type
+                    .as_deref()
+                    .unwrap_or("application/octet-stream")
+                    .into(),
+            })
+        })
     }
 }
 

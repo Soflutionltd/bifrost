@@ -54,10 +54,16 @@ pub(crate) struct GmailResponseHeaders {
 
 impl GmailResponseHeaders {
     pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
-        Self::from_headers_at(headers, SystemTime::now())
+        // Only the response observer has the client's clock. Parsing elsewhere
+        // preserves delta syntax rather than inventing a second wall-clock epoch.
+        Self::parse_headers(headers, None)
     }
 
     pub(crate) fn from_headers_at(headers: &HeaderMap, now: SystemTime) -> Self {
+        Self::parse_headers(headers, Some(now))
+    }
+
+    fn parse_headers(headers: &HeaderMap, now: Option<SystemTime>) -> Self {
         // Keep the private quota carrier while sharing all header parsing.
         let retry_after = bifrost_net::request::parse_retry_after_hint(headers.get(RETRY_AFTER))
             .and_then(|hint| match hint {
@@ -66,7 +72,11 @@ impl GmailResponseHeaders {
                 _ => None,
             });
         Self {
-            retry_at: retry_after.and_then(|hint| hint.resolve(now)),
+            retry_at: retry_after.and_then(|hint| match (hint, now) {
+                (RetryAfter::At(at), _) => Some(at),
+                (hint, Some(now)) => hint.resolve(now),
+                (RetryAfter::Delta(_), None) => None,
+            }),
             retry_after,
             project: None,
             request_id: first_header(
@@ -587,6 +597,9 @@ mod tests {
             Some(RetryAfter::Delta(Duration::from_secs(30)))
         );
         assert_eq!(parsed.retry_at, Some(now + Duration::from_secs(30)));
+        let unobserved = GmailResponseHeaders::from_headers(&headers);
+        assert_eq!(unobserved.retry_after, parsed.retry_after);
+        assert_eq!(unobserved.retry_at, None);
     }
 
     #[test]

@@ -281,8 +281,6 @@ pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
     pub(crate) timeout: Duration,
 
     #[cfg(feature = "websockets")]
-    pub(crate) authorization: Authorization,
-    #[cfg(feature = "websockets")]
     pub(crate) ws: tokio::sync::Mutex<Option<crate::client_ws::WsStream>>,
     /// RFC 8887 `requestId` counter for WebSocket requests.
     ///
@@ -461,7 +459,7 @@ impl ClientBuilder {
 
         let transport = ReqwestTransport::new_with_net(
             headers.clone(),
-            authorization.clone(),
+            authorization,
             self.net_account_id,
             self.timeout,
             self.accept_invalid_certs,
@@ -491,8 +489,6 @@ impl ClientBuilder {
                 session_changes: tokio::sync::watch::channel(0).0,
                 timeout: self.timeout,
                 transport,
-                #[cfg(feature = "websockets")]
-                authorization,
                 #[cfg(feature = "websockets")]
                 ws: None.into(),
                 #[cfg(feature = "websockets")]
@@ -1012,6 +1008,33 @@ mod session_state_tests {
         session.to_string()
     }
 
+    #[tokio::test]
+    async fn oversized_http_request_is_refused_before_transport() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut session: serde_json::Value =
+            serde_json::from_str(&session_with_call_limit("old", "A1", "session-1", 10)).unwrap();
+        session["capabilities"]["urn:ietf:params:jmap:core"]["maxSizeRequest"] = json!(1);
+        let client = Client::with_transport(
+            RequestSnapshotTransport {
+                requests: Arc::clone(&requests),
+                refreshed_session: session_with_call_limit("new", "B2", "session-2", 10),
+            },
+            serde_json::from_value(session).unwrap(),
+            "https://example.test/.well-known/jmap",
+        )
+        .unwrap();
+        let request = client.build();
+        // A refresh must not replace the size bound attached to this request.
+        client.refresh_session().await.unwrap();
+        assert!(matches!(
+            client.send_request(&request).await,
+            Err(crate::Error::RequestSizeLimit { max: 1, .. })
+        ));
+        assert!(requests.lock().unwrap().is_empty());
+        let _ = client.send_request(&client.build()).await;
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
     /// A Request must keep one session view for its default account, call
     /// limit, and API URL. Refreshing after construction used to splice the
     /// old call limit and account together with the new endpoint.
@@ -1472,8 +1495,6 @@ impl<T: HttpTransport> Client<T> {
                 timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
                 transport,
                 #[cfg(feature = "websockets")]
-                authorization: Authorization::Basic(String::new()),
-                #[cfg(feature = "websockets")]
                 ws: None.into(),
                 #[cfg(feature = "websockets")]
                 ws_request_id: std::sync::atomic::AtomicU64::new(0),
@@ -1521,6 +1542,21 @@ impl<T: HttpTransport> Client<T> {
         request: &request::Request<'_, T>,
     ) -> crate::Result<response::Response> {
         let body = serde_json::to_vec(request).map_err(crate::Error::RequestEncode)?;
+        // Enforce the advertised bound before transport, using the same session
+        // snapshot that supplied the request's API URL and call limit.
+        if let Some(max) = request
+            .session_state()
+            .session()
+            .core_capabilities()
+            .and_then(crate::core::session::CoreCapabilities::max_size_request)
+            && max > 0
+            && body.len() > max
+        {
+            return Err(crate::Error::RequestSizeLimit {
+                max,
+                size: body.len(),
+            });
+        }
         let (bytes, bytes_in) = self
             .inner
             .transport
@@ -1649,18 +1685,6 @@ impl<T: HttpTransport> Client<T> {
     pub(crate) fn transport(&self) -> &T {
         &self.inner.transport
     }
-
-    /// Returns the `Authorization` header value used by this client.
-    /// Async because the bearer case reads the current token from the
-    /// shared source so a rotated token is presented on reconnect.
-    #[cfg(feature = "websockets")]
-    pub(crate) async fn authorization(&self) -> crate::Result<String> {
-        self.inner
-            .authorization
-            .header_value()
-            .await
-            .map_err(|e| crate::Error::from(crate::core::transport::TransportError::from_net(e)))
-    }
 }
 
 impl Credentials {
@@ -1774,5 +1798,21 @@ mod bearer_lifecycle_tests {
     fn basic_authorization_has_no_bearer_token_source() {
         let auth = Authorization::from_credentials(Credentials::basic("user", "password"));
         assert!(auth.optional_account_token_source().is_none());
+    }
+}
+
+#[cfg(feature = "websockets")]
+impl Client {
+    /// Returns the `Authorization` header value used by this client.
+    /// Async because the bearer case reads the current token from the
+    /// shared source so a rotated token is presented on reconnect.
+    #[cfg(feature = "websockets")]
+    pub(crate) async fn authorization(&self) -> crate::Result<String> {
+        self.inner
+            .transport
+            .ws_authorization()
+            .header_value()
+            .await
+            .map_err(|e| crate::Error::from(crate::core::transport::TransportError::from_net(e)))
     }
 }

@@ -15,7 +15,7 @@ use super::{
     ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions, SmtpConnection,
     SmtpInfo, error,
 };
-use super::{SUBMISSION_PORT, SUBMISSIONS_PORT, Tls, TlsParameters};
+use super::{PortTls, Tls, TlsParameters, default_port};
 use crate::address::Address;
 use crate::transport::smtp::account_error::SmtpErrorContext;
 use crate::transport::smtp::authentication::IntoSecretString;
@@ -133,7 +133,10 @@ impl SmtpTransport {
         let tls_parameters = TlsParameters::new(relay.into())?;
 
         Ok(Self::builder_dangerous(relay)
-            .port(SUBMISSIONS_PORT)
+            .port(default_port(
+                bifrost_types::error::Protocol::Smtp,
+                PortTls::Implicit,
+            ))
             .tls(Tls::Wrapper(tls_parameters)))
     }
 
@@ -152,7 +155,10 @@ impl SmtpTransport {
         let tls_parameters = TlsParameters::new(relay.into())?;
 
         Ok(Self::builder_dangerous(relay)
-            .port(SUBMISSION_PORT)
+            .port(default_port(
+                bifrost_types::error::Protocol::Smtp,
+                PortTls::StartTls,
+            ))
             .tls(Tls::Required(tls_parameters)))
     }
 
@@ -205,7 +211,7 @@ impl SmtpTransport {
     /// | `smtps` | unset                 | `smtps://user:pass@hostname:port`                  | 465          | SMTP over TLS, recommended method                                                                                                     |
     /// | `smtp`  | `required`            | `smtp://user:pass@hostname:port?tls=required`      | 587          | SMTP with STARTTLS required, when SMTP over TLS is not available                                                                      |
     /// | `smtp`  | `opportunistic`       | `smtp://user:pass@hostname:port?tls=opportunistic` | 587          | SMTP with optionally STARTTLS when supported by the server. Not suitable for production use: vulnerable to a man-in-the-middle attack |
-    /// | `smtp`  | unset                 | `smtp://user:pass@hostname:port`                   | 587          | Always unencrypted SMTP. Credentials are refused by default; message data is still unencrypted                                        |
+    /// | `smtp`  | unset                 | `smtp://user:pass@hostname:port`                   | 25           | Always unencrypted SMTP. Credentials are refused by default; message data is still unencrypted                                        |
     ///
     /// IMPORTANT: some parameters like `user` and `pass` cannot simply
     /// be concatenated to construct the final URL because special characters
@@ -971,7 +977,7 @@ mod tests {
         },
     };
 
-    use super::{ClientId, Protocol, SmtpClient, SmtpConnection};
+    use super::{ClientId, Protocol, SmtpClient, SmtpConnection, SmtpErrorContext};
 
     fn hello() -> ClientId {
         ClientId::Domain("client.example".to_owned())
@@ -1050,6 +1056,50 @@ mod tests {
         assert_eq!(builder.info.port, 465);
         assert!(builder.info.credentials.is_none());
         assert!(matches!(builder.info.tls, Tls::Wrapper(_)));
+    }
+
+    #[test]
+    fn plaintext_url_and_builder_share_the_default_port() {
+        assert_eq!(
+            SmtpTransport::from_url("smtp://relay.example")
+                .unwrap()
+                .info
+                .port,
+            SmtpTransport::builder_dangerous("relay.example").info.port
+        );
+        assert_eq!(
+            SmtpTransport::from_url("smtp://relay.example:587")
+                .unwrap()
+                .info
+                .port,
+            587
+        );
+    }
+
+    #[test]
+    fn url_configuration_errors_are_invalid_input() {
+        for url in [
+            "not a URL",
+            "smtp://",
+            "unknown://relay.example",
+            "smtp://relay.example?tls=wrong",
+            "smtp://user@relay.example",
+            "smtp://user:%FF@relay.example",
+            "smtp://user:%GG@relay.example",
+        ] {
+            let error = SmtpTransport::from_url(url).unwrap_err();
+            assert!(error.is_invalid_input(), "{url}: {error}");
+            let account = crate::transport::smtp::account_error::into_account_error(
+                error,
+                SmtpErrorContext::send(Protocol::Smtp),
+            );
+            assert!(matches!(
+                account.kind(),
+                bifrost_types::error::AccountErrorKind::Request(
+                    bifrost_types::error::RequestErrorKind::Malformed
+                )
+            ));
+        }
     }
 
     #[test]

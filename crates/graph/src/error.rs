@@ -76,14 +76,9 @@ pub(crate) enum GraphError {
     /// entropy source, say): `Internal(RuntimeFailure)`.
     RuntimeFailure { message: String },
 
-    /// A throttle-shaped failure (429 / 503 / 507) of a request charged to one
-    /// Outlook mailbox, tagged at the REST funnel with that mailbox's
-    /// throttle budget. Raised only by `GraphClient`, which alone knows
-    /// which mailbox a request was routed to; `source` is the failure
-    /// exactly as it would otherwise have surfaced, and every reader that
-    /// asks about the failure itself (`response_status`) sees through the
-    /// tag.
-    MailboxThrottled {
+    /// An Outlook failure carrying its routed mailbox budget as context.
+    /// Classification alone decides whether the budget should be stamped.
+    MailboxContext {
         budget: bifrost_types::ThrottleBudget,
         source: Box<GraphError>,
     },
@@ -146,6 +141,14 @@ struct InnerErrorBody {
 }
 
 impl GraphError {
+    /// The underlying failure, independent of mailbox routing context.
+    pub(crate) fn terminal(&self) -> &Self {
+        match self {
+            Self::MailboxContext { source, .. } => source.terminal(),
+            _ => self,
+        }
+    }
+
     /// The HTTP status the SERVER answered with, wherever that evidence
     /// survives.
     ///
@@ -160,7 +163,7 @@ impl GraphError {
     #[must_use]
     pub(crate) fn response_status(&self) -> Option<StatusCode> {
         match self {
-            Self::MailboxThrottled { source, .. } => source.response_status(),
+            Self::MailboxContext { source, .. } => source.response_status(),
             Self::Response(response) => Some(response.status),
             Self::Net(error) => match error.terminal() {
                 bifrost_net::Error::Status { code, .. } => Some(*code),

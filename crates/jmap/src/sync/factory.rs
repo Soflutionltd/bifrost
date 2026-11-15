@@ -3029,10 +3029,17 @@ mod tests {
             let primary = client
                 .primary_account::<capability::Mail>()
                 .expect("primary mail account");
-            let mut request = primary.build();
-            let (email, _) = open_probe_methods();
-            request.call(email).expect("probe encodes");
-            request.encoded_len().expect("probe encodes")
+            // The advertised size limit is now enforced at send, so the limit
+            // must hold the LARGER of the two single probes.
+            let (email, mailboxes) = open_probe_methods();
+            let mut email_request = primary.build();
+            email_request.call(email).expect("probe encodes");
+            let mut mailbox_request = primary.build();
+            mailbox_request.call(mailboxes).expect("probe encodes");
+            email_request
+                .encoded_len()
+                .expect("probe encodes")
+                .max(mailbox_request.encoded_len().expect("probe encodes"))
         };
         let client = scripted_client_with_session(
             session_with_limits(16, one_probe),

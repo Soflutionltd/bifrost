@@ -537,19 +537,15 @@ pub(crate) fn decode_part_handle(
         return Err(malformed("unsupported IMAP part handle version", op));
     }
 
-    let (folder, rest) = length_prefixed(rest, "IMAP part handle folder", op)?;
-    let folder = if version == 2 {
-        MailboxName::new(folder)
-    } else {
-        MailboxName::from_account_id(folder)
-    }
-    .map_err(|e| malformed(&e.to_string(), op))?;
+    let (folder, rest) = super::envelope::length_prefixed(rest, "IMAP part handle folder", op)?;
+    let folder = super::envelope::decode_folder_identity(folder, version != 2, op)?;
     let rest = rest.ok_or_else(|| malformed("invalid IMAP part handle separator", op))?;
 
     let (uidvalidity, rest) = split_field(rest, "IMAP part handle uidvalidity", op)?;
-    let uidvalidity = nonzero(uidvalidity, "IMAP part handle uidvalidity", op)?;
+    let uidvalidity =
+        super::envelope::parse_nonzero_u32(Some(uidvalidity), "IMAP part handle uidvalidity", op)?;
     let (uid, rest) = split_field(rest, "IMAP part handle uid", op)?;
-    let uid = nonzero(uid, "IMAP part handle uid", op)?;
+    let uid = super::envelope::parse_nonzero_u32(Some(uid), "IMAP part handle uid", op)?;
     let (path, rest) = split_field(rest, "IMAP part handle path", op)?;
     let path =
         PartPath::parse(path).ok_or_else(|| malformed("invalid IMAP part handle path", op))?;
@@ -557,7 +553,8 @@ pub(crate) fn decode_part_handle(
     let classified = encoding_from_token(classified)
         .ok_or_else(|| malformed("invalid IMAP part handle encoding", op))?;
 
-    let (token, rest) = length_prefixed(rest, "IMAP part handle encoding token", op)?;
+    let (token, rest) =
+        super::envelope::length_prefixed(rest, "IMAP part handle encoding token", op)?;
     if rest.is_some() {
         return Err(malformed("trailing IMAP part handle field", op));
     }
@@ -598,35 +595,6 @@ fn split_field<'a>(
     op: AccountOperation,
 ) -> Result<(&'a str, &'a str), AccountError> {
     rest.split_once(':').ok_or_else(|| malformed(detail, op))
-}
-
-/// Read a `<len>:<value>` field, returning the value and whatever follows the
-/// separator after it (`None` when the value ends the string).
-fn length_prefixed<'a>(
-    rest: &'a str,
-    detail: &str,
-    op: AccountOperation,
-) -> Result<(&'a str, Option<&'a str>), AccountError> {
-    let (len, rest) = rest.split_once(':').ok_or_else(|| malformed(detail, op))?;
-    let len = len.parse::<usize>().map_err(|_| malformed(detail, op))?;
-    let value = rest.get(..len).ok_or_else(|| malformed(detail, op))?;
-    let tail = rest.get(len..).ok_or_else(|| malformed(detail, op))?;
-    if tail.is_empty() {
-        Ok((value, None))
-    } else {
-        let tail = tail
-            .strip_prefix(':')
-            .ok_or_else(|| malformed(detail, op))?;
-        Ok((value, Some(tail)))
-    }
-}
-
-fn nonzero(value: &str, detail: &str, op: AccountOperation) -> Result<u32, AccountError> {
-    let parsed = value.parse::<u32>().map_err(|_| malformed(detail, op))?;
-    if parsed == 0 {
-        return Err(malformed(detail, op));
-    }
-    Ok(parsed)
 }
 
 /// Canonical wire token per encoding.

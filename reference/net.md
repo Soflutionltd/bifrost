@@ -30,7 +30,7 @@ let account = net.attach_account(account_id, spec);     // per-account
   quota coordination on Gmail / Graph hosts works out of the box.
 - `AccountNet` is account-scoped: token source, timeouts, User-Agent,
   buffered-body ceiling, redirect policy, default `RetryPolicy`,
-  `AtomicU8` priority, and a shared `BandwidthBudget` from its Net registry.
+  typed mutex-protected priority, and a shared `BandwidthBudget` from its Net registry.
   `Clone` is one `Arc` bump; protocol crates clone per spawned task.
 - `Net::shared_default()` returns a process-wide `OnceLock<Net>`
   built from `NetConfig::default()`. The default registration target
@@ -1581,3 +1581,10 @@ but `connect_tunnel` fails closed on SOCKS rather than connecting directly.
 Origin TLS and upgrade framing remain the caller's responsibility. JMAP reaches
 these APIs through its actual ReqwestTransport AccountNet, so an injected Net
 determines both HTTP and WebSocket routing and TLS trust.
+
+## Request state representations
+
+Request timeout overrides use explicit inherit, unbounded and bounded states.
+Ranged-download validation consumes the original `ByteRange`, rather than
+parsing the generated request header. Account priority stores `Priority`
+directly, without an integer decoding fallback.

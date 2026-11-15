@@ -78,7 +78,8 @@ pub(crate) type LifecycleBaseline = Arc<std::sync::Mutex<LifecycleBaselineState>
 struct LifecycleState {
     client: Arc<GmailClient>,
     shutdown: CancellationToken,
-    // This state is account-owned and independent of the mutable vocabulary cache.
+    cache: ScopeCache,
+    // Lifecycle delivery stays independent of vocabulary reads and refreshes.
     baseline: LifecycleBaseline,
     ended: bool,
     next_delay: Option<Duration>,
@@ -169,8 +170,13 @@ pub(crate) fn scope_lifecycle_stream(
     shutdown: CancellationToken,
 ) -> AccountStream<ScopeLifecycleEvent> {
     Box::pin(
-        scope_lifecycle_stream_with_baseline(client, shutdown, Default::default())
-            .filter(|event| futures::future::ready(!matches!(event, ScopeLifecycleEvent::Polled))),
+        scope_lifecycle_stream_with_baseline(
+            client,
+            shutdown,
+            Default::default(),
+            Arc::new(ScopeCacheState::new(ScopeSnapshot::empty())),
+        )
+        .filter(|event| futures::future::ready(!matches!(event, ScopeLifecycleEvent::Polled))),
     )
 }
 
@@ -178,11 +184,13 @@ pub(crate) fn scope_lifecycle_stream_with_baseline(
     client: Arc<GmailClient>,
     shutdown: CancellationToken,
     baseline: LifecycleBaseline,
+    cache: ScopeCache,
 ) -> AccountStream<ScopeLifecycleEvent> {
     let state = LifecycleState {
         client,
         shutdown,
         baseline,
+        cache,
         ended: false,
         next_delay: None,
     };
@@ -229,7 +237,7 @@ pub(crate) fn scope_lifecycle_stream_with_baseline(
         let snapshot = tokio::select! {
             biased;
             () = state.shutdown.cancelled() => return None,
-            result = fetch_scope_snapshot(&state.client) => result,
+            result = refresh_scope_snapshot(&state.client, &state.cache) => result,
         };
         match snapshot {
             Ok(new) => {
@@ -281,8 +289,8 @@ fn record_lifecycle_snapshot(
 /// the name slot and destabilises `Fingerprint.flags_hash`; writing, every
 /// `$gmail-label:` flag becomes unsupported and the batch reports
 /// `Skipped`. A refresh failure with nothing cached therefore propagates
-/// as an error - a stale-but-populated vocabulary is degraded, an empty
-/// one is unusable.
+/// as an error. A successfully fetched empty vocabulary is usable too;
+/// only a never-fetched or explicitly invalidated snapshot is unusable.
 ///
 /// The refresh is single-flight under `ScopeCache::refresh`, with staleness
 /// re-checked after the lock, and that is load-bearing rather than tidy:
@@ -293,23 +301,9 @@ pub(crate) async fn labels_for_flags(
     client: &Arc<GmailClient>,
     cache: &ScopeCache,
 ) -> crate::Result<Vec<GmailLabel>> {
-    let current = snapshot(cache);
-    if !current.is_stale() {
-        return Ok(current.labels);
-    }
-    let _refresh = cache.refresh.lock().await;
-    let current = snapshot(cache);
-    if !current.is_stale() {
-        return Ok(current.labels);
-    }
-    match refresh_scope_snapshot_locked(client, cache).await {
-        Ok(snapshot) => Ok(snapshot.labels),
-        Err(error) if current.fetched_at.is_some() => {
-            tracing::warn!("gmail label refresh failed during flag translation: {error}");
-            Ok(current.labels)
-        }
-        Err(error) => Err(error),
-    }
+    scope_snapshot_or_refresh(client, cache)
+        .await
+        .map(|snapshot| snapshot.labels)
 }
 
 pub(crate) fn snapshot(cache: &ScopeCache) -> ScopeSnapshot {
@@ -344,7 +338,17 @@ pub(crate) async fn scope_snapshot_or_refresh(
         return Ok(current);
     }
 
-    refresh_scope_snapshot_locked(client, cache).await
+    match refresh_scope_snapshot_locked(client, cache).await {
+        Ok(snapshot) => Ok(snapshot),
+        // A label-list refresh does not invalidate a previously fetched view.
+        // Outlook users can keep browsing known folders during an outage; the
+        // authoritative lifecycle poll still surfaces refresh errors for recovery.
+        Err(failure) if current.fetched_at.is_some() => {
+            tracing::warn!("gmail label refresh failed; using cached vocabulary: {failure}");
+            Ok(current)
+        }
+        Err(failure) => Err(failure),
+    }
 }
 
 /// Fetch an authoritative snapshot even when the cache is still fresh.
@@ -410,11 +414,10 @@ fn diff_snapshots(old: &ScopeSnapshot, new: &ScopeSnapshot) -> Vec<ScopeLifecycl
                 label.id.clone(),
             ))));
         } else if old_by_id.get(label.id.as_str()).is_some_and(|old_name| {
-            *old_name != label.name.as_str()
-                && label
-                    .label_type
-                    .as_deref()
-                    .is_none_or(|label_type| label_type != "system")
+            // A rename is metadata invalidation, not permission to mutate the
+            // label. Missing type must still report changed display metadata;
+            // flag replacement separately requires proven user ownership.
+            *old_name != label.name.as_str() && label.label_type.as_deref() != Some("system")
         }) {
             events.push(ScopeLifecycle::Renamed {
                 old: MembershipScope::Label(LabelId(label.id.clone())),
@@ -444,22 +447,47 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn discovery_keeps_cached_memberships_after_refresh_failure() {
+        let (client, script) = scripted_client(vec![unavailable()]);
+        let fetched_at = Instant::now()
+            .checked_sub(SCOPE_CACHE_STALE_AFTER + Duration::from_secs(1))
+            .expect("fixture can backdate the cache");
+        let cache = Arc::new(ScopeCacheState::new(ScopeSnapshot {
+            labels: vec![label("Label_1", "Work", "user")],
+            fetched_at: Some(fetched_at),
+        }));
+        let mut discovery = discover_memberships(client, cache);
+        let Some(SyncEvent::Batch(batch)) = discovery.next().await else {
+            panic!("cached discovery should remain usable");
+        };
+        assert_eq!(
+            batch.items,
+            vec![MembershipScope::Label(LabelId("Label_1".into()))]
+        );
+        assert!(matches!(discovery.next().await, Some(SyncEvent::Done(_))));
+        assert_eq!(script.requests().len(), 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_successful_label_poll_yields_polled_after_its_commit() {
         let (client, _) = scripted_client(vec![ok_json(
             json!({"labels": [{"id":"one", "name":"One"}]}),
         )]);
         let baseline = LifecycleBaseline::default();
+        let cache = Arc::new(ScopeCacheState::new(ScopeSnapshot::empty()));
         let mut stream = scope_lifecycle_stream_with_baseline(
             client,
             CancellationToken::new(),
             Arc::clone(&baseline),
+            Arc::clone(&cache),
         );
         assert!(matches!(
             stream.next().await,
             Some(ScopeLifecycleEvent::Polled)
         ));
         assert!(baseline.lock().expect("baseline").last_emitted.is_some());
+        assert_eq!(snapshot(&cache).labels[0].id, "one");
     }
 
     #[tokio::test(start_paused = true)]
@@ -469,6 +497,7 @@ mod tests {
             client,
             CancellationToken::new(),
             Default::default(),
+            Arc::new(ScopeCacheState::new(ScopeSnapshot::empty())),
         );
         assert!(matches!(
             stream.next().await,
@@ -750,6 +779,7 @@ mod tests {
                     Arc::clone(&client),
                     CancellationToken::new(),
                     Arc::clone(&baseline),
+                    Arc::new(ScopeCacheState::new(ScopeSnapshot::empty())),
                 )
                 .filter(|event| {
                     futures::future::ready(!matches!(event, ScopeLifecycleEvent::Polled))

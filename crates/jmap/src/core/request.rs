@@ -380,6 +380,13 @@ impl<T: HttpTransport> Request<'_, T> {
         max_size: usize,
     ) -> crate::Result<Option<M::Responses>> {
         let extract = methods.add_to_request(&mut self)?;
+        let advertised = self
+            .session_state()
+            .session()
+            .core_capabilities()
+            .and_then(crate::core::session::CoreCapabilities::max_size_request)
+            .filter(|max| *max > 0);
+        let max_size = advertised.map_or(max_size, |max| max.min(max_size));
         if self.encoded_len()? > max_size {
             return Ok(None);
         }

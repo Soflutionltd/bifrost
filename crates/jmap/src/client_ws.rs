@@ -388,7 +388,7 @@ impl Client {
         tokio::time::timeout(self.timeout, async {
             let mut retried = false;
             loop {
-                let (authorization, used) = match &self.authorization {
+                let (authorization, used) = match self.transport().ws_authorization() {
                     crate::client::Authorization::Bearer(source) => {
                         let token = source.current().await.map_err(|error| {
                             crate::Error::from(crate::core::transport::TransportError::from_net(
@@ -410,7 +410,7 @@ impl Client {
                         ))
                     )
                     && let (crate::client::Authorization::Bearer(source), Some(used)) =
-                        (&self.authorization, used)
+                        (self.transport().ws_authorization(), used)
                 {
                     source.refresh_if_unchanged(used).await.map_err(|error| {
                         crate::Error::from(crate::core::transport::TransportError::from_net(error))

@@ -346,7 +346,8 @@ is `Protocol(ParseFailed)`, not a missing field), and stores the
   discovery returns a fresh cached snapshot without a request; stale reads
   re-check after taking the lock. Container listing still fetches the latest
   server view, but its write uses the same lock. Lifecycle diff state is
-  held separately in account-owned `lifecycle_baseline` and never reads this cache.
+  held separately in account-owned `lifecycle_baseline`. Lifecycle polls refresh
+  this same vocabulary under the shared lock before announcing changes.
 - `lifecycle_baseline` retains the last observed label snapshot and undelivered
   lifecycle events across replacement streams.
 - `shutdown: CancellationToken` for the watch actor, cancellable account
@@ -562,7 +563,9 @@ search, including its page-token query encoding.
 
 Container CRUD treats Gmail labels as `ContainerKind::Label` and returns
 native label ids. System labels `INBOX`, `SENT`, `DRAFT`, `TRASH`, `SPAM`
-map to the matching `FolderRole`; Archive is a synthetic label-shaped
+map case-insensitively to the matching `FolderRole`; search and server-filter
+container queries share that same case rule, including synthetic Archive.
+User label ids retain exact case. Archive is a synthetic label-shaped
 container with native id `archive` and `FolderRole::Archive`. Create,
 rename, and delete call Gmail label endpoints. Each dispatched label mutation
 marks the shared vocabulary stale afterward, including an attempt whose
@@ -912,7 +915,11 @@ regardless of age while a successful fetch that returned no labels is
 fresh for the usual five minutes. If the initial refresh fails with
 nothing cached, the operation fails rather than canonicalizing against
 an empty vocabulary; a populated stale cache stays usable when a later
-refresh fails.
+refresh fails. Membership discovery and flag translation use the same
+single-flight reader and fallback policy, including a successfully fetched empty
+list. Explicit invalidation disables fallback until a fresh fetch succeeds.
+This keeps known folders browsable during an outage, as an Outlook user expects;
+authoritative container listing and lifecycle polling still propagate errors.
 
 A complete successful label poll commits its baseline and pending changes
 before yielding `ScopeLifecycleEvent::Polled`; partial failures yield no
@@ -924,7 +931,12 @@ fetch seeds the baseline without emitting Created events. Later polls diff
 against that baseline, so cache refreshes by other operations cannot consume
 changes. Both the baseline and queued events survive replacement streams;
 dropping a stream halfway through a diff does not discard the remaining events.
-Rename events carry the stable label id and both display names.
+Rename events carry the stable label id and both display names. Unknown or
+missing native label types still emit metadata renames, while exact flag
+replacement requires proven `type: user` ownership. These are deliberately
+different questions: an Outlook user should see updated display metadata without
+that granting permission to replace an unknown label. Known system labels do not
+emit locale-driven renames. Category labels retain explicit Add/Remove support.
 
 The first poll runs immediately and successful polls use a thirty-second cadence.
 Every classified poll failure emits `ScopeLifecycleEvent::Terminated` once and
@@ -1613,7 +1625,10 @@ Mapping highlights:
   `RetryHint::At` on the originating
   `ServerCause::{Unavailable, RateLimited, QuotaExhausted}` and forwarded to
   `RetryAdvice::retry_hint`. Unrecognized bodies retain net's generic hint
-  handling. There is no separate `retry_not_before` side-channel.
+  handling. Header parsing outside the observer never reads the real wall clock:
+unobserved delta hints remain `RetryHint::After`, and HTTP dates remain
+`RetryHint::At`. Only observation resolves a delta against the injected client
+clock. There is no separate `retry_not_before` side-channel.
 - Local failures (`GmailLocalError::*`) map by who is at fault, per the
   three disjoint blame families in `reference/error-model.md`:
   - `InvalidRequest` (caller input this crate cannot use, refused before

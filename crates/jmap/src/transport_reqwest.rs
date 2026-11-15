@@ -32,6 +32,42 @@ pub(crate) struct ReqwestTransport {
 }
 
 impl ReqwestTransport {
+    #[cfg(feature = "websockets")]
+    pub(crate) fn ws_authorization(&self) -> &Authorization {
+        // The transport is the credential owner for HTTP, SSE and WebSocket.
+        // Custom client construction must never fabricate a second credential.
+        &self.authorization
+    }
+
+    async fn authorize(
+        &self,
+        mut request: bifrost_net::RequestBuilder,
+    ) -> Result<bifrost_net::RequestBuilder, TransportError> {
+        for (name, value) in &self.headers {
+            let value = value.to_str().map_err(|e| {
+                TransportError::invariant_with_source(
+                    format!("Invalid default header value for {name}"),
+                    e,
+                )
+            })?;
+            request = request.header(name.as_str(), value);
+        }
+        if self.authorization.uses_bearer_pipeline() {
+            // AccountNet injects the bearer token from the shared
+            // token source on every request attempt.
+        } else {
+            let value = self
+                .authorization
+                .header_value()
+                .await
+                .map_err(TransportError::from_net)?;
+            request = request
+                .without_bearer_auth()
+                .header(header::AUTHORIZATION.as_str(), &value);
+        }
+        Ok(request)
+    }
+
     pub(crate) fn new(
         headers: header::HeaderMap,
         authorization: Authorization,
@@ -203,28 +239,7 @@ impl ReqwestTransport {
             Some(timeout) => request.timeout(timeout),
             None => request.without_timeout(),
         };
-        for (name, value) in &self.headers {
-            let value = value.to_str().map_err(|e| {
-                TransportError::invariant_with_source(
-                    format!("Invalid default header value for {name}"),
-                    e,
-                )
-            })?;
-            request = request.header(name.as_str(), value);
-        }
-        if self.authorization.uses_bearer_pipeline() {
-            // AccountNet injects the bearer token from the shared
-            // token source on every request attempt.
-        } else {
-            let value = self
-                .authorization
-                .header_value()
-                .await
-                .map_err(TransportError::from_net)?;
-            request = request
-                .without_bearer_auth()
-                .header(header::AUTHORIZATION.as_str(), &value);
-        }
+        request = self.authorize(request).await?;
         if let Some(ct) = content_type {
             request = request.header(header::CONTENT_TYPE.as_str(), ct);
         }
@@ -473,26 +488,7 @@ impl SseTransport for ReqwestTransport {
             .replay(bifrost_net::ReplayPolicy::Idempotent)
             .header(header::ACCEPT.as_str(), "text/event-stream")
             .without_timeout();
-        for (name, value) in &self.headers {
-            let value = value.to_str().map_err(|e| {
-                TransportError::invariant_with_source(
-                    format!("Invalid default header value for {name}"),
-                    e,
-                )
-            })?;
-            request = request.header(name.as_str(), value);
-        }
-        if self.authorization.uses_bearer_pipeline() {
-        } else {
-            let value = self
-                .authorization
-                .header_value()
-                .await
-                .map_err(TransportError::from_net)?;
-            request = request
-                .without_bearer_auth()
-                .header(header::AUTHORIZATION.as_str(), &value);
-        }
+        request = self.authorize(request).await?;
         if let Some(id) = last_event_id {
             request = request.header("Last-Event-ID", id);
         }

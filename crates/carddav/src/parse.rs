@@ -398,7 +398,7 @@ impl MultiStatusSink for MultigetSink {
         } else if let Some((href, status)) = parts.failed_resource() {
             self.report.failed.push(CardDavFailedResource {
                 href: href.to_string(),
-                status: Some(status),
+                status,
             });
         } else if let Some(href) = parts.missing_data_href() {
             self.report.missing_data.push(href.to_string());

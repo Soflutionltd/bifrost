@@ -258,7 +258,11 @@ fn spawn_recreate(
     let account = account.clone();
     let handle = handle.clone();
     tokio::spawn(async move {
-        let endpoint = account.push_endpoint.clone().expect("webhook endpoint");
+        let endpoint = account
+            .push_config
+            .endpoint()
+            .cloned()
+            .expect("webhook endpoint");
         replace_gone_subscription(
             &account,
             &endpoint,

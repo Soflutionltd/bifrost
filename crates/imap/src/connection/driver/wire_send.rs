@@ -100,7 +100,9 @@ pub(super) async fn commit_before_first_write<'w>(
 /// by [`write_failure_evidence`].
 ///
 /// `routing` is `Some` only inside a pipelined batch; see
-/// [`wait_for_continuation`]. A refused literal there is the command's own
+/// [`wait_for_continuation`]. `literal_budget` is the single command's
+/// remaining budget; pipeline routing derives its own from active consumers.
+/// A refused literal there is the command's own
 /// result, already in its slot, and the sender answers `Rejected` after
 /// abandoning the rest of the command. Outside a pipeline the wait returns the
 /// refusal as an error instead, so `Rejected` is reported only with routing.
@@ -113,6 +115,7 @@ pub(super) async fn send_wire_command(
     own_tag: &str,
     baseline: u64,
     mut routing: Option<&mut PipelineRouting<'_>>,
+    literal_budget: Option<usize>,
 ) -> Result<SendOutcome, Error> {
     let segments = wire.segments();
     for (i, segment) in segments.iter().enumerate() {
@@ -127,6 +130,7 @@ pub(super) async fn send_wire_command(
                 event_sink,
                 own_tag,
                 routing.as_deref_mut(),
+                literal_budget,
             )
             .await?
                 == ContinuationOutcome::Rejected
@@ -229,6 +233,7 @@ pub(super) async fn wait_for_continuation(
     event_sink: &mut event_sink::DriverEventSink,
     own_tag: &str,
     mut routing: Option<&mut PipelineRouting<'_>>,
+    literal_budget: Option<usize>,
 ) -> Result<ContinuationOutcome, Error> {
     loop {
         let utf8 = super::utf8_mode(state);
@@ -251,7 +256,12 @@ pub(super) async fn wait_for_continuation(
         // We have already sent the pre-literal bytes; a transport failure
         // reading the server's continuation grant is InFlight.
         let resp = wire_reader
-            .read_one(utf8)
+            .read_one_limited(
+                utf8,
+                routing
+                    .as_deref()
+                    .map_or(literal_budget, PipelineRouting::literal_budget),
+            )
             .await
             .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
 

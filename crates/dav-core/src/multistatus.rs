@@ -78,6 +78,12 @@ pub struct FailedResource {
     pub status: Option<u16>,
 }
 
+/// Whether a DAV status says the target no longer exists.
+#[must_use]
+pub(crate) fn is_missing_status(status: u16) -> bool {
+    matches!(status, 404 | 410)
+}
+
 impl FailedResource {
     /// True when the status means "this particular resource is not there" - the
     /// benign, genuinely per-resource case that `Page::failed_ids` exists to
@@ -85,7 +91,7 @@ impl FailedResource {
     /// all) can just as easily be a condition affecting the whole request.
     #[must_use]
     pub fn is_missing_resource(&self) -> bool {
-        matches!(self.status, Some(404 | 410))
+        self.status.is_some_and(is_missing_status)
     }
 }
 
@@ -117,7 +123,15 @@ pub fn classify_207(any_usable: bool, failed: &[FailedResource]) -> MultiStatusO
     if any_usable || failed.is_empty() {
         return MultiStatusOutcome::Usable;
     }
-    match failed.iter().find(|failure| !failure.is_missing_resource()) {
+    // A refusal whose status line was unreadable (`status: None`) is reported
+    // per resource but never fails the page. One garbage line from a proxy
+    // must not turn an enterprise user's whole folder into an error; the
+    // failed lane still preserves that resource's local copy and holds the
+    // collection token, so nothing is lost by staying Usable.
+    match failed
+        .iter()
+        .find(|failure| failure.status.is_some() && !failure.is_missing_resource())
+    {
         Some(failure) => MultiStatusOutcome::CompleteFailure {
             status: failure.status,
         },
@@ -274,7 +288,7 @@ impl<P: PropSet> ResponseParts<P> {
     fn worst_failed_status(&self) -> Option<u16> {
         self.failed_statuses
             .iter()
-            .find(|code| !matches!(**code, 404 | 410))
+            .find(|code| !is_missing_status(**code))
             .or_else(|| self.failed_statuses.first())
             .copied()
     }
@@ -289,7 +303,7 @@ impl<P: PropSet> ResponseParts<P> {
         if self.committed.is_collection() {
             return None;
         }
-        if self.saw_failed_propstat && !self.has_success_propstat {
+        if self.failed_href().is_some() {
             return None;
         }
         self.href.as_deref()
@@ -300,11 +314,18 @@ impl<P: PropSet> ResponseParts<P> {
     /// is not an absent one, so the caller preserves the local copy rather than
     /// emitting a `Destroyed`.
     pub fn failed_href(&self) -> Option<&str> {
-        if self.committed.is_collection() || self.has_success_propstat || !self.saw_failed_propstat
-        {
+        if self.committed.is_collection() {
             return None;
         }
-        self.href.as_deref()
+        let response_failed = self
+            .response_status
+            .as_deref()
+            .is_some_and(|line| !status_line_is_success(line));
+        if response_failed || (self.saw_failed_propstat && !self.has_success_propstat) {
+            self.href.as_deref()
+        } else {
+            None
+        }
     }
 
     /// The failed member of a LISTING lane, carrying the status the server gave
@@ -327,41 +348,47 @@ impl<P: PropSet> ResponseParts<P> {
 
     /// The href and body of a multiget response that yielded usable data.
     pub fn fetched(&self) -> Option<(&str, &str)> {
-        if self.committed.is_collection() {
-            return None;
-        }
-        Some((self.href.as_deref()?, self.committed.resource_data()?))
+        Some((self.entry_href()?, self.committed.resource_data()?))
     }
 
-    /// A multiget response with an actual non-2xx status: the refused propstat
-    /// code that describes the resource (see
-    /// [`worst_failed_status`](Self::worst_failed_status)), or a non-2xx
-    /// response-level code.
-    // Accepted edge: a failed propstat whose status line is absent or
-    // unparseable yields no numeric code here, so the resource degrades to the
-    // benign missing-data lane and cannot contribute to a complete failure. A
-    // pathological server failing every resource with garbage status text thus
-    // reads as an empty success; tolerated because such a server violates RFC
-    // 4918's required status line and the honest lanes still preserve the
-    // resource.
-    pub fn failed_resource(&self) -> Option<(&str, u16)> {
-        if self.committed.is_collection() {
-            return None;
+    /// A refused multiget response, with the refusal code when one could be
+    /// read. `None` means the refusal's status line was unreadable.
+    // An unreadable refusal is still a refusal: an enterprise user expects the
+    // item reported as not fetched, never shown as a successful empty result.
+    // No code is invented for it - a fabricated 500 would be indistinguishable
+    // from a real one - and [`classify_207`] keeps it per-resource news.
+    pub fn failed_resource(&self) -> Option<(&str, Option<u16>)> {
+        if let Some(href) = self.failed_href() {
+            return Some((href, self.member_status_code()));
         }
-        let href = self.href.as_deref()?;
-        let status = self.worst_failed_status().or_else(|| {
-            self.response_status
-                .as_deref()
-                .and_then(status_line_code)
-                .filter(|status| !(200..=299).contains(status))
-        })?;
-        Some((href, status))
+        // A refused body property beside a successful sibling propstat (a 403
+        // on `calendar-data` next to a 200 `getetag`) still means the item was
+        // not fetched: an enterprise user expects it reported as failed, never
+        // silently dropped as "no data". Only when no body arrived, so an
+        // optional-property miss beside real data stays a success.
+        if self.refused_without_data() {
+            return Some((self.href.as_deref()?, self.worst_failed_status()));
+        }
+        None
+    }
+
+    /// A response with a refused propstat that carried a readable code and
+    /// delivered no resource body.
+    fn refused_without_data(&self) -> bool {
+        !self.committed.is_collection()
+            && self.saw_failed_propstat
+            && self.committed.resource_data().is_none()
+            && self.worst_failed_status().is_some()
     }
 
     /// A multiget response that succeeded but omitted the body property. That
     /// is a per-resource absence, not a DAV failure.
     pub fn missing_data_href(&self) -> Option<&str> {
-        if self.committed.is_collection() || self.committed.resource_data().is_some() {
+        if self.committed.is_collection()
+            || self.failed_href().is_some()
+            || self.refused_without_data()
+            || self.committed.resource_data().is_some()
+        {
             return None;
         }
         self.href.as_deref()
@@ -786,6 +813,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unreadable_refusal_is_failed_in_both_member_lanes() {
+        let mut parts = ResponseParts::<MemberProps> {
+            href: Some("/c/a".into()),
+            ..Default::default()
+        };
+        parts.begin_propstat();
+        parts.staged_status = Some("HTTP/1.1 garbage".into());
+        parts.staged_success = Some(false);
+        parts.commit_propstat();
+        assert_eq!(parts.failed_member().unwrap().status, None);
+        assert_eq!(parts.failed_resource(), Some(("/c/a", None)));
+        assert_eq!(
+            classify_207(false, &[parts.failed_member().unwrap()]),
+            MultiStatusOutcome::Usable
+        );
+        assert_eq!(parts.entry_href(), None);
+        assert_eq!(parts.fetched(), None);
+        assert_eq!(parts.missing_data_href(), None);
+    }
+
+    #[test]
+    fn refused_optional_property_does_not_fail_successful_multiget() {
+        let mut parts = ResponseParts::<MemberProps> {
+            href: Some("/c/a".into()),
+            ..Default::default()
+        };
+        parts.has_success_propstat = true;
+        parts.saw_failed_propstat = true;
+        parts.failed_statuses.push(404);
+        parts.committed.data = Some("body".into());
+        assert_eq!(parts.fetched(), Some(("/c/a", "body")));
+        assert_eq!(parts.failed_resource(), None);
+    }
+
     #[derive(Default)]
     struct MemberSink {
         entries: Vec<(String, Option<String>)>,
@@ -795,7 +857,7 @@ mod tests {
         member_statuses: Vec<(String, Option<u16>)>,
         fetched: Vec<(String, String)>,
         missing_data: Vec<String>,
-        failed_resources: Vec<(String, u16)>,
+        failed_resources: Vec<(String, Option<u16>)>,
     }
 
     impl MultiStatusSink for MemberSink {
@@ -972,17 +1034,18 @@ mod tests {
                 ("/c/refused".to_string(), Some(403)),
             ]
         );
-        // The entry lane does not read status (a propstat-less response is
-        // still a named member); the sync caller consults the member status
-        // above before upserting, which is why the two are reported apart.
+        // A response-level refusal (the removed member's own 404) is withheld
+        // from the entry lane and reported in the failed lane with its code,
+        // so it can never be upserted as a live resource; the member status
+        // above carries the same code for the sync caller.
         assert_eq!(
             sink.entries,
-            vec![
-                ("/c/live".to_string(), Some("e1".to_string())),
-                ("/c/removed".to_string(), None),
-            ]
+            vec![("/c/live".to_string(), Some("e1".to_string()))]
         );
-        assert_eq!(sink.failed_hrefs, vec!["/c/refused".to_string()]);
+        assert_eq!(
+            sink.failed_hrefs,
+            vec!["/c/removed".to_string(), "/c/refused".to_string()]
+        );
     }
 
     /// A `<collection/>` inside a REFUSED propstat is a prop skeleton echo,
@@ -1129,7 +1192,10 @@ mod tests {
             MultiStatusOutcome::CompleteFailure { status: Some(403) }
         );
         // The multiget lane reads the same ladder from the same codes.
-        assert_eq!(sink.failed_resources, vec![("/c/refused".to_string(), 403)]);
+        assert_eq!(
+            sink.failed_resources,
+            vec![("/c/refused".to_string(), Some(403))]
+        );
     }
 
     /// An all-404 response has no refusal to prefer, so document order stands

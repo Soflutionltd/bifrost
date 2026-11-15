@@ -79,7 +79,7 @@ pub(crate) fn renewal_session(
                     // first meant a failed create left the resource with no
                     // state at all, so no later tick could ever see it as due
                     // and coverage was lost until reopen.
-                    let (phase, error) = match account.push_endpoint.as_ref() {
+                    let (phase, error) = match account.push_config.endpoint() {
                         Some(endpoint) if subscription_is_gone(&error) => {
                             match replace_gone_subscription(
                                 &account, endpoint, &handle, &server_id, &resource, &scopes,

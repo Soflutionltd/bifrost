@@ -385,28 +385,6 @@ and re-checking after every internal wait. Lanes keep only their reaction to
 `Held { scope_local: true }` (requeue, defer or park). Orphan teardown and
 repair go through it too.
 
-## CON-015 - How long before attempt N? (backoff and jitter)
-
-**Reported by:** sync-engine (the two jitter rules contradict each other).
-
-- `reattach.rs`: `REOPEN_BACKOFF_INITIAL/CAP` with `jittered`, hand-looped three
-  times (`restart_account`, `handle_schema_incompatible`,
-  `re_establish_scope_with_backoff`), each `delay =
-  delay.saturating_mul(2).min(CAP)`. `jittered` gives +/-20% and its comment
-  rejects `SystemTime::now()` as entropy, using a UUID.
-- `backoff.rs::ReconnectBackoff` (push lanes; lifecycle with jitter off, 30s to
-  480s), whose `jitter_seed` uses `SystemTime::now().subsec_nanos()` and applies
-  +0..25% - the clock the other rule was written to avoid.
-- `engine/backfill.rs`: `BACKFILL_RETRY_INITIAL/CAP` (5s to 5min) inside
-  `BackfillScan`.
-- `RepairPacing`: a cumulative wait budget measured against
-  `REOPEN_BACKOFF_CAP`, the same constant reused as a different concept.
-
-`bifrost_types::BackoffPolicy` already exists and `ReconnectBackoff` wraps it.
-Owner: every engine retry loop is a `ReconnectBackoff` built from a named
-`BackoffPolicy` const with one jitter rule; "attempt budget" and "cumulative
-wait budget" become separate named types rather than a reused cap.
-
 ## CON-016 - Which cursor scopes does a membership map to, and back?
 
 **Reported by:** sync-engine, types.
@@ -827,26 +805,6 @@ filter_extended_markers)` is called with `true` in `dispatch/select.rs` (twice)
 and with a value derived from a SUBSCRIBED string scan in `mailbox.rs` and
 `pipeline/mod.rs` (folded by typed LIST options, STR-053).
 
-## CON-037 - Smaller duplicated decisions in the IMAP account
-
-**Reported by:** imap-account.
-
-- Folding FETCH responses per requested UID is inline in `get::run_folder_get`
-  and in `pim::merge_requested_fetches`, both delegating the field merge to
-  `get::merge_fetch_response`; the filter-to-requested rule is written twice.
-- `importance_sets_important_keyword` (write) and `fetch_to_message`'s
-  `flags.contains("$important")` (read) each name the importance keyword.
-- Object-id decoding (`decode_len_prefixed`) and part-handle decoding
-  (`length_prefixed`) each own a length-prefix parser and the same "legacy
-  version decodes the folder literally (`MailboxName::new`), current version
-  decodes wire identity (`from_account_id`)" rule (see STR-051 for the single
-  identity codec).
-- The "nonzero" rule is hand-written at least five times: `parse_nonzero_u32`
-  (`envelope.rs`), `nonzero` (`parts.rs`), `operand_uid` (`targets.rs`),
-  `CompactUidSet::from_uids` dropping zero, `record_modseq`'s `uidvalidity == 0`
-  early return, and `poll.rs`'s `nonzero()`, which `expect`s the decoder already
-  did it (BUG-024).
-
 ## CON-038 - How does a JMAP push object decompose into state changes and token-free notifications?
 
 **Reported by:** jmap-protocol (the two traversals already differ).
@@ -867,37 +825,6 @@ is where this drifted (STR-096). Owner: one `PushObject::decompose(self) ->
 PushBlock { notifications, state: Option<MergedStateChange>, push_state }` in the
 crate root (or `core/push.rs`), consumed by both lanes, with
 `WebSocketStateChange` decoding straight into the shared struct.
-
-## CON-039 - Does this JMAP request fit `maxSizeRequest`?
-
-**Reported by:** jmap-protocol.
-
-The WebSocket door always checks the encoded frame (`encode_ws_request`). The
-HTTP door checks only when a caller opts into
-`Request::send_methods_within(max_size)`, which one call site does
-(`batched_open_probes`); every other HTTP batch is sized by `maxObjectsInSet` /
-`maxObjectsInGet` chunking and otherwise relies on the server's request-level
-`limit` rejection. Owner: `Client::send_request` checks against the request's own
-session snapshot, as the WS door does, with `send_methods_within`'s `Ok(None)` as
-the "tell me instead of failing" variant.
-
-## CON-040 - JMAP URI template expansion and value encoding
-
-**Reported by:** jmap-protocol.
-
-The session's templates are expanded by three hand loops
-(`Client::blob_download_url`, `Client::upload_to`, `Client::event_source`), each
-matching `URLPart` and choosing an encoder. Two encoding sets answer "what to
-percent-encode in a template value": `core/session.rs::TEMPLATE_VALUE`
-(`NON_ALPHANUMERIC` minus `-._~`, whose doc calls a deny list "the wrong shape")
-and `bifrost_net::url::COMPONENT` (a deny list) reached through
-`encode_template_value_at`. They agree on ASCII by enumeration, not construction.
-`event_source`'s `Types` arm re-tests `contains('?') || contains('#')` on the
-prefix before calling `encode_template_value_at`, which tests the same internally,
-and so in query position uses `TEMPLATE_VALUE` where blob URLs use `COMPONENT`.
-Owner: one `expand<P>(parts: &[URLPart<P>], value: impl Fn(&P) -> Cow<str>) ->
-String` beside `URLPart::parse`, with one encoder (bifrost-net's, since net owns
-URL components workspace-wide); `TEMPLATE_VALUE` and `encode_template_value` go.
 
 ## CON-041 - Setting one member of a JMAP id-set without clobbering the rest
 
@@ -1213,24 +1140,6 @@ the weak marker kept as text precisely so later code can re-detect it. Type fix:
 `PutCondition::IfMatch(&StrongTag)`, so a conditional write on a weak tag cannot be
 expressed. Graph's `If-Match` (STR-107), Google People and Google Calendar etags are
 candidates for the same type.
-
-## CON-063 - The DAV "empty listing is no observation" rule, written three times
-
-**Reported by:** net-dav (agrees today).
-
-`diff_snapshots`, `preserve_unobserved_entries` and `Observation::complete` each
-encode "empty current against populated previous means nothing was observed".
-Owner: an `Observed` value built once from `(previous, current, failed)` that the
-diff and the token-advance decision both consume.
-
-## CON-064 - Small duplicated status predicates in dav-core
-
-**Reported by:** net-dav.
-
-"404|410 means the target is gone" is spelled by `FailedResource::is_missing_resource`,
-`worst_failed_status` and `delete_target_already_gone`; the 429|507 throttle set
-appears in `status_error` and again in net. Each should be one predicate on a status
-type.
 
 ## CON-065 - Google Drive and OneDrive drive the same resumable-upload protocol separately
 

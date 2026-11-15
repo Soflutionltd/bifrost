@@ -688,7 +688,7 @@ async fn every_false_pim_flag_refuses_without_touching_the_wire() {
 /// the test above vacuous without anyone noticing.
 #[test]
 fn the_graph_snapshot_advertises_both_answers() {
-    let caps = super::capabilities::build_capabilities(PushMode::GraphSubscriptions, true);
+    let caps = super::capabilities::build_capabilities(&super::PushConfig::None, true);
     assert!(caps.pim_methods.contacts_list, "some flag is true");
     assert!(!caps.pim_methods.set_keyword, "some flag is false");
 }

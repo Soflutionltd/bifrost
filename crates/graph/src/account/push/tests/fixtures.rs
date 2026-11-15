@@ -105,7 +105,7 @@ pub(super) fn converted(source_id: &str, target_id: &str) -> TranslatedExchangeI
 
 pub(super) fn webhook_account(client: &GraphClient) -> GraphAccount {
     let mut account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
-    account.push_endpoint = Some(PushEndpoint {
+    account.push_config = crate::account::PushConfig::Webhook(PushEndpoint {
         webhook_url: "https://example.test/hook".to_string(),
         client_state: "secret".to_string(),
     });

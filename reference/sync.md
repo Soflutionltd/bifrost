@@ -414,6 +414,9 @@ registry generation while holding that lock. Every live change drive
 captures the generation with its scope lease and conditionally publishes
 the batch and installs its cursor together under the state lock. The swap
 also overlays the final live cursor snapshot onto every retained scope.
+Per-scope delete fence counters remain owned by the live registry, including
+counters for absent scopes; topology staging cannot reset them. A reintroduced
+scope therefore retains its delete history independently of the account fence.
 A batch from an old handle that finishes after cutover is therefore fenced
 out before broadcast or durable ack, instead of rolling either cursor copy
 backward. This fencing avoids waiting for an unbounded old stream during
@@ -3026,7 +3029,14 @@ this.
 Degraded coverage is surfaced to the consumer as a
 `Warning::OperatorAttentionNeeded`, and open debt is enumerable through
 `SyncEngine::debt`. Durable debt that nothing reports, or that nothing can list,
-is only half a fix.
+is only half a fix. Backfill announces replayable incomplete coverage on the
+FIRST incomplete page of each partition walk and on the terminal summary; later
+incomplete pages of the same walk add no warning (their obligations still reach
+the debt ledger). Enterprise mail users must see that a live folder is
+incomplete even when automatic replay can repair it, and a stream that ends
+before its summary must not hide the page's degraded coverage - but one warning
+per page of a large degraded folder is noise they cannot act on. Barrier warnings
+remain distinct and follow durable barrier recording.
 
 ### Repair
 
@@ -3649,8 +3659,17 @@ available for engine directives. Sleeping there would serialize
 restart and schema recovery behind a delay after which no operation was
 actually retried.
 
-Reopens use exponential backoff with ±20% jitter (1s initial, 5min
-cap) and a three-attempt budget. Per-scope re-establishment
+Reopens use `ReconnectBackoff` with the shared `BackoffPolicy` jitter rule:
+a uniform addition from zero through one quarter of the base delay, seeded by
+UUID entropy rather than wall-clock resolution. The base starts at 1s and caps
+at 5min; jitter may extend that cap by one quarter. The attempt budget is three.
+The three reopen loops, lifecycle reconnects and backfill retries all use this
+same pacing implementation. Named engine policies are lazy statics because
+`BackoffPolicy::new` is not a const constructor; provider push policies remain
+provider supplied. Lifecycle (30s to 480s) and backfill (5s to 300s) disable
+jitter. Backfill reaches its 300s cap rather than stopping at 160s.
+`AttemptBudget` and `CumulativeWaitBudget` distinguish the reopen count from
+the independent 300s repair hold budget. Per-scope re-establishment
 dispatches each failure through `plan_recovery` rather than
 blind-retrying every class: a `DisableScope` establish failure
 quarantines the scope immediately (same rule attach applies), and a
@@ -3684,7 +3703,7 @@ to the per-account `AccountControl` broadcast via
 end-to-end by
 `tests/attach_schema_recovery.rs::three_failed_reopens_terminate_and_pause_the_account`,
 which runs under paused time so the recorded per-attempt open instants
-expose the 1s / 2s backoff schedule exactly.
+exercise the bounded reopen schedule under the shared jitter envelope.
 
 `EngineDirective::OperatorOverrideRequired { reason }` auto-pauses
 the account with `PauseReason::OperatorOverrideRequired` and emits
@@ -3718,7 +3737,7 @@ waits for both those holds and the previous failure's local deadline.
 Failures record shareable Retry or Reconcile holds before rollback or close,
 and throttled failures pace on their holds instead of the jittered backoff.
 Hold waits do not consume attempts, but share a cumulative
-`REOPEN_BACKOFF_CAP` allowance per scope repair or account restart; expiry
+`REPAIR_WAIT_BUDGET` allowance per scope repair or account restart; expiry
 never authorizes a provider call and ends recovery with the distinct warning
 `recovery wait budget exhausted`. The promise is bounded additional throttle
 delay, not bounded transaction occupancy. Restart retries keep the failed

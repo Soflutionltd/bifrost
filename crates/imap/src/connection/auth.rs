@@ -968,7 +968,7 @@ impl ImapConnection {
     /// driver dropped is a driver death stamped `Unsent` when it was never
     /// committed and `InFlight` once it was. `Unsent` is never inferred from the
     /// timer alone after admission: only a won withdrawal earns it.
-    async fn submit_driver_command<P: Send, T>(
+    pub(super) async fn submit_driver_command<P: Send, T>(
         &self,
         payload: P,
         deadline: Option<tokio::time::Instant>,
