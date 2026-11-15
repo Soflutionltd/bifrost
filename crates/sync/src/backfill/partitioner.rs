@@ -158,14 +158,18 @@ pub fn parse_page_partition(partition: &Partition) -> Option<(u32, u32)> {
 /// skipped without re-walking.
 #[must_use]
 pub fn completion_partition() -> Partition {
-    Partition(b"complete".to_vec())
+    // The unversioned marker could be earned by an empty plan without any
+    // inventory. Its bytes cannot distinguish that from a legitimate walk.
+    // A new version distinguishes a genuinely empty inventory from that old
+    // marker; resume rechecks legacy zero/one markers once for missing history.
+    Partition(b"complete:v2".to_vec())
 }
 
-/// True if `partition` is the completion sentinel from
-/// `completion_partition`.
+/// True if `partition` names a completion sentinel, including the legacy key.
+/// Resume separately checks whether a legacy marker proves any inventory.
 #[must_use]
 pub fn is_completion_partition(partition: &Partition) -> bool {
-    partition.0 == b"complete"
+    partition.0 == b"complete:v2" || partition.0 == b"complete"
 }
 
 /// Plan a partition list for the given policy.

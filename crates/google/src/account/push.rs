@@ -1466,8 +1466,13 @@ mod tests {
         );
     }
 
+    /// A terminal renewal failure stops local retry and a later subscribe
+    /// restarts the lifecycle. A `historyNotFound` reason on `/watch` is not
+    /// cursor loss (only the history endpoint proves that), so it falls
+    /// through to the plain HTTP 400 classification: a terminal rejection,
+    /// not an engine restart of the scope.
     #[tokio::test(start_paused = true)]
-    async fn history_loss_from_renewal_stops_local_retry_and_can_resubscribe() {
+    async fn terminal_renewal_failure_stops_local_retry_and_can_resubscribe() {
         let now_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
@@ -1517,7 +1522,7 @@ mod tests {
         loop {
             if matches!(
                 health.next().await.expect("session event"),
-                bifrost_types::PushSessionEvent::Failed(ref error) if error.recovery().requires_engine_action()
+                bifrost_types::PushSessionEvent::Failed(ref error) if error.recovery().is_terminal()
             ) {
                 break;
             }
@@ -1532,10 +1537,14 @@ mod tests {
         tokio::time::advance(MIN_RENEW_DELAY + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         let mut next = test_session(&pubsub);
-        while !matches!(
-            next.next().await,
-            Some(bifrost_types::PushSessionEvent::Healthy)
-        ) {}
+        // The first Healthy is the fresh-watch announcement after the lapse;
+        // the second only follows the replacement watch's own renewal.
+        for _ in 0..2 {
+            while !matches!(
+                next.next().await,
+                Some(bifrost_types::PushSessionEvent::Healthy)
+            ) {}
+        }
         pubsub.shutdown.cancel();
         assert_eq!(
             script.requests().len(),

@@ -338,10 +338,8 @@ impl SyncEngine {
             complete: Some(complete_tx),
         }))
         .await
-        .map_err(|e| Error::Other(format!("ack channel closed: {e}")))?;
-        complete_rx
-            .await
-            .map_err(|e| Error::Other(format!("ack writer dropped before persisting: {e}")))?
+        .map_err(|_| Error::ShuttingDown)?;
+        complete_rx.await.map_err(|_| Error::ShuttingDown)?
     }
 
     /// Build the published backfill checkpoint helper on this account's single
@@ -380,9 +378,8 @@ impl SyncEngine {
             done,
         })
         .await
-        .map_err(|e| Error::Other(format!("ack channel closed: {e}")))?;
-        wait.await
-            .map_err(|e| Error::Other(format!("ack writer dropped before acknowledging: {e}")))?
+        .map_err(|_| Error::ShuttingDown)?;
+        wait.await.map_err(|_| Error::ShuttingDown)?
     }
 
     /// Everything this account still owes: obligations no walk has resolved and
@@ -530,9 +527,8 @@ impl SyncEngine {
             done,
         })
         .await
-        .map_err(|e| Error::Other(format!("writer channel closed: {e}")))?;
-        wait.await
-            .map_err(|e| Error::Other(format!("writer dropped before deciding: {e}")))?
+        .map_err(|_| Error::ShuttingDown)?;
+        wait.await.map_err(|_| Error::ShuttingDown)?
     }
 
     /// Explicitly shutdown the engine. Cancels the engine root token FIRST,
@@ -1124,7 +1120,7 @@ impl SyncEngine {
         // the subscribe and the numbering.
         let receiver = slot
             .delivery
-            .subscribe(Some(slot.control.clone()), Some(Arc::clone(&slot.coverage)));
+            .subscribe(Some(slot.control.clone()), Arc::clone(&slot.coverage));
         // Wake any deferred-inventory workers parked on the Notify so
         // they observe the new subscriber without hot-polling.
         slot.subscriber_notify.notify_waiters();

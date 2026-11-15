@@ -87,6 +87,13 @@ restatement, including this one.
   `cargo install` resolves, so no sibling member can donate a feature back.
   Every default feature of this crate is optional, so the zero-feature build is
   a promise to consumers.
+- `smtp-no-default` - `bifrost-smtp` with no features at all, pinned to
+  `feature_unification = "package"`. `account-error` is a default feature that
+  gates a large part of the crate, and the code that only compiles with it off
+  is typechecked nowhere else.
+- `smtp-no-default-tokio` - `bifrost-smtp` with no default features plus
+  `tokio`, pinned to `feature_unification = "package"`: the async transport
+  without the account-error layer.
 - `jmap-sync` - `bifrost-jmap` with its non-default `sync` feature, pinned to
   `feature_unification = "package"`. A focused `brokkr test -p bifrost-jmap`
   otherwise never compiles `crates/jmap/src/sync/`, since only bifrost-sync

@@ -236,8 +236,7 @@ async fn cancel_upload_session(
         return None;
     }
     let cancel = client.execute_aux(
-        Resource::Unmetered,
-        "DELETE",
+        reqwest::Method::DELETE,
         AuxTarget::Anonymous(upload_url),
         &[],
         Bytes::new(),
@@ -618,8 +617,7 @@ async fn upload_chunks(
         // it would leak the token to whatever host OneDrive minted.
         let headers = [("Content-Range", content_range.as_str())];
         let put = client.execute_aux(
-            Resource::Unmetered,
-            "PUT",
+            reqwest::Method::PUT,
             AuxTarget::Anonymous(upload_url),
             &headers,
             chunk,

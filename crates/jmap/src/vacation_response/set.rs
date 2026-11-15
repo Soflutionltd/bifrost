@@ -12,27 +12,27 @@ macro_rules! vacation_setters {
             }
 
             pub(crate) fn from_date(&mut self, from_date: Option<i64>) -> &mut Self {
-                self.from_date = from_date.map(from_timestamp);
+                self.from_date = Field::from(from_date.map(from_timestamp));
                 self
             }
 
             pub(crate) fn to_date(&mut self, to_date: Option<i64>) -> &mut Self {
-                self.to_date = to_date.map(from_timestamp);
+                self.to_date = Field::from(to_date.map(from_timestamp));
                 self
             }
 
             pub(crate) fn subject(&mut self, subject: Option<impl Into<String>>) -> &mut Self {
-                self.subject = subject.map(std::convert::Into::into);
+                self.subject = Field::from(subject.map(std::convert::Into::into));
                 self
             }
 
             pub(crate) fn text_body(&mut self, text_body: Option<impl Into<String>>) -> &mut Self {
-                self.text_body = text_body.map(std::convert::Into::into);
+                self.text_body = Field::from(text_body.map(std::convert::Into::into));
                 self
             }
 
             pub(crate) fn html_body(&mut self, html_body: Option<impl Into<String>>) -> &mut Self {
-                self.html_body = html_body.map(std::convert::Into::into);
+                self.html_body = Field::from(html_body.map(std::convert::Into::into));
                 self
             }
         }

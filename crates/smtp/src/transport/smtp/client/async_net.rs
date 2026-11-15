@@ -230,11 +230,13 @@ impl AsyncNetworkStream {
 
     /// Inject a peer-certificate DER for tests. See the field's comment.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) fn set_test_peer_certificate_der(&mut self, der: Vec<u8>) {
         self.test_peer_certificate_der = Some(der);
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) fn from_transcript(
         transcript: crate::transport::smtp::test_support::Transcript,
     ) -> Self {
@@ -246,6 +248,7 @@ impl AsyncNetworkStream {
     /// Wrap an arbitrary scripted stream. For peers a `Transcript` cannot
     /// express; see `AsyncSmtpConnection::from_raw_stream_for_test`.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) fn from_raw_stream_for_test(stream: Box<dyn AsyncTokioStream>) -> Self {
         Self::new(InnerAsyncNetworkStream::Transcript(stream))
     }

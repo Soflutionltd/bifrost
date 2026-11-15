@@ -40,7 +40,7 @@ mod framing;
 pub(crate) use framing::{decode_auth_challenge, decode_scram_payload};
 // Preserve the published credential paths while separating token-source I/O
 // from SMTP challenge framing and mechanism selection.
-#[cfg(test)]
+#[cfg(all(test, feature = "account-error"))]
 use credentials::oauth_token_error;
 pub use credentials::{Credentials, IntoSecretString};
 
@@ -163,9 +163,7 @@ impl Mechanism {
                 "SCRAM is driven by the SCRAM exchange, not the stateless mechanism encoder",
             )),
             Mechanism::Plain => match challenge {
-                Some(_) => Err(error::invalid_input(
-                    "This mechanism does not expect a challenge",
-                )),
+                Some(_) => Err(error::parse("This mechanism does not expect a challenge")),
                 None => {
                     let (username, password) = credentials.password_parts()?;
                     // RFC 4616 forbids NUL inside authzid/authcid/passwd: NUL is
@@ -189,7 +187,7 @@ impl Mechanism {
                 match challenge_index {
                     0 => Ok(Secret::from(username)),
                     1 => Ok(Secret::from(password)),
-                    _ => Err(error::invalid_input("Unexpected LOGIN challenge")),
+                    _ => Err(error::parse("Unexpected LOGIN challenge")),
                 }
             }
             Mechanism::Xoauth2 => match challenge {
@@ -229,22 +227,22 @@ impl From<bifrost_sasl::SaslError> for Error {
         match e {
             bifrost_sasl::SaslError::Protocol(m) => error::parse(m),
             // A caller credential that fails SASLprep, refused while the
-            // exchange is built, before the AUTH line is sent. Deliberately
-            // NOT Auth-phase tagged: that lane maps to PolicyBlocked, and
-            // this is the caller's input, `Request(Malformed)`, per the
+            // exchange is built, before the AUTH line is sent. This remains
+            // caller input, `Request(Malformed)`, independently of any outer
+            // AUTH phase stamp, per the
             // local-refusal rule in `reference/error-model.md`.
             bifrost_sasl::SaslError::InvalidCredential(m) => error::invalid_input(m),
             bifrost_sasl::SaslError::AuthFailed(m) => {
                 let kind = if credential_rejected {
                     error::ErrorKind::Authentication
                 } else {
-                    error::ErrorKind::InvalidInput
+                    error::ErrorKind::Policy
                 };
                 Error::new(kind, Some(m)).with_phase(SmtpCommandPhase::Auth { mechanism: None })
             }
             // `SaslError` is `#[non_exhaustive]`; any future variant is an
-            // unclassified auth failure until it is mapped explicitly.
-            other => error::invalid_input(other.to_string())
+            // client mapping gap until it is handled explicitly.
+            other => error::internal(other.to_string())
                 .with_phase(SmtpCommandPhase::Auth { mechanism: None }),
         }
     }
@@ -309,7 +307,9 @@ pub(crate) fn password_mechanism(
     } else {
         "no compatible authentication mechanism"
     };
-    Err(error::invalid_input(message).with_phase(SmtpCommandPhase::Auth { mechanism: None }))
+    // A mailbox user must change the authentication policy, rather than
+    // re-enter a password that the server has never evaluated.
+    Err(error::policy(message).with_phase(SmtpCommandPhase::Auth { mechanism: None }))
 }
 
 /// First advertised OAuth mechanism in the caller's order, or `None`.
@@ -507,9 +507,9 @@ fn generate_scram_nonce_with<E: std::fmt::Display>(
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "account-error"))]
 mod test {
-    use super::{Credentials, Mechanism, Zeroizing};
+    use super::{Credentials, Mechanism};
     use bifrost_net::auth::TokenSnapshot;
     use bifrost_net::{AccessToken, StaticTokenSource, TokenSource};
     use std::sync::Arc;
@@ -827,10 +827,10 @@ mod test {
         let advertised =
             ServerInfo::with_auth_mechanisms(&[Mechanism::ScramSha256Plus, Mechanism::ScramSha256]);
         let err = password_mechanism(PASSWORD_MECHANISMS, &advertised, false).unwrap_err();
-        assert!(err.is_invalid_input());
+        assert!(err.is_policy());
         assert_eq!(
             err.to_string(),
-            "invalid SMTP input: channel binding required but unavailable"
+            "SMTP policy error: channel binding required but unavailable"
         );
     }
 
@@ -932,7 +932,7 @@ mod test {
             Mechanism::ScramSha256Plus
         );
 
-        // All-PLUS order with no binding -> Auth-phase invalid_input error,
+        // All-PLUS order with no binding -> Auth-phase policy error,
         // diagnosed as a channel-binding failure (every candidate was a
         // binding-unavailable PLUS rung).
         let all_plus = [Mechanism::ScramSha256Plus, Mechanism::ScramSha1Plus];
@@ -942,7 +942,7 @@ mod test {
             false,
         )
         .unwrap_err();
-        assert!(err.is_invalid_input());
+        assert!(err.is_policy());
         assert_eq!(
             err.phase(),
             Some(SmtpCommandPhase::Auth { mechanism: None })
@@ -952,11 +952,11 @@ mod test {
             Some("channel binding required but unavailable")
         );
 
-        // Empty order -> same routing (Auth-phase invalid_input) but the
+        // Empty order -> same routing (Auth-phase policy) but the
         // no-compatible-mechanism diagnostic, not the channel-binding one (no
         // PLUS rung was skipped).
         let err = password_mechanism(&[], &ServerInfo::default(), true).unwrap_err();
-        assert!(err.is_invalid_input());
+        assert!(err.is_policy());
         assert_eq!(
             err.phase(),
             Some(SmtpCommandPhase::Auth { mechanism: None })
@@ -986,7 +986,7 @@ mod test {
 
         let auth_failed: super::Error =
             bifrost_sasl::SaslError::AuthFailed("server rejected".into()).into();
-        assert_eq!(auth_failed.kind(), &ErrorKind::InvalidInput);
+        assert_eq!(auth_failed.kind(), &ErrorKind::Policy);
         assert_eq!(
             auth_failed.phase(),
             Some(SmtpCommandPhase::Auth { mechanism: None })
@@ -995,8 +995,8 @@ mod test {
 
     /// A password that fails `SASLprep` is refused when the exchange is BUILT,
     /// before the AUTH line is sent, as the caller's invalid input - not a
-    /// parse fault, and not on the Auth-phase lane that maps to
-    /// `PolicyBlocked`. It used to surface from `step`, after the server-first
+    /// parse fault; AUTH phase decoration cannot change that classification.
+    /// It used to surface from `step`, after the server-first
     /// message, as a protocol-class parse error.
     #[test]
     fn a_password_that_fails_saslprep_is_refused_before_the_exchange() {
@@ -1515,7 +1515,9 @@ mod test {
     }
 
     #[tokio::test]
+    #[cfg(feature = "tokio")]
     async fn test_accepts_zeroizing_secrets() {
+        use super::Zeroizing;
         let credentials = Credentials::oauth2(
             "alice".to_owned(),
             Zeroizing::new("access-token".to_owned()),
@@ -1536,6 +1538,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[cfg(feature = "tokio")]
     async fn oauth2_payload_reads_current_token() {
         use bifrost_net::{AccessToken, StaticTokenSource};
         use std::sync::Arc;
@@ -1570,5 +1573,27 @@ mod test {
 
         let (_identity, token) = credentials.oauth2_token_blocking().unwrap();
         assert_eq!(token.as_str(), "new-token");
+    }
+}
+
+#[cfg(all(test, not(feature = "account-error")))]
+mod standalone_tests {
+    use super::{Credentials, Mechanism, PASSWORD_MECHANISMS, password_mechanism};
+    use crate::transport::smtp::extension::ServerInfo;
+
+    #[test]
+    fn direct_authentication_preserves_policy_and_protocol_errors_without_account_types() {
+        let refused =
+            password_mechanism(PASSWORD_MECHANISMS, &ServerInfo::default(), false).unwrap_err();
+        assert!(refused.is_policy());
+        let credentials = Credentials::password("user", "password");
+        let malformed = Mechanism::Plain
+            .response_with_token(&credentials, Some("unexpected"), None)
+            .unwrap_err();
+        assert!(malformed.is_parse());
+        let (_, token) = Credentials::oauth2("user", "token")
+            .oauth2_token_blocking()
+            .unwrap();
+        assert_eq!(token.as_str(), "token");
     }
 }

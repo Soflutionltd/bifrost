@@ -40,7 +40,18 @@ pub(crate) struct SubscriptionResponse {
     // for rollback, close, and unsubscribe. A typed-expiry redesign must carry
     // that id through its error lane and preserve account-owned cleanup.
     pub(crate) id: String,
+    #[serde(default, deserialize_with = "decode_expiry_text")]
     pub(crate) expiration_date_time: String,
+}
+
+// Missing or non-string expiry is deliberately retained as invalid text. The
+// owner must register the returned id before renewal classifies the expiry as
+// due; an Outlook user expects broken push metadata to remain cleanable.
+fn decode_expiry_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_str().unwrap_or_default().to_owned())
 }
 
 #[derive(Debug, Serialize)]
@@ -275,6 +286,25 @@ mod tests {
         let resp: SubscriptionResponse = serde_json::from_str(json).expect("should deserialize");
         assert_eq!(resp.id, "sub-123");
         assert_eq!(resp.expiration_date_time, "2024-06-15T12:00:00Z");
+    }
+
+    #[test]
+    fn subscription_id_survives_missing_or_mistyped_expiry() {
+        for value in [
+            serde_json::json!({"id": "sub-123"}),
+            serde_json::json!({"id": "sub-123", "expirationDateTime": null}),
+            serde_json::json!({"id": "sub-123", "expirationDateTime": 123}),
+            serde_json::json!({"id": "sub-123", "expirationDateTime": {}}),
+            serde_json::json!({"id": "sub-123", "expirationDateTime": []}),
+            serde_json::json!({"id": "sub-123", "expirationDateTime": false}),
+        ] {
+            let response: SubscriptionResponse = serde_json::from_value(value).expect("retain id");
+            assert_eq!(response.id, "sub-123");
+            assert_eq!(
+                check_expiry(&response.expiration_date_time, 30),
+                ExpiryCheck::Unparseable
+            );
+        }
     }
 
     #[test]

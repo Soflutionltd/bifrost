@@ -1,8 +1,11 @@
 //! Error and result type for SMTP clients
 
-use std::{error::Error as StdError, fmt, io, sync::Arc};
+use std::{error::Error as StdError, fmt, io};
 
+#[cfg(feature = "account-error")]
 use bifrost_types::error::AccountError;
+#[cfg(feature = "account-error")]
+use std::sync::Arc;
 
 use crate::{
     BoxError,
@@ -32,6 +35,7 @@ impl Clone for Error {
                 source,
                 attempt: self.inner.attempt,
                 phase: self.inner.phase,
+                #[cfg(feature = "account-error")]
                 preclassified_account_error: self.inner.preclassified_account_error.clone(),
             }),
         }
@@ -52,6 +56,7 @@ struct Inner {
     /// A lower-level dependency already projected this failure into the
     /// shared account-error model. Keep the typed result through the SMTP
     /// wrapper so its protocol boundary does not flatten it into `InvalidInput`.
+    #[cfg(feature = "account-error")]
     preclassified_account_error: Option<Arc<AccountError>>,
 }
 
@@ -61,13 +66,16 @@ struct Inner {
 /// `InFlight` means a write or read failed mid-command and the server's view is
 /// ambiguous. `Acknowledged` means the server returned a definitive negative
 /// reply for the command.
+#[cfg_attr(not(feature = "account-error"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// This local vocabulary remains usable when account integration is disabled.
 pub(crate) enum SmtpTransmissionState {
     Unsent,
     InFlight,
     Acknowledged,
 }
 
+#[cfg_attr(not(feature = "account-error"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SmtpAttempt {
     pub(crate) transmission_state: SmtpTransmissionState,
@@ -137,6 +145,7 @@ impl Error {
                 source: source.map(Into::into),
                 attempt: None,
                 phase: None,
+                #[cfg(feature = "account-error")]
                 preclassified_account_error: None,
             }),
         }
@@ -149,6 +158,7 @@ impl Error {
                 source: None,
                 attempt: None,
                 phase: None,
+                #[cfg(feature = "account-error")]
                 preclassified_account_error: None,
             }),
         }
@@ -165,6 +175,7 @@ impl Error {
         self
     }
 
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) fn attempt(&self) -> Option<SmtpTransmissionState> {
         self.inner.attempt.map(|a| a.transmission_state)
     }
@@ -201,15 +212,18 @@ impl Error {
 
     /// Preserve an account error already classified by a dependency such as
     /// bifrost-net. The SMTP account boundary will add its call-site context.
+    #[cfg(feature = "account-error")]
     pub(crate) fn with_preclassified_account_error(mut self, error: AccountError) -> Self {
         self.inner.preclassified_account_error = Some(Arc::new(error));
         self
     }
 
+    #[cfg(feature = "account-error")]
     pub(crate) fn preclassified_account_error(&self) -> Option<AccountError> {
         self.inner.preclassified_account_error.as_deref().cloned()
     }
 
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) fn phase(&self) -> Option<SmtpCommandPhase> {
         self.inner.phase
     }
@@ -217,6 +231,7 @@ impl Error {
     /// Support-safe diagnostic string for the account-error mapper. AUTH paths
     /// already redact credentials before they reach here; this just exposes the
     /// boxed source or the kind discriminant for support text.
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) fn diagnostic_text(&self) -> Option<String> {
         self.inner
             .source

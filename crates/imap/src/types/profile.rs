@@ -46,6 +46,8 @@ impl ServerProfile {
     /// Build a profile from capability and enabled-extension snapshots.
     pub fn new(capabilities: Vec<Capability>, enabled: Vec<String>) -> Self {
         let imap4rev2 = imap4rev2_active(&capabilities, &enabled);
+        // Directly constructed Auth/Thread payloads need not be canonical.
+        // Keep profile normalization until every producer uses from_imap_str.
         let auth_mechanisms = capabilities
             .iter()
             .filter_map(|cap| match cap {
@@ -349,7 +351,7 @@ pub(crate) mod capability_matrix {
             Capability::SaveDate,
             Capability::SearchRes,
             Capability::Sort,
-            Capability::SortDisplay("DISPLAY".to_owned()),
+            Capability::SortDisplay,
             Capability::StartTls,
             Capability::SpecialUse,
             Capability::Thread("REFERENCES".to_owned()),
@@ -415,7 +417,7 @@ pub(crate) mod capability_matrix {
             | Capability::Rights(_)
             | Capability::Preview
             | Capability::Sort
-            | Capability::SortDisplay(_)
+            | Capability::SortDisplay
             | Capability::StartTls
             | Capability::Thread(_)
             | Capability::Unauthenticate

@@ -45,7 +45,10 @@ mod upload;
 pub mod url;
 
 pub use account_error::{NetErrorContext, into_account_error_with_throttle_scope};
-pub use auth::{AccessToken, OAuthRefresher, RefreshState, StaticTokenSource, TokenSource};
+pub use auth::{
+    AccessToken, CoordinatedTokenSource, OAuthRefresher, RefreshState, StaticTokenSource,
+    TokenSource, coordinate,
+};
 pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink, MeterSinkHandle};
 pub use budget::{BandwidthBudget, BandwidthDirection, BandwidthRegistry, Reservation};
 // Shared identity / priority / byte-range / future-alias types live

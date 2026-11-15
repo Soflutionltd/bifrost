@@ -32,8 +32,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
 use bifrost_net::{
-    AccessToken, AccountNet, AccountSpec, Error as NetError, FollowRedirects,
-    MalformedRedirectKind, Net, NetErrorContext, TokenSource,
+    AccessToken, AccountNet, AccountSpec, CoordinatedTokenSource, Error as NetError,
+    FollowRedirects, MalformedRedirectKind, Net, NetErrorContext, TokenSource, coordinate,
 };
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, AccountOperation, AttemptCause,
@@ -66,11 +66,37 @@ pub enum DavCredentials {
     Bearer { token_source: Arc<dyn TokenSource> },
 }
 
+// Keep raw-source ergonomics at the public input boundary, but make bypassing
+// coordination impossible in the dispatcher's stored credentials.
+#[derive(Clone)]
+enum DispatchCredentials {
+    Basic {
+        username: String,
+        password: String,
+    },
+    Bearer {
+        token_source: CoordinatedTokenSource,
+    },
+}
+
+impl From<DavCredentials> for DispatchCredentials {
+    fn from(credentials: DavCredentials) -> Self {
+        match credentials {
+            DavCredentials::Basic { username, password } => Self::Basic { username, password },
+            DavCredentials::Bearer { token_source } => Self::Bearer {
+                token_source: coordinate(token_source),
+            },
+        }
+    }
+}
+
 /// The account spec every DAV account attaches under.
 ///
 /// `token_source` stays `None` and every request opts out of bearer injection:
 /// the origin gate decides whether a credential may be minted at all, and the
-/// transport cannot make that call. Redirects are disabled because the walk
+/// transport cannot make that call. An injected AccountNet can belong to a
+/// different composed leg, so its source must not replace DAV credentials.
+/// DAV stores its own coordinated source instead. Redirects are disabled because the walk
 /// below owns them.
 fn dav_account_spec() -> AccountSpec {
     let mut spec = AccountSpec::new(None);
@@ -116,7 +142,7 @@ impl DavByteTally {
 pub struct DavDispatch {
     net: AccountNet,
     base_url: String,
-    credentials: DavCredentials,
+    credentials: DispatchCredentials,
     trusted_origins: Vec<String>,
     protocol: DavProtocol,
     request_guard: Option<Arc<dyn DavRequestGuard>>,
@@ -184,7 +210,7 @@ impl DavDispatch {
         Self {
             net,
             base_url,
-            credentials,
+            credentials: credentials.into(),
             trusted_origins,
             protocol,
             request_guard: None,
@@ -384,7 +410,7 @@ impl DavDispatch {
         // always header-safe, so the Basic arm can only trip on this via a
         // future refactor; the Bearer token is user-supplied input.)
         match &self.credentials {
-            DavCredentials::Basic { username, password } => {
+            DispatchCredentials::Basic { username, password } => {
                 let credentials = base64::engine::general_purpose::STANDARD
                     .encode(format!("{username}:{password}"));
                 let value =
@@ -397,7 +423,7 @@ impl DavDispatch {
                     })?;
                 headers.insert(AUTHORIZATION, value);
             }
-            DavCredentials::Bearer { token_source } => {
+            DispatchCredentials::Bearer { token_source } => {
                 let token = token_source
                     .current()
                     .await
@@ -844,7 +870,7 @@ impl DavDispatch {
             history.record_response(response.status, unreplayable);
             if response.status == StatusCode::UNAUTHORIZED
                 && !refreshed
-                && let (DavCredentials::Bearer { token_source }, Some(token)) =
+                && let (DispatchCredentials::Bearer { token_source }, Some(token)) =
                     (&self.credentials, used.take())
             {
                 // The 401 is a refusal, so replaying the owned byte body is
@@ -2066,11 +2092,68 @@ mod tests {
         );
     }
 
+    struct RawProvider {
+        refreshes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TokenSource for RawProvider {
+        fn current(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
+            Box::pin(async { Ok(AccessToken::new("uncoordinated", None)) })
+        }
+
+        fn refresh(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
+            let generation = self.refreshes.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move { Ok(AccessToken::new(format!("generation-{generation}"), None)) })
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_bearer_provider_is_coordinated_across_dispatch_clones() {
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let dispatch = DavDispatch::with_account_net(
+                scripted_dav_net(&dav_script_empty()),
+                BASE,
+                DavCredentials::Bearer {
+                    token_source: Arc::new(RawProvider {
+                        refreshes: Arc::clone(&refreshes),
+                    }),
+                },
+                protocol,
+            );
+            let clone = dispatch.clone();
+            let (first, second) = tokio::join!(
+                dispatch.auth_headers(BASE, AccountOperation::Discover),
+                clone.auth_headers(BASE, AccountOperation::Discover),
+            );
+            assert_eq!(first.unwrap()[AUTHORIZATION], "Bearer generation-0");
+            assert_eq!(second.unwrap()[AUTHORIZATION], "Bearer generation-0");
+            assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+            let DispatchCredentials::Bearer { token_source } = &dispatch.credentials else {
+                panic!("bearer credentials expected");
+            };
+            let used = token_source.current().await.unwrap();
+            let (first, second) = tokio::join!(
+                token_source.refresh_if_unchanged(used.clone()),
+                token_source.refresh_if_unchanged(used),
+            );
+            assert_eq!(first.unwrap().as_str(), "generation-1");
+            assert_eq!(second.unwrap().as_str(), "generation-1");
+            assert_eq!(refreshes.load(Ordering::Relaxed), 2);
+        }
+    }
+
     struct RotatingTokenSource {
         refreshes: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl TokenSource for RotatingTokenSource {
+        // This double models a live coordinating cache: its per-read behavior
+        // drives the dispatcher's replay, error or deadline contract directly.
+        fn is_coordinating(&self) -> bool {
+            true
+        }
+
         fn current(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
             // Deliberately remains stale: the dispatcher must use the refresh
             // return value, not assume a simple source stores it in current().
@@ -2271,6 +2354,12 @@ mod tests {
     }
 
     impl TokenSource for RedirectFailingTokenSource {
+        // This double models a live coordinating cache: its per-read behavior
+        // drives the dispatcher's replay, error or deadline contract directly.
+        fn is_coordinating(&self) -> bool {
+            true
+        }
+
         fn current(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
             let read = self.reads.fetch_add(1, Ordering::Relaxed);
             let succeeds = read == 0 || self.fail_refresh;
@@ -2342,6 +2431,12 @@ mod tests {
     struct AdvancingTokenSource;
 
     impl TokenSource for AdvancingTokenSource {
+        // This double models a live coordinating cache: its per-read behavior
+        // drives the dispatcher's replay, error or deadline contract directly.
+        fn is_coordinating(&self) -> bool {
+            true
+        }
+
         fn current(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
             Box::pin(async {
                 tokio::time::advance(std::time::Duration::from_secs(2)).await;
@@ -2569,6 +2664,12 @@ mod tests {
     struct FailingTokenSource(fn() -> NetError);
 
     impl TokenSource for FailingTokenSource {
+        // This double models a live coordinating cache: its per-read behavior
+        // drives the dispatcher's replay, error or deadline contract directly.
+        fn is_coordinating(&self) -> bool {
+            true
+        }
+
         fn current(&self) -> bifrost_types::AccountFuture<Result<AccessToken, NetError>> {
             let make = self.0;
             Box::pin(async move { Err(make()) })

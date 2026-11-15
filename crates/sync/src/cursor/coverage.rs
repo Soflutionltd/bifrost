@@ -548,15 +548,9 @@ struct Ledger {
     last_backfill_mint: HashMap<CursorScope, u64>,
     /// The numbered consumer receivers currently holding a subscription.
     ///
-    /// A mirror of `ChangeDelivery`'s own `live` set, kept here because the
-    /// charge is a question about the ring - "could any live receiver still be
-    /// holding this page" - and `backfill_in_flight` is asked it from a producer
-    /// that has no delivery handle. Maintained by
-    /// [`PendingCoverage::receiver_joined`] and
-    /// [`PendingCoverage::receiver_departed`], which the delivery gate calls
-    /// while holding its own lock, so subscribe/depart, the send's stamp and this
-    /// set stay in one total order. Lock order is delivery -> coverage and never
-    /// the reverse.
+    /// The single membership set, updated under ChangeDelivery's ordering lock.
+    /// Delivery queries this ledger rather than maintaining a second copy.
+    /// Lock order is delivery -> coverage, never the reverse.
     live: BTreeSet<u64>,
     /// The same fence, narrowed to the BACKFILL lane.
     ///
@@ -1102,6 +1096,11 @@ impl PendingCoverage {
         if freed {
             self.wake_capacity();
         }
+    }
+
+    /// Lowest numbered receiver still subscribed, from the authoritative set.
+    pub(crate) fn min_live_receiver(&self) -> Option<u64> {
+        self.guard().live.iter().next().copied()
     }
 
     /// A numbered consumer receiver has subscribed.

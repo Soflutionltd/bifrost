@@ -600,3 +600,33 @@ fn intersect_single_uid_overlap_produces_single() {
     assert_eq!(result, vec![UidRange::single(5)]);
     assert_eq!(dropped, 4); // UIDs 1,2,3,4
 }
+
+#[test]
+fn mailbox_inbox_identity_folds_without_migrating_persisted_ids() {
+    use std::collections::HashSet;
+
+    let upper = MailboxName::new("INBOX").unwrap();
+    let lower = MailboxName::new("inbox").unwrap();
+    let wire = MailboxName::from_wire("InBoX".into(), b"InBoX", false);
+    assert_eq!(upper, lower);
+    assert_eq!(upper, wire);
+    assert!(upper.matches_mailbox(&lower));
+    assert_eq!(HashSet::from([upper, lower.clone(), wire]).len(), 1);
+    assert_eq!(lower.account_id(), "inbox");
+    assert_eq!(
+        MailboxName::from_account_id("inbox").unwrap().account_id(),
+        "inbox"
+    );
+
+    let encoded = MailboxName::from_wire("INBOX".into(), b"&AEkATgBCAE8AWA-", false);
+    assert_ne!(lower, encoded);
+    assert!(!lower.matches_mailbox(&encoded));
+    for child in ["inbox/Sub", "inbox.Sub", "inbox-Sub", "inbox_Sub"] {
+        let name = MailboxName::new(child).unwrap();
+        assert_ne!(
+            name,
+            MailboxName::new(child.replacen("inbox", "INBOX", 1)).unwrap()
+        );
+        assert_eq!(name.account_id(), child);
+    }
+}

@@ -128,6 +128,48 @@ pub trait TokenSource: Send + Sync + 'static {
     }
 }
 
+/// A token source admitted through the shared coordination policy.
+///
+/// Clone this handle across protocol legs to share refresh work and backoff.
+/// Raw providers get one refresher; live caches retain their own policy.
+#[derive(Clone)]
+pub struct CoordinatedTokenSource(Arc<dyn TokenSource>);
+
+/// Coordinate a provider using the default opaque-token maximum age.
+#[must_use]
+pub fn coordinate(source: Arc<dyn TokenSource>) -> CoordinatedTokenSource {
+    CoordinatedTokenSource::with_max_age(source, DEFAULT_TOKEN_MAX_AGE)
+}
+
+impl CoordinatedTokenSource {
+    /// Admit a provider with an explicit maximum age for opaque tokens.
+    /// Existing coordinators keep their own policy.
+    #[must_use]
+    pub fn with_max_age(source: Arc<dyn TokenSource>, max_age: Duration) -> Self {
+        // Preserve custom caches and StaticTokenSource's live out-of-band
+        // rotation. Blindly wrapping every source would hide later set() calls.
+        if source.is_coordinating() {
+            Self(source)
+        } else {
+            Self(Arc::new(OAuthRefresher::new(source).with_max_age(max_age)))
+        }
+    }
+
+    /// Share this coordinator with an API accepting a token-source trait object.
+    #[must_use]
+    pub fn as_source(&self) -> &Arc<dyn TokenSource> {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for CoordinatedTokenSource {
+    type Target = Arc<dyn TokenSource>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// An OAuth access token. The bytes are held in a `Zeroizing<String>`
 /// so the buffer is wiped on drop. The `Debug` impl redacts the bytes;
 /// only the expiry hint and a fingerprint length are surfaced.

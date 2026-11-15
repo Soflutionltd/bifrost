@@ -739,7 +739,12 @@ impl BackfillRunner {
                                 .await
                                 .is_ok()
                             {
-                                let _ = done_rx.await;
+                                // A store refusal is retained by the writer, but
+                                // must remain visible for diagnosis. Channel loss
+                                // is teardown, not a second persistence failure.
+                                if let Ok(Err(error)) = done_rx.await {
+                                    tracing::warn!(error = %error, "could not persist terminal inventory debt");
+                                }
                             }
                         }
                     }

@@ -1,6 +1,7 @@
 use super::{ACLPatch, MailboxCreate, MailboxId, MailboxPatch, Role, SetArguments};
 use crate::core::creation::{CreationId, IdOrRef};
 use crate::core::field::Field;
+use crate::core::patch::{self, PatchPath};
 use crate::mailbox::ACL;
 use std::collections::HashMap;
 
@@ -11,23 +12,19 @@ impl MailboxCreate {
     }
 
     pub(crate) fn parent_id(&mut self, parent_id: Option<impl Into<MailboxId>>) -> &mut Self {
-        self.parent_id = parent_id.map(|id| IdOrRef::Id(id.into()));
+        self.parent_id = Field::from(parent_id.map(|id| IdOrRef::Id(id.into())));
         self
     }
 
     pub(crate) fn parent_id_ref(&mut self, parent_id_ref: &str) -> &mut Self {
-        self.parent_id = Some(IdOrRef::Reference(
+        self.parent_id = Field::from(Some(IdOrRef::Reference(
             CreationId::named(parent_id_ref).reference(),
-        ));
+        )));
         self
     }
 
-    pub(crate) fn role(&mut self, role: Role) -> &mut Self {
-        if !matches!(role, Role::None) {
-            self.role = Some(role);
-        } else {
-            self.role = None;
-        }
+    pub(crate) fn role(&mut self, role: Option<Role>) -> &mut Self {
+        self.role = Field::from(role);
         self
     }
 
@@ -47,11 +44,11 @@ impl MailboxCreate {
         U: Into<String>,
         V: IntoIterator<Item = ACL>,
     {
-        self.share_with = Some(
+        self.share_with = Field::from(Some(
             acls.into_iter()
                 .map(|(id, acls)| (id.into(), acls.into_iter().map(|acl| (acl, true)).collect()))
                 .collect(),
-        );
+        ));
         self
     }
 }
@@ -77,12 +74,8 @@ impl MailboxPatch {
         self
     }
 
-    pub(crate) fn role(&mut self, role: Role) -> &mut Self {
-        if !matches!(role, Role::None) {
-            self.role = Some(role);
-        } else {
-            self.role = None;
-        }
+    pub(crate) fn role(&mut self, role: Option<Role>) -> &mut Self {
+        self.role = Field::from(role);
         self
     }
 
@@ -102,45 +95,66 @@ impl MailboxPatch {
         U: Into<String>,
         V: IntoIterator<Item = ACL>,
     {
-        self.share_with = Some(
+        self.acl_patch = None;
+        self.share_with = Field::from(Some(
             acls.into_iter()
                 .map(|(id, acls)| (id.into(), acls.into_iter().map(|acl| (acl, true)).collect()))
                 .collect(),
-        );
+        ));
         self
     }
 
     pub(crate) fn acl(&mut self, id: &str, acl: impl IntoIterator<Item = ACL>) -> &mut Self {
-        self.acl_patch.get_or_insert_with(HashMap::new).insert(
-            format!(
-                "shareWith/{}",
-                crate::core::set::escape_json_pointer_token(id)
-            ),
+        self.share_with = Field::Omitted;
+        patch::insert(
+            self.acl_patch.get_or_insert_with(HashMap::new),
+            PatchPath::new(["shareWith", id]),
             ACLPatch::Replace(acl.into_iter().map(|acl| (acl, true)).collect()),
         );
         self
     }
 
     pub(crate) fn acl_set(&mut self, id: &str, acl: ACL, set: bool) -> &mut Self {
-        self.acl_patch.get_or_insert_with(HashMap::new).insert(
-            format!(
-                "shareWith/{}/{}",
-                crate::core::set::escape_json_pointer_token(id),
-                acl.as_str()
-            ),
+        self.share_with = Field::Omitted;
+        patch::insert(
+            self.acl_patch.get_or_insert_with(HashMap::new),
+            PatchPath::new(["shareWith", id, acl.as_str()]),
             ACLPatch::Set(set),
         );
         self
     }
 }
 
-pub(crate) fn role_not_set(role: &Option<Role>) -> bool {
-    matches!(role, Some(Role::None))
-}
-
 impl SetArguments {
     pub(crate) fn on_destroy_remove_emails(&mut self, value: bool) -> &mut Self {
         self.on_destroy_remove_emails = value.into();
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn acl_setters_supersede_ancestors_and_keep_siblings() {
+        let mut patch = MailboxPatch::default();
+        patch.acls([("old", [ACL::ReadItems])]);
+        patch.acl("a/b", [ACL::ReadItems]);
+        patch.acl_set("a/b", ACL::AddItems, true);
+        patch.acl_set("other", ACL::ReadItems, false);
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            json!({
+                "shareWith/a~1b/mayAddItems": true,
+                "shareWith/other/mayReadItems": false
+            })
+        );
+        patch.acls(std::iter::empty::<(String, Vec<ACL>)>());
+        assert_eq!(
+            serde_json::to_value(patch).unwrap(),
+            json!({"shareWith": {}})
+        );
     }
 }

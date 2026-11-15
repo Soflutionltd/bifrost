@@ -352,7 +352,7 @@ async fn fetch_batch(
     if !etags.is_empty() {
         let mut cache = account.etag_index.write().await;
         for (id, etag) in etags {
-            cache.insert(id, etag);
+            cache.observe(&id, super::EtagObservation::Read(etag));
         }
     }
 
@@ -412,23 +412,8 @@ fn reconcile_hydration_responses(
     let mut etags = Vec::new();
     let mut seen_indices = HashSet::new();
 
-    for item in responses {
-        let Some(index) = item.id.parse::<usize>().ok().filter(|idx| *idx < ids.len()) else {
-            tracing::warn!(
-                target: "bifrost_graph::batch",
-                response_id = %item.id,
-                "ignoring Graph $batch hydration response with an invalid request id"
-            );
-            continue;
-        };
-        if !seen_indices.insert(index) {
-            tracing::warn!(
-                target: "bifrost_graph::batch",
-                response_id = %item.id,
-                "ignoring duplicate Graph $batch hydration response"
-            );
-            continue;
-        }
+    for (index, item) in super::batch_routing::resolve_answers(0..ids.len(), responses) {
+        seen_indices.insert(index);
         let id = ids[index].clone();
         let batch_id = BatchItemId(id.0.clone());
         if !(200..=299).contains(&item.status) {

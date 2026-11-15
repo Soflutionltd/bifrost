@@ -160,7 +160,7 @@ pub(super) fn mutation_stream(
                 while let Some(id) = targets.next().await {
                     let item = BatchItemId(id.0);
                     rejected.push(ItemOutcome::Failed(BatchFailure::new(item, error.clone())));
-                    if rejected.len() >= super::TARGET_BUFFER_ITEMS
+                    if rejected.len() >= account.config.mutation_batch_size.max(1)
                         && flush_items(&mut rejected, &tx).await.is_err()
                     {
                         return;
@@ -196,7 +196,7 @@ pub(super) fn mutation_stream(
                 }
             }
             buffered += 1;
-            if buffered >= super::TARGET_BUFFER_ITEMS {
+            if buffered >= account.config.mutation_batch_size.max(1) {
                 if flush_items(&mut undecodable, &tx).await.is_err() {
                     return;
                 }

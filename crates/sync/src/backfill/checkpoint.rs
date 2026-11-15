@@ -93,10 +93,8 @@ impl BackfillCheckpointWriter {
                 let (done, wait) = oneshot::channel();
                 tx.send(WriterRequest::PersistBackfill { checkpoint, done })
                     .await
-                    .map_err(|error| Error::Other(format!("writer channel closed: {error}")))?;
-                wait.await.map_err(|error| {
-                    Error::Other(format!("writer dropped before persisting: {error}"))
-                })?
+                    .map_err(|_| Error::ShuttingDown)?;
+                wait.await.map_err(|_| Error::ShuttingDown)?
             }
             TargetRoute::Store(store) => {
                 let ledger = store.get_ledger(&self.account_id).await?;

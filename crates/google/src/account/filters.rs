@@ -5,15 +5,12 @@
 //! it fresh rather than assuming that sweep covered it.
 
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, ContainerId, FilterAction, FilterCondition,
     FilterDiagnostic, FilterDiagnosticSeverity, FilterRule, FilterRuleCreate, FilterValidation,
     Provider, ServerFilter, ServerFilterCreate, ServerFilterId,
 };
-use jiff::Timestamp;
-use jiff::tz::Offset;
 
 use crate::client::GmailClient;
 use crate::types::{
@@ -23,6 +20,9 @@ use crate::types::{
 use super::error::{GmailErrorContext, into_account_error};
 use super::flags;
 use super::flags::{LABEL_STARRED, LABEL_TRASH, LABEL_UNREAD};
+#[cfg(test)]
+use super::query::container_query;
+use super::query::{condition_query, sanitize_term};
 
 pub(crate) fn list(
     client: Arc<GmailClient>,
@@ -260,7 +260,7 @@ fn apply_condition(
         FilterCondition::From(value) => set_or_query(
             &mut builder.criteria.from,
             sanitize_term(value),
-            format!("from:{}", query_term(value)),
+            condition_query(condition, op)?,
             &mut builder.query,
         ),
         FilterCondition::To(value)
@@ -269,78 +269,50 @@ fn apply_condition(
             set_or_query(
                 &mut builder.criteria.to,
                 sanitize_term(value),
-                format!("to:{}", query_term(value)),
+                condition_query(condition, op)?,
                 &mut builder.query,
             );
         }
         FilterCondition::Subject(value) => set_or_query(
             &mut builder.criteria.subject,
             sanitize_term(value),
-            format!("subject:{}", query_term(value)),
+            condition_query(condition, op)?,
             &mut builder.query,
         ),
-        FilterCondition::Body(value) => builder.query.push(query_term(value)),
         FilterCondition::HasAttachment(value) => {
             if builder.criteria.has_attachment.is_none() {
                 builder.criteria.has_attachment = Some(*value);
             } else {
-                builder.query.push(if *value {
-                    "has:attachment".to_string()
-                } else {
-                    "-has:attachment".to_string()
-                });
+                builder.query.push(condition_query(condition, op)?);
             }
-        }
-        FilterCondition::InContainer(container) => {
-            builder.query.push(container_query(&container.0));
         }
         FilterCondition::SizeGreaterThan(size) => set_size_or_query(
             &mut builder.criteria,
             *size,
             GmailFilterSizeComparison::Larger,
-            format!("larger:{size}"),
+            condition_query(condition, op)?,
             &mut builder.query,
         ),
         FilterCondition::SizeLessThan(size) => set_size_or_query(
             &mut builder.criteria,
             *size,
             GmailFilterSizeComparison::Smaller,
-            format!("smaller:{size}"),
+            condition_query(condition, op)?,
             &mut builder.query,
         ),
-        FilterCondition::DateRange { after, before } => {
-            if let Some(after) = after {
-                builder.query.push(format!("after:{}", gmail_date(*after)));
-            }
-            if let Some(before) = before {
-                builder
-                    .query
-                    .push(format!("before:{}", gmail_date(*before)));
-            }
-        }
-        FilterCondition::ProviderExpression {
-            provider,
-            expression,
-        } => {
-            if *provider != Provider::Gmail {
-                return Err(invalid(
-                    op,
-                    "Gmail filters cannot store another provider's expression",
-                ));
-            }
-            builder.query.push(sanitize_term(expression));
-        }
+        FilterCondition::DateRange {
+            after: None,
+            before: None,
+        } => {}
+        FilterCondition::Body(_)
+        | FilterCondition::InContainer(_)
+        | FilterCondition::DateRange { .. }
+        | FilterCondition::ProviderExpression { .. }
+        | FilterCondition::Or(_) => builder.query.push(condition_query(condition, op)?),
         FilterCondition::And(items) => {
             for item in items {
                 apply_condition(builder, item, op)?;
             }
-        }
-        FilterCondition::Or(items) => {
-            let parts = items
-                .iter()
-                .map(|item| condition_query(item, op))
-                .collect::<Result<Vec<_>, _>>()?;
-            builder.query.push(format!("({})", parts.join(" OR ")));
         }
         FilterCondition::Not(item) => {
             builder.negated_query.push(condition_query(item, op)?);
@@ -354,64 +326,6 @@ fn apply_condition(
         _ => return Err(invalid(op, "unsupported Gmail filter condition")),
     }
     Ok(())
-}
-
-fn condition_query(
-    condition: &FilterCondition,
-    op: AccountOperation,
-) -> Result<String, AccountError> {
-    match condition {
-        FilterCondition::From(value) => Ok(format!("from:{}", query_term(value))),
-        FilterCondition::To(value)
-        | FilterCondition::Cc(value)
-        | FilterCondition::Recipient(value) => Ok(format!("to:{}", query_term(value))),
-        FilterCondition::Subject(value) => Ok(format!("subject:{}", query_term(value))),
-        FilterCondition::Body(value) => Ok(query_term(value)),
-        FilterCondition::HasAttachment(true) => Ok("has:attachment".to_string()),
-        FilterCondition::HasAttachment(false) => Ok("-has:attachment".to_string()),
-        FilterCondition::InContainer(container) => Ok(container_query(&container.0)),
-        FilterCondition::SizeGreaterThan(size) => Ok(format!("larger:{size}")),
-        FilterCondition::SizeLessThan(size) => Ok(format!("smaller:{size}")),
-        FilterCondition::DateRange { after, before } => {
-            let mut parts = Vec::new();
-            if let Some(after) = after {
-                parts.push(format!("after:{}", gmail_date(*after)));
-            }
-            if let Some(before) = before {
-                parts.push(format!("before:{}", gmail_date(*before)));
-            }
-            Ok(parts.join(" "))
-        }
-        FilterCondition::ProviderExpression {
-            provider,
-            expression,
-        } => {
-            if *provider == Provider::Gmail {
-                Ok(sanitize_term(expression))
-            } else {
-                Err(invalid(
-                    op,
-                    "Gmail filters cannot store another provider's expression",
-                ))
-            }
-        }
-        FilterCondition::And(items) => items
-            .iter()
-            .map(|item| condition_query(item, op))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|items| items.join(" ")),
-        FilterCondition::Or(items) => items
-            .iter()
-            .map(|item| condition_query(item, op))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|items| format!("({})", items.join(" OR "))),
-        FilterCondition::Not(item) => Ok(format!("-({})", condition_query(item, op)?)),
-        FilterCondition::HeaderContains { .. } => Err(invalid(
-            op,
-            "Gmail filters do not support arbitrary header conditions",
-        )),
-        _ => Err(invalid(op, "unsupported Gmail filter condition")),
-    }
 }
 
 fn set_or_query(
@@ -502,43 +416,6 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
     if !values.iter().any(|existing| existing == value) {
         values.push(value.to_string());
     }
-}
-
-fn sanitize_term(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| if matches!(ch, '\r' | '\n') { ' ' } else { ch })
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
-
-fn query_term(value: &str) -> String {
-    let sanitized = sanitize_term(value);
-    if sanitized
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '@' | '/' | ':'))
-    {
-        sanitized
-    } else {
-        format!(
-            "\"{}\"",
-            sanitized.replace('\\', "\\\\").replace('"', "\\\"")
-        )
-    }
-}
-
-fn container_query(id: &str) -> String {
-    super::flags::container_search_operator(id)
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("label:{}", query_term(id)))
-}
-
-fn gmail_date(time: SystemTime) -> String {
-    let dt = Offset::UTC
-        .to_datetime(Timestamp::try_from(time).unwrap_or(Timestamp::UNIX_EPOCH))
-        .date();
-    format!("{:04}/{:02}/{:02}", dt.year(), dt.month(), dt.day())
 }
 
 #[cfg(test)]

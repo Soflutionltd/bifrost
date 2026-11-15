@@ -10,14 +10,8 @@ use super::{Object, SetCreate, request::ResultReference};
 /// Escape one token of an RFC 8620 s5.3 patch path (a JSON Pointer,
 /// RFC 6901): `~` becomes `~0` and `/` becomes `~1`.
 ///
-/// Every `format!`-built dotted path in this crate must route its
-/// interpolated token through here. Most JMAP ids are URL-safe by
-/// grammar, but keywords are IMAP atoms (which legally contain `/` -
-/// `work/urgent`), and server-minted map keys carry no grammar promise
-/// at all. An unescaped `/` splits the token into extra pointer steps:
-/// `keywords/work/urgent` patches a nested key inside the keyword map's
-/// `work` entry, which a strict server rejects as `invalidPatch` and a
-/// lenient one misapplies.
+/// New dynamic paths use `core::patch::PatchPath::new`. This encoder stays
+/// available for account-layer callers that already build encoded wire paths.
 pub(crate) fn escape_json_pointer_token(token: &str) -> String {
     token.replace('~', "~0").replace('/', "~1")
 }
@@ -517,20 +511,4 @@ impl Display for SetErrorType {
 // replacing an invalid date with the epoch changes the user's requested date.
 pub(crate) fn from_timestamp(timestamp: i64) -> Timestamp {
     Timestamp::from_second(timestamp).unwrap_or(Timestamp::UNIX_EPOCH)
-}
-
-pub(crate) fn skip_if_empty_str(string: &Option<String>) -> bool {
-    matches!(string, Some(string) if string.is_empty())
-}
-
-pub(crate) fn skip_if_zero_date(date: &Option<Timestamp>) -> bool {
-    matches!(date, Some(date) if date.as_second() == 0)
-}
-
-pub(crate) fn skip_if_empty_list<O>(list: &Option<Vec<O>>) -> bool {
-    matches!(list, Some(list) if list.is_empty() )
-}
-
-pub(crate) fn skip_if_empty_map<K, V>(list: &Option<HashMap<K, V>>) -> bool {
-    matches!(list, Some(list) if list.is_empty() )
 }

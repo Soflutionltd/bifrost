@@ -34,23 +34,17 @@ pub(crate) enum Credentials {
 #[derive(Clone)]
 pub(crate) enum Authorization {
     Basic(String),
-    Bearer(Arc<dyn TokenSource>),
+    Bearer(bifrost_net::CoordinatedTokenSource),
 }
 
 impl Authorization {
     fn from_credentials(credentials: Credentials) -> Self {
         match credentials {
             Credentials::Basic(value) => Self::Basic(value),
-            Credentials::Bearer(token) => {
-                // HTTP and WebSocket retain this exact coordinating handle.
-                // Net preserves it rather than wrapping a second cache.
-                let source = if token.is_coordinating() {
-                    token
-                } else {
-                    Arc::new(bifrost_net::OAuthRefresher::new(token)) as Arc<dyn TokenSource>
-                };
-                Self::Bearer(source)
-            }
+            // HTTP and WebSocket retain this exact coordinating handle, the
+            // same admission net and DAV use: an already-coordinating source
+            // is kept as is, a raw provider gets one refresher.
+            Credentials::Bearer(token) => Self::Bearer(bifrost_net::coordinate(token)),
         }
     }
 
@@ -81,7 +75,7 @@ impl Authorization {
         match self {
             // This inert handle is not attached to Basic transport accounts.
             Self::Basic(_) => Arc::new(StaticTokenSource::new("", None)),
-            Self::Bearer(source) => Arc::clone(source),
+            Self::Bearer(source) => Arc::clone(source.as_source()),
         }
     }
 

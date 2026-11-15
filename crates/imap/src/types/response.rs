@@ -563,6 +563,9 @@ pub struct MoveResult {
     /// untagged `OK [COPYUID ...]`, whatever code the tagged OK carries.
     /// Always a [`ResponseCode::CopyUid`] when present. `None` when the
     /// server sent no COPYUID at all.
+    // The account mutation effect recorder destructures this response code.
+    // A dedicated mapping type must migrate that reader together with this
+    // field; retaining the code here preserves its committed-copy evidence.
     pub copy_uid: Option<ResponseCode>,
     /// The EXPUNGE or VANISHED responses that preceded the tagged OK
     /// (RFC 6851 Section 3 / RFC 7162 Section 3.2.10).
@@ -589,6 +592,9 @@ pub struct CopyResult {
     /// `OK [COPYUID ...]`, whatever code the tagged OK carries. Always a
     /// [`ResponseCode::CopyUid`] when present. `None` when the server sent
     /// no COPYUID at all.
+    // The account mutation effect recorder destructures this response code.
+    // A dedicated mapping type must migrate that reader together with this
+    // field; retaining the code here preserves its committed-copy evidence.
     pub copy_uid: Option<ResponseCode>,
 }
 

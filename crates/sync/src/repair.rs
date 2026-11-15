@@ -337,9 +337,8 @@ pub async fn run_repair_pass(
                 done,
             })
             .await
-            .map_err(|e| Error::Other(format!("writer channel closed: {e}")))?;
-        wait.await
-            .map_err(|e| Error::Other(format!("writer dropped before applying repair: {e}")))??;
+            .map_err(|_| Error::ShuttingDown)?;
+        wait.await.map_err(|_| Error::ShuttingDown)??;
     }
     Ok(resolved)
 }

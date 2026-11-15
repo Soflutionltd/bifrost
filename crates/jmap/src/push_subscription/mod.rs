@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::DataType;
 use crate::core::field::Field;
-use crate::core::set::skip_if_empty_list;
 
 mod marker {
     pub(crate) enum PushSubscription {}
@@ -76,8 +75,8 @@ pub(crate) struct PushSubscriptionCreate {
     pub(super) expires: Option<Timestamp>,
 
     #[serde(rename = "types")]
-    #[serde(skip_serializing_if = "skip_if_empty_list")]
-    pub(super) types: Option<Vec<DataType>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) types: Field<Vec<DataType>>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -153,7 +152,7 @@ impl crate::core::SetCreate for PushSubscriptionCreate {
             keys: None,
             verification_code: None,
             expires: None,
-            types: Vec::with_capacity(0).into(),
+            types: Field::Omitted,
         }
     }
 }

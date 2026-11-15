@@ -418,7 +418,8 @@ Date setters on `EmailCreate` (`sent_at`, `received_at`) and `EmailImport` (`rec
 
 ## Key types
 
-- `Field<T>` - three-state nullable: `Omitted` / `Null` / `Value(T)`. Use instead of `Option<Option<T>>`.
+- `Field<T>` - three-state nullable: `Omitted` / `Null` / `Value(T)`. Use instead of `Option<Option<T>>`, and instead of sentinels: an empty collection, an empty string and an epoch date are real values, never a stand-in for "clear". At a setter boundary `From<Option<T>>` maps `None` to an explicit `Null`; an untouched property stays `Omitted`. Mailbox role setters and `Filter::role` take `Option<Role>`, where `None` is the explicit null role.
+- `core::patch` - the one owner of PatchObject path handling. `PatchPath::new` builds a path from literal segments with RFC 6901 escaping, so an id containing `/` or `~` cannot retarget the edit; `From<&str>` / `From<String>` accept an already-encoded path as is. `patch::insert` applies RFC 8620's no-overlap rule as latest-setter-wins: an edit removes any earlier edit on the same path, a parent of it or a child of it, while sibling paths survive. `IdSet` builds complete create-time `Id[Boolean]` sets (memberships, keywords) holding only `true` members; `IdSetPatch` edits them by per-member path (`true` to add, `null` to remove) or replaces the whole set. The generated `set_property` goes through `patch::insert`; the raw JSON-map escape hatches (`properties_mut` on `json_object_struct!` types) bypass overlap handling, and a caller writing paths through them owns RFC 8620 overlap validation.
 - `Id<T>` - phantom-typed string ID: `AccountId`, `BlobId`, `State`. Available for incremental adoption.
 - `Account<Tr>` - internal account-scoped view of `Client`. Use `account.build()` for scoped requests inside the crate.
 - `Capability` trait - typed URIs with associated `Config` type.
@@ -1218,9 +1219,39 @@ direct TCP when no proxy applies. Both proxy TLS and origin TLS use the owning
 Net's trust configuration, including an injected Net's roots and certificate
 policy. Proxy credentials are confined to CONNECT. Redirects remain refused.
 
+### Cursor scope classification
+
+`sync/state.rs::JmapScopeRepr` is the shared parser into the persisted
+scope vocabulary; its exhaustive `data_type` classification is shared by cursor
+descriptions, fresh establishment and push. Inventory and changes dispatch on
+that same vocabulary. Discovery seeds primary Email, primary Mailbox and one
+account-level Folder per share. This discovery topology is narrower than the
+supported persisted vocabulary: foreign per-mailbox Folder cursors still drive
+filtered inventory and account-wide Email changes. Their v2 rows remain readable
+without a schema bump. Thread and Query tags remain readable but unsupported.
+Collapsing this vocabulary to only the three discovery shapes would remove the
+legacy per-mailbox capability; it is deliberately retained.
+
+Folder ids without a foreign-account separator cannot subscribe to Email push. The account subscription
+door also rejects departed shares, retaining reachable scopes in a mixed request.
+Cursor descriptions advertise no strategy for a departed share.
+When every requested scope is a departed share, `push_subscribe` returns a
+subscription with no handle and one refusal per scope, never a call-level
+error: a user whose share was removed expects that share shown as unwatched,
+the same answer a mixed request gives it.
+An enterprise mailbox user expects an unreachable share to be reported rather
+than falsely advertised as watched. Existing seeded-state storage and deterministic
+discovery ordering remain unchanged.
+
 ### Error translation
 
 `sync/error.rs::into_account_error(error, ctx)` is the single translation boundary: it consumes `crate::Error` plus a `JmapErrorContext { operation, scope, .. }` and emits an `AccountError` via `AccountErrorBuilder`, routing `(AccountErrorKind, Cause)` plus operation, scope, and any `AttemptCause` through `bifrost-types::recovery::derive` (central `RecoveryClass`; no private `to_recovery` table).
+
+The request contract is one of `Plain`, `StateRead(CursorScope)`,
+`AnchoredQuery(CursorScope)` or `Send`. Only `Send` adds envelope-decode
+acknowledgement and evidence-less transport in-flight evidence. A plain request
+may still carry a diagnostic scope without acquiring state-read or anchor
+recovery. Provider identity is unset at this generic JMAP boundary.
 
 Mapping highlights for the JMAP signals the central table reads:
 
@@ -1232,17 +1263,16 @@ arrived) and, unless its primary cause already is one, the typed
   `State(ConcurrencyConflict)` -> `Retry::AfterStateRefresh`.
 - `Method(cannotCalculateChanges | tooManyChanges)` ->
   `SyncState(CursorInvalid)` -> `Engine(RestartScope)` only when the request
-  context is marked state-based and carries an `ErrorScope::Cursor`. A
-  state-based context without a cursor scope is a client
-  `Internal(InvariantViolated)`, not evidence of provider misconduct; the same
-  method errors on a stateless request are `Protocol(ContractViolation)`. The
-  changes and lifecycle walks mark their requests state-based. Lifecycle
+  context is `StateRead(CursorScope)`. Its constructor requires the recovery
+  scope, so the missing-scope combination is unrepresentable. The same method
+  errors on a stateless request are `Protocol(ContractViolation)`. The
+  changes and lifecycle walks use state-read contracts. Lifecycle
   handles `CursorInvalid` locally by reconciling a fresh name snapshot.
 - `Method(anchorNotFound)` -> `SyncState(CursorInvalid)` ->
-  `Engine(RestartScope)` only when the request context explicitly marks an
-  anchored query and carries a cursor scope. A cursor-scoped `get` or an
-  unanchored first-page query remains `Protocol(ContractViolation)`; an
-  anchored-query context without a cursor scope is an internal invariant error.
+  `Engine(RestartScope)` only when the request context uses an
+  `AnchoredQuery(CursorScope)` contract. A cursor-scoped `get` or an
+  unanchored first-page query remains `Protocol(ContractViolation)`; the
+  anchored-query constructor requires its recovery scope.
 - `Method(serverUnavailable | serverFail)` -> `Server(Unavailable)` ->
   `Retry::SameRequest`. `Method(serverPartialFail)` is different: some calls
   may have committed, so it is `Protocol(PartialResponse)` (the wire cause is

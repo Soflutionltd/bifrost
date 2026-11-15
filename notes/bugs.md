@@ -68,19 +68,6 @@ request, so a forged or stale handle steers the provider. Gmail and JMAP refuse
 regardless. Proposal: providers re-derive handle capability from the `BlobId`
 they minted rather than reading it off the caller's handle.
 
-## BUG-003 - Google `Message` hydration drops recipients without marking the message incomplete
-
-**Reported by:** types.
-
-`Address::parse_list` (lossy) and `parse_list_checked` are two doors to one
-parser, and each call site decides whether silent recipient loss is acceptable.
-Google's `Message` hydration in `google/src/account/pim.rs` reads ONE `To`
-header (`header_from`) lossily, while its draft path reads every repeated
-header checked. A hydrated `Message` that dropped recipients does not set
-`incomplete`. Proposal: a single `AddressList { accepted, rejected }` return so
-every caller sees the loss; at minimum read all repeated headers and set
-`incomplete` on rejection.
-
 ## BUG-006 - A freshly minted cursor with a bad envelope gets three classifications
 
 **Reported by:** sync-engine (P2/P3, sites already disagree).
@@ -126,44 +113,6 @@ teardown fails. Its comment says "a paused account makes no provider calls on
 the engine's own initiative", which the code does not keep. `repair_debt`
 likewise does wire work with no activity guard, admission or throttle wait. The
 gate itself is CON-014.
-
-## BUG-010 - "The writer is gone" means something different at every call site
-
-**Reported by:** sync-engine (P3), sync-lanes (live divergence).
-
-`WriterHandle::reset_account_for_schema_recovery` maps a closed channel to
-`Error::ShuttingDown`; every other `WriterHandle` method, plus `ack_checkpoint`,
-`ack_publication`, `operator_decision` and `repair.rs`, maps it to
-`Error::Other("writer channel closed: ..")`. Callers branch on `ShuttingDown`:
-`run_deferred_inventory_establishment` returns quietly on it but logs `Other` as
-"deferred inventory failed". A consumer calling `ack_checkpoint` during detach
-gets `Other(String)` instead of `AccountNotAttached`.
-
-The sync-lanes hunter's table of the lanes' answers:
-
-| Site | Writer gone means |
-|---|---|
-| `inventory_walk::record_barriers` | `Ok(())`: "not a persistence failure" |
-| `inventory_walk::cross_waived_barriers` | `Ok(false)`: not waived, so the walk stops |
-| `inventory_walk::record_refused_debt` | `Err(Error::ShuttingDown)` |
-| runner `Done` `RecordDebt` | ignored: `let _ = done_rx.await;` drops a store error and a departed writer alike (the writer retains the report, so only the diagnostic is lost; `record_refused_debt`, sending the same request, logs it) |
-| `engine/backfill.rs::scope_barrier_blocked` | `false`: not blocked, so the walk proceeds |
-| `engine/backfill.rs::discard_backfill_progress` | `false`: request stays outstanding |
-| `WriterHandle::get_change_cursor`, `persist_established`, `reset_scope`, `reattach_insert` | `Err(Error::Other("writer channel closed"))` |
-| `WriterHandle::reset_account_for_schema_recovery` | `Err(Error::ShuttingDown)` |
-| `BackfillCheckpointWriter::persist` (Writer route) | `Err(Error::Other(..))` |
-| `repair.rs` `ApplyRepair` | `Err(Error::Other(..))` |
-
-Some divergence is principled (a barrier with nowhere to persist is not a
-failure), but `scope_barrier_blocked` answering "not blocked" while
-`cross_waived_barriers` answers "not waived" are opposite fail-open and
-fail-closed choices on the same ledger, and `Error::Other` vs
-`Error::ShuttingDown` changes which recovery arm the caller takes. The lanes hold
-raw `mpsc::Sender<WriterRequest>`s and hand-roll the oneshot dance at each site;
-only recovery code gets `WriterHandle`. Proposal: `WriterHandle` everywhere,
-returning `Result<T, WriterError>` with `WriterError::Gone` distinct from
-`WriterError::Store(Error)`, so each call site states which it tolerates (see
-STR-031 for where the writer protocol should live).
 
 ## BUG-015 - Proof generations restart at zero every attachment while ledger generations are durable
 
@@ -289,70 +238,6 @@ is written with uidvalidity 0, so every reconnect silently drops QRESYNC and
 full-resyncs. Owner: the decoder (or the SELECT consumer) turns the wire number
 into `Option<UidValidity>` / `Option<ModSeq>` once, stating the "0 means absent"
 tolerance there; every downstream field is the typed value.
-
-## BUG-027 - "Is this mailbox INBOX / the same mailbox?" has six answers, and a solicited STATUS is misrouted
-
-**Reported by:** imap-protocol (live).
-
-- `MailboxName::eq` / `hash`: wire identity, NO INBOX folding (`"inbox"` !=
-  `"INBOX"`).
-- `MailboxName::matches_mailbox`: folds exact `INBOX` only.
-- `classification::mailbox_names_eq`: folds exact `INBOX`; production-dead,
-  kept alive only by `connection/helpers_tests.rs` through the `inbox_eq` alias
-  - a copy that exists to be tested.
-- `encode::commands::encode_mailbox_str`: folds `INBOX` AND rewrites an
-  `INBOX<ascii-separator>child` prefix to upper case.
-- `account/push.rs::first_inbox_folder`: case-insensitive, with a tie-break
-  because the registry can hold two INBOX-equivalent entries (a consequence of
-  the first bullet).
-- `account/pim.rs::folder_role` name fallback: leaf-name `"inbox"` (BUG-028).
-
-The disagreement that bites: a caller names `inbox/Sub`; the encoder sends
-`INBOX/Sub`; the server answers `* STATUS "INBOX/Sub"`; `matches_mailbox`
-compares `inbox/Sub` with `INBOX/Sub` and says no; `classify` routes the
-solicited STATUS as unsolicited; the STATUS consumer's finalize reports the
-missing STATUS as `ProtocolMissing`. Same shape for QUOTAROOT, ACL, MYRIGHTS,
-METADATA and LIST-correlated consumers. Owner: `MailboxName` construction
-canonicalizes the INBOX token (and the INBOX-prefix, if the encoder's rule is
-kept) once, for caller and server names alike; `eq`, `hash`, `matches_mailbox`
-and the encoder then agree by construction, and `mailbox_names_eq` is deleted
-with its tests. The display/wire conversion it rides on is CON-031.
-
-## BUG-028 - IMAP role folders ignore namespace, so a shared folder can win the role
-
-**Reported by:** imap-protocol (live, needs confirmation), imap-account (live).
-
-The imap-account hunter reached the same defect independently: a shared
-`#shared/team/Sent` (sorting before `Sent`), or a shared folder carrying a
-`\Sent` attribute when the personal one has none, becomes the account's Sent, so
-`send_message` files the sender's copy there and `delete_thread` moves mail into
-another principal's Trash. It counts four deciders for "which folder plays role
-R": `pim::folder_role` / `role_folder_from_entries` (below);
-`capabilities::build_capabilities`'s `has_drafts` (SPECIAL-USE `\Drafts` or leaf
-`"drafts"` only - not `"draft"` - and only over the personal LIST, since it runs
-before shared folders are merged; its comment claims it is "the same leaf rule
-`folder_role` uses", but only the leaf split is shared, so a server with a
-`Draft` folder resolves `role_folder(Drafts)` while advertising `draft_create =
-false`); `push::first_inbox_folder` (full name equals `INBOX`
-case-insensitively, not the role rule); and `pim::quota_probe_folder`
-(`role_folder(Inbox)` then first selectable). Its owner: the registry computes
-roles once at ingest (personal namespace only, with an explicit policy for
-shared), and capabilities, send, draft, trash and push all read that one
-answer.
-
-`pim::role_folder_from_entries` filters every registry entry, personal and
-shared (`FolderEntry::shared_owner` is not consulted), by `folder_role`, ranks
-attribute matches above name matches, and breaks ties with
-`MailboxName::cmp_account_order` (lexicographic display order). On a server
-without SPECIAL-USE that exposes shared folders, personal `Trash` and shared
-`Shared/alice/Trash` both match by name with equal rank, and
-`"Shared/alice/Trash" < "Trash"`, so `delete` / trash fallback and
-`role_folder(Sent|Drafts)` can resolve to another user's folder. With the
-leaf-name rule for INBOX, `Archive/Inbox` (`'A' < 'I'`) beats `INBOX` for
-`quota_probe_folder`, and `containers_list` labels every shared user's `INBOX`
-as `FolderRole::Inbox`. Fix: restrict role resolution to the personal namespace,
-and match INBOX only as the top-level name. The duplicated role tables are
-CON-028.
 
 ## BUG-029 - IMAP command admission has three front doors and two clocks, and they disagree
 
@@ -525,23 +410,6 @@ unrecognized code. Owner: make `ImapResponseCode::code` public and derive
 middle table; the IMAP crate should own the conversion as an `impl From` beside
 `ResponseCode` in the codec, with the name table in exactly one place (see
 STR-013 on provider vocabularies in the neutral crate).
-
-## BUG-043 - An IMAP server without IDLE exposes push lanes and accepts direct `push_subscribe` while advertising no push
-
-**Reported by:** imap-account.
-
-`build_capabilities`: `PushCapability::InProcess` iff `Capability::Idle` and
-`push_capacity > 0`. `PushState::new`: lane count from `push_capacity` and
-`supports_notify`, no IDLE check. `push_subscribe` admission: `push_capacity > 0`
-and NOTIFY-or-budget, no IDLE check. `ImapAccountConfig::push_session_capacity`:
-the capacity rule itself. On a server without IDLE and `pool_cap >= 2`,
-capabilities say "no push" while `push_lanes()` is non-empty and a direct
-`push_subscribe` reports scopes in the succeeded lane. The engine reads lanes only
-when the capability is not `None`, so it is protected; a direct consumer is not.
-Owner: one `PushPlan { lanes, topology: Notify | PerFolder, capacity }` computed
-at open, `None` when the server cannot IDLE, from which capabilities, lanes and
-admission all read. The workspace-level form of the question is CON-004.
-`supports_notify` is also stored twice, on `ImapAccountInner` and `PushState`.
 
 ## BUG-045 - IMAP drops shared-namespace discovery failures and reports a degraded open twice
 
@@ -987,28 +855,6 @@ no Message-ID, `parse_draft_for_submission` falls back to the constant
 which then becomes the "stable fallback id" on the receipt
 (`append_to_sent_or_fallback`) - not unique by construction.
 
-## BUG-106 - bifrost-smtp's `account-error` feature cannot be turned off
-
-**Reported by:** smtp-sasl (defect: a promise to consumers the build does not keep).
-
-`Cargo.toml` makes `bifrost-types` optional behind `account-error` (a default
-feature), but nothing in `src/` is gated on it, and `account_error.rs`, `batch.rs`,
-`error.rs`, `authentication.rs`, `client/core.rs`, `client/envelope.rs`,
-`client/connection.rs`, `client/async_connection.rs`, `transport.rs` and
-`async_transport.rs` all name `bifrost_types::` unconditionally, so
-`--no-default-features` cannot compile. No `[[check]]` sweep builds bifrost-smtp
-without default features (`smtp-dkim` adds a feature; `install-shape` uses
-defaults). `SmtpTransmissionState` (+ `to_types_state`) duplicates
-`bifrost_types::TransmissionState` and only makes sense if the dependency were truly
-optional. Either make the dependency unconditional (dropping a published feature
-name needs the owner, and `SmtpTransmissionState` is replaced by the types enum) or
-actually gate the account surface and add a no-default sweep. Smaller:
-`Credentials::oauth2_token` carries `#[cfg_attr(not(feature = "tokio"),
-allow(dead_code))]` to keep an async-only helper compiled in blocking builds, and
-`test-support` exposes `ScriptedConnector`/`Transcript`, usable only by the async
-executor path, so a downstream crate cannot script the published blocking
-transport.
-
 ## BUG-110 - "May this logical request have committed?" is decided four ways in net and DAV, and they disagree
 
 **Reported by:** net-dav.
@@ -1040,25 +886,6 @@ self-walking caller (DAV) feed it, and `account_error` reads the verdict rather 
 re-mining `Cause::Attempt` entries out of translated errors. The evidence fields it
 replaces are STR-144; the second walker is CON-060.
 
-## BUG-111 - DAV bearer token sources are never coordinated
-
-**Reported by:** net-dav (likely live).
-
-`Net::attach_account` wraps any non-coordinating source in an `OAuthRefresher`, and
-JMAP's `Authorization::from_credentials` does the same on its own. DAV does neither:
-`dav_account_spec()` attaches with `AccountSpec::new(None)`, and
-`DavCredentials::Bearer { token_source }` is the consumer's raw source; `mint_auth`
-calls `token_source.current()` on every request, and the 401 path calls
-`refresh_if_unchanged`, whose trait default is a plain `refresh()`. A raw provider
-`TokenSource` passed to `CalDavCredentials::bearer_source` or
-`CardDavCredentials::bearer_source` gets none of the single-flight,
-proactive-refresh, max-age or failure-backoff guarantees the reference promises
-every other HTTP crate. The hunter did not check whether IMAP XOAUTH2 or SMTP have
-the same gap. Type fix: a `CoordinatedTokenSource` newtype mintable only by
-`coordinate(Arc<dyn TokenSource>)`, which wraps when needed, held by `AccountSpec`,
-JMAP and DAV, making `is_coordinating()` unnecessary; DAV can keep minting headers
-itself through `AccountNet::bearer()` if it attaches the source to its spec.
-
 ## BUG-048 - IMAP sync lanes cycle on a `UIDNOTSTICKY` folder
 
 **Reported by:** imap-account; reopened by the wave 1 review.
@@ -1070,31 +897,6 @@ vanish from the user's view, which removes a capability. The remaining fix is a
 cursor-free sync mode for such folders (re-inventory on each poll, no durable
 UID cursor, no CursorInvalid loop); the inventory site and `reference/imap.md`
 say so.
-
-## BUG-147 - Gmail `historyNotFound` is cursor loss whatever endpoint answered it
-
-**Reported by:** wave 3 fixer (google, lateral).
-
-`historyNotFound` derives `CursorInvalid` regardless of which endpoint returned
-it, though only the history endpoint's answer means the cursor is gone.
-
-## BUG-148 - A Graph subscription create with a missing or mistyped expiry orphans the subscription
-
-**Reported by:** wave 3 fixer (graph, lateral).
-
-A create response whose `expirationDateTime` is missing or wrongly typed fails
-deserialization, so the returned subscription id is lost before cleanup can
-register it and the server-side subscription is orphaned until it expires.
-Decode the id independently of the expiry, register it, then classify the bad
-expiry.
-
-## BUG-142 - Completion markers written by an empty backfill plan still skip inventory
-
-**Reported by:** wave 2 fixer (sync, lateral).
-
-A `Fixed` plan with zero partitions now runs one full inventory, but a durable
-completion marker an empty plan wrote before that fix is still honoured, so
-such a scope never inventories until the marker is cleared. No migration exists.
 
 ## BUG-116 - The HTTP bandwidth meter cannot be handed to the engine or IMAP
 
@@ -1117,22 +919,6 @@ factory, and behind it an `AccountRegistration` value owning every per-account
 entry, so detach and retag are one operation each. The string-keyed registries are
 STR-145.
 
-## BUG-076 - Four Graph `$batch` reconcilers disagree on invalid subresponses and etag maintenance
-
-**Reported by:** graph (live).
-
-The live symptom (a successful PIM write leaving the pre-write etag cached) is fixed:
-successful batch writes in `account/pim/messages.rs` now evict the cached validator.
-What remains is the duplication: "given the submitted legs and the subresponses,
-what is each leg's outcome, and what does the etag cache learn?" is still answered
-by `mutate::resolve_batch_responses` / `reconcile_mutation_responses` /
-`update_etag_cache_from_responses`, `get::reconcile_hydration_responses`,
-`pim::messages::submit_write_batch_resource`, and `reactions::classify_chunk`. On
-invalid input the first two discard an unparseable or out-of-range subresponse id
-while the PIM path dedupes by raw string and builds an `ErrorScope::Account`
-outcome; the etag rules are restated per lane. Owner: one `BatchAnswers::resolve`
-plus `EtagIndex::observe(id, Observation)` (STR-108).
-
 ## BUG-133 - A stale reattach abort can delete a row a scoped recovery resumed
 
 **Reported by:** resolution wave review (lateral; needs a ruling).
@@ -1147,4 +933,54 @@ restart before that ack. Before the ordering fixes the mark was always dropped, 
 the window is new. It needs a reattach attempt still pending while a scoped
 recovery runs on the same scope; decide whether that interleaving is reachable and
 whether a non-reattach resume should drop or transfer the mark.
+
+## BUG-150 - The Gmail query encoder drops time of day and substitutes the epoch on failure
+
+**Reported by:** wave 5 fixer (google, lateral).
+
+Date filters reach Gmail `q` as dates only, and a conversion failure yields the
+epoch rather than a refusal, so a bad bound silently searches from 1970.
+
+## BUG-151 - A failed Graph hydration keeps the cached etag
+
+**Reported by:** wave 5 fixer (graph, lateral).
+
+`account/get.rs` leaves the previously cached etag in place when hydration
+fails, a 404 included, so a later conditional write can carry the validator of
+an item already known to be gone.
+
+## BUG-152 - IMAP leaf matching and the quota fallback edge cases
+
+**Reported by:** wave 5 fixer (imap-account, lateral).
+
+A `NIL` hierarchy delimiter still triggers slash-based leaf matching in role
+resolution, and the quota probe's fallback can still pick a shared folder when
+the account has no personal INBOX.
+
+## BUG-153 - A huge COPYUID range is expanded into one id per UID
+
+**Reported by:** wave 5 fixer (imap-protocol, lateral).
+
+`account/mutate.rs` expands every COPYUID destination range into individual
+target references, so a very large server-supplied range costs unbounded CPU
+and memory. Bound the expansion or keep the range as a range.
+
+## BUG-154 - JMAP foreign-id and principal patch paths skip validation
+
+**Reported by:** wave 5 fixers (jmap, lateral).
+
+`sync/foreign.rs::parse_foreign` accepts an empty account id and repeated
+separators. Separately, `principal/set.rs` alias and member paths interpolate
+unescaped tokens and can coexist with a whole-property replacement, bypassing
+the new `PatchPath` overlap rule.
+
+## BUG-155 - Public coverage membership mutators can bypass subscription ownership
+
+**Reported by:** wave 5 fixer (sync, lateral).
+
+`PendingCoverage` now owns live-receiver membership, but its membership
+mutators are still public, and one ledger can be shared by several delivery
+gates, so a caller holding the coverage can break the ownership assumption the
+delivery gate relies on. Nothing in production does this; narrowing the
+mutators' visibility closes it.
 

@@ -251,7 +251,7 @@ fn net_to_account_error(net: bifrost_net::Error, ctx: &GraphErrorContext) -> Acc
             bifrost_net::into_account_error_with_throttle_scope(
                 net,
                 ctx.to_net_ctx(),
-                throttle_scope_for(ctx),
+                throttle_scope_for(),
             ),
             ctx,
         ),
@@ -346,7 +346,7 @@ pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext
             bifrost_net::into_account_error_with_throttle_scope(
                 net,
                 ctx.to_net_ctx(),
-                throttle_scope_for(&ctx),
+                throttle_scope_for(),
             ),
             &ctx,
         ),
@@ -486,7 +486,7 @@ fn soap_fault_to_account_error(
     let throttle = is_throttle(&kind);
     let mut builder = base_builder(ctx, kind, cause).text(detail);
     builder = push_attempt(builder, TransmissionState::Acknowledged);
-    if throttle && let Some(scope) = throttle_scope_for(ctx) {
+    if throttle && let Some(scope) = throttle_scope_for() {
         builder = builder.throttle_scope(scope);
     }
     finish(builder, ctx)
@@ -612,7 +612,7 @@ fn autodiscover_error(
         builder = builder.native_code(code.to_string());
     }
     builder = push_attempt(builder, TransmissionState::Acknowledged);
-    if throttle && let Some(scope) = throttle_scope_for(ctx) {
+    if throttle && let Some(scope) = throttle_scope_for() {
         builder = builder.throttle_scope(scope);
     }
     finish(builder, ctx)
@@ -759,7 +759,7 @@ fn response_to_account_error(
     // The retry hint already lives structurally on `ServerCause`; no
     // builder side-channel is needed. `throttle_scope` annotation
     // applies only on rate-limit / quota paths. A plain 503 is unavailable.
-    if throttle && let Some(scope) = throttle_scope_for(ctx) {
+    if throttle && let Some(scope) = throttle_scope_for() {
         builder = builder.throttle_scope(scope);
         if let Some(budget) = ctx.budget.as_ref() {
             builder = builder.throttle_budget(budget.clone());
@@ -1125,7 +1125,7 @@ fn parse_retry_after_header(headers: &HeaderMap) -> Option<RetryHint> {
 /// (it pauses this account's other mailboxes too) without inventing a
 /// tenant identity this crate never sees. It is a chosen approximation, not a
 /// claim about how EWS or the subscription service meter.
-fn throttle_scope_for(_ctx: &GraphErrorContext) -> Option<ThrottleScope> {
+fn throttle_scope_for() -> Option<ThrottleScope> {
     Some(ThrottleScope::Account)
 }
 

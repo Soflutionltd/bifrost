@@ -1090,17 +1090,17 @@ fn custom_auth_plain_equals_auth_variant() {
 #[test]
 fn sort_display_as_imap_str_round_trip() {
     // RFC 5957 defines the capability as `SORT=DISPLAY`. The parser stores the
-    // part after `SORT=` (i.e. `"DISPLAY"`) into `SortDisplay(String)`.
+    // token as the unit variant `SortDisplay`.
     // `as_imap_str()` must reconstruct the original wire form `SORT=DISPLAY`,
     // not `SORT=DISPLAYDISPLAY`.
-    let cap = Capability::SortDisplay("DISPLAY".to_owned());
+    let cap = Capability::SortDisplay;
     assert_eq!(cap.as_imap_str(), "SORT=DISPLAY");
 }
 
 #[test]
 fn sort_display_cross_representation_equality() {
-    // Cross-representation: Other("SORT=DISPLAY") must equal SortDisplay("DISPLAY").
-    let structured = Capability::SortDisplay("DISPLAY".to_owned());
+    // Cross-representation: Other("SORT=DISPLAY") must equal SortDisplay.
+    let structured = Capability::SortDisplay;
     let other = Capability::Other("SORT=DISPLAY".to_owned());
     assert_eq!(structured, other);
     assert_eq!(other, structured);
@@ -1112,7 +1112,7 @@ fn sort_display_hash_consistency() {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    let a = Capability::SortDisplay("DISPLAY".to_owned());
+    let a = Capability::SortDisplay;
     let b = Capability::Other("SORT=DISPLAY".to_owned());
 
     let hash = |c: &Capability| {
@@ -1295,10 +1295,7 @@ fn capability_as_imap_str_all_variants() {
     assert_eq!(Capability::SaveDate.as_imap_str(), "SAVEDATE");
     assert_eq!(Capability::SearchRes.as_imap_str(), "SEARCHRES");
     assert_eq!(Capability::Sort.as_imap_str(), "SORT");
-    assert_eq!(
-        Capability::SortDisplay("DISPLAY".into()).as_imap_str(),
-        "SORT=DISPLAY"
-    );
+    assert_eq!(Capability::SortDisplay.as_imap_str(), "SORT=DISPLAY");
     assert_eq!(Capability::StartTls.as_imap_str(), "STARTTLS");
     assert_eq!(Capability::SpecialUse.as_imap_str(), "SPECIAL-USE");
     assert_eq!(
@@ -1328,15 +1325,15 @@ fn capability_as_imap_str_all_variants() {
 #[test]
 fn capability_sort_display_equality() {
     // RFC 5957: SORT=DISPLAY capability.
-    // SortDisplay variants with same payload must be equal (case-insensitive).
+    // The parser recognizes the fixed token case-insensitively.
     assert_eq!(
-        Capability::SortDisplay("DISPLAY".into()),
-        Capability::SortDisplay("display".into()),
+        Capability::SortDisplay,
+        Capability::from_imap_str("sort=display"),
         "SortDisplay must compare case-insensitively per RFC 3501 Section 7.2.1"
     );
     assert_ne!(
-        Capability::SortDisplay("DISPLAY".into()),
-        Capability::SortDisplay("OTHER".into()),
+        Capability::SortDisplay,
+        Capability::from_imap_str("SORT=OTHER"),
     );
 }
 
@@ -1544,4 +1541,24 @@ fn capability_from_str_unknown() {
         Capability::from("X-CUSTOM-CAP"),
         Capability::Other("X-CUSTOM-CAP".to_owned())
     );
+}
+
+#[test]
+fn capability_parser_canonicalizes_suffixes() {
+    assert!(matches!(
+        Capability::from_imap_str("quota=res-storage"),
+        Capability::QuotaResource(value) if value == "STORAGE"
+    ));
+    assert!(matches!(
+        Capability::from_imap_str("rights=TEXK"),
+        Capability::Rights(value) if value == "texk"
+    ));
+    assert!(matches!(
+        Capability::from_imap_str("auth=plain"),
+        Capability::Auth(value) if value == "PLAIN"
+    ));
+    assert!(matches!(
+        Capability::from_imap_str("thread=references"),
+        Capability::Thread(value) if value == "REFERENCES"
+    ));
 }

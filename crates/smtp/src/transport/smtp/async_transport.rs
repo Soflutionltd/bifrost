@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "account-error")]
 use bifrost_types::error::{AccountError, BatchItem, BatchOutcome};
 
 use bifrost_net::MeterSinkHandle;
@@ -15,6 +16,7 @@ use super::PoolConfig;
 #[cfg(feature = "tokio")]
 use super::Tls;
 use super::WireMetering;
+#[cfg(feature = "account-error")]
 use super::batch::{SmtpBatchRecipient, batch_level_error};
 use super::pool::async_impl::Pool;
 use super::{
@@ -23,8 +25,10 @@ use super::{
 };
 use crate::AsyncTransport;
 use crate::TokioExecutor;
+#[cfg(feature = "account-error")]
 use crate::address::Address;
 use crate::executor::SmtpExecutor;
+#[cfg(feature = "account-error")]
 use crate::transport::smtp::account_error::SmtpErrorContext;
 use crate::transport::smtp::authentication::IntoSecretString;
 use crate::transport::smtp::error::SmtpCommandPhase;
@@ -68,7 +72,7 @@ pub struct AsyncSmtpTransport<E: Executor> {
 /// `RCPT` response; accepted recipients carry their post-DATA delivery response.
 ///
 /// Direct sends return only the ordered statuses. Use
-/// [`AsyncLmtpTransport::send_raw_batch_with_options`] when callers need the
+/// `AsyncLmtpTransport::send_raw_batch_with_options` (feature `account-error`) when callers need the
 /// RCPT-versus-final-status phase and per-recipient recovery classification.
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncLmtpTransport<E: Executor> {
@@ -100,7 +104,7 @@ impl AsyncTransport for AsyncLmtpTransport<TokioExecutor> {
     /// Sends an email and returns one LMTP status per recipient.
     ///
     /// For per-recipient command-phase and recovery details, use
-    /// [`AsyncLmtpTransport::send_raw_batch_with_options`].
+    /// `AsyncLmtpTransport::send_raw_batch_with_options` (feature `account-error`).
     async fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
         let mut conn = self.inner.connection().await?;
 
@@ -403,6 +407,7 @@ where
     /// per-recipient outcome can be attributed: pool checkout failure, connection
     /// setup failure, MAIL FROM rejection, or a pre-MAIL transport drop.
     #[allow(private_bounds)]
+    #[cfg(feature = "account-error")]
     pub async fn send_raw_batch_with_options(
         &self,
         from: Option<Address>,
@@ -522,7 +527,7 @@ where
     /// Sends an email over LMTP with per-message SMTP options.
     ///
     /// For per-recipient command-phase and recovery details, use
-    /// [`Self::send_raw_batch_with_options`].
+    /// `Self::send_raw_batch_with_options` (feature `account-error`).
     #[allow(private_bounds)]
     pub async fn send_raw_with_options(
         &self,
@@ -589,6 +594,7 @@ where
     /// per-recipient outcome can be attributed: pool checkout failure, connection
     /// setup failure, MAIL FROM rejection, or a pre-MAIL transport drop.
     #[allow(private_bounds)]
+    #[cfg(feature = "account-error")]
     pub async fn send_raw_batch_with_options(
         &self,
         from: Option<Address>,
@@ -1096,7 +1102,7 @@ impl<E> Debug for AsyncSmtpClient<E> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "account-error"))]
 #[cfg(feature = "tokio")]
 mod tests {
     use std::marker::PhantomData;

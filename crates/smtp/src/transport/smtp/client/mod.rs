@@ -21,7 +21,7 @@ pub use self::tls::{CertificateStore, Tls, TlsParameters, TlsParametersBuilder, 
 mod async_connection;
 #[cfg(feature = "tokio")]
 mod async_net;
-#[cfg(all(test, feature = "tokio"))]
+#[cfg(all(test, feature = "tokio", feature = "account-error"))]
 pub(crate) use async_net::AsyncNetworkStream;
 mod connection;
 mod core;

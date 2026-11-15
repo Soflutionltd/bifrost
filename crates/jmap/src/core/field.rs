@@ -93,3 +93,20 @@ impl<T> Field<T> {
 pub(crate) fn field_is_omitted<T>(field: &Field<T>) -> bool {
     field.is_omitted()
 }
+
+impl<T> From<T> for Field<T> {
+    fn from(value: T) -> Self {
+        Self::Value(value)
+    }
+}
+
+// At a setter boundary None explicitly clears a nullable property; untouched
+// payloads use Omitted. Empty strings, collections and epoch dates are values.
+impl<T> From<Option<T>> for Field<T> {
+    fn from(value: Option<T>) -> Self {
+        match value {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        }
+    }
+}

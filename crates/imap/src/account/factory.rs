@@ -66,8 +66,13 @@ pub struct ImapAccountConfig {
     pub idle_connection_budget: usize,
     pub idle_timeout: Duration,
     pub enable_qresync: bool,
+    /// Reserved polling hint. The account runs no background sync scheduler;
+    /// explicit changes calls always observe current flags, never a timed cache.
     pub flag_sync_interval: Duration,
+    /// Reserved polling hint. Suppressing deletion scans in explicit changes
+    /// calls would leave deleted mail visible; the engine owns polling cadence.
     pub deletion_check_interval: Duration,
+    /// Maximum input targets per mutation window, clamped to at least one.
     pub mutation_batch_size: usize,
     pub bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
     pub meter_sink: Option<Arc<dyn bifrost_net::MeterSink>>,
@@ -287,9 +292,10 @@ impl ImapAccountFactory {
             let contact_cursor_folders = dav_cursor_folders(contacts.as_ref()).await;
             let calendar_cursor_folders = dav_cursor_folders(calendars.as_ref()).await;
             let submission = open_submission(&cfg, meter.clone(), bandwidth_budget.clone())?;
-            let caps = capabilities::build_capabilities(
+            let registry = Arc::new(FolderRegistry::from_lists(folders, shared));
+            let mut caps = capabilities::build_capabilities_for_registry(
                 &profile,
-                &folders,
+                &registry,
                 cfg.sieve.is_some(),
                 contacts.as_ref().map(|c| c.capabilities()),
                 calendars.as_ref().map(|c| c.capabilities()),
@@ -297,7 +303,7 @@ impl ImapAccountFactory {
                 foreign_namespaces_advertised,
                 cfg.push_session_capacity(profile.supports_notify()),
             );
-            let registry = Arc::new(FolderRegistry::from_lists(folders, shared));
+            caps.batching_policy.max_items = cfg.mutation_batch_size.max(1);
             // Built AFTER the registry so the index can be made disjoint from
             // the real mailbox set: a DAV collection whose href happens to be
             // an IMAP mailbox name must not capture that mailbox's scope.

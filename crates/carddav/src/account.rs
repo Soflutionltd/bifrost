@@ -1741,7 +1741,7 @@ fn resource_file_name(url: &str) -> String {
 
 fn contact_addressbook_url(client: &CardDavClient, contact: &ContactId) -> Option<String> {
     let resolved = client.resolve_url(&contact.0);
-    bifrost_net::url::parent_collection_url(&resolved)
+    bifrost_dav_core::url::parent_collection_url(&resolved)
 }
 
 #[cfg(test)]

@@ -54,16 +54,6 @@ pub(crate) enum IdOrRef<I> {
     Reference(CreationRef),
 }
 
-// Preserve the create payload's existing empty-id omission policy for real ids.
-// None is an explicit null parent; the untouched create uses an empty id.
-pub(crate) fn skip_if_empty_id_or_ref<I: AsRef<str>>(id: &Option<IdOrRef<I>>) -> bool {
-    match id {
-        None => false,
-        Some(IdOrRef::Id(id)) => id.as_ref().is_empty(),
-        Some(IdOrRef::Reference(_)) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{CreationId, IdOrRef};

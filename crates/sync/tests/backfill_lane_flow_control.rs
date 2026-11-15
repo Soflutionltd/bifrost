@@ -773,7 +773,7 @@ async fn no_backfill_page_is_lost_or_duplicated_under_the_bound() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             pages += 1;
             seen.extend(batch_ids(&event));
             // A DELIBERATELY slow consumer. Without it the reader keeps up with
@@ -992,7 +992,7 @@ async fn a_mid_walk_receiver_replacement_does_not_settle_the_scope() {
                 continue;
             };
             let partition: String = String::from_utf8_lossy(&checkpoint.partition.0).into();
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             if first_page.is_none() {
                 first_page = Some(partition);
             }
@@ -1099,7 +1099,7 @@ async fn a_retry_after_lost_pages_restarts_an_open_ended_walk_from_its_beginning
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             partitions_seen.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
             ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
             if completion {
@@ -1168,7 +1168,7 @@ async fn completion_recorded(
         .get_backfill(account_id, scope)
         .await
         .expect("the in-memory store reads back")
-        .is_some_and(|checkpoint| checkpoint.partition.0 == b"complete")
+        .is_some_and(|checkpoint| checkpoint.partition.0 == b"complete:v2")
 }
 
 /// The partition key of a backfill page event.
@@ -1278,7 +1278,7 @@ async fn a_page_lost_after_the_marker_was_published_is_refused_at_ack_time() {
                 "a receiver that joined after a page must not be handed it, or this test \
                  stages no loss at all"
             );
-            if checkpoint.partition.0 == b"complete" {
+            if checkpoint.partition.0 == b"complete:v2" {
                 return (
                     event.scope.clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
@@ -1439,7 +1439,7 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            if checkpoint.partition.0 == b"complete" {
+            if checkpoint.partition.0 == b"complete:v2" {
                 return (
                     event.scope.clone(),
                     Checkpoint::Backfill(checkpoint.clone()),
@@ -1517,7 +1517,7 @@ async fn an_ack_time_refusal_reopens_the_incarnation_and_the_next_attach() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             offered.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
             engine
                 .ack_checkpoint(
@@ -1625,7 +1625,7 @@ async fn pages_lost_to_a_lag_withhold_the_completion_marker() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
             if completion {
                 walked_at_completion = stub.walked_partitions().len();
@@ -1688,7 +1688,7 @@ async fn the_live_driver_refuses_a_backfill_checkpoint() {
             bytes_in: 0,
             checkpoint: Some(Checkpoint::Backfill(bifrost_types::BackfillCheckpoint {
                 scope: hook_scope.clone(),
-                partition: bifrost_types::Partition(b"complete".to_vec()),
+                partition: bifrost_types::Partition(b"complete:v2".to_vec()),
                 progress_marker: None,
                 progress: bifrost_types::BackfillProgress::default(),
                 envelope_version: 1,
@@ -1974,7 +1974,7 @@ async fn a_page_ack_replayed_across_a_detach_does_not_rebuild_the_resume_positio
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             offered.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
             ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
             if completion {
@@ -2077,7 +2077,7 @@ async fn a_loss_with_no_walk_running_is_settled_by_detach() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             engine
                 .ack_checkpoint(
                     &account_id,
@@ -2132,7 +2132,7 @@ async fn a_loss_with_no_walk_running_is_settled_by_detach() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             offered.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
             ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
             if completion {
@@ -2330,7 +2330,7 @@ async fn a_departure_inside_a_live_detach_records_no_loss() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             engine
                 .ack_checkpoint(
                     &account_id,
@@ -2499,7 +2499,7 @@ async fn a_detach_between_the_loss_and_the_walks_end_still_drops_the_rows() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             offered.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
             ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
             if completion {
@@ -2602,7 +2602,7 @@ async fn a_loss_after_the_marker_is_durable_still_forces_a_fresh_walk() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             engine
                 .ack_checkpoint(
                     &account_id,
@@ -2669,7 +2669,7 @@ async fn a_loss_after_the_marker_is_durable_still_forces_a_fresh_walk() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             offered.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
             ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
             if completion {
@@ -2784,7 +2784,7 @@ async fn an_incomplete_positional_walk_restarts_after_a_detach() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             offered.insert(String::from_utf8_lossy(&checkpoint.partition.0).into());
             engine
                 .ack_checkpoint(
@@ -2897,7 +2897,7 @@ async fn a_withheld_marker_does_not_abandon_the_accounts_other_scopes() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            if checkpoint.partition.0 == b"complete" {
+            if checkpoint.partition.0 == b"complete:v2" {
                 completed.insert(format!("{:?}", checkpoint.scope));
             }
             engine
@@ -3051,7 +3051,7 @@ async fn the_runner_records_pages_that_reached_only_the_sentinel() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             ack_page_or_fenced(&engine, &account_id, &event, checkpoint).await;
             if completion {
                 walked_at_completion = stub.walked_partitions().len();
@@ -3128,7 +3128,7 @@ async fn a_completed_walk_does_not_strand_the_accounts_admission() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            if checkpoint.partition.0 == b"complete" {
+            if checkpoint.partition.0 == b"complete:v2" {
                 completed.insert(format!("{:?}", checkpoint.scope));
             }
             engine
@@ -3322,7 +3322,7 @@ async fn an_eagerly_acknowledging_consumer_never_strands_lane_capacity() {
             let Some(checkpoint) = backfill_checkpoint(&event) else {
                 continue;
             };
-            let completion = checkpoint.partition.0 == b"complete";
+            let completion = checkpoint.partition.0 == b"complete:v2";
             pages += 1;
             seen.extend(batch_ids(&event));
             engine

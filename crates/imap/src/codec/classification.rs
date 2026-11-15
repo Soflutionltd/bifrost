@@ -46,19 +46,6 @@ pub(crate) struct ClassificationContext<'a> {
     pub command_target: Option<&'a MailboxName>,
 }
 
-/// Compare two decoded mailbox names for command-response correlation.
-///
-/// RFC 3501 Section 5.1: `INBOX` is case-insensitive; all other mailbox
-/// names are compared byte-for-byte. Both arguments must be decoded
-/// (user-facing UTF-8), not wire-form.
-///
-pub(crate) fn mailbox_names_eq(a: &str, b: &str) -> bool {
-    if a.eq_ignore_ascii_case("INBOX") && b.eq_ignore_ascii_case("INBOX") {
-        return true;
-    }
-    a == b
-}
-
 /// Classify a (command, untagged-response) pair into a solicitation rule.
 ///
 /// This is the single source of routing truth for the entire IMAP crate.

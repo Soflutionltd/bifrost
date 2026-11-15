@@ -814,12 +814,16 @@ fn classify_response(
                 Cause::State(StateCause::ConcurrencyConflict),
             );
         }
-        GmailSignal::HistoryNotFound => {
+        GmailSignal::HistoryNotFound if ctx.history_endpoint => {
             return (
                 AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
                 Cause::State(StateCause::CursorInvalid),
             );
         }
+        // Only a history response proves cursor loss. Elsewhere preserve the
+        // HTTP classification: users must not lose sync progress because an
+        // unrelated endpoint returned a misplaced history reason.
+        GmailSignal::HistoryNotFound => {}
         GmailSignal::NotFound if ctx.history_endpoint => {
             return (
                 AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
@@ -1534,6 +1538,30 @@ mod tests {
             acc.recovery(),
             RecoveryClass::Engine(EngineDirective::RestartScope(CursorScope::Account))
         ));
+    }
+
+    #[test]
+    fn history_not_found_requires_history_endpoint() {
+        let history = into_account_error(
+            gmail_response(404, &body_with_reason("historyNotFound")),
+            GmailErrorContext::changes(),
+        );
+        assert!(matches!(
+            history.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
+        ));
+        for status in [400, 404, 500] {
+            let actual = into_account_error(
+                gmail_response(status, &body_with_reason("historyNotFound")),
+                GmailErrorContext::inventory(),
+            );
+            let fallback = into_account_error(
+                gmail_response(status, &body_with_reason("unrecognized")),
+                GmailErrorContext::inventory(),
+            );
+            assert_eq!(actual.kind(), fallback.kind());
+            assert_eq!(actual.recovery(), fallback.recovery());
+        }
     }
 
     #[test]

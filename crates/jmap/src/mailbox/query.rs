@@ -55,14 +55,8 @@ impl Filter {
         }
     }
 
-    pub(crate) fn role(value: Role) -> Self {
-        Filter::Role {
-            value: if !matches!(value, Role::None) {
-                value.into()
-            } else {
-                None
-            },
-        }
+    pub(crate) fn role(value: Option<Role>) -> Self {
+        Filter::Role { value }
     }
 
     pub(crate) fn has_any_role(value: bool) -> Self {

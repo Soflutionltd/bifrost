@@ -71,6 +71,9 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
         return recontextualize_preclassified(account_error, &ctx);
     }
 
+    // An enterprise send queue must distinguish configuration repair, policy
+    // changes and malformed peer exchanges. AUTH phase adds wire context; it
+    // must never turn caller input or peer protocol faults into policy blocks.
     match error.kind() {
         ErrorKind::Authentication => {
             let (kind, cause) = auth_reauth();
@@ -88,24 +91,6 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
             diagnostic.as_deref(),
             None,
         ),
-        ErrorKind::InvalidInput if matches!(phase, Some(SmtpCommandPhase::Auth { .. })) => {
-            // "No compatible authentication mechanism" and other local AUTH
-            // refusals must surface as Authorization(PolicyBlocked) so
-            // consumers route to a policy/reauth UX instead of "malformed
-            // request" -> ClientBug (internal telemetry).
-            //
-            // A SCRAM policy error arrives here too, and that one does
-            // know its rung, so the support text names it.
-            let detail = name_mechanism(diagnostic.clone(), auth_mechanism(phase));
-            build_basic(
-                &ctx,
-                AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked),
-                Cause::Access(AccessCause::PolicyBlocked),
-                attempt_state,
-                detail.as_deref(),
-                None,
-            )
-        }
         ErrorKind::InvalidInput => build_basic(
             &ctx,
             AccountErrorKind::Request(RequestErrorKind::Malformed),
@@ -174,14 +159,17 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
             diagnostic.as_deref(),
             None,
         ),
-        ErrorKind::Policy => build_basic(
-            &ctx,
-            AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked),
-            Cause::Access(AccessCause::PolicyBlocked),
-            attempt_state,
-            diagnostic.as_deref(),
-            None,
-        ),
+        ErrorKind::Policy => {
+            let detail = name_mechanism(diagnostic.clone(), auth_mechanism(phase));
+            build_basic(
+                &ctx,
+                AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked),
+                Cause::Access(AccessCause::PolicyBlocked),
+                attempt_state,
+                detail.as_deref(),
+                None,
+            )
+        }
         ErrorKind::Connection | ErrorKind::Network => build_transport(
             &ctx,
             TransportErrorKind::Network,
@@ -1170,12 +1158,8 @@ mod tests {
 
     #[test]
     fn auth_no_compatible_mechanism_routes_to_policy_blocked() {
-        // smtp-D2: an InvalidInput error originating from the AUTH path
-        // (e.g. server advertises no compatible mechanism for our
-        // credentials) must surface as Authorization(PolicyBlocked), not
-        // Request(Malformed) -> ClientBug. Consumer UX must offer reauth/
-        // policy-change, not "library bug, see internal telemetry".
-        let err = crate::transport::smtp::error::invalid_input(
+        // Negotiation refusal is explicitly policy-class, independent of phase.
+        let err = crate::transport::smtp::error::policy(
             "No compatible authentication mechanism was found",
         )
         .with_phase(SmtpCommandPhase::Auth { mechanism: None });
@@ -1187,10 +1171,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_input_without_phase_stays_malformed() {
-        // Phase-less InvalidInput keeps the original Request(Malformed)
-        // routing; only the Auth-tagged path elevates to PolicyBlocked.
-        let err = crate::transport::smtp::error::invalid_input("bad SIZE parameter");
+    fn invalid_input_in_auth_phase_stays_malformed() {
+        // Invalid input stays malformed even when the AUTH driver stamps a phase.
+        let err = crate::transport::smtp::error::invalid_input("bad credential configuration")
+            .with_phase(SmtpCommandPhase::Auth { mechanism: None });
         let account = into_account_error(err, ctx_smtp_send());
         assert!(matches!(
             account.kind(),
@@ -1227,15 +1211,17 @@ mod tests {
     }
 
     #[test]
-    fn error_phase_drives_auth_classification() {
+    fn error_phase_is_read_from_the_error_not_the_context() {
         // Phase has one carrier: `SmtpErrorContext` cannot hold one, so batch
-        // conversion cannot construct disagreeing evidence.
+        // conversion cannot construct disagreeing evidence. The phase on the
+        // error is still honoured (it names the mechanism) but a local
+        // invalid-input refusal is never reclassified as a policy block by it.
         let err = crate::transport::smtp::error::invalid_input("x")
             .with_phase(SmtpCommandPhase::Auth { mechanism: None });
         let account = into_account_error(err, ctx_smtp_send());
         assert!(matches!(
             account.kind(),
-            AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
         ));
     }
 

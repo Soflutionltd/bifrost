@@ -2151,7 +2151,7 @@ mod tests {
         // Only the doors taking an `Option<CalendarId>` route through the
         // default. `event_get` / `event_update` / `event_rsvp` derive the
         // collection from the resource's own URL, and
-        // `bifrost_net::url::parent_collection_url` answers for every id that
+        // `bifrost_dav_core::url::parent_collection_url` answers for every id that
         // resolves absolute, so their fallback is unreachable in practice.
 
         let mut scopes = account.discover_cursor_scopes();

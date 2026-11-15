@@ -208,6 +208,7 @@ pub enum Dialect {
     Lmtp,
 }
 
+#[cfg(feature = "account-error")]
 impl From<Dialect> for bifrost_types::error::Protocol {
     fn from(dialect: Dialect) -> Self {
         match dialect {
@@ -243,14 +244,19 @@ use crate::transport::smtp::{
     response::Response,
 };
 
+// Account integration is optional; direct SMTP/LMTP clients keep their wire
+// errors and response APIs without the shared account vocabulary.
+#[cfg(feature = "account-error")]
 mod account_error;
 #[cfg(feature = "tokio")]
 mod async_transport;
 // pub: users select credential kinds and explicit SASL mechanisms.
 pub mod authentication;
+#[cfg(feature = "account-error")]
 mod batch;
 
 // pub: composed accounts share the SMTP-owned submission interpretation.
+#[cfg(feature = "account-error")]
 pub use batch::{SubmissionStatus, submission_status};
 mod client;
 mod commands;

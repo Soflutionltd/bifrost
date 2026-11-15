@@ -745,6 +745,10 @@ pub(crate) fn scripted_account_config(pool_cap: usize) -> super::factory::ImapAc
     imap.keepalive = None;
     super::factory::ImapAccountConfig {
         pool_cap,
+        // The window-boundary transcripts are written against the read
+        // path's TARGET_BUFFER_ITEMS window; pin the mutation window to it so
+        // they exercise a boundary rather than the production default.
+        mutation_batch_size: super::TARGET_BUFFER_ITEMS,
         ..super::factory::ImapAccountConfig::new(
             imap,
             crate::types::Credentials::password("user", "pass"),
@@ -761,6 +765,15 @@ pub(crate) fn scripted_account_parts_from(
     config: super::factory::ImapAccountConfig,
     connector: super::pool::Connector,
 ) -> super::ImapAccountParts {
+    let mut capabilities = stub_capabilities();
+    if conn
+        .server_profile()
+        .supports(crate::types::Capability::Idle)
+        && config.push_session_capacity(false) > 0
+    {
+        capabilities.push = bifrost_types::PushCapability::InProcess;
+    }
+    capabilities.batching_policy.max_items = config.mutation_batch_size.max(1);
     let config = Arc::new(config);
     let bandwidth_budget = bifrost_net::BandwidthBudget::default();
     let pool = Arc::new(super::Pool::new(
@@ -772,7 +785,7 @@ pub(crate) fn scripted_account_parts_from(
     ));
     super::ImapAccountParts {
         config,
-        capabilities: stub_capabilities(),
+        capabilities,
         pool,
         folders: Arc::new(super::folder_registry::FolderRegistry::default()),
         qresync_enabled: false,

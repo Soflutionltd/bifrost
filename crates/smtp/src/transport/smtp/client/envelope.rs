@@ -3,14 +3,20 @@
 //! cannot return a connection to the pool with a half-open transaction.
 
 use super::smtp_data_size;
+#[cfg(feature = "account-error")]
+use crate::transport::smtp::batch::{SendProgress, SmtpBatchRecipient};
+#[cfg(feature = "account-error")]
+use crate::transport::smtp::{
+    Dialect,
+    commands::build_recipient_commands,
+    error::{SmtpCommandPhase, SmtpTransmissionState},
+};
 use crate::{
     address::{Address, Envelope},
     transport::smtp::{
-        Dialect,
-        batch::{SendProgress, SmtpBatchRecipient},
-        commands::{Mail, Rcpt, build_recipient_commands, build_transaction_commands},
+        commands::{Mail, Rcpt, build_transaction_commands},
         error,
-        error::{Error, SmtpCommandPhase, SmtpTransmissionState},
+        error::Error,
         extension::{
             DeliverByMode, Extension, FutureReleaseParameter, MailBodyParameter, MailKeyword,
             MailParameter, RcptParameter, SendOptions, ServerInfo,
@@ -44,6 +50,7 @@ impl EnvelopeBuilder<'_> {
     }
 
     #[allow(clippy::type_complexity)]
+    #[cfg(feature = "account-error")]
     pub(super) fn build_batch(
         &self,
         protocol: Dialect,
@@ -385,7 +392,7 @@ impl EnvelopeBuilder<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "account-error"))]
 mod tests {
     use super::*;
     use crate::transport::smtp::{

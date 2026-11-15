@@ -770,6 +770,11 @@ pub(crate) struct WriterHandle {
     tx: mpsc::Sender<WriterRequest>,
 }
 
+// Channel loss means the attachment writer is unavailable, never a store error.
+// Preserve store errors from the inner reply so recovery can tell them apart.
+// A second writer-error enum is unnecessary at this boundary: ShuttingDown is
+// already the recovery callers' typed unavailable-writer branch. Lane helpers
+// may tolerate it explicitly when no permission or durable progress is claimed.
 impl WriterHandle {
     pub(super) fn new(tx: mpsc::Sender<WriterRequest>) -> Self {
         Self { tx }
@@ -809,9 +814,8 @@ impl WriterHandle {
                 done,
             })
             .await
-            .map_err(|error| Error::Other(format!("writer channel closed: {error}")))?;
-        recv.await
-            .map_err(|error| Error::Other(format!("writer dropped before reading: {error}")))?
+            .map_err(|_| Error::ShuttingDown)?;
+        recv.await.map_err(|_| Error::ShuttingDown)?
     }
 
     pub(super) async fn persist_established(&self, cursor: ChangeCursor) -> Result<(), Error> {
@@ -819,9 +823,8 @@ impl WriterHandle {
         self.tx
             .send(WriterRequest::PersistEstablished { cursor, done })
             .await
-            .map_err(|error| Error::Other(format!("writer channel closed: {error}")))?;
-        recv.await
-            .map_err(|error| Error::Other(format!("writer dropped before persisting: {error}")))?
+            .map_err(|_| Error::ShuttingDown)?;
+        recv.await.map_err(|_| Error::ShuttingDown)?
     }
 
     /// Routine cursor invalidation: drop the change cursor so the next
@@ -880,9 +883,8 @@ impl WriterHandle {
                 done,
             })
             .await
-            .map_err(|error| Error::Other(format!("writer channel closed: {error}")))?;
-        recv.await
-            .map_err(|error| Error::Other(format!("writer dropped before reset: {error}")))?
+            .map_err(|_| Error::ShuttingDown)?;
+        recv.await.map_err(|_| Error::ShuttingDown)?
     }
 
     pub(super) fn sender(&self) -> mpsc::Sender<WriterRequest> {
@@ -902,9 +904,8 @@ impl WriterHandle {
                 done,
             })
             .await
-            .map_err(|error| Error::Other(format!("writer channel closed: {error}")))?;
-        recv.await
-            .map_err(|error| Error::Other(format!("writer dropped before persisting: {error}")))?
+            .map_err(|_| Error::ShuttingDown)?;
+        recv.await.map_err(|_| Error::ShuttingDown)?
     }
 
     pub(super) async fn reattach_abort(&self, attempt: u64) {
@@ -923,7 +924,7 @@ impl WriterHandle {
         self.tx
             .send(WriterRequest::ReattachCommit { attempt })
             .await
-            .map_err(|error| Error::Other(format!("writer channel closed: {error}")))
+            .map_err(|_| Error::ShuttingDown)
     }
 }
 

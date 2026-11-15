@@ -1297,6 +1297,17 @@ without asking the provider: an enterprise Outlook user expects an apparently
 empty folder to be checked even when its planning hint is stale. The normal
 partition outcome and failure rules decide whether that pass can complete.
 
+Completion markers now use the `complete:v2` partition key. The old `complete`
+key with `items_done` zero or one could come from an empty fixed plan without
+inventory. It no longer suppresses inventory, for fixed and open-page plans
+alike. Larger legacy markers still prove a nonempty walk and remain valid.
+Ambiguous scopes re-walk once and earn the new marker through consumer
+acknowledgement. This conservative replay makes missing history visible, as an
+enterprise mail user expects; it requires no checkpoint-store schema change.
+The new key sorts after the old key when progress is equal, including a
+genuinely empty scope. Both keys remain completion sentinels for acknowledgement
+safety checks; only the resume decision rejects ambiguous legacy markers.
+
 The rescan retires an incarnation only on a durable conclusion: the plan
 ran to completion, or the checkpoint store already carries its
 completion marker. A partition failure or a checkpoint-store read
@@ -4186,3 +4197,29 @@ Directive scope and campaign deduplication use `EngineDirective::target_scope`
 and `identity` from bifrost-types. Distinct directive kinds on the same scope
 remain distinct actions. Strategy details and operator reasons do not split
 one kind into multiple campaign actions.
+
+## Writer availability and receiver membership
+
+A writer request that cannot be sent, or whose reply channel closes, returns
+`Error::ShuttingDown` from checkpoint/publication acknowledgement, operator
+choices, repair application, the attached backfill checkpoint helper and
+`WriterHandle` operations. Store errors remain the inner reply and retain their
+original classification. The account lookup can still return
+`AccountNotAttached` before a request is sent. Channel loss after lookup is
+attachment shutdown, rather than an opaque persistence failure.
+
+Barrier eligibility fails closed when the writer disappears: a backfill walk
+cannot cross debt whose policy it could not read. Barrier recording may still
+quietly tolerate a departed writer, since there is no remaining persistence
+owner; waived-barrier crossing refuses permission and discarded-progress
+requests remain outstanding. Terminal inventory debt store refusals are logged;
+writer departure during that diagnostic wait is ordinary teardown.
+
+`PendingCoverage` owns the single live numbered-receiver set. `ChangeDelivery`
+queries it for subscriber admission, delivery and departure sweeps instead of
+mirroring membership. `subscribe` requires an `Arc<PendingCoverage>`; the first
+numbered subscription binds the ledger and later subscriptions must use that
+same Arc. Unnumbered observers remain available through `observe`. The delivery
+lock still orders subscribe, send/stamp and departure, with delivery-to-coverage
+lock order. Receivers retain a weak delivery handle so they cannot keep the
+broadcast sender alive after detach; the ledger retains no delivery handle.

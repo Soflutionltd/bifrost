@@ -161,7 +161,7 @@ impl Drop for ChangesReceiver {
         // as a lag does and returns its capacity - a cold-start producer parked
         // behind a consumer that walked away resumes at once instead of stalling
         // for the life of the attachment.
-        let retired = delivery.depart(seq, inner, self.coverage.as_deref());
+        let retired = delivery.depart(seq, inner);
         if retired == 0 {
             return;
         }
@@ -243,13 +243,15 @@ pub struct ChangeDelivery {
 struct SubscriberState {
     /// How many consumer receivers this account has ever handed out.
     next: u64,
-    /// The sequences still holding a receiver, in order.
-    live: std::collections::BTreeSet<u64>,
+    /// Bound by the first numbered subscription; this ledger alone owns membership.
+    coverage: Option<Arc<crate::cursor::PendingCoverage>>,
 }
 
 impl SubscriberState {
     fn min_live(&self) -> Option<u64> {
-        self.live.iter().next().copied()
+        self.coverage
+            .as_ref()
+            .and_then(|coverage| coverage.min_live_receiver())
     }
 }
 
@@ -301,7 +303,7 @@ impl ChangeDelivery {
         if let Some(id) = publication {
             coverage.mark_delivered(id, issued);
         }
-        let reached = !state.live.is_empty();
+        let reached = state.min_live().is_some();
         drop(state);
         reached
     }
@@ -326,7 +328,7 @@ impl ChangeDelivery {
     pub fn publish_acknowledgeable(&self, event: MultiplexerEvent) -> bool {
         let state = self.guard();
         let _ = self.tx.send(event);
-        let reached = !state.live.is_empty();
+        let reached = state.min_live().is_some();
         drop(state);
         reached
     }
@@ -340,7 +342,7 @@ impl ChangeDelivery {
     /// afterwards, could never see them.
     #[must_use]
     pub fn has_numbered_subscriber(&self) -> bool {
-        !self.guard().live.is_empty()
+        self.guard().min_live().is_some()
     }
 
     /// Hand out an OBSERVER on the account's change stream: a receiver that
@@ -376,32 +378,38 @@ impl ChangeDelivery {
     /// `Closed`: it would be keeping the last sender alive itself. The engine
     /// must be able to close the channel by dropping the slot, and a weak handle
     /// is what lets it.
+    ///
+    /// The first subscription binds the coverage ledger; all later ones must
+    /// use the same Arc. Numbered receivers always participate in that ledger.
     pub fn subscribe(
         self: &Arc<Self>,
         control: Option<crate::control::SyncControl>,
-        coverage: Option<Arc<crate::cursor::PendingCoverage>>,
+        coverage: Arc<crate::cursor::PendingCoverage>,
     ) -> ChangesReceiver {
         let mut state = self.guard();
+        // One delivery gate cannot number receivers against different ledgers.
+        // Binding under the send/depart lock preserves the existing lock order.
+        if let Some(bound) = &state.coverage {
+            assert!(
+                Arc::ptr_eq(bound, &coverage),
+                "delivery coverage ledger changed"
+            );
+        } else {
+            state.coverage = Some(Arc::clone(&coverage));
+        }
         // Subscribe INSIDE the lock: a receiver created here is numbered against
         // exactly the set of batches already sent, with no window in which a
         // send could slip between the two and be mis-attributed.
         let inner = self.tx.subscribe();
         let seq = state.next;
         state.next += 1;
-        state.live.insert(seq);
-        // Mirror the membership into the ledger under this same lock: the bound
-        // follows the slowest LIVE numbered reader, so the ledger has to know who
-        // is live, and it has to learn it in the same total order that numbers the
-        // receiver and stamps the sends.
-        if let Some(coverage) = &coverage {
-            coverage.receiver_joined(seq);
-        }
+        coverage.receiver_joined(seq);
         drop(state);
         ChangesReceiver {
             inner: Some(inner),
             control,
             subscription: Some((Arc::downgrade(self), seq)),
-            coverage,
+            coverage: Some(coverage),
         }
     }
 
@@ -416,15 +424,10 @@ impl ChangeDelivery {
     /// destruction have to be ordered by the same mutex that orders sends.
     ///
     /// Returns how many were retired, for the caller's warning.
-    fn depart(
-        &self,
-        seq: u64,
-        inner: broadcast::Receiver<MultiplexerEvent>,
-        coverage: Option<&crate::cursor::PendingCoverage>,
-    ) -> usize {
-        let mut state = self.guard();
+    fn depart(&self, seq: u64, inner: broadcast::Receiver<MultiplexerEvent>) -> usize {
+        let state = self.guard();
+        let coverage = state.coverage.as_deref();
         drop(inner);
-        state.live.remove(&seq);
         // Recompute the charge for the departing sequence first. A page this
         // receiver read is settled by its departure; a page it never read stops
         // being charged to it, so a producer parked behind a slow reader that
@@ -2927,6 +2930,15 @@ mod tests {
         }
     }
 
+    #[test]
+    #[should_panic(expected = "delivery coverage ledger changed")]
+    fn numbered_subscribers_cannot_split_between_coverage_ledgers() {
+        let h = delivery_harness(4);
+        let _first = h.subscribe();
+        let other = Arc::new(crate::cursor::PendingCoverage::new());
+        let _second = h.delivery.subscribe(None, other);
+    }
+
     impl Delivery {
         fn backfill_page(partition: &str) -> Checkpoint {
             Checkpoint::Backfill(bifrost_types::BackfillCheckpoint {
@@ -2968,7 +2980,7 @@ mod tests {
 
         fn subscribe(&self) -> ChangesReceiver {
             self.delivery
-                .subscribe(Some(self.control.clone()), Some(Arc::clone(&self.coverage)))
+                .subscribe(Some(self.control.clone()), Arc::clone(&self.coverage))
         }
     }
 

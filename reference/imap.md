@@ -32,6 +32,26 @@ display strings coincide, while canonical names compare equal to caller-created
 names. NUL-bearing mailbox wire strings are refused rather than silently
 stripped. Gmail FETCH labels use the negotiated mailbox decoding mode.
 
+The exact name INBOX compares and hashes ASCII-case-insensitively (RFC 3501
+Section 5.1), and command-response correlation (`MailboxName::matches_mailbox`)
+uses that same equality, so registry keys and solicited-response matching agree.
+Display spelling and existing account-id strings are unchanged, so persisted
+folder identities survive. Only the exact token is folded: the encoder sends the
+bare name as `INBOX`, but an INBOX child (`inbox/Sub`) is sent as spelled and is
+a distinct identity from `INBOX/Sub`. Ruling: child names are case-sensitive,
+callers name folders from the server's own LIST spelling, and an enterprise
+user acting on a subfolder of Inbox expects the command to reach exactly the
+folder the server listed; the old prefix rewrite only repaired spellings no
+server reported, and could address a different folder on a server that lists
+its children in another case.
+
+`Capability` hashing streams its case-folded wire spelling through `Display`
+without allocating. `SORT=DISPLAY` is the unit variant `SortDisplay`. Parsed
+`AUTH=`, `THREAD=` and `QUOTA=RES-` suffixes are stored uppercase and `RIGHTS=`
+suffixes lowercase; payload variants still compare case-insensitively because
+callers may construct them directly, and `ServerProfile::new` still normalizes
+directly constructed AUTH and THREAD payloads for the same reason.
+
 The account registry keys on `MailboxName`. Folder/container ids and the
 folder component of object, thread and part ids retain noncanonical wire
 identity in a `~imap-wire:` base64url envelope containing the mode and octets.
@@ -1447,7 +1467,7 @@ the changes path. A failed send leaves the previous cursor hint intact.
 ### Mutation batch shape
 
 Every per-item `mutation_stream` outcome rides a batch sized by the same
-`TARGET_BUFFER_ITEMS` window, on all three lanes; no lane emits one batch per
+`ImapAccountConfig::mutation_batch_size` window (at least one), on all three lanes; no lane emits one batch per
 id. A stream-level `Terminated` is the account-wide exception described
 above: it ends the stream before later groups or input windows can be answered.
 The grouped lane flushes one batch per folder group per window. The two
@@ -1641,3 +1661,37 @@ collection's URL. Valid IMAP destinations retain their existing move behavior.
 
 Container sharing authority is projected from the MYRIGHTS `a` (Administer)
 right into `ContainerRights::may_share`.
+
+## Account role and scheduling policy
+
+The folder registry owns account role resolution. Only selectable personal
+entries are eligible: shared and other-user folders never receive the account's
+Sent copies, drafts or Trash moves. Enterprise users expect those effects in
+their own mailbox. SPECIAL-USE beats name fallback; stable mailbox identity
+breaks ties. INBOX is exclusively the case-insensitive top-level name, even
+when another folder claims a custom `\Inbox` attribute. Containers in shared
+namespaces have no account role. Capabilities resolve Drafts after shared
+namespace ownership is installed, through the same resolver used by submission,
+drafts, trash, quota and push's INBOX fallback. Refreshes resolve against the
+current registry rather than retaining a stale role address.
+
+One exception to the single resolver: `delete_thread` deletes in place when the
+current folder's OWN role is Trash (SPECIAL-USE or name fallback), including a
+second Trash-like personal folder and a shared mailbox's own Trash. An Outlook
+user emptying an item from anything shown as Deleted Items expects it gone, and
+a shared mailbox's Trash must never be moved across into the user's personal
+Trash. The resolver still chooses the move target for every other folder.
+
+The open-time push capability gates the push state's capacity. Without IDLE,
+capacity and lanes are zero and direct subscriptions fail admission, including
+when NOTIFY is advertised. NOTIFY topology lives only on the push state.
+
+`mutation_batch_size`, clamped to at least one, controls the bulk mutation
+input window and the advertised batching maximum. Hydration retains its separate
+256-item window. The published `flag_sync_interval` and
+`deletion_check_interval` remain reserved hints: the account has no background
+polling scheduler. Explicit changes requests always check current state; delaying
+flag or deletion observations would leave stale mail visible. Polling cadence
+belongs to the engine. Priority is retained as a hint for IMAP (which owns no
+priority scheduler) and forwarded to composed DAV accounts, whose HTTP admission
+schedulers can apply it. No published knob is removed.

@@ -85,19 +85,12 @@ pub(crate) enum JmapCursorError {
 }
 
 impl JmapScopeRepr {
-    /// `Type(Thread)` and `Query(_)` encode successfully here even though
-    /// `changes::stream` terminates both as `Unsupported`, so this codec has
-    /// two legal-but-dead paths. That is deliberate and accepted: the codec's
-    /// job is to be a total, symmetric mapping of the wire format, and the
-    /// two scope tags are already spent in cursors written by older builds.
-    /// Refusing them at encode would not stop such a cursor from arriving -
-    /// it must still DECODE, or the round-trip property this type is built on
-    /// stops holding - and it would make encode and decode asymmetric for no
-    /// gain, since discovery never mints either scope. The refusal belongs
-    /// where the scope is actually driven; see the scope list under
-    /// "Per-scope inventory, changes, hydration" in `reference/jmap.md`.
-    /// If thread or query scopes ever become discoverable, this stays as it
-    /// is and the change-stream arm grows a real implementation.
+    /// Keep the persisted representation separate from discovery topology.
+    /// Thread and Query tags remain readable but are not drivable. Foreign
+    /// per-mailbox cursors remain drivable: inventory filters by inMailbox,
+    /// while changes follows the owning account's Email state. Replacing this
+    /// representation with only the three currently seeded shapes would remove
+    /// that existing capability and reject readable v2 rows without a migration.
     pub(crate) fn from_cursor_scope(scope: &CursorScope) -> Result<Self, JmapCursorError> {
         match scope {
             CursorScope::Type(ObjectType::Email) => Ok(Self::Email),
@@ -111,6 +104,17 @@ impl JmapScopeRepr {
                 })
                 .ok_or(JmapCursorError::UnsupportedScope),
             _ => Err(JmapCursorError::UnsupportedScope),
+        }
+    }
+
+    /// One exhaustive account-drive classification, shared by descriptors,
+    /// establishment and push. A valid folder encoding is required; an arbitrary
+    /// Folder id must never acquire an Email subscription by its shape alone.
+    pub(crate) fn data_type(&self) -> Option<crate::DataType> {
+        match self {
+            Self::Email | Self::Folder { .. } => Some(crate::DataType::Email),
+            Self::Mailbox => Some(crate::DataType::Mailbox),
+            Self::Thread | Self::Query(_) => None,
         }
     }
 

@@ -7,8 +7,6 @@ pub(crate) mod get;
 pub(crate) mod set;
 
 use crate::core::field::Field;
-use crate::core::set::skip_if_empty_str;
-use crate::core::set::skip_if_zero_date;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
@@ -59,24 +57,24 @@ pub(crate) struct VacationResponseCreate {
     pub(super) is_enabled: Option<bool>,
 
     #[serde(rename = "fromDate")]
-    #[serde(skip_serializing_if = "skip_if_zero_date")]
-    pub(super) from_date: Option<Timestamp>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) from_date: Field<Timestamp>,
 
     #[serde(rename = "toDate")]
-    #[serde(skip_serializing_if = "skip_if_zero_date")]
-    pub(super) to_date: Option<Timestamp>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) to_date: Field<Timestamp>,
 
     #[serde(rename = "subject")]
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    pub(super) subject: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) subject: Field<String>,
 
     #[serde(rename = "textBody")]
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    pub(super) text_body: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) text_body: Field<String>,
 
     #[serde(rename = "htmlBody")]
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    pub(super) html_body: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) html_body: Field<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -151,15 +149,14 @@ impl crate::core::SetCreate for VacationResponseCreate {
     }
 
     fn new(create_id: Option<crate::core::creation::CreationId>) -> Self {
-        use crate::core::set::from_timestamp;
         VacationResponseCreate {
             _create_id: create_id,
             is_enabled: None,
-            from_date: from_timestamp(0).into(),
-            to_date: from_timestamp(0).into(),
-            subject: String::new().into(),
-            text_body: String::new().into(),
-            html_body: String::new().into(),
+            from_date: Field::Omitted,
+            to_date: Field::Omitted,
+            subject: Field::Omitted,
+            text_body: Field::Omitted,
+            html_body: Field::Omitted,
         }
     }
 }

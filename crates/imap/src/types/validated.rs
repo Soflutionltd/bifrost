@@ -403,6 +403,19 @@ impl MailboxName {
     // Noncanonical octets must remain distinct even when display decoding
     // collapses them; malformed UTF-8 needs a separate identity domain.
     fn identity(&self) -> (bool, Vec<u8>) {
+        // RFC 3501 Section 5.1 reserves only the exact name INBOX. Keep the
+        // display spelling and account_id unchanged: enterprise users expect
+        // stored folder ids to survive upgrades, while registry keys and
+        // response correlation must recognize the same inbox. Never fold a
+        // hierarchy prefix or a noncanonical wire spelling into another folder.
+        if self.0.eq_ignore_ascii_case("INBOX")
+            && self
+                .1
+                .as_ref()
+                .is_none_or(|(bytes, _)| bytes == self.0.as_bytes())
+        {
+            return (false, b"INBOX".to_vec());
+        }
         let canonical = crate::codec::utf7::encode_utf7(&self.0).into_bytes();
         match &self.1 {
             Some((bytes, false)) => (false, bytes.clone()),
@@ -522,19 +535,9 @@ impl MailboxName {
         self.identity() == Self::from_decoded(self.0.clone()).identity()
     }
 
-    /// Whether two decoded mailbox addresses name the same mailbox for a
-    /// command response. Canonical encodings compare by their decoded name so
-    /// caller-created targets match responses in either encoding mode. When
-    /// either address is noncanonical, compare the retained wire identity so
-    /// lossy display decoding cannot pair two distinct mailboxes. INBOX keeps
-    /// its RFC-defined ASCII case-insensitive comparison for canonical names.
+    /// Command correlation uses the same identity as registry keys and hashing.
     pub(crate) fn matches_mailbox(&self, other: &Self) -> bool {
-        if self.can_reencode() && other.can_reencode() {
-            (self.0.eq_ignore_ascii_case("INBOX") && other.0.eq_ignore_ascii_case("INBOX"))
-                || self.0 == other.0
-        } else {
-            self.identity() == other.identity()
-        }
+        self == other
     }
 
     /// Construct from already-decoded bytes produced by the codec's decoder.

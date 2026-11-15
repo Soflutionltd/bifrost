@@ -15,12 +15,10 @@ use bifrost_types::{
     AccountError, AccountFuture, AccountStream, Address, AttachmentHandle, AttachmentInline,
     Container, ContainerId, ContainerKind, ContainerList, ContainerStyle, DraftHandle, DraftPatch,
     FolderRole, HydrationProjection, Identity, IdentityId, IdentityPatch, Importance, Message,
-    MutationTarget, ObjectId, Page, ProtocolKind, Provenance, QuotaInfo, SearchFilter,
-    SearchRequest, SendRequest, ThreadHydration, ThreadId, VacationConfig,
+    MutationTarget, ObjectId, Page, ProtocolKind, Provenance, QuotaInfo, SearchRequest,
+    SendRequest, ThreadHydration, ThreadId, VacationConfig,
 };
 use bytes::Bytes;
-use jiff::Timestamp;
-use jiff::tz::Offset;
 use serde_json::json;
 
 use crate::client::GmailClient;
@@ -38,6 +36,9 @@ use super::flags::{
     ARCHIVE_ID, LABEL_DRAFT, LABEL_INBOX, LABEL_SENT, LABEL_SPAM, LABEL_TRASH, LABEL_UNREAD,
     is_archive_id,
 };
+use super::query::filter_query;
+#[cfg(test)]
+use super::query::{container_query, gmail_date};
 use super::scopes::{
     ScopeCache, invalidate_scope_snapshot, labels_for_flags, refresh_scope_snapshot,
 };
@@ -802,46 +803,6 @@ fn gmail_query(request: &SearchRequest) -> Result<Option<String>, AccountError> 
     Ok((!parts.is_empty()).then(|| parts.join(" ")))
 }
 
-fn filter_query(filter: &SearchFilter) -> Result<String, AccountError> {
-    match filter {
-        SearchFilter::From(value) => Ok(format!("from:{}", query_term(value))),
-        SearchFilter::To(value) => Ok(format!("to:{}", query_term(value))),
-        SearchFilter::Subject(value) => Ok(format!("subject:{}", query_term(value))),
-        SearchFilter::Body(value) => Ok(query_term(value)),
-        SearchFilter::Has(value) => {
-            if value.eq_ignore_ascii_case("attachment") {
-                Ok("has:attachment".to_string())
-            } else {
-                Ok(format!("filename:{}", query_term(value)))
-            }
-        }
-        SearchFilter::In(container) => Ok(container_query(&container.0)),
-        SearchFilter::Labeled(label) => Ok(format!("label:{}", query_term(&label.0))),
-        SearchFilter::DateRange { after, before } => {
-            let mut parts = Vec::new();
-            if let Some(after) = after {
-                parts.push(format!("after:{}", gmail_date(*after)));
-            }
-            if let Some(before) = before {
-                parts.push(format!("before:{}", gmail_date(*before)));
-            }
-            Ok(parts.join(" "))
-        }
-        SearchFilter::And(filters) => filters
-            .iter()
-            .map(filter_query)
-            .collect::<Result<Vec<_>, _>>()
-            .map(|items| items.join(" ")),
-        SearchFilter::Or(filters) => filters
-            .iter()
-            .map(filter_query)
-            .collect::<Result<Vec<_>, _>>()
-            .map(|items| format!("({})", items.join(" OR "))),
-        SearchFilter::Not(filter) => Ok(format!("-({})", filter_query(filter)?)),
-        _ => Err(unsupported(bifrost_types::AccountOperation::Search)),
-    }
-}
-
 fn page_token(request: &SearchRequest) -> Result<Option<String>, AccountError> {
     request
         .page_cursor
@@ -855,38 +816,6 @@ fn page_token(request: &SearchRequest) -> Result<Option<String>, AccountError> {
             })
         })
         .transpose()
-}
-
-fn sanitize_header(value: &str) -> String {
-    value.replace(['\r', '\n'], " ").trim().to_string()
-}
-
-fn query_term(value: &str) -> String {
-    let sanitized = sanitize_header(value);
-    if sanitized
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '@' | '/' | ':'))
-    {
-        sanitized
-    } else {
-        format!(
-            "\"{}\"",
-            sanitized.replace('\\', "\\\\").replace('"', "\\\"")
-        )
-    }
-}
-
-fn container_query(id: &str) -> String {
-    super::flags::container_search_operator(id)
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("label:{}", query_term(id)))
-}
-
-fn gmail_date(time: SystemTime) -> String {
-    let dt = Offset::UTC
-        .to_datetime(Timestamp::try_from(time).unwrap_or(Timestamp::UNIX_EPOCH))
-        .date();
-    format!("{:04}/{:02}/{:02}", dt.year(), dt.month(), dt.day())
 }
 
 fn archive_container() -> Container {
@@ -969,7 +898,7 @@ async fn message_from_gmail(
     projection: HydrationProjection,
 ) -> Result<Message, AccountError> {
     let headers = message_headers(message);
-    let (body_text, body_html, incomplete) = match projection {
+    let (body_text, body_html, mut incomplete) = match projection {
         HydrationProjection::Headers => (None, None, false),
         HydrationProjection::Preview(limit) => (
             Some(message.snippet.chars().take(limit).collect::<String>()),
@@ -994,15 +923,11 @@ async fn message_from_gmail(
     Ok(Message {
         id: ObjectId(message.id.clone()),
         thread_id: Some(ThreadId(message.thread_id.clone())),
-        from: Address::parse_list(header_from(headers, "From").as_deref().unwrap_or_default()),
-        to: Address::parse_list(header_from(headers, "To").as_deref().unwrap_or_default()),
-        cc: Address::parse_list(header_from(headers, "Cc").as_deref().unwrap_or_default()),
-        bcc: Address::parse_list(header_from(headers, "Bcc").as_deref().unwrap_or_default()),
-        reply_to: Address::parse_list(
-            header_from(headers, "Reply-To")
-                .as_deref()
-                .unwrap_or_default(),
-        ),
+        from: hydrated_address_list(headers, "From", &mut incomplete),
+        to: hydrated_address_list(headers, "To", &mut incomplete),
+        cc: hydrated_address_list(headers, "Cc", &mut incomplete),
+        bcc: hydrated_address_list(headers, "Bcc", &mut incomplete),
+        reply_to: hydrated_address_list(headers, "Reply-To", &mut incomplete),
         subject: header_from(headers, "Subject"),
         date: internal_date(&message.internal_date),
         containers: message
@@ -1059,6 +984,31 @@ async fn document_from_message(
         thread_id: Some(message.thread_id.clone()),
         request_read_receipt: false,
     })
+}
+
+// Users need readable mail even when one mailbox cannot be represented, but
+// must see that the recipient list is incomplete before relying on reply-all.
+// Preserve every repeated field in wire order, including accepted siblings.
+fn hydrated_address_list(
+    headers: &[GmailHeader],
+    name: &str,
+    incomplete: &mut bool,
+) -> Vec<Address> {
+    let mut addresses = Vec::new();
+    for header in headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case(name))
+    {
+        match Address::parse_list_checked(&header.value) {
+            Ok(parsed) => addresses.extend(parsed),
+            Err(_) => {
+                *incomplete = true;
+                // The checked API does not expose accepted siblings on failure.
+                addresses.extend(Address::parse_list(&header.value));
+            }
+        }
+    }
+    addresses
 }
 
 fn checked_draft_address_list(
@@ -1505,6 +1455,27 @@ fn account_error_for(error: crate::Error, ctx: error::GmailErrorContext) -> Acco
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn hydrate_repeated_address_headers_preserves_siblings_and_marks_loss() {
+        let message = gmail_message(serde_json::json!({
+            "id": "m1", "threadId": "t1",
+            "payload": {"mimeType": "text/plain", "headers": [
+                {"name": "To", "value": "first@example.com"},
+                {"name": "tO", "value": "second@example.com, invalid"},
+                {"name": "Cc", "value": "cc@example.com"},
+                {"name": "Cc", "value": "other@example.com"}
+            ]}
+        }));
+        let hydrated = message_from_gmail(&[], &message, HydrationProjection::Headers)
+            .await
+            .unwrap();
+        assert_eq!(hydrated.to.len(), 2);
+        assert_eq!(hydrated.to[0].address, "first@example.com");
+        assert_eq!(hydrated.to[1].address, "second@example.com");
+        assert_eq!(hydrated.cc.len(), 2);
+        assert!(hydrated.incomplete);
+    }
+
+    #[tokio::test]
     async fn hydrate_decodes_declared_charset_without_transfer_decoding_twice() {
         let message = gmail_message(serde_json::json!({
             "id": "m1", "threadId": "t1",
@@ -1637,7 +1608,7 @@ mod tests {
 
     use bifrost_net::test_support::{Canned, ScriptedDispatch};
     use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource};
-    use bifrost_types::FlagOp;
+    use bifrost_types::{FlagOp, SearchFilter};
     use bytes::Bytes;
     use reqwest::StatusCode;
 

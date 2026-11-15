@@ -14,6 +14,7 @@ mod inventory;
 mod mutation;
 mod pim;
 mod push;
+mod query;
 mod scopes;
 
 use std::sync::Arc;

@@ -29,7 +29,7 @@ impl PushSubscriptionCreate {
     }
 
     pub(crate) fn types(&mut self, types: Option<impl IntoIterator<Item = DataType>>) -> &mut Self {
-        self.types = types.map(|types| types.into_iter().collect());
+        self.types = Field::from(types.map(|types| types.into_iter().collect()));
         self
     }
 }

@@ -405,6 +405,12 @@ impl ScriptedDownload {
     }
 }
 
+#[derive(Default)]
+struct RequestOptions<'a> {
+    prefer: Option<&'a str>,
+    eventual_consistency: bool,
+}
+
 impl GraphClient {
     // pub: ergonomic constructor for the default Microsoft Graph endpoint.
     pub fn new(access_token: impl Into<String>) -> Self {
@@ -866,7 +872,7 @@ impl GraphClient {
         self.request::<T, ()>(
             resource,
             url,
-            "GET",
+            reqwest::Method::GET,
             None,
             bifrost_net::ReplayPolicy::Idempotent,
         )
@@ -883,9 +889,12 @@ impl GraphClient {
             .execute_wire(
                 resource,
                 url,
-                "GET",
+                reqwest::Method::GET,
                 None,
-                (None, eventual),
+                RequestOptions {
+                    prefer: None,
+                    eventual_consistency: eventual,
+                },
                 None,
                 bifrost_net::ReplayPolicy::Idempotent,
             )
@@ -902,7 +911,7 @@ impl GraphClient {
         self.request_prefer::<T, ()>(
             resource,
             url,
-            "GET",
+            reqwest::Method::GET,
             prefer,
             None,
             bifrost_net::ReplayPolicy::Idempotent,
@@ -918,7 +927,7 @@ impl GraphClient {
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<T, GraphError> {
         let url = self.api_url(path)?;
-        self.request(resource, &url, "POST", Some(body), replay)
+        self.request(resource, &url, reqwest::Method::POST, Some(body), replay)
             .await
     }
 
@@ -930,7 +939,7 @@ impl GraphClient {
     ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
         let response = self
-            .execute(resource, &url, "POST", None::<&()>, replay)
+            .execute(resource, &url, reqwest::Method::POST, None::<&()>, replay)
             .await?;
         check_response_status(response)
     }
@@ -944,7 +953,7 @@ impl GraphClient {
     ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
         let response = self
-            .execute(resource, &url, "POST", Some(body), replay)
+            .execute(resource, &url, reqwest::Method::POST, Some(body), replay)
             .await?;
         check_response_status(response)
     }
@@ -966,9 +975,9 @@ impl GraphClient {
             .execute_wire(
                 resource,
                 &url,
-                "POST",
+                reqwest::Method::POST,
                 None,
-                (None, false),
+                RequestOptions::default(),
                 Some(WireBody::mime(base64_mime)),
                 replay,
             )
@@ -985,7 +994,7 @@ impl GraphClient {
     ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
         let response = self
-            .execute(resource, &url, "PATCH", Some(body), replay)
+            .execute(resource, &url, reqwest::Method::PATCH, Some(body), replay)
             .await?;
         check_response_status(response)
     }
@@ -1000,7 +1009,14 @@ impl GraphClient {
     ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
         let response = self
-            .execute_if_match(resource, &url, "PATCH", etag, Some(body), replay)
+            .execute_if_match(
+                resource,
+                &url,
+                reqwest::Method::PATCH,
+                etag,
+                Some(body),
+                replay,
+            )
             .await?;
         check_response_status(response)
     }
@@ -1013,7 +1029,7 @@ impl GraphClient {
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<T, GraphError> {
         let url = self.api_url(path)?;
-        self.request(resource, &url, "PATCH", Some(body), replay)
+        self.request(resource, &url, reqwest::Method::PATCH, Some(body), replay)
             .await
     }
 
@@ -1025,7 +1041,7 @@ impl GraphClient {
     ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
         let response = self
-            .execute(resource, &url, "DELETE", None::<&()>, replay)
+            .execute(resource, &url, reqwest::Method::DELETE, None::<&()>, replay)
             .await?;
         check_response_status(response)
     }
@@ -1039,7 +1055,14 @@ impl GraphClient {
     ) -> Result<(), GraphError> {
         let url = self.api_url(path)?;
         let response = self
-            .execute_if_match(resource, &url, "DELETE", etag, None::<&()>, replay)
+            .execute_if_match(
+                resource,
+                &url,
+                reqwest::Method::DELETE,
+                etag,
+                None::<&()>,
+                replay,
+            )
             .await?;
         check_response_status(response)
     }
@@ -1057,7 +1080,7 @@ impl GraphClient {
         &self,
         resource: Resource,
         url: &AdmittedUrl,
-        method: &str,
+        method: reqwest::Method,
         body: Option<&B>,
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<T, GraphError> {
@@ -1069,7 +1092,7 @@ impl GraphClient {
         &self,
         resource: Resource,
         url: &AdmittedUrl,
-        method: &str,
+        method: reqwest::Method,
         prefer: &str,
         body: Option<&B>,
         replay: bifrost_net::ReplayPolicy,
@@ -1084,7 +1107,7 @@ impl GraphClient {
         &self,
         resource: Resource,
         url: &AdmittedUrl,
-        method: &str,
+        method: reqwest::Method,
         body: Option<&B>,
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<RestResponse, GraphError> {
@@ -1096,7 +1119,7 @@ impl GraphClient {
         &self,
         resource: Resource,
         url: &AdmittedUrl,
-        method: &str,
+        method: reqwest::Method,
         etag: &GraphETag,
         body: Option<&B>,
         replay: bifrost_net::ReplayPolicy,
@@ -1110,7 +1133,7 @@ impl GraphClient {
         &self,
         resource: Resource,
         url: &AdmittedUrl,
-        method: &str,
+        method: reqwest::Method,
         if_match: Option<&GraphETag>,
         prefer: Option<&str>,
         body: Option<&B>,
@@ -1125,7 +1148,10 @@ impl GraphClient {
             url,
             method,
             if_match,
-            (prefer, false),
+            RequestOptions {
+                prefer,
+                eventual_consistency: false,
+            },
             body,
             replay,
         )
@@ -1144,20 +1170,23 @@ impl GraphClient {
         &self,
         resource: Resource,
         url: &AdmittedUrl,
-        method: &str,
+        method: reqwest::Method,
         if_match: Option<&GraphETag>,
-        options: (Option<&str>, bool),
+        options: RequestOptions<'_>,
         body: Option<WireBody>,
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<RestResponse, GraphError> {
-        let (prefer, eventual) = options;
+        let RequestOptions {
+            prefer,
+            eventual_consistency,
+        } = options;
         let url = url.as_str();
         // Records the request in this crate's richer shape and does not
         // answer it: the response comes back from the scripted transport
         // below, through the production retry loop.
         #[cfg(test)]
         self.record_wire(
-            method,
+            method.as_str(),
             url,
             if_match.map(GraphETag::as_str),
             prefer,
@@ -1169,24 +1198,13 @@ impl GraphClient {
         // knows the request and its payload, and declares its replay policy
         // (applied below). Batch POSTs, conditional PATCHes and absolute
         // updates all pass through here, so no verb-level default would do.
-        let mut builder = match method {
-            "GET" => account_net.get(url),
-            "POST" => account_net.post(url),
-            "PATCH" => account_net.patch(url),
-            "DELETE" => account_net.delete(url),
-            // pub(crate) callers route through `get_json` / `post` /
-            // `patch` / `delete` / `post_empty` only; any other token
-            // is a programmer bug rather than a runtime path.
-            other => {
-                unreachable!("unsupported HTTP method passed to GraphClient::execute: {other}")
-            }
-        };
+        let mut builder = account_net.request(method, url);
 
         for (limit, weight) in self.claims(&resource, &account_net) {
             builder = builder.concurrency_claim(limit, weight);
         }
 
-        if eventual {
+        if eventual_consistency {
             builder = builder.header("ConsistencyLevel", "eventual");
         }
         if let Some(etag) = if_match {
@@ -1228,15 +1246,13 @@ impl GraphClient {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_aux(
         &self,
-        resource: Resource,
-        method: &str,
+        method: reqwest::Method,
         target: AuxTarget<'_>,
         headers: &[(&str, &str)],
         body: Bytes,
         timeout: Option<std::time::Duration>,
         replay: bifrost_net::ReplayPolicy,
     ) -> Result<RestResponse, GraphError> {
-        debug_assert!(matches!(resource, Resource::Unmetered));
         // Autodiscover is ungated: EWS throttling is per calling user under
         // its own policy, and streaming notifications have a separate
         // subscription budget. The REST per-mailbox four does not apply.
@@ -1245,17 +1261,9 @@ impl GraphClient {
             AuxTarget::Anonymous(url) => (url.as_str(), false),
         };
         #[cfg(test)]
-        self.record_aux(method, url, headers, bearer, &body);
+        self.record_aux(method.as_str(), url, headers, bearer, &body);
         let account_net = self.attached_net()?;
-        let mut builder = match method {
-            "POST" => account_net.post(url),
-            "PUT" => account_net.put(url),
-            // The OneDrive upload session cancel.
-            "DELETE" => account_net.delete(url),
-            other => {
-                unreachable!("unsupported HTTP method passed to GraphClient::execute_aux: {other}")
-            }
-        };
+        let mut builder = account_net.request(method, url);
         if !bearer {
             // An anonymous target was admitted under the upload rule, which
             // the transport's redirect walk cannot apply to a hop: following
@@ -1284,8 +1292,11 @@ impl GraphClient {
             .send()
             .await;
         self.record_bytes(&counter);
-        let response =
-            sent.map_err(|error| self.with_mailbox_context(&resource, GraphError::Net(error)))?;
+        // The aux paths are never mailbox-metered, so no mailbox context
+        // applies to their failures.
+        let response = sent.map_err(|error| {
+            self.with_mailbox_context(&Resource::Unmetered, GraphError::Net(error))
+        })?;
         Ok(RestResponse::from(response))
     }
 
@@ -1851,8 +1862,7 @@ mod tests {
         assert!(is_internal(
             client
                 .execute_aux(
-                    Resource::Unmetered,
-                    "POST",
+                    reqwest::Method::POST,
                     AuxTarget::Bearer(&url),
                     &[],
                     Bytes::new(),
@@ -2041,9 +2051,9 @@ mod tests {
             .execute_wire(
                 Resource::Outlook,
                 &url,
-                "GET",
+                reqwest::Method::GET,
                 None,
-                (None, false),
+                RequestOptions::default(),
                 None,
                 bifrost_net::ReplayPolicy::Idempotent,
             )
@@ -2085,9 +2095,9 @@ mod tests {
                 .execute_wire(
                     Resource::Outlook,
                     &url,
-                    "GET",
+                    reqwest::Method::GET,
                     None,
-                    (None, false),
+                    RequestOptions::default(),
                     None,
                     bifrost_net::ReplayPolicy::Idempotent
                 )
@@ -2104,9 +2114,9 @@ mod tests {
                         .execute_wire(
                             Resource::Unmetered,
                             &url,
-                            "GET",
+                            reqwest::Method::GET,
                             None,
-                            (None, false),
+                            RequestOptions::default(),
                             None,
                             bifrost_net::ReplayPolicy::Idempotent
                         )
@@ -2700,9 +2710,9 @@ mod tests {
             .execute_wire(
                 Resource::Outlook,
                 &url,
-                "GET",
+                reqwest::Method::GET,
                 None,
-                (None, false),
+                RequestOptions::default(),
                 None,
                 bifrost_net::ReplayPolicy::Idempotent,
             )
@@ -2840,9 +2850,9 @@ mod tests {
             .execute_wire(
                 Resource::Outlook,
                 &url,
-                "GET",
+                reqwest::Method::GET,
                 None,
-                (None, false),
+                RequestOptions::default(),
                 None,
                 bifrost_net::ReplayPolicy::Idempotent,
             )

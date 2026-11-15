@@ -9,8 +9,7 @@ Current architecture of the shared HTTP transport crate.
 Scope: HTTP/2 connection pool, OAuth bearer-token refresh, retry
 budget, per-host rate limiting, per-account bandwidth metering,
 native-tls, W3C `traceparent` injection, URL component-encoding
-helpers, resource-parent extraction, and origin-rooted well-known URL
-construction shared by the HTTP protocol crates. Used by `bifrost-jmap`,
+helpers shared by the HTTP protocol crates. Used by `bifrost-jmap`,
 `bifrost-google`, `bifrost-graph`, and - through `bifrost-dav-core` -
 `bifrost-caldav` and `bifrost-carddav`. Not used by `bifrost-imap` or
 `bifrost-smtp` (those carry their own TCP/TLS stacks); IMAP/SMTP
@@ -642,6 +641,15 @@ test could drive the failure backoff but not the proactive-refresh or
 max-age windows, because `tokio::time::advance` moves only the tokio
 clock and real time barely moves inside a test. Both windows are now
 drivable exactly the way the rate governor and byte bucket already are.
+
+`coordinate(Arc<dyn TokenSource>)` returns a `CoordinatedTokenSource`,
+using the default maximum age. `CoordinatedTokenSource::with_max_age` accepts
+an explicit age. `AccountNet` stores this admitted type; `AccountSpec` remains
+the raw provider input boundary. `as_source()` lets other protocol legs share
+that exact cache through existing trait-object APIs. DAV stores the same typed
+handle behind its credential-origin gate, independently of any supplied net
+handle's bearer source. Its request deadlines still bound token lookup and
+refresh, and every HTTP request disables net's automatic bearer injection.
 
 `TokenSource::is_coordinating()` defaults to false and is true for
 `OAuthRefresher` and `StaticTokenSource`. `Net::attach_account` retains these
@@ -1486,22 +1494,8 @@ unaddressable through this encoder, and no correct spelling exists
 under WHATWG parsing (single-escaped `%2E` still resolves as
 navigation).
 
-`url::parent_collection_url(resource_url)` returns the parent
-collection of an absolute resource URL. It drops query and fragment
-before popping the final path segment, so a slash in either cannot be
-mistaken for a path separator. Both DAV crates use it rather than
-carrying a private copy each.
-
-`url::well_known_url(base_url, service)` builds the RFC 6764 discovery
-endpoint by replacing the base URL's path with `/.well-known/<service>`
-and clearing query and fragment. Well-known discovery is defined at the
-ORIGIN root, so appending the suffix to a path-bearing configured base
-is wrong: it addresses a resource that is not a discovery endpoint, and
-because only a not-found classification triggers the base fallback, a
-deployment answering that path with 401 or 403 would fail the open
-before the configured base was ever tried. `None` means the base does
-not parse or cannot carry a path; callers go straight to the configured
-base.
+DAV collection ancestry and RFC 6764 discovery helpers live in
+`bifrost_dav_core::url`, together with their tests.
 
 ## File map
 
@@ -1532,8 +1526,7 @@ crates/net/src/
                   // MeterSinkHandle
   error.rs        // Error + cap_status_body
   trace.rs        // traceparent injection (current: uuid trace id)
-  url.rs          // distinct path-component and query-value encoders;
-                  // parent_collection_url; origin-rooted well_known_url
+  url.rs          // distinct path-component and query-value encoders
 ```
 
 ## Redirect predicate contract

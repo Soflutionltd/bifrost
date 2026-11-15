@@ -8378,3 +8378,35 @@ fn a_mode_change_refuses_noncanonical_addresses_before_writing() {
     assert!(matches!(result, Err(crate::Error::InvalidInput(_))));
     assert!(bytes.is_empty());
 }
+
+#[test]
+fn mailbox_encoding_preserves_inbox_children_and_correlation() {
+    use crate::codec::classification::{ClassificationContext, SolicitationRule, classify};
+    use crate::types::notify::NotifyFlags;
+    use crate::types::{CommandKind, UntaggedResponse};
+
+    for utf8 in [false, true] {
+        for spelling in ["inbox/Sub", "inbox.Sub", "inbox-Sub", "inbox_Sub", "inbox"] {
+            let target = MailboxName::new(spelling).unwrap();
+            let bytes = commands::encode_mailbox_name(&target, utf8).unwrap();
+            let expected = if spelling == "inbox" {
+                "INBOX"
+            } else {
+                spelling
+            };
+            assert_eq!(bytes, expected.as_bytes());
+            let response = UntaggedResponse::MailboxStatus {
+                mailbox: MailboxName::from_wire(expected.into(), &bytes, utf8),
+                items: vec![],
+            };
+            let context = ClassificationContext {
+                notify: NotifyFlags::default(),
+                command_target: Some(&target),
+            };
+            assert!(matches!(
+                classify(CommandKind::Status, &response, &context),
+                SolicitationRule::OnlySolicited
+            ));
+        }
+    }
+}

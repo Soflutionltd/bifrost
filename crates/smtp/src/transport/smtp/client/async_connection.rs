@@ -1,3 +1,5 @@
+#[cfg(feature = "account-error")]
+use crate::transport::smtp::batch::{SendProgress, SmtpBatchRecipient};
 use std::net::IpAddr;
 #[cfg(unix)]
 use std::path::Path;
@@ -23,9 +25,10 @@ use super::{
     core::{Op, OpOutcome, ProtocolMachine, Step},
     data_terminator,
 };
+#[cfg(feature = "account-error")]
+use crate::address::Address;
 use crate::{
     Envelope,
-    address::Address,
     transport::smtp::{
         Dialect,
         authentication::{
@@ -33,7 +36,6 @@ use crate::{
             decode_scram_payload, oauth_mechanism, password_mechanism, resolve_scram_binding,
             scram_hash,
         },
-        batch::{SendProgress, SmtpBatchRecipient},
         commands::{Auth, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Starttls, Vrfy},
         error,
         error::{Error, SmtpCommandPhase},
@@ -343,6 +345,7 @@ impl AsyncSmtpConnection {
     // Widened so the pool and transport tests can drive a scripted peer
     // through the public entry points instead of a socket.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(in crate::transport::smtp) async fn from_transcript(
         transcript: crate::transport::smtp::test_support::Transcript,
         hello_name: &ClientId,
@@ -361,6 +364,7 @@ impl AsyncSmtpConnection {
     /// Transcript setup with byte accounting installed, so a test can
     /// observe what the real send path would have metered.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(in crate::transport::smtp) async fn from_transcript_metered(
         transcript: crate::transport::smtp::test_support::Transcript,
         hello_name: &ClientId,
@@ -385,6 +389,7 @@ impl AsyncSmtpConnection {
     /// present-but-unusable certificate as a hard error) is testable without
     /// TLS.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(in crate::transport::smtp) async fn from_transcript_with_peer_certificate(
         transcript: crate::transport::smtp::test_support::Transcript,
         hello_name: &ClientId,
@@ -408,6 +413,7 @@ impl AsyncSmtpConnection {
     /// one that trickles reply lines on a clock, which is what separates a
     /// per-reply read deadline from a per-line one.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(in crate::transport::smtp) fn from_raw_stream_for_test(
         stream: Box<dyn super::async_net::AsyncTokioStream>,
         hello_name: &ClientId,
@@ -548,6 +554,7 @@ impl AsyncSmtpConnection {
     /// some recipients were rejected). Returns `Err((error, progress))` for
     /// batch-level failures where no recipient-specific outcome can be
     /// attributed.
+    #[cfg(feature = "account-error")]
     pub(crate) async fn send_smtp_batch(
         &mut self,
         from: Option<Address>,
@@ -566,6 +573,7 @@ impl AsyncSmtpConnection {
     ///
     /// Like `send_smtp_batch` but reads one final status per accepted
     /// recipient after the DATA body.
+    #[cfg(feature = "account-error")]
     pub(crate) async fn send_lmtp_batch(
         &mut self,
         from: Option<Address>,
@@ -582,6 +590,7 @@ impl AsyncSmtpConnection {
     /// Local validation and command construction for a batch send, all of it
     /// before `MAIL FROM` opens a transaction (see `build_envelope`).
     #[allow(clippy::type_complexity)]
+    #[cfg(feature = "account-error")]
     fn build_batch(
         &self,
         protocol: Dialect,
@@ -1063,12 +1072,11 @@ impl AsyncSmtpConnection {
 
         if challenges == 0 && response.has_code(334) {
             // The server never completed (or rejected) the exchange within the
-            // round-trip budget: an auth-exchange failure, routed on the Auth
-            // lane (InvalidInput + Auth -> Authorization), not an untagged
-            // Protocol(ParseFailed). Exhausting the budget while sending the
+            // round-trip budget: malformed peer behavior, with AUTH phase kept
+            // for diagnostics. Exhausting the budget while sending the
             // tenth answer is fine when that answer receives a final reply.
             self.abort().await;
-            Err(error::invalid_input("Unexpected number of challenges").with_phase(phase))
+            Err(error::parse("Unexpected number of challenges").with_phase(phase))
         } else {
             let hello_name = self.hello_name.clone();
             try_smtp!(self.hello(&hello_name).await, self);
@@ -1114,12 +1122,14 @@ impl AsyncSmtpConnection {
     /// write the body through `Op::WriteBody` and read the final reply through
     /// `Op::ReadSingle`, over these same writers.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) async fn message(&mut self, message: &[u8]) -> Result<Response, Error> {
         self.message_iter(std::iter::once(message)).await
     }
 
     /// Sends the message content by consuming an iterator that in its whole represents a message.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) async fn message_iter<I, B>(&mut self, message: I) -> Result<Response, Error>
     where
         I: Iterator<Item = B>,
@@ -1499,7 +1509,7 @@ impl AsyncSmtpConnection {
     }
 }
 
-#[cfg(all(test, feature = "tokio"))]
+#[cfg(all(test, feature = "tokio", feature = "account-error"))]
 mod transcript_tests {
     use std::time::Duration;
 

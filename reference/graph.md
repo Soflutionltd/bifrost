@@ -1,6 +1,12 @@
 # bifrost-graph reference
 
-Generic net translation receives `throttle_scope_for` explicitly for REST and EWS.
+Generic net translation receives `throttle_scope_for()` explicitly for REST and EWS.
+The context-free helper supplies the Account fallback; mailbox budget attribution
+remains context-dependent at the classified throttle sites.
+REST and auxiliary funnels use `reqwest::Method` through net's typed request
+builder. REST header options use named `RequestOptions` fields (`prefer` and
+`eventual_consistency`). Auxiliary requests are intrinsically unmetered and
+accept no assertion-only `Resource` argument.
 Body diagnostics use net's shared byte cap and truncation marker.
 
 Every request declares its `ReplayPolicy`; the table lives at the call sites.
@@ -72,7 +78,15 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   shared-mailbox owner). The rejected half goes to the caller's failed lane
   and the chunk proceeds; an empty routable half skips the POST. Generic
   over the per-site URL builder, so the lane rule is pinned once while each
-  site keeps its own classification.
+  site keeps its own classification. `resolve_answers` also correlates responses
+  for hydration, bulk mutation, PIM writes and reactions: only submitted numeric
+  ids are admitted, numeric aliases count as the same id, and the first answer
+  wins. Invalid, unsubmitted and duplicate answers are logged and discarded;
+  each lane retains its missing-answer policy. A non-numeric submitted id in
+  PIM writes is a debug assertion; release builds skip it in correlation, so
+  the missing-answer sweep reports it rather than panicking. An Outlook user expects each
+  submitted item accounted once, without unrelated provider answers changing
+  outcomes or cached validators.
 - `push/` - the push subscription surface, split by arm. `mod.rs` declares the
   modules and re-exports the `pub(crate)` doors the rest of `account/` calls
   (`push_subscribe` / `push_unsubscribe`, `retire_all_graph_subscriptions`,
@@ -2562,7 +2576,13 @@ responses update the etag cache: flag writes record the returned etag or evict
 when absent, moves and destroys evict the old id, and 412 evicts so retry must
 refresh. PIM batch writes instead evict every successful target, including
 property clears, through `pim::messages::submit_write_batch_resource`; the next
-bulk write cannot reuse a validator observed before that write. The outcome
+bulk write cannot reuse a validator observed before that write. PIM writes also
+evict on 404 and 412, matching bulk writes: absence has no validator and a
+conflict disproves the cached observation. Reads cache only validated hydrated
+bodies' etags; reactions do not observe a whole-message validator.
+`EtagIndex::observe` represents Read, Written and Invalidated observations, with
+deliberately different observations rather than one status-only cache rule:
+a read observes a version while a write consumes or replaces it. The outcome
 projector is shared by bulk and PIM writes.
 
 Cursor-decode failures (`CursorProtocolMismatch`, `CursorEnvelopeUnknown`,
@@ -2801,7 +2821,12 @@ Subscription expiry remains server text in `SubscriptionResponse` and
 `GraphSubscriptionState`. The renewal pass parses it and treats malformed text
 as due, warning once per row. Rejecting a create response merely because its
 expiry is malformed would discard its decoded server id before registration,
-losing the existing rollback, unsubscribe and close ownership. Outlook users
+losing the existing rollback, unsubscribe and close ownership. Missing, null,
+or non-string `expirationDateTime` decodes to empty invalid text, independently
+of the required subscription id. Both initial create and recreate therefore
+retain cleanup ownership; renewal classifies the invalid text as due and warns
+once through the existing maintenance path. Renewal responses use the same
+representation. Outlook users
 expect recoverable push coverage and reachable cleanup. A future typed-expiry
 conversion must retain that id through the failure lane and preserve those
 account-owned effects; parsing into a bare fallible timestamp is insufficient.

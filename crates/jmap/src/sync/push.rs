@@ -415,15 +415,9 @@ fn commit_push_set(enabled: &mut DataTypeSet, push_state: &mut Option<String>, u
 }
 
 fn data_type_for_scope(scope: &CursorScope) -> Option<DataType> {
-    match scope {
-        CursorScope::Type(ObjectType::Email) => Some(DataType::Email),
-        // Push subscriptions are per data type, not per mailbox. An Email
-        // subscription covers every account visible to this session,
-        // including delegate/shared accounts represented by Folder scopes.
-        CursorScope::Folder(_) => Some(DataType::Email),
-        CursorScope::Type(ObjectType::Mailbox) => Some(DataType::Mailbox),
-        _ => None,
-    }
+    super::state::JmapScopeRepr::from_cursor_scope(scope)
+        .ok()
+        .and_then(|scope| scope.data_type())
 }
 
 fn scope_for_data_type(data_type: &DataType) -> Option<CursorScope> {
@@ -1092,6 +1086,16 @@ mod tests {
         assert_eq!(routing.foreign_scopes.len(), 2);
         assert_eq!(routing.foreign_scopes["acct-a"], foreign_scope("acct-a"));
         assert_eq!(routing.foreign_scopes["acct-b"], foreign_scope("acct-b"));
+    }
+
+    #[test]
+    fn malformed_folder_scope_does_not_map_to_email_push() {
+        assert_eq!(
+            data_type_for_scope(&CursorScope::Folder(bifrost_types::FolderId(
+                "no-separator".to_string(),
+            ))),
+            None,
+        );
     }
 
     #[test]

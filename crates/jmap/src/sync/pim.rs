@@ -461,8 +461,7 @@ fn send_boundary_error(
 ) -> impl FnOnce(crate::Error) -> AccountError {
     move |error| {
         let unreadable = matches!(error, crate::Error::ResponseDecode(_));
-        let mut ctx = super::error::JmapErrorContext::new(op);
-        ctx.send_boundary = true;
+        let ctx = super::error::JmapErrorContext::send(op);
         let error = super::error::into_account_error(error, ctx);
         if unreadable {
             uncertain_submission(error, subject.as_ref())

@@ -31,7 +31,7 @@ addressbook home and directory gateways, caches the default personal address boo
 empty (single-principal surface). The raw DAV client and parser modules stay
 crate-private; consumers use only the factory and the shared `Account`
 contact primitives. Discovery tries `/.well-known/carddav` first - built from the ORIGIN of the
-configured base URL via `bifrost_net::url::well_known_url`, never by appending
+configured base URL via `bifrost_dav_core::url::well_known_url`, never by appending
 the suffix to a configured path - and falls
 back to the configured base URL both when that probe answers that it is not a
 discovery endpoint and when its successful body does not identify a current-user
@@ -761,7 +761,7 @@ no address book against such an account fails locally with `Request(Malformed)`
 Only the doors taking an `Option<AddressBookId>` reach the default at all -
 `contacts_list`, `contact_create` and `contact_search`. `contact_get` and
 `contact_update` derive the collection from the resource's own URL via
-`bifrost_net::url::parent_collection_url`, which answers for every id that
+`bifrost_dav_core::url::parent_collection_url`, which answers for every id that
 resolves absolute, so their fallback to the default is unreachable in practice
 and kept only as a total match arm.
 
@@ -960,3 +960,22 @@ legacy type scopes, which have no URL, and folder scopes validate it before
 polling. The shared optional token is storage only: CalDAV interprets it as a
 sync-token and CardDAV as a ctag. Neither token is interchangeable with the
 other dialect's token.
+
+## Coordinated DAV bearer sources and URL helpers
+
+The dispatcher admits raw bearer providers through `bifrost_net::coordinate`
+and stores a `CoordinatedTokenSource`. Clones share one cache, proactive refresh,
+opaque-token maximum age and failure backoff; concurrent rejected-token refreshes
+reuse the replacement. Existing coordinating sources retain their policy, and
+`StaticTokenSource` retains live external rotation. Credential-origin admission
+still precedes token lookup, and the DAV deadline bounds lookup and refresh.
+This also applies to clients given an existing `AccountNet`: that handle may
+belong to another composed protocol leg, so its bearer source is not the DAV
+credential authority. Separate clients needing shared refresh work should pass
+the same already-coordinated source.
+
+`bifrost_dav_core::url::parent_collection_url` drops query and fragment before
+removing the final resource path segment. `well_known_url` replaces the base
+path with the origin-rooted `/.well-known/<service>` and clears query and
+fragment; unusable bases return `None` so discovery can try the configured base.
+Both helpers and their existing tests live in dav-core.

@@ -35,6 +35,7 @@ mod snapshot;
 #[cfg(any(feature = "test-support", test))]
 pub mod test_support;
 mod transport;
+pub mod url;
 mod xml;
 
 pub use dispatch::{

@@ -1,6 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use super::*;
 use crate::connection::test_support::detached;
 use crate::connection::{ImapConnection, SessionState};
 use crate::error::Error;
@@ -12,19 +11,6 @@ fn conn(caps: Vec<Capability>) -> ImapConnection {
 
 fn conn_enabled(caps: Vec<Capability>, enabled: &[&str]) -> ImapConnection {
     detached(SessionState::Authenticated, caps, enabled)
-}
-
-// ---------------------------------------------------------------------------
-// inbox_eq (RFC 3501 Section 5.1)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn inbox_compare_is_case_insensitive_for_inbox_only() {
-    assert!(inbox_eq("INBOX", "inbox"));
-    assert!(inbox_eq("InBoX", "INBOX"));
-    assert!(inbox_eq("Archive", "Archive"));
-    assert!(!inbox_eq("Archive", "archive"));
-    assert!(!inbox_eq("INBOX", "INBOX/Sub"));
 }
 
 /// RFC 6855 Section 5: non-ASCII credentials require AUTHENTICATE. The check
@@ -175,7 +161,8 @@ fn quota_resource_name_uses_capability_parser() {
     let cap = Capability::from_imap_str("QUOTA=RES-MESSAGE");
     assert_eq!(ImapConnection::quota_resource_name(&cap), Some("MESSAGE"));
     let lower = Capability::from_imap_str("quota=res-message");
-    assert_eq!(ImapConnection::quota_resource_name(&lower), Some("message"));
+    // The parser stores `QUOTA=RES-` suffixes uppercase.
+    assert_eq!(ImapConnection::quota_resource_name(&lower), Some("MESSAGE"));
 }
 
 #[test]

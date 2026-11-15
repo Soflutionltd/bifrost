@@ -1,3 +1,5 @@
+use bifrost_types::container::FolderRole;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -569,12 +571,7 @@ pub(crate) fn shared_overrides_personal(name: &str, namespace_prefix: &str) -> b
 /// The trailing path segment of a mailbox name under the server's own
 /// hierarchy delimiter.
 ///
-/// The single home for this rule. Both the `FolderRole` name fallback
-/// (`pim.rs::folder_role`) and the Drafts probe that decides
-/// `draft_create` (`capabilities.rs`) key roles off the leaf, and they
-/// have to agree: a server where one sees `INBOX.Drafts` and the other
-/// sees `Drafts` advertises a draft capability whose APPEND target then
-/// fails to resolve. Two private copies of the split is how that drifts.
+/// Shared by the registry's role-name fallback and its callers.
 ///
 /// A `None` delimiter is LIST reporting a flat namespace, where the whole
 /// name IS the leaf. We still split on `/` there, deliberately: it is the
@@ -622,7 +619,81 @@ pub(crate) struct FolderRegistry {
     by_name: RwLock<HashMap<MailboxName, Arc<FolderEntry>>>,
 }
 
+fn folder_role_from_attributes(attributes: &[MailboxAttribute]) -> Option<FolderRole> {
+    for attr in attributes {
+        match attr {
+            MailboxAttribute::Sent => return Some(FolderRole::Sent),
+            MailboxAttribute::Drafts => return Some(FolderRole::Drafts),
+            MailboxAttribute::Archive => return Some(FolderRole::Archive),
+            MailboxAttribute::Trash => return Some(FolderRole::Trash),
+            MailboxAttribute::Junk => return Some(FolderRole::Spam),
+            MailboxAttribute::Custom(value) if value.eq_ignore_ascii_case("\\Inbox") => {
+                // A nested or localized name is not the protocol INBOX.
+                continue;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+pub(crate) fn folder_role(
+    attributes: &[MailboxAttribute],
+    name: &str,
+    delimiter: Option<char>,
+) -> Option<FolderRole> {
+    if name.eq_ignore_ascii_case("INBOX") {
+        return Some(FolderRole::Inbox);
+    }
+    if let Some(role) = folder_role_from_attributes(attributes) {
+        return Some(role);
+    }
+    // Only the top-level INBOX is the account inbox; nested names are ordinary folders.
+    let lower = super::folder_registry::leaf_name(name, delimiter).to_ascii_lowercase();
+    match lower.as_str() {
+        "inbox" => None,
+        "sent" | "sent mail" | "sent messages" => Some(FolderRole::Sent),
+        "draft" | "drafts" => Some(FolderRole::Drafts),
+        "archive" | "archives" => Some(FolderRole::Archive),
+        "trash" | "deleted" | "deleted messages" => Some(FolderRole::Trash),
+        "junk" | "spam" | "junk mail" => Some(FolderRole::Spam),
+        _ => None,
+    }
+}
+
+// Enterprise users expect Sent copies and Trash moves to stay in their own mailbox.
+// All account role consumers share this resolver, including capability discovery.
+pub(crate) fn role_folder_from_entries(
+    entries: Vec<std::sync::Arc<FolderEntry>>,
+    role: FolderRole,
+) -> Option<MailboxName> {
+    entries
+        .into_iter()
+        .filter(|entry| {
+            entry.shared_owner.is_none()
+                && entry.selectable()
+                && folder_role(&entry.attributes(), entry.name.as_str(), entry.delimiter())
+                    == Some(role)
+        })
+        .min_by(|left, right| {
+            let left_rank = u8::from(folder_role_from_attributes(&left.attributes()) != Some(role));
+            let right_rank =
+                u8::from(folder_role_from_attributes(&right.attributes()) != Some(role));
+            // Distinct wire addresses can decode to the same display name.
+            // Use the stable mailbox order last so registry iteration cannot
+            // decide which address represents the role.
+            left_rank
+                .cmp(&right_rank)
+                .then_with(|| left.name.cmp_account_order(&right.name))
+        })
+        .map(|entry| entry.name.clone())
+}
+
 impl FolderRegistry {
+    pub(crate) fn role_folder(&self, role: FolderRole) -> Option<MailboxName> {
+        role_folder_from_entries(self.entries(), role)
+    }
+
     pub(crate) fn from_list(folders: Vec<MailboxInfo>) -> Self {
         let registry = Self::default();
         registry.replace_all(folders);
@@ -1883,6 +1954,40 @@ mod tests {
         assert_eq!(
             recreated.shared_owner,
             Some(bifrost_types::MailboxId("alice".to_owned())),
+        );
+    }
+}
+
+#[cfg(test)]
+mod role_resolution_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn roles_exclude_shared_and_nested_inboxes() {
+        let personal = MailboxInfo {
+            name: MailboxName::new("Sent").unwrap(),
+            ..Default::default()
+        };
+        let shared = SharedFolderEntry {
+            info: MailboxInfo {
+                name: MailboxName::new("Shared/alice/Sent").unwrap(),
+                attributes: vec![MailboxAttribute::Sent],
+                ..Default::default()
+            },
+            owner: bifrost_types::MailboxId("alice".into()),
+            rights: None,
+            namespace_prefix: "Shared/".into(),
+        };
+        let registry = FolderRegistry::from_lists(vec![personal], vec![shared]);
+        assert_eq!(
+            registry.role_folder(FolderRole::Sent).unwrap().as_str(),
+            "Sent"
+        );
+        assert_eq!(folder_role(&[], "Archive/Inbox", Some('/')), None);
+        assert_eq!(
+            folder_role(&[], "INBOX", Some('/')),
+            Some(FolderRole::Inbox)
         );
     }
 }

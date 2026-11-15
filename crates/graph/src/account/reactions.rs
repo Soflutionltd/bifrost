@@ -218,15 +218,8 @@ fn classify_chunk(
     replayable: &[bool],
 ) {
     let mut answered: HashSet<usize> = HashSet::new();
-    for item in responses {
-        let Some(index) = item.id.parse::<usize>().ok().filter(|i| *i < chunk.len()) else {
-            // An id we never submitted; nothing to account it against.
-            continue;
-        };
-        if !answered.insert(index) {
-            // Graph answered the same request twice; the first answer won.
-            continue;
-        }
+    for (index, item) in super::batch_routing::resolve_answers(0..chunk.len(), responses) {
+        answered.insert(index);
         let message_id = &chunk[index];
         if (200..300).contains(&item.status) {
             builder.push_succeeded(

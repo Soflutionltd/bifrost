@@ -14,6 +14,7 @@ pub(crate) mod get;
 pub(crate) mod id;
 pub(crate) mod method;
 pub(crate) mod parse;
+pub(crate) mod patch;
 pub(crate) mod query;
 pub(crate) mod query_changes;
 pub(crate) mod request;
@@ -114,12 +115,15 @@ macro_rules! json_object_struct {
         impl $patch {
             pub(crate) fn set_property(
                 &mut self,
-                name: impl Into<String>,
+                name: impl Into<$crate::core::patch::PatchPath>,
                 value: serde_json::Value,
             ) -> &mut Self {
-                self.properties.insert(name.into(), value);
+                $crate::core::patch::insert(&mut self.properties, name, value);
                 self
             }
+            // Raw extension access intentionally remains possible. Callers editing
+            // paths here own RFC 8620 overlap validation; typed setters and
+            // set_property use the central path policy instead.
             pub(crate) fn properties_mut(
                 &mut self,
             ) -> &mut serde_json::Map<String, serde_json::Value> {

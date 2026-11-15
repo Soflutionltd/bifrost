@@ -78,7 +78,7 @@ pub enum Capability {
     /// SORT extension (RFC 5256 Section 1).
     Sort,
     /// `SORT=DISPLAY` extension (RFC 5957).
-    SortDisplay(String),
+    SortDisplay,
     /// `STARTTLS` (RFC 3501 Section 6.2.1 / RFC 9051 Section 6.2.1).
     StartTls,
     /// `SPECIAL-USE` (RFC 6154).
@@ -115,6 +115,9 @@ pub enum Capability {
     /// `AUTH=<mechanism>` (e.g. `AUTH=PLAIN`, `AUTH=XOAUTH2`) (RFC 3501 Section 7.2.1).
     Auth(String),
     /// Unrecognized capability  -  preserved verbatim.
+    // Account callers still construct payload variants directly. Until all
+    // producers use from_imap_str, enum-derived equality would silently change
+    // protocol identity for alternate spellings; retain wire-token equality.
     Other(String),
 }
 
@@ -123,59 +126,7 @@ impl Capability {
     /// (e.g. `IDLE`, `AUTH=PLAIN`, `THREAD=REFERENCES`)
     /// (RFC 3501 Section 7.2.1 / RFC 9051 Section 7.2.1).
     pub fn as_imap_str(&self) -> String {
-        match self {
-            Self::Imap4Rev1 => "IMAP4rev1".into(),
-            Self::Imap4Rev2 => "IMAP4rev2".into(),
-            Self::Acl => "ACL".into(),
-            Self::AppendLimit(Some(n)) => format!("APPENDLIMIT={n}"),
-            Self::AppendLimit(None) => "APPENDLIMIT".into(),
-            Self::Binary => "BINARY".into(),
-            Self::Children => "CHILDREN".into(),
-            Self::CompressDeflate => "COMPRESS=DEFLATE".into(),
-            Self::Condstore => "CONDSTORE".into(),
-            Self::CreateSpecialUse => "CREATE-SPECIAL-USE".into(),
-            Self::Enable => "ENABLE".into(),
-            Self::Esearch => "ESEARCH".into(),
-            Self::Id => "ID".into(),
-            Self::Idle => "IDLE".into(),
-            Self::ListExtended => "LIST-EXTENDED".into(),
-            Self::ListStatus => "LIST-STATUS".into(),
-            Self::LiteralPlus => "LITERAL+".into(),
-            Self::LoginDisabled => "LOGINDISABLED".into(),
-            Self::LiteralMinus => "LITERAL-".into(),
-            Self::Metadata => "METADATA".into(),
-            Self::MetadataServer => "METADATA-SERVER".into(),
-            Self::Move => "MOVE".into(),
-            Self::MultiAppend => "MULTIAPPEND".into(),
-            Self::Namespace => "NAMESPACE".into(),
-            Self::Notify => "NOTIFY".into(),
-            Self::ObjectId => "OBJECTID".into(),
-            Self::Preview => "PREVIEW".into(),
-            Self::QResync => "QRESYNC".into(),
-            Self::Quota => "QUOTA".into(),
-            Self::QuotaResource(s) => format!("QUOTA=RES-{s}"),
-            Self::QuotaSet => "QUOTASET".into(),
-            Self::Rights(s) => format!("RIGHTS={s}"),
-            Self::SaslIr => "SASL-IR".into(),
-            Self::SaveDate => "SAVEDATE".into(),
-            Self::SearchRes => "SEARCHRES".into(),
-            Self::Sort => "SORT".into(),
-            Self::SortDisplay(s) => format!("SORT={s}"),
-            Self::StartTls => "STARTTLS".into(),
-            Self::SpecialUse => "SPECIAL-USE".into(),
-            Self::Thread(s) => format!("THREAD={s}"),
-            Self::StatusSize => "STATUS=SIZE".into(),
-            Self::StatusDeleted => "STATUS=DELETED".into(),
-            Self::Unauthenticate => "UNAUTHENTICATE".into(),
-            Self::UidPlus => "UIDPLUS".into(),
-            Self::Unselect => "UNSELECT".into(),
-            Self::Within => "WITHIN".into(),
-            Self::XGmExt1 => "X-GM-EXT-1".into(),
-            Self::Utf8Accept => "UTF8=ACCEPT".into(),
-            Self::Utf8Only => "UTF8=ONLY".into(),
-            Self::Auth(s) => format!("AUTH={s}"),
-            Self::Other(s) => s.clone(),
-        }
+        self.to_string()
     }
 
     /// Parse a capability token from its IMAP wire representation
@@ -244,14 +195,14 @@ impl Capability {
                     }
                 } else if upper == "SORT=DISPLAY" {
                     // RFC 5957 defines the dedicated SORT=DISPLAY capability.
-                    Self::SortDisplay("DISPLAY".to_owned())
+                    Self::SortDisplay
                 } else if let Some(resource) = upper.strip_prefix("QUOTA=RES-") {
                     // RFC 9208 Section 3.1.1: supported quota resources are
                     // advertised as `QUOTA=RES-<name>`, so the suffix is required.
                     if resource.is_empty() {
                         Self::Other(s.to_owned())
                     } else {
-                        Self::QuotaResource(s["QUOTA=RES-".len()..].to_string())
+                        Self::QuotaResource(resource.to_owned())
                     }
                 } else if let Some(algo) = upper.strip_prefix("THREAD=") {
                     // THREAD=REFERENCES, THREAD=ORDEREDSUBJECT, etc. (RFC 5256 Section 1)
@@ -262,13 +213,13 @@ impl Capability {
                     }
                 } else if let Some(rights) = upper.strip_prefix("RIGHTS=") {
                     // RIGHTS=<chars> (RFC 4314 Section 6)
-                    // Preserve the original case of the rights characters.
+                    // Canonical rights characters are lowercase.
                     // RFC 4314 Section 7: rights-capa = "RIGHTS=" new-rights,
                     // and new-rights = 1*LOWER-ALPHA, so an empty suffix is malformed.
                     if rights.is_empty() {
                         Self::Other(s.to_owned())
                     } else {
-                        Self::Rights(s["RIGHTS=".len()..].to_string())
+                        Self::Rights(rights.to_ascii_lowercase())
                     }
                 } else if let Some(rest) = upper.strip_prefix("APPENDLIMIT") {
                     if rest.is_empty() {
@@ -322,7 +273,7 @@ impl From<&str> for Capability {
 /// registered"  -  capability names are atoms and IMAP atoms are case-insensitive.
 ///
 /// Known capability variants with no string payload compare by discriminant.
-/// String-carrying variants (`Auth`, `Thread`, `SortDisplay`, `Rights`, `Other`)
+/// String-carrying variants (`Auth`, `Thread`, `Rights`, `Other`)
 /// compare using ASCII case-insensitive comparison so that e.g.
 /// `Auth("PLAIN")` and `Auth("plain")` are treated as the same capability.
 ///
@@ -374,11 +325,11 @@ impl PartialEq for Capability {
             | (Self::Within, Self::Within)
             | (Self::XGmExt1, Self::XGmExt1)
             | (Self::Utf8Accept, Self::Utf8Accept)
-            | (Self::Utf8Only, Self::Utf8Only) => true,
+            | (Self::Utf8Only, Self::Utf8Only)
+            | (Self::SortDisplay, Self::SortDisplay) => true,
             (Self::AppendLimit(a), Self::AppendLimit(b)) => a == b,
             (Self::Auth(a), Self::Auth(b))
             | (Self::Thread(a), Self::Thread(b))
-            | (Self::SortDisplay(a), Self::SortDisplay(b))
             | (Self::QuotaResource(a), Self::QuotaResource(b))
             | (Self::Rights(a), Self::Rights(b))
             | (Self::Other(a), Self::Other(b)) => a.eq_ignore_ascii_case(b),
@@ -402,17 +353,77 @@ impl Eq for Capability {}
 /// variants, which is identical for cross-representation equivalents.
 impl std::hash::Hash for Capability {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // RFC 3501 Section 7.2.1: case-insensitive hashing via wire form.
-        // Other("IDLE") and Idle both yield "IDLE", so lowercasing
-        // produces the same hash.
-        for byte in self.as_imap_str().as_bytes() {
-            byte.to_ascii_lowercase().hash(state);
+        use std::fmt::Write;
+
+        struct FoldedHash<'a, H>(&'a mut H);
+        impl<H: std::hash::Hasher> std::fmt::Write for FoldedHash<'_, H> {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                for byte in s.bytes() {
+                    std::hash::Hash::hash(&byte.to_ascii_lowercase(), self.0);
+                }
+                Ok(())
+            }
         }
+        // Display writes static tokens, suffixes and numbers directly into the
+        // sink. No capability spelling needs a temporary allocation to hash.
+        let _ = write!(FoldedHash(state), "{self}");
     }
 }
 
 impl std::fmt::Display for Capability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.as_imap_str(), f)
+        match self {
+            Self::Imap4Rev1 => f.write_str("IMAP4rev1"),
+            Self::Imap4Rev2 => f.write_str("IMAP4rev2"),
+            Self::Acl => f.write_str("ACL"),
+            Self::AppendLimit(Some(n)) => write!(f, "APPENDLIMIT={n}"),
+            Self::AppendLimit(None) => f.write_str("APPENDLIMIT"),
+            Self::Binary => f.write_str("BINARY"),
+            Self::Children => f.write_str("CHILDREN"),
+            Self::CompressDeflate => f.write_str("COMPRESS=DEFLATE"),
+            Self::Condstore => f.write_str("CONDSTORE"),
+            Self::CreateSpecialUse => f.write_str("CREATE-SPECIAL-USE"),
+            Self::Enable => f.write_str("ENABLE"),
+            Self::Esearch => f.write_str("ESEARCH"),
+            Self::Id => f.write_str("ID"),
+            Self::Idle => f.write_str("IDLE"),
+            Self::ListExtended => f.write_str("LIST-EXTENDED"),
+            Self::ListStatus => f.write_str("LIST-STATUS"),
+            Self::LiteralPlus => f.write_str("LITERAL+"),
+            Self::LoginDisabled => f.write_str("LOGINDISABLED"),
+            Self::LiteralMinus => f.write_str("LITERAL-"),
+            Self::Metadata => f.write_str("METADATA"),
+            Self::MetadataServer => f.write_str("METADATA-SERVER"),
+            Self::Move => f.write_str("MOVE"),
+            Self::MultiAppend => f.write_str("MULTIAPPEND"),
+            Self::Namespace => f.write_str("NAMESPACE"),
+            Self::Notify => f.write_str("NOTIFY"),
+            Self::ObjectId => f.write_str("OBJECTID"),
+            Self::Preview => f.write_str("PREVIEW"),
+            Self::QResync => f.write_str("QRESYNC"),
+            Self::Quota => f.write_str("QUOTA"),
+            Self::QuotaResource(s) => write!(f, "QUOTA=RES-{s}"),
+            Self::QuotaSet => f.write_str("QUOTASET"),
+            Self::Rights(s) => write!(f, "RIGHTS={s}"),
+            Self::SaslIr => f.write_str("SASL-IR"),
+            Self::SaveDate => f.write_str("SAVEDATE"),
+            Self::SearchRes => f.write_str("SEARCHRES"),
+            Self::Sort => f.write_str("SORT"),
+            Self::SortDisplay => f.write_str("SORT=DISPLAY"),
+            Self::StartTls => f.write_str("STARTTLS"),
+            Self::SpecialUse => f.write_str("SPECIAL-USE"),
+            Self::Thread(s) => write!(f, "THREAD={s}"),
+            Self::StatusSize => f.write_str("STATUS=SIZE"),
+            Self::StatusDeleted => f.write_str("STATUS=DELETED"),
+            Self::Unauthenticate => f.write_str("UNAUTHENTICATE"),
+            Self::UidPlus => f.write_str("UIDPLUS"),
+            Self::Unselect => f.write_str("UNSELECT"),
+            Self::Within => f.write_str("WITHIN"),
+            Self::XGmExt1 => f.write_str("X-GM-EXT-1"),
+            Self::Utf8Accept => f.write_str("UTF8=ACCEPT"),
+            Self::Utf8Only => f.write_str("UTF8=ONLY"),
+            Self::Auth(s) => write!(f, "AUTH={s}"),
+            Self::Other(s) => f.write_str(s),
+        }
     }
 }

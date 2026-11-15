@@ -17,7 +17,7 @@ use bifrost_types::TransmissionState;
 use futures::StreamExt;
 use reqwest::header::RANGE;
 
-use crate::auth::{DEFAULT_TOKEN_MAX_AGE, OAuthRefresher, TokenSource};
+use crate::auth::{CoordinatedTokenSource, DEFAULT_TOKEN_MAX_AGE, TokenSource};
 use crate::bandwidth::{AccountMeter, BandwidthMeter};
 use crate::budget::{BandwidthBudget, BandwidthDirection, BandwidthRegistry};
 use crate::concurrency::{ConcurrencyLimit, WeakLimit};
@@ -336,14 +336,9 @@ impl Net {
                 account: id,
                 registration_id,
                 meter: account_meter,
-                token_source: spec.token_source.map(|source| {
-                    if source.is_coordinating() {
-                        source
-                    } else {
-                        Arc::new(OAuthRefresher::new(source).with_max_age(spec.token_max_age))
-                            as Arc<dyn TokenSource>
-                    }
-                }),
+                token_source: spec
+                    .token_source
+                    .map(|source| CoordinatedTokenSource::with_max_age(source, spec.token_max_age)),
                 rate_scopes,
                 ambiguous_scope_hosts,
                 default_retry: spec.default_retry,
@@ -460,7 +455,7 @@ pub(crate) struct AccountNetInner {
     /// meter map per attempt.
     pub(crate) meter: AccountMeter,
     /// Provider of OAuth bearer tokens for this account.
-    pub(crate) token_source: Option<Arc<dyn TokenSource>>,
+    pub(crate) token_source: Option<CoordinatedTokenSource>,
     /// Quota discriminator selected for each registered request host.
     pub(crate) rate_scopes: HashMap<String, String>,
     /// Hosts this account declared more than one quota scope for. A request
@@ -819,7 +814,10 @@ impl AccountNet {
     /// `auth.rs` can share the trait object across requests.
     #[must_use]
     pub fn token_source(&self) -> Option<&Arc<dyn TokenSource>> {
-        self.inner.token_source.as_ref()
+        self.inner
+            .token_source
+            .as_ref()
+            .map(CoordinatedTokenSource::as_source)
     }
 
     /// Underlying shared `Net` handle. Crate-internal: used by the
@@ -928,6 +926,7 @@ pub struct AccountSpec {
     /// Per-host rate-limit declarations. Empty means "no governor
     /// enforcement for this account", which is the default for JMAP.
     pub hosts: Vec<RateLimit>,
+    /// Raw input boundary: attachment admits this into a CoordinatedTokenSource.
     /// Optional OAuth token provider. Coordinating sources are retained as-is;
     /// raw providers are wrapped in an `OAuthRefresher` using `token_max_age`.
     /// A retained source owns its proactive refresh and backoff policy.
@@ -1935,7 +1934,7 @@ mod tests {
 #[cfg(test)]
 mod coordinating_resource_tests {
     use super::*;
-    use crate::{AccessToken, StaticTokenSource};
+    use crate::{AccessToken, OAuthRefresher, StaticTokenSource};
 
     #[tokio::test]
     async fn coordinating_sources_survive_multiple_attachments() {

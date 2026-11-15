@@ -34,7 +34,7 @@ use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, BatchFailure, BatchItemId,
     BatchSuccess, Cause, CursorScope, DiagnosticText, ErrorScope, InternalCause, InternalErrorKind,
-    ItemOutcome, JmapMethod, MutationSuccess, Protocol, ProtocolErrorKind, Provider, RequestCause,
+    ItemOutcome, JmapMethod, MutationSuccess, Protocol, ProtocolErrorKind, RequestCause,
     RequestErrorKind, ResourceKind, RetryHint, ServerCause, ServerErrorKind, StateCause, SyncEvent,
     SyncStateErrorKind, ThrottleScope, TransmissionState, TransportCause, TransportErrorKind,
     TransportKind, WireCause,
@@ -43,6 +43,16 @@ use bifrost_types::{
 use crate::core::error::{JMAPError, MethodErrorType, ProblemDetails, ProblemType};
 use crate::core::set::{SetError, SetErrorType};
 
+// State-bearing contracts own their recovery scope. A caller cannot describe
+// an anchored or state-based request without saying which cursor to restart.
+#[derive(Clone, Debug)]
+enum RequestContract {
+    Plain,
+    StateRead(CursorScope),
+    AnchoredQuery(CursorScope),
+    Send,
+}
+
 /// Context attached at the JMAP conversion boundary. Mirrors
 /// `bifrost_net::NetErrorContext` but with `protocol` fixed to
 /// `Protocol::Jmap` and operation non-optional so call sites cannot
@@ -50,24 +60,18 @@ use crate::core::set::{SetError, SetErrorType};
 /// idempotent-true default of the central recovery mapper.
 #[derive(Clone, Debug)]
 pub(crate) struct JmapErrorContext {
-    pub(crate) provider: Option<Provider>,
     pub(crate) operation: AccountOperation,
-    pub(crate) scope: Option<ErrorScope>,
-    pub(crate) state_based: bool,
-    pub(crate) anchored_query: bool,
-    pub(crate) send_boundary: bool,
+    scope: Option<ErrorScope>,
+    contract: RequestContract,
 }
 
 impl JmapErrorContext {
     #[must_use]
     pub(crate) fn new(operation: AccountOperation) -> Self {
         Self {
-            provider: None,
             operation,
             scope: None,
-            state_based: false,
-            anchored_query: false,
-            send_boundary: false,
+            contract: RequestContract::Plain,
         }
     }
 
@@ -77,6 +81,15 @@ impl JmapErrorContext {
         self
     }
 
+    fn scope(&self) -> Option<ErrorScope> {
+        match &self.contract {
+            RequestContract::StateRead(scope) | RequestContract::AnchoredQuery(scope) => {
+                Some(ErrorScope::Cursor(scope.clone()))
+            }
+            RequestContract::Plain | RequestContract::Send => self.scope.clone(),
+        }
+    }
+
     #[must_use]
     pub(crate) fn cursor(operation: AccountOperation, scope: CursorScope) -> Self {
         Self::new(operation).with_scope(ErrorScope::Cursor(scope))
@@ -84,19 +97,39 @@ impl JmapErrorContext {
 
     #[must_use]
     pub(crate) fn state_cursor(operation: AccountOperation, scope: CursorScope) -> Self {
-        Self::cursor(operation, scope).with_state_based()
+        Self {
+            operation,
+            scope: None,
+            contract: RequestContract::StateRead(scope),
+        }
     }
 
     #[must_use]
-    pub(crate) fn with_state_based(mut self) -> Self {
-        self.state_based = true;
-        self
+    pub(crate) fn anchored_cursor(operation: AccountOperation, scope: CursorScope) -> Self {
+        Self {
+            operation,
+            scope: None,
+            contract: RequestContract::AnchoredQuery(scope),
+        }
     }
 
     #[must_use]
-    pub(crate) fn with_anchored_query(mut self) -> Self {
-        self.anchored_query = true;
-        self
+    pub(crate) fn send(operation: AccountOperation) -> Self {
+        Self {
+            operation,
+            scope: None,
+            contract: RequestContract::Send,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_state_read(&self) -> bool {
+        matches!(self.contract, RequestContract::StateRead(_))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_anchored_query(&self) -> bool {
+        matches!(self.contract, RequestContract::AnchoredQuery(_))
     }
 
     #[must_use]
@@ -191,7 +224,7 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             // Only a send boundary knows this came from the received envelope:
             // `From<serde_json::Error>` makes any stray `?` on a serde error a
             // `ResponseDecode`, so elsewhere it is no evidence of an answer.
-            let builder = if ctx.send_boundary {
+            let builder = if matches!(ctx.contract, RequestContract::Send) {
                 builder.push_cause(Cause::Attempt(AttemptCause::new(
                     TransmissionState::Acknowledged,
                 )))
@@ -737,7 +770,8 @@ pub(crate) fn set_error_to_account_error(
     ctx: JmapErrorContext,
     item_scope: Option<ErrorScope>,
 ) -> AccountError {
-    let scope_for_resource = item_scope.as_ref().or(ctx.scope.as_ref());
+    let context_scope = ctx.scope();
+    let scope_for_resource = item_scope.as_ref().or(context_scope.as_ref());
     let error_type = set_error.error_type().clone();
     let (kind, primary) = match error_type {
         SetErrorType::Forbidden
@@ -1045,10 +1079,7 @@ fn build_with(
         _ => AccountErrorBuilder::new(kind, primary).protocol(Protocol::Jmap),
     }
     .operation(ctx.operation);
-    if let Some(provider) = ctx.provider {
-        builder = builder.provider(provider);
-    }
-    if let Some(scope) = ctx.scope.clone() {
+    if let Some(scope) = ctx.scope() {
         builder = builder.scope(scope);
     }
     builder
@@ -1082,10 +1113,10 @@ fn convert_transport(
         net_into_account_error(
             net,
             NetErrorContext {
-                provider: ctx.provider,
+                provider: None,
                 protocol: Protocol::Jmap,
                 operation: ctx.operation,
-                scope: ctx.scope,
+                scope: ctx.scope(),
             },
             Some(ThrottleScope::Account),
         )
@@ -1102,7 +1133,7 @@ fn convert_transport(
             )),
             &ctx,
         );
-        let builder = if ctx.send_boundary {
+        let builder = if matches!(ctx.contract, RequestContract::Send) {
             builder.push_cause(Cause::Attempt(AttemptCause::new(
                 TransmissionState::InFlight,
             )))
@@ -1163,13 +1194,13 @@ fn convert_problem(
         (ProblemType::Other(_), Some(403)) => (
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied {
-                resource: ctx.scope.as_ref().and_then(ErrorScope::resource),
+                resource: ctx.scope().as_ref().and_then(ErrorScope::resource),
             }),
         ),
         (ProblemType::Other(_), Some(404)) => {
-            if let Some(resource) = ctx.scope.as_ref().and_then(ErrorScope::resource) {
+            if let Some(resource) = ctx.scope().as_ref().and_then(ErrorScope::resource) {
                 let id = ctx
-                    .scope
+                    .scope()
                     .as_ref()
                     .and_then(ErrorScope::object_id)
                     .map(str::to_owned);
@@ -1204,10 +1235,14 @@ fn convert_problem(
             AccountErrorKind::ConcurrencyConflict,
             Cause::State(StateCause::ConcurrencyConflict),
         ),
-        (ProblemType::Other(_), Some(410)) if matches!(ctx.scope, Some(ErrorScope::Cursor(_))) => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-        ),
+        (ProblemType::Other(_), Some(410))
+            if matches!(ctx.scope(), Some(ErrorScope::Cursor(_))) =>
+        {
+            (
+                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+                Cause::State(StateCause::CursorInvalid),
+            )
+        }
         (ProblemType::Other(_), Some(429)) => (
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
             Cause::Server(ServerCause::RateLimited { retry_hint }),
@@ -1322,7 +1357,7 @@ fn state_expiry_error(
     wire: JmapMethod,
     ctx: &JmapErrorContext,
 ) -> (AccountErrorKind, Cause, JmapMethod) {
-    if !ctx.state_based {
+    if !matches!(ctx.contract, RequestContract::StateRead(_)) {
         return (
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
             Cause::Wire(WireCause::MalformedResponse {
@@ -1336,35 +1371,15 @@ fn state_expiry_error(
         );
     }
 
-    if matches!(ctx.scope.as_ref(), Some(ErrorScope::Cursor(_))) {
-        (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-            wire,
-        )
-    } else {
-        (
-            AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
-            Cause::Internal(InternalCause::new(
-                InternalErrorKind::InvariantViolated,
-                Some(DiagnosticText::support_only(
-                    "state-based request reached error conversion without a cursor scope"
-                        .to_string(),
-                )),
-            )),
-            wire,
-        )
-    }
+    (
+        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+        Cause::State(StateCause::CursorInvalid),
+        wire,
+    )
 }
 
 fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext) -> AccountError {
     let method_type = method.error_type();
-    // A cursor scope alone does not prove which request contract applies:
-    // inventory needs an explicitly anchored query for anchorNotFound, while
-    // cannotCalculateChanges only means expiry on a state-based request. The
-    // two explicit flags keep those method errors from borrowing each other's
-    // recovery policy.
-    let has_cursor_scope = matches!(ctx.scope, Some(ErrorScope::Cursor(_)));
     let (kind, primary, wire) = match method_type {
         MethodErrorType::ServerUnavailable => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
@@ -1405,7 +1420,7 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
         MethodErrorType::Forbidden => (
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied {
-                resource: ctx.scope.as_ref().and_then(ErrorScope::resource),
+                resource: ctx.scope().as_ref().and_then(ErrorScope::resource),
             }),
             JmapMethod::Forbidden,
         ),
@@ -1432,7 +1447,7 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
         MethodErrorType::AccountReadOnly => (
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied {
-                resource: ctx.scope.as_ref().and_then(ErrorScope::resource),
+                resource: ctx.scope().as_ref().and_then(ErrorScope::resource),
             }),
             JmapMethod::AccountReadOnly,
         ),
@@ -1456,21 +1471,15 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
             Cause::State(StateCause::ConcurrencyConflict),
             JmapMethod::AlreadyExists,
         ),
-        MethodErrorType::AnchorNotFound if ctx.anchored_query && has_cursor_scope => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-            JmapMethod::AnchorNotFound,
-        ),
-        MethodErrorType::AnchorNotFound if ctx.anchored_query => (
-            AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
-            Cause::Internal(InternalCause::new(
-                InternalErrorKind::InvariantViolated,
-                Some(DiagnosticText::support_only(
-                    "anchored query reached error conversion without a cursor scope".to_string(),
-                )),
-            )),
-            JmapMethod::AnchorNotFound,
-        ),
+        MethodErrorType::AnchorNotFound
+            if matches!(ctx.contract, RequestContract::AnchoredQuery(_)) =>
+        {
+            (
+                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+                Cause::State(StateCause::CursorInvalid),
+                JmapMethod::AnchorNotFound,
+            )
+        }
         MethodErrorType::AnchorNotFound => (
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
             Cause::Wire(WireCause::Jmap(JmapMethod::AnchorNotFound)),
@@ -1765,7 +1774,7 @@ pub(crate) fn require_created_id(
 }
 
 fn convert_id_not_found(id: String, ctx: JmapErrorContext) -> AccountError {
-    if let Some(resource) = ctx.scope.as_ref().and_then(ErrorScope::resource) {
+    if let Some(resource) = ctx.scope().as_ref().and_then(ErrorScope::resource) {
         build(
             AccountErrorKind::NotFound(resource),
             Cause::Request(RequestCause::NotFound {
@@ -2270,23 +2279,6 @@ mod tests {
     }
 
     #[test]
-    fn state_expiry_without_a_cursor_scope_is_a_client_invariant() {
-        // A state-based caller that omits its recovery scope is a client bug,
-        // not evidence of a non-conforming server.
-        for code in ["cannotCalculateChanges", "tooManyChanges"] {
-            let err = into_account_error(
-                method_error(code),
-                JmapErrorContext::new(AccountOperation::SyncChanges).with_state_based(),
-            );
-            assert_eq!(
-                err.kind(),
-                &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
-            );
-            assert!(err.recovery().is_terminal());
-        }
-    }
-
-    #[test]
     fn state_expiry_on_a_stateless_request_is_a_contract_violation() {
         let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
         for code in ["cannotCalculateChanges", "tooManyChanges"] {
@@ -2562,8 +2554,7 @@ mod tests {
         // response arrived: `From<serde_json::Error>` produces it for any
         // serde failure.
         assert_eq!(attempt(&err), None);
-        let mut ctx = JmapErrorContext::new(AccountOperation::Send);
-        ctx.send_boundary = true;
+        let ctx = JmapErrorContext::send(AccountOperation::Send);
         let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
         let err = into_account_error(crate::Error::ResponseDecode(json_err), ctx);
         assert_eq!(attempt(&err), Some(TransmissionState::Acknowledged));
@@ -3076,8 +3067,7 @@ mod tests {
 
         let anchored = into_account_error(
             method_error("anchorNotFound"),
-            JmapErrorContext::cursor(AccountOperation::SyncInventory, scope.clone())
-                .with_anchored_query(),
+            JmapErrorContext::anchored_cursor(AccountOperation::SyncInventory, scope.clone()),
         );
         assert_eq!(
             anchored.kind(),
@@ -3086,15 +3076,6 @@ mod tests {
         assert_eq!(
             anchored.recovery(),
             &RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(scope)),
-        );
-
-        let bare = into_account_error(
-            method_error("anchorNotFound"),
-            JmapErrorContext::new(AccountOperation::SyncInventory).with_anchored_query(),
-        );
-        assert_eq!(
-            bare.kind(),
-            &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
         );
     }
 

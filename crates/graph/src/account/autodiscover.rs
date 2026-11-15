@@ -23,7 +23,7 @@ use super::graph_error::{
     autodiscover_pox_error_to_account_error, into_account_error, provider_answer_violation,
     response_to_account_error_pub,
 };
-use crate::client::{AuxTarget, Resource};
+use crate::client::AuxTarget;
 use crate::error::{GraphError, GraphResponseError};
 use crate::ews::try_push_general_ref;
 use crate::origin::AdmittedUrl;
@@ -619,8 +619,7 @@ impl GraphAccount {
         let resp = self
             .client
             .execute_aux(
-                Resource::Unmetered,
-                "POST",
+                reqwest::Method::POST,
                 AuxTarget::Bearer(url),
                 &headers,
                 bytes::Bytes::from(body),

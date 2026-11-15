@@ -332,25 +332,24 @@ async fn fresh_cursor_establishment<T: HttpTransport>(
     email_states: StateMap,
     mailbox_states: StateMap,
 ) -> Result<CursorEstablishment, AccountError> {
-    let (states, account_id) = match &scope {
-        CursorScope::Type(bifrost_types::ObjectType::Email) | CursorScope::Folder(_) => {
-            (&email_states, mail.id_str().to_string())
-        }
-        CursorScope::Type(bifrost_types::ObjectType::Mailbox) => {
-            (&mailbox_states, mail.id_str().to_string())
-        }
+    let data_type = state::JmapScopeRepr::from_cursor_scope(&scope)
+        .ok()
+        .and_then(|scope| scope.data_type());
+    let (states, account_id) = match &data_type {
+        Some(crate::DataType::Email) => (&email_states, mail.id_str().to_string()),
+        Some(crate::DataType::Mailbox) => (&mailbox_states, mail.id_str().to_string()),
         _ => return Err(unseeded_scope_error(scope)),
     };
     // Capture the cache value before the network read. If a concurrent
     // mutation advances it while the probe is in flight, the CAS below keeps
     // that newer state instead of replacing it with this probe's older one.
     let cached_before_probe = state_cache::get(states, &account_id).await;
-    let state_string = match &scope {
-        CursorScope::Type(bifrost_types::ObjectType::Email) | CursorScope::Folder(_) => mail
+    let state_string = match data_type {
+        Some(crate::DataType::Email) => mail
             .call(crate::email::EmailGet::new().ids(Vec::<crate::email::EmailId>::new()))
             .await
             .map(crate::core::get::GetResponse::<crate::email::Email>::into_state),
-        CursorScope::Type(bifrost_types::ObjectType::Mailbox) => mail
+        Some(crate::DataType::Mailbox) => mail
             .call(crate::mailbox::MailboxGet::new().ids(Vec::<crate::mailbox::MailboxId>::new()))
             .await
             .map(crate::core::get::GetResponse::<crate::mailbox::Mailbox>::into_state),
@@ -470,15 +469,10 @@ fn upload_draft_attachment<T: crate::core::transport::HttpTransport>(
 /// one would promise a strategy that dies on its first poll, so only
 /// the scopes the change stream actually drives report one.
 fn describe_cursor_support(cursor: &ChangeCursor) -> CursorDescriptor {
-    let supported = matches!(
-        state::decode_cursor(cursor),
-        Ok((
-            state::JmapScopeRepr::Email
-                | state::JmapScopeRepr::Mailbox
-                | state::JmapScopeRepr::Folder { .. },
-            _
-        ))
-    );
+    let supported = state::decode_cursor(cursor)
+        .ok()
+        .and_then(|(scope, _)| scope.data_type())
+        .is_some();
     CursorDescriptor {
         cost_class: if supported {
             CostClass::Cheap
@@ -512,7 +506,12 @@ impl Account for JmapAccount {
     }
 
     fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor {
-        describe_cursor_support(cursor)
+        let mut descriptor = describe_cursor_support(cursor);
+        if self.is_unregistered_foreign_scope(&cursor.scope) {
+            descriptor.cost_class = CostClass::Expensive;
+            descriptor.strategy = SyncStrategy::None;
+        }
+        descriptor
     }
 
     fn discover_cursor_scopes(&self) -> AccountStream<SyncEvent<CursorScope>> {
@@ -652,11 +651,58 @@ impl Account for JmapAccount {
         scopes: &[CursorScope],
     ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
         let scopes = scopes.to_vec();
+        // A departed share cannot produce hints in this session. Outlook users
+        // expect a refusal for that scope, while other requested scopes still
+        // subscribe successfully; never claim a dead share is being watched.
+        let registered: Vec<bool> = scopes
+            .iter()
+            .map(|scope| !self.is_unregistered_foreign_scope(scope))
+            .collect();
+        let routed_scopes = scopes
+            .iter()
+            .zip(&registered)
+            .filter(|(_, registered)| **registered)
+            .map(|(scope, _)| scope.clone())
+            .collect::<Vec<_>>();
+        // Ruling: when EVERY requested scope is a departed share, report each
+        // scope as refused rather than failing the whole call. An Outlook user
+        // whose share was removed expects that share shown as unwatched, the
+        // same per-scope answer a mixed request gives it, not a generic push
+        // failure. Nothing is registered on the wire, so no handle is minted.
+        if !scopes.is_empty() && routed_scopes.is_empty() {
+            let expected = (0..scopes.len())
+                .map(|index| bifrost_types::BatchItemId(index.to_string()))
+                .collect::<Vec<_>>();
+            let mut outcomes = bifrost_types::BatchOutcomeBuilder::new();
+            for (id, scope) in expected.iter().cloned().zip(scopes) {
+                outcomes.push_failed(
+                    id,
+                    super::error::unsupported_error(
+                        AccountOperation::PushSubscribe,
+                        Some(bifrost_types::ErrorScope::Cursor(scope)),
+                        "JMAP push requires a supported scope in a registered account",
+                    ),
+                );
+            }
+            let result = bifrost_types::PushSubscription::new(
+                None,
+                outcomes
+                    .finalize(&expected)
+                    .expect("every requested push scope is accounted for once"),
+            )
+            .map_err(|failure| {
+                super::error::internal_invariant(
+                    AccountOperation::PushSubscribe,
+                    format!("JMAP push subscription invariant failed: {failure}"),
+                )
+            });
+            return Box::pin(async move { result });
+        }
         let future = push::subscribe(
             self.client.clone(),
             self.caps.push,
             self.next_subscription_handle(),
-            scopes.clone(),
+            routed_scopes,
             push::SubscribeState {
                 subscriptions: Arc::clone(&self.subscriptions),
                 enabled: Arc::clone(&self.ws.enabled),
@@ -666,6 +712,11 @@ impl Account for JmapAccount {
         );
         Box::pin(async move {
             let (handle, accepted) = future.await?;
+            let mut accepted = accepted.into_iter();
+            let accepted: Vec<bool> = registered
+                .into_iter()
+                .map(|registered| registered && accepted.next().unwrap_or(false))
+                .collect();
             let expected = (0..scopes.len())
                 .map(|index| bifrost_types::BatchItemId(index.to_string()))
                 .collect::<Vec<_>>();
@@ -679,7 +730,7 @@ impl Account for JmapAccount {
                         super::error::unsupported_error(
                             AccountOperation::PushSubscribe,
                             Some(bifrost_types::ErrorScope::Cursor(scope)),
-                            "JMAP push does not map this cursor scope to a data type",
+                            "JMAP push requires a supported scope in a registered account",
                         ),
                     );
                 }

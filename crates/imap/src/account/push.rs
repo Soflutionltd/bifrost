@@ -519,13 +519,10 @@ fn choose_assignment(
 fn first_inbox_folder(
     entries: Vec<std::sync::Arc<super::folder_registry::FolderEntry>>,
 ) -> Option<crate::types::MailboxName> {
-    entries
-        .into_iter()
-        .filter(|entry| entry.name.as_str().eq_ignore_ascii_case("INBOX"))
-        // Registry order is unspecified. Prefer a stable mailbox identity
-        // when multiple entries match the case-insensitive INBOX role.
-        .min_by(|left, right| left.name.cmp_account_order(&right.name))
-        .map(|entry| entry.name.clone())
+    super::folder_registry::role_folder_from_entries(
+        entries,
+        bifrost_types::container::FolderRole::Inbox,
+    )
 }
 
 /// Every subscribed folder scope, sorted and deduplicated.
@@ -1080,6 +1077,24 @@ mod assignment_tests {
             .unwrap();
         (account, peer)
     }
+    #[tokio::test]
+    async fn no_idle_has_no_lanes_or_direct_admission() {
+        let (conn, _peer) = crate::connection::test_support::driver_pair(
+            &crate::connection::test_support::preauth_greeting("IMAP4rev1 NOTIFY"),
+        )
+        .await;
+        let mut parts = super::super::test_support::scripted_account_parts(conn, 4);
+        parts.supports_notify = true;
+        let account = ImapAccount::new(parts);
+        assert!(account.push_lanes().is_empty());
+        let result = account
+            .push_subscribe(&[CursorScope::Folder(bifrost_types::FolderId("INBOX".into()))])
+            .await
+            .unwrap();
+        assert_eq!(result.outcomes.succeeded().len(), 0);
+        assert_eq!(result.outcomes.failed().len(), 1);
+    }
+
     #[tokio::test]
     async fn an_exclusion_from_a_stale_subscription_version_is_discarded() {
         let (account, _peer) = account().await;

@@ -1,79 +1,51 @@
-use serde_json::json;
-
 use super::{ContactCardCreate, ContactCardPatch};
 use crate::address_book::AddressBookId;
 
 impl ContactCardCreate {
-    pub(crate) fn address_book_ids<U, V>(&mut self, address_book_ids: U) -> &mut Self
+    pub(crate) fn address_book_ids<U, V>(&mut self, ids: U) -> &mut Self
     where
         U: IntoIterator<Item = V>,
         V: Into<AddressBookId>,
     {
-        let map: serde_json::Map<String, serde_json::Value> = address_book_ids
-            .into_iter()
-            .map(|id| (id.into().into_string(), json!(true)))
-            .collect();
-        self.properties
-            .insert("addressBookIds".into(), serde_json::Value::Object(map));
+        crate::core::patch::IdSet::replace(
+            &mut self.properties,
+            "addressBookIds",
+            ids.into_iter().map(|id| id.into().into_string()),
+        );
         self
     }
 
-    pub(crate) fn address_book_id(
-        &mut self,
-        address_book_id: impl Into<AddressBookId>,
-        set: bool,
-    ) -> &mut Self {
-        let entry = self
-            .properties
-            .entry("addressBookIds")
-            .or_insert_with(|| json!({}));
-        if let Some(map) = entry.as_object_mut() {
-            // A create carries a complete Id[Boolean] set, not patch operations.
-            let id = address_book_id.into().into_string();
-            if set {
-                map.insert(id, serde_json::Value::Bool(true));
-            } else {
-                map.remove(&id);
-            }
-        }
+    pub(crate) fn address_book_id(&mut self, id: impl Into<AddressBookId>, set: bool) -> &mut Self {
+        crate::core::patch::IdSet::member(
+            &mut self.properties,
+            "addressBookIds",
+            id.into().into_string(),
+            set,
+        );
         self
     }
 }
 
 impl ContactCardPatch {
-    pub(crate) fn address_book_ids<U, V>(&mut self, address_book_ids: U) -> &mut Self
+    pub(crate) fn address_book_ids<U, V>(&mut self, ids: U) -> &mut Self
     where
         U: IntoIterator<Item = V>,
         V: Into<AddressBookId>,
     {
-        let map: serde_json::Map<String, serde_json::Value> = address_book_ids
-            .into_iter()
-            .map(|id| (id.into().into_string(), json!(true)))
-            .collect();
-        self.properties
-            .retain(|name, _| !name.starts_with("addressBookIds/"));
-        self.properties
-            .insert("addressBookIds".into(), serde_json::Value::Object(map));
+        crate::core::patch::IdSetPatch::replace(
+            &mut self.properties,
+            "addressBookIds",
+            ids.into_iter().map(|id| id.into().into_string()),
+        );
         self
     }
 
-    /// Set or clear one address-book membership without replacing unrelated ones.
-    pub(crate) fn address_book_id(
-        &mut self,
-        address_book_id: impl Into<AddressBookId>,
-        set: bool,
-    ) -> &mut Self {
-        self.properties.remove("addressBookIds");
-        self.properties.insert(
-            format!(
-                "addressBookIds/{}",
-                crate::core::set::escape_json_pointer_token(&address_book_id.into().into_string())
-            ),
-            if set {
-                serde_json::Value::Bool(true)
-            } else {
-                serde_json::Value::Null
-            },
+    pub(crate) fn address_book_id(&mut self, id: impl Into<AddressBookId>, set: bool) -> &mut Self {
+        crate::core::patch::IdSetPatch::member(
+            &mut self.properties,
+            "addressBookIds",
+            id.into().into_string(),
+            set,
         );
         self
     }

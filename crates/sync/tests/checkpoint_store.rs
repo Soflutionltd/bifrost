@@ -405,3 +405,28 @@ async fn clear_account_checkpoints_drops_every_row_of_the_account_and_only_that_
         bytes
     );
 }
+
+#[tokio::test]
+async fn checked_empty_completion_wins_legacy_marker_at_equal_progress() {
+    let scope = CursorScope::Type(ObjectType::Email);
+    for legacy_first in [true, false] {
+        let store = InMemoryCheckpointStore::new();
+        let keys: [&[u8]; 2] = if legacy_first {
+            [b"complete", b"complete:v2"]
+        } else {
+            [b"complete:v2", b"complete"]
+        };
+        for key in keys {
+            store
+                .put_backfill(&account("a"), backfill(&scope, key, 1))
+                .await
+                .expect("put");
+        }
+        let got = store
+            .get_backfill(&account("a"), &scope)
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(got.partition, Partition(b"complete:v2".to_vec()));
+    }
+}

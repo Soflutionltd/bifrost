@@ -2,8 +2,10 @@
 
 use super::{Mechanism, OAUTH2_MECHANISMS, PASSWORD_MECHANISMS, Zeroizing};
 use crate::transport::smtp::error::{self, Error, SmtpCommandPhase};
+#[cfg(feature = "account-error")]
+use bifrost_net::NetErrorContext;
 use bifrost_net::auth::TokenSnapshot;
-use bifrost_net::{AccessToken, NetErrorContext, StaticTokenSource, TokenSource};
+use bifrost_net::{AccessToken, StaticTokenSource, TokenSource};
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
@@ -145,13 +147,7 @@ impl Credentials {
     /// Resolve the OAuth identity and a freshly read access token from
     /// the shared source. Used by the async transport, which awaits a
     /// possible refresh.
-    ///
-    /// Its only production caller lives in the Tokio-gated async connection,
-    /// so a build without the `tokio` feature compiles this with no in-crate
-    /// caller. The method stays present in every build rather than being
-    /// gated away, because the blocking sibling `oauth2_token_blocking` is
-    /// ungated and the pair is read as one API.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    #[cfg(feature = "tokio")]
     pub(crate) async fn oauth2_token(&self) -> Result<(String, Zeroizing<String>), Error> {
         match self {
             Credentials::OAuth2 {
@@ -181,6 +177,7 @@ impl Credentials {
                     TokenSnapshot::Usable(token) => {
                         Ok((identity.clone(), Zeroizing::new(token.as_str().to_owned())))
                     }
+                    #[cfg(feature = "account-error")]
                     TokenSnapshot::Contended => Err(oauth_token_error(
                         bifrost_net::Error::RefreshFailed {
                             retry_after: None,
@@ -190,6 +187,10 @@ impl Credentials {
                                 source: None,
                             }),
                         },
+                    )),
+                    #[cfg(not(feature = "account-error"))]
+                    TokenSnapshot::Contended => Err(error::connection(
+                        "OAuth token cache is busy; retry when ready",
                     )),
                     _ => Err(error::invalid_input(
                         "OAuth token source requires refresh or async resolution; use the async SMTP transport",
@@ -206,11 +207,13 @@ impl Credentials {
 
 /// Preserve bifrost-net's typed projection for token-source failures. In
 /// particular, `OAuthRefresher` distinguishes terminal credential loss from a
-/// transient refresh failure; flattening either one to `InvalidInput` would
-/// turn it into a terminal policy block at the SMTP account boundary.
+/// transient refresh failure. Without account integration the original net
+/// error remains available through the low-level error source chain.
 pub(super) fn oauth_token_error(error: bifrost_net::Error) -> Error {
+    #[cfg(feature = "account-error")]
     let message = format!("failed to read OAuth access token: {error}");
     // A token endpoint throttle has no SMTP transaction scope to name.
+    #[cfg(feature = "account-error")]
     let account_error = bifrost_net::into_account_error_with_throttle_scope(
         error,
         NetErrorContext {
@@ -221,9 +224,11 @@ pub(super) fn oauth_token_error(error: bifrost_net::Error) -> Error {
         },
         None,
     );
-    error::invalid_input(message)
-        .with_preclassified_account_error(account_error)
-        .with_phase(SmtpCommandPhase::Auth { mechanism: None })
+    #[cfg(feature = "account-error")]
+    let error = error::invalid_input(message).with_preclassified_account_error(account_error);
+    #[cfg(not(feature = "account-error"))]
+    let error = error::connection(error);
+    error.with_phase(SmtpCommandPhase::Auth { mechanism: None })
 }
 
 impl Debug for Credentials {

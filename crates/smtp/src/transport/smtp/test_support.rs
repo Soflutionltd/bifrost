@@ -3,6 +3,10 @@
 //! no threads and no sleeps in this module, so a test can never fail because
 //! of a port, a socket path or the scheduler.
 
+// The tests that drive most of this harness sit behind `account-error`, so a
+// build without that feature legitimately leaves parts of it unused.
+#![cfg_attr(not(feature = "account-error"), allow(dead_code))]
+
 use std::collections::VecDeque;
 #[cfg(test)]
 use std::time::Duration;
@@ -837,6 +841,73 @@ mod connector_tests {
     use super::*;
     use crate::transport::smtp::extension::ClientId;
     use crate::{AsyncLmtpTransport, AsyncSmtpTransport, TokioExecutor};
+
+    #[test]
+    fn blocking_scripted_connector_drives_smtp_and_lmtp_without_sockets() {
+        for lmtp in [false, true] {
+            let connector = ScriptedConnector::new(move || {
+                Transcript::new("220 peer\r\n")
+                    .expect(
+                        if lmtp {
+                            "LHLO client\r\n"
+                        } else {
+                            "EHLO client\r\n"
+                        },
+                        "250 peer\r\n",
+                    )
+                    .expect("NOOP\r\n", "250 ok\r\n")
+            });
+            for _ in 0..2 {
+                let hello = ClientId::Domain("client".into());
+                let ready = if lmtp {
+                    crate::LmtpTransport::builder_dangerous("invalid")
+                        .hello_name(hello)
+                        .scripted_connector(connector.clone())
+                        .build()
+                        .test_connection()
+                } else {
+                    crate::SmtpTransport::builder_dangerous("invalid")
+                        .hello_name(hello)
+                        .scripted_connector(connector.clone())
+                        .build()
+                        .test_connection()
+                };
+                assert!(ready.unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn blocking_scripted_connector_refuses_tls_before_creating_a_peer() {
+        for starttls in [false, true] {
+            let connector = ScriptedConnector::new(|| panic!("TLS must reject before dial"));
+            let builder = if starttls {
+                crate::SmtpTransport::starttls_relay("example.com").unwrap()
+            } else {
+                crate::SmtpTransport::relay("example.com").unwrap()
+            };
+            let error = builder
+                .scripted_connector(connector.clone())
+                .build()
+                .test_connection()
+                .unwrap_err();
+            assert!(error.is_invalid_input());
+            let parameters =
+                crate::transport::smtp::client::TlsParameters::new("example.com".into()).unwrap();
+            let tls = if starttls {
+                crate::transport::smtp::client::Tls::Required(parameters)
+            } else {
+                crate::transport::smtp::client::Tls::Wrapper(parameters)
+            };
+            let error = crate::LmtpTransport::builder_dangerous("invalid")
+                .tls(tls)
+                .scripted_connector(connector)
+                .build()
+                .test_connection()
+                .unwrap_err();
+            assert!(error.is_invalid_input());
+        }
+    }
 
     #[tokio::test]
     async fn scripted_connector_creates_independent_smtp_and_lmtp_connections() {

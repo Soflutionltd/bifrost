@@ -1,7 +1,5 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
-#[cfg(test)]
-pub(crate) use crate::codec::classification::mailbox_names_eq as inbox_eq;
 
 impl ImapConnection {
     /// Current session state (RFC 3501 Section3 / RFC 9051 Section3).

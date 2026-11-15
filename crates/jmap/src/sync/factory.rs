@@ -120,12 +120,12 @@ impl JmapAccountFactoryBuilder {
             url: url.into(),
             // Preserve one cache across repeated opens as well as across
             // HTTP and WebSocket paths within each opened account.
+            // Admission goes through the shared net policy, so an
+            // already-coordinating source is kept rather than double-wrapped.
             credentials: match credentials {
-                JmapCredentials::Bearer { token_source } if !token_source.is_coordinating() => {
-                    JmapCredentials::Bearer {
-                        token_source: Arc::new(bifrost_net::OAuthRefresher::new(token_source)),
-                    }
-                }
+                JmapCredentials::Bearer { token_source } => JmapCredentials::Bearer {
+                    token_source: Arc::clone(bifrost_net::coordinate(token_source).as_source()),
+                },
                 credentials => credentials,
             },
             net: None,

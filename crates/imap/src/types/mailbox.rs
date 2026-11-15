@@ -215,44 +215,18 @@ impl MailboxAttribute {
 /// RFC 3501 Section 7.2.2: mailbox attributes use `flag-extension = "\" atom`,
 /// and IMAP atoms are case-insensitive.
 ///
-/// Known attribute variants compare by discriminant (no payload).
+/// All variants compare through their protocol spelling.
 /// `Custom` attributes compare using ASCII case-insensitive comparison so that
 /// e.g. `\MyCustom` and `\mycustom` are treated as the same attribute.
 ///
 /// Cross-representation is also handled: `Custom("\\Noselect")` equals
 /// `NoSelect`, because they denote the same protocol attribute.
+// Escape variants are also constructed directly by account callers. Keep
+// protocol-spelling equality until those producers can use parser-only values;
+// deriving enum equality here would make equivalent wire tokens unequal.
 impl PartialEq for MailboxAttribute {
     fn eq(&self, other: &Self) -> bool {
-        // RFC 3501 Section 7.2.2: attribute comparisons are case-insensitive.
-        match (self, other) {
-            (Self::NoInferiors, Self::NoInferiors)
-            | (Self::NoSelect, Self::NoSelect)
-            | (Self::NonExistent, Self::NonExistent)
-            | (Self::HasChildren, Self::HasChildren)
-            | (Self::HasNoChildren, Self::HasNoChildren)
-            | (Self::Marked, Self::Marked)
-            | (Self::Unmarked, Self::Unmarked)
-            | (Self::Subscribed, Self::Subscribed)
-            | (Self::Remote, Self::Remote)
-            | (Self::All, Self::All)
-            | (Self::Archive, Self::Archive)
-            | (Self::Drafts, Self::Drafts)
-            | (Self::Flagged, Self::Flagged)
-            | (Self::Junk, Self::Junk)
-            | (Self::Sent, Self::Sent)
-            | (Self::Trash, Self::Trash)
-            | (Self::Important, Self::Important)
-            | (Self::NoAccess, Self::NoAccess)
-            | (Self::Memos, Self::Memos)
-            | (Self::Scheduled, Self::Scheduled)
-            | (Self::Snoozed, Self::Snoozed) => true,
-            (Self::Custom(a), Self::Custom(b)) => a.eq_ignore_ascii_case(b),
-            // Cross-representation: compare Custom's wire form against known variant.
-            (Self::Custom(s), known) | (known, Self::Custom(s)) => {
-                s.eq_ignore_ascii_case(known.as_imap_str())
-            }
-            _ => false,
-        }
+        self.as_imap_str().eq_ignore_ascii_case(other.as_imap_str())
     }
 }
 

@@ -106,7 +106,6 @@ pub(crate) struct ImapAccountInner {
     pub(crate) folders: Arc<FolderRegistry>,
     pub(crate) qresync_negotiation_warning: Option<String>,
     pub(crate) qresync_negotiation_warning_sent: AtomicBool,
-    pub(crate) supports_notify: bool,
     pub(crate) shutdown: CancellationToken,
     pub(crate) closed: AtomicBool,
     pub(crate) close_completion: std::sync::OnceLock<close::Completion>,
@@ -149,7 +148,13 @@ impl ImapAccount {
     pub(crate) fn new(parts: ImapAccountParts) -> Self {
         let push = push::PushState::new(
             parts.supports_notify,
-            parts.config.push_session_capacity(parts.supports_notify),
+            // Capability admission is fixed from the open-time IDLE profile.
+            // Direct callers must get the same availability as the sync engine.
+            if parts.capabilities.push == bifrost_types::PushCapability::None {
+                0
+            } else {
+                parts.config.push_session_capacity(parts.supports_notify)
+            },
         );
         // The QRESYNC policy lives on the pool, which reads it at every dial
         // to bring a new member to the account's QRESYNC state. The pool
@@ -164,7 +169,6 @@ impl ImapAccount {
                 folders: parts.folders,
                 qresync_negotiation_warning: parts.qresync_negotiation_warning,
                 qresync_negotiation_warning_sent: AtomicBool::new(false),
-                supports_notify: parts.supports_notify,
                 shutdown: CancellationToken::new(),
                 closed: AtomicBool::new(false),
                 close_completion: std::sync::OnceLock::new(),
@@ -388,7 +392,16 @@ impl Account for ImapAccount {
 
     // Account: stores the engine priority hint; direct ImapConnection calls remain caller scheduled.
     fn set_priority(&self, priority: Priority) {
+        // IMAP has no autonomous scheduler: delaying explicit calls would hide
+        // fresh mail from an enterprise user. The engine schedules IMAP work.
+        // Composed HTTP accounts do own admission schedulers and must see the hint.
         self.priority.store(priority as u8, Ordering::Release);
+        if let Some(contacts) = &self.contacts {
+            contacts.set_priority(priority);
+        }
+        if let Some(calendars) = &self.calendars {
+            calendars.set_priority(priority);
+        }
     }
 
     // Account: every protocol leg admits against this shared budget.

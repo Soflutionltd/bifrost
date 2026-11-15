@@ -1785,7 +1785,7 @@ fn unsupported_stream<T: Send + 'static>(
 /// all, and which then travels onward as `calendar_id` and `calendar_native`.
 /// Query and fragment are dropped before the final path segment is removed.
 fn event_calendar_url(event_url: &str) -> Option<String> {
-    bifrost_net::url::parent_collection_url(event_url)
+    bifrost_dav_core::url::parent_collection_url(event_url)
 }
 
 /// Reduce the failure lane to one outcome per resource id.

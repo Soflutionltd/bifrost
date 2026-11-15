@@ -1,3 +1,4 @@
+use crate::core::field::Field;
 use crate::email::EmailAddress;
 
 use super::{IdentityCreate, IdentityPatch};
@@ -18,7 +19,7 @@ impl IdentityCreate {
         T: Iterator<Item = U>,
         U: Into<EmailAddress>,
     {
-        self.bcc = bcc.map(|s| s.map(std::convert::Into::into).collect());
+        self.bcc = Field::from(bcc.map(|s| s.map(std::convert::Into::into).collect()));
         self
     }
 
@@ -27,7 +28,7 @@ impl IdentityCreate {
         T: Iterator<Item = U>,
         U: Into<EmailAddress>,
     {
-        self.reply_to = reply_to.map(|s| s.map(std::convert::Into::into).collect());
+        self.reply_to = Field::from(reply_to.map(|s| s.map(std::convert::Into::into).collect()));
         self
     }
 
@@ -43,6 +44,9 @@ impl IdentityCreate {
 }
 
 impl IdentityPatch {
+    // Clearing a recipient list in the mail UI must send an empty list, not
+    // silently preserve the old recipients. None remains an explicit null.
+
     pub(crate) fn name(&mut self, name: impl Into<String>) -> &mut Self {
         self.name = Some(name.into());
         self
@@ -53,9 +57,7 @@ impl IdentityPatch {
         T: Iterator<Item = U>,
         U: Into<EmailAddress>,
     {
-        self.bcc = bcc
-            .map(|s| s.map(std::convert::Into::into).collect::<Vec<_>>())
-            .and_then(|values| (!values.is_empty()).then_some(values));
+        self.bcc = Field::from(bcc.map(|s| s.map(std::convert::Into::into).collect::<Vec<_>>()));
         self
     }
 
@@ -64,9 +66,8 @@ impl IdentityPatch {
         T: Iterator<Item = U>,
         U: Into<EmailAddress>,
     {
-        self.reply_to = reply_to
-            .map(|s| s.map(std::convert::Into::into).collect::<Vec<_>>())
-            .and_then(|values| (!values.is_empty()).then_some(values));
+        self.reply_to =
+            Field::from(reply_to.map(|s| s.map(std::convert::Into::into).collect::<Vec<_>>()));
         self
     }
 

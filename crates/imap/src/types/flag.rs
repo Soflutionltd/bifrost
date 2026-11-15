@@ -86,30 +86,18 @@ impl std::fmt::Display for Flag {
 
 /// RFC 3501 Section 2.3.2: "Flag names are case-insensitive."
 ///
-/// System flag variants compare by discriminant (they have no payload).
+/// All variants compare through their protocol spelling.
 /// `Custom` flags compare using ASCII case-insensitive comparison so that
 /// e.g. `$Important` and `$important` are treated as the same flag.
 ///
 /// Cross-representation is also handled: `Custom("\\Seen")` equals `Seen`,
 /// because they denote the same protocol flag.
+// Escape variants are also constructed directly by account callers. Keep
+// protocol-spelling equality until those producers can use parser-only values;
+// deriving enum equality here would make equivalent wire tokens unequal.
 impl PartialEq for Flag {
     fn eq(&self, other: &Self) -> bool {
-        // RFC 3501 Section 2.3.2: flag comparisons are case-insensitive.
-        match (self, other) {
-            (Self::Seen, Self::Seen)
-            | (Self::Answered, Self::Answered)
-            | (Self::Flagged, Self::Flagged)
-            | (Self::Deleted, Self::Deleted)
-            | (Self::Draft, Self::Draft)
-            | (Self::Recent, Self::Recent)
-            | (Self::Wildcard, Self::Wildcard) => true,
-            (Self::Custom(a), Self::Custom(b)) => a.eq_ignore_ascii_case(b),
-            // Cross-representation: compare Custom's wire form against known variant.
-            (Self::Custom(s), known) | (known, Self::Custom(s)) => {
-                s.eq_ignore_ascii_case(known.as_imap_str())
-            }
-            _ => false,
-        }
+        self.as_imap_str().eq_ignore_ascii_case(other.as_imap_str())
     }
 }
 

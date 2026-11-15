@@ -6,12 +6,38 @@ use bifrost_types::{
     PimMethodSupport, PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape,
 };
 
-use crate::types::{Capability, MailboxAttribute, MailboxInfo, ServerProfile};
+use crate::types::{Capability, ServerProfile};
+#[cfg(test)]
+use crate::types::{MailboxAttribute, MailboxInfo};
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_capabilities(
     profile: &ServerProfile,
     folders: &[MailboxInfo],
+    has_sieve: bool,
+    contacts: Option<&AccountCapabilities>,
+    calendars: Option<&AccountCapabilities>,
+    submission_configured: bool,
+    foreign_namespaces_advertised: bool,
+    push_capacity: usize,
+) -> AccountCapabilities {
+    build_capabilities_for_registry(
+        profile,
+        &super::folder_registry::FolderRegistry::from_list(folders.to_vec()),
+        has_sieve,
+        contacts,
+        calendars,
+        submission_configured,
+        foreign_namespaces_advertised,
+        push_capacity,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_capabilities_for_registry(
+    profile: &ServerProfile,
+    folders: &super::folder_registry::FolderRegistry,
     has_sieve: bool,
     contacts: Option<&AccountCapabilities>,
     calendars: Option<&AccountCapabilities>,
@@ -25,17 +51,9 @@ pub(crate) fn build_capabilities(
     // other `pim_methods` field stays IMAP-owned below.
     let contact_pim = contacts.map(|c| &c.pim_methods);
     let calendar_pim = calendars.map(|c| &c.pim_methods);
-    let has_drafts = folders.iter().any(|folder| {
-        folder
-            .attributes
-            .iter()
-            .any(|attr| matches!(attr, MailboxAttribute::Drafts))
-            // Same leaf rule `folder_role` uses for its name fallback, so
-            // the Drafts folder this flag promises is the one
-            // `role_folder(Drafts)` later resolves.
-            || super::folder_registry::leaf_name(folder.name.as_str(), folder.delimiter)
-                .eq_ignore_ascii_case("drafts")
-    });
+    let has_drafts = folders
+        .role_folder(bifrost_types::container::FolderRole::Drafts)
+        .is_some();
     let mail_set_flags = profile.supports_condstore();
     // `draft_create` returns the APPENDUID-derived id of the saved draft, so
     // it needs UIDPLUS (advertised, or in the IMAP4rev2 baseline). Message
@@ -537,6 +555,22 @@ mod tests {
     // `draft_create` APPENDs to Drafts and needs the APPENDUID from
     // UIDPLUS to mint the returned handle, so both halves must be present
     // before the flag goes true.
+    #[test]
+    fn singular_draft_name_is_advertised() {
+        let profile = ServerProfile::new(vec![Capability::UidPlus], Vec::new());
+        let caps = build_capabilities(
+            &profile,
+            &[mailbox("Draft", Vec::new())],
+            false,
+            None,
+            None,
+            false,
+            false,
+            1,
+        );
+        assert!(caps.pim_methods.draft_create);
+    }
+
     #[test]
     fn draft_create_requires_both_a_drafts_folder_and_uidplus() {
         let with_uidplus = ServerProfile::new(vec![Capability::UidPlus], Vec::new());

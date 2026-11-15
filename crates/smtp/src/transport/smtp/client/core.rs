@@ -20,10 +20,13 @@
 //! throttling, and the socket shutdown that `Op::Abort` performs.
 
 use super::PhasedError;
+#[cfg(feature = "account-error")]
 use crate::transport::smtp::{
     Dialect,
     account_error::{SmtpErrorContext, into_account_error},
     batch::{RcptProgress, SendProgress},
+};
+use crate::transport::smtp::{
     commands::{Bdat, Data, Mail, Rcpt, Rset},
     error,
     error::{Error, SmtpCommandPhase, SmtpTransmissionState},
@@ -958,16 +961,19 @@ impl ProtocolMachine for DirectLmtp {
 // Account-oriented batch sends
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "account-error")]
 type BatchResult = Result<SendProgress, (Error, SendProgress)>;
 
 /// Batch outcomes never leave the machine without their progress tracker, so
 /// this pairs the two the way the driver signature does.
+#[cfg(feature = "account-error")]
 enum BatchExit {
     Progress,
     Error(Error),
 }
 
 /// `send_smtp_batch`, pipelined or not.
+#[cfg(feature = "account-error")]
 pub(super) struct BatchSmtp {
     mail: Mail,
     recipients: Vec<Rcpt>,
@@ -977,6 +983,7 @@ pub(super) struct BatchSmtp {
     epilogue: Option<Epilogue<BatchExit>>,
 }
 
+#[cfg(feature = "account-error")]
 enum BatchSmtpStage {
     Start,
     /// A command write is outstanding. On success the reply for it is read and
@@ -1000,6 +1007,7 @@ enum BatchSmtpStage {
     FinalReply,
 }
 
+#[cfg(feature = "account-error")]
 impl BatchSmtp {
     pub(super) fn new(
         mail: Mail,
@@ -1081,6 +1089,7 @@ impl BatchSmtp {
     }
 }
 
+#[cfg(feature = "account-error")]
 impl BatchSmtp {
     /// Write a command, then read the single reply it owes into `next`.
     fn write_then(&mut self, next: BatchSmtpStage, bytes: String) -> Step<BatchResult> {
@@ -1089,6 +1098,7 @@ impl BatchSmtp {
     }
 }
 
+#[cfg(feature = "account-error")]
 impl ProtocolMachine for BatchSmtp {
     type Output = BatchResult;
 
@@ -1384,6 +1394,7 @@ impl ProtocolMachine for BatchSmtp {
 }
 
 /// `send_lmtp_batch`.
+#[cfg(feature = "account-error")]
 pub(super) struct BatchLmtp {
     mail: Mail,
     recipients: Vec<Rcpt>,
@@ -1393,6 +1404,7 @@ pub(super) struct BatchLmtp {
     epilogue: Option<Epilogue<BatchExit>>,
 }
 
+#[cfg(feature = "account-error")]
 enum BatchLmtpStage {
     Start,
     /// A command write is outstanding. On success the reply for it is read and
@@ -1408,6 +1420,7 @@ enum BatchLmtpStage {
     DrainClosing,
 }
 
+#[cfg(feature = "account-error")]
 impl BatchLmtp {
     pub(super) fn new(mail: Mail, recipients: Vec<Rcpt>, progress: SendProgress) -> Self {
         Self {
@@ -1471,6 +1484,7 @@ impl BatchLmtp {
     }
 }
 
+#[cfg(feature = "account-error")]
 impl BatchLmtp {
     /// Write a command, then read the single reply it owes into `next`.
     fn write_then(&mut self, next: BatchLmtpStage, bytes: String) -> Step<BatchResult> {
@@ -1479,6 +1493,7 @@ impl BatchLmtp {
     }
 }
 
+#[cfg(feature = "account-error")]
 impl ProtocolMachine for BatchLmtp {
     type Output = BatchResult;
 
@@ -1695,5 +1710,5 @@ pub(super) fn bdat_header(len: usize) -> String {
     Bdat::last(len).to_string()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "account-error"))]
 mod core_tests;

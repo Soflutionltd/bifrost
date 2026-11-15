@@ -1596,18 +1596,27 @@ pub(crate) fn delete_thread(
     Box::pin(async move {
         if let Some(current) = current {
             let folder = folder_from_container(&current, AccountOperation::BulkMove)?;
+            // Ruling: a folder whose OWN role is Trash deletes in place, not
+            // only the account's resolved Trash. An Outlook user emptying an
+            // item from anything shown as Deleted Items expects it gone: a
+            // second Trash-like personal folder, and a shared mailbox's own
+            // Trash, which must delete in that mailbox and never be moved
+            // across into the user's personal Trash. The single resolver still
+            // picks the move TARGET below; this test only decides in-place.
             let entry = account.folders.get(&folder);
             let attributes = entry
                 .as_deref()
                 .map(super::folder_registry::FolderEntry::attributes)
                 .unwrap_or_default();
-            if folder_role(
+            let own_role = folder_role(
                 &attributes,
                 folder.as_str(),
                 entry
                     .as_deref()
                     .and_then(super::folder_registry::FolderEntry::delimiter),
-            ) == Some(FolderRole::Trash)
+            );
+            if own_role == Some(FolderRole::Trash)
+                || role_folder(&account, FolderRole::Trash).as_ref() == Some(&folder)
             {
                 return remove_from_container_inner(
                     &account,
@@ -2704,7 +2713,11 @@ fn container_from_folder_entry(
     Container::new(
         ContainerId(native.clone()),
         ContainerKind::Folder,
-        folder_role(&entry.attributes(), entry.name.as_str(), entry.delimiter()),
+        entry
+            .shared_owner
+            .is_none()
+            .then(|| folder_role(&entry.attributes(), entry.name.as_str(), entry.delimiter()))
+            .flatten(),
         Provenance {
             provider: ProtocolKind::Imap,
             kind: ContainerKind::Folder,
@@ -2759,46 +2772,9 @@ fn rights_from_myrights(rights: &MailboxRights) -> ContainerRights {
     }
 }
 
-fn folder_role_from_attributes(attributes: &[MailboxAttribute]) -> Option<FolderRole> {
-    for attr in attributes {
-        match attr {
-            MailboxAttribute::Sent => return Some(FolderRole::Sent),
-            MailboxAttribute::Drafts => return Some(FolderRole::Drafts),
-            MailboxAttribute::Archive => return Some(FolderRole::Archive),
-            MailboxAttribute::Trash => return Some(FolderRole::Trash),
-            MailboxAttribute::Junk => return Some(FolderRole::Spam),
-            MailboxAttribute::Custom(value) if value.eq_ignore_ascii_case("\\Inbox") => {
-                return Some(FolderRole::Inbox);
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn folder_role(
-    attributes: &[MailboxAttribute],
-    name: &str,
-    delimiter: Option<char>,
-) -> Option<FolderRole> {
-    if let Some(role) = folder_role_from_attributes(attributes) {
-        return Some(role);
-    }
-    // SPECIAL-USE is authoritative; this is the name fallback for servers
-    // that publish none. The leaf split is shared with the `draft_create`
-    // Drafts probe - see `folder_registry::leaf_name` for why it is one
-    // function and what a `None` delimiter means.
-    let lower = super::folder_registry::leaf_name(name, delimiter).to_ascii_lowercase();
-    match lower.as_str() {
-        "inbox" => Some(FolderRole::Inbox),
-        "sent" | "sent mail" | "sent messages" => Some(FolderRole::Sent),
-        "draft" | "drafts" => Some(FolderRole::Drafts),
-        "archive" | "archives" => Some(FolderRole::Archive),
-        "trash" | "deleted" | "deleted messages" => Some(FolderRole::Trash),
-        "junk" | "spam" | "junk mail" => Some(FolderRole::Spam),
-        _ => None,
-    }
-}
+use super::folder_registry::folder_role;
+#[cfg(test)]
+use super::folder_registry::role_folder_from_entries;
 
 fn parent_id(delimiter: Option<char>, native: &str) -> Option<ContainerId> {
     let delimiter = delimiter?;
@@ -2810,30 +2786,7 @@ fn parent_id(delimiter: Option<char>, native: &str) -> Option<ContainerId> {
 }
 
 fn role_folder(account: &ImapAccount, role: FolderRole) -> Option<MailboxName> {
-    role_folder_from_entries(account.folders.entries(), role)
-}
-
-fn role_folder_from_entries(
-    entries: Vec<std::sync::Arc<super::folder_registry::FolderEntry>>,
-    role: FolderRole,
-) -> Option<MailboxName> {
-    entries
-        .into_iter()
-        .filter(|entry| {
-            folder_role(&entry.attributes(), entry.name.as_str(), entry.delimiter()) == Some(role)
-        })
-        .min_by(|left, right| {
-            let left_rank = u8::from(folder_role_from_attributes(&left.attributes()) != Some(role));
-            let right_rank =
-                u8::from(folder_role_from_attributes(&right.attributes()) != Some(role));
-            // Distinct wire addresses can decode to the same display name.
-            // Use the stable mailbox order last so registry iteration cannot
-            // decide which address represents the role.
-            left_rank
-                .cmp(&right_rank)
-                .then_with(|| left.name.cmp_account_order(&right.name))
-        })
-        .map(|entry| entry.name.clone())
+    account.folders.role_folder(role)
 }
 
 fn quota_probe_folder(account: &ImapAccount) -> Option<MailboxName> {
@@ -3802,8 +3755,8 @@ body text\r\n";
                 "Posteingang",
                 None,
             ),
-            Some(FolderRole::Inbox),
-            "the \\Inbox custom attribute is matched case-insensitively",
+            None,
+            "a custom attribute cannot make another name the protocol INBOX",
         );
     }
 

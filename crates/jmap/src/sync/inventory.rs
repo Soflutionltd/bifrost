@@ -22,9 +22,9 @@ pub(crate) fn stream<T: HttpTransport>(
     scope: CursorScope,
     owner: Option<TypesMailboxId>,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
-    match scope {
-        CursorScope::Type(ObjectType::Email) => email_inventory(mail, limits),
-        CursorScope::Type(ObjectType::Mailbox) => {
+    match super::state::JmapScopeRepr::from_cursor_scope(&scope) {
+        Ok(super::state::JmapScopeRepr::Email) => email_inventory(mail, limits),
+        Ok(super::state::JmapScopeRepr::Mailbox) => {
             mailbox_inventory(mail, limits.max_objects_in_get.max(1))
         }
         // A foreign (shared/delegate) account scope: page its emails via
@@ -34,36 +34,27 @@ pub(crate) fn stream<T: HttpTransport>(
         // - one walk per share, mirroring the primary `Type(Email)`
         // inventory. A legacy per-mailbox scope still decodes and takes
         // the `inMailbox`-filtered walk.
-        CursorScope::Folder(ref folder) => match super::foreign::parse_foreign(folder) {
-            Some(parsed) => {
-                foreign_email_inventory(mail, limits, scope.clone(), parsed.mailbox_id, owner)
-            }
-            None => Box::pin(async_stream::stream! {
-                yield super::error::terminated_unsupported(
-                    bifrost_types::AccountOperation::SyncInventory,
-                    Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
-                    "JMAP folder scope is not a foreign-mailbox scope",
-                );
-            }),
-        },
-        CursorScope::Type(ObjectType::Thread) => Box::pin(async_stream::stream! {
+        Ok(super::state::JmapScopeRepr::Folder { mailbox_id, .. }) => {
+            foreign_email_inventory(mail, limits, scope.clone(), mailbox_id, owner)
+        }
+        Ok(super::state::JmapScopeRepr::Thread) => Box::pin(async_stream::stream! {
                 yield super::error::terminated_unsupported(
                     bifrost_types::AccountOperation::SyncInventory,
                     Some(bifrost_types::ErrorScope::Cursor(CursorScope::Type(ObjectType::Thread))),
                     "JMAP thread inventory is derived from Email inventory in this implementation",
                 );
         }),
-        CursorScope::Query(_) => Box::pin(async_stream::stream! {
+        Ok(super::state::JmapScopeRepr::Query(_)) => Box::pin(async_stream::stream! {
                 yield super::error::terminated_unsupported(
                     bifrost_types::AccountOperation::SyncInventory,
                     None,
                     "JMAP query inventory requires registered query definitions outside the v1 Account trait",
                 );
         }),
-        _ => Box::pin(async_stream::stream! {
+        Err(_) => Box::pin(async_stream::stream! {
                 yield super::error::terminated_unsupported(
                     bifrost_types::AccountOperation::SyncInventory,
-                    None,
+                    Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
                     "cursor scope is not supported by JMAP",
                 );
         }),

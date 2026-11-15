@@ -525,26 +525,15 @@ pub(crate) fn encode_mailbox_str(name: &str, utf8: bool) -> String {
     if name.eq_ignore_ascii_case("INBOX") {
         return "INBOX".to_owned();
     }
-    // RFC 3501 Section 5.1 / 5.1.1: check for INBOX as hierarchical prefix.
-    // The exact special name is only the case-insensitive "INBOX"; child
-    // mailboxes use a single hierarchy separator after that token. Restrict
-    // the heuristic to ASCII separator characters so names like "Inboxé"
-    // are preserved as distinct mailboxes.
-    if name.len() > 5 && name.is_char_boundary(5) {
-        let prefix = &name[..5];
-        let sep = name[5..].chars().next();
-        if prefix.eq_ignore_ascii_case("INBOX")
-            && sep.is_some_and(|ch| ch.is_ascii() && !ch.is_ascii_alphanumeric())
-        {
-            let child = &name[5..];
-            let encoded_child = if utf8 {
-                child.to_owned()
-            } else {
-                crate::codec::utf7::encode_utf7(child)
-            };
-            return format!("INBOX{encoded_child}");
-        }
-    }
+    // Only the exact INBOX token is special (RFC 3501 Section 5.1). An INBOX
+    // child such as `inbox/Sub` is sent as spelled, never rewritten to
+    // `INBOX/Sub`: child names are case-sensitive, the server's hierarchy
+    // delimiter is not known here, and the names callers pass come from the
+    // server's own LIST spelling. An enterprise user acting on a subfolder of
+    // Inbox expects the command to reach exactly the folder the server listed;
+    // a rewrite could only ever repair a spelling no server reported, and on a
+    // server whose children are listed in another case it would address a
+    // different (or missing) folder.
     if utf8 {
         name.to_owned()
     } else {

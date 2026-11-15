@@ -20,7 +20,7 @@ use bifrost_types::{
     TargetRole,
 };
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::common::*;
 use super::hydrate::*;
@@ -681,7 +681,7 @@ async fn submit_write_batch_resource(
         })
         .collect();
     let expected_ids: Vec<String> = requests.iter().map(|r| r.id.clone()).collect();
-    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut seen_ids = std::collections::HashSet::new();
     let mut progress = BatchProgress::default();
     let response: BatchResponse = account
         .client
@@ -697,11 +697,22 @@ async fn submit_write_batch_resource(
     // early once left the etag of a message that demonstrably WAS destroyed
     // in the cache whenever its subresponse sorted after a failing sibling's,
     // and it dropped the successes the partial-commit record must report.
-    for item in response.responses {
-        // A repeated subresponse id is accounted once, by its first answer.
-        if !seen_ids.insert(item.id.clone()) {
-            continue;
-        }
+    for (index, mut item) in super::super::batch_routing::resolve_answers(
+        // Ruling: a non-numeric submitted id is a caller bug, asserted in
+        // debug builds. In production it fails soft: the id is never
+        // correlated, so the missing-answer sweep reports it unanswered
+        // instead of a panic aborting the user's whole send of the batch.
+        expected_ids.iter().filter_map(|id| {
+            let parsed = id.parse::<usize>().ok();
+            debug_assert!(parsed.is_some(), "submitted batch id {id} is not numeric");
+            parsed
+        }),
+        response.responses,
+    ) {
+        // Normalize numeric aliases so the missing sweep and replay lookup use
+        // the same identity as correlation, not the provider's raw spelling.
+        item.id = index.to_string();
+        seen_ids.insert(item.id.clone());
         // Reuse the per-item outcome projector so 4xx/5xx items
         // build structured `AccountError`s with `Protocol::Graph`,
         // `AttemptCause(Acknowledged)`, `WireCause::Graph(signal)`
@@ -745,6 +756,17 @@ async fn submit_write_batch_resource(
                 id: (id.0.clone()).into(),
             })
             .unwrap_or(ErrorScope::Account);
+        // A conflict invalidates our observation; absence has no validator.
+        // Match bulk writes so a later retry cannot reuse a known stale etag.
+        if matches!(item.status, 404 | 412)
+            && let Some(id) = &target
+        {
+            account
+                .etag_index
+                .write()
+                .await
+                .observe(&id.0, super::super::EtagObservation::Invalidated);
+        }
         let outcome = mutation_item_outcome(
             item.status,
             headers,
@@ -780,7 +802,11 @@ async fn submit_write_batch_resource(
                 // A successful write consumes the observed validator, including
                 // PATCHes and moves whose response omits the new etag.
                 if let Some(id) = target {
-                    account.etag_index.write().await.remove(&id.0);
+                    account
+                        .etag_index
+                        .write()
+                        .await
+                        .observe(&id.0, super::super::EtagObservation::Written(None));
                 }
             }
             bifrost_types::ItemOutcome::Failed(failure) => {
@@ -923,6 +949,58 @@ mod replay_tests {
         assert_eq!(body["requests"][0]["headers"]["If-Match"], "v1");
         (error, client)
     }
+    #[tokio::test]
+    async fn write_answers_ignore_unsubmitted_ids_and_invalidate_stale_versions() {
+        for status in [204, 404, 412] {
+            let client = GraphClient::new("token");
+            let body = serde_json::to_vec(&json!({"responses": [
+                {"id": "99", "status": 204},
+                {"id": "00", "status": status},
+                {"id": "0", "status": 204}
+            ]}))
+            .unwrap();
+            client.script_wire(
+                [bifrost_net::test_support::Canned::Response {
+                    status: reqwest::StatusCode::OK,
+                    headers: reqwest::header::HeaderMap::new(),
+                    body: bytes::Bytes::from(body),
+                }],
+                bifrost_net::RetryPolicy::default(),
+            );
+            let account = GraphAccount::new_for_tests_with_shared(
+                client,
+                crate::account::PushMode::GraphSubscriptions,
+                &[],
+            );
+            account
+                .etag_index
+                .write()
+                .await
+                .insert("m1".into(), GraphETag::from_odata_annotation("old"));
+            let progress = submit_write_batch_resource(
+                &account,
+                Resource::Outlook,
+                vec![BatchRequestItem {
+                    id: "0".into(),
+                    method: "PATCH".into(),
+                    url: "/me/messages/m1".into(),
+                    headers: None,
+                    body: Some(json!({"isRead": true})),
+                }],
+                &[ObjectId("m1".into())],
+                false,
+                AccountOperation::SetCategory,
+            )
+            .await
+            .expect("batch envelope");
+            assert_eq!(progress.committed.len(), usize::from(status == 204));
+            assert_eq!(progress.failed.len(), usize::from(status != 204));
+            assert!(progress.committed.iter().all(|(index, _)| *index == 0));
+            assert!(progress.failed.iter().all(|(index, _, _)| *index == 0));
+            assert_eq!(account.etag_index.write().await.get("m1"), None);
+        }
+    }
+
     #[tokio::test]
     async fn a_503_before_a_batch_412_reconciles_without_replay() {
         let conflict = || {

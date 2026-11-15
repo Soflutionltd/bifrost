@@ -136,6 +136,10 @@ Internal modules:
   CRUD, identities, vacation responder, message/thread hydration.
 - `filters.rs` - Gmail settings filter list/create/delete and
   typed-rule mapping.
+- `query.rs` - shared Gmail query encoder; search predicates adapt to filter
+  conditions before encoding. Stored filters retain native criteria fields,
+  routing query fallbacks through the same escaping, grouping, date and
+  container encoder. The public predicate types remain separate.
 - `flags.rs` - Gmail-label-to-IMAP-flag canonicalization and the
   reverse `LabelPatch` translation used by mutations.
 - `blobs.rs` - `open_blob` / `open_blob_range` over Gmail
@@ -596,10 +600,14 @@ Hydration primitives use Gmail's `full` and `metadata` formats.
 `message_hydrate` picks the cheapest format for the requested
 `HydrationProjection`, parses common address and threading headers, maps
 label ids to containers and canonical flags, and surfaces attachment blob
-handles for `FullWithBlobs`. Address-list headers use the shared
-`Address::parse_list` for ordinary hydration, including quoted-pair handling
-and RFC 2047 display-name decoding; rejected items are omitted from this read
-projection. `draft_update` reparses From, To, Cc, Bcc, and Reply-To with
+handles for `FullWithBlobs`. Hydration reads every repeated From, To, Cc, Bcc
+and Reply-To field in wire order with the shared address parser, including
+quoted-pair handling and RFC 2047 display-name decoding. Accepted addresses
+survive malformed siblings, and any rejection marks `Message.incomplete` in
+every projection. Users retain readable mail and see that the recipient list
+is incomplete before relying on reply-all. The checked parser does not expose
+accepted siblings on failure, so rejected fields require a second, tolerant
+parse to retain them. `draft_update` reparses the same five address fields with
 `Address::parse_list_checked` before fetching inline attachments or writing.
 Any rejected item returns `Request(Malformed)` and leaves the stored draft
 untouched, so an update never writes a shortened address list. Accepted
@@ -613,9 +621,11 @@ rejected as unsupported rather than silently dropped.
 
 The Gmail overrides for multi-call conveniences are:
 
-- `move_thread` adds the target container first, then removes the
-  source container when supplied. The implementation lives in the
-  crate so it can own a cloned client inside the boxed future.
+- `move_thread` sends one `threads.modify` carrying the target add and
+  every removal (the exclusive display containers plus the `source`
+  label when supplied), as described above; there is no separate
+  add-then-remove sequence. The implementation lives in the crate so
+  it can own a cloned client inside the boxed future.
 - `delete_thread` moves to `TRASH` unless the caller says the thread
   is already in Trash, in which case it calls `users.threads.delete`
   for permanent deletion.
@@ -1621,6 +1631,9 @@ Mapping highlights:
   `AttemptCause::unreadable_success()`, so a write leg they fail
   (the post-move event PATCH, the contact photo leg) reads as
   `Uncertain` rather than `NotApplied`.
+- `historyNotFound` invalidates a cursor only on the history endpoint. On
+  other endpoints it falls through to HTTP status classification. Users expect
+  unrelated resource failures to preserve sync progress.
 - `failedPrecondition` from the history endpoint ->
   `SyncState(CursorInvalid)`. `failedPrecondition` elsewhere ->
   `ConcurrencyConflict` (etag / version mismatch semantics),

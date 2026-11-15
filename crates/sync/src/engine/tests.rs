@@ -4215,3 +4215,81 @@ async fn an_already_persisted_change_ack_promotes_a_provisional_row() {
     drop(tx);
     writer.await.expect("writer");
 }
+
+#[test]
+fn legacy_empty_completion_rechecks_but_nonempty_completion_remains_valid() {
+    use super::backfill::{BackfillPlan, OpenPagesResume, ScopeResume, open_pages_resume};
+    for items_done in [0, 1] {
+        let legacy = checkpoint_on(bifrost_types::Partition(b"complete".to_vec()), items_done);
+        let ScopeResume::Walk(mut driver) = BackfillPlan::Fixed(Vec::new()).resume(Some(&legacy))
+        else {
+            panic!("legacy empty marker must not skip inventory");
+        };
+        assert_eq!(
+            driver.next_partition(),
+            Some(bifrost_types::InventoryPartition::Full)
+        );
+        assert_eq!(
+            open_pages_resume(Some(&legacy)),
+            OpenPagesResume::ResumeFrom(0)
+        );
+    }
+    let legacy = checkpoint_on(bifrost_types::Partition(b"complete".to_vec()), 2);
+    assert!(matches!(
+        BackfillPlan::Fixed(Vec::new()).resume(Some(&legacy)),
+        ScopeResume::Skip
+    ));
+    assert_eq!(open_pages_resume(Some(&legacy)), OpenPagesResume::Skip);
+    let checked_empty = checkpoint_on(crate::backfill::partitioner::completion_partition(), 1);
+    assert!(matches!(
+        BackfillPlan::Fixed(Vec::new()).resume(Some(&checked_empty)),
+        ScopeResume::Skip
+    ));
+    assert_eq!(
+        open_pages_resume(Some(&checked_empty)),
+        OpenPagesResume::Skip
+    );
+}
+
+#[tokio::test]
+async fn departed_writer_is_shutdown_for_reads_and_writes() {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    drop(rx);
+    let writer = super::ack::WriterHandle::new(tx);
+    assert!(matches!(
+        writer.get_change_cursor(CursorScope::Account, None).await,
+        Err(Error::ShuttingDown)
+    ));
+    assert!(matches!(
+        writer.reset_scope_for_restart(CursorScope::Account).await,
+        Err(Error::ShuttingDown)
+    ));
+    assert!(matches!(
+        writer.reattach_commit(0).await,
+        Err(Error::ShuttingDown)
+    ));
+}
+
+#[tokio::test]
+async fn writer_reply_loss_is_shutdown_but_store_refusal_stays_intact() {
+    for lose_reply in [true, false] {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            let Some(WriterRequest::GetChangeCursor { done, .. }) = rx.recv().await else {
+                panic!("expected cursor read");
+            };
+            if !lose_reply {
+                let _ = done.send(Err(Error::Other("store refused".into())));
+            }
+        });
+        let result = WriterHandle::new(tx)
+            .get_change_cursor(CursorScope::Account, None)
+            .await;
+        if lose_reply {
+            assert!(matches!(result, Err(Error::ShuttingDown)));
+        } else {
+            assert!(matches!(result, Err(Error::Other(message)) if message == "store refused"));
+        }
+        task.await.expect("writer task");
+    }
+}

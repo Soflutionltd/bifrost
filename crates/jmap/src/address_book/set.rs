@@ -6,7 +6,7 @@ use super::{AddressBookCreate, AddressBookPatch, AddressBookRights};
 
 impl AddressBookCreate {
     pub(crate) fn name(&mut self, name: impl Into<String>) -> &mut Self {
-        self.name = Some(name.into());
+        self.name = Field::from(Some(name.into()));
         self
     }
 

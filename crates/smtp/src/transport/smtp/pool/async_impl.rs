@@ -329,6 +329,7 @@ impl<E: Executor> Pool<E> {
     /// Park an already-established connection so a test can exercise checkout
     /// and recycle without dialing anything.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) async fn park_for_test(&self, conn: AsyncSmtpConnection) {
         let permit = Arc::clone(&self.admission)
             .try_acquire_owned()
@@ -343,6 +344,7 @@ impl<E: Executor> Pool<E> {
 
     /// Number of connections currently parked as idle.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) fn idle_count_for_test(&self) -> usize {
         self.connections
             .lock()

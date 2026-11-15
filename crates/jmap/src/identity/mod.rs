@@ -3,10 +3,11 @@
 // kept built for completeness.
 #![allow(dead_code)]
 
+use crate::core::field::Field;
+
 pub(crate) mod get;
 pub(crate) mod set;
 
-use crate::core::set::skip_if_empty_list;
 use crate::email::EmailAddress;
 use serde::{Deserialize, Serialize};
 
@@ -66,12 +67,12 @@ pub(crate) struct IdentityCreate {
     pub(super) email: Option<String>,
 
     #[serde(rename = "replyTo")]
-    #[serde(skip_serializing_if = "skip_if_empty_list")]
-    pub(super) reply_to: Option<Vec<EmailAddress>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) reply_to: Field<Vec<EmailAddress>>,
 
     #[serde(rename = "bcc")]
-    #[serde(skip_serializing_if = "skip_if_empty_list")]
-    pub(super) bcc: Option<Vec<EmailAddress>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) bcc: Field<Vec<EmailAddress>>,
 
     #[serde(rename = "textSignature")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,12 +90,12 @@ pub(crate) struct IdentityPatch {
     pub(super) name: Option<String>,
 
     #[serde(rename = "replyTo")]
-    #[serde(skip_serializing_if = "skip_if_empty_list")]
-    pub(super) reply_to: Option<Vec<EmailAddress>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) reply_to: Field<Vec<EmailAddress>>,
 
     #[serde(rename = "bcc")]
-    #[serde(skip_serializing_if = "skip_if_empty_list")]
-    pub(super) bcc: Option<Vec<EmailAddress>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) bcc: Field<Vec<EmailAddress>>,
 
     #[serde(rename = "textSignature")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,8 +110,8 @@ impl Default for IdentityPatch {
     fn default() -> Self {
         Self {
             name: None,
-            reply_to: Some(Vec::new()),
-            bcc: Some(Vec::new()),
+            reply_to: Field::Omitted,
+            bcc: Field::Omitted,
             text_signature: None,
             html_signature: None,
         }
@@ -167,8 +168,8 @@ impl crate::core::SetCreate for IdentityCreate {
             _create_id: create_id,
             name: None,
             email: None,
-            reply_to: Vec::with_capacity(0).into(),
-            bcc: Vec::with_capacity(0).into(),
+            reply_to: Field::Omitted,
+            bcc: Field::Omitted,
             text_signature: None,
             html_signature: None,
         }

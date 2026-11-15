@@ -4,76 +4,50 @@ use super::{CalendarEventCreate, CalendarEventPatch};
 use crate::calendar::CalendarId;
 
 impl CalendarEventCreate {
-    pub(crate) fn calendar_ids<U, V>(&mut self, calendar_ids: U) -> &mut Self
+    pub(crate) fn calendar_ids<U, V>(&mut self, ids: U) -> &mut Self
     where
         U: IntoIterator<Item = V>,
         V: Into<CalendarId>,
     {
-        let map: serde_json::Map<String, serde_json::Value> = calendar_ids
-            .into_iter()
-            .map(|id| (id.into().into_string(), json!(true)))
-            .collect();
-        self.properties
-            .insert("calendarIds".into(), serde_json::Value::Object(map));
+        crate::core::patch::IdSet::replace(
+            &mut self.properties,
+            "calendarIds",
+            ids.into_iter().map(|id| id.into().into_string()),
+        );
         self
     }
 
-    pub(crate) fn calendar_id(
-        &mut self,
-        calendar_id: impl Into<CalendarId>,
-        set: bool,
-    ) -> &mut Self {
-        let entry = self
-            .properties
-            .entry("calendarIds")
-            .or_insert_with(|| json!({}));
-        if let Some(map) = entry.as_object_mut() {
-            // A create carries a complete Id[Boolean] set, not patch operations.
-            let id = calendar_id.into().into_string();
-            if set {
-                map.insert(id, serde_json::Value::Bool(true));
-            } else {
-                map.remove(&id);
-            }
-        }
+    pub(crate) fn calendar_id(&mut self, id: impl Into<CalendarId>, set: bool) -> &mut Self {
+        crate::core::patch::IdSet::member(
+            &mut self.properties,
+            "calendarIds",
+            id.into().into_string(),
+            set,
+        );
         self
     }
 }
 
 impl CalendarEventPatch {
-    pub(crate) fn calendar_ids<U, V>(&mut self, calendar_ids: U) -> &mut Self
+    pub(crate) fn calendar_ids<U, V>(&mut self, ids: U) -> &mut Self
     where
         U: IntoIterator<Item = V>,
         V: Into<CalendarId>,
     {
-        let map: serde_json::Map<String, serde_json::Value> = calendar_ids
-            .into_iter()
-            .map(|id| (id.into().into_string(), json!(true)))
-            .collect();
-        self.properties
-            .retain(|name, _| !name.starts_with("calendarIds/"));
-        self.properties
-            .insert("calendarIds".into(), serde_json::Value::Object(map));
+        crate::core::patch::IdSetPatch::replace(
+            &mut self.properties,
+            "calendarIds",
+            ids.into_iter().map(|id| id.into().into_string()),
+        );
         self
     }
 
-    /// Set or clear one calendar membership without replacing unrelated ones.
-    pub(crate) fn calendar_id(
-        &mut self,
-        calendar_id: impl Into<CalendarId>,
-        set: bool,
-    ) -> &mut Self {
-        self.properties.remove("calendarIds");
-        self.properties.insert(
-            format!(
-                "calendarIds/{}",
-                crate::core::set::escape_json_pointer_token(&calendar_id.into().into_string())
-            ),
-            if set {
-                serde_json::Value::Bool(true)
-            } else {
-                serde_json::Value::Null
-            },
+    pub(crate) fn calendar_id(&mut self, id: impl Into<CalendarId>, set: bool) -> &mut Self {
+        crate::core::patch::IdSetPatch::member(
+            &mut self.properties,
+            "calendarIds",
+            id.into().into_string(),
+            set,
         );
         self
     }

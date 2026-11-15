@@ -3,12 +3,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::{fmt::Debug, time::Duration};
 
+#[cfg(feature = "account-error")]
 use bifrost_types::error::{AccountError, BatchItem, BatchOutcome};
 
 use bifrost_net::MeterSinkHandle;
 
 use super::PoolConfig;
 use super::WireMetering;
+#[cfg(feature = "account-error")]
 use super::batch::{SmtpBatchRecipient, batch_level_error};
 use super::pool::sync_impl::Pool;
 use super::{
@@ -16,7 +18,9 @@ use super::{
     SmtpInfo,
 };
 use super::{PortTls, Tls, TlsParameters, default_port};
+#[cfg(feature = "account-error")]
 use crate::address::Address;
+#[cfg(feature = "account-error")]
 use crate::transport::smtp::account_error::SmtpErrorContext;
 use crate::transport::smtp::authentication::IntoSecretString;
 use crate::transport::smtp::error::SmtpCommandPhase;
@@ -60,7 +64,7 @@ pub struct SmtpTransport {
 /// accepted recipients carry their post-DATA delivery response.
 ///
 /// Direct sends return only the ordered statuses. Use
-/// [`LmtpTransport::send_raw_batch_with_options`] when callers need the
+/// `LmtpTransport::send_raw_batch_with_options` (feature `account-error`) when callers need the
 /// RCPT-versus-final-status phase and per-recipient recovery classification.
 #[derive(Clone)]
 pub struct LmtpTransport {
@@ -92,7 +96,7 @@ impl Transport for LmtpTransport {
     /// Sends an email and returns one LMTP status per recipient.
     ///
     /// For per-recipient command-phase and recovery details, use
-    /// [`LmtpTransport::send_raw_batch_with_options`].
+    /// `LmtpTransport::send_raw_batch_with_options` (feature `account-error`).
     fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
         let mut conn = self.inner.connection()?;
 
@@ -363,6 +367,7 @@ impl SmtpTransport {
     /// Returns `Err(AccountError)` only for batch-level failures where no
     /// per-recipient outcome can be attributed: pool checkout failure, connection
     /// setup failure, MAIL FROM rejection, or a pre-MAIL transport drop.
+    #[cfg(feature = "account-error")]
     pub fn send_raw_batch_with_options(
         &self,
         from: Option<Address>,
@@ -456,7 +461,7 @@ impl LmtpTransport {
     /// Sends an email over LMTP with per-message SMTP options.
     ///
     /// For per-recipient command-phase and recovery details, use
-    /// [`Self::send_raw_batch_with_options`].
+    /// `Self::send_raw_batch_with_options` (feature `account-error`).
     pub fn send_raw_with_options(
         &self,
         envelope: &Envelope,
@@ -501,6 +506,7 @@ impl LmtpTransport {
     /// Returns `Err(AccountError)` only for batch-level failures where no
     /// per-recipient outcome can be attributed: pool checkout failure, connection
     /// setup failure, MAIL FROM rejection, or a pre-MAIL transport drop.
+    #[cfg(feature = "account-error")]
     pub fn send_raw_batch_with_options(
         &self,
         from: Option<Address>,
@@ -551,6 +557,13 @@ pub struct LmtpTransportBuilder {
 
 /// Builder for the SMTP `SmtpTransport`
 impl SmtpTransportBuilder {
+    /// Substitute a fresh in-memory peer at stream creation. Plaintext only.
+    #[cfg(feature = "test-support")]
+    pub fn scripted_connector(mut self, connector: super::test_support::ScriptedConnector) -> Self {
+        self.info.connector = Some(connector);
+        self
+    }
+
     // Create new builder with default parameters
     pub(crate) fn new<T: Into<String>>(server: T) -> Self {
         Self {
@@ -723,6 +736,13 @@ impl SmtpTransportBuilder {
 
 /// Builder for the LMTP `LmtpTransport`
 impl LmtpTransportBuilder {
+    /// Substitute a fresh in-memory peer at stream creation. Plaintext only.
+    #[cfg(feature = "test-support")]
+    pub fn scripted_connector(mut self, connector: super::test_support::ScriptedConnector) -> Self {
+        self.info.connector = Some(connector);
+        self
+    }
+
     // Create new builder with default parameters
     pub(crate) fn new<T: Into<String>>(server: T) -> Self {
         Self {
@@ -885,6 +905,25 @@ impl SmtpClient {
     /// Handles encryption and authentication
     pub(super) fn connection(&self) -> Result<SmtpConnection, Error> {
         let plan = super::DialPlan::new(&self.info.tls, self.info.unix_socket.as_deref())?;
+        #[cfg(feature = "test-support")]
+        if let Some(connector) = &self.info.connector {
+            // Scripted peers cannot prove TLS. Refuse before creating a peer,
+            // just as the async executor does, rather than bypassing policy.
+            if !matches!(self.info.tls, Tls::None) {
+                return Err(super::error::invalid_input(
+                    "scripted connectors require plaintext TLS mode",
+                ));
+            }
+            let mut conn = SmtpConnection::from_scripted_peer(
+                connector.connect(),
+                &self.info.hello_name,
+                self.info.protocol,
+                self.info.timeout,
+                self.info.metering.clone(),
+            )?;
+            self.authenticate_if_configured(&mut conn)?;
+            return Ok(conn);
+        }
         if let Some(path) = &self.info.unix_socket {
             #[cfg(unix)]
             {
@@ -951,7 +990,7 @@ impl SmtpClient {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "account-error"))]
 mod tests {
     use crate::transport::smtp::Tls;
     use crate::transport::smtp::test_support::Transcript;

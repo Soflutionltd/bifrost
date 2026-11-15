@@ -434,6 +434,7 @@ impl ServerInfo {
     /// Test-only seam so the pure mechanism-selection helpers can be exercised
     /// without parsing an EHLO banner.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) fn with_auth_mechanisms(mechanisms: &[Mechanism]) -> ServerInfo {
         ServerInfo {
             name: "test".to_owned(),

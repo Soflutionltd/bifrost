@@ -151,7 +151,7 @@ impl Harness {
         };
         let receiver = Some(ctx.delivery.subscribe(
             Some(ctx.control.clone()),
-            Some(Arc::<PendingCoverage>::clone(&ctx.coverage)),
+            Arc::<PendingCoverage>::clone(&ctx.coverage),
         ));
         let registry = Arc::new(BackfillRegistry::new());
         let task = tokio::spawn(run_backfill_orchestrator(
@@ -235,7 +235,7 @@ async fn parking_page_loss_restarts_without_completion() {
     assert_eq!(h.ctx.coverage.undelivered_watermark(&scope()), 1);
     h.receiver = Some(h.ctx.delivery.subscribe(
         Some(h.ctx.control.clone()),
-        Some(Arc::<PendingCoverage>::clone(&h.ctx.coverage)),
+        Arc::<PendingCoverage>::clone(&h.ctx.coverage),
     ));
     h.advance(60).await;
     assert_eq!(h.partitions().len(), 1, "the holed walk must be abandoned");

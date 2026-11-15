@@ -1,6 +1,7 @@
 use super::{
     ACL, DKIM, PrincipalAccount, PrincipalCreate, PrincipalId, PrincipalPatch, Property, Type,
 };
+use crate::core::field::Field;
 use crate::core::id::AccountId;
 use std::collections::HashMap;
 
@@ -8,7 +9,7 @@ macro_rules! principal_setters {
     ($t:ty) => {
         impl $t {
             pub(crate) fn name(&mut self, name: impl Into<String>) -> &mut Self {
-                self.name = name.into().into();
+                self.name = Field::Value(name.into());
                 self
             }
 
@@ -16,27 +17,27 @@ macro_rules! principal_setters {
                 &mut self,
                 description: Option<impl Into<String>>,
             ) -> &mut Self {
-                self.description = description.map(std::convert::Into::into);
+                self.description = Field::from(description.map(std::convert::Into::into));
                 self
             }
 
             pub(crate) fn email(&mut self, email: impl Into<String>) -> &mut Self {
-                self.email = email.into().into();
+                self.email = Field::Value(email.into());
                 self
             }
 
             pub(crate) fn secret(&mut self, secret: impl Into<String>) -> &mut Self {
-                self.secret = secret.into().into();
+                self.secret = Field::Value(secret.into());
                 self
             }
 
             pub(crate) fn timezone(&mut self, timezone: Option<impl Into<String>>) -> &mut Self {
-                self.timezone = timezone.map(std::convert::Into::into);
+                self.timezone = Field::from(timezone.map(std::convert::Into::into));
                 self
             }
 
             pub(crate) fn picture(&mut self, picture: Option<impl Into<String>>) -> &mut Self {
-                self.picture = picture.map(std::convert::Into::into);
+                self.picture = Field::from(picture.map(std::convert::Into::into));
                 self
             }
 
@@ -56,7 +57,7 @@ macro_rules! principal_setters {
             }
 
             pub(crate) fn acl(&mut self, acl: Option<HashMap<PrincipalId, Vec<ACL>>>) -> &mut Self {
-                self.acl = acl;
+                self.acl = Field::from(acl);
                 self
             }
 
@@ -65,8 +66,9 @@ macro_rules! principal_setters {
                 T: IntoIterator<Item = U>,
                 U: Into<String>,
             {
-                self.aliases =
-                    aliases.map(|l| l.into_iter().map(std::convert::Into::into).collect());
+                self.aliases = Field::from(
+                    aliases.map(|l| l.into_iter().map(std::convert::Into::into).collect()),
+                );
                 self
             }
 
@@ -91,8 +93,9 @@ macro_rules! principal_setters {
                 T: IntoIterator<Item = U>,
                 U: Into<PrincipalId>,
             {
-                self.members =
-                    members.map(|l| l.into_iter().map(std::convert::Into::into).collect());
+                self.members = Field::from(
+                    members.map(|l| l.into_iter().map(std::convert::Into::into).collect()),
+                );
                 self
             }
         }

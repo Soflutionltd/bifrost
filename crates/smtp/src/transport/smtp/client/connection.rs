@@ -1,3 +1,5 @@
+#[cfg(feature = "account-error")]
+use crate::transport::smtp::batch::{SendProgress, SmtpBatchRecipient};
 #[cfg(unix)]
 use std::path::Path;
 use std::{
@@ -20,8 +22,10 @@ use super::{
     core::{Op, OpOutcome, ProtocolMachine, Step},
     data_terminator,
 };
+#[cfg(feature = "account-error")]
+use crate::address::Address;
 use crate::{
-    address::{Address, Envelope},
+    address::Envelope,
     transport::smtp::{
         Dialect,
         authentication::{
@@ -29,7 +33,6 @@ use crate::{
             decode_scram_payload, oauth_mechanism, password_mechanism, resolve_scram_binding,
             scram_hash,
         },
-        batch::{SendProgress, SmtpBatchRecipient},
         commands::{Auth, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Starttls, Vrfy},
         error,
         error::{Error, SmtpCommandPhase},
@@ -50,7 +53,7 @@ macro_rules! try_smtp (
     });
     // Phase-tagged variant. Stamps the SMTP error with the given
     // SmtpCommandPhase so the translation boundary in `account_error.rs`
-    // can route per-phase (e.g. AUTH-time failures -> PolicyBlocked,
+    // can retain phase evidence (e.g. AUTH mechanism diagnostics,
     // MAIL FROM phase tagged on telemetry, etc.). Use this in the
     // legacy non-batch send paths and the AUTH command exchange.
     // Set-if-absent (`or_phase`): a multi-phase callee (the LMTP body
@@ -141,12 +144,33 @@ impl SmtpConnection {
     // Widened so the pool and transport tests can drive a scripted peer
     // through the public entry points instead of a socket.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(in crate::transport::smtp) fn from_transcript(
         transcript: crate::transport::smtp::test_support::Transcript,
         hello_name: &ClientId,
         protocol: Dialect,
     ) -> Result<Self, Error> {
-        let stream = BufReader::new(NetworkStream::from_transcript(transcript));
+        Self::from_scripted_peer(
+            transcript,
+            hello_name,
+            protocol,
+            None,
+            WireMetering::disabled(),
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
+    pub(in crate::transport::smtp) fn from_scripted_peer(
+        transcript: crate::transport::smtp::test_support::Transcript,
+        hello_name: &ClientId,
+        protocol: Dialect,
+        timeout: Option<Duration>,
+        metering: WireMetering,
+    ) -> Result<Self, Error> {
+        let mut network = NetworkStream::from_transcript(transcript);
+        network.set_metering(metering);
+        let stream = BufReader::new(network);
         let mut conn = Self {
             stream,
             server_info: ServerInfo::default(),
@@ -156,6 +180,7 @@ impl SmtpConnection {
             retire: false,
             read_timeout: None,
         };
+        conn.set_timeout(timeout).map_err(error::connection_io)?;
         let _response = conn.read_response()?;
         conn.hello(hello_name)?;
         Ok(conn)
@@ -324,6 +349,7 @@ impl SmtpConnection {
     /// attributed: MAIL FROM rejection, transport drop before any command, or
     /// pre-MAIL local validation errors. In the `Err` case the tracker holds
     /// whatever state was accumulated before the abort.
+    #[cfg(feature = "account-error")]
     pub(crate) fn send_smtp_batch(
         &mut self,
         from: Option<Address>,
@@ -342,6 +368,7 @@ impl SmtpConnection {
     ///
     /// Like `send_smtp_batch` but reads one final status per accepted
     /// recipient after the DATA body.
+    #[cfg(feature = "account-error")]
     pub(crate) fn send_lmtp_batch(
         &mut self,
         from: Option<Address>,
@@ -358,6 +385,7 @@ impl SmtpConnection {
     /// Local validation and command construction for a batch send, all of it
     /// before `MAIL FROM` opens a transaction (see `build_envelope`).
     #[allow(clippy::type_complexity)]
+    #[cfg(feature = "account-error")]
     fn build_batch(
         &self,
         protocol: Dialect,
@@ -845,12 +873,11 @@ impl SmtpConnection {
 
         if challenges == 0 && response.has_code(334) {
             // The server never completed (or rejected) the exchange within the
-            // round-trip budget: an auth-exchange failure, routed on the Auth
-            // lane (InvalidInput + Auth -> Authorization), not an untagged
-            // Protocol(ParseFailed). Exhausting the budget while sending the
+            // round-trip budget: malformed peer behavior, with AUTH phase kept
+            // for diagnostics. Exhausting the budget while sending the
             // tenth answer is fine when that answer receives a final reply.
             self.abort();
-            Err(error::invalid_input("Unexpected number of challenges").with_phase(phase))
+            Err(error::parse("Unexpected number of challenges").with_phase(phase))
         } else {
             let hello_name = self.hello_name.clone();
             try_smtp!(self.hello(&hello_name), self);
@@ -898,12 +925,14 @@ impl SmtpConnection {
     /// write the body through `Op::WriteBody` and read the final reply through
     /// `Op::ReadSingle`, over these same writers.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) fn message(&mut self, message: &[u8]) -> Result<Response, Error> {
         self.message_iter(std::iter::once(message))
     }
 
     /// Sends the message content by consuming an iterator that in its whole represents a message.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) fn message_iter<I, B>(&mut self, message: I) -> Result<Response, Error>
     where
         I: Iterator<Item = B>,
@@ -1075,7 +1104,7 @@ impl SmtpConnection {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "account-error"))]
 mod transcript_tests {
     use crate::{
         address::{Address, Envelope},

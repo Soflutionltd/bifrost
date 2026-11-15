@@ -164,6 +164,7 @@ impl Pool {
     /// Park an already-established connection so a test can exercise checkout
     /// and recycle without dialing anything.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) fn park_for_test(&self, conn: SmtpConnection) {
         assert!(self.try_reserve(), "test connection fits pool bound");
         self.connections
@@ -176,6 +177,7 @@ impl Pool {
 
     /// Number of connections currently parked as idle.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "account-error"), allow(dead_code))]
     pub(crate) fn idle_count_for_test(&self) -> usize {
         self.connections
             .lock()

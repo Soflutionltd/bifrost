@@ -19,15 +19,9 @@
 //! rule itself is pinnable here; the round trip the routable half then
 //! makes is pinned at each call site through the `GraphClient` REST seam.
 //!
-//! What is deliberately NOT shared: the per-item lane discipline downstream
-//! of this partition - the `reconcile_*` readers and `BatchOutcomeBuilder`
-//! use - exists four times (hydration, the mutation funnel, reactions, push),
-//! and `resolve_batch_responses` / `reconcile_hydration_responses` each carry
-//! their own invalid-index and duplicate-index rules. A validated `$batch`
-//! projection type replacing those copies was proposed in the 2026-09-04
-//! bug hunt and ruled NOT approved by the repository owner: one recorded
-//! drift between the four is thin evidence for restructuring four working
-//! lanes. Re-raise it if a second drift between them is ever found.
+//! Response correlation below is shared by all four REST batch readers. Each
+//! lane retains its own missing-answer and etag semantics: a read observes a
+//! version, while a successful write consumes or replaces it.
 
 use bifrost_types::ObjectId;
 
@@ -61,9 +55,55 @@ pub(crate) fn partition_routable<T, E>(
     (routable, rejected)
 }
 
+/// Correlate only submitted numeric request ids, accepting the first answer.
+/// Unknown ids cannot create caller-visible outcomes or update validators.
+/// Outlook users expect each submitted item accounted once even when the
+/// provider duplicates an answer or appends an unrelated one.
+pub(crate) fn resolve_answers(
+    submitted: impl IntoIterator<Item = usize>,
+    responses: Vec<crate::types::BatchResponseItem>,
+) -> Vec<(usize, crate::types::BatchResponseItem)> {
+    let mut pending: std::collections::HashSet<usize> = submitted.into_iter().collect();
+    responses
+        .into_iter()
+        .filter_map(|item| {
+            let index = item.id.parse::<usize>().ok();
+            if let Some(index) = index.filter(|index| pending.remove(index)) {
+                Some((index, item))
+            } else {
+                tracing::warn!(
+                    target: "bifrost_graph::batch",
+                    response_id = %item.id,
+                    "ignoring unknown or duplicate Graph $batch response"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answers_accept_only_submitted_indices_once() {
+        let responses = serde_json::from_value(serde_json::json!([
+            {"id": "nonsense", "status": 200},
+            {"id": "1", "status": 200},
+            {"id": "99", "status": 200},
+            {"id": "2", "status": 412},
+            {"id": "02", "status": 200},
+            {"id": "0", "status": 204}
+        ]))
+        .expect("batch responses");
+        let resolved = resolve_answers([0, 2], responses);
+        let accepted: Vec<_> = resolved
+            .iter()
+            .map(|(index, item)| (*index, item.status))
+            .collect();
+        assert_eq!(accepted, [(2, 412), (0, 204)]);
+    }
 
     fn oid(value: &str) -> ObjectId {
         ObjectId(value.to_string())

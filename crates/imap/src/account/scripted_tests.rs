@@ -1556,7 +1556,7 @@ async fn invalid_move_destination_batches_its_rejections() {
     let (conn, _server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
     let account = scripted_account(conn, 1);
     let folder = crate::types::MailboxName::new("INBOX").unwrap();
-    let target_count = super::TARGET_BUFFER_ITEMS * 2 + 5;
+    let target_count = account.config.mutation_batch_size.max(1) * 2 + 5;
     let ids: Vec<bifrost_types::ObjectId> = (1..=target_count)
         .map(|uid| super::encode_object_id(&folder, 5, u32::try_from(uid).unwrap()))
         .collect();
@@ -1573,7 +1573,7 @@ async fn invalid_move_destination_batches_its_rejections() {
     );
 
     let batches = drain_mutation_batches(output).await;
-    // Ceiling of target_count / TARGET_BUFFER_ITEMS: three windows here.
+    // Ceiling of target_count / mutation_batch_size: three windows here.
     assert_batched_exactly_once(&batches, &expected, 3);
 }
 
@@ -1584,7 +1584,7 @@ async fn invalid_move_destination_batches_its_rejections() {
 async fn undecodable_ids_ride_one_batch_per_window() {
     let (conn, _server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
     let account = scripted_account(conn, 1);
-    let target_count = super::TARGET_BUFFER_ITEMS + 7;
+    let target_count = account.config.mutation_batch_size.max(1) + 7;
     let ids: Vec<bifrost_types::ObjectId> = (1..=target_count)
         .map(|n| bifrost_types::ObjectId(format!("not-an-imap-object-id-{n}")))
         .collect();
@@ -1617,7 +1617,7 @@ async fn undecodable_ids_ride_one_batch_per_window() {
 async fn non_notify_push_reports_the_folder_beyond_its_budget_as_poll_only() {
     use bifrost_types::{Account, CursorScope, FolderId};
 
-    let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1 IDLE")).await;
     let account = scripted_account(conn, 4);
     assert_eq!(
         account.config.idle_connection_budget, 2,
@@ -1682,7 +1682,7 @@ async fn non_notify_push_reports_the_folder_beyond_its_budget_as_poll_only() {
 async fn a_folder_scope_with_an_unsendable_name_is_refused_not_misreported() {
     use bifrost_types::{Account, CursorScope, FolderId};
 
-    let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1 IDLE")).await;
     let account = scripted_account(conn, 2);
     let scopes = vec![
         CursorScope::Folder(FolderId("bad\r\nname".to_owned())),
@@ -1733,7 +1733,7 @@ async fn a_composed_dav_collection_scope_is_refused_by_push_admission() {
         &std::collections::HashSet::new(),
     );
     assert!(warnings.is_empty());
-    let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1 IDLE")).await;
     let account = scripted_dav_account(conn, 2, false, None, FolderRegistry::default(), dav_scopes);
     let scopes = vec![
         CursorScope::Folder(FolderId(collection.to_owned())),
@@ -4885,7 +4885,7 @@ async fn session_account_with_budget(
     tokio::io::DuplexStream,
     super::test_support::ScriptedDials,
 ) {
-    let (conn, peer) = driver_pair(&preauth_greeting("IMAP4rev1 ACL")).await;
+    let (conn, peer) = driver_pair(&preauth_greeting("IMAP4rev1 ACL IDLE")).await;
     let (connector, dials) =
         super::test_support::scripted_connector(vec![SESSION_GREETING.to_vec(); count]);
     let config = super::factory::ImapAccountConfig {

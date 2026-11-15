@@ -4862,12 +4862,12 @@ fn capability_rights_parsed() {
     }
 }
 
-/// RFC 4314 Section 6: RIGHTS= is case-insensitive but the rights chars are preserved.
+/// RFC 4314 Section 6: RIGHTS= is case-insensitive and the rights chars are canonicalized.
 #[test]
 fn capability_rights_case_insensitive() {
     let (_, cap) = capability(b"rights=TEXK").unwrap();
     match cap {
-        Capability::Rights(rights) => assert_eq!(rights, "TEXK"),
+        Capability::Rights(rights) => assert_eq!(rights, "texk"),
         other => panic!("expected Rights variant, got {other:?}"),
     }
 }

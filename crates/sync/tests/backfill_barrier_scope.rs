@@ -250,7 +250,7 @@ async fn a_barrier_stops_the_whole_scope_walk_through_the_real_orchestrator() {
             let event = events.recv().await.expect("broadcast stays open");
             if matches!(
                 &event.checkpoint,
-                Some(Checkpoint::Backfill(checkpoint)) if checkpoint.partition.0 == b"complete"
+                Some(Checkpoint::Backfill(checkpoint)) if checkpoint.partition.0 == b"complete:v2"
             ) {
                 break;
             }

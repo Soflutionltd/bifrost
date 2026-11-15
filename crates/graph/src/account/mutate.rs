@@ -502,33 +502,7 @@ fn resolve_batch_responses(
     request_ids: &[ObjectId],
     responses: Vec<crate::types::BatchResponseItem>,
 ) -> Vec<(usize, crate::types::BatchResponseItem)> {
-    let mut seen_indices: HashSet<usize> = HashSet::new();
-    let mut resolved = Vec::with_capacity(responses.len());
-    for item in responses {
-        let Some(index) = item
-            .id
-            .parse::<usize>()
-            .ok()
-            .filter(|idx| *idx < request_ids.len())
-        else {
-            tracing::warn!(
-                target: "bifrost_graph::batch",
-                response_id = %item.id,
-                "ignoring Graph $batch mutation response with an invalid request id"
-            );
-            continue;
-        };
-        if !seen_indices.insert(index) {
-            tracing::warn!(
-                target: "bifrost_graph::batch",
-                response_id = %item.id,
-                "ignoring duplicate Graph $batch mutation response"
-            );
-            continue;
-        }
-        resolved.push((index, item));
-    }
-    resolved
+    super::batch_routing::resolve_answers(0..request_ids.len(), responses)
 }
 
 async fn update_etag_cache_from_responses(
@@ -550,7 +524,7 @@ async fn update_etag_cache_from_responses(
             || ((200..300).contains(&response.status)
                 && matches!(kind, MutationKind::Move(_) | MutationKind::Destroy))
         {
-            cache.remove(&id.0);
+            cache.observe(&id.0, super::EtagObservation::Invalidated);
             continue;
         }
         if (200..300).contains(&response.status) {
@@ -564,10 +538,7 @@ async fn update_etag_cache_from_responses(
                         .map(|(_, value)| GraphETag::from_odata_annotation(value))
                 })
                 .or_else(|| response.body.as_ref().and_then(graph_etag));
-            match etag {
-                Some(etag) => cache.insert(id.0.clone(), etag),
-                None => cache.remove(&id.0),
-            }
+            cache.observe(&id.0, super::EtagObservation::Written(etag));
         }
     }
 }

@@ -3,7 +3,8 @@ use super::{
     EmailPatch, Header, HeaderValue,
 };
 use crate::core::id::BlobId;
-use crate::core::{request::ResultReference, set::escape_json_pointer_token};
+use crate::core::patch::{self, IdSet, IdSetPatch};
+use crate::core::request::ResultReference;
 use crate::mailbox::MailboxId;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ impl EmailCreate {
         T: IntoIterator<Item = U>,
         U: Into<MailboxId>,
     {
-        self.mailbox_ids = Some(mailbox_ids.into_iter().map(|s| (s.into(), true)).collect());
+        self.mailbox_ids = Some(IdSet::collect(mailbox_ids.into_iter().map(Into::into)));
         self.mailbox_ids_ref = None;
         self
     }
@@ -30,7 +31,7 @@ impl EmailCreate {
         T: IntoIterator<Item = U>,
         U: Into<String>,
     {
-        self.keywords = Some(keywords.into_iter().map(|s| (s.into(), true)).collect());
+        self.keywords = Some(IdSet::collect(keywords.into_iter().map(Into::into)));
         self
     }
 
@@ -195,16 +196,11 @@ impl EmailPatch {
     pub(crate) fn mailbox_id(&mut self, mailbox_id: &MailboxId, set: bool) -> &mut Self {
         self.mailbox_ids = None;
         self.remove_patch_property("mailboxIds");
-        self.patch.get_or_insert_with(HashMap::new).insert(
-            format!(
-                "mailboxIds/{}",
-                escape_json_pointer_token(mailbox_id.as_str())
-            ),
-            if set {
-                serde_json::Value::Bool(true)
-            } else {
-                serde_json::Value::Null
-            },
+        IdSetPatch::member_entries(
+            self.patch.get_or_insert_with(HashMap::new),
+            "mailboxIds",
+            mailbox_id.as_str(),
+            set,
         );
         self
     }
@@ -214,7 +210,7 @@ impl EmailPatch {
         T: IntoIterator<Item = U>,
         U: Into<MailboxId>,
     {
-        self.mailbox_ids = Some(mailbox_ids.into_iter().map(|s| (s.into(), true)).collect());
+        self.mailbox_ids = Some(IdSet::collect(mailbox_ids.into_iter().map(Into::into)));
         self.remove_patch_entries("mailboxIds");
         self
     }
@@ -223,13 +219,11 @@ impl EmailPatch {
     pub(crate) fn keyword(&mut self, keyword: &str, set: bool) -> &mut Self {
         self.keywords = None;
         self.remove_patch_property("keywords");
-        self.patch.get_or_insert_with(HashMap::new).insert(
-            format!("keywords/{}", escape_json_pointer_token(keyword)),
-            if set {
-                serde_json::Value::Bool(true)
-            } else {
-                serde_json::Value::Null
-            },
+        IdSetPatch::member_entries(
+            self.patch.get_or_insert_with(HashMap::new),
+            "keywords",
+            keyword,
+            set,
         );
         self
     }
@@ -239,12 +233,13 @@ impl EmailPatch {
         T: IntoIterator<Item = U>,
         U: Into<String>,
     {
-        self.keywords = Some(keywords.into_iter().map(|s| (s.into(), true)).collect());
+        self.keywords = Some(IdSet::collect(keywords.into_iter().map(Into::into)));
         self.remove_patch_entries("keywords");
         self
     }
 
     pub(crate) fn subject(&mut self, subject: impl Into<String>) -> &mut Self {
+        self.remove_patch_entries("subject");
         self.subject = Some(subject.into());
         self
     }
@@ -254,17 +249,31 @@ impl EmailPatch {
         property: impl Into<String>,
         value: &T,
     ) -> serde_json::Result<&mut Self> {
-        self.patch
-            .get_or_insert_with(HashMap::new)
-            .insert(property.into(), serde_json::to_value(value)?);
+        let value = serde_json::to_value(value)?;
+        let property = property.into();
+        self.clear_typed_set(&property);
+        patch::insert(self.patch.get_or_insert_with(HashMap::new), property, value);
         Ok(self)
     }
 
     pub(crate) fn null_property(&mut self, property: impl Into<String>) -> &mut Self {
-        self.patch
-            .get_or_insert_with(HashMap::new)
-            .insert(property.into(), serde_json::Value::Null);
+        let property = property.into();
+        self.clear_typed_set(&property);
+        patch::insert(
+            self.patch.get_or_insert_with(HashMap::new),
+            property,
+            serde_json::Value::Null,
+        );
         self
+    }
+
+    fn clear_typed_set(&mut self, path: &str) {
+        match path.split('/').next() {
+            Some("mailboxIds") => self.mailbox_ids = None,
+            Some("keywords") => self.keywords = None,
+            Some("subject") => self.subject = None,
+            _ => {}
+        }
     }
 
     fn remove_patch_property(&mut self, property: &str) {
@@ -283,8 +292,7 @@ impl EmailPatch {
     /// and the request carries duplicate, conflicting keys.
     fn remove_patch_entries(&mut self, property: &str) {
         if let Some(patch) = &mut self.patch {
-            let prefix = format!("{property}/");
-            patch.retain(|key, _| key != property && !key.starts_with(&prefix));
+            patch::remove(patch, property);
         }
     }
 

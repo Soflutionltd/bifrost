@@ -643,15 +643,17 @@ async fn discard_backfill_progress(
 }
 
 async fn scope_barrier_blocked(writer: &mpsc::Sender<WriterRequest>, scope: CursorScope) -> bool {
+    // An unavailable writer cannot prove the scope unblocked. An enterprise
+    // mail user expects inventory to stop rather than cross unknown debt.
     let (done, recv) = oneshot::channel();
     if writer
         .send(WriterRequest::ScopeBarrierBlocked { scope, done })
         .await
         .is_err()
     {
-        return false;
+        return true;
     }
-    recv.await.unwrap_or(false)
+    recv.await.unwrap_or(true)
 }
 
 /// First retry delay for a scope incarnation whose backfill did not
@@ -1102,8 +1104,14 @@ pub(super) enum OpenPagesResume {
 /// plans; `get_backfill` only ever returns consumer-acked checkpoints, so
 /// a marker means every page the consumer needed was durably persisted.
 pub(super) fn backfill_complete_recorded(checkpoint: Option<&BackfillCheckpoint>) -> bool {
-    checkpoint
-        .is_some_and(|ck| crate::backfill::partitioner::is_completion_partition(&ck.partition))
+    checkpoint.is_some_and(|ck| {
+        // Empty plans used to emit the legacy marker with zero seen + one.
+        // Larger legacy markers prove a nonempty walk and remain valid. An
+        // enterprise mail user expects a possibly skipped empty folder to be
+        // checked once; new empty inventories earn the versioned marker.
+        crate::backfill::partitioner::is_completion_partition(&ck.partition)
+            && (ck.partition.0 != b"complete" || ck.progress.items_done > 1)
+    })
 }
 
 /// Map the persisted backfill checkpoint to a resume decision.

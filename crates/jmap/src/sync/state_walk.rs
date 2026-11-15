@@ -122,7 +122,7 @@ impl InventoryWalk {
     pub(crate) fn query_error_context(&self, operation: AccountOperation) -> JmapErrorContext {
         let context = self.error_context(operation);
         if self.anchor.is_some() {
-            context.with_anchored_query()
+            JmapErrorContext::anchored_cursor(operation, self.scope.clone())
         } else {
             context
         }
@@ -185,22 +185,22 @@ mod tests {
         assert!(
             changes
                 .error_context(AccountOperation::SyncChanges)
-                .state_based
+                .is_state_read()
         );
         assert!(
             lifecycle
                 .error_context(AccountOperation::ScopeLifecycle)
-                .state_based
+                .is_state_read()
         );
         assert!(
             !inventory
                 .error_context(AccountOperation::SyncInventory)
-                .state_based
+                .is_state_read()
         );
         assert!(
             !inventory
                 .query_error_context(AccountOperation::SyncInventory)
-                .anchored_query
+                .is_anchored_query()
         );
     }
 
@@ -236,12 +236,12 @@ mod tests {
         assert!(
             inventory
                 .query_error_context(AccountOperation::SyncInventory)
-                .anchored_query
+                .is_anchored_query()
         );
         assert!(
             !inventory
                 .error_context(AccountOperation::SyncInventory)
-                .anchored_query,
+                .is_anchored_query(),
             "a get call keeps the cursor scope without inheriting the query anchor"
         );
         assert_eq!(

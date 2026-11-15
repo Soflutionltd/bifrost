@@ -115,10 +115,3 @@ mod marker {
 pub(crate) type AccountId = Id<marker::Account>;
 pub(crate) type BlobId = Id<marker::Blob>;
 pub(crate) type State = Id<marker::State>;
-
-/// `serde(skip_serializing_if)` predicate for `Option<Id<T>>` fields
-/// that treat an empty string the same as `None`. Mirrors the semantics
-/// of `skip_if_empty_str` for the typed-id storage migration.
-pub(crate) fn skip_if_empty_id<T: ?Sized>(id: &Option<Id<T>>) -> bool {
-    matches!(id, Some(id) if id.as_str().is_empty())
-}

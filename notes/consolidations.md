@@ -537,24 +537,6 @@ crossing, the stop, barrier recording and the degraded flag, plus one
 fence-before-forward rule and the warnings. Only the checkpoint source (minted
 positional vs account-supplied) stays per front end.
 
-## CON-025 - Which numbered change-stream receivers are live?
-
-**Reported by:** sync-lanes.
-
-`ChangeDelivery::SubscriberState::live` and `cursor::coverage::Ledger::live` are
-the same set; the ledger copy is "a mirror of `ChangeDelivery`'s own `live`
-set", maintained by `receiver_joined` / `receiver_departed` calls under the
-delivery lock. In one departure, `ChangeDelivery::depart` computes `min_live`
-from its own copy and passes it to `PendingCoverage::release_undelivered`, while
-`BoundaryEntry::page_unread` and `backfill_charge_holders` read the ledger's.
-`ChangeDelivery::subscribe` takes `coverage: Option<Arc<PendingCoverage>>`, so a
-numbered receiver created with `None` is live in one set and absent from the
-other. Production always passes `Some`; they agree only because every call site
-does. Owner: one of them - `ChangeDelivery` owns the ledger (it already holds the
-lock ordering sends, stamps and departures), or `PendingCoverage` owns
-numbering and `ChangeDelivery` asks it. Either way the `Option` on `subscribe`
-goes.
-
 ## CON-026 - Backfill completion state is tracked four times in memory
 
 **Reported by:** sync-lanes.
@@ -764,20 +746,6 @@ PushBlock { notifications, state: Option<MergedStateChange>, push_state }` in th
 crate root (or `core/push.rs`), consumed by both lanes, with
 `WebSocketStateChange` decoding straight into the shared struct.
 
-## CON-041 - Setting one member of a JMAP id-set without clobbering the rest
-
-**Reported by:** jmap-protocol.
-
-`EmailPatch::mailbox_id` / `mailbox_ids`, `CalendarEventPatch::calendar_id` /
-`calendar_ids`, `ContactCardPatch::address_book_id` / `address_book_ids`, and the
-Create-side twins each implement "path op vs wholesale replace, and never both"
-independently, and the create twins diverge (BUG-061). The RFC 8620 section 5.3
-rule "a patch may not name a property and a path into it" is implemented
-separately as `EmailPatch::remove_patch_entries`, as `.retain(|name, _|
-!name.starts_with("calendarIds/"))` and the `addressBookIds/` twin, and by hand in
-each single-path setter. Owner: one `IdSetPatch<T>` / `IdSet<T>` pair with a
-`PatchPath` (STR-088).
-
 ## CON-042 - JMAP data type, capability and method name are restated at every invocation
 
 **Reported by:** jmap-protocol.
@@ -944,19 +912,6 @@ on `response_parts`), and `MutationProgress::finish_failures` takes that answer 
 Option<Evidence>` beside `cursor.rs` (the proof rests on the cursor model), called by
 both inventory sites; the walk should arguably report the same evidence rather than
 silently `continue`, so the engine sees it. Related: BUG-021.
-
-## CON-053 - Google has two query translators, and the workspace two predicate algebras
-
-**Reported by:** google (the translators already disagree on archive, BUG-091).
-
-`pim::filter_query` (`SearchFilter` to Gmail `q`) and `filters::condition_query` /
-`apply_condition` (`FilterCondition` to Gmail `q`) duplicate `query_term`,
-`sanitize_term` / `sanitize_header`, `container_query` and `gmail_date`, and
-translate nearly the same algebra (From, To, Subject, Body, Has, In, DateRange, And,
-Or, Not). Owner: one Gmail query encoder. Lateral, for bifrost-types:
-`SearchFilter` and `FilterCondition` are two message-predicate algebras with
-overlapping variants, so every crate with both search and filters re-translates the
-overlap twice.
 
 ## CON-060 - Two redirect walkers, two 401-refresh-once paths, two deadlines
 

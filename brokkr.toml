@@ -56,6 +56,24 @@ packages = ["bifrost-jmap"]
 no_default_features = true
 feature_unification = "package"
 
+# bifrost-smtp with NO features, resolved per package. `account-error` is a
+# default feature gating a large part of the crate, and code exists that only
+# compiles with it off; no other sweep builds that shape.
+[[check]]
+name = "smtp-no-default"
+packages = ["bifrost-smtp"]
+no_default_features = true
+feature_unification = "package"
+
+# bifrost-smtp with no default features plus `tokio`: the async transport
+# without the account-error layer.
+[[check]]
+name = "smtp-no-default-tokio"
+packages = ["bifrost-smtp"]
+no_default_features = true
+features = ["tokio"]
+feature_unification = "package"
+
 # bifrost-jmap with its `sync` feature, resolved per package. The workspace sweep
 # only builds `sync` because bifrost-sync donates it through unification, so a
 # focused `brokkr test -p bifrost-jmap` never compiled `crates/jmap/src/sync/`

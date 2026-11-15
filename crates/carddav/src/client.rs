@@ -2148,7 +2148,7 @@ mod tests {
             .expect_err("a create naming no address book has nowhere to write");
         // Only the doors taking an `Option<AddressBookId>` route through the
         // default. `contact_get` / `contact_update` derive the collection from
-        // the resource's own URL, and `bifrost_net::url::parent_collection_url`
+        // the resource's own URL, and `bifrost_dav_core::url::parent_collection_url`
         // answers for every id that resolves absolute, so their fallback is
         // unreachable in practice.
 

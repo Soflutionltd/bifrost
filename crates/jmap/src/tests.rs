@@ -1976,10 +1976,7 @@ mod mailbox_wire {
 
     #[test]
     fn a_fresh_create_serialises_to_an_empty_object() {
-        // The sentinel defaults (`parentId: ""`, `role: None`, empty
-        // `shareWith`) all have to be skipped, or a plain
-        // `Mailbox/set create` would carry three properties the caller
-        // never asked for.
+        // Untouched fields must be omitted; empty values remain expressible.
         let create = MailboxCreate::new(None);
         assert_eq!(serde_json::to_value(&create).unwrap(), json!({}));
     }
@@ -2042,29 +2039,15 @@ mod mailbox_wire {
     }
 
     #[test]
-    fn role_none_is_the_only_way_to_omit_role_from_a_patch() {
-        // `role(Role::None)` sets the field to `None`, which is NOT the
-        // sentinel `role_not_set` looks for, so it still emits null.
-        // Only an explicit `Some(Role::None)` is skipped, and no public
-        // setter produces one.
+    fn role_null_clears_and_default_omits() {
         let mut patch = MailboxPatch::default();
-        patch.name("Renamed");
-        patch.role(Role::None);
+        assert_eq!(serde_json::to_value(&patch).unwrap(), json!({}));
+        patch.role(None);
+        assert_eq!(serde_json::to_value(&patch).unwrap(), json!({"role": null}));
+        patch.role(Some(Role::Inbox));
         assert_eq!(
-            serde_json::to_value(&patch).unwrap().get("role"),
-            Some(&serde_json::Value::Null)
-        );
-
-        let sentinel = MailboxPatch {
-            role: Some(Role::None),
-            ..MailboxPatch::default()
-        };
-        assert!(
-            serde_json::to_value(&sentinel)
-                .unwrap()
-                .get("role")
-                .is_none(),
-            "the sentinel is the skip condition; the setter cannot reach it"
+            serde_json::to_value(&patch).unwrap(),
+            json!({"role": "inbox"})
         );
     }
 
@@ -2298,7 +2281,7 @@ mod settings_object_wire {
         patch.bcc(Some(std::iter::empty::<crate::email::EmailAddress>()));
         assert_eq!(
             serde_json::to_value(&patch).unwrap(),
-            json!({"replyTo": null, "bcc": null})
+            json!({"replyTo": [], "bcc": []})
         );
     }
 
@@ -2435,8 +2418,34 @@ mod patch_defaults {
         }
     }
 
+    #[cfg(feature = "mail")]
     #[test]
-    fn creates_install_empty_sentinels() {
+    fn explicit_empty_create_values_are_preserved() {
+        use crate::core::SetCreate;
+        let mut identity = crate::identity::IdentityCreate::new(None);
+        identity.reply_to(Some(std::iter::empty::<crate::email::EmailAddress>()));
+        assert_eq!(
+            serde_json::to_value(identity).unwrap(),
+            json!({"replyTo": []})
+        );
+
+        let mut mailbox = crate::mailbox::MailboxCreate::new(None);
+        mailbox.acls(std::iter::empty::<(String, Vec<crate::mailbox::ACL>)>());
+        assert_eq!(
+            serde_json::to_value(mailbox).unwrap(),
+            json!({"shareWith": {}})
+        );
+
+        let mut vacation = crate::vacation_response::VacationResponseCreate::new(None);
+        vacation.from_date(Some(0)).subject(Some(""));
+        assert_eq!(
+            serde_json::to_value(vacation).unwrap(),
+            json!({"fromDate": "1970-01-01T00:00:00Z", "subject": ""})
+        );
+    }
+
+    #[test]
+    fn untouched_creates_omit_optional_fields() {
         use crate::core::SetCreate;
         #[cfg(feature = "contacts")]
         assert_eq!(

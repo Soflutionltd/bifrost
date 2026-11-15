@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::core::field::Field;
-use crate::core::set::skip_if_empty_str;
 
 mod marker {
     pub(crate) enum AddressBook {}
@@ -57,8 +56,8 @@ pub(crate) struct AddressBookCreate {
     pub(super) _create_id: Option<crate::core::creation::CreationId>,
 
     #[serde(rename = "name")]
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    pub(super) name: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) name: Field<String>,
 
     #[serde(rename = "description")]
     #[serde(skip_serializing_if = "Field::is_omitted")]
@@ -190,7 +189,7 @@ impl crate::core::SetCreate for AddressBookCreate {
     fn new(create_id: Option<crate::core::creation::CreationId>) -> Self {
         AddressBookCreate {
             _create_id: create_id,
-            name: Some(String::new()),
+            name: Field::Omitted,
             description: Field::Omitted,
             sort_order: None,
             is_subscribed: None,

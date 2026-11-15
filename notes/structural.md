@@ -1342,21 +1342,22 @@ gates), embedded in `EncodeOptions` and `ConsumerContext`, with
 
 **Reported by:** imap-protocol.
 
-- `Capability`, `Flag` and `MailboxAttribute` hand-write `PartialEq` and `Hash`
-  so `Other("IDLE") == Idle`, `Custom("\\Seen") == Seen`, `Custom("\\Noselect")
-  == NoSelect`, only because the escape variant can hold a known name. Make the
-  payload a private newtype minted only by `from_imap_str`, derive equality on
-  a case-folded key. `Capability::hash` allocates a `String` per call.
-  `Capability::SortDisplay(String)` only ever holds `"DISPLAY"`.
-  `MailboxAttribute` has no `Inbox` variant, so `pim` matches
-  `Custom("\\Inbox")`.
-- `Capability::from_imap_str` stores `Auth` and `Thread` suffixes UPPERCASED
-  while `QuotaResource` and `Rights` preserve case; `ServerProfile` uppercases
-  `Auth` / `Thread` again. One canonical spelling per variant.
+Allocation-free capability hashing, the unit `SortDisplay`, one canonical
+suffix spelling per capability variant, and direct case-insensitive flag and
+attribute equality landed. What remains crosses into `crates/imap/src/account/`,
+so it wants a fixer owning both sides:
+
+- Escape payloads are still public, so equality has to tolerate
+  `Custom("\\Seen")` meaning `Seen`. Make the payload a private newtype minted
+  only by `from_imap_str`; the account constructs `Flag::Custom(s)` and
+  `Capability::Thread(s)` directly and must switch to `from_imap_str`.
+- `MailboxAttribute` has no `Inbox` variant, so the account's
+  `folder_registry.rs` role match reads `Custom("\\Inbox")`.
 - `MoveResult::copy_uid` / `CopyResult::copy_uid: Option<ResponseCode>` are
   documented "Always a `ResponseCode::CopyUid` when present" and every consumer
   re-matches. Use `Option<CopyUid { validity: UidValidity, source: UidSet, dest:
-  UidSet }>` (and the same struct inside `ResponseCode::CopyUid`).
+  UidSet }>` (and the same struct inside `ResponseCode::CopyUid`); its readers
+  are `account/mutate.rs` and three matches in `account/error.rs`.
 
 ## STR-057 - IMAP failures and signals that reach callers only as prose
 
@@ -1722,17 +1723,6 @@ QresyncRefusal }`) with a typed reason (`KnownBrokenServer`, `EnableNotConfirmed
 - `blob::run_fetch(.., refuse_not_sticky: bool, ..)`, whose `NotSticky` outcome is
   `unreachable!` on one caller.
 
-## STR-077 - Published IMAP knobs that decide nothing
-
-**Reported by:** imap-account (published; wire them or ask the owner, do not remove).
-
-`ImapAccountConfig::{flag_sync_interval, deletion_check_interval,
-mutation_batch_size}` are read by nothing in the workspace. `mutation_batch_size`
-(default 1024) coexists with the hard-coded `BatchingPolicy::max_items: 1024` in
-`build_capabilities` and the `TARGET_BUFFER_ITEMS = 256` flush window: three
-numbers for one axis, one published and inert. `ImapAccountInner::priority` is
-written by `set_priority` and never read.
-
 ## STR-078 - Credentials and TLS mode, three copies each
 
 **Reported by:** imap-account, smtp-sasl, net-dav.
@@ -1846,29 +1836,6 @@ closed. The `closed` flag is checked by the send paths, `blob::run_fetch` and
 teardown task, so a panic inside a sub-account's `close()` re-panics in the
 engine's `detach`.
 
-## STR-084 - JMAP encodes omitted / null / value three ways, though `Field<T>` exists
-
-**Reported by:** jmap-protocol.
-
-`core/field.rs` defines `Field<T>` (`Omitted | Null | Value`) for exactly this,
-used by calendar, address book, vacation patch, push-subscription patch and
-mailbox `parentId` patch. Elsewhere: sentinels - `skip_if_empty_str` /
-`skip_if_empty_list` / `skip_if_empty_map` / `skip_if_zero_date` (`core/set.rs`)
-and `skip_if_empty_id` (`core/id.rs`), where an empty string, list, map, epoch
-timestamp or empty id means "omit", used by `IdentityCreate`/`IdentityPatch`,
-`PrincipalCreate`, `MailboxCreate`, `VacationResponseCreate`,
-`PushSubscriptionCreate`, `AddressBookCreate`; `PrincipalCreate::new` and
-`MailboxCreate::new` install the sentinels and
-`tests.rs::patch_defaults::creates_install_empty_sentinels` pins that they do. A
-create cannot send a genuinely empty value (an empty `shareWith`, an empty
-`name`), and `IdentityPatch` cannot clear `replyTo` with `[]` without a separate
-path (`identity_patch_empty_list_clears_instead_of_omitting`). And `Option<Role>`
-with a `Role::None` variant (`mailbox/mod.rs`): `Some(Role::None)` means omit,
-`None` serializes as `null`, `Some(role)` is a value - `Field<Role>` spelled
-inside-out, with `Role::None` a wire entry serializing as `""`. Proposal: finish
-`Field<T>`, delete the five `skip_if_*` helpers and `Role::None`, and give
-membership sets their own create/patch type (BUG-061).
-
 ## STR-086 - JMAP states are all `String`; the typed `State` alias is dead
 
 **Reported by:** jmap-protocol.
@@ -1903,22 +1870,6 @@ product decision about generic requests. Proposal: `Account<C, Tr>` (or
 methods any account serves (`Blob/copy`, core); with every request built from a
 capability-scoped account, the generic default-account fallback has no caller and
 the open question dissolves.
-
-## STR-088 - JMAP patch paths are strings with an escaping rule held by comment
-
-**Reported by:** jmap-protocol.
-
-`escape_json_pointer_token`'s doc says "every `format!`-built dotted path in this
-crate must route its interpolated token through here", enforced by reading:
-paths are built in `EmailPatch::mailbox_id`, `EmailPatch::keyword`,
-`MailboxPatch::acl`, `MailboxPatch::acl_set`, `CalendarEventPatch::calendar_id`,
-`ContactCardPatch::address_book_id`, and `sync/calendar_ops.rs`
-(`participants/{}/participationStatus`). The JSON-object patches expose
-`set_property(name: impl Into<String>, ..)`, accepting any unescaped path (the
-tests use it that way). Proposal: a `PatchPath` (segments, escaped at `Display`)
-and one `PatchObject` owning both the escaping rule and the property-vs-path rule
-(CON-041), used by `EmailPatch`, `MailboxPatch`'s `acl_patch`, and the JSON-object
-patches.
 
 ## STR-089 - Smaller JMAP axes travelling as primitives
 
@@ -2090,54 +2041,6 @@ stops a door pairing one handle with another account's state key. Proposal:
 `PushRouting` becomes a view of the registry rather than a second copy built from
 `seed_states`. Doors take `&Slot` or `Route` and nothing else.
 
-## STR-098 - "Which scopes does this JMAP account drive" is a `CursorScope` match in eight places
-
-**Reported by:** jmap-account.
-
-JMAP drives exactly three scope shapes: primary `Type(Email)`, primary
-`Type(Mailbox)`, and one account-level `Folder` per shared account. Each of these
-re-derives it from a raw `CursorScope`: `state::JmapScopeRepr::from_cursor_scope`
-(codec; also accepts `Thread`, `Query` and per-mailbox `Folder`, documented as
-"legal but dead"); `account::describe_cursor_support` (`Cheap` / `ServerCursor`);
-`account::cursor_scopes_from_seeds` (discovery order - Email, Mailbox, then sorted
-Folders, the sort existing only because `seed_states` is a `HashMap`);
-`account::fresh_cursor_establishment`; `changes::stream` (`Thread` and `Query`
-terminate `Unsupported`); `inventory::stream` (per-mailbox `Folder` takes an
-`inMailbox`-filtered walk nothing seeds); `push::data_type_for_scope` (accepts any
-`Folder(_)` without parsing it - garbage and departed shares included - as an Email
-subscription) and `push::scope_for_data_type`; and the `inventory_stream` /
-`changes_stream` gates (`is_unregistered_foreign_scope`). `describe_cursor_support`
-and `changes::stream` independently decide which decoded scopes are drivable and
-the codec a third answer, which a comment on `from_cursor_scope` accepts as
-deliberate. `seed_states: HashMap<CursorScope, OpaqueChangeState>` is the only
-record of which scopes are live, and its values are never read in production:
-`establish_initial_cursor` uses it as a membership gate and always probes fresh,
-so the factory encodes three cursor payloads at open that nothing decodes.
-Proposal: `enum JmapScope { Email, Mailbox, Shared(JmapAccountId) }` with one
-`TryFrom<&CursorScope>` and one `Into<CursorScope>`, held in a `BTreeSet`
-(deterministic order for free), each site an exhaustive three-variant `match`; the
-codec keeps decoding the dead tags so old rows classify, mapping them to a
-`LegacyScope` refusal at decode time. Whether the per-mailbox `Folder` branches in
-`changes.rs` and `inventory.rs` are reachable depends on whether any
-`PAYLOAD_ENVELOPE_VERSION = 2` build ever seeded per-mailbox scopes; if none did,
-the version gate already refuses those rows and the branches are dead.
-
-## STR-100 - `JmapErrorContext` routes classification through booleans
-
-**Reported by:** jmap-account.
-
-`state_based`, `anchored_query` and `send_boundary` are independent bools steering
-`convert_method`, `convert_transport` and the `ResponseDecode` arm. Their legal
-combinations are a small enum of request contracts (`Plain`, `StateRead`,
-`AnchoredQuery`, `Send`), and `state_expiry_error` / the `AnchorNotFound` arms
-already handle the illegal combinations by minting `Internal(InvariantViolated)`
-at runtime ("anchored query reached error conversion without a cursor scope").
-Making the contract an enum whose state-bearing variants carry their `CursorScope`
-deletes those arms and lets an "anchored page walk" be expressed (BUG-069).
-`provider: Option<Provider>` is never `Some` in production and can go.
-`send_boundary` exists to compensate for the blanket `From<serde_json::Error>`
-(STR-090).
-
 ## STR-102 - JMAP refusals reach callers as prose
 
 **Reported by:** jmap-account (lower priority than the rest).
@@ -2268,17 +2171,6 @@ never written by hand), response resolution, the absent-leg policy (Uncertain fo
 writes, `PartialResponse` for reads), and etag observation (BUG-076). Hydration,
 bulk mutation, PIM writes and reactions become thin front ends; about 600 lines
 across four files answer these questions slightly differently today.
-
-## STR-109 - Graph funnel parameters that are not types
-
-**Reported by:** graph.
-
-`GraphClient::execute_wire(method: &str, .., options: (Option<&str>, bool), ..)`
-ends in `unreachable!` for an unknown verb; the bare tuple means `(prefer,
-eventual_consistency)` - use `reqwest::Method` and `RequestOptions { prefer,
-consistency }`. `execute_aux` takes a `Resource` only to `debug_assert!` it is
-`Unmetered`. `throttle_scope_for(_ctx)` ignores its argument and returns a
-constant.
 
 ## STR-112 - The recurrence rule is a `String` that three crates each parse
 
@@ -2680,24 +2572,6 @@ sniff reply text for "rate", "limit", "throttle", "mailbox", "storage", "quota",
 the only classification in the crate driven by free-form server prose, deserving a
 named table rather than inline `contains` chains.
 
-## STR-137 - SMTP error kind plus phase encodes classification
-
-**Reported by:** smtp-sasl (three of the five facts land on the wrong recovery class).
-
-In `account_error.rs::into_account_error`, `ErrorKind::InvalidInput` means
-`Request(Malformed)` except when the phase is `Auth { .. }`, where it means
-`Authorization(PolicyBlocked)`, and producers rely on that pairing: local "no
-compatible authentication mechanism" and "channel binding required but unavailable"
-(`password_mechanism`); SCRAM server errors other than invalid-proof
-(`From<SaslError>`, BUG-100); "OAuth token source requires refresh or async
-resolution; use the async SMTP transport" (`oauth2_token_blocking`); SCRAM nonce RNG
-failure (`generate_scram_nonce`, BUG-102); legacy encoder protocol errors such as
-"This mechanism does not expect a challenge", which `try_smtp!(.., phase)` stamps
-Auth. Five different facts (local negotiation failure, server policy refusal, wrong
-transport for this token source, local runtime failure, server protocol violation)
-flattened into one (kind, phase) pair. Proposal: a typed `ErrorKind::Auth(AuthFailure)`
-with a variant for each, classified once.
-
 ## STR-138 - Smaller SMTP axes and placement notes
 
 **Reported by:** smtp-sasl.
@@ -2954,10 +2828,3 @@ mode returning `Ok(Response)` for the listed statuses with the ledger attached;
 classifying the response is then the caller's call against the shared ladder
 (BUG-072).
 
-## STR-155 - bifrost-net carries DAV-only URL helpers
-
-**Reported by:** net-dav (low priority).
-
-`url::well_known_url` (RFC 6764) and `url::parent_collection_url` are used only by
-DAV. `status_line` is HTTP grammar and belongs in net; the other two belong next to
-the DAV `Url`, `Origin` and `Href` types if those are introduced (STR-146).

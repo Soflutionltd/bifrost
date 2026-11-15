@@ -2,12 +2,13 @@
 // Remaining Principal methods are retained for protocol use.
 #![allow(dead_code)]
 
+use crate::core::field::Field;
+
 pub(crate) mod availability;
 pub(crate) mod get;
 pub(crate) mod query;
 pub(crate) mod set;
 
-use crate::core::set::{skip_if_empty_list, skip_if_empty_map, skip_if_empty_str};
 use crate::mailbox_rights::ACL;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -82,18 +83,18 @@ pub(crate) struct PrincipalCreate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) ptype: Option<Type>,
 
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    pub(super) name: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) name: Field<String>,
 
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    pub(super) description: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) description: Field<String>,
 
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    pub(super) email: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) email: Field<String>,
 
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
     #[serde(rename = "timeZone")]
-    pub(super) timezone: Option<String>,
+    pub(super) timezone: Field<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) capabilities: Option<HashMap<String, serde_json::Value>>,
@@ -101,11 +102,11 @@ pub(crate) struct PrincipalCreate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) accounts: Option<HashMap<crate::core::id::AccountId, PrincipalAccount>>,
 
-    #[serde(skip_serializing_if = "skip_if_empty_list")]
-    pub(super) aliases: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) aliases: Field<Vec<String>>,
 
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    pub(super) secret: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) secret: Field<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) dkim: Option<DKIM>,
@@ -113,14 +114,14 @@ pub(crate) struct PrincipalCreate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) quota: Option<u32>,
 
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    pub(super) picture: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) picture: Field<String>,
 
-    #[serde(skip_serializing_if = "skip_if_empty_list")]
-    pub(super) members: Option<Vec<PrincipalId>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) members: Field<Vec<PrincipalId>>,
 
-    #[serde(skip_serializing_if = "skip_if_empty_map")]
-    pub(super) acl: Option<HashMap<PrincipalId, Vec<ACL>>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) acl: Field<HashMap<PrincipalId, Vec<ACL>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -129,18 +130,18 @@ pub(crate) struct PrincipalPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) ptype: Option<Type>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) name: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) name: Field<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) description: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) description: Field<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) email: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) email: Field<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
     #[serde(rename = "timeZone")]
-    pub(super) timezone: Option<String>,
+    pub(super) timezone: Field<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) capabilities: Option<HashMap<String, serde_json::Value>>,
@@ -148,11 +149,11 @@ pub(crate) struct PrincipalPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) accounts: Option<HashMap<crate::core::id::AccountId, PrincipalAccount>>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) aliases: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) aliases: Field<Vec<String>>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) secret: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) secret: Field<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) dkim: Option<DKIM>,
@@ -160,14 +161,14 @@ pub(crate) struct PrincipalPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) quota: Option<u32>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) picture: Option<String>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) picture: Field<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) members: Option<Vec<PrincipalId>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) members: Field<Vec<PrincipalId>>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) acl: Option<HashMap<PrincipalId, Vec<ACL>>>,
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) acl: Field<HashMap<PrincipalId, Vec<ACL>>>,
 
     #[serde(flatten)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -334,19 +335,19 @@ impl crate::core::SetCreate for PrincipalCreate {
         PrincipalCreate {
             _create_id: create_id,
             ptype: None,
-            name: String::new().into(),
-            description: String::new().into(),
-            email: String::new().into(),
-            timezone: String::new().into(),
+            name: Field::Omitted,
+            description: Field::Omitted,
+            email: Field::Omitted,
+            timezone: Field::Omitted,
             capabilities: None,
             accounts: None,
-            aliases: Vec::with_capacity(0).into(),
-            secret: String::new().into(),
+            aliases: Field::Omitted,
+            secret: Field::Omitted,
             dkim: None,
             quota: None,
-            picture: String::new().into(),
-            members: Vec::with_capacity(0).into(),
-            acl: HashMap::with_capacity(0).into(),
+            picture: Field::Omitted,
+            members: Field::Omitted,
+            acl: Field::Omitted,
         }
     }
 }

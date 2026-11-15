@@ -248,7 +248,24 @@ pub(crate) struct EtagIndex {
     next_seq: u64,
 }
 
+/// Reads learn a validator; writes consume the old one even without a new
+/// validator. Failed preconditions and vanished targets invalidate it.
+pub(crate) enum EtagObservation {
+    Read(GraphETag),
+    Written(Option<GraphETag>),
+    Invalidated,
+}
+
 impl EtagIndex {
+    pub(crate) fn observe(&mut self, id: &str, observation: EtagObservation) {
+        match observation {
+            EtagObservation::Read(etag) | EtagObservation::Written(Some(etag)) => {
+                self.insert(id.to_owned(), etag);
+            }
+            EtagObservation::Written(None) | EtagObservation::Invalidated => self.remove(id),
+        }
+    }
+
     pub(crate) fn insert(&mut self, id: String, etag: GraphETag) {
         // `remove_entry` hands back the owned key, so re-caching an id
         // already present does not reallocate it.

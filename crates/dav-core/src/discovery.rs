@@ -47,17 +47,15 @@ impl DavDispatch {
     /// failure, or a base answer naming no principal.
     pub async fn discover_current_user_principal(&self) -> Result<String, AccountError> {
         let protocol = self.protocol();
-        let from_well_known = match bifrost_net::url::well_known_url(
-            self.base_url(),
-            protocol.well_known_service(),
-        ) {
-            Some(well_known) => match self.discover_principal(&well_known).await {
-                Ok(principal) => principal,
-                Err(error) if should_fallback_discovery(&error, protocol) => None,
-                Err(error) => return Err(error),
-            },
-            None => None,
-        };
+        let from_well_known =
+            match crate::url::well_known_url(self.base_url(), protocol.well_known_service()) {
+                Some(well_known) => match self.discover_principal(&well_known).await {
+                    Ok(principal) => principal,
+                    Err(error) if should_fallback_discovery(&error, protocol) => None,
+                    Err(error) => return Err(error),
+                },
+                None => None,
+            };
         if let Some(principal) = from_well_known {
             return Ok(principal);
         }
