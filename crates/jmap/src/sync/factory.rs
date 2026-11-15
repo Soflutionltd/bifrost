@@ -919,7 +919,7 @@ impl JmapCredentials {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -2398,11 +2398,11 @@ mod tests {
     #[tokio::test]
     async fn an_empty_flag_op_is_rejected_before_wire_or_target_routing() {
         for op in [
-            FlagOp::Add(HashSet::new()),
-            FlagOp::Remove(HashSet::new()),
+            FlagOp::Add(bifrost_types::FlagSet::new()),
+            FlagOp::Remove(bifrost_types::FlagSet::new()),
             FlagOp::Patch {
-                add: HashSet::new(),
-                remove: HashSet::new(),
+                add: bifrost_types::FlagSet::new(),
+                remove: bifrost_types::FlagSet::new(),
             },
         ] {
             let client = scripted_client([]);
@@ -2487,7 +2487,7 @@ mod tests {
             },
             states,
             targets,
-            FlagOp::Add(HashSet::from(["$seen".to_string()])),
+            FlagOp::Add(bifrost_types::FlagSet::from(["$seen".to_string()])),
             idempotency_key(),
         );
 
@@ -2535,7 +2535,7 @@ mod tests {
             state_map(&[("primary", "primary-state")]),
             "primary".to_string(),
             MutationTarget::Thread(bifrost_types::ThreadId("T9".to_string())),
-            "$seen".to_string(),
+            "$seen".into(),
             true,
         )
         .await
@@ -2567,7 +2567,7 @@ mod tests {
             states,
             "shared".to_string(),
             MutationTarget::Message(foreign_id.clone()),
-            "$seen".to_string(),
+            "$seen".into(),
             true,
         )
         .await
@@ -2800,7 +2800,7 @@ mod tests {
             },
             states,
             targets,
-            FlagOp::Add(HashSet::from(["$seen".to_string()])),
+            FlagOp::Add(bifrost_types::FlagSet::from(["$seen".to_string()])),
             idempotency_key(),
         );
         while let Some(event) = stream.next().await {
@@ -3534,7 +3534,7 @@ mod tests {
             state_map(&[("primary", "primary-state"), ("shared", "shared-state")]),
             "shared".to_string(),
             MutationTarget::Thread(foreign_thread("shared", "T9")),
-            "$seen".to_string(),
+            "$seen".into(),
             true,
         )
         .await
@@ -3588,7 +3588,7 @@ mod tests {
             state_map(&[("primary", "primary-state")]),
             "primary".to_string(),
             MutationTarget::Thread(foreign_thread("revoked", "T9")),
-            "$seen".to_string(),
+            "$seen".into(),
             true,
         )
         .await

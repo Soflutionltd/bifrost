@@ -573,7 +573,7 @@ impl InventoryFusion {
 /// `Backfill` checkpoint is REFUSED, and that refusal is the whole reason this
 /// arm exists: fusion is a change-cursor establishment walk and has no backfill
 /// admission. Sending a backfill checkpoint through the unstamped change path
-/// would leave it without a delivery stamp. A `Lane::Backfill` entry whose
+/// would leave it without a delivery stamp. A `PublicationStream::Backfill` entry whose
 /// `delivered_at` stays `None` for ever is charged against the account's backfill
 /// bound and can be freed only by an acknowledgement, a lag or a reset - the
 /// receiver-drop sweep will not touch it, because an unsent page is deliberately
@@ -986,7 +986,7 @@ mod tests {
 
     /// Latent rather than live - no provider in this workspace attaches one - and
     /// refused for a structural reason: fusion registers the publication and then
-    /// publishes it unstamped, so a `Lane::Backfill` entry created here is never
+    /// publishes it unstamped, so a `PublicationStream::Backfill` entry created here is never
     /// stamped with a delivery. An unsent stamp is deliberately never swept, so
     /// that entry is charged against the account's backfill bound until an
     /// acknowledgement, a lag or a reset frees it - a permanent slot of the bound

@@ -196,7 +196,7 @@ impl Default for BackfillConfig {
             uid_range_chunk: 5000,
             page_count_chunk: 1000,
             clock_skew_warn: Duration::from_secs(5 * 60),
-            lane_capacity: crate::engine::lane::DEFAULT_BACKFILL_LANE_CAPACITY,
+            lane_capacity: crate::engine::backfill_bound::DEFAULT_BACKFILL_CAPACITY,
         }
     }
 }
@@ -468,7 +468,7 @@ pub(crate) enum WorkerRole {
     /// Push reconciler: turns watch events into driven scopes.
     PushReconciler,
     /// Supervises push sessions and their bounded cleanup.
-    PushLanes,
+    PushSupervisor,
     /// The per-scope poll multiplexer.
     Multiplexer,
     /// Walks registered scopes and runs their backfill partitions.

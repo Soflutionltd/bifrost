@@ -50,7 +50,7 @@ pub(crate) fn address_books_list<T: HttpTransport>(
 pub(crate) fn list<T: HttpTransport>(
     contacts: Option<ContactAccount<T>>,
     address_book: Option<SharedAddressBookId>,
-    page_cursor: Option<Vec<u8>>,
+    page_cursor: Option<bifrost_types::PageCursor>,
 ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
     Box::pin(async move {
         let contacts = require_contacts(contacts, AccountOperation::ContactsList)?;
@@ -1316,7 +1316,7 @@ mod tests {
 
     /// Build a page cursor the way a real page would have minted it, so no
     /// test hand-writes the encoding.
-    fn page_cursor(anchor: &str, query_state: &str) -> Vec<u8> {
+    fn page_cursor(anchor: &str, query_state: &str) -> bifrost_types::PageCursor {
         ContactPages::next_cursor(
             None,
             0,
@@ -1536,7 +1536,7 @@ mod tests {
         ]);
 
         let mut seen: Vec<String> = Vec::new();
-        let mut cursor: Option<Vec<u8>> = None;
+        let mut cursor: Option<bifrost_types::PageCursor> = None;
         loop {
             let page = list(Some(transport.account()), None, cursor.take())
                 .await

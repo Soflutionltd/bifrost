@@ -30,9 +30,9 @@ pub(super) struct BackfillWiring {
 /// all) or resumes after the furthest durably-checkpointed full page
 /// instead of re-paginating from page 0 on every re-attach.
 pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: BackfillWiring) {
-    // The producer's door onto the account's bounded backfill lane. Taken
+    // The producer's door onto the account's backfill bound. Taken
     // before the destructure below so it carries the slot's shutdown token.
-    let lane_gate = ctx.lane_gate();
+    let backfill_bound = ctx.backfill_bound();
     let SlotContext {
         current: account,
         account_id,
@@ -300,7 +300,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     &throttles,
                     &coverage,
                     &writer_tx,
-                    &lane_gate,
+                    &backfill_bound,
                     &delivery,
                     fence_at_walk_start,
                     &cursors,
@@ -404,7 +404,7 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
                     &scope,
                     driver.total_seen(),
                     &publisher,
-                    &lane_gate,
+                    &backfill_bound,
                     undelivered_before,
                     fence_at_walk_start,
                 )
@@ -852,7 +852,7 @@ async fn run_backfill_partition_at_boundary(
     throttles: &crate::recovery::ThrottleBucket,
     coverage: &Arc<PendingCoverage>,
     writer_tx: &mpsc::Sender<WriterRequest>,
-    lane: &LaneGate,
+    bound: &BackfillBound,
     delivery: &Arc<crate::multiplexer::ChangeDelivery>,
     fence_at_walk_start: crate::cursor::ScopeFence,
     cursors: &CursorRegistry,
@@ -870,7 +870,7 @@ async fn run_backfill_partition_at_boundary(
         let gate = super::drive_start::DriveStart {
             current: account,
             control,
-            scheduler: &lane.admission().scheduler,
+            scheduler: &bound.admission().scheduler,
             throttles,
             account_id,
             shutdown,
@@ -895,7 +895,7 @@ async fn run_backfill_partition_at_boundary(
             activity,
             permit,
         } = admitted;
-        let _lane_permit = lane.hold_admission(permit);
+        let _backfill_permit = bound.hold_admission(permit);
         // RE-CHECK THE WALK'S FENCE, with admission in hand and before a single
         // page has been read. Every step above this line can park indefinitely -
         // a pause, a throttle deadline, the scheduler's admission queue - and a
@@ -922,7 +922,7 @@ async fn run_backfill_partition_at_boundary(
                 .all_scope_incarnations()
                 .contains(&(scope.clone(), incarnation))
         {
-            lane.release_admission();
+            bound.release_admission();
             tracing::warn!(
                 target: "bifrost.sync.backfill",
                 account = ?account_id,
@@ -949,11 +949,11 @@ async fn run_backfill_partition_at_boundary(
             bifrost_types::TraitEnvelopeVersion::new(crate::cursor::ENGINE_VERSION),
             &publisher,
             generation,
-            Some(lane),
+            Some(bound),
             fence_at_walk_start,
         )
         .await;
-        lane.release_admission();
+        bound.release_admission();
         if matches!(result, Err(Error::Paused)) {
             continue;
         }
@@ -1037,13 +1037,13 @@ pub(super) async fn emit_backfill_complete(
     scope: &CursorScope,
     total_seen: crate::backfill::scope_walk::WalkTotal,
     publisher: &crate::multiplexer::PagePublisher,
-    lane: &LaneGate,
+    bound: &BackfillBound,
     undelivered_before: crate::cursor::UndeliveredMark,
     fence_at_walk_start: crate::cursor::ScopeFence,
 ) -> MarkerOutcome {
     let control = &publisher.control;
     let shutdown = &publisher.shutdown;
-    if !publisher.shares_lane_ledger(lane) {
+    if !publisher.shares_bound_ledger(bound) {
         return MarkerOutcome::Withheld;
     }
     let _activity = loop {
@@ -1083,7 +1083,7 @@ pub(super) async fn emit_backfill_complete(
     // the comparison below would be a walk checking itself against a fence it
     // adopted from a scope it never enumerated.
     let fence_before = fence_at_walk_start;
-    if lane.coverage().scope_fence(scope) != fence_before {
+    if bound.coverage().scope_fence(scope) != fence_before {
         tracing::warn!(
             target: "bifrost.sync.backfill",
             scope = ?scope,
@@ -1091,13 +1091,13 @@ pub(super) async fn emit_backfill_complete(
         );
         return MarkerOutcome::Withheld;
     }
-    if lane.wait_for_capacity().await.is_err() {
+    if bound.wait_for_capacity().await.is_err() {
         return MarkerOutcome::ShuttingDown;
     }
     // Same revalidation the page path does, and the stakes are higher here: a
     // completion marker published against a reset scope suppresses the
     // replacement incarnation's entire inventory walk on the next attach.
-    if lane.coverage().scope_fence(scope) != fence_before {
+    if bound.coverage().scope_fence(scope) != fence_before {
         tracing::warn!(
             target: "bifrost.sync.backfill",
             scope = ?scope,
@@ -1115,7 +1115,7 @@ pub(super) async fn emit_backfill_complete(
     // instant earlier, and the replacement consumer acknowledges it in good
     // faith. The page is gone for the life of the attachment either way; what
     // this refuses is making it permanent.
-    if lane.coverage().undelivered_watermark(scope) != undelivered_before {
+    if bound.coverage().undelivered_watermark(scope) != undelivered_before {
         tracing::warn!(
             target: "bifrost.sync.backfill",
             scope = ?scope,
@@ -1145,7 +1145,7 @@ pub(super) async fn emit_backfill_complete(
         // and for a marker that reached no receiver. A fence that no longer
         // equals the walk's is the refusal (the fence only moves forward, so
         // the mint cannot have passed); otherwise the marker reached nobody.
-        if lane.coverage().scope_fence(scope) != fence_before {
+        if bound.coverage().scope_fence(scope) != fence_before {
             tracing::warn!(
                 target: "bifrost.sync.backfill",
                 scope = ?scope,

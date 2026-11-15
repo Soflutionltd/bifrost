@@ -28,12 +28,12 @@
 //!
 //! ## Flow control
 //!
-//! The same acknowledgement is also what frees the bounded backfill lane. The
+//! The same acknowledgement is also what frees the backfill bound. The
 //! runner waits, before registering a page, until the account has fewer than
 //! `BackfillConfig::lane_capacity` published-but-unanswered backfill batches, so
 //! it is not asked for the next page while the bound is full. That capacity is
 //! not a separate ledger: it is the publication's own boundary registration in
-//! `PendingCoverage` (see `crate::engine::lane`), which is why nothing here has
+//! `PendingCoverage` (see `crate::engine::backfill_bound`), which is why nothing here has
 //! to remember to release anything.
 //!
 //! The page is then broadcast through `ChangeDelivery::publish_backfill`, which
@@ -358,13 +358,13 @@ impl BackfillRunner {
         envelope_version: bifrost_types::TraitEnvelopeVersion,
         publisher: &crate::multiplexer::PagePublisher,
         generation: crate::cursor::WalkGeneration,
-        lane: Option<&crate::engine::lane::LaneGate>,
+        bound: Option<&crate::engine::backfill_bound::BackfillBound>,
         walk_fence: crate::cursor::ScopeFence,
     ) -> Result<BackfillPartitionOutcome, Error> {
-        if let Some(gate) = lane
-            && !publisher.shares_lane_ledger(gate)
+        if let Some(gate) = bound
+            && !publisher.shares_bound_ledger(gate)
         {
-            return Err(Error::Other("backfill lane ledger mismatch".into()));
+            return Err(Error::Other("backfill bound ledger mismatch".into()));
         }
         let control = &publisher.control;
         let writer_tx = &publisher.writer_tx;
@@ -524,21 +524,21 @@ impl BackfillRunner {
                         // The wait also hands the account's scheduler admission
                         // back for its duration, so a parked cold start is not
                         // sitting on the permit polling needs.
-                        if let Some(gate) = lane {
+                        if let Some(gate) = bound {
                             match gate.wait_for_capacity_holding_admission().await {
                                 Ok(()) => {}
                                 // The account is detaching. Publishing now would
                                 // broadcast into a teardown; the partition fails,
                                 // the scope stays Pending, and the next attach
                                 // re-walks it.
-                                Err(crate::engine::lane::WaitFailed::ShuttingDown) => {
+                                Err(crate::engine::backfill_bound::WaitFailed::ShuttingDown) => {
                                     return Err(Error::ShuttingDown);
                                 }
                                 // Transient scheduler pressure. Same treatment as
                                 // any other refused admission on a repeating work
                                 // path: fail the partition, leave the scope
                                 // Pending, come back on the rescan ramp.
-                                Err(crate::engine::lane::WaitFailed::Refused(error)) => {
+                                Err(crate::engine::backfill_bound::WaitFailed::Refused(error)) => {
                                     return Err(error);
                                 }
                             }
@@ -690,7 +690,7 @@ impl BackfillRunner {
                 // degrade the consumer would otherwise have to infer (Graph's
                 // public-folder additions-only mode, IMAP's QRESYNC ->
                 // CONDSTORE downgrade), and the IMAP one is a one-shot that
-                // cannot be re-emitted once a lane has consumed it.
+                // cannot be re-emitted once a producer has consumed it.
                 bifrost_types::InventoryEvent::Warning(warning) => {
                     delivery.publish_warning(EventScope::Cursor(scope.clone()), warning);
                 }

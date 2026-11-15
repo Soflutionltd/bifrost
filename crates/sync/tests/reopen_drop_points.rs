@@ -105,6 +105,7 @@ async fn a_reattach_dropped_before_any_replacement_subscription_closes_the_repla
     let log = Arc::new(PushLog::default());
     let old = Arc::new(StubAccount {
         caps: push_caps(),
+        push_lane_specs: StubAccount::registration_lanes(),
         push_label: "old".to_owned(),
         push_log: Arc::clone(&log),
         ..StubAccount::new(vec![inbox()])
@@ -152,6 +153,7 @@ async fn a_dropped_reattach_rolls_back_the_cursor_rows_it_inserted() {
     let log = Arc::new(PushLog::default());
     let old = Arc::new(StubAccount {
         caps: push_caps(),
+        push_lane_specs: StubAccount::registration_lanes(),
         push_label: "old".to_owned(),
         push_log: Arc::clone(&log),
         ..StubAccount::new(vec![inbox()])

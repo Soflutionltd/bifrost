@@ -1,105 +1,13 @@
 use std::time::Duration;
 
+use super::error::{core_limits_error, malformed_required_capability};
+
 use bifrost_types::{
-    AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation,
-    BatchingPolicy, BlobRangeSupport, Cause, ConvenienceShape, CursorFreshness, DiagnosticText,
-    FilterRuleShape, MutationCapabilities, MutationConcurrency, MutationReplaySafety,
-    PimMethodSupport, Protocol, ProtocolErrorKind, PushCapability, QuotaSignal, RateLimitClass,
-    StarredFlagShape, StateCause, SyncStateErrorKind, VersionedDoors, WireCause,
+    AccountCapabilities, AccountError, BatchingPolicy, BlobRangeSupport, ConvenienceShape,
+    CursorFreshness, FilterRuleShape, MutationCapabilities, MutationConcurrency,
+    MutationReplaySafety, PimMethodSupport, PushCapability, QuotaSignal, RateLimitClass,
+    StarredFlagShape, VersionedDoors,
 };
-
-/// Session document does not advertise the `urn:ietf:params:jmap:core`
-/// capability at all. This is a server-side capability change relative
-/// to whatever the session previously claimed: the engine must reopen.
-fn missing_core_capability() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-        Cause::State(StateCause::CapabilityChanged { delta: None }),
-    )
-    .protocol(Protocol::Jmap)
-    .operation(AccountOperation::Discover)
-    .text(DiagnosticText::support_only(
-        "JMAP session does not advertise the core capability",
-    ))
-    .try_build()
-    .expect("valid account error classification")
-}
-
-/// A method response named a different session state. Account construction
-/// derives routing, limits, and capabilities from the old session, so the
-/// only safe consumer action is to reopen against a freshly fetched session.
-pub(crate) fn session_state_changed() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-        Cause::State(StateCause::CapabilityChanged { delta: None }),
-    )
-    .protocol(Protocol::Jmap)
-    .operation(AccountOperation::ScopeLifecycle)
-    .text(DiagnosticText::support_only(
-        "JMAP response sessionState diverged from the open session",
-    ))
-    .try_build()
-    .expect("valid account error classification")
-}
-
-/// Server advertises the core capability but omits a required field or gives
-/// zero for one of the request limits this account requires to be positive.
-/// That is a `Protocol(ContractViolation)`: the server claimed conformance
-/// and then withheld required information or advertised an unusable limit.
-/// Zero is valid for `maxSizeUpload` and the concurrency limits because they
-/// are `UnsignedInt`; an omitted `maxSizeUpload` takes the same error lane.
-/// It is not a capability change.
-fn unusable_core_limits() -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::Jmap,
-            detail: Some(DiagnosticText::support_only(
-                "JMAP core capability omits required fields or advertises unusable limits",
-            )),
-        }),
-    )
-    .protocol(Protocol::Jmap)
-    .operation(AccountOperation::Discover)
-    .try_build()
-    .expect("valid account error classification")
-}
-
-/// The `urn:ietf:params:jmap:core` block is PRESENT but does not parse as
-/// the RFC 8620 §2 core object (`"maxCallsInRequest": "16"` as a string is
-/// the canonical shape). The server advertised the capability and then
-/// described it wrongly, so this is the same `Protocol(ContractViolation)`
-/// lane as a zero-valued limit, and deliberately NOT the
-/// `SyncState(CapabilityChanged)` lane an absent block takes: nothing about
-/// this session changes on a reopen, so classifying it as a capability
-/// change would buy an endless reopen loop.
-fn malformed_core_capability() -> AccountError {
-    malformed_required_capability(
-        <crate::core::capability::Core as crate::core::capability::Capability>::URI,
-    )
-}
-
-/// A capability block the account DEPENDS on is present but does not
-/// parse. Same lane and same reasoning as the core block: the server
-/// advertised the capability and then described it wrongly, so a reopen
-/// buys nothing and the honest classification is a contract violation.
-/// The URI is named in the diagnostic - "some capability is malformed" is
-/// not an actionable report when a session advertises a dozen.
-fn malformed_required_capability(uri: &str) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::Jmap,
-            detail: Some(DiagnosticText::support_only(format!(
-                "JMAP capability object {uri} is present but not parseable"
-            ))),
-        }),
-    )
-    .protocol(Protocol::Jmap)
-    .operation(AccountOperation::Discover)
-    .try_build()
-    .expect("valid account error classification")
-}
 
 use crate::core::session::Session;
 
@@ -112,14 +20,6 @@ pub(super) fn max_objects_in_get(session: &Session) -> usize {
 
 pub(super) fn max_objects_in_set(session: &Session) -> usize {
     set_batch_size(session.object_limits().max_objects_in_set)
-}
-
-fn core_limits_error(error: crate::core::session::CoreLimitsError) -> AccountError {
-    match error {
-        crate::core::session::CoreLimitsError::Absent => missing_core_capability(),
-        crate::core::session::CoreLimitsError::Malformed => malformed_core_capability(),
-        crate::core::session::CoreLimitsError::Unusable => unusable_core_limits(),
-    }
 }
 
 /// RFC 8620 section 2 requires maxSizeUpload. Zero permits only empty files;
@@ -172,7 +72,7 @@ pub(crate) struct PimSupport {
 /// having run it first; running it twice is pure session reads.
 pub(crate) fn validate_session(session: &Session) -> Result<CoreLimits, AccountError> {
     // Validate before seeding (factory::validate_and_seed), not after probes.
-    // Keep account error classification here: rejecting every bad core block
+    // Keep account error classification at the error boundary: rejecting every bad core block
     // as a generic protocol error during SessionState derivation would erase
     // the absent-core CapabilityChanged lane that tells the engine to reopen.
     let limits = session.validated_core_limits().map_err(core_limits_error)?;
@@ -365,6 +265,9 @@ pub(crate) fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bifrost_types::{
+        AccountErrorKind, AccountOperation, Protocol, ProtocolErrorKind, SyncStateErrorKind,
+    };
 
     fn session(json: &str) -> Session {
         serde_json::from_str(json).unwrap()

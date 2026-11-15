@@ -2,7 +2,7 @@
 
 use super::super::error;
 use super::super::query::filter_query;
-use super::{account_error_for, non_negative_i64, other_error};
+use super::{account_error_for, non_negative_i64};
 use crate::client::GmailClient;
 use bifrost_types::{AccountError, AccountFuture, ObjectId, Page, SearchRequest, ThreadId};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ pub(crate) fn search(
 ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
     Box::pin(async move {
         let query = gmail_query(&request)?;
-        let page_token = page_token(&request)?;
+        let page_token = page_token(&request, bifrost_types::AccountOperation::Search)?;
         let max = request
             .limit
             .unwrap_or(MAX_GMAIL_PAGE_SIZE)
@@ -42,7 +42,9 @@ pub(crate) fn search(
                 .into_iter()
                 .map(|thread| ThreadId(thread.id))
                 .collect(),
-            next_cursor: next.map(String::into_bytes),
+            next_cursor: next.map(|token| {
+                super::super::page_cursor::encode(bifrost_types::AccountOperation::Search, &token)
+            }),
             estimated_total: None,
             failed_ids: Vec::new(),
             skipped_scopes: Vec::new(),
@@ -56,7 +58,7 @@ pub(crate) fn search_messages(
 ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
     Box::pin(async move {
         let query = gmail_query(&request)?;
-        let page_token = page_token(&request)?;
+        let page_token = page_token(&request, bifrost_types::AccountOperation::SearchMessages)?;
         let max = request
             .limit
             .unwrap_or(MAX_GMAIL_PAGE_SIZE)
@@ -84,7 +86,12 @@ pub(crate) fn search_messages(
                 .into_iter()
                 .map(|message| ObjectId(message.id))
                 .collect(),
-            next_cursor: response.next_page_token.map(String::into_bytes),
+            next_cursor: response.next_page_token.map(|token| {
+                super::super::page_cursor::encode(
+                    bifrost_types::AccountOperation::SearchMessages,
+                    &token,
+                )
+            }),
             estimated_total: response.result_size_estimate.and_then(non_negative_i64),
             failed_ids: Vec::new(),
             skipped_scopes: Vec::new(),
@@ -105,19 +112,11 @@ fn gmail_query(request: &SearchRequest) -> Result<Option<String>, AccountError> 
     Ok((!parts.is_empty()).then(|| parts.join(" ")))
 }
 
-fn page_token(request: &SearchRequest) -> Result<Option<String>, AccountError> {
-    request
-        .page_cursor
-        .as_ref()
-        .map(|cursor| {
-            String::from_utf8(cursor.clone()).map_err(|error| {
-                other_error(
-                    bifrost_types::AccountOperation::Search,
-                    format!("invalid gmail page cursor: {error}"),
-                )
-            })
-        })
-        .transpose()
+fn page_token(
+    request: &SearchRequest,
+    operation: bifrost_types::AccountOperation,
+) -> Result<Option<String>, AccountError> {
+    super::super::page_cursor::decode(request.page_cursor.clone(), operation)
 }
 
 #[cfg(test)]

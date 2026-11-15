@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-
+use bifrost_types::FlagSet;
 use bifrost_types::{
     AccountError, AccountFuture, AccountStream, Checkpoint, CursorEstablishment, CursorScope,
     DiagnosticText, Fingerprint, InventoryEntry, PageBoundary, ServerVersion, SyncEvent,
@@ -499,7 +498,7 @@ pub(crate) fn flags_hash(flags: &[crate::types::Flag]) -> u64 {
     bifrost_types::canonical_flags_hash(flags.iter().map(crate::types::Flag::as_imap_str))
 }
 
-pub(crate) fn flags_set(flags: &[crate::types::Flag]) -> HashSet<String> {
+pub(crate) fn flags_set(flags: &[crate::types::Flag]) -> FlagSet {
     flags
         .iter()
         .map(|flag| flag.as_imap_str().to_ascii_lowercase())
@@ -513,11 +512,11 @@ pub(crate) fn flags_set(flags: &[crate::types::Flag]) -> HashSet<String> {
 /// Requests use the same neutral-keyword conversion as STORE, followed by
 /// the generic case-insensitive judge. Observations retain wire identity.
 pub(crate) fn imap_flag_target(
-    observed: &HashSet<String>,
+    observed: &FlagSet,
     op: &bifrost_types::FlagOp,
 ) -> bifrost_types::FlagTargetState {
     use bifrost_types::{FlagOp, FlagTargetState};
-    let unwritable = |flags: &HashSet<String>| {
+    let unwritable = |flags: &FlagSet| {
         flags
             .iter()
             .any(|f| !crate::types::Flag::from_neutral_keyword(f).is_writable())
@@ -532,7 +531,7 @@ pub(crate) fn imap_flag_target(
     }
     // Translate only the request: a literal server keyword `$seen` is not
     // evidence that the system flag `\Seen` was stored.
-    let normalize = |flags: &HashSet<String>| {
+    let normalize = |flags: &FlagSet| {
         flags
             .iter()
             .map(|flag| {
@@ -576,8 +575,8 @@ mod tests {
             ("$answered", "\\Answered"),
             ("$flagged", "\\Flagged"),
         ] {
-            let requested = HashSet::from([neutral.to_owned()]);
-            let observed = HashSet::from([wire.to_owned()]);
+            let requested = FlagSet::from([neutral.to_owned()]);
+            let observed = FlagSet::from([wire.to_owned()]);
             for op in [
                 FlagOp::Add(requested.clone()),
                 FlagOp::Set(requested.clone()),
@@ -591,7 +590,7 @@ mod tests {
             for op in [
                 FlagOp::Remove(requested.clone()),
                 FlagOp::Patch {
-                    add: HashSet::from(["custom".to_owned()]),
+                    add: FlagSet::from(["custom".to_owned()]),
                     remove: requested,
                 },
             ] {
@@ -599,16 +598,16 @@ mod tests {
                     imap_flag_target(&observed, &op),
                     FlagTargetState::Unsatisfied
                 );
-                let cleared = HashSet::from(["custom".to_owned()]);
+                let cleared = FlagSet::from(["custom".to_owned()]);
                 assert_eq!(imap_flag_target(&cleared, &op), FlagTargetState::Satisfied);
             }
         }
         let overlap = FlagOp::Patch {
-            add: HashSet::from(["$seen".to_owned()]),
-            remove: HashSet::from(["\\Seen".to_owned()]),
+            add: FlagSet::from(["$seen".to_owned()]),
+            remove: FlagSet::from(["\\Seen".to_owned()]),
         };
         assert_eq!(
-            imap_flag_target(&HashSet::new(), &overlap),
+            imap_flag_target(&FlagSet::new(), &overlap),
             FlagTargetState::Indeterminate
         );
     }
@@ -632,11 +631,11 @@ mod tests {
         let recent = ["\\Recent"].map(String::from).into_iter().collect();
         for op in [
             FlagOp::Add(recent),
-            FlagOp::Remove(["\\recent".into()].into_iter().collect()),
-            FlagOp::Set(["\\RECENT".into()].into_iter().collect()),
+            FlagOp::Remove(["\\recent".to_owned()].into_iter().collect()),
+            FlagOp::Set(["\\RECENT".to_owned()].into_iter().collect()),
             FlagOp::Patch {
-                add: ["x".into()].into_iter().collect(),
-                remove: ["\\recent".into()].into_iter().collect(),
+                add: ["x".to_owned()].into_iter().collect(),
+                remove: ["\\recent".to_owned()].into_iter().collect(),
             },
         ] {
             assert_eq!(
@@ -849,7 +848,11 @@ mod tests {
         let set = flags_set(&[Flag::Seen, keyword("$Important")]);
         assert!(set.contains("\\seen"));
         assert!(set.contains("$important"));
-        assert!(!set.contains("\\Seen"));
+        // Membership is case-insensitive under `Flag` identity, so the
+        // lowercased wire spelling is pinned through the retained spelling.
+        let mut spellings: Vec<&str> = set.iter().map(bifrost_types::Flag::as_str).collect();
+        spellings.sort_unstable();
+        assert_eq!(spellings, ["$important", "\\seen"]);
     }
 
     #[test]

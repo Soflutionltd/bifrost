@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bifrost_sync::backfill::{BackfillRunner, LiveSupersedes};
-use bifrost_sync::engine::lane::LaneGate;
+use bifrost_sync::engine::backfill_bound::BackfillBound;
 use bifrost_sync::multiplexer::{ChangeDelivery, PagePublisher};
 use bifrost_sync::{Boundary, Error, SyncControl};
 use bifrost_sync::{BudgetGate, ConcurrencyBudget, Scheduler, SchedulerConfig};
@@ -77,7 +77,7 @@ async fn cancelled_partition(with_lane: bool) {
         }),
     );
     scheduler.budget().register(account_id.clone());
-    let gate = LaneGate::new(
+    let gate = BackfillBound::new(
         Arc::clone(publisher.coverage()),
         4,
         shutdown.clone(),

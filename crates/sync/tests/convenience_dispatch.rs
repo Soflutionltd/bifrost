@@ -258,7 +258,7 @@ impl Account for RecorderAccount {
     fn set_keyword(
         &self,
         target: MutationTarget,
-        keyword: String,
+        keyword: bifrost_types::Flag,
         value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         self.record(format!("set_keyword:{target:?}:{keyword}:{value}"));
@@ -486,7 +486,7 @@ impl Account for RecorderAccount {
     fn contacts_list(
         &self,
         _address_book: Option<bifrost_types::AddressBookId>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::ContactsList)) })
     }
@@ -531,14 +531,14 @@ impl Account for RecorderAccount {
         &self,
         _query: String,
         _limit: Option<u32>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryCard>, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::DirectorySearch)) })
     }
 
     fn directory_groups_list(
         &self,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroup>, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::DirectoryGroupsList)) })
     }
@@ -546,7 +546,7 @@ impl Account for RecorderAccount {
     fn directory_group_expand(
         &self,
         _group: bifrost_types::DirectoryGroupId,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroupMember>, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::DirectoryGroupExpand)) })
     }

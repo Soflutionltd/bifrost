@@ -157,7 +157,6 @@ pub(super) async fn range(
     query: &EventRange,
 ) -> Result<Page<CalendarEvent>, AccountError> {
     let op = AccountOperation::EventsInRange;
-    let headers = routing(account, folder, op).await?;
     let map = |e| graph_error::ews_error_to_account_error(e, context(op, folder));
     let start = ticks(&query.start, op)?;
     let end = ticks(&query.end, op)?;
@@ -169,8 +168,12 @@ pub(super) async fn range(
         ));
     }
     let mut pos = if let Some(bytes) = &query.page_cursor {
-        let p: Position = serde_json::from_slice(bytes).map_err(|_| {
-            graph_error::invalid_account_error(op, "invalid public CalendarView cursor")
+        let p: Position = crate::paging::decode_cursor(bytes, op).map_err(|_| {
+            AccountError::invalid_page_cursor(
+                op,
+                bifrost_types::Protocol::Graph,
+                "invalid public CalendarView cursor",
+            )
         })?;
         if p.public_calendar_v1 != folder
             || p.start != query.start.value
@@ -182,8 +185,9 @@ pub(super) async fn range(
                 .iter()
                 .any(|(a, b)| *a < start || *b > end || a >= b)
         {
-            return Err(graph_error::invalid_account_error(
+            return Err(AccountError::invalid_page_cursor(
                 op,
+                bifrost_types::Protocol::Graph,
                 "public CalendarView cursor belongs to another query or has invalid windows",
             ));
         }
@@ -201,6 +205,7 @@ pub(super) async fn range(
             requests: 0,
         }
     };
+    let headers = routing(account, folder, op).await?;
     let client = super::super::public_folder::ews_client(account).map_err(map)?;
     let cap = CAP;
     let page_limit = query.limit.unwrap_or(CAP).clamp(1, CAP) as usize;
@@ -275,7 +280,7 @@ pub(super) async fn range(
     let next_cursor = if pos.windows.is_empty() && pos.ready.is_empty() {
         None
     } else {
-        Some(serde_json::to_vec(&pos).expect("serializable CalendarView cursor"))
+        Some(crate::paging::encode_cursor(op, &pos))
     };
     Ok(Page {
         truncated: false,
@@ -419,18 +424,22 @@ pub(super) async fn search(
     request: &EventSearchRequest,
 ) -> Result<Page<CalendarEvent>, AccountError> {
     let op = AccountOperation::EventSearch;
-    let headers = routing(account, folder, op).await?;
     let map = |e| graph_error::ews_error_to_account_error(e, context(op, folder));
     let mut pos = if let Some(bytes) = &request.page_cursor {
-        let pos: SearchPosition = serde_json::from_slice(bytes).map_err(|_| {
-            graph_error::invalid_account_error(op, "invalid public event search cursor")
+        let pos: SearchPosition = crate::paging::decode_cursor(bytes, op).map_err(|_| {
+            AccountError::invalid_page_cursor(
+                op,
+                bifrost_types::Protocol::Graph,
+                "invalid public event search cursor",
+            )
         })?;
         if pos.public_event_search_v1 != folder
             || pos.query != request.query
             || pos.include_cancelled != request.include_cancelled
         {
-            return Err(graph_error::invalid_account_error(
+            return Err(AccountError::invalid_page_cursor(
                 op,
+                bifrost_types::Protocol::Graph,
                 "public event search cursor belongs to another query",
             ));
         }
@@ -446,6 +455,7 @@ pub(super) async fn search(
             requests: 0,
         }
     };
+    let headers = routing(account, folder, op).await?;
     let client = super::super::public_folder::ews_client(account).map_err(map)?;
     let limit = request.limit.unwrap_or(CAP).clamp(1, CAP) as usize;
     let needle = request.query.to_ascii_lowercase();
@@ -511,7 +521,7 @@ pub(super) async fn search(
     let next_cursor = if pos.ready.is_empty() && pos.next_offset.is_none() {
         None
     } else {
-        Some(serde_json::to_vec(&pos).expect("serializable public event search cursor"))
+        Some(crate::paging::encode_cursor(op, &pos))
     };
     Ok(Page {
         truncated: false,

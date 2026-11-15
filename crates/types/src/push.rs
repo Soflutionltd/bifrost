@@ -1,7 +1,9 @@
 //! Push lanes and sessions: the vocabulary of `Account::push_lanes` and
 //! `Account::push_stream`, plus the shared single-driver lease.
 
-use crate::{AccountError, AccountOperation, InvalidationHint, Protocol, Warning};
+use crate::{
+    Account, AccountError, AccountOperation, InvalidationHint, Protocol, PushCapability, Warning,
+};
 use futures::{
     FutureExt,
     channel::oneshot,
@@ -36,6 +38,22 @@ pub struct PushLaneSpec {
     pub lane: PushLane,
     pub kind: PushLaneKind,
     pub backoff: BackoffPolicy,
+}
+
+/// The runnable push lanes for this account instance, in declaration order.
+///
+/// `PushCapability::None` disables every lane, even if `Account::push_lanes`
+/// declares slots. Otherwise the lane list determines availability and each
+/// lane's delivery kind; provider-specific capability variants do not select
+/// sessions. Use the same decision for health, supervision and subscription
+/// carry-over so a user never sees push coverage for a lane that cannot run.
+#[must_use]
+pub fn effective_push_lanes(account: &dyn Account) -> Vec<PushLaneSpec> {
+    if account.capabilities().push == PushCapability::None {
+        Vec::new()
+    } else {
+        account.push_lanes()
+    }
 }
 
 /// One item of a push session (`Account::push_stream`).

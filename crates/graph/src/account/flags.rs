@@ -23,7 +23,13 @@ impl<'a> GraphFlag<'a> {
         {
             Some(Self::Flagged)
         } else {
-            token.strip_prefix(CATEGORY_PREFIX).map(Self::Category)
+            // Shared flag identity folds ASCII case. An Outlook user expects
+            // equivalent spellings to make the same edit, independent of which
+            // spelling a set retained. Preserve the category's display name.
+            token
+                .get(..CATEGORY_PREFIX.len())
+                .filter(|prefix| prefix.eq_ignore_ascii_case(CATEGORY_PREFIX))
+                .map(|_| Self::Category(&token[CATEGORY_PREFIX.len()..]))
         }
     }
 
@@ -58,7 +64,10 @@ mod tests {
         assert_eq!(GraphFlag::parse("$flagged"), None);
         assert!(!GraphFlag::is_starred_category("read"));
         assert_eq!(GraphFlag::parse("READ"), Some(GraphFlag::Read));
-        assert_eq!(GraphFlag::parse("Category:Work"), None);
+        assert_eq!(
+            GraphFlag::parse("Category:Work"),
+            Some(GraphFlag::Category("Work"))
+        );
         assert_eq!(
             GraphFlag::parse("category:Work").unwrap().token(),
             "category:Work"

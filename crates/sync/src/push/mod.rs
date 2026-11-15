@@ -15,9 +15,9 @@
 //! multiplexer's, so consumers see one unified `Change` stream.
 pub mod health;
 pub mod ingress;
-pub(crate) mod lanes;
 pub mod reconciler;
 pub mod subscription;
+pub(crate) mod supervisor;
 
 use crate::cancel::{BoundaryRequest, BoundaryView};
 use crate::multiplexer::{ChangeDelivery, EventScope, MultiplexerEvent, ReopenRequest};
@@ -390,4 +390,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod lane_tests;
+mod supervisor_tests;

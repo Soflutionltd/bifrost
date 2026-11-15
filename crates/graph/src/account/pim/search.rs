@@ -21,7 +21,7 @@ pub(crate) async fn search(
     account: GraphAccount,
     request: SearchRequest,
 ) -> Result<Page<ThreadId>, AccountError> {
-    let page = search_message_rows(&account, request).await?;
+    let page = search_message_rows(&account, request, AccountOperation::Search).await?;
     let mut seen = HashSet::new();
     let mut threads = Vec::new();
     for row in page.items {
@@ -44,7 +44,7 @@ pub(crate) async fn search_messages(
     account: GraphAccount,
     request: SearchRequest,
 ) -> Result<Page<ObjectId>, AccountError> {
-    let page = search_message_rows(&account, request).await?;
+    let page = search_message_rows(&account, request, AccountOperation::SearchMessages).await?;
     Ok(Page {
         truncated: false,
         items: page.items.into_iter().map(|row| row.id).collect(),
@@ -61,8 +61,6 @@ pub(super) struct SearchRow {
     pub(super) thread_id: Option<ThreadId>,
 }
 
-pub(super) const SEARCH_CURSOR_PREFIX: &str = "bifrost-graph-search-v1:";
-
 /// Graph's `nextLink` is only meaningful in the mailbox that minted it.
 /// Wrap it with that mailbox so one `Page` cursor can walk the primary and
 /// every configured shared mailbox in deterministic order.
@@ -77,7 +75,7 @@ pub(super) const SEARCH_CURSOR_PREFIX: &str = "bifrost-graph-search-v1:";
 /// never asked about - a wrong answer that reports success. So the set is
 /// pinned in the cursor and a mismatch is rejected, which costs the caller
 /// a restart from page one and nothing else (unlike a sync cursor, a
-/// search cursor holds no durable state). The version prefix covers the
+/// search cursor holds no durable state). The versioned envelope covers the
 /// same ground for a cursor whose SHAPE predates this encoding.
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct SearchCursor {
@@ -91,8 +89,9 @@ pub(super) struct SearchCursor {
 pub(super) async fn search_message_rows(
     account: &GraphAccount,
     request: SearchRequest,
+    operation: AccountOperation,
 ) -> Result<Page<SearchRow>, AccountError> {
-    let cursor = decode_search_cursor(account, request.page_cursor.as_deref())?;
+    let cursor = decode_search_cursor(account, request.page_cursor.as_deref(), operation)?;
     let mut owner = cursor
         .as_ref()
         .and_then(|cursor| cursor.owner.as_deref())
@@ -105,17 +104,16 @@ pub(super) async fn search_message_rows(
     let (client, page) = loop {
         let client = account
             .client_for_owner(owner.as_deref())
-            .map_err(|error| {
-                into_account_error(error, GraphErrorContext::graph(AccountOperation::Search))
-            })?;
-        let ctx = GraphErrorContext::graph(AccountOperation::Search);
+            .map_err(|error| into_account_error(error, GraphErrorContext::graph(operation)))?;
+        let ctx = GraphErrorContext::graph(operation);
         let url = match next_link.take() {
             // The caller's cursor bytes: admitted onto the owning mailbox
             // client's origin before anything is sent, or refused as the
             // caller's malformed input.
             Some(next_link) => client.admit_target(&next_link).map_err(|refusal| {
-                invalid_account_error(
-                    AccountOperation::Search,
+                AccountError::invalid_page_cursor(
+                    operation,
+                    bifrost_types::Protocol::Graph,
                     format!("Graph search cursor {refusal}"),
                 )
             })?,
@@ -180,7 +178,7 @@ pub(super) async fn search_message_rows(
     };
     let mut rows = Vec::new();
     for value in page.value {
-        let id = object_id_from_value(&value, AccountOperation::Search, None)?;
+        let id = object_id_from_value(&value, operation, None)?;
         let id = ObjectId(crate::account::foreign::qualify_with_owner(
             owner.as_deref(),
             &id.0,
@@ -200,17 +198,16 @@ pub(super) async fn search_message_rows(
     // can be minted into the caller's cursor.
     let next_link = client
         .admit_next(page.next_link.as_ref())
-        .map_err(|error| {
-            into_account_error(error, GraphErrorContext::graph(AccountOperation::Search))
-        })?;
+        .map_err(|error| into_account_error(error, GraphErrorContext::graph(operation)))?;
     let next_cursor = match next_link {
         Some(next_link) => Some(encode_search_cursor(
             account,
+            operation,
             owner.as_deref(),
             Some(next_link.as_str().to_string()),
         )),
         None => next_search_owner(account, owner.as_deref())
-            .map(|owner| encode_search_cursor(account, Some(&owner), None)),
+            .map(|owner| encode_search_cursor(account, operation, Some(&owner), None)),
     };
     Ok(Page {
         truncated: false,
@@ -231,34 +228,19 @@ pub(super) async fn search_message_rows(
 pub(super) fn decode_search_cursor(
     account: &GraphAccount,
     cursor: Option<&[u8]>,
+    operation: AccountOperation,
 ) -> Result<Option<SearchCursor>, AccountError> {
     let Some(cursor) = cursor else {
         return Ok(None);
     };
-    let cursor = std::str::from_utf8(cursor).map_err(|error| {
-        invalid_account_error(
-            AccountOperation::Search,
-            format!("Graph search cursor is not UTF-8: {error}"),
-        )
-    })?;
-    // No compatibility arm for a bare Graph nextLink: an unrecognized
-    // cursor is never fetched as a URL, because "whatever bytes the caller
-    // held" is not a request this crate is willing to issue.
-    let payload = cursor.strip_prefix(SEARCH_CURSOR_PREFIX).ok_or_else(|| {
-        invalid_account_error(
-            AccountOperation::Search,
-            "Graph search cursor predates the mailbox-aware search encoding",
-        )
-    })?;
-    let cursor: SearchCursor = serde_json::from_str(payload).map_err(|error| {
-        invalid_account_error(
-            AccountOperation::Search,
-            format!("Graph search cursor is malformed: {error}"),
-        )
-    })?;
+    let cursor: SearchCursor =
+        crate::paging::decode_cursor(cursor, operation).map_err(|detail| {
+            AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, detail)
+        })?;
     if cursor.mailboxes != search_mailboxes(account) {
-        return Err(invalid_account_error(
-            AccountOperation::Search,
+        return Err(AccountError::invalid_page_cursor(
+            operation,
+            bifrost_types::Protocol::Graph,
             "Graph search cursor was minted against a different shared-mailbox set",
         ));
     }
@@ -271,8 +253,9 @@ pub(super) fn decode_search_cursor(
         .as_deref()
         .is_some_and(|link| reqwest::Url::parse(link).is_err())
     {
-        return Err(invalid_account_error(
-            AccountOperation::Search,
+        return Err(AccountError::invalid_page_cursor(
+            operation,
+            bifrost_types::Protocol::Graph,
             "Graph search cursor link is not an absolute URL",
         ));
     }
@@ -281,16 +264,16 @@ pub(super) fn decode_search_cursor(
 
 pub(super) fn encode_search_cursor(
     account: &GraphAccount,
+    operation: AccountOperation,
     owner: Option<&str>,
     next_link: Option<String>,
-) -> Vec<u8> {
+) -> bifrost_types::PageCursor {
     let cursor = SearchCursor {
         mailboxes: search_mailboxes(account),
         owner: owner.map(str::to_string),
         next_link,
     };
-    let payload = serde_json::to_string(&cursor).expect("SearchCursor serializes");
-    format!("{SEARCH_CURSOR_PREFIX}{payload}").into_bytes()
+    crate::paging::encode_cursor(operation, &cursor)
 }
 
 /// The shared mailboxes the search walk visits after the primary, in the

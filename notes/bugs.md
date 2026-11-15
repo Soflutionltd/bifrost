@@ -87,24 +87,6 @@ At(PartitionKey) }`, or the store returns rows and the engine selects. Trait
 change, needs the owner. `BackfillProgress::items_done` goes back to meaning a
 count.
 
-## BUG-018 - The ledger and cursor codecs panic on a `bifrost-types` variant they have not learned
-
-**Reported by:** sync-lanes (latent).
-
-Partly fixed in wave 14: the operation, object-type and protocol tag encoders
-moved into bifrost-types as exhaustive matches. Residue: the other
-non-exhaustive ledger vocabulary encoders in `cursor/ledger_envelope.rs` still
-fall back to a panic on an unknown variant. The original account:
-
-`cursor/ledger_envelope.rs::encode_operation` looks the operation up in the
-positional table `OPERATIONS` and panics if it is missing. The table matches
-`bifrost-types` today, but `AccountOperation` is `#[non_exhaustive]` in another
-crate, so nothing at compile time ties them: the first new operation reaching a
-persisted `last_error` or barrier `evidence` panics the account writer.
-`cursor/envelope.rs` has the same shape for `ObjectType` and `ProtocolKind`
-("encoding a variant the codec does not know panics"), and that codec runs
-inside consumer stores. The structural cause is STR-045.
-
 ## BUG-055 - IMAP `SearchFilter::Has` (attachment filename or type) compiles to a full-text `BODY` search
 
 **Reported by:** imap-account.

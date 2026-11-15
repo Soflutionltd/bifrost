@@ -13,6 +13,7 @@ mod flags;
 mod inventory;
 mod mailbox;
 mod mutation;
+pub(crate) mod page_cursor;
 mod pim;
 mod push;
 mod query;
@@ -535,7 +536,7 @@ impl Account for GoogleAccount {
     fn flag_target(
         &self,
         _target: &ObjectId,
-        observed: &std::collections::HashSet<String>,
+        observed: &bifrost_types::FlagSet,
         op: &bifrost_types::FlagOp,
     ) -> bifrost_types::FlagTargetState {
         // Clones the label vocabulary per observed id; accepted, see
@@ -706,7 +707,7 @@ impl Account for GoogleAccount {
     fn set_keyword(
         &self,
         _target: MutationTarget,
-        _keyword: String,
+        _keyword: bifrost_types::Flag,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         self.shutdown_future(
@@ -1089,7 +1090,7 @@ impl Account for GoogleAccount {
     fn contacts_list(
         &self,
         address_book: Option<AddressBookId>,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         self.shutdown_future(
             AccountOperation::ContactsList,
@@ -1148,7 +1149,7 @@ impl Account for GoogleAccount {
         &self,
         query: String,
         limit: Option<u32>,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
         self.shutdown_future(
             AccountOperation::DirectorySearch,
@@ -1158,7 +1159,7 @@ impl Account for GoogleAccount {
 
     fn directory_groups_list(
         &self,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
         self.shutdown_future(
             AccountOperation::DirectoryGroupsList,
@@ -1174,7 +1175,7 @@ impl Account for GoogleAccount {
     fn directory_group_expand(
         &self,
         _group: DirectoryGroupId,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
         self.shutdown_future(
             AccountOperation::DirectoryGroupExpand,

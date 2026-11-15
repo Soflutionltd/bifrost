@@ -496,6 +496,20 @@ fn stub_inventory_stream(
 }
 
 impl StubAccount {
+    /// A declared registration slot for subscription and teardown fixtures.
+    /// The default capability still disables it until a test enables push.
+    pub fn registration_lanes() -> Vec<bifrost_types::PushLaneSpec> {
+        vec![bifrost_types::PushLaneSpec {
+            lane: bifrost_types::PushLane(0),
+            kind: bifrost_types::PushLaneKind::Registration,
+            backoff: bifrost_types::BackoffPolicy::new(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(40),
+                false,
+            ),
+        }]
+    }
+
     #[must_use]
     pub fn new(scopes: Vec<CursorScope>) -> Self {
         Self {
@@ -1089,7 +1103,7 @@ impl Account for StubAccount {
     fn set_keyword(
         &self,
         _target: MutationTarget,
-        _keyword: String,
+        _keyword: bifrost_types::Flag,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetKeyword)) })
@@ -1335,7 +1349,7 @@ impl Account for StubAccount {
     fn contacts_list(
         &self,
         _address_book: Option<AddressBookId>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactsList)) })
     }
@@ -1374,7 +1388,7 @@ impl Account for StubAccount {
         &self,
         _query: String,
         _limit: Option<u32>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryCard>, AccountError>> {
         Box::pin(async {
             Err(unsupported(
@@ -1385,7 +1399,7 @@ impl Account for StubAccount {
 
     fn directory_groups_list(
         &self,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroup>, AccountError>> {
         Box::pin(async {
             Err(unsupported(
@@ -1397,7 +1411,7 @@ impl Account for StubAccount {
     fn directory_group_expand(
         &self,
         _group: bifrost_types::DirectoryGroupId,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroupMember>, AccountError>> {
         Box::pin(async {
             Err(unsupported(

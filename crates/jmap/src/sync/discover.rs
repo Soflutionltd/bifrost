@@ -169,7 +169,7 @@ pub(crate) fn scope_lifecycle<T: HttpTransport>(
 
             if !client.is_session_updated() {
                 yield ScopeLifecycleEvent::Terminated(
-                    super::capabilities::session_state_changed(),
+                    super::error::session_state_changed(),
                 );
                 break;
             }

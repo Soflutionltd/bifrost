@@ -1,4 +1,6 @@
 use crate::core::id::PushState;
+
+use super::error::push_set_error;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -257,9 +259,8 @@ pub(crate) fn subscribe<T: PushTransport>(
         let mut enabled_guard = state.enabled.lock().await;
         let mut push_state_guard = state.push_state.lock().await;
         if state.closed.load(Ordering::Acquire) {
-            return Err(bifrost_types::AccountError::account_closed(
+            return Err(super::error::account_closed(
                 AccountOperation::PushSubscribe,
-                bifrost_types::Protocol::Jmap,
             ));
         }
         let mut prospective = subscriptions_guard.clone();
@@ -472,31 +473,6 @@ async fn apply_push_set(
         let values = data_types.iter().cloned().collect::<Vec<_>>();
         client.enable_push_ws(Some(values), push_state).await
     }
-}
-
-/// Classify a failed push-set frame for the consumer.
-///
-/// The frame is replay-safe, whatever the central table says about
-/// `PushSubscribe`. That operation is non-idempotent because on webhook
-/// providers a subscribe CREATES a server resource, and replaying it after
-/// an in-flight drop can create a second one. A JMAP `WebSocketPushEnable`
-/// or `WebSocketPushDisable` creates nothing: it carries the complete
-/// desired data-type set for the connection, so applying it twice leaves
-/// the same state as applying it once. Without the override an in-flight
-/// sink failure derives `Reconcile(TransportDropAfterSend, [CheckTarget])`,
-/// which asks the consumer to read back a target that does not exist.
-///
-/// `WebSocketNotConnected` never reaches here: both callers absorb it as a
-/// deferred success.
-fn push_set_error(err: crate::Error) -> AccountError {
-    super::error::into_account_error(
-        err,
-        super::error::JmapErrorContext::new(AccountOperation::PushSubscribe),
-    )
-    .into_builder()
-    .idempotency_override(true)
-    .try_build()
-    .expect("valid account error classification")
 }
 
 /// Await `future` under the session's shutdown token and a wall-clock

@@ -11,8 +11,8 @@ use crate::{
 };
 use arc_swap::ArcSwap;
 use bifrost_types::{
-    Account, AccountError, AccountId, EngineDirective, PushCapability, PushGate, PushLaneKind,
-    PushLaneSpec, PushSessionEnd, PushSessionEvent, SessionStop, SyncEvent, Warning, WarningKind,
+    Account, AccountError, AccountId, EngineDirective, PushGate, PushLaneKind, PushLaneSpec,
+    PushSessionEnd, PushSessionEvent, SessionStop, SyncEvent, Warning, WarningKind,
 };
 use futures::{FutureExt, StreamExt};
 use std::{
@@ -23,7 +23,7 @@ use std::{
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) struct PushLanes {
+pub(crate) struct PushSupervisor {
     pub account_id: AccountId,
     pub current: Arc<ArcSwap<crate::types::Incarnation>>,
     pub generation: watch::Receiver<crate::types::AccountGeneration>,
@@ -42,17 +42,13 @@ pub(crate) struct PushLanes {
     /// bound still finishes inside detach's worker deadline.
     pub drain_bound: Duration,
 }
-impl PushLanes {
+impl PushSupervisor {
     pub async fn run(mut self) {
         let mut carried = HashMap::new();
         loop {
             let generation = *self.generation.borrow_and_update();
             let account = self.current.load_full();
-            let specs = if account.capabilities().push == PushCapability::None {
-                Vec::new()
-            } else {
-                account.push_lanes()
-            };
+            let specs = bifrost_types::effective_push_lanes(account.as_ref().as_ref());
             self.health.send_replace(PushHealth {
                 generation,
                 lanes: specs

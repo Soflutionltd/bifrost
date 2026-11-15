@@ -1,4 +1,4 @@
-//! End-to-end pins for the bounded backfill lane (`engine::lane`).
+//! End-to-end pins for the bounded backfill lane (`engine::backfill_bound`).
 //!
 //! Cold-start pages and live changes share one broadcast ring with no
 //! producer-side backpressure of its own. Backfill now takes one lane permit per
@@ -1674,7 +1674,7 @@ async fn pages_lost_to_a_lag_withhold_the_completion_marker() {
 ///
 /// Same structural reason in both: the driver registers the publication and then
 /// sends on the raw sender, so the entry is never stamped with a delivery - and
-/// an unsent stamp is deliberately never swept, leaving a `Lane::Backfill` entry
+/// an unsent stamp is deliberately never swept, leaving a `PublicationStream::Backfill` entry
 /// charged against the account's backfill bound until an acknowledgement, a lag
 /// or a reset frees it. Worse for the completion partition specifically: nothing
 /// ever stamped that publication with a walk reading, so its acknowledgement

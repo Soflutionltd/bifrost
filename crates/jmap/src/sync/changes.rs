@@ -31,34 +31,11 @@ pub(crate) fn stream<T: HttpTransport>(
     let (scope, state_string) = match decoded {
         Ok(decoded) => decoded,
         Err(err) => {
-            let fault = match &err {
-                state::JmapCursorError::CursorProtocolMismatch => {
-                    bifrost_types::CursorDecodeFault::ProtocolMismatch
-                }
-                state::JmapCursorError::CursorEnvelopeUnknown => {
-                    bifrost_types::CursorDecodeFault::FutureVersion
-                }
-                // A readable scope disagreement restarts only that scope. Keep
-                // this exhaustive so new faults cannot inherit that policy.
-                state::JmapCursorError::ScopeMismatch => {
-                    bifrost_types::CursorDecodeFault::ScopeMismatch
-                }
-                state::JmapCursorError::UnsupportedScope
-                | state::JmapCursorError::SchemaIncompatible => {
-                    bifrost_types::CursorDecodeFault::Malformed
-                }
-            };
             return Box::pin(async_stream::stream! {
-                yield super::error::terminated(
-                    fault.builder(
-                        bifrost_types::Protocol::Jmap,
-                        bifrost_types::AccountOperation::SyncChanges,
-                    )
-                        .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
-                        .text(bifrost_types::DiagnosticText::support_only(format!("JMAP cursor decode: {err:?}")))
-                        .try_build()
-                        .expect("valid account error classification"),
-                );
+                yield super::error::terminated(super::error::change_cursor_error(
+                    err,
+                    cursor.scope.clone(),
+                ));
             });
         }
     };

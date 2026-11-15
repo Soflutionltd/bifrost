@@ -30,6 +30,95 @@ use crate::client::GraphClient;
 use crate::error::GraphError;
 use crate::origin::AdmittedUrl;
 
+use bifrost_types::{AccountOperation, PageCursor};
+
+/// One versioned, surface-tagged boundary for every caller-owned Graph walk.
+/// A saved cursor from another surface must reload that walk, never fetch an
+/// unrelated collection with the account bearer. Inner positions remain owned
+/// by their walkers (including public-folder and Search API positions).
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "surface", content = "position", rename_all = "snake_case")]
+enum GraphPageCursor {
+    ContactsList(serde_json::Value),
+    ContactSearch(serde_json::Value),
+    DirectorySearch(serde_json::Value),
+    DirectoryGroupsList(serde_json::Value),
+    DirectoryGroupExpand(serde_json::Value),
+    EventsInRange(serde_json::Value),
+    EventSearch(serde_json::Value),
+    Search(serde_json::Value),
+    SearchMessages(serde_json::Value),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CursorEnvelope {
+    version: u8,
+    cursor: GraphPageCursor,
+}
+
+impl GraphPageCursor {
+    fn operation(&self) -> AccountOperation {
+        match self {
+            Self::ContactsList(_) => AccountOperation::ContactsList,
+            Self::ContactSearch(_) => AccountOperation::ContactSearch,
+            Self::DirectorySearch(_) => AccountOperation::DirectorySearch,
+            Self::DirectoryGroupsList(_) => AccountOperation::DirectoryGroupsList,
+            Self::DirectoryGroupExpand(_) => AccountOperation::DirectoryGroupExpand,
+            Self::EventsInRange(_) => AccountOperation::EventsInRange,
+            Self::EventSearch(_) => AccountOperation::EventSearch,
+            Self::Search(_) => AccountOperation::Search,
+            Self::SearchMessages(_) => AccountOperation::SearchMessages,
+        }
+    }
+
+    fn into_position(self) -> serde_json::Value {
+        match self {
+            Self::ContactsList(value)
+            | Self::ContactSearch(value)
+            | Self::DirectorySearch(value)
+            | Self::DirectoryGroupsList(value)
+            | Self::DirectoryGroupExpand(value)
+            | Self::EventsInRange(value)
+            | Self::EventSearch(value)
+            | Self::Search(value)
+            | Self::SearchMessages(value) => value,
+        }
+    }
+}
+
+pub(crate) fn encode_cursor<T: Serialize>(operation: AccountOperation, position: &T) -> PageCursor {
+    let position = serde_json::to_value(position).expect("Graph page position is serializable");
+    let cursor = match operation {
+        AccountOperation::ContactsList => GraphPageCursor::ContactsList(position),
+        AccountOperation::ContactSearch => GraphPageCursor::ContactSearch(position),
+        AccountOperation::DirectorySearch => GraphPageCursor::DirectorySearch(position),
+        AccountOperation::DirectoryGroupsList => GraphPageCursor::DirectoryGroupsList(position),
+        AccountOperation::DirectoryGroupExpand => GraphPageCursor::DirectoryGroupExpand(position),
+        AccountOperation::EventsInRange => GraphPageCursor::EventsInRange(position),
+        AccountOperation::EventSearch => GraphPageCursor::EventSearch(position),
+        AccountOperation::Search => GraphPageCursor::Search(position),
+        AccountOperation::SearchMessages => GraphPageCursor::SearchMessages(position),
+        _ => unreachable!("only page operations encode Graph page cursors"),
+    };
+    serde_json::to_vec(&CursorEnvelope { version: 1, cursor })
+        .expect("Graph page cursor is serializable")
+        .into()
+}
+
+pub(crate) fn decode_cursor<T: serde::de::DeserializeOwned>(
+    cursor: &[u8],
+    operation: AccountOperation,
+) -> Result<T, String> {
+    let envelope: CursorEnvelope = serde_json::from_slice(cursor)
+        .map_err(|_| "malformed or retired Graph page cursor".to_string())?;
+    if envelope.version != 1 || envelope.cursor.operation() != operation {
+        return Err("Graph page cursor version or surface mismatch".to_string());
+    }
+    serde_json::from_value(envelope.cursor.into_position())
+        .map_err(|_| "malformed Graph page position".to_string())
+}
+
 /// Maximum pages one collection walk may request.
 ///
 /// Deliberately generous: at Graph's typical `$top` of 100-250 this is
@@ -87,114 +176,110 @@ impl PageWalk {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum DirectoryMode {
-    Search,
-    #[default]
-    Filter,
-}
-
 #[derive(Serialize, Deserialize)]
 struct PagedCursor {
     url: String,
     skip: usize,
-    #[serde(default)]
-    mode: DirectoryMode,
 }
 
-/// Decode a caller's paged cursor (minted by [`encode_paged_cursor`]) into
-/// an admitted URL and the count of already-delivered values to skip.
-///
-/// These bytes are request INPUT the caller handed back, so every refusal
-/// is a detail for `Request(Malformed)`, never a provider fault. The url
-/// must be absolute, or a path starting with `/` (this crate once minted
-/// first-page positions that way), and either way must admit onto the
-/// client's api-base: a cursor naming another origin would otherwise be
-/// fetched with the account bearer. A cursor that is not the JSON form is
-/// read as a bare link cursor, which must be an absolute URL.
+#[derive(Serialize, Deserialize)]
+struct DirectoryCursor {
+    url: String,
+    skip: usize,
+    mode: crate::account::DirectoryMode,
+}
+
+/// Admit the decoded position onto this client's API origin before using its bearer.
+fn admit_cursor_url(client: &GraphClient, url: &str) -> Result<AdmittedUrl, String> {
+    if !url.starts_with('/') && reqwest::Url::parse(url).is_err() {
+        return Err("page cursor url is neither absolute nor a path".to_string());
+    }
+    client
+        .admit_target(url)
+        .map_err(|refusal| format!("page cursor {refusal}"))
+}
+
 pub(crate) fn decode_paged_cursor(
     client: &GraphClient,
-    cursor: Option<Vec<u8>>,
+    cursor: Option<PageCursor>,
+    operation: AccountOperation,
 ) -> Result<Option<(AdmittedUrl, usize)>, String> {
-    let Some(cursor) = cursor else {
-        return Ok(None);
-    };
-    match serde_json::from_slice::<PagedCursor>(&cursor) {
-        Ok(PagedCursor { url, skip, .. }) => {
-            if !url.starts_with('/') && reqwest::Url::parse(&url).is_err() {
-                return Err("page cursor url is neither absolute nor a path".to_string());
-            }
-            let url = client
-                .admit_target(&url)
-                .map_err(|refusal| format!("page cursor {refusal}"))?;
-            Ok(Some((url, skip)))
-        }
-        Err(_) => Ok(decode_link_cursor(client, Some(cursor))?.map(|url| (url, 0))),
-    }
+    cursor
+        .map(|cursor| {
+            let PagedCursor { url, skip } = decode_cursor(&cursor, operation)?;
+            Ok((admit_cursor_url(client, &url)?, skip))
+        })
+        .transpose()
 }
 
 pub(crate) fn decode_directory_cursor(
     client: &GraphClient,
-    cursor: Option<Vec<u8>>,
-) -> Result<Option<(AdmittedUrl, usize, DirectoryMode)>, String> {
-    let mode = cursor
-        .as_ref()
-        .and_then(|bytes| serde_json::from_slice::<PagedCursor>(bytes).ok())
-        .map_or(DirectoryMode::Filter, |cursor| cursor.mode);
-    Ok(decode_paged_cursor(client, cursor)?.map(|(url, skip)| (url, skip, mode)))
+    cursor: Option<PageCursor>,
+) -> Result<Option<(AdmittedUrl, usize, crate::account::DirectoryMode)>, String> {
+    cursor
+        .map(|cursor| {
+            let DirectoryCursor { url, skip, mode } =
+                decode_cursor(&cursor, AccountOperation::DirectorySearch)?;
+            Ok((admit_cursor_url(client, &url)?, skip, mode))
+        })
+        .transpose()
 }
 
 pub(crate) fn encode_directory_cursor(
     url: &AdmittedUrl,
     skip: usize,
-    mode: DirectoryMode,
-) -> Vec<u8> {
-    serde_json::to_vec(&PagedCursor {
-        url: url.as_str().to_string(),
-        skip,
-        mode,
-    })
-    .expect("directory cursor is serializable")
+    mode: crate::account::DirectoryMode,
+) -> PageCursor {
+    encode_cursor(
+        AccountOperation::DirectorySearch,
+        &DirectoryCursor {
+            url: url.as_str().to_string(),
+            skip,
+            mode,
+        },
+    )
 }
 
-/// Decode a caller's bare link cursor: the verbatim `@odata.nextLink` bytes
-/// a list surface returned as `next_cursor`. Strict UTF-8, an absolute URL,
-/// and admitted onto the client's api-base; refusals are details for
-/// `Request(Malformed)`.
 pub(crate) fn decode_link_cursor(
     client: &GraphClient,
-    cursor: Option<Vec<u8>>,
+    cursor: Option<PageCursor>,
+    operation: AccountOperation,
 ) -> Result<Option<AdmittedUrl>, String> {
-    let Some(cursor) = cursor else {
-        return Ok(None);
-    };
-    let text = String::from_utf8(cursor).map_err(|error| format!("page cursor: {error}"))?;
-    if reqwest::Url::parse(&text).is_err() {
-        return Err("page cursor is not an absolute URL".to_string());
-    }
-    client
-        .admit_target(&text)
-        .map(Some)
-        .map_err(|refusal| format!("page cursor {refusal}"))
+    cursor
+        .map(|cursor| {
+            let text: String = decode_cursor(&cursor, operation)?;
+            if reqwest::Url::parse(&text).is_err() {
+                return Err("page cursor is not an absolute URL".to_string());
+            }
+            admit_cursor_url(client, &text)
+        })
+        .transpose()
 }
 
-pub(crate) fn encode_paged_cursor(url: &AdmittedUrl, skip: usize) -> Vec<u8> {
-    serde_json::to_vec(&PagedCursor {
-        url: url.as_str().to_string(),
-        skip,
-        mode: DirectoryMode::Filter,
-    })
-    .expect("search cursor is serializable")
+pub(crate) fn encode_paged_cursor(
+    url: &AdmittedUrl,
+    skip: usize,
+    operation: AccountOperation,
+) -> PageCursor {
+    encode_cursor(
+        operation,
+        &PagedCursor {
+            url: url.as_str().to_string(),
+            skip,
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_PAGES, PageWalk, decode_link_cursor, decode_paged_cursor, encode_paged_cursor,
+        MAX_PAGES, PageWalk, PagedCursor, decode_cursor, decode_link_cursor, decode_paged_cursor,
+        encode_cursor, encode_paged_cursor,
     };
     use crate::client::GraphClient;
     use crate::error::GraphError;
     use crate::origin::{AdmittedUrl, Base};
+    use bifrost_types::AccountOperation;
 
     fn url(link: &str) -> AdmittedUrl {
         Base::parse("https://graph.test")
@@ -208,21 +293,27 @@ mod tests {
         let link = client
             .admit_target("https://graph.microsoft.com/v1.0/users?page=4")
             .expect("same origin");
-        let encoded = encode_paged_cursor(&link, 17);
-        let (url, skip) = decode_paged_cursor(&client, Some(encoded))
-            .expect("valid cursor")
-            .expect("present cursor");
+        let encoded = encode_paged_cursor(&link, 17, AccountOperation::ContactSearch);
+        let (url, skip) =
+            decode_paged_cursor(&client, Some(encoded), AccountOperation::ContactSearch)
+                .expect("valid cursor")
+                .expect("present cursor");
         assert_eq!(url, link);
         assert_eq!(skip, 17);
     }
 
-    /// A cursor minted before cursors carried absolute urls names its first
-    /// page as a path; it still resumes, on the client's own base.
+    /// An encoded first-page path resumes on this client's own base.
     #[test]
     fn a_path_paged_cursor_resumes_on_the_api_base() {
         let client = GraphClient::new("token");
-        let cursor = br#"{"url":"/me/events?$top=5","skip":2}"#.to_vec();
-        let (url, skip) = decode_paged_cursor(&client, Some(cursor))
+        let cursor = encode_cursor(
+            AccountOperation::EventSearch,
+            &PagedCursor {
+                url: "/me/events?$top=5".into(),
+                skip: 2,
+            },
+        );
+        let (url, skip) = decode_paged_cursor(&client, Some(cursor), AccountOperation::EventSearch)
             .expect("valid cursor")
             .expect("present cursor");
         assert_eq!(
@@ -244,8 +335,32 @@ mod tests {
             b"https://elsewhere.example/users".to_vec(),
             b"HTTPS://elsewhere.example/users".to_vec(),
         ] {
-            assert!(decode_paged_cursor(&client, Some(cursor.clone())).is_err());
-            assert!(decode_link_cursor(&client, Some(cursor)).is_err());
+            let text = String::from_utf8_lossy(&cursor);
+            let position = serde_json::from_slice::<PagedCursor>(&cursor).unwrap_or(PagedCursor {
+                url: text.into_owned(),
+                skip: 0,
+            });
+            let link = encode_cursor(AccountOperation::ContactsList, &position.url);
+            assert!(
+                decode_link_cursor(&client, Some(link), AccountOperation::ContactsList).is_err()
+            );
+            let encoded = encode_cursor(AccountOperation::ContactSearch, &position);
+            assert!(
+                decode_paged_cursor(&client, Some(encoded), AccountOperation::ContactSearch)
+                    .is_err()
+            );
+            assert!(
+                decode_paged_cursor(
+                    &client,
+                    Some(cursor.clone().into()),
+                    AccountOperation::ContactSearch
+                )
+                .is_err()
+            );
+            assert!(
+                decode_link_cursor(&client, Some(cursor.into()), AccountOperation::ContactsList)
+                    .is_err()
+            );
         }
     }
 
@@ -260,9 +375,49 @@ mod tests {
             vec![0xff, 0xfe],
             br#"{"url":"garbage","skip":0}"#.to_vec(),
         ] {
-            assert!(decode_paged_cursor(&client, Some(cursor.clone())).is_err());
-            assert!(decode_link_cursor(&client, Some(cursor)).is_err());
+            assert!(
+                decode_paged_cursor(
+                    &client,
+                    Some(cursor.clone().into()),
+                    AccountOperation::ContactSearch
+                )
+                .is_err()
+            );
+            assert!(
+                decode_link_cursor(&client, Some(cursor.into()), AccountOperation::ContactsList)
+                    .is_err()
+            );
         }
+    }
+
+    #[test]
+    fn graph_page_cursors_reject_every_other_surface_and_version() {
+        let operations = [
+            AccountOperation::ContactsList,
+            AccountOperation::ContactSearch,
+            AccountOperation::DirectorySearch,
+            AccountOperation::DirectoryGroupsList,
+            AccountOperation::DirectoryGroupExpand,
+            AccountOperation::EventsInRange,
+            AccountOperation::EventSearch,
+            AccountOperation::Search,
+            AccountOperation::SearchMessages,
+        ];
+        for minted in operations {
+            let cursor = encode_cursor(minted, &"opaque");
+            assert_eq!(decode_cursor::<String>(&cursor, minted).unwrap(), "opaque");
+            for used in operations.into_iter().filter(|used| *used != minted) {
+                assert!(
+                    decode_cursor::<String>(&cursor, used).is_err(),
+                    "{minted:?} used on {used:?}"
+                );
+            }
+            let mut value: serde_json::Value = serde_json::from_slice(&cursor).unwrap();
+            value["version"] = 2.into();
+            assert!(decode_cursor::<String>(&serde_json::to_vec(&value).unwrap(), minted).is_err());
+        }
+        let legacy = br#"{"url":"https://graph.microsoft.com/v1.0/users","skip":0}"#;
+        assert!(decode_cursor::<PagedCursor>(legacy, AccountOperation::ContactSearch).is_err());
     }
 
     #[test]

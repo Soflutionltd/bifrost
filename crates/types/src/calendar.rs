@@ -247,7 +247,7 @@ pub struct EventRange {
     pub calendar_id: CalendarId,
     pub start: EventTime,
     pub end: EventTime,
-    pub page_cursor: Option<Vec<u8>>,
+    pub page_cursor: Option<crate::PageCursor>,
     pub limit: Option<u32>,
 }
 
@@ -361,7 +361,7 @@ pub struct EventPatch {
 pub struct EventSearchRequest {
     pub query: String,
     pub calendar_id: Option<CalendarId>,
-    pub page_cursor: Option<Vec<u8>>,
+    pub page_cursor: Option<crate::PageCursor>,
     pub limit: Option<u32>,
     /// When `false` (the default) events whose status is
     /// [`EventStatus::Cancelled`] are excluded from the results; when `true`

@@ -133,8 +133,8 @@ impl SlotContext {
     /// publication records in `coverage`. It bundles the bound, the token and
     /// the account's scheduler admission, and that admission is the only state
     /// it owns.
-    pub(super) fn lane_gate(&self) -> LaneGate {
-        LaneGate::new(
+    pub(super) fn backfill_bound(&self) -> BackfillBound {
+        BackfillBound::new(
             Arc::clone(&self.coverage),
             self.backfill_capacity,
             self.shutdown.clone(),

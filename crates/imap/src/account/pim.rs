@@ -321,14 +321,14 @@ async fn remove_from_container_inner(
 pub(crate) fn set_keyword(
     account: ImapAccount,
     target: MutationTarget,
-    keyword: String,
+    keyword: bifrost_types::Flag,
     value: bool,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         if !account.capabilities.pim_methods.set_keyword {
             return Err(super::error::unsupported(AccountOperation::SetKeyword));
         }
-        let flag = imap_flag_for_keyword(&keyword);
+        let flag = imap_flag_for_keyword(keyword.as_str());
         let ids = resolved_targets(
             &account,
             &target,
@@ -1732,7 +1732,7 @@ async fn set_flag(
     value: bool,
     op: AccountOperation,
 ) -> Result<Vec<FolderEffect>, FolderProgress> {
-    let flags = std::collections::HashSet::from([flag.to_string()]);
+    let flags = bifrost_types::FlagSet::from([flag.to_string()]);
     let flags = if value {
         bifrost_types::FlagOp::Add(flags)
     } else {
@@ -2605,7 +2605,10 @@ impl<T> SearchPager<T> {
         let (next_cursor, estimated_total) = if self.collected.len() > self.limit {
             // The lookahead item stays ahead of the cursor for the next call.
             self.collected.truncate(self.limit);
-            let last = self.collected.last().map(|(position, _)| position.encode());
+            let last = self
+                .collected
+                .last()
+                .map(|(position, _)| position.encode().into());
             (last, None)
         } else if self.resume.is_none() {
             // This call enumerated the whole result from the start.
@@ -3922,7 +3925,7 @@ body text\r\n";
     fn search_request(limit: Option<u32>, cursor: Option<&str>) -> SearchRequest {
         let mut request = SearchRequest::default();
         request.limit = limit;
-        request.page_cursor = cursor.map(|c| c.as_bytes().to_vec());
+        request.page_cursor = cursor.map(|c| c.as_bytes().to_vec().into());
         request
     }
 
@@ -3932,7 +3935,7 @@ body text\r\n";
         folders: &[(&str, u32, &[u32])],
         restriction: Option<&str>,
         limit: u32,
-        cursor: Option<Vec<u8>>,
+        cursor: Option<bifrost_types::PageCursor>,
     ) -> Result<Page<(String, u32)>, AccountError> {
         let mut request = search_request(Some(limit), None);
         request.page_cursor = cursor;
@@ -4048,7 +4051,7 @@ body text\r\n";
         };
         // The retired offset spelling, garbage, and a legacy imap1 payload.
         for cursor in ["2", "not-a-number", "imapsearch1:imap1:5:INBOX:7:9"] {
-            let err = search_page(&[], None, 2, Some(cursor.as_bytes().to_vec()))
+            let err = search_page(&[], None, 2, Some(cursor.as_bytes().to_vec().into()))
                 .expect_err("a cursor this crate did not mint");
             assert_eq!(*err.kind(), malformed, "{cursor}");
             assert!(is_page_cursor_fault(&err), "{cursor}");

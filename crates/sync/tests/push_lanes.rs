@@ -44,6 +44,98 @@ fn terminal() -> bifrost_types::AccountError {
     common::unsupported(bifrost_types::AccountOperation::PushStream)
 }
 
+#[test]
+fn effective_push_lanes_preserves_declared_topology_for_every_push_capability() {
+    use bifrost_types::effective_push_lanes;
+
+    let mut account = StubAccount::new(Vec::new());
+    let backoff = BackoffPolicy::new(Duration::from_secs(3), Duration::from_secs(17), true);
+    account.push_lane_specs = vec![
+        PushLaneSpec {
+            lane: PushLane(7),
+            kind: PushLaneKind::Registration,
+            backoff,
+        },
+        PushLaneSpec {
+            lane: PushLane(2),
+            kind: PushLaneKind::Connection,
+            backoff,
+        },
+    ];
+    for capability in [
+        PushCapability::None,
+        PushCapability::InProcess,
+        PushCapability::OutOfProcessPubsub,
+        PushCapability::Webhook,
+    ] {
+        account.caps.push = capability;
+        let lanes = effective_push_lanes(&account);
+        if capability == PushCapability::None {
+            assert!(lanes.is_empty());
+        } else {
+            assert_eq!(lanes.len(), 2);
+            for (actual, expected) in lanes.iter().zip(&account.push_lane_specs) {
+                assert_eq!(actual.lane, expected.lane);
+                assert_eq!(actual.kind, expected.kind);
+                assert_eq!(actual.backoff, expected.backoff);
+            }
+        }
+        let declared = std::mem::take(&mut account.push_lane_specs);
+        assert!(effective_push_lanes(&account).is_empty());
+        account.push_lane_specs = declared;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn reattach_does_not_carry_subscriptions_to_an_account_without_effective_push_lanes() {
+    use bifrost_types::CursorScope;
+
+    for capability in [PushCapability::Webhook, PushCapability::None] {
+        let mut old = StubAccount::new(vec![CursorScope::Account]);
+        old.caps.push = PushCapability::Webhook;
+        old.push_lane_specs = StubAccount::registration_lanes();
+        old.push_label = "old".into();
+        let old = Arc::new(old);
+        let mut next = StubAccount::new(vec![CursorScope::Account]);
+        next.caps.push = capability;
+        // Exercise both a disabled declared lane and an enabled empty list.
+        if capability == PushCapability::None {
+            next.push_lane_specs = StubAccount::registration_lanes();
+        }
+        next.push_label = "next".into();
+        next.push_log = Arc::clone(&old.push_log);
+        let next = Arc::new(next);
+        let engine = SyncEngine::builder().build().unwrap();
+        let id = AccountId("no-effective-push".into());
+        engine
+            .attach(
+                id.clone(),
+                Arc::new(StubFactory::queue(vec![
+                    Arc::clone(&old),
+                    Arc::clone(&next),
+                ])),
+            )
+            .await
+            .unwrap();
+        engine
+            .subscribe_push(&id, &[CursorScope::Account])
+            .await
+            .unwrap();
+        engine.reattach(&id).await.unwrap();
+        settle().await;
+        assert_eq!(
+            old.push_log.subscribed(),
+            vec![("old".into(), vec![CursorScope::Account])]
+        );
+        assert_eq!(old.push_log.unsubscribed().len(), 1);
+        assert!(next.push_session_log.lock().unwrap().is_empty());
+        assert!(engine.push_health(&id).unwrap().borrow().lanes.is_empty());
+        engine.unsubscribe_push(&id).await.unwrap();
+        assert_eq!(old.push_log.unsubscribed().len(), 1);
+        engine.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_terminal_session_failure_is_broadcast_once_and_parks_the_lane() {
     let stub = stub(

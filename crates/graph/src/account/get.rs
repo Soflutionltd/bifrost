@@ -1,3 +1,4 @@
+use bifrost_types::FlagSet;
 use std::collections::HashSet;
 
 use bifrost_types::{
@@ -250,8 +251,8 @@ pub(crate) fn hydrated_from_ews_item(
 /// The canonical flag set an EWS item carries. EWS surfaces only the
 /// read/unread bit on this shape (no categories, no flag status), so
 /// `\seen` is the whole vocabulary.
-fn ews_flags(item: &crate::ews::EwsItem) -> HashSet<String> {
-    let mut flags = HashSet::new();
+fn ews_flags(item: &crate::ews::EwsItem) -> FlagSet {
+    let mut flags = FlagSet::new();
     if item.is_read {
         flags.insert(crate::account::flags::GraphFlag::Read.token());
     }
@@ -579,9 +580,9 @@ fn metadata_or_flags(id: &ObjectId, value: &Value) -> HydratedObjectKind {
     )
 }
 
-fn flags_from_value(value: &Value) -> HashSet<String> {
+fn flags_from_value(value: &Value) -> FlagSet {
     let observed = super::wire_item::GraphItem::decode(value).flags;
-    let mut flags = HashSet::new();
+    let mut flags = FlagSet::new();
     if observed.read.unwrap_or(false) {
         flags.insert(crate::account::flags::GraphFlag::Read.token());
     }

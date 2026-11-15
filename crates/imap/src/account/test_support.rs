@@ -40,7 +40,7 @@ fn unsupported(op: AccountOperation) -> AccountError {
 pub(crate) struct DirectoryCall {
     pub(crate) query: String,
     pub(crate) limit: Option<u32>,
-    pub(crate) cursor: Option<Vec<u8>>,
+    pub(crate) cursor: Option<bifrost_types::PageCursor>,
 }
 
 /// A configurable `Account` test double. Records whether each sync
@@ -340,12 +340,12 @@ impl Account for StubAccount {
     fn set_keyword(
         &self,
         _target: MutationTarget,
-        keyword: String,
+        keyword: bifrost_types::Flag,
         value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         // Records the call and succeeds so flag-convenience dispatch
         // (e.g. mark_mdn_sent) can be observed reaching the success path.
-        *self.last_set_keyword.lock().expect("stub mutex") = Some((keyword, value));
+        *self.last_set_keyword.lock().expect("stub mutex") = Some((keyword.to_string(), value));
         Box::pin(async { Ok(()) })
     }
 
@@ -557,7 +557,7 @@ impl Account for StubAccount {
     fn contacts_list(
         &self,
         _address_book: Option<AddressBookId>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::ContactsList)) })
     }
@@ -596,7 +596,7 @@ impl Account for StubAccount {
         &self,
         query: String,
         limit: Option<u32>,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
         *self.directory_call.lock().expect("lock") = Some(DirectoryCall {
             query,
@@ -628,7 +628,7 @@ impl Account for StubAccount {
 
     fn directory_groups_list(
         &self,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::DirectoryGroupsList)) })
     }
@@ -636,7 +636,7 @@ impl Account for StubAccount {
     fn directory_group_expand(
         &self,
         _group: DirectoryGroupId,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::DirectoryGroupExpand)) })
     }

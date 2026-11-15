@@ -479,7 +479,7 @@ pub trait Account: Send + Sync {
     fn flag_target(
         &self,
         target: &ObjectId,
-        observed: &std::collections::HashSet<String>,
+        observed: &crate::FlagSet,
         op: &FlagOp,
     ) -> crate::FlagTargetState {
         let _ = target;
@@ -545,8 +545,8 @@ pub trait Account: Send + Sync {
     ) -> AccountFuture<Result<(), AccountError>>;
 
     /// The push lanes this account instance runs, constant for its life.
-    /// Empty when push is unavailable. The engine reads it once per account
-    /// generation and only when `capabilities().push` is not `None`.
+    /// Empty when push is unavailable. Consumers use [`crate::effective_push_lanes`]
+    /// to apply the capability gate consistently for this account generation.
     fn push_lanes(&self) -> Vec<crate::PushLaneSpec> {
         Vec::new()
     }
@@ -840,7 +840,7 @@ pub trait Account: Send + Sync {
     fn set_keyword(
         &self,
         target: MutationTarget,
-        keyword: String,
+        keyword: crate::Flag,
         value: bool,
     ) -> AccountFuture<Result<(), AccountError>>;
 
@@ -1156,7 +1156,7 @@ pub trait Account: Send + Sync {
     fn contacts_list(
         &self,
         address_book: Option<AddressBookId>,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<crate::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>>;
 
     /// Fetch one contact card by engine-facing id.
@@ -1217,7 +1217,7 @@ pub trait Account: Send + Sync {
         &self,
         query: String,
         limit: Option<u32>,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<crate::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>>;
 
     /// List the mail-enabled organization-directory groups the
@@ -1234,7 +1234,7 @@ pub trait Account: Send + Sync {
     /// with a `NoPermission` error at call time.
     fn directory_groups_list(
         &self,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<crate::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>>;
 
     /// Expand one directory group to its user members. Expansion is
@@ -1248,7 +1248,7 @@ pub trait Account: Send + Sync {
     fn directory_group_expand(
         &self,
         group: DirectoryGroupId,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<crate::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>>;
 
     // ------------------------------------------------------------
@@ -1445,9 +1445,7 @@ pub trait Account: Send + Sync {
         const STARRED_KEYWORD: &str = "$flagged";
         const STARRED_LABEL: &str = "STARRED";
         match self.capabilities().conveniences.starred {
-            StarredFlagShape::Keyword => {
-                self.set_keyword(target, STARRED_KEYWORD.to_string(), starred)
-            }
+            StarredFlagShape::Keyword => self.set_keyword(target, STARRED_KEYWORD.into(), starred),
             StarredFlagShape::LabelMembership => {
                 self.set_label_membership(target, ContainerId(STARRED_LABEL.to_string()), starred)
             }
@@ -1467,7 +1465,7 @@ pub trait Account: Send + Sync {
     fn mark_replied(&self, message: ObjectId) -> AccountFuture<Result<(), AccountError>> {
         let target = MutationTarget::Message(message);
         match self.capabilities().conveniences.replied {
-            RepliedFlagShape::Keyword => self.set_keyword(target, "$answered".to_string(), true),
+            RepliedFlagShape::Keyword => self.set_keyword(target, "$answered".into(), true),
             RepliedFlagShape::ExtendedProperty => self.set_extended_property(
                 target,
                 "PR_LAST_VERB_EXECUTED".to_string(),
@@ -1485,7 +1483,7 @@ pub trait Account: Send + Sync {
     fn mark_forwarded(&self, message: ObjectId) -> AccountFuture<Result<(), AccountError>> {
         let target = MutationTarget::Message(message);
         match self.capabilities().conveniences.forwarded {
-            ForwardedFlagShape::Keyword => self.set_keyword(target, "$forwarded".to_string(), true),
+            ForwardedFlagShape::Keyword => self.set_keyword(target, "$forwarded".into(), true),
             ForwardedFlagShape::ExtendedProperty => self.set_extended_property(
                 target,
                 "PR_LAST_VERB_EXECUTED".to_string(),
@@ -1508,7 +1506,7 @@ pub trait Account: Send + Sync {
         const MDN_SENT_KEYWORD: &str = "$MDNSent";
         let target = MutationTarget::Message(message);
         if self.capabilities().conveniences.mdn_sent_via_keyword {
-            return self.set_keyword(target, MDN_SENT_KEYWORD.to_string(), true);
+            return self.set_keyword(target, MDN_SENT_KEYWORD.into(), true);
         }
 
         let error = AccountError::unsupported(AccountOperation::MarkMdnSent, self.protocol());
@@ -1677,7 +1675,9 @@ fn dispatch_label<T: Account + ?Sized>(
         (ContainerKind::Label, ProtocolKind::Graph) => {
             receiver.set_category(target, label.provenance.native, value)
         }
-        (ContainerKind::Label, _) => receiver.set_keyword(target, label.provenance.native, value),
+        (ContainerKind::Label, _) => {
+            receiver.set_keyword(target, label.provenance.native.into(), value)
+        }
         (ContainerKind::Folder, ProtocolKind::Graph) => {
             receiver.set_category(target, label.provenance.native, value)
         }

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::client::Resource;
 use crate::etag::GraphETag;
 use crate::origin::AdmittedUrl;
-use crate::paging::DirectoryMode;
+
 use crate::types::ODataCollection;
 
 use super::GraphAccount;
@@ -62,10 +62,16 @@ pub(crate) async fn address_books_list(
     Ok(books)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum DirectoryMode {
+    Search,
+    Filter,
+}
+
 pub(crate) async fn list(
     account: GraphAccount,
     address_book: Option<AddressBookId>,
-    page_cursor: Option<Vec<u8>>,
+    page_cursor: Option<bifrost_types::PageCursor>,
 ) -> Result<Page<ContactCard>, AccountError> {
     contact_page(account, address_book, page_cursor, 250).await
 }
@@ -73,7 +79,7 @@ pub(crate) async fn list(
 async fn contact_page(
     account: GraphAccount,
     address_book: Option<AddressBookId>,
-    page_cursor: Option<Vec<u8>>,
+    page_cursor: Option<bifrost_types::PageCursor>,
     top: u32,
 ) -> Result<Page<ContactCard>, AccountError> {
     if let Some(folder) = address_book
@@ -92,7 +98,7 @@ async fn contact_page(
     };
     let page: ODataCollection<GraphContact> =
         get_page(&account, Resource::Outlook, &url, operation).await?;
-    let next_cursor = link_cursor(admit_next(&account, &page, operation)?);
+    let next_cursor = link_cursor(admit_next(&account, &page, operation)?, operation);
     Ok(Page {
         truncated: false,
         items: page.value.into_iter().map(contact_from_graph).collect(),
@@ -346,11 +352,13 @@ pub(crate) async fn search(
                 if items.len() == limit {
                     let consumed = index + 1;
                     next_cursor = if consumed < page_len {
-                        Some(crate::paging::encode_paged_cursor(&url, consumed))
+                        Some(crate::paging::encode_paged_cursor(
+                            &url, consumed, operation,
+                        ))
                     } else {
                         next_link
                             .as_ref()
-                            .map(|next| crate::paging::encode_paged_cursor(next, 0))
+                            .map(|next| crate::paging::encode_paged_cursor(next, 0, operation))
                     };
                     return Ok(Page {
                         truncated: false,
@@ -395,7 +403,7 @@ pub(crate) async fn directory_search(
     account: GraphAccount,
     query: String,
     limit: Option<u32>,
-    page_cursor: Option<Vec<u8>>,
+    page_cursor: Option<bifrost_types::PageCursor>,
 ) -> Result<Page<DirectoryCard>, AccountError> {
     let limit_cap = limit
         .and_then(|limit| usize::try_from(limit).ok())
@@ -405,9 +413,11 @@ pub(crate) async fn directory_search(
     let resumed = page_cursor.is_some();
     let top = top_for_limit(limit, 999);
     let (mut url, mut skip, mut mode) =
-        match crate::paging::decode_directory_cursor(&account.client, page_cursor)
-            .map_err(|detail| graph_error::invalid_account_error(operation, detail))?
-        {
+        match crate::paging::decode_directory_cursor(&account.client, page_cursor).map_err(
+            |detail| {
+                AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, detail)
+            },
+        )? {
             Some(position) => position,
             None => {
                 let mode = if query.trim().is_empty() {
@@ -792,29 +802,34 @@ pub(crate) fn admit_next<T>(
         .map_err(|error| into_error(error, operation))
 }
 
-/// A list surface's `next_cursor`: the admitted link's bytes.
-pub(crate) fn link_cursor(next: Option<AdmittedUrl>) -> Option<Vec<u8>> {
-    next.map(|next| next.as_str().as_bytes().to_vec())
+/// A list surface's `next_cursor`: its tagged, admitted link.
+pub(crate) fn link_cursor(
+    next: Option<AdmittedUrl>,
+    operation: AccountOperation,
+) -> Option<bifrost_types::PageCursor> {
+    next.map(|next| crate::paging::encode_cursor(operation, &next.as_str()))
 }
 
-/// Decode a caller's bare link cursor; a refusal is the caller's malformed
+/// Decode a caller's tagged link cursor; a refusal is the caller's malformed
 /// input.
 pub(crate) fn decode_link_cursor(
     account: &GraphAccount,
-    page_cursor: Option<Vec<u8>>,
+    page_cursor: Option<bifrost_types::PageCursor>,
     operation: AccountOperation,
 ) -> Result<Option<AdmittedUrl>, AccountError> {
-    crate::paging::decode_link_cursor(&account.client, page_cursor)
-        .map_err(|detail| graph_error::invalid_account_error(operation, detail))
+    crate::paging::decode_link_cursor(&account.client, page_cursor, operation).map_err(|detail| {
+        AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, detail)
+    })
 }
 
 fn decode_paged_cursor(
     account: &GraphAccount,
-    page_cursor: Option<Vec<u8>>,
+    page_cursor: Option<bifrost_types::PageCursor>,
     operation: AccountOperation,
 ) -> Result<Option<(AdmittedUrl, usize)>, AccountError> {
-    crate::paging::decode_paged_cursor(&account.client, page_cursor)
-        .map_err(|detail| graph_error::invalid_account_error(operation, detail))
+    crate::paging::decode_paged_cursor(&account.client, page_cursor, operation).map_err(|detail| {
+        AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, detail)
+    })
 }
 
 fn contacts_url(account: &GraphAccount, address_book: Option<&AddressBookId>, top: u32) -> String {
@@ -1630,14 +1645,52 @@ mod tests {
         );
     }
 
+    /// A valid contacts nextLink used to pass the directory decoder's
+    /// bare-link fallback and select the wrong collection.
+    #[tokio::test]
+    async fn contact_list_cursor_cannot_resume_directory_search() {
+        let (client, account) = test_account();
+        client.script_rest([crate::client::ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({"value": [], "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/contacts?$skiptoken=next"}),
+        )]);
+        let cursor = list(account.clone(), None, None)
+            .await
+            .expect("contacts page")
+            .next_cursor
+            .expect("continuation");
+        let error = directory_search(account, "Ada".into(), None, Some(cursor))
+            .await
+            .expect_err("a contacts cursor cannot select the directory request URL");
+        assert_eq!(error.operation(), Some(AccountOperation::DirectorySearch));
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Request(bifrost_types::RequestCause::InvalidArgument {
+                field: Some("page_cursor"),
+                ..
+            })
+        )));
+        assert_eq!(
+            client.wire_attempts(),
+            1,
+            "only the contacts page was fetched"
+        );
+    }
+
     /// The token leak: a caller's page cursor naming another origin was
     /// fetched verbatim with the account bearer. Every cursor-taking list
     /// and search surface refuses it before any request, as the caller's
     /// malformed input.
     #[tokio::test]
     async fn a_foreign_origin_page_cursor_is_refused_before_any_request() {
-        let foreign = b"https://elsewhere.example/v1.0/me/contacts?$skiptoken=x".to_vec();
-        let paged = br#"{"url":"HTTPS://elsewhere.example/v1.0/users","skip":1}"#.to_vec();
+        let foreign: bifrost_types::PageCursor =
+            b"https://elsewhere.example/v1.0/me/contacts?$skiptoken=x"
+                .to_vec()
+                .into();
+        let paged: bifrost_types::PageCursor =
+            br#"{"url":"HTTPS://elsewhere.example/v1.0/users","skip":1}"#
+                .to_vec()
+                .into();
         let (client, account) = test_account();
         client.script_rest([]);
 

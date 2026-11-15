@@ -5,8 +5,8 @@ use std::time::Instant;
 use futures::StreamExt as _;
 
 use bifrost_types::{
-    AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream, Batch, BlobHandle,
-    ByteRange, Cause, ObjectId, PageBoundary, Protocol, RequestCause, ResourceKind, SyncEvent,
+    AccountOperation, AccountStream, Batch, BlobHandle, ByteRange, ObjectId, PageBoundary,
+    SyncEvent,
 };
 
 use crate::blob::BlobRef;
@@ -158,20 +158,10 @@ pub(crate) fn open_raw_rfc822<T: BlobTransport>(
             .and_then(|email| email.blob_id().cloned());
         let Some(blob_id) = blob_id else {
             // Email present but `blobId` is `None`: no transport error to
-            // convert, so build the NotFound directly. `terminated_unsupported`
+            // convert, so classify the missing blob locally. `terminated_unsupported`
             // would be wrong - the operation is supported; the
             // whole-message blob is missing.
-            let err = AccountErrorBuilder::new(
-                AccountErrorKind::NotFound(ResourceKind::Message),
-                Cause::Request(RequestCause::NotFound {
-                    what: ResourceKind::Message,
-                    id: Some(message.0.clone()),
-                }),
-            )
-            .operation(AccountOperation::OpenRawRfc822)
-            .protocol(Protocol::Jmap)
-            .try_build()
-            .expect("valid account error classification");
+            let err = super::error::raw_message_not_found(&message.0);
             yield super::error::terminated(err);
             return;
         };

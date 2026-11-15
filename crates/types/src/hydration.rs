@@ -96,7 +96,7 @@ pub struct Message {
     /// Containers (folders, labels, mailboxes) the message is in.
     pub containers: Vec<ContainerId>,
     /// Keywords / flags currently set on the message.
-    pub flags: std::collections::HashSet<String>,
+    pub flags: crate::FlagSet,
     /// Message importance. The uniform, exclusive importance bit:
     /// Graph maps its `low|normal|high` wire field; JMAP/IMAP map the
     /// `$important` keyword (present -> `High`, absent -> `Normal`);

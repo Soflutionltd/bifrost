@@ -590,12 +590,22 @@ impl Account for HealAccount {
         })
     }
 
+    fn push_lanes(&self) -> Vec<bifrost_types::PushLaneSpec> {
+        common::StubAccount::registration_lanes()
+    }
+
     fn push_stream(
         &self,
         lane: bifrost_types::PushLane,
-        _stop: bifrost_types::SessionStop,
+        stop: bifrost_types::SessionStop,
         _gate: bifrost_types::PushGate,
     ) -> AccountStream<bifrost_types::PushSessionEvent> {
+        if lane == bifrost_types::PushLane(0) {
+            return Box::pin(stream::once(async move {
+                stop.stopped().await;
+                bifrost_types::PushSessionEvent::Ended(bifrost_types::PushSessionEnd::Stopped)
+            }));
+        }
         Box::pin(futures::stream::iter([
             bifrost_types::PushSessionEvent::Failed(bifrost_types::push_lane_contract_error(
                 self.protocol(),
@@ -686,7 +696,7 @@ impl Account for HealAccount {
     fn set_keyword(
         &self,
         _target: MutationTarget,
-        _keyword: String,
+        _keyword: bifrost_types::Flag,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetKeyword)) })
@@ -932,7 +942,7 @@ impl Account for HealAccount {
     fn contacts_list(
         &self,
         _address_book: Option<AddressBookId>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         if !self.degraded_contacts {
             // A successful page with both lanes empty - the shape that
@@ -994,7 +1004,7 @@ impl Account for HealAccount {
         &self,
         _query: String,
         _limit: Option<u32>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryCard>, AccountError>> {
         Box::pin(async {
             Err(unsupported(
@@ -1005,7 +1015,7 @@ impl Account for HealAccount {
 
     fn directory_groups_list(
         &self,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroup>, AccountError>> {
         Box::pin(async {
             Err(unsupported(
@@ -1017,7 +1027,7 @@ impl Account for HealAccount {
     fn directory_group_expand(
         &self,
         _group: bifrost_types::DirectoryGroupId,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroupMember>, AccountError>> {
         Box::pin(async {
             Err(unsupported(

@@ -30,7 +30,7 @@ SyncEngine
     Scheduler (four-lane: Foreground / Normal / Background / Bulk)
     BudgetGate (global + per-account semaphores)
     CursorRegistry (scope -> cursor; membership index)
-    LaneGate (per account; the backfill bound's wait plus its admission)
+    BackfillBound (per account; the backfill bound's wait plus its admission)
     CheckpointStore (consumer-provided; InMemoryCheckpointStore for tests)
     InvalidationSinkInner (per-account SinkTargets)
     SubscriptionRegistry (per-engine push subscription handles)
@@ -39,6 +39,17 @@ SyncEngine
 `slot.current` is `ArcSwap<Arc<dyn Account>>` so reopens are
 visible to spawned tasks immediately: every iteration calls
 `current.load_full()`. No `RwLock` on the hot path.
+
+The engine uses distinct names for three independent mechanisms:
+`cursor::coverage::PublicationStream` keys publication supersession and
+acknowledgement, `engine::backfill_bound::BackfillBound` waits for unread-page
+capacity and manages scheduler admission, and `push::supervisor::PushSupervisor`
+owns push sessions and their recovery. `control::DurableStream` keys durable
+checkpoint snapshots by scope and partition. Scheduler lanes remain priority
+queues;
+`bifrost_types::PushLane` and `PushLaneKind` identify protocol push sessions.
+The backfill setting `BackfillConfig::lane_capacity` limits unread pages,
+while `EngineConfig::lane_capacity` bounds each scheduler queue.
 
 ## Construction
 
@@ -146,7 +157,7 @@ engine.shutdown().await?; // explicit cleanup; preferred over Drop
    backfill orchestrator, deferred-inventory worker (if any),
    reopen listener, bandwidth feed (if a meter is wired). Store
    all `WorkerTask`s. The push lane supervisor parks while
-   `PushCapability::None` and wakes on the reopen-generation signal,
+   `effective_push_lanes` is empty and wakes on the reopen-generation signal,
    so a capability change does not require spawning a new task.
 7. Return `SyncControl`.
 
@@ -959,7 +970,8 @@ carries no tag yields `Protocol::Unknown` rather than a guess.
 outright**, and the reason is about the bound rather than about envelopes. Both
 register the publication and then use the unstamped change delivery, so an entry created
 there is never stamped with a delivery, and an unsent stamp is deliberately
-never swept. A `Lane::Backfill` entry minted that way would sit charged against
+never swept. A `PublicationStream::Backfill` entry minted that way would sit
+charged against
 the account's backfill bound until an acknowledgement, a lag or a reset freed
 it: a permanent slot of the bound spent per scope. No provider in this workspace
 attaches one, so refusing costs nothing real. Fusion fails the inventory pass,
@@ -1076,7 +1088,7 @@ remain readable afterward. The engine cannot replay the overwritten
 batches in-session, but it never presents that loss as success.
 `account_changes_observer` returns the same type in its observer role: same
 events, same lag warning shape, but the engine never waits on it and its lag
-abandons nothing (see the consumer contract under "Bounded backfill lane").
+abandons nothing (see the consumer contract under "Backfill flow control").
 
 Observing a lag on the ACKNOWLEDGING receiver also abandons the account's
 outstanding checkpoint publications through the per-account `Publications`
@@ -1095,7 +1107,7 @@ costs a re-walk; over-reporting it loses objects nobody sees again.
 Surfacing lag without this
 would turn silent in-session loss into a permanent hang. Abandonment is also
 what frees the account's backfill bound, because that bound IS the set of
-outstanding boundary registrations (see "The bounded backfill lane"); no second
+outstanding boundary registrations (see "Backfill flow control"); no second
 step is needed here, and an earlier revision that kept a separate permit map did
 need one. The cost is
 bounded and disclosed: a registration whose batch is still in the ring
@@ -1484,7 +1496,7 @@ ack writer: it calls `SyncControl::record_checkpoint` after the
 consumer-acked `put_backfill` lands, so waiters wake on a durable,
 consumer-acknowledged boundary - identical to the change-cursor path.
 
-### The bounded backfill lane
+### Backfill flow control
 
 Backfill publications are flow controlled; live changes are not. Before
 publishing a page the runner waits until the account has fewer than
@@ -1528,7 +1540,7 @@ page that reaches no numbered reader advances the undelivered watermark.
 an unreachable marker returns `Withheld`, never `Published`. A user must get a
 retry rather than a completed folder whose inventory reached nobody.
 
-A runner's optional lane controls capacity and scheduler admission only. Fence
+A runner's optional bound controls capacity and scheduler admission only. Fence
 registration, removal validation, debt routing and poll cancellation do not
 change when it is omitted. Fusion has no optional safety services or broadcast
 mode. Tests can serve the required writer channel with an in-process double and
@@ -1565,7 +1577,7 @@ site flip one into the other. Pinned by
 second such receiver for a UI and stops polling it holds up to `lane_capacity`
 pages unread for the life of the attachment and parks cold start permanently.
 That stall reports nothing on its own - the departure warning fires on drop and
-the lag warning on poll, and this receiver does neither - so `LaneGate` warns on
+the lag warning on poll, and this receiver does neither - so `BackfillBound` warns on
 `bifrost.sync.backfill` when a park BEGINS, at most once per 30s per account,
 naming the account, the charged scopes and the receiver sequences holding the
 charge (`PendingCoverage::backfill_charge_holders`). A receiver that only
@@ -1639,8 +1651,8 @@ unchanged.
 in-flight count is the sum over its live backfill `BoundaryEntry`s in
 `PendingCoverage`, each charging one for itself and one per page it superseded,
 counting only the pages some live numbered receiver could still be holding in
-the ring. `engine/lane.rs` holds no
-ledger: `LaneGate` is the wait plus the
+the ring. `engine/backfill_bound.rs` holds no
+ledger: `BackfillBound` is the wait plus the
 account's scheduler admission. A first design kept a permit map beside the
 ledger, and two reviews found the same defect four times over, the two
 structures disagreeing about what was in flight. There is no separate release
@@ -1692,7 +1704,8 @@ Under the bare rule one partition could publish
 without limit while holding one record. The survivor therefore inherits the
 charge of what it displaced (`BoundaryEntry::subsumed`, each page with its own
 delivery stamp), and acknowledging a superseded id settles exactly that page.
-Only the backfill lane inherits: `Lane::Change` never consults the bound, and
+Only the backfill stream inherits: `PublicationStream::Change` never consults
+the bound, and
 inheriting there would let a subscriber that drains without acknowledging grow
 one entry's history without limit.
 
@@ -1705,7 +1718,7 @@ the runner turns into a failed partition on the rescan ramp; it is never read
 as `WaitFailed::ShuttingDown`, which would retire the whole orchestrator. The
 completion marker takes no admission at all (`wait_for_capacity`): it does no
 wire work and is emitted after the partition pass has handed its permit back.
-A `LanePermit` drop guard also releases the gate's stored permit when the
+A `BackfillPermit` drop guard also releases the gate's stored permit when the
 partition future is cancelled. Capacity wakeup resumes the same already-open
 stream with its original activity, account and publication fence; it does not
 start a new drive or load a replacement account. Its low-level refused
@@ -1764,7 +1777,8 @@ changes on a one-permit budget, no loss or duplication through an 8-slot ring, a
 completed walk not stranding admission, the eager-acker bound-of-one walk,
 detach while parked, the receiver replaced while parked, the retained receiver
 seeing `Closed`, and the live driver's refusal of a backfill checkpoint), the
-gate's unit tests in `engine/lane.rs`, `tests/backfill_scope_fence.rs` (the
+gate's unit tests in `engine/backfill_bound.rs`, `tests/backfill_scope_fence.rs`
+(the
 between-partitions reset, staged through an account pause - `run_partition`
 holds the control's activity guard for a whole pass, so a `pause()` that returns
 has proved the producer is parked at the top of the NEXT partition with no page
@@ -2129,9 +2143,14 @@ work sweeps before the task waits, so resuming needs no additional hint.
 Parked, deleted and refused scopes discharge their work rather than spin.
 Account errors from drives enter the same recovery path as stream terminations.
 
-`PushLanes` owns the session set for each account generation. It runs lanes
-concurrently, applies their declared backoff and account holds, routes every
-unit/session failure, and resets failure counts only on `Healthy`. Counts
+`PushSupervisor` owns the session set for each account generation. It runs lanes
+selected by `bifrost_types::effective_push_lanes`, the same decision used to
+seed push health and carry subscriptions across reattach. A disabled capability
+or an empty declared lane list means no sessions and no recreated subscriptions;
+old subscriptions still receive teardown and scopes remain polled.
+It runs selected lanes concurrently, applies their declared backoff and account
+holds, routes every unit/session failure, and resets failure counts only on
+`Healthy`. Counts
 cross replacement generations. Connection coverage losses owe a full reconcile
 at the next establishment; Registration cutover debt is reconciled at lane
 start. Terminal Connection failures broadcast once and park until topology or
@@ -3480,11 +3499,13 @@ propagate as an ordinary establish failure - three burnt reopen
 attempts, a broadcast `Terminated`, and the undecodable row still on
 disk for the next attach to trip over identically.
 
-`ObjectType` and `ProtocolKind` tags are encoded by exhaustive methods in
-bifrost-types. A new variant requires a storage tag at compile time. Unknown
-`CursorScope` variants still panic in `encode_scope` and need a codec update.
-Decoding the reserved tag `0xFF`, written by an older engine revision, yields
-`Error::SchemaIncompatible` so those rows still heal.
+The cursor envelope implementation lives in `bifrost_types::wire::cursor`,
+including checkpoint dispatch, scope and tag codecs, and migration. Sync
+re-exports the encoding API and maps shared decode errors to its existing
+`Error` contract. Every shared enum encoder matches exhaustively in its owning
+crate, so new checkpoint or scope variants require an explicit representation
+at compile time. Decoding the reserved tag `0xFF`, written by an older engine
+revision, still yields `Error::SchemaIncompatible` so those rows heal.
 
 Every encoded length is checked against `u32::MAX`. An impossible
 larger in-memory field panics at the encoding boundary instead of
@@ -3666,12 +3687,17 @@ full evidence and are persistence interfaces, not unconditional telemetry
 exports. The default debt snapshot is for user inspection, not telemetry:
 telemetry must still exclude all free-form text, including user-safe text.
 
-The `AccountOperation::ledger_tag`, `ObjectType::cursor_tag` and
-`ProtocolKind::cursor_tag` encoders live in bifrost-types, with exhaustive
-matches so a new variant cannot silently acquire a panic in the writer or
-consumer store. Existing numeric tags remain unchanged; sync retains the
-version-aware decoders. Other vocabulary codecs still require explicit updates
-when bifrost-types grows a variant.
+`bifrost_types::wire::ledger` owns the shared vocabulary codecs: error kinds
+and scopes, operations, providers, protocols, resources, diagnostics, coverage
+domains and repair targets. Its enum encoders, including nested kinds and text
+visibility, are exhaustive in the defining crate. Its decoders retain all
+historical minimum-version checks. Sync composes these with ledger-owned
+entries, barriers, proofs, policy, audit and budget sections through the shared
+`wire::Reader`; no shared enum encoder has a fallback panic. The existing bytes,
+ledger version 12 and readable window 3 through 12 are unchanged. Future shared
+tag additions advance `wire::ledger::VOCABULARY_VERSION` beyond the enclosing
+ledger version; a compile-time assertion requires sync to adopt that version.
+Shared malformed-input and schema errors preserve sync's existing classifications.
 
 `DebtLedger::from_parts` is the only door into the private maps that is not
 `ingest`, and it is crate-private for the reason the fields are: no protocol
@@ -4175,10 +4201,10 @@ crates/sync/src/
     context.rs            // SlotContext: the slot-wide handle bundle
                           // every spawned worker shares, plus
                           // `recovery()` which borrows it as a
-                          // RecoveryContext and `lane_gate()` which
+                          // RecoveryContext and `backfill_bound()` which
                           // borrows it as the backfill producer's door
-                          // onto the bounded lane
-    lane.rs               // LaneGate + BackfillAdmission + WaitFailed.
+                          // onto the backfill bound
+    backfill_bound.rs     // BackfillBound + BackfillAdmission + WaitFailed.
                           // The backfill bound itself lives on the
                           // publication records in PendingCoverage, so
                           // this module keeps no ledger: it is the wait
@@ -4259,7 +4285,7 @@ crates/sync/src/
   push/
     mod.rs                // InvalidationSinkInner, synchronous controls
     ingress.rs            // Bounded pending invalidation intent
-    lanes.rs              // Session supervision, pacing, generation drain
+    supervisor.rs         // Session supervision, pacing, generation drain
     health.rs             // Retained per-lane coverage state
     reconciler.rs         // Retained work set -> changes_stream
     subscription.rs       // SubscriptionRegistry (per-engine DashMap)
@@ -4278,7 +4304,7 @@ crates/sync/src/
                           // capacity (`backfill_in_flight`,
                           // `await_backfill_capacity`,
                           // `release_undelivered`)
-    envelope.rs           // MIN_MIGRATABLE / ENGINE_VERSION + migrations
+    envelope.rs           // types-owned cursor codec + engine error translation
     ledger.rs             // DebtLedger: entries, barriers, retained proofs,
                           // compacted discharge audit, folded parent links
     ledger_envelope.rs    // encode_ledger / decode_ledger + error digest
@@ -4311,14 +4337,13 @@ crates/sync/tests/
                               // while parked)
 ```
 
-### Published surface the bounded lane added
+### Published backfill flow-control surface
 
-Listed because the standing rule - a change that removes or renames a published
-item stops and asks the repository owner - needs a list to protect, and these are
-not obvious from the module names above. `engine::lane` is a PUBLIC module
-(`LaneGate`, `BackfillAdmission`, `WaitFailed`, `DEFAULT_BACKFILL_LANE_CAPACITY`),
-public because `BackfillRunner::run_partition` is public and gained two
-parameters, a `LaneGate` and a `ChangeDelivery`. `LaneGate::wake` within it has
+`engine::backfill_bound` is public because the public
+`BackfillRunner::run_partition` accepts an optional `BackfillBound`. The module
+also exposes `BackfillAdmission`, `WaitFailed` and `DEFAULT_BACKFILL_CAPACITY`.
+These names describe producer flow control separately from scheduler priority
+lanes and protocol push lanes. `BackfillBound::wake` has
 no in-engine caller - teardown pulses the slot's
 `PendingCoverage::wake_capacity` directly, having the coverage and no gate - and
 is kept as published surface rather than removed, the same standing as
@@ -4702,9 +4727,9 @@ Cursor and backfill inspection contracts:
   Crossing also preserves the retained decision when restoring an older
   snapshot that contains both forms of the key. The operator's accepted loss
   must not silently revert to automatic debt on the next walk.
-- `LaneGate::clone` shares account capacity and warning state but allocates an
+- `BackfillBound::clone` shares account capacity and warning state but allocates an
   independent `BackfillAdmission` permit slot. A clone represents another pass;
-  use an `Arc<LaneGate>` to share the same pass with a helper task.
+  use an `Arc<BackfillBound>` to share the same pass with a helper task.
 - Account writers bind every issued acknowledgement receipt to their account
   id and check that binding before resolving live claims or restart replay.
   Acknowledgement token format version 2 authenticates this account id.

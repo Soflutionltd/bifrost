@@ -34,6 +34,7 @@ fn pushing(label: &str, log: &Arc<PushLog>, failures: usize) -> Arc<StubAccount>
     caps.push = PushCapability::Webhook;
     Arc::new(StubAccount {
         caps,
+        push_lane_specs: StubAccount::registration_lanes(),
         push_label: label.to_owned(),
         push_log: Arc::clone(log),
         push_unsubscribe_failures: AtomicUsize::new(failures),
@@ -290,6 +291,7 @@ fn strict_refusing(label: &str, log: &Arc<PushLog>, refused: &[&str]) -> Arc<Stu
     caps.push = PushCapability::Webhook;
     Arc::new(StubAccount {
         caps,
+        push_lane_specs: StubAccount::registration_lanes(),
         push_label: label.to_owned(),
         push_log: Arc::clone(log),
         push_unsubscribe_refused: refused.iter().map(|h| (*h).to_owned()).collect(),

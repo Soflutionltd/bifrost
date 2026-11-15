@@ -1398,6 +1398,14 @@ discovery ordering remain unchanged.
 
 ### Error translation
 
+`sync/error.rs` owns local account-error classification and builder decoration
+under `#![warn(dead_code)]`. Capability validation, persisted cursor faults,
+caller-owned paging, blob misses, PIM refusals, partial-commit attachment and
+push replay decoration all route through it. Shared constructors and recovery
+rules remain owned by `bifrost-types`; call sites pass observations and context
+rather than constructing kinds and causes themselves. Existing hermetic tests
+exercise these paths through their capability, paging, PIM and push callers.
+
 `sync/error.rs::into_account_error(error, ctx)` is the single translation boundary: it consumes `crate::Error` plus a `JmapErrorContext { operation, scope, .. }` and emits an `AccountError` via `AccountErrorBuilder`, routing `(AccountErrorKind, Cause)` plus operation, scope, and any `AttemptCause` through `bifrost-types::recovery::derive` (central `RecoveryClass`; no private `to_recovery` table).
 
 The request contract is one of `Plain`, `StateRead(CursorScope)`,
@@ -1826,10 +1834,10 @@ false when the server omits the optional sharing right.
 
 `core/session.rs` owns core object-limit decoding (`CoreLimits`), required-field
 validation (`validated_core_limits`) and upload-size validation.
-`sync/capabilities.rs` maps the three protocol validation failures (absent,
-malformed and unusable) to account errors, and owns the local set batch
-ceiling of 500 and the 100 ms batching wait. Capability advertisement and both
-bulk mutation streams use the same set-size function; hydration uses the same
+`sync/error.rs` maps the three protocol validation failures (absent, malformed
+and unusable) to account errors. `sync/capabilities.rs` invokes this boundary
+and owns the local set batch ceiling of 500 and the 100 ms batching wait.
+Capability advertisement and both bulk mutation streams use the same set-size function; hydration uses the same
 wait constant. Bare protocol Account doors read their own session through the protocol-owned
 `Session::object_limits` accessor via the capabilities helpers. Those handles do not carry the validated sync slot;
 using the primary slot for a routed foreign handle would obscure that boundary.

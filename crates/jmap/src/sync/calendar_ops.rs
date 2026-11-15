@@ -14,13 +14,17 @@
 
 use crate::calendar_event::value::{Duration as CalendarDuration, LocalDateTime};
 
+use super::error::invalid_argument as malformed_time;
+
+#[cfg(test)]
+use bifrost_types::AccountErrorKind;
+
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFuture, AccountOperation,
-    AttendeeRole, Calendar, CalendarEvent, CalendarId, CalendarProvenance, Cause, DiagnosticText,
-    EventAttendee, EventAvailability, EventCreate, EventId, EventOrganizer, EventPatch, EventRange,
-    EventRecurrence, EventReminder, EventSearchRequest, EventStatus, EventTime, EventVisibility,
-    Page, Protocol, ProtocolKind, ReminderRelativeTo, ReminderTrigger, RequestCause,
-    RequestErrorKind, RsvpStatus,
+    AccountError, AccountFuture, AccountOperation, AttendeeRole, Calendar, CalendarEvent,
+    CalendarId, CalendarProvenance, EventAttendee, EventAvailability, EventCreate, EventId,
+    EventOrganizer, EventPatch, EventRange, EventRecurrence, EventReminder, EventSearchRequest,
+    EventStatus, EventTime, EventVisibility, Page, ProtocolKind, ReminderRelativeTo,
+    ReminderTrigger, RsvpStatus,
 };
 use jiff::tz::{Offset, TimeZone};
 use jiff::{Span, Timestamp, civil};
@@ -1746,24 +1750,6 @@ fn validate_start(
     Ok(())
 }
 
-fn malformed_time(
-    operation: AccountOperation,
-    field: &'static str,
-    message: String,
-) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::InvalidArgument {
-            field: Some(field),
-            message: Some(DiagnosticText::support_only(message)),
-        }),
-    )
-    .protocol(Protocol::Jmap)
-    .operation(operation)
-    .try_build()
-    .expect("valid account error classification")
-}
-
 /// The JSCalendar `duration` for a shared start and (exclusive) end.
 ///
 /// Both bounds must parse and the end must not precede the start; anything
@@ -2944,7 +2930,7 @@ mod tests {
 
     /// Build a page cursor the way a real page would have minted it, so no
     /// test hand-writes the encoding.
-    fn page_cursor(anchor: &str, query_state: &str) -> Vec<u8> {
+    fn page_cursor(anchor: &str, query_state: &str) -> bifrost_types::PageCursor {
         CalendarPages::next_cursor(
             None,
             0,
@@ -3188,7 +3174,7 @@ mod tests {
 
     async fn walk_range(
         transport: &ScriptedQueryTransport,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> Result<Page<CalendarEvent>, AccountError> {
         events_in_range(
             Some(transport.account()),
@@ -3230,7 +3216,7 @@ mod tests {
         ]);
 
         let mut seen: Vec<String> = Vec::new();
-        let mut cursor: Option<Vec<u8>> = None;
+        let mut cursor: Option<bifrost_types::PageCursor> = None;
         loop {
             let page = walk_range(&transport, cursor.take()).await.expect("page");
             seen.extend(page.items.iter().map(|event| event.id.0.clone()));

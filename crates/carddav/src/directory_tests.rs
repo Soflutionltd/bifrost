@@ -443,7 +443,7 @@ async fn directory_empty_cursor_and_false_capability_refuse_locally() {
         .expect("open");
         for query in ["", "   ", "q"] {
             let error = account
-                .directory_search(query.into(), Some(3), Some(vec![255]))
+                .directory_search(query.into(), Some(3), Some(vec![255].into()))
                 .await
                 .expect_err("local refusal");
             if !enabled || query.trim().is_empty() {

@@ -536,7 +536,7 @@ impl Account for ImapAccount {
     fn flag_target(
         &self,
         _target: &ObjectId,
-        observed: &std::collections::HashSet<String>,
+        observed: &bifrost_types::FlagSet,
         op: &bifrost_types::FlagOp,
     ) -> bifrost_types::FlagTargetState {
         inventory::imap_flag_target(observed, op)
@@ -660,7 +660,7 @@ impl Account for ImapAccount {
     fn set_keyword(
         &self,
         target: MutationTarget,
-        keyword: String,
+        keyword: bifrost_types::Flag,
         value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         pim::set_keyword(self.clone(), target, keyword, value)
@@ -887,7 +887,7 @@ impl Account for ImapAccount {
     fn contacts_list(
         &self,
         address_book: Option<AddressBookId>,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         if let Some(contacts) = &self.contacts {
             return contacts.contacts_list(address_book, page_cursor);
@@ -966,7 +966,7 @@ impl Account for ImapAccount {
         &self,
         query: String,
         limit: Option<u32>,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
         if let Some(contacts) = &self.contacts {
             return contacts.directory_search(query, limit, page_cursor);
@@ -976,7 +976,7 @@ impl Account for ImapAccount {
 
     fn directory_groups_list(
         &self,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
         if let Some(contacts) = &self.contacts {
             return contacts.directory_groups_list(page_cursor);
@@ -987,7 +987,7 @@ impl Account for ImapAccount {
     fn directory_group_expand(
         &self,
         group: DirectoryGroupId,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
         if let Some(contacts) = &self.contacts {
             return contacts.directory_group_expand(group, page_cursor);
@@ -2071,7 +2071,7 @@ mod directory_forwarding_tests {
             ..scripted_account_parts(conn, 1)
         });
         let page = account
-            .directory_search("needle".into(), Some(17), Some(vec![4, 2]))
+            .directory_search("needle".into(), Some(17), Some(vec![4, 2].into()))
             .await
             .expect("forward");
         assert_eq!(page.items[0].email, "directory-sentinel@example.test");
@@ -2081,7 +2081,7 @@ mod directory_forwarding_tests {
             Some(DirectoryCall {
                 query: "needle".into(),
                 limit: Some(17),
-                cursor: Some(vec![4, 2]),
+                cursor: Some(vec![4, 2].into()),
             })
         );
     }

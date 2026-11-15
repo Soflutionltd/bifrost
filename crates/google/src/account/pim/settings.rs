@@ -354,7 +354,6 @@ mod tests {
     use bifrost_types::FlagOp;
     use bytes::Bytes;
     use reqwest::StatusCode;
-    use std::collections::HashSet;
 
     #[tokio::test]
     async fn creating_a_label_invalidates_the_vocabulary_cache() {
@@ -385,7 +384,9 @@ mod tests {
         let labels = labels_for_flags(&client, &cache)
             .await
             .expect("the next vocabulary read refreshes");
-        let op = FlagOp::Add(HashSet::from(["$gmail-label:Label_2:New".to_string()]));
+        let op = FlagOp::Add(bifrost_types::FlagSet::from([
+            "$gmail-label:Label_2:New".to_string()
+        ]));
         let patch = flags::translate_flag_op(&op, &labels);
         assert!(patch.unsupported_flags.is_empty());
         assert_eq!(patch.add_label_ids, vec!["Label_2".to_string()]);

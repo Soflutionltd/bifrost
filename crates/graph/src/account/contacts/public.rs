@@ -80,7 +80,7 @@ struct Position {
 pub(super) async fn list(
     account: &GraphAccount,
     folder: &str,
-    cursor: Option<Vec<u8>>,
+    cursor: Option<bifrost_types::PageCursor>,
 ) -> Result<Page<ContactCard>, AccountError> {
     page(
         account,
@@ -112,18 +112,20 @@ pub(super) async fn search(
 async fn page(
     account: &GraphAccount,
     folder: &str,
-    cursor: Option<Vec<u8>>,
+    cursor: Option<bifrost_types::PageCursor>,
     query: Option<&str>,
     limit: usize,
     operation: AccountOperation,
 ) -> Result<Page<ContactCard>, AccountError> {
-    let headers = routing(account, folder, operation).await?;
     let (offset, skip) = if let Some(cursor) = cursor {
-        let position: Position = serde_json::from_slice(&cursor)
-            .map_err(|error| graph_error::invalid_account_error(operation, error.to_string()))?;
+        let position: Position =
+            crate::paging::decode_cursor(&cursor, operation).map_err(|error| {
+                AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, error)
+            })?;
         if position.public_contacts_v1 != folder || position.query.as_deref() != query {
-            return Err(graph_error::invalid_account_error(
+            return Err(AccountError::invalid_page_cursor(
                 operation,
+                bifrost_types::Protocol::Graph,
                 "public contact cursor belongs to another folder",
             ));
         }
@@ -131,6 +133,7 @@ async fn page(
     } else {
         (0, 0)
     };
+    let headers = routing(account, folder, operation).await?;
     let client = super::super::public_folder::ews_client(account)
         .map_err(|error| ews_error(error, operation))?;
     let xml = client
@@ -175,8 +178,9 @@ async fn page(
         );
     }
     if skip > nodes.len() {
-        return Err(graph_error::invalid_account_error(
+        return Err(AccountError::invalid_page_cursor(
             operation,
+            bifrost_types::Protocol::Graph,
             "public contact cursor skips beyond its page",
         ));
     }
@@ -195,13 +199,15 @@ async fn page(
         }
     }
     let next_cursor = resume.map(|(offset, skip)| {
-        serde_json::to_vec(&Position {
-            public_contacts_v1: folder.to_string(),
-            offset,
-            query: query.map(str::to_string),
-            skip,
-        })
-        .expect("serializable public contact position")
+        crate::paging::encode_cursor(
+            operation,
+            &Position {
+                public_contacts_v1: folder.to_string(),
+                offset,
+                query: query.map(str::to_string),
+                skip,
+            },
+        )
     });
     Ok(Page {
         truncated: false,
@@ -735,7 +741,7 @@ Second</t:Street><t:City>London</t:City><t:State>Region</t:State><t:PostalCode>1
             let error = super::super::list(
                 account.clone(),
                 Some(foreign::public_address_book("people")),
-                Some(cursor),
+                Some(cursor.into()),
             )
             .await
             .unwrap_err();
@@ -937,7 +943,7 @@ Second</t:Street><t:City>London</t:City><t:State>Region</t:State><t:PostalCode>1
             .unwrap();
         for cursor in [
             first.next_cursor.clone().unwrap(),
-            b"https://graph.test/v1.0/rest".to_vec(),
+            b"https://graph.test/v1.0/rest".to_vec().into(),
         ] {
             let error = super::super::search(
                 account.clone(),

@@ -281,6 +281,35 @@ face.
 
 Narrow edge cases, audits with no known defect, and design work.
 
+- **The backfill bound docs say an acknowledgement frees capacity; the code
+  frees it on receipt.** `engine/backfill_bound.rs` documents the permit as the
+  consumer's receipt of the page (`ChangesReceiver::note_receipt`), but the
+  `BackfillConfig::lane_capacity` doc in `crates/sync/src/types.rs`, the
+  `readers` field doc in `crates/sync/src/cursor/coverage.rs` and
+  `reference/sync.md` still say "an acknowledgement frees a page for every
+  receiver". Reconcile the prose with the receipt bound (doc-only).
+- **`reference/jmap.md` misstates the `CallNotFound` classification.** It lists
+  `CallNotFound -> Protocol(MissingField)`; `crates/jmap/src/sync/error.rs`
+  maps it to `Protocol(PartialResponse)` with `Acknowledged` transmission
+  evidence (an omitted call is unanswered). Fix the reference.
+- **JMAP raw-message reads collapse two failures into `NotFound(Message)`.**
+  `open_raw_rfc822` in `crates/jmap/src/sync/blob.rs` takes the same
+  `raw_message_not_found` lane when the correlated Email has no `blobId` and
+  when the `Email/get` list does not contain the requested id at all. The
+  second is a server answering a different object than asked, which reads as a
+  contract violation rather than a vanished message. Needs a call on whether to
+  split them.
+- **Cursor envelope decoding accepts trailing bytes.** `parse_envelope` in
+  `crates/types/src/wire/cursor.rs` checks only `bytes.len() < payload_end`,
+  so bytes after the payload are silently ignored rather than refused as
+  `Malformed`. Check the ledger codec for the same shape when fixing.
+- **Reattach and first subscribe disagree on accounts with no push lanes.**
+  Reattach now carries a desired subscription only when
+  `effective_push_lanes` of the replacement is non-empty
+  (`crates/sync/src/engine/reattach.rs`), dropping it otherwise; verify the
+  initial `push_subscribe` path applies the same decision, or a consumer can
+  hold a subscription on one incarnation that the next silently drops.
+
 - **IMAP `draft_send` and `draft_discard` do not check that the handle is a
   draft.** Both decode any `imap2` object id (`crates/imap/src/account/pim.rs`)
   and neither verifies Drafts-folder membership or the `\Draft` flag, so a

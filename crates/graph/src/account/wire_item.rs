@@ -125,9 +125,9 @@ impl<'de> Deserialize<'de> for FlagStatus {
 }
 
 impl CompleteFlags {
-    pub(super) fn tokens(self) -> std::collections::HashSet<String> {
+    pub(super) fn tokens(self) -> bifrost_types::FlagSet {
         use super::flags::GraphFlag;
-        let mut flags = std::collections::HashSet::new();
+        let mut flags = bifrost_types::FlagSet::new();
         if self.is_read {
             flags.insert(GraphFlag::Read.token());
         }

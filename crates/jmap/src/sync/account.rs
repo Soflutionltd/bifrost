@@ -874,10 +874,7 @@ impl Account for JmapAccount {
             return bifrost_types::mutation::versioned_mail_stream(targets, |target| {
                 bifrost_types::mutation::refused_mail_target(
                     target.id,
-                    bifrost_types::AccountError::unsupported(
-                        bifrost_types::AccountOperation::BulkMove,
-                        bifrost_types::Protocol::Jmap,
-                    ),
+                    super::error::unsupported(bifrost_types::AccountOperation::BulkMove),
                 )
             });
         };
@@ -981,7 +978,7 @@ impl Account for JmapAccount {
     fn set_keyword(
         &self,
         target: MutationTarget,
-        keyword: String,
+        keyword: bifrost_types::Flag,
         value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         let mail = self.mail_for_mutation_target(&target);
@@ -1406,7 +1403,7 @@ impl Account for JmapAccount {
     fn contacts_list(
         &self,
         address_book: Option<AddressBookId>,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         contacts::list(self.contacts.clone(), address_book, page_cursor)
     }
@@ -1453,7 +1450,7 @@ impl Account for JmapAccount {
         &self,
         _query: String,
         _limit: Option<u32>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
         let err = super::error::unsupported_error(
             AccountOperation::DirectorySearch,
@@ -1465,7 +1462,7 @@ impl Account for JmapAccount {
 
     fn directory_groups_list(
         &self,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
         let err = super::error::unsupported_error(
             AccountOperation::DirectoryGroupsList,
@@ -1478,7 +1475,7 @@ impl Account for JmapAccount {
     fn directory_group_expand(
         &self,
         _group: DirectoryGroupId,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
         let err = super::error::unsupported_error(
             AccountOperation::DirectoryGroupExpand,
@@ -1605,7 +1602,7 @@ impl Account for JmapAccount {
         label: Label,
     ) -> AccountFuture<Result<(), AccountError>> {
         match label.provenance.kind {
-            ContainerKind::Label => self.set_keyword(target, label.provenance.native, true),
+            ContainerKind::Label => self.set_keyword(target, label.provenance.native.into(), true),
             ContainerKind::Folder => self.add_to_container(target, label.id),
             _ => {
                 let err = super::error::unsupported_error(
@@ -1624,7 +1621,7 @@ impl Account for JmapAccount {
         label: Label,
     ) -> AccountFuture<Result<(), AccountError>> {
         match label.provenance.kind {
-            ContainerKind::Label => self.set_keyword(target, label.provenance.native, false),
+            ContainerKind::Label => self.set_keyword(target, label.provenance.native.into(), false),
             ContainerKind::Folder => self.remove_from_container(target, label.id),
             _ => {
                 let err = super::error::unsupported_error(

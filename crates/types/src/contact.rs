@@ -216,7 +216,7 @@ pub struct ContactPatch {
 pub struct ContactSearchRequest {
     pub query: String,
     pub address_book_id: Option<AddressBookId>,
-    pub page_cursor: Option<Vec<u8>>,
+    pub page_cursor: Option<crate::PageCursor>,
     pub limit: Option<u32>,
 }
 

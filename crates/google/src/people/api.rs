@@ -143,9 +143,7 @@ pub(crate) fn directory_search_url(
         )
     };
     if let Some(cursor) = page_cursor {
-        let token = std::str::from_utf8(cursor).map_err(|error| {
-            caller_input_error(AccountOperation::DirectorySearch, error.to_string())
-        })?;
+        let token = crate::account::page_cursor::token(cursor, AccountOperation::DirectorySearch)?;
         url.push_str("&pageToken=");
         url.push_str(&bifrost_net::url::encode_query_value(token));
     }
@@ -185,9 +183,7 @@ pub(crate) fn search_url(
         url.push_str(&limit.min(30).to_string());
     }
     if let Some(cursor) = request.page_cursor.as_ref() {
-        let token = std::str::from_utf8(cursor).map_err(|error| {
-            caller_input_error(AccountOperation::ContactSearch, error.to_string())
-        })?;
+        let token = crate::account::page_cursor::token(cursor, AccountOperation::ContactSearch)?;
         url.push_str("&pageToken=");
         url.push_str(&bifrost_net::url::encode_query_value(token));
     }
@@ -267,7 +263,10 @@ mod url_tests {
             &ContactSearchRequest {
                 query: "Ada Lovelace".to_string(),
                 address_book_id: None,
-                page_cursor: Some(b"next token".to_vec()),
+                page_cursor: Some(crate::account::page_cursor::encode(
+                    AccountOperation::ContactSearch,
+                    "next token",
+                )),
                 limit: Some(100),
             },
         )
@@ -308,7 +307,10 @@ mod url_tests {
             "https://people.mock.test/v1",
             "Ada Lovelace",
             None,
-            Some(b"tok".as_slice()),
+            Some(&crate::account::page_cursor::encode(
+                AccountOperation::DirectorySearch,
+                "tok",
+            )),
         )
         .expect("url");
 

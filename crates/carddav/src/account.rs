@@ -913,7 +913,7 @@ impl Account for CardDavAccount {
     fn set_keyword(
         &self,
         _target: MutationTarget,
-        _keyword: String,
+        _keyword: bifrost_types::Flag,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         unsupported_future(AccountOperation::SetKeyword)
@@ -1154,7 +1154,7 @@ impl Account for CardDavAccount {
     fn contacts_list(
         &self,
         address_book: Option<AddressBookId>,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         let client = Arc::clone(&self.client);
         let default_addressbook_url = self.default_addressbook_url.clone();
@@ -1459,7 +1459,7 @@ impl Account for CardDavAccount {
         &self,
         query: String,
         limit: Option<u32>,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
         let operation = AccountOperation::DirectorySearch;
         if !self.capabilities.pim_methods.directory_search
@@ -1552,7 +1552,7 @@ impl Account for CardDavAccount {
 
     fn directory_groups_list(
         &self,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
         unsupported_future(AccountOperation::DirectoryGroupsList)
     }
@@ -1560,7 +1560,7 @@ impl Account for CardDavAccount {
     fn directory_group_expand(
         &self,
         _group: DirectoryGroupId,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
         unsupported_future(AccountOperation::DirectoryGroupExpand)
     }
@@ -2141,7 +2141,7 @@ fn cursor_error(message: impl Into<String>) -> AccountError {
 }
 
 fn decode_contact_page_cursor(
-    cursor: Option<Vec<u8>>,
+    cursor: Option<bifrost_types::PageCursor>,
     operation: AccountOperation,
 ) -> Result<Option<String>, AccountError> {
     decode_watermark_cursor(cursor, operation, DavProtocol::CardDav)
@@ -2643,7 +2643,7 @@ mod tests {
         );
         assert_eq!(
             page.next_cursor,
-            Some(b"https://dav.example.test/books/b.vcf".to_vec()),
+            Some(b"https://dav.example.test/books/b.vcf".to_vec().into()),
             "the cursor is the last href served"
         );
         assert_eq!(page.estimated_total, Some(3), "three candidates, not 24");
@@ -2810,7 +2810,7 @@ mod tests {
         );
         assert_eq!(
             page.next_cursor,
-            Some(b"https://dav.example.test/books/a.vcf".to_vec()),
+            Some(b"https://dav.example.test/books/a.vcf".to_vec().into()),
             "the degrade lane keys the cursor on the href too, so a mid-walk \
              degrade neither re-serves nor skips"
         );
@@ -2934,7 +2934,7 @@ mod tests {
         );
         assert_eq!(
             page.next_cursor,
-            Some(b"https://dav.example.test/books/c249.vcf".to_vec()),
+            Some(b"https://dav.example.test/books/c249.vcf".to_vec().into()),
             "a bounded default must hand back a continuation for the remainder"
         );
         assert_eq!(page.estimated_total, Some(300));
@@ -2996,7 +2996,7 @@ mod tests {
         );
         assert_eq!(
             page.next_cursor,
-            Some(b"https://dav.example.test/books/b.vcf".to_vec()),
+            Some(b"https://dav.example.test/books/b.vcf".to_vec().into()),
             "the cursor is the last href served"
         );
         assert_eq!(page.estimated_total, Some(3));
@@ -3040,7 +3040,7 @@ mod tests {
                 query: String::new(),
                 address_book_id: None,
                 limit: Some(2),
-                page_cursor: Some(b"https://dav.example.test/books/b.vcf".to_vec()),
+                page_cursor: Some(b"https://dav.example.test/books/b.vcf".to_vec().into()),
             })
             .await
             .expect("continued page");
@@ -3081,7 +3081,10 @@ mod tests {
             CardDavAccount::for_tests(Arc::new(client), "https://dav.example.test/books/");
 
         let page = account
-            .contacts_list(None, Some(b"https://dav.example.test/books/z.vcf".to_vec()))
+            .contacts_list(
+                None,
+                Some(b"https://dav.example.test/books/z.vcf".to_vec().into()),
+            )
             .await
             .expect("final page");
 
@@ -3364,7 +3367,7 @@ mod tests {
     fn the_contact_page_cursor_carries_the_last_href_served() {
         assert_eq!(
             decode_contact_page_cursor(
-                Some(b"/book/two.vcf".to_vec()),
+                Some(b"/book/two.vcf".to_vec().into()),
                 AccountOperation::ContactsList
             )
             .unwrap(),
@@ -3375,7 +3378,8 @@ mod tests {
             None
         );
         assert!(
-            decode_contact_page_cursor(Some(Vec::new()), AccountOperation::ContactsList).is_err(),
+            decode_contact_page_cursor(Some(Vec::new().into()), AccountOperation::ContactsList)
+                .is_err(),
             "an empty cursor is corrupt, not a restart from the first contact"
         );
     }

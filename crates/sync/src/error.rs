@@ -85,3 +85,13 @@ pub enum Error {
 /// engine's warning surface (currently identical to the types surface)
 /// does not churn import paths.
 pub type Warning = bifrost_types::Warning;
+
+impl From<bifrost_types::wire::DecodeError> for Error {
+    fn from(error: bifrost_types::wire::DecodeError) -> Self {
+        match error {
+            bifrost_types::wire::DecodeError::SchemaIncompatible => Self::SchemaIncompatible,
+            // Preserve malformed-input classification for future shared faults.
+            other => Self::Other(other.to_string()),
+        }
+    }
+}

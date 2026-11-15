@@ -31,7 +31,7 @@ const MEMBER_SELECT: &str = "displayName,mail,userPrincipalName";
 
 pub(crate) async fn directory_groups_list(
     account: GraphAccount,
-    page_cursor: Option<Vec<u8>>,
+    page_cursor: Option<bifrost_types::PageCursor>,
 ) -> Result<Page<DirectoryGroup>, AccountError> {
     let operation = AccountOperation::DirectoryGroupsList;
     let url = match decode_link_cursor(&account, page_cursor, operation)? {
@@ -43,7 +43,7 @@ pub(crate) async fn directory_groups_list(
     };
     let page: ODataCollection<GraphDirectoryGroup> =
         get_page(&account, Resource::Unmetered, &url, operation).await?;
-    let next_cursor = link_cursor(admit_next(&account, &page, operation)?);
+    let next_cursor = link_cursor(admit_next(&account, &page, operation)?, operation);
     Ok(Page {
         truncated: false,
         items: page.value.into_iter().filter_map(classify_group).collect(),
@@ -57,7 +57,7 @@ pub(crate) async fn directory_groups_list(
 pub(crate) async fn directory_group_expand(
     account: GraphAccount,
     group: DirectoryGroupId,
-    page_cursor: Option<Vec<u8>>,
+    page_cursor: Option<bifrost_types::PageCursor>,
 ) -> Result<Page<DirectoryGroupMember>, AccountError> {
     let operation = AccountOperation::DirectoryGroupExpand;
     let url = match decode_link_cursor(&account, page_cursor, operation)? {
@@ -66,7 +66,7 @@ pub(crate) async fn directory_group_expand(
     };
     let page: ODataCollection<GraphGroupMember> =
         get_page(&account, Resource::Unmetered, &url, operation).await?;
-    let next_cursor = link_cursor(admit_next(&account, &page, operation)?);
+    let next_cursor = link_cursor(admit_next(&account, &page, operation)?, operation);
     Ok(Page {
         truncated: false,
         items: page.value.into_iter().filter_map(member_to_row).collect(),
@@ -77,7 +77,7 @@ pub(crate) async fn directory_group_expand(
     })
 }
 
-/// A page cursor is the verbatim `@odata.nextLink` URL as bytes, the same
+/// A page cursor wraps the admitted `@odata.nextLink` in a surface tag, the same
 /// convention `contacts_list` uses, decoded and admitted the same way.
 fn first_page(
     account: &GraphAccount,

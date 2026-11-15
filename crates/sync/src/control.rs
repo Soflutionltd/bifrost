@@ -63,14 +63,16 @@ struct CheckpointSnapshot {
     quiescent: bool,
 }
 
+/// Scope/partition identity for persisted checkpoint snapshots. Publication
+/// supersession and outstanding acknowledgements belong to the coverage ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum DurableLane {
+enum DurableStream {
     Change(CursorScope),
     Backfill(CursorScope, Partition),
     Unkeyed,
 }
 
-impl DurableLane {
+impl DurableStream {
     fn of(checkpoint: &Checkpoint) -> Self {
         match checkpoint {
             Checkpoint::Change(cursor) => Self::Change(cursor.scope.clone()),
@@ -91,7 +93,8 @@ struct SyncControlInner {
     /// Watch channel carrying the latest persisted checkpoint and the
     /// generation in which quiescence was observed.
     checkpoint_tx: watch::Sender<CheckpointSnapshot>,
-    durable: std::sync::Mutex<HashMap<DurableLane, (Option<crate::cursor::AckToken>, Checkpoint)>>,
+    durable:
+        std::sync::Mutex<HashMap<DurableStream, (Option<crate::cursor::AckToken>, Checkpoint)>>,
     /// Monotonic generation counter; bumped by `pause` /
     /// `checkpoint_now` BEFORE flipping the boundary so the waiter
     /// reads the new generation before parking.
@@ -99,12 +102,12 @@ struct SyncControlInner {
     active: AtomicU64,
     /// The per-account publication ledger: coverage claims, boundary
     /// registrations, supersession, lag abandonment and retirement, in
-    /// one place under one lock. At most one boundary per LANE (a
+    /// one place under one lock. At most one boundary per publication stream (a
     /// scope's changes stream, or one backfill partition of a scope).
     /// Every entry leaves through `record_publication` (acked and
     /// durable), `retire_publication` (ack processed but not durable,
     /// or never delivered), abandonment after a subscriber lag, or
-    /// supersession by a newer broadcast in the same lane - so an
+    /// supersession by a newer broadcast in the same stream - so an
     /// unacked batch can never wedge boundary waiters indefinitely.
     publications: Arc<crate::cursor::Publications>,
     priority: watch::Sender<Priority>,
@@ -302,23 +305,23 @@ impl SyncControl {
                 .durable
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let lane = DurableLane::of(&checkpoint);
+            let stream = DurableStream::of(&checkpoint);
             let replace =
                 durable
-                    .get(&lane)
+                    .get(&stream)
                     .is_none_or(|(current, _)| match (&publication, current) {
                         (Some(next), Some(previous)) => next >= previous,
                         // A publication-less announcement replaces
-                        // unconditionally - including a lane snapshot recorded
+                        // unconditionally - including a stream snapshot recorded
                         // under a newer AckToken. No engine path reaches
                         // that today (only the published `record_checkpoint`
                         // foot-gun announces without a publication), but a new
                         // publication-less caller would silently regress the
-                        // lane; guard by ordering if one ever appears.
+                        // stream; guard by ordering if one ever appears.
                         _ => true,
                     });
             if replace {
-                durable.insert(lane, (publication, checkpoint));
+                durable.insert(stream, (publication, checkpoint));
             }
             DurableCheckpointSet::new(
                 durable
@@ -1081,7 +1084,7 @@ mod tests {
         );
     }
 
-    /// Supersession is per lane, per scope and - for backfill - per
+    /// Supersession is per stream, per scope and - for backfill - per
     /// PARTITION. Concurrent work on distinct scopes must each be
     /// tracked, or a pause would report a safe boundary while another
     /// scope's batch is still unacked. Two partitions of ONE scope are

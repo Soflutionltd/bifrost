@@ -1728,7 +1728,7 @@ mod campaign_tests {
                 .bulk_set_flags(
                     &id,
                     vec![ObjectId("requested".into())],
-                    bifrost_types::FlagOp::Add(HashSet::from(["$seen".into()])),
+                    bifrost_types::FlagOp::Add(bifrost_types::FlagSet::from(["$seen".into()])),
                     &vendor,
                     bifrost_types::ProtocolKind::Imap,
                 )
@@ -1781,7 +1781,7 @@ mod campaign_tests {
             .bulk_set_flags(
                 &id,
                 vec![ObjectId("twice".into()), ObjectId("twice".into())],
-                bifrost_types::FlagOp::Add(HashSet::from(["$seen".into()])),
+                bifrost_types::FlagOp::Add(bifrost_types::FlagSet::from(["$seen".into()])),
                 &vendor,
                 bifrost_types::ProtocolKind::Imap,
             )
@@ -1994,7 +1994,7 @@ mod campaign_tests {
                     id: ObjectId("one".into()),
                     expected_version: Some(bifrost_types::ServerVersion::ModSeq(100)),
                 }],
-                bifrost_types::FlagOp::Add(HashSet::from(["$seen".into()])),
+                bifrost_types::FlagOp::Add(bifrost_types::FlagSet::from(["$seen".into()])),
                 &vendor,
                 bifrost_types::ProtocolKind::Imap,
             )

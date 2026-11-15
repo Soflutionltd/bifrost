@@ -10,7 +10,7 @@
 //! batch, and the single durable writer reads it back when the matching
 //! acknowledgement arrives. The record it then writes is still ONE atomic store
 //! operation carrying both cursor and coverage - this map is in-memory engine
-//! state on the path to that write, not a second durable lane.
+//! state on the path to that write, not a second durable stream.
 //!
 //! Losing it on a crash is consistent by construction: if the process dies
 //! before the acknowledgement, the checkpoint never became durable either, so
@@ -53,8 +53,8 @@ use bifrost_types::{Checkpoint, CursorScope, InventoryCoverageReport};
 pub struct PublicationReceipt {
     pub(crate) account: Option<bifrost_types::AccountId>,
     pub(crate) replay: Option<Vec<super::DebtLedger>>,
-    /// The exact checkpoint lane this receipt may acknowledge. `None` is the
-    /// repair lane, which intentionally has no checkpoint.
+    /// The exact checkpoint stream this receipt may acknowledge. `None` is the
+    /// repair stream, which intentionally has no checkpoint.
     pub(crate) checkpoint: Option<Checkpoint>,
     /// The coverage evidence that must land atomically with the checkpoint.
     pub(crate) claim: CoverageClaim,
@@ -65,7 +65,7 @@ pub struct PublicationReceipt {
     /// question it answers - "is the walk this marker concludes still whole?" -
     /// outlives the registration. A transient store failure retires the entry
     /// and the consumer legitimately retries; a later publication on the same
-    /// lane supersedes it. In both cases the entry is gone while the
+    /// stream supersedes it. In both cases the entry is gone while the
     /// acknowledgement is still perfectly valid, and a watermark that vanished
     /// with the entry read as "cannot be vouched for", was refused, and DELETED
     /// the scope's rows underneath a consumer that had done nothing wrong.
@@ -162,7 +162,7 @@ impl std::fmt::Display for PublicationNumber {
 /// a bare `u64` cannot. Accepted residual, not a regression to undo.
 ///
 /// The id's high 32 bits are a per-`PendingCoverage`-instance segment, so a
-/// stale pre-reattach id can never outrank a current one in the durable-lane
+/// stale pre-reattach id can never outrank a current one in the durable-stream
 /// ordering, and [`PendingCoverage::minted_here`] can tell a replay from a
 /// prior attachment apart from anything this one issued.
 ///
@@ -291,23 +291,24 @@ impl CoverageClaim {
 ///
 /// Two jobs, and the second is why this is not just a supersession key.
 ///
-/// It is the supersession key: broadcasts within one lane come from a single
+/// It is the supersession key: broadcasts within one stream come from a single
 /// sequential task, so the newest subsumes its predecessors.
 ///
-/// It is also the ACKNOWLEDGEMENT lane. `ack` derives it from the token
-/// checkpoint, selecting `Repair` when the token carries no checkpoint. A repair acknowledgement naming a checkpoint publication therefore
+/// It is also the ACKNOWLEDGEMENT stream. `ack` derives it from the token
+/// checkpoint, selecting `Repair` when the token carries no checkpoint. A repair
+/// acknowledgement naming a checkpoint publication therefore
 /// finds nothing instead of consuming it - without that check it would consume
 /// the claim, the later real acknowledgement would short-circuit as already
 /// persisted, and the engine would announce a durable boundary the store never
 /// wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Lane {
+enum PublicationStream {
     /// One scope's changes stream. Driven by a single sequential task, so the
     /// newest advance subsumes its predecessors.
     Change(CursorScope),
     /// One backfill PARTITION of one scope. The partition belongs in the key:
     /// two partitions of a scope are explicitly in flight together, neither
-    /// subsumes the other, and folding them into one lane would make
+    /// subsumes the other, and folding them into one stream would make
     /// acknowledging partition A - a batch the consumer really received -
     /// resolve to an unknown publication once B published.
     Backfill(CursorScope, bifrost_types::Partition),
@@ -320,23 +321,25 @@ enum Lane {
     Repair,
 }
 
-/// Which family a lane belongs to, for the invalidations that are about one
+/// Which family a stream belongs to, for the invalidations that are about one
 /// family rather than about the whole scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LaneKind {
+enum PublicationStreamKind {
     Backfill,
     Other,
 }
 
-impl Lane {
-    fn kind(&self) -> LaneKind {
+impl PublicationStream {
+    fn kind(&self) -> PublicationStreamKind {
         match self {
-            Self::Backfill(..) => LaneKind::Backfill,
+            Self::Backfill(..) => PublicationStreamKind::Backfill,
             // Everything that is not a backfill publication. Only `Backfill` is
             // ever asked for by name, so the others share one answer; the day a
             // second family needs narrowing, it gets its own variant and this
             // match tells the compiler where to look.
-            Self::Change(_) | Self::UnkeyedCheckpoint | Self::Repair => LaneKind::Other,
+            Self::Change(_) | Self::UnkeyedCheckpoint | Self::Repair => {
+                PublicationStreamKind::Other
+            }
         }
     }
 
@@ -354,8 +357,8 @@ impl Lane {
         matches!(self, Self::Change(_) | Self::Backfill(..))
     }
 
-    /// The cursor scope whose durable rows this lane writes, if any. Repair and
-    /// unkeyed lanes write no scope-owned row and are therefore never fenced by
+    /// The cursor scope whose durable rows this stream writes, if any. Repair and
+    /// unkeyed streams write no scope-owned row and are therefore never fenced by
     /// a scope reset.
     fn scope(&self) -> Option<&CursorScope> {
         match self {
@@ -372,11 +375,11 @@ impl Lane {
 /// One live publication.
 #[derive(Debug, Clone)]
 struct Publication {
-    lane: Lane,
+    stream: PublicationStream,
     claim: CoverageClaim,
 }
 
-/// One page an entry SUPERSEDED, with the three facts the lane needs about it:
+/// One page an entry SUPERSEDED, with the three facts the stream needs about it:
 /// its identity, its own delivery stamp, and who has read it.
 ///
 /// A tuple carried the first two of these; the receipt bit made the positions
@@ -396,7 +399,7 @@ struct SubsumedPage {
 /// One outstanding boundary registration: a batch the engine has published and
 /// the consumer has not answered for.
 ///
-/// This entry is ALSO the backfill lane's unit of capacity, and that is
+/// This entry is ALSO the backfill stream's unit of capacity, and that is
 /// deliberate rather than convenient. An earlier revision kept a second map of
 /// capacity permits beside this one, keyed and released separately, and two
 /// consecutive cold reviews found the same class of defect four times over: the
@@ -409,11 +412,11 @@ struct SubsumedPage {
 #[derive(Debug, Clone)]
 struct BoundaryEntry {
     id: AckToken,
-    lane: Lane,
+    stream: PublicationStream,
     checkpoint: Checkpoint,
     /// Which numbered receivers have READ this batch.
     ///
-    /// This is the backfill lane's PERMIT, and it is deliberately not the
+    /// This is the backfill stream's PERMIT, and it is deliberately not the
     /// acknowledgement. What overruns the broadcast ring is pages nobody has
     /// taken out of it; an acknowledgement is a promise about the consumer's own
     /// durability, made on whatever schedule the consumer likes. Binding the
@@ -455,7 +458,7 @@ struct BoundaryEntry {
     /// does not arise, and what remains is two ACKNOWLEDGING receivers, which
     /// this engine already documents as unsupported.
     ///
-    /// Read and acknowledged free different things: a read returns lane
+    /// Read and acknowledged free different things: a read returns stream
     /// capacity, an acknowledgement retires the registration (and with it the
     /// boundary waiter and the coverage claim). A page that was read and never
     /// acknowledged is still an unanswered page, so it is still a recorded loss
@@ -468,7 +471,7 @@ struct BoundaryEntry {
     /// The one place the "capacity is the live record" rule needed a correction.
     /// Supersession removes the older entry ON PURPOSE - it is what lets a
     /// consumer persist N batches of one partition, acknowledge only the last,
-    /// and still reach a boundary, for any N below the lane capacity - so under
+    /// and still reach a boundary, for any N below the stream capacity - so under
     /// the bare rule a partition could publish unboundedly
     /// many pages while never holding more than one live record, and the flow
     /// control would not bind at all. The survivor therefore inherits the
@@ -476,7 +479,7 @@ struct BoundaryEntry {
     /// superseded id (which the consumer may legitimately send: it really
     /// received that batch) releases exactly that one page's worth.
     ///
-    /// NOT bounded by the lane capacity. It was, while the charge was the
+    /// NOT bounded by the stream capacity. It was, while the charge was the
     /// unacknowledged page: the producer parked once the charge reached the
     /// bound, so no partition could fold more than that many pages into one
     /// record. Under the receipt bound a page every eligible reader has READ
@@ -486,7 +489,7 @@ struct BoundaryEntry {
     /// judges the completion guarantee one page at a time and a read page whose
     /// reader leaves is still a loss. That is the memory face of what the receipt
     /// bound deliberately gives up: it bounds the ring, not the consumer's
-    /// unpersisted backlog. `Lane::Change` still inherits nothing at all.
+    /// unpersisted backlog. `PublicationStream::Change` still inherits nothing at all.
     ///
     /// Say the size plainly, because it is a memory bound a consumer controls:
     /// this list grows with the number of pages ONE PARTITION publishes while the
@@ -526,7 +529,7 @@ struct BoundaryEntry {
 }
 
 impl BoundaryEntry {
-    /// How much lane capacity this entry accounts for: every page it stands
+    /// How much stream capacity this entry accounts for: every page it stands
     /// for, itself plus everything folded into it, that some live numbered
     /// receiver could still be holding in the ring.
     ///
@@ -604,7 +607,7 @@ impl BoundaryEntry {
 /// inserts the survivor; performing that under separate locks leaves a window
 /// in which a second backfill partition of the same scope inserts its own entry
 /// for the same key, and the one-entry-per-key bound - which is what makes a
-/// single acknowledgement discharge the whole lane - silently stops holding.
+/// single acknowledgement discharge the whole stream - silently stops holding.
 #[derive(Debug)]
 struct Ledger {
     /// Publications that have not yet been resolved.
@@ -612,25 +615,25 @@ struct Ledger {
     /// Debt rescued from publications nobody can acknowledge, waiting for the
     /// next publication that someone can.
     carried: Option<CoverageClaim>,
-    /// Highest PERSISTED publication per lane. This is the bounded replacement
-    /// for a per-publication tombstone set: within a lane, publications are
+    /// Highest PERSISTED publication per stream. This is the bounded replacement
+    /// for a per-publication tombstone set: within a stream, publications are
     /// sequential and supersession folds older claims into newer ones, so a
     /// persisted id at or above `id` means everything `id` proved is durable.
-    /// One entry per lane bounds this by the account's scope count, where a
+    /// One entry per stream bounds this by the account's scope count, where a
     /// tombstone per acknowledgement grew for the life of the attachment.
-    persisted: HashMap<Lane, AckToken>,
-    /// Highest publication per lane whose claim was FOLDED into a successor.
+    persisted: HashMap<PublicationStream, AckToken>,
+    /// Highest publication per stream whose claim was FOLDED into a successor.
     ///
     /// A superseded publication's claim moves to the survivor so coarse acking
     /// ("persist N batches, ack the last") cannot strand it. But the consumer
     /// may still acknowledge the superseded batch - it really received it, and
     /// producers routinely run ahead of consumers - and that acknowledgement
     /// must persist its checkpoint while ingesting nothing, because its
-    /// coverage now rides the survivor. One entry per lane, so this stays
+    /// coverage now rides the survivor. One entry per stream, so this stays
     /// bounded where a per-publication record would not.
-    folded: HashMap<Lane, AckToken>,
+    folded: HashMap<PublicationStream, AckToken>,
     /// Publications whose checkpoint the control path is still waiting on, in
-    /// publication order. Also the backfill lane's capacity ledger - see
+    /// publication order. Also the backfill stream's capacity ledger - see
     /// [`BoundaryEntry`].
     boundaries: Vec<BoundaryEntry>,
     /// Per-scope acknowledgement fence installed by a durable scope reset.
@@ -670,7 +673,7 @@ struct Ledger {
     /// Delivery queries this ledger rather than maintaining a second copy.
     /// Lock order is delivery -> coverage, never the reverse.
     live: BTreeSet<crate::multiplexer::ReceiverSequence>,
-    /// The same fence, narrowed to the BACKFILL lane.
+    /// The same fence, narrowed to the BACKFILL stream.
     ///
     /// Raised by the discard that follows a walk which lost pages: that walk's
     /// pages must stop being acknowledgeable, or a late one rebuilds the resume
@@ -698,7 +701,7 @@ impl Default for Ledger {
 }
 
 /// Hard ceiling on outstanding boundary registrations. Reachable only through a
-/// `Checkpoint` variant this revision does not key; keyed lanes are already
+/// `Checkpoint` variant this revision does not key; keyed streams are already
 /// bounded by the account's scope count.
 pub(crate) const PENDING_BOUNDARY_CAP: usize = 1024;
 
@@ -884,7 +887,7 @@ impl PendingCoverage {
         })
     }
 
-    /// Register a REPAIR-lane claim and issue its publication identity.
+    /// Register a REPAIR-stream claim and issue its publication identity.
     ///
     /// Repair publications carry no checkpoint, gate no boundary waiter, and
     /// are acknowledged through `SyncEngine::ack`. Checkpoint
@@ -904,7 +907,7 @@ impl PendingCoverage {
         ledger.claims.insert(
             id.clone(),
             Publication {
-                lane: Lane::Repair,
+                stream: PublicationStream::Repair,
                 claim,
             },
         );
@@ -917,7 +920,7 @@ impl PendingCoverage {
     /// The whole transition - carry-forward, supersession lookup, removal,
     /// folding, insertion of the survivor and its boundary - happens under one
     /// lock. Two backfill partitions of one scope are in flight together by
-    /// design, and any gap here lets both leave a live entry for the same lane,
+    /// design, and any gap here lets both leave a live entry for the same stream,
     /// after which one acknowledgement discharges only one of them.
     pub(crate) fn register(&self, checkpoint: Checkpoint, claim: CoverageClaim) -> AckToken {
         self.register_in(checkpoint, claim, None, None)
@@ -945,17 +948,17 @@ impl PendingCoverage {
         walk_watermark: Option<crate::cursor::UndeliveredMark>,
         expected_fence: Option<crate::cursor::ScopeFence>,
     ) -> Result<AckToken, CoverageClaim> {
-        let lane = Lane::of(&checkpoint);
-        self.register_lane_in(checkpoint, claim, walk_watermark, expected_fence, lane)
+        let stream = PublicationStream::of(&checkpoint);
+        self.register_stream_in(checkpoint, claim, walk_watermark, expected_fence, stream)
     }
 
-    fn register_lane_in(
+    fn register_stream_in(
         &self,
         checkpoint: Checkpoint,
         claim: CoverageClaim,
         walk_watermark: Option<crate::cursor::UndeliveredMark>,
         expected_fence: Option<crate::cursor::ScopeFence>,
-        lane: Lane,
+        stream: PublicationStream,
     ) -> Result<AckToken, CoverageClaim> {
         let receipt = PublicationReceipt {
             account: self.account.clone(),
@@ -971,7 +974,7 @@ impl PendingCoverage {
         if let Some(expected) = expected_fence {
             // An unknown checkpoint cannot prove which scope's fence guards it.
             // Refuse before minting, returning its debt to the producer.
-            let Some(scope) = lane.scope() else {
+            let Some(scope) = stream.scope() else {
                 return Err(claim);
             };
             if Self::scope_fence_in(&ledger, scope) != expected {
@@ -980,7 +983,7 @@ impl PendingCoverage {
         }
         let mut id = self.mint(&mut ledger, receipt);
         let mut claim = claim;
-        if let Lane::Backfill(scope, _) = &lane {
+        if let PublicationStream::Backfill(scope, _) = &stream {
             let mint = ledger
                 .last_backfill_mint
                 .entry(scope.clone())
@@ -1002,7 +1005,7 @@ impl PendingCoverage {
             let (mine, theirs): (Vec<_>, Vec<_>) = carried
                 .reports
                 .into_iter()
-                .partition(|report| lane.scope() == Some(&report.domain.scope));
+                .partition(|report| stream.scope() == Some(&report.domain.scope));
             if !mine.is_empty() {
                 claim.absorb(CoverageClaim {
                     reports: mine,
@@ -1024,7 +1027,7 @@ impl PendingCoverage {
         // holding more than one live entry. The survivor carries what it
         // displaced instead.
         //
-        // The lane restriction is not tidiness. `Lane::Change` also supersedes,
+        // The stream restriction is not tidiness. `PublicationStream::Change` also supersedes,
         // and live changes never consult the capacity gate, so inheriting there
         // would make a subscriber that drains without acknowledging grow one
         // entry's `subsumed` without bound - each retained id holding its
@@ -1032,12 +1035,12 @@ impl PendingCoverage {
         // backfill has a bound to keep honest, so only backfill keeps the
         // history.
         let mut subsumed = Vec::new();
-        let charged = matches!(lane, Lane::Backfill(..));
-        if lane.supersedes()
+        let charged = matches!(stream, PublicationStream::Backfill(..));
+        if stream.supersedes()
             && let Some(index) = ledger
                 .boundaries
                 .iter()
-                .position(|entry| entry.lane == lane)
+                .position(|entry| entry.stream == stream)
         {
             let previous = ledger.boundaries.remove(index);
             let superseded = previous.id.clone();
@@ -1060,7 +1063,7 @@ impl PendingCoverage {
                 claim.absorb(old.claim);
                 let mark = ledger
                     .folded
-                    .entry(lane.clone())
+                    .entry(stream.clone())
                     .or_insert(superseded.clone());
                 if *mark < superseded {
                     *mark = superseded;
@@ -1078,7 +1081,7 @@ impl PendingCoverage {
             // the ledger pulses the notify; this one is reached only through an
             // unkeyed `Checkpoint` variant, which is exactly the sort of rarely-
             // walked arm where a missing wake sits undiscovered.
-            freed_capacity = matches!(evicted.lane, Lane::Backfill(..));
+            freed_capacity = matches!(evicted.stream, PublicationStream::Backfill(..));
             tracing::warn!(
                 target: "bifrost.sync.control",
                 cap = PENDING_BOUNDARY_CAP,
@@ -1101,13 +1104,13 @@ impl PendingCoverage {
         ledger.claims.insert(
             id.clone(),
             Publication {
-                lane: lane.clone(),
+                stream: stream.clone(),
                 claim,
             },
         );
         ledger.boundaries.push(BoundaryEntry {
             id: id.clone(),
-            lane,
+            stream,
             checkpoint,
             subsumed,
             delivered_at: None,
@@ -1124,8 +1127,8 @@ impl PendingCoverage {
     /// compared under the same lock. A refusal registers nothing, mints
     /// nothing, and hands the claim back so its debt can be preserved.
     ///
-    /// The scope comes from the checkpoint's lane; every caller passes a change
-    /// or backfill checkpoint, so a scope-less lane is a caller bug and panics.
+    /// The scope comes from the checkpoint's stream; every caller passes a change
+    /// or backfill checkpoint, so a scope-less stream is a caller bug and panics.
     pub(crate) fn register_if_fence(
         &self,
         checkpoint: Checkpoint,
@@ -1194,8 +1197,8 @@ impl PendingCoverage {
     }
 
     /// The account-wide form of [`PendingCoverage::invalidate_scope`]: retire
-    /// every boundary entry and claim whose lane has a scope (every lane, every
-    /// scope; the scope-less repair lane is untouched, since obligations survive
+    /// every boundary entry and claim whose stream has a scope (every stream, every
+    /// scope; the scope-less repair stream is untouched, since obligations survive
     /// resets and stay acknowledgeable), take the debt of their claims and the
     /// WHOLE carry-forward slot, and raise the account fence with a burnt id.
     /// One critical section. Retiring the entries frees their backfill
@@ -1204,7 +1207,7 @@ impl PendingCoverage {
         let mut ledger = self.guard();
         ledger
             .boundaries
-            .retain(|entry| entry.lane.scope().is_none());
+            .retain(|entry| entry.stream.scope().is_none());
         let mut debt = ledger.carried.take().unwrap_or(CoverageClaim {
             reports: Vec::new(),
             generation: crate::cursor::PendingCoverage::initial_generation(),
@@ -1212,7 +1215,7 @@ impl PendingCoverage {
         let ids: Vec<_> = ledger
             .claims
             .iter()
-            .filter(|(_, publication)| publication.lane.scope().is_some())
+            .filter(|(_, publication)| publication.stream.scope().is_some())
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
@@ -1281,7 +1284,7 @@ impl PendingCoverage {
     /// Record that the numbered receiver `receiver_seq` has READ the
     /// publication's batch.
     ///
-    /// This is what returns backfill lane capacity, so the producer runs exactly
+    /// This is what returns backfill stream capacity, so the producer runs exactly
     /// as far ahead as the SLOWEST subscribed consumer reads and no further.
     /// Idempotent per receiver, and per receiver rather than per page because a
     /// page is out of the ring's way only once everyone who could still be
@@ -1301,11 +1304,11 @@ impl PendingCoverage {
             let mut ledger = self.guard();
             let mut freed = false;
             for entry in &mut ledger.boundaries {
-                // Only the backfill lane has a bound to keep honest, and only it
-                // inherits a charge on supersession. Marking a live-lane entry
+                // Only the backfill stream has a bound to keep honest, and only it
+                // inherits a charge on supersession. Marking a live-stream entry
                 // would leave state nothing ever reads, which is the sort of
                 // thing a later reader has to prove is dead.
-                if !matches!(entry.lane, Lane::Backfill(..)) {
+                if !matches!(entry.stream, PublicationStream::Backfill(..)) {
                     continue;
                 }
                 if entry.id == *id {
@@ -1370,7 +1373,7 @@ impl PendingCoverage {
         ledger
             .boundaries
             .iter()
-            .filter(|entry| matches!(entry.lane, Lane::Backfill(..)))
+            .filter(|entry| matches!(entry.stream, PublicationStream::Backfill(..)))
             .map(|entry| entry.unread_charge(&ledger.live))
             .sum()
     }
@@ -1381,10 +1384,11 @@ impl PendingCoverage {
     ///
     /// Diagnostics only, and the only reason it exists: every receiver
     /// `account_changes_stream` hands out is numbered, so a consumer that opens a
-    /// second receiver for a UI and then stops polling it holds `lane_capacity`
+    /// second receiver for a UI and then stops polling it holds
+    /// `BackfillConfig::lane_capacity`
     /// pages unread for the life of the attachment. Nothing else reports that -
     /// the departure warning fires on drop and the lag warning on poll, and this
-    /// receiver does neither - so the lane's park warning names the sequences
+    /// receiver does neither - so the stream's park warning names the sequences
     /// instead of leaving the stall silent.
     ///
     /// Both lists are deduplicated and ordered; an entry not yet sent has no
@@ -1398,7 +1402,7 @@ impl PendingCoverage {
         for entry in ledger
             .boundaries
             .iter()
-            .filter(|entry| matches!(entry.lane, Lane::Backfill(..)))
+            .filter(|entry| matches!(entry.stream, PublicationStream::Backfill(..)))
         {
             let mut charged = false;
             let pages = std::iter::once((entry.delivered_at, &entry.readers)).chain(
@@ -1422,7 +1426,7 @@ impl PendingCoverage {
                 }
             }
             if charged
-                && let Some(scope) = entry.lane.scope()
+                && let Some(scope) = entry.stream.scope()
                 && !scopes.contains(scope)
             {
                 scopes.push(scope.clone());
@@ -1518,11 +1522,11 @@ impl PendingCoverage {
             // own stamp is still reachable may be carrying pages that are not.
             let mut demote = Vec::new();
             for entry in &mut ledger.boundaries {
-                if !matches!(entry.lane, Lane::Backfill(..)) {
+                if !matches!(entry.stream, PublicationStream::Backfill(..)) {
                     continue;
                 }
                 let before = entry.subsumed.len();
-                let scope = entry.lane.scope().cloned();
+                let scope = entry.stream.scope().cloned();
                 entry.subsumed.retain(|page| {
                     if BoundaryEntry::sent_beyond_reach(page.delivered_at, min_live) {
                         retired.push(page.id.clone());
@@ -1552,10 +1556,12 @@ impl PendingCoverage {
             }
             // Then whole entries whose own send is beyond every live reader.
             ledger.boundaries.retain(|entry| {
-                if matches!(entry.lane, Lane::Backfill(..)) && entry.undeliverable(min_live) {
+                if matches!(entry.stream, PublicationStream::Backfill(..))
+                    && entry.undeliverable(min_live)
+                {
                     retired.push(entry.id.clone());
                     retired.extend(entry.subsumed.iter().map(|page| page.id.clone()));
-                    if let Some(scope) = entry.lane.scope() {
+                    if let Some(scope) = entry.stream.scope() {
                         // Only pages that were actually SENT, exactly as the
                         // per-page pass above and `abandon_checkpoints` count
                         // them. An unsent page is not one anybody failed to
@@ -1787,7 +1793,7 @@ impl PendingCoverage {
         // Abandoned BACKFILL pages, per scope. An abandonment is a page the
         // consumer will never answer for, which is the same fact the drop sweep
         // and the retire-on-sentinel-only path record - and it was the one
-        // producer of that fact which did not. A live-lane burst overwriting
+        // producer of that fact which did not. A live-stream burst overwriting
         // unread backfill pages therefore left the walk's watermark untouched,
         // and its completion marker became durable over pages nobody read.
         let mut by_scope: HashMap<CursorScope, usize> = HashMap::new();
@@ -1809,7 +1815,9 @@ impl PendingCoverage {
                     // own stamp loses exactly those, so a page really lost to the
                     // lag goes unrecorded and the marker becomes durable over it.
                     // `release_undelivered` judges per page for the same reason.
-                    if let (Lane::Backfill(..), Some(scope)) = (&entry.lane, entry.lane.scope()) {
+                    if let (PublicationStream::Backfill(..), Some(scope)) =
+                        (&entry.stream, entry.stream.scope())
+                    {
                         let sent = usize::from(entry.delivered_at.is_some())
                             + entry
                                 .subsumed
@@ -1846,7 +1854,7 @@ impl PendingCoverage {
     /// first await and persists what it returns.
     ///
     /// Retiring the entries is also what returns their BACKFILL CAPACITY, the
-    /// pages each one subsumed included - so a reset frees the lane wherever it
+    /// pages each one subsumed included - so a reset frees the stream wherever it
     /// runs, on both of its passes, with nothing to remember at the call site
     /// and no window between retiring a publication and releasing its capacity.
     pub(crate) fn invalidate_scope(&self, scope: &CursorScope) -> CoverageClaim {
@@ -1854,14 +1862,14 @@ impl PendingCoverage {
     }
 
     /// The BACKFILL half of the same operation: retire and fence only this
-    /// scope's backfill publications, leaving its live-lane ones acknowledgeable.
+    /// scope's backfill publications, leaving its live-stream ones acknowledgeable.
     ///
     /// For the discard that follows a walk which lost pages. That discard is
     /// about backfill ROWS, and fencing the whole scope made it refuse a
     /// replacement consumer's acknowledgement of live batches it had genuinely
     /// received - an `Unknown` no retry can ever satisfy, after which the live
     /// cursor advances past changes nothing replayed. The reset keeps the full
-    /// scope-wide fence, because a reset really does invalidate every lane's
+    /// scope-wide fence, because a reset really does invalidate every stream's
     /// durable rows.
     /// `through` bounds it in TIME as well: only publications at or below that
     /// id are retired and fenced. The ack path passes the refused marker's own
@@ -1875,7 +1883,7 @@ impl PendingCoverage {
         scope: &CursorScope,
         through: Option<&AckToken>,
     ) -> CoverageClaim {
-        self.invalidate_in(scope, Some(LaneKind::Backfill), through)
+        self.invalidate_in(scope, Some(PublicationStreamKind::Backfill), through)
     }
 
     /// Has this scope minted a BACKFILL publication above `ceiling`?
@@ -1899,7 +1907,7 @@ impl PendingCoverage {
     fn invalidate_in(
         &self,
         scope: &CursorScope,
-        lane_kind: Option<LaneKind>,
+        stream_kind: Option<PublicationStreamKind>,
         through: Option<&AckToken>,
     ) -> CoverageClaim {
         let mut ledger = self.guard();
@@ -1910,8 +1918,8 @@ impl PendingCoverage {
         // ids collected here are for the CLAIMS and their debt, which is a
         // different question with a different answer.
         ledger.boundaries.retain(|entry| {
-            if entry.lane.belongs_to(scope)
-                && lane_kind.is_none_or(|kind| entry.lane.kind() == kind)
+            if entry.stream.belongs_to(scope)
+                && stream_kind.is_none_or(|kind| entry.stream.kind() == kind)
                 // The ceiling bounds the RETIREMENT, not only the fence. Fencing
                 // an old attempt while retiring the whole scope's entries takes
                 // the retry's pages with it: they lose their charge, so the bound
@@ -1976,10 +1984,14 @@ impl PendingCoverage {
         // past the ceiling: everything the old attempt minted, and nothing the
         // retry will.
         let watermark = through.map_or_else(|| self.burn_fence(&mut ledger), ScopeFence::after);
-        match lane_kind {
-            // No narrowing: the whole scope is invalidated, every lane with it.
-            None | Some(LaneKind::Other) => Self::fence_in(&mut ledger, scope, watermark),
-            Some(LaneKind::Backfill) => Self::fence_in_backfill(&mut ledger, scope, watermark),
+        match stream_kind {
+            // No narrowing: the whole scope is invalidated, every stream with it.
+            None | Some(PublicationStreamKind::Other) => {
+                Self::fence_in(&mut ledger, scope, watermark);
+            }
+            Some(PublicationStreamKind::Backfill) => {
+                Self::fence_in_backfill(&mut ledger, scope, watermark);
+            }
         }
         drop(ledger);
         self.wake_capacity();
@@ -2007,10 +2019,10 @@ impl PendingCoverage {
     /// How many superseded publications the outstanding entries are still
     /// holding on to. Observability; used by tests.
     ///
-    /// Only the backfill lane inherits a charge, so a non-zero reading on an
+    /// Only the backfill stream inherits a charge, so a non-zero reading on an
     /// account doing nothing but live changes is the unbounded-history defect.
-    /// On the backfill lane it is bounded by how many pages one partition
-    /// publishes while the consumer reads without acknowledging, not by the lane
+    /// On the backfill stream it is bounded by how many pages one partition
+    /// publishes while the consumer reads without acknowledging, not by the stream
     /// capacity - see [`BoundaryEntry::subsumed`].
     #[must_use]
     pub fn retained_history(&self) -> usize {
@@ -2025,12 +2037,12 @@ impl PendingCoverage {
     ///
     /// Removing the older claim WITHOUT folding it is how partition A's
     /// obligations get discarded while the engine believes B accounted for
-    /// them. `register` performs this inline for the checkpoint lane; this is
+    /// them. `register` performs this inline for the checkpoint stream; this is
     /// the standalone form.
     // This standalone operation changes only live evidence: it cannot revise a
     // survivor receipt already handed to a consumer. Restart replay therefore
     // cannot recover this later fold. Production checkpoint publication folds
-    // before freezing the receipt in register_lane_in instead.
+    // before freezing the receipt in register_stream_in instead.
     // A receipt already saved in an external transaction cannot be changed by
     // this registry. Mutating shared memory would only fix same-process clones,
     // not saved bytes. This method remains a live-registry operation; durable
@@ -2054,14 +2066,14 @@ impl PendingCoverage {
 
     /// Resolve an acknowledgement of a CHECKPOINT publication.
     ///
-    /// The checkpoint names the lane, so an id belonging to a repair
-    /// publication - or to a different lane entirely - resolves to `Unknown`
+    /// The checkpoint names the stream, so an id belonging to a repair
+    /// publication - or to a different stream entirely - resolves to `Unknown`
     /// rather than consuming a claim it does not name.
     pub fn claim_checkpoint(&self, id: AckToken, checkpoint: &Checkpoint) -> ClaimLookup {
         if id.1.checkpoint.as_ref() != Some(checkpoint) {
             return ClaimLookup::Unknown;
         }
-        self.claim_in(id, &Lane::of(checkpoint))
+        self.claim_in(id, &PublicationStream::of(checkpoint))
     }
 
     /// Resolve an acknowledgement of a REPAIR publication.
@@ -2071,10 +2083,10 @@ impl PendingCoverage {
     /// short-circuit as already persisted and make the engine announce a
     /// durable boundary the store never wrote.
     pub fn claim_repair(&self, id: AckToken) -> ClaimLookup {
-        self.claim_in(id, &Lane::Repair)
+        self.claim_in(id, &PublicationStream::Repair)
     }
 
-    fn claim_in(&self, id: AckToken, lane: &Lane) -> ClaimLookup {
+    fn claim_in(&self, id: AckToken, stream: &PublicationStream) -> ClaimLookup {
         // Check before numeric identity, live claims, or replay fallback. Process
         // restarts can reuse numeric segments; account identity is durable.
         if id.1.account != self.account {
@@ -2087,19 +2099,19 @@ impl PendingCoverage {
         // reset deleted to force re-establishment. The fence is an exclusive
         // bound - it holds the mint counter, whose current value is the id the
         // next, post-reset publication will take.
-        let fenced_out = lane.scope().is_some_and(|scope| {
+        let fenced_out = stream.scope().is_some_and(|scope| {
             let scope_wide = ledger
                 .fenced
                 .get(scope)
                 .is_some_and(|watermark| watermark.excludes(&id));
-            let lane_wide = lane.kind() == LaneKind::Backfill
+            let stream_wide = stream.kind() == PublicationStreamKind::Backfill
                 && ledger
                     .fenced_backfill
                     .get(scope)
                     .is_some_and(|watermark| watermark.excludes(&id));
             let account_wide = ledger.fenced_account.excludes(&id)
                 || (ledger.fenced_account.is_raised() && !self.minted_here(&id));
-            account_wide || scope_wide || lane_wide
+            account_wide || scope_wide || stream_wide
         });
         if fenced_out {
             // Nothing is dropped here: `invalidate_scope` runs twice around the
@@ -2109,14 +2121,14 @@ impl PendingCoverage {
             return ClaimLookup::Unknown;
         }
         match ledger.claims.get(&id) {
-            Some(publication) if publication.lane == *lane => {
+            Some(publication) if publication.stream == *stream => {
                 let publication = ledger
                     .claims
                     .remove(&id)
                     .unwrap_or_else(|| unreachable!("checked present under the same lock"));
                 ClaimLookup::Apply(publication.claim)
             }
-            // Live, but in another lane. Leave it alone; the acknowledgement
+            // Live, but in another stream. Leave it alone; the acknowledgement
             // that really names it can still arrive.
             Some(_) => ClaimLookup::Unknown,
             None => {
@@ -2126,7 +2138,7 @@ impl PendingCoverage {
                 // lower segment, so it sits under every watermark this attachment
                 // has moved, and a replayed acknowledgement was answered
                 // `AlreadyPersisted` the moment this attachment had persisted
-                // anything at all on that lane. That is a durable boundary
+                // anything at all on that stream. That is a durable boundary
                 // announced for a write this attachment never made: the replay's
                 // whole purpose is to reach the receipt fallback below and be
                 // persisted here. Segments are not a time order across instances,
@@ -2136,13 +2148,13 @@ impl PendingCoverage {
                 if mine
                     && ledger
                         .persisted
-                        .get(lane)
+                        .get(stream)
                         .is_some_and(|watermark| *watermark >= id)
                 {
                     ClaimLookup::AlreadyPersisted
                 } else if let Some(claim) = ledger
                     .folded
-                    .get(lane)
+                    .get(stream)
                     .filter(|watermark| mine && **watermark >= id)
                     .map(|_| CoverageClaim {
                         reports: Vec::new(),
@@ -2159,8 +2171,8 @@ impl PendingCoverage {
                     .1
                     .checkpoint
                     .as_ref()
-                    .is_some_and(|saved| Lane::of(saved) == *lane)
-                    || (*lane == Lane::Repair && id.1.checkpoint.is_none())
+                    .is_some_and(|saved| PublicationStream::of(saved) == *stream)
+                    || (*stream == PublicationStream::Repair && id.1.checkpoint.is_none())
                 {
                     match &id.1.replay {
                         Some(reports) => ClaimLookup::Replay(reports.clone()),
@@ -2180,30 +2192,30 @@ impl PendingCoverage {
     /// `AlreadyPersisted`, which would make the engine announce a durable
     /// boundary that does not exist.
     pub fn settle_checkpoint(&self, id: AckToken, checkpoint: &Checkpoint) {
-        self.settle_in(id, Lane::of(checkpoint));
+        self.settle_in(id, PublicationStream::of(checkpoint));
     }
 
     /// Record that a repair publication was durably applied.
     pub fn settle_repair(&self, id: AckToken) {
-        self.settle_in(id, Lane::Repair);
+        self.settle_in(id, PublicationStream::Repair);
     }
 
-    fn settle_in(&self, id: AckToken, lane: Lane) {
+    fn settle_in(&self, id: AckToken, stream: PublicationStream) {
         if id.1.account != self.account {
             return;
         }
         let mut ledger = self.guard();
-        let watermark = ledger.persisted.entry(lane).or_insert(id.clone());
+        let watermark = ledger.persisted.entry(stream).or_insert(id.clone());
         if *watermark < id {
             *watermark = id;
         }
     }
 
-    /// Kind-agnostic lookup, retained for callers that already know which lane
+    /// Kind-agnostic lookup, retained for callers that already know which stream
     /// an id belongs to. Engine acknowledgement paths use
     /// [`PendingCoverage::claim_checkpoint`] or
     /// [`PendingCoverage::claim_repair`], which refuse an id from the wrong
-    /// lane instead of consuming it.
+    /// stream instead of consuming it.
     ///
     /// Documented foot-gun, kept on purpose: no engine path reaches this, and
     /// none should. It is published, so it is not removable, and an audit that
@@ -2212,11 +2224,11 @@ impl PendingCoverage {
     /// [`crate::SyncControl::record_checkpoint`], which identifies a
     /// publication by checkpoint VALUE where equal values are routinely
     /// different publications. Both stay; every engine path uses the
-    /// lane-checked, publication-identified forms.
+    /// stream-checked, publication-identified forms.
     pub fn claim(&self, id: AckToken) -> ClaimLookup {
-        let lane = self.guard().claims.get(&id).map(|p| p.lane.clone());
-        match lane {
-            Some(lane) => self.claim_in(id, &lane),
+        let stream = self.guard().claims.get(&id).map(|p| p.stream.clone());
+        match stream {
+            Some(stream) => self.claim_in(id, &stream),
             None => ClaimLookup::Unknown,
         }
     }
@@ -2316,7 +2328,7 @@ mod tests {
         assert!(!ledger.bind_delivery(&second));
     }
 
-    use super::{ClaimLookup, CoverageClaim, Lane, PendingCoverage};
+    use super::{ClaimLookup, CoverageClaim, PendingCoverage, PublicationStream};
     use bifrost_types::{
         AccountErrorBuilder, AccountErrorKind, Cause, ChangeCursor, Checkpoint, CoverageDomain,
         CursorScope, DiagnosticText, InventoryCoverageReport, InventoryObligation, ObjectId,
@@ -2356,18 +2368,18 @@ mod tests {
     }
 
     #[test]
-    fn fence_registration_refuses_an_unkeyed_lane_without_minting() {
+    fn fence_registration_refuses_an_unkeyed_stream_without_minting() {
         let pending = PendingCoverage::new();
         // Downstream code cannot construct a future non-exhaustive variant.
-        // Inject its lane into the same registration path instead.
-        let result = pending.register_lane_in(
+        // Inject its stream into the same registration path instead.
+        let result = pending.register_stream_in(
             checkpoint(b"unknown"),
             CoverageClaim::new(degraded("owed"), crate::cursor::WalkGeneration::for_test(7)),
             None,
             Some(PendingCoverage::initial_fence()),
-            Lane::UnkeyedCheckpoint,
+            PublicationStream::UnkeyedCheckpoint,
         );
-        let claim = result.expect_err("an unkeyed lane cannot pass a scope fence");
+        let claim = result.expect_err("an unkeyed stream cannot pass a scope fence");
         assert_eq!(claim.reports.len(), 1);
         assert_eq!(claim.generation, crate::cursor::WalkGeneration::for_test(7));
         assert_eq!(pending.outstanding(), 0);
@@ -2617,7 +2629,7 @@ mod tests {
     /// Idempotency must not expire. A tombstone-per-acknowledgement set is the
     /// leak this ledger was rebuilt to close, and a fixed-size ring closes it by
     /// forgetting: after enough later acknowledgements the retry of an older
-    /// successful one reports `Unknown`. A per-lane watermark is bounded by the
+    /// successful one reports `Unknown`. A per-stream watermark is bounded by the
     /// account's scope count AND never forgets, so a delayed consumer retry
     /// still answers correctly.
     #[test]
@@ -2708,7 +2720,7 @@ mod tests {
     fn a_drop_sweep_hands_its_debt_to_a_later_scope_reset() {
         let pending = PendingCoverage::new();
 
-        // P, degraded, then Q on the same lane: Q supersedes P and absorbs its
+        // P, degraded, then Q on the same stream: Q supersedes P and absorbs its
         // claim.
         let cp = backfill_checkpoint(b"page:0:10");
         let p = pending.register(
@@ -3031,7 +3043,7 @@ mod tests {
     /// id, whose high bits are the minting instance's segment - so a foreign id
     /// from an earlier instance sits UNDER them, and a replay was short-circuited
     /// as durable the moment this attachment had persisted anything at all on
-    /// that lane. The write never happened here: the replay exists precisely to
+    /// that stream. The write never happened here: the replay exists precisely to
     /// reach the receipt fallback and be persisted, and answering it from a
     /// watermark announces a durable boundary the store was never asked for.
     #[test]
@@ -3045,7 +3057,7 @@ mod tests {
         );
 
         // A fresh attachment that has persisted a publication of its OWN on the
-        // same lane, which is what moves the watermark past every foreign id.
+        // same stream, which is what moves the watermark past every foreign id.
         let current = PendingCoverage::new();
         let mine = current.register(
             cp.clone(),
@@ -3182,12 +3194,12 @@ mod tests {
         assert_eq!(claim.reports.len(), 2);
     }
 
-    /// Two producers registering for one lane concurrently must leave exactly
+    /// Two producers registering for one stream concurrently must leave exactly
     /// ONE live entry. A gap between removing the superseded entry and
     /// inserting the survivor lets both insert, and a later acknowledgement
-    /// then discharges only half the lane.
+    /// then discharges only half the stream.
     #[test]
-    fn concurrent_registration_leaves_one_entry_per_lane() {
+    fn concurrent_registration_leaves_one_entry_per_stream() {
         use std::sync::Arc;
         let pending = Arc::new(PendingCoverage::new());
         let mut handles = Vec::new();
@@ -3212,7 +3224,7 @@ mod tests {
         assert_eq!(
             pending.pending_checkpoints(),
             1,
-            "one lane must hold exactly one boundary registration"
+            "one stream must hold exactly one boundary registration"
         );
         assert_eq!(
             pending.outstanding(),

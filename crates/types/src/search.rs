@@ -69,7 +69,7 @@ pub struct SearchRequest {
     pub limit: Option<u32>,
     /// Opaque cursor returned by a prior call's `Page::next_cursor`.
     /// `None` starts a fresh search.
-    pub page_cursor: Option<Vec<u8>>,
+    pub page_cursor: Option<crate::PageCursor>,
     /// Provider-specific raw query, appended to or substituted for
     /// the structured filter at the protocol layer. Lets consumers
     /// reach Gmail-specific operators like `larger:5M` or Graph

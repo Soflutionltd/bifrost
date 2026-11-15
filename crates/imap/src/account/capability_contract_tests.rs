@@ -355,7 +355,7 @@ async fn every_false_pim_flag_refuses_without_touching_the_wire() {
         caps,
         set_keyword,
         AccountOperation::SetKeyword,
-        account.set_keyword(target(), "$flagged".to_string(), true)
+        account.set_keyword(target(), "$flagged".into(), true)
     );
     refuses!(
         caps,

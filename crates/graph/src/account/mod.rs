@@ -10,6 +10,7 @@ mod categories;
 mod changes;
 mod cloud;
 mod contacts;
+pub(crate) use contacts::DirectoryMode;
 mod cursor;
 mod delta;
 mod error;
@@ -1140,7 +1141,7 @@ impl Account for GraphAccount {
     fn flag_target(
         &self,
         target: &ObjectId,
-        observed: &std::collections::HashSet<String>,
+        observed: &bifrost_types::FlagSet,
         op: &bifrost_types::FlagOp,
     ) -> bifrost_types::FlagTargetState {
         mutate::graph_flag_target(target, observed, op)
@@ -1275,7 +1276,7 @@ impl Account for GraphAccount {
     fn set_keyword(
         &self,
         _target: MutationTarget,
-        _keyword: String,
+        _keyword: bifrost_types::Flag,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async {
@@ -1580,7 +1581,7 @@ impl Account for GraphAccount {
     fn contacts_list(
         &self,
         address_book: Option<AddressBookId>,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         let account = self.clone();
         Box::pin(async move { contacts::list(account, address_book, page_cursor).await })
@@ -1636,7 +1637,7 @@ impl Account for GraphAccount {
         &self,
         query: String,
         limit: Option<u32>,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
         let account = self.clone();
         Box::pin(
@@ -1646,7 +1647,7 @@ impl Account for GraphAccount {
 
     fn directory_groups_list(
         &self,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
         let account = self.clone();
         Box::pin(async move { groups::directory_groups_list(account, page_cursor).await })
@@ -1655,7 +1656,7 @@ impl Account for GraphAccount {
     fn directory_group_expand(
         &self,
         group: DirectoryGroupId,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
         let account = self.clone();
         Box::pin(async move { groups::directory_group_expand(account, group, page_cursor).await })

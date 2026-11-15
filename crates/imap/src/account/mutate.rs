@@ -3,13 +3,16 @@ use super::error::{
     concurrency_conflict_error, invalid_move_destination_error, store_failed_error,
     uidvalidity_changed_error,
 };
+use bifrost_types::FlagSet;
 use bifrost_types::{
     Application, ErrorScope, PartialCommitBuilder, PrimaryLeg, StepEffect, StepReplay, StepTargets,
     TargetRef, TargetRole,
 };
 #[cfg(test)]
 use bifrost_types::{RequestErrorKind, ServerErrorKind};
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 
 use bifrost_types::{
     AccountError, AccountErrorKind, AccountOperation, AccountStream, BatchFailure, BatchItemId,
@@ -876,8 +879,8 @@ async fn run_flag_mutation_groups(
 /// `Succeeded(Applied)`.
 struct PatchMutationWork<'a> {
     targets: TargetBatch,
-    add: &'a HashSet<String>,
-    remove: &'a HashSet<String>,
+    add: &'a FlagSet,
+    remove: &'a FlagSet,
     unchanged_since: Option<u64>,
     caller_guard: bool,
 }
@@ -1099,7 +1102,7 @@ async fn apply_flag_op(
     }
 }
 
-fn store_flag_atoms(flags: &HashSet<String>) -> Vec<Flag> {
+fn store_flag_atoms(flags: &FlagSet) -> Vec<Flag> {
     flags
         .iter()
         .map(|flag| Flag::from_neutral_keyword(flag))
@@ -1110,7 +1113,7 @@ async fn store_flags(
     conn: &super::PooledConn,
     set: &crate::types::SequenceSet,
     operation: StoreOperation,
-    flags: &HashSet<String>,
+    flags: &FlagSet,
     unchanged_since: Option<u64>,
     timeout: std::time::Duration,
 ) -> Result<StoreWireOutcome, crate::Error> {
@@ -1487,7 +1490,7 @@ mod tests {
 
     #[test]
     fn bulk_store_folds_neutral_keywords() {
-        let flags = HashSet::from([
+        let flags = FlagSet::from([
             "$SEEN".to_owned(),
             "$answered".to_owned(),
             "$flagged".to_owned(),

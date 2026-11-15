@@ -4,8 +4,8 @@
 //!
 //! Everything here is protocol mechanics that is identical for every object
 //! type: the type-tagged payload, anchor paging, the `queryState` pin, the
-//! termination rules, the `anchorNotFound` mapping and the error
-//! classifications. What varies per object type is a [`PageKind`]: the id
+//! termination rules and the inputs to the central error boundary.
+//! What varies per object type is a [`PageKind`]: the id
 //! marker, the query-builder type, how a query is pointed at its start or at
 //! an anchor, and the diagnostic wording. Nothing about behaviour is a kind
 //! parameter - two kinds cannot disagree on termination, on an absent
@@ -17,7 +17,9 @@
 //! Anchored payloads carry their query method and a JSON `[anchor, queryState]` pair.
 //! Ambiguous legacy payloads require restarting the caller-owned walk.
 
-use bifrost_types::{AccountError, AccountOperation, DiagnosticText};
+use bifrost_types::{AccountError, AccountOperation};
+
+use super::error::page_cursor_error as cursor_error;
 
 use crate::core::id::Id;
 
@@ -227,13 +229,13 @@ pub(super) trait PageKind {
     /// crate's standing answer for an older cursor payload version. The `page_cursor` field, not the kind, is what
     /// tells the consumer to restart paging from the first page.
     fn decode_page_cursor(
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
         operation: AccountOperation,
     ) -> Result<Option<PageCursor>, AccountError> {
         let Some(cursor) = page_cursor else {
             return Ok(None);
         };
-        let cursor = String::from_utf8(cursor)
+        let cursor = String::from_utf8(cursor.into_bytes())
             .map_err(|error| cursor_error(operation, error.to_string()))?;
         match CursorPayload::decode(&cursor, operation)? {
             CursorPayload::Anchored {
@@ -364,7 +366,7 @@ pub(super) trait PageKind {
         total: Option<u64>,
         query_state: &str,
         operation: AccountOperation,
-    ) -> Result<Option<Vec<u8>>, AccountError> {
+    ) -> Result<Option<bifrost_types::PageCursor>, AccountError> {
         let base = position;
         let served = u64::try_from(ids.len()).map_err(|_| {
             page_envelope_violation(operation, "query page length exceeds UnsignedInt".into())
@@ -426,7 +428,7 @@ pub(super) trait PageKind {
                 format!("{} page cursor is not encodable: {error}", Self::COLLECTION),
             )
         })?;
-        Ok(Some(payload.into_bytes()))
+        Ok(Some(payload.into_bytes().into()))
     }
 
     /// The result set this page cursor addresses is not the one it was minted
@@ -434,20 +436,15 @@ pub(super) trait PageKind {
     /// `ConcurrencyConflict` derives `Retry(AfterStateRefresh)`, and
     /// refreshing here means repeating from the first page.
     fn result_set_superseded(operation: AccountOperation) -> AccountError {
-        bifrost_types::AccountErrorBuilder::new(
-            bifrost_types::AccountErrorKind::ConcurrencyConflict,
-            bifrost_types::Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
+        super::error::page_concurrency_conflict(
+            operation,
+            format!(
+                "{} result set changed between pages ({} queryState moved); repeat the {}",
+                Self::COLLECTION,
+                Self::METHOD,
+                Self::REPEAT
+            ),
         )
-        .protocol(bifrost_types::Protocol::Jmap)
-        .operation(operation)
-        .text(DiagnosticText::support_only(format!(
-            "{} result set changed between pages ({} queryState moved); repeat the {}",
-            Self::COLLECTION,
-            Self::METHOD,
-            Self::REPEAT
-        )))
-        .try_build()
-        .expect("valid account error classification")
     }
 
     /// Error mapping for a paged query call, aware of whether the call
@@ -466,39 +463,16 @@ pub(super) trait PageKind {
         anchored: bool,
     ) -> impl Fn(crate::Error) -> AccountError {
         move |error| {
-            if anchored && is_anchor_not_found(&error) {
-                return Self::anchor_lost(operation);
-            }
-            super::error::into_account_error(error, super::error::JmapErrorContext::new(operation))
+            super::error::page_call_error(
+                error,
+                operation,
+                anchored,
+                Self::ITEM,
+                Self::METHOD,
+                Self::REPEAT,
+            )
         }
     }
-
-    /// The item the cursor resumed after was destroyed between pages.
-    fn anchor_lost(operation: AccountOperation) -> AccountError {
-        bifrost_types::AccountErrorBuilder::new(
-            bifrost_types::AccountErrorKind::ConcurrencyConflict,
-            bifrost_types::Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
-        )
-        .protocol(bifrost_types::Protocol::Jmap)
-        .operation(operation)
-        .text(DiagnosticText::support_only(format!(
-            "the {} this page cursor resumes after was removed ({} anchorNotFound); \
-             repeat the {}",
-            Self::ITEM,
-            Self::METHOD,
-            Self::REPEAT
-        )))
-        .try_build()
-        .expect("valid account error classification")
-    }
-}
-
-fn is_anchor_not_found(error: &crate::Error) -> bool {
-    matches!(error, crate::Error::Method(method)
-    if matches!(
-        method.error_type(),
-        crate::core::error::MethodErrorType::AnchorNotFound
-    ))
 }
 
 /// The server's own page envelope is internally inconsistent, or it
@@ -521,39 +495,6 @@ fn is_anchor_not_found(error: &crate::Error) -> bool {
 /// terminal for this walk and it names the server.
 fn page_envelope_violation(operation: AccountOperation, message: String) -> AccountError {
     super::error::contract_violation(operation, None, message)
-}
-
-/// A cursor payload this crate cannot honour: an older, retired, malformed or
-/// out-of-range encoding.
-///
-/// Classified `Request(Malformed)` (recovery `ClientBug`, so the ENGINE takes
-/// no action) with `RequestCause::InvalidArgument { field: Some("page_cursor") }`.
-/// That field is the contract: a consumer seeing it restarts this paging walk
-/// from page one, silently - an Outlook user whose saved search page went
-/// stale after an upgrade expects the results to reload, not an error.
-pub(super) fn cursor_error(operation: AccountOperation, message: String) -> AccountError {
-    // Restart only this caller-owned walk. Invalid page state must never clear
-    // an enterprise user's account-wide durable mail or sync checkpoints, which
-    // is what `SyncState(SchemaIncompatible)` would have directed the engine to do.
-    AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Jmap, message)
-}
-
-pub(super) fn invalid_argument(
-    operation: AccountOperation,
-    field: &'static str,
-    message: String,
-) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-        bifrost_types::Cause::Request(bifrost_types::RequestCause::InvalidArgument {
-            field: Some(field),
-            message: Some(DiagnosticText::support_only(message)),
-        }),
-    )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(operation)
-    .try_build()
-    .expect("valid account error classification")
 }
 
 #[cfg(test)]
@@ -587,7 +528,7 @@ mod tests {
             assert_eq!(error.kind(), expected.kind());
             assert_eq!(error.recovery(), expected.recovery());
         }
-        assert!(decode(Some(b"search-3:42:q".to_vec())).is_err());
+        assert!(decode(Some(b"search-3:42:q".to_vec().into())).is_err());
     }
 
     #[test]
@@ -651,7 +592,9 @@ mod tests {
         }
     }
 
-    fn decode(bytes: Option<Vec<u8>>) -> Result<Option<PageCursor>, AccountError> {
+    fn decode(
+        bytes: Option<bifrost_types::PageCursor>,
+    ) -> Result<Option<PageCursor>, AccountError> {
         TestPages::decode_page_cursor(bytes, OP)
     }
 
@@ -662,7 +605,7 @@ mod tests {
         page: &[Id<TestMarker>],
         total: Option<u64>,
         query_state: &str,
-    ) -> Result<Option<Vec<u8>>, AccountError> {
+    ) -> Result<Option<bifrost_types::PageCursor>, AccountError> {
         TestPages::next_cursor(None, position, page, total, query_state, OP)
     }
 
@@ -679,12 +622,12 @@ mod tests {
     #[test]
     fn typed_encoding_is_stable() {
         assert_eq!(
-            decode(Some(br#"pim-3:Widget/query:["c2","q1"]"#.to_vec())).expect("decodes"),
+            decode(Some(br#"pim-3:Widget/query:["c2","q1"]"#.to_vec().into())).expect("decodes"),
             Some(cursor("c2", "q1"))
         );
         assert_eq!(
             decode(Some(
-                br#"pim-3:Widget/query:["a:b\",\"c","[\"q:1\"]"]"#.to_vec()
+                br#"pim-3:Widget/query:["a:b\",\"c","[\"q:1\"]"]"#.to_vec().into()
             ))
             .expect("decodes"),
             Some(cursor("a:b\",\"c", "[\"q:1\"]"))
@@ -693,7 +636,7 @@ mod tests {
             mint(0, &ids(&["c1", "c2"]), Some(250), "q1")
                 .expect("valid envelope")
                 .expect("cursor"),
-            br#"pim-3:Widget/query:["c2","q1"]"#.to_vec()
+            bifrost_types::PageCursor::from(br#"pim-3:Widget/query:["c2","q1"]"#.to_vec())
         );
     }
 
@@ -706,11 +649,11 @@ mod tests {
             for method in ["ContactCard/query", "CalendarEvent/query"] {
                 let bytes = format!("pim-3:{method}:[\"same-id\",\"same-state\"]").into_bytes();
                 assert_eq!(
-                    ContactPages::decode_page_cursor(Some(bytes.clone()), OP).is_ok(),
+                    ContactPages::decode_page_cursor(Some(bytes.clone().into()), OP).is_ok(),
                     method == "ContactCard/query",
                 );
                 assert_eq!(
-                    CalendarPages::decode_page_cursor(Some(bytes), OP).is_ok(),
+                    CalendarPages::decode_page_cursor(Some(bytes.into()), OP).is_ok(),
                     method == "CalendarEvent/query",
                 );
             }
@@ -718,7 +661,7 @@ mod tests {
                 ContactPages::decode_page_cursor,
                 CalendarPages::decode_page_cursor,
             ] {
-                let error = decode(Some(br#"2:["same-id","same-state"]"#.to_vec()), OP)
+                let error = decode(Some(br#"2:["same-id","same-state"]"#.to_vec().into()), OP)
                     .expect_err("legacy payload has no provable collection");
                 let expected = AccountError::invalid_page_cursor(
                     OP,
@@ -894,7 +837,7 @@ mod tests {
             "3:[\"c2\",\"q1\"]",
             "2:",
         ] {
-            let error = decode(Some(Vec::from(refused)))
+            let error = decode(Some(Vec::from(refused).into()))
                 .expect_err("older or malformed cursor should fail");
             assert!(
                 matches!(
@@ -906,7 +849,7 @@ mod tests {
                 "{refused} must be refused as a caller error"
             );
         }
-        let non_utf8 = decode(Some(vec![0xff, 0xfe])).expect_err("not UTF-8");
+        let non_utf8 = decode(Some(vec![0xff, 0xfe].into())).expect_err("not UTF-8");
         assert!(matches!(
             non_utf8.kind(),
             bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
@@ -1006,7 +949,7 @@ mod tests {
         assert!(superseded.contains("Widget/query"), "{superseded}");
         assert!(superseded.contains("trawl"), "{superseded}");
 
-        let lost = text(&TestPages::anchor_lost(OP));
+        let lost = text(&TestPages::page_call_err(OP, true)(anchor_not_found()));
         assert!(lost.contains("gadget"), "{lost}");
         assert!(lost.contains("Widget/query"), "{lost}");
         assert!(lost.contains("trawl"), "{lost}");
@@ -1025,7 +968,7 @@ mod tests {
         // message in the `InvalidArgument` cause, so read the debug form.
         let undecodable = format!(
             "{:?}",
-            decode(Some(b"100".to_vec())).expect_err("v1 cursor")
+            decode(Some(b"100".to_vec().into())).expect_err("v1 cursor")
         );
         assert!(undecodable.contains("page cursor"), "{undecodable}");
     }

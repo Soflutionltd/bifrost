@@ -1,4 +1,4 @@
-//! The bounded backfill lane: producer-side flow control for cold start.
+//! Backfill capacity and scheduler admission for cold-start producers.
 //!
 //! # Why a bound at all
 //!
@@ -11,7 +11,7 @@
 //! machinery fires as a matter of routine rather than as an exception. Every
 //! abandonment costs a re-read from the last durable checkpoint.
 //!
-//! A bounded `mpsc` for the backfill lane was considered and NOT taken.
+//! A bounded `mpsc` for the backfill stream was considered and NOT taken.
 //! `account_changes_stream` hands every caller its own receiver and several live
 //! subscribers are a supported shape; an `mpsc` is single-consumer, so backfill
 //! pages would reach one of them and silently vanish for the rest. So the flow
@@ -52,7 +52,7 @@
 //! whose permit had not been inserted yet; supersession removed a record whose
 //! permit the reset then could not name; an acknowledgement released capacity
 //! the ledger had refused; a rejected acknowledgement released a different
-//! lane's. Every one of those is a seam between two structures that must agree,
+//! stream's. Every one of those is a seam between two structures that must agree,
 //! and the fix for each was another rule at another call site.
 //!
 //! `PendingCoverage::boundaries` already answers, exactly, "which publications
@@ -86,7 +86,7 @@
 //! as long as it lives - parking cold start for the rest of the attachment. So
 //! every numbered receiver MUST be polled or dropped. Nothing else reports that
 //! stall: the departure warning fires on drop and the lag warning on poll, and a
-//! receiver that does neither produces neither. [`LaneGate::wait_for_capacity`]
+//! receiver that does neither produces neither. [`BackfillBound::wait_for_capacity`]
 //! therefore warns when it parks, naming the account, the scopes and the receiver
 //! sequences holding the charge. A receiver that only watches should be an
 //! observer (`SyncEngine::account_changes_observer`, `ChangeDelivery::observe`),
@@ -100,11 +100,11 @@
 //! When both have a batch ready, both send and neither waits. There is no merge
 //! point and therefore no arbiter.
 //!
-//! That is only true if a parked backfill holds nothing the live lane needs. It
+//! That is only true if a parked backfill holds nothing the live work needs. It
 //! used to hold the account's SCHEDULER ADMISSION across the park, which with a
 //! minimal budget (`per_account = 2`, the mutation share leaving one sync
 //! permit) meant polling and push reconciliation could not be admitted until a
-//! backfill acknowledgement arrived - the live lane starving on the very
+//! backfill acknowledgement arrived - the live work starving on the very
 //! mechanism that exists to protect it. [`BackfillAdmission`] is what this
 //! module is actually for: the fast path keeps the permit, a park gives it up
 //! and re-takes it on the wake, and the completion sentinel - which does no wire
@@ -126,7 +126,7 @@ use crate::scheduler::{BudgetPermit, Scheduler, WorkKind};
 /// Deliberately far below `MultiplexerConfig::changes_capacity` (256): the bound
 /// is what keeps a cold start from overrunning the shared ring, so it has to
 /// leave room for live traffic in the same ring.
-pub const DEFAULT_BACKFILL_LANE_CAPACITY: usize = 64;
+pub const DEFAULT_BACKFILL_CAPACITY: usize = 64;
 
 /// How often one gate repeats its park warning.
 ///
@@ -138,10 +138,10 @@ pub const DEFAULT_BACKFILL_LANE_CAPACITY: usize = 64;
 const PARK_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The account's scheduler admission, owned by the gate so a parked producer is
-/// not sitting on budget the live lane needs.
+/// not sitting on budget the live work needs.
 ///
 /// The engine admits every wire path, and with a minimal budget the account has
-/// a single sync permit. A backfill that filled the lane, started the next
+/// a single sync permit. A backfill that filled the bound, started the next
 /// partition, took that permit and then parked blocked polling and push
 /// reconciliation until an acknowledgement arrived, and with `global = 1` other
 /// accounts and mutations too. So the permit is dropped for the duration of a
@@ -225,7 +225,7 @@ impl BackfillAdmission {
 /// IS the capacity ledger), the token a park must be able to end through, and
 /// the account's scheduler admission.
 #[derive(Debug)]
-pub struct LaneGate {
+pub struct BackfillBound {
     coverage: Arc<PendingCoverage>,
     capacity: usize,
     shutdown: CancellationToken,
@@ -238,7 +238,7 @@ pub struct LaneGate {
 
 // Capacity and warning state belong to the account; admission belongs to one
 // pass. Sharing the permit slot lets a cloned pass release another pass's budget.
-impl Clone for LaneGate {
+impl Clone for BackfillBound {
     fn clone(&self) -> Self {
         Self {
             coverage: Arc::clone(&self.coverage),
@@ -256,15 +256,15 @@ impl Clone for LaneGate {
 
 /// A cancelled partition future must release the gate's stored budget too.
 /// Keeping the permit only in the cloneable gate would outlive that future.
-pub(super) struct LanePermit<'a>(&'a LaneGate);
+pub(super) struct BackfillPermit<'a>(&'a BackfillBound);
 
-impl Drop for LanePermit<'_> {
+impl Drop for BackfillPermit<'_> {
     fn drop(&mut self) {
         self.0.release_admission();
     }
 }
 
-impl LaneGate {
+impl BackfillBound {
     #[must_use]
     pub fn new(
         coverage: Arc<PendingCoverage>,
@@ -276,7 +276,7 @@ impl LaneGate {
     ) -> Self {
         Self {
             coverage,
-            // A zero-capacity lane is a permanently parked cold start, and a
+            // A zero-capacity bound is a permanently parked cold start, and a
             // misconfigured knob must not be able to produce one.
             capacity: capacity.max(1),
             shutdown,
@@ -308,13 +308,13 @@ impl LaneGate {
     /// Install a permit acquired by the slot's drive-start gate. The gate
     /// retains activity and the incarnation in the partition caller; this
     /// owner releases only the scarce scheduler budget at a capacity park.
-    pub(super) fn hold_admission(&self, permit: BudgetPermit) -> LanePermit<'_> {
+    pub(super) fn hold_admission(&self, permit: BudgetPermit) -> BackfillPermit<'_> {
         *self
             .admission
             .permit
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(permit);
-        LanePermit(self)
+        BackfillPermit(self)
     }
 
     /// Give the account's sync admission back.
@@ -395,7 +395,7 @@ impl LaneGate {
             in_flight,
             holders = ?holders,
             scopes = ?scopes,
-            "backfill parked on the lane bound; every numbered change-stream receiver \
+            "backfill parked on the unread-page bound; every numbered change-stream receiver \
              must be polled or dropped"
         );
     }
@@ -409,7 +409,7 @@ impl LaneGate {
     /// mid-partition - but it does so through the slot's `PendingCoverage`
     /// directly, because teardown holds the coverage and has no gate. Nothing
     /// here is dead in the sense of unreachable: it is published, so a consumer
-    /// holding a `LaneGate` can reach the same pulse without reaching for the
+    /// holding a `BackfillBound` can reach the same pulse without reaching for the
     /// ledger. Recorded rather than removed: deleting a published item is not a
     /// call this makes on its own judgement, and an audit finding it uncalled has
     /// found the intended state. Same standing as
@@ -452,7 +452,7 @@ mod tests {
 
     struct Harness {
         coverage: Arc<PendingCoverage>,
-        gate: LaneGate,
+        gate: BackfillBound,
         shutdown: CancellationToken,
         account: AccountId,
         scheduler: Scheduler,
@@ -465,10 +465,10 @@ mod tests {
     fn harness_with_budget(capacity: usize, per_account: usize, global: usize) -> Harness {
         let coverage = Arc::new(PendingCoverage::new());
         let shutdown = CancellationToken::new();
-        let account = AccountId("lane-unit".to_owned());
+        let account = AccountId("bound-unit".to_owned());
         let scheduler = scheduler(per_account, global);
         scheduler.budget().register(account.clone());
-        let gate = LaneGate::new(
+        let gate = BackfillBound::new(
             Arc::clone(&coverage),
             capacity,
             shutdown.clone(),
@@ -532,11 +532,11 @@ mod tests {
         SyncControl::new_with_publications(account.clone(), boundary, priority, bandwidth, coverage)
     }
 
-    /// The lane harness plus the pieces `emit_backfill_complete` needs: a real
+    /// The bound harness plus the pieces `emit_backfill_complete` needs: a real
     /// broadcast channel with a retained receiver, so "was the marker actually
     /// published" is observable rather than inferred.
     struct MarkerHarness {
-        lane: Harness,
+        bound: Harness,
         control: SyncControl,
         delivery: Arc<crate::multiplexer::ChangeDelivery>,
         rx: std::sync::Mutex<
@@ -547,11 +547,11 @@ mod tests {
     fn marker_harness(capacity: usize) -> MarkerHarness {
         let coverage = Arc::new(PendingCoverage::new());
         let shutdown = CancellationToken::new();
-        let account = AccountId("lane-marker".to_owned());
+        let account = AccountId("bound-marker".to_owned());
         let scheduler = scheduler(8, 64);
         scheduler.budget().register(account.clone());
         let control = control_over(&account, Arc::clone(&coverage));
-        let gate = LaneGate::new(
+        let gate = BackfillBound::new(
             Arc::clone(&coverage),
             capacity,
             shutdown.clone(),
@@ -561,7 +561,7 @@ mod tests {
         );
         let (tx, rx) = tokio::sync::broadcast::channel(16);
         MarkerHarness {
-            lane: Harness {
+            bound: Harness {
                 coverage,
                 gate,
                 shutdown,
@@ -594,17 +594,17 @@ mod tests {
                 .expect("page"),
             )]
         }));
-        let old = h.lane.coverage.scope_fence(&scope);
-        h.lane.coverage.raise_scope_fence(&scope);
+        let old = h.bound.coverage.scope_fence(&scope);
+        h.bound.coverage.raise_scope_fence(&scope);
         let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(4);
         drop(writer_rx);
         let publisher = crate::multiplexer::PagePublisher::new(
             Arc::clone(&h.delivery),
             h.control.clone(),
             writer_tx,
-            h.lane.shutdown.clone(),
+            h.bound.shutdown.clone(),
         );
-        for lane in [Some(&h.lane.gate), None] {
+        for bound in [Some(&h.bound.gate), None] {
             let result = crate::backfill::runner::BackfillRunner::run_partition(
                 &account,
                 scope.clone(),
@@ -613,7 +613,7 @@ mod tests {
                 bifrost_types::TraitEnvelopeVersion::new(1),
                 &publisher,
                 crate::cursor::WalkGeneration::for_test(1),
-                lane,
+                bound,
                 old,
             )
             .await;
@@ -626,10 +626,10 @@ mod tests {
     async fn a_completion_reaching_only_an_observer_is_withheld() {
         let h = marker_harness(4);
         let scope = scope_a();
-        let before = h.lane.coverage.undelivered_watermark(&scope);
+        let before = h.bound.coverage.undelivered_watermark(&scope);
         assert_eq!(h.emit_marker(&scope, before).await, MarkerOutcome::Withheld);
-        assert_eq!(h.lane.coverage.pending_checkpoints(), 0);
-        assert_ne!(h.lane.coverage.undelivered_watermark(&scope), before);
+        assert_eq!(h.bound.coverage.pending_checkpoints(), 0);
+        assert_ne!(h.bound.coverage.undelivered_watermark(&scope), before);
         assert_eq!(
             h.received(),
             1,
@@ -644,7 +644,7 @@ mod tests {
             scope: &'a CursorScope,
             undelivered_before: crate::cursor::UndeliveredMark,
         ) -> impl std::future::Future<Output = MarkerOutcome> + 'a {
-            let fence = self.lane.coverage.scope_fence(scope);
+            let fence = self.bound.coverage.scope_fence(scope);
             self.emit_marker_for_walk(scope, undelivered_before, fence)
         }
 
@@ -663,13 +663,13 @@ mod tests {
                 Arc::clone(&self.delivery),
                 self.control.clone(),
                 writer_tx,
-                self.lane.shutdown.clone(),
+                self.bound.shutdown.clone(),
             );
             crate::engine::backfill::emit_backfill_complete(
                 scope,
                 crate::backfill::ScopeWalkDriver::fixed(Vec::new()).total_seen(),
                 &publisher,
-                &self.lane.gate,
+                &self.bound.gate,
                 undelivered_before,
                 fence_at_walk_start,
             )
@@ -825,7 +825,7 @@ mod tests {
         assert!(h.gate.wait_for_capacity().await.is_ok());
     }
 
-    /// FINDING 1. The live lane supersedes too, and it never consults the bound,
+    /// FINDING 1. The change stream supersedes too, and it never consults the bound,
     /// so inheriting the capacity charge there would make a subscriber that
     /// drains without acknowledging grow one entry's history without limit -
     /// every retained id holding a `PublicationReceipt` and its whole coverage
@@ -835,7 +835,7 @@ mod tests {
     /// Bites on the SIZE of what the ledger retains, which is the actual defect;
     /// asserting `backfill_in_flight() == 0` alone would pass against it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_live_lane_retains_no_publication_history() {
+    async fn the_change_stream_retains_no_publication_history() {
         let h = harness(4);
         for round in 0..64u32 {
             h.publish(&live_cursor(&round.to_be_bytes()), 1);
@@ -844,7 +844,7 @@ mod tests {
         assert_eq!(
             h.coverage.pending_checkpoints(),
             1,
-            "one live lane, one outstanding registration"
+            "one change stream, one outstanding registration"
         );
         assert_eq!(
             h.coverage.retained_history(),
@@ -853,7 +853,7 @@ mod tests {
              drains without acknowledging would otherwise grow this for ever"
         );
 
-        // The backfill lane is the one that does keep a history, so the assertion
+        // The backfill stream is the one that does keep a history, so the assertion
         // above is about the LANE and not about the mechanism being absent.
         h.publish(&page(&scope_a(), "page:0:10", 1), 1);
         h.publish(&page(&scope_a(), "page:0:10", 2), 1);
@@ -1136,7 +1136,7 @@ mod tests {
     }
 
     /// FINDING 3 of the previous round, kept: a producer parked mid-partition
-    /// must give the budget back, or the live lane starves on a minimal budget.
+    /// must give the budget back, or the live work starves on a minimal budget.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_parked_producer_gives_up_the_accounts_sync_admission() {
         let h = harness_with_budget(1, 2, 2);
@@ -1207,7 +1207,7 @@ mod tests {
         let gate_for = |name: &str, coverage: Arc<PendingCoverage>| {
             let account = AccountId(name.to_owned());
             scheduler.budget().register(account.clone());
-            LaneGate::new(
+            BackfillBound::new(
                 coverage,
                 1,
                 CancellationToken::new(),
@@ -1383,7 +1383,7 @@ mod tests {
     ///
     /// Both routes into the counter are checked, because both take a scope and
     /// either could take the wrong one: the departure sweep, which attributes each
-    /// retired entry through its own lane, and the direct
+    /// retired entry through its own publication stream, and the direct
     /// retire-on-sentinel-only note.
     #[tokio::test(start_paused = true)]
     async fn the_undelivered_watermark_is_recorded_against_one_scope_only() {
@@ -1448,9 +1448,9 @@ mod tests {
         let h = marker_harness(1);
         let scope = scope_a();
         // One page holds the whole bound, so the marker's wait is a real one.
-        h.lane.publish(&page(&scope, "page:0:10", 1), 1);
+        h.bound.publish(&page(&scope, "page:0:10", 1), 1);
 
-        let before = h.lane.coverage.undelivered_watermark(&scope);
+        let before = h.bound.coverage.undelivered_watermark(&scope);
         let emit = h.emit_marker(&scope, before);
         tokio::pin!(emit);
         assert!(
@@ -1461,7 +1461,7 @@ mod tests {
         // The reset closes while the marker waits: it retires the outstanding
         // publication - which frees the bound and wakes the marker - and raises
         // the fence the marker has to re-read.
-        let _ = h.lane.coverage.invalidate_scope(&scope);
+        let _ = h.bound.coverage.invalidate_scope(&scope);
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), emit)
             .await
@@ -1497,15 +1497,15 @@ mod tests {
         let scope = scope_a();
         // A page of the walk, so the reset below has something to fence and the
         // mint counter it fences at is past the walk's own starting fence.
-        h.lane.publish(&page(&scope, "page:0:10", 1), 1);
-        let fence_at_walk_start = h.lane.coverage.scope_fence(&scope);
-        let before = h.lane.coverage.undelivered_watermark(&scope);
+        h.bound.publish(&page(&scope, "page:0:10", 1), 1);
+        let fence_at_walk_start = h.bound.coverage.scope_fence(&scope);
+        let before = h.bound.coverage.undelivered_watermark(&scope);
 
         // The reset closes while the walk's last page is still on the provider
         // stream, so it lands BEFORE the emission rather than during its wait.
-        let _ = h.lane.coverage.invalidate_scope(&scope);
+        let _ = h.bound.coverage.invalidate_scope(&scope);
         assert_ne!(
-            h.lane.coverage.scope_fence(&scope),
+            h.bound.coverage.scope_fence(&scope),
             fence_at_walk_start,
             "the reset must have moved the fence, or this test stages nothing"
         );
@@ -1539,9 +1539,9 @@ mod tests {
     async fn a_page_swept_while_the_marker_waits_withholds_the_marker() {
         let h = marker_harness(1);
         let scope = scope_a();
-        let before = h.lane.coverage.undelivered_watermark(&scope);
+        let before = h.bound.coverage.undelivered_watermark(&scope);
         // The walk's final page: delivered to receiver 0, unacknowledged.
-        h.lane.publish(&page(&scope, "page:0:10", 1), 1);
+        h.bound.publish(&page(&scope, "page:0:10", 1), 1);
 
         let emit = h.emit_marker(&scope, before);
         tokio::pin!(emit);
@@ -1549,7 +1549,7 @@ mod tests {
 
         // Receiver 0 departs. This is the sweep: it records the page as reaching
         // nobody and frees the bound in the same transition.
-        assert_eq!(h.lane.coverage.release_undelivered(None), 1);
+        assert_eq!(h.bound.coverage.release_undelivered(None), 1);
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), emit)
             .await
@@ -1619,7 +1619,7 @@ mod tests {
     /// bug produces, and an await with no deadline cannot tell "admitted" from
     /// "never returns".
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_zero_capacity_lane_still_admits_one_publication() {
+    async fn a_zero_capacity_bound_still_admits_one_publication() {
         let h = harness(0);
         let admitted = tokio::time::timeout(
             std::time::Duration::from_secs(5),

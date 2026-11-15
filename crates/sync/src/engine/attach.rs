@@ -489,25 +489,19 @@ impl SyncEngine {
 
         let (push_health_tx, _) = watch::channel(crate::push::health::PushHealth {
             generation: crate::types::Incarnation::initial_generation(),
-            lanes: if current.load().capabilities().push == bifrost_types::PushCapability::None {
-                Vec::new()
-            } else {
-                current
-                    .load()
-                    .push_lanes()
-                    .into_iter()
-                    .map(|spec| crate::push::health::PushLaneHealth {
-                        lane: spec.lane,
-                        kind: spec.kind,
-                        state: crate::push::health::PushLaneState::Starting,
-                    })
-                    .collect()
-            },
+            lanes: bifrost_types::effective_push_lanes(current.load().as_ref().as_ref())
+                .into_iter()
+                .map(|spec| crate::push::health::PushLaneHealth {
+                    lane: spec.lane,
+                    kind: spec.kind,
+                    state: crate::push::health::PushLaneState::Starting,
+                })
+                .collect(),
         });
         let (push_topology_tx, push_topology_rx) =
             watch::channel(crate::engine::PushTopologyGeneration::default());
         let (push_retired_tx, _) = watch::channel(crate::types::Incarnation::initial_generation());
-        let push_lanes = crate::push::lanes::PushLanes {
+        let push_supervisor = crate::push::supervisor::PushSupervisor {
             account_id: account_id.clone(),
             current: Arc::clone(&current),
             generation: account_generation_rx.clone(),
@@ -523,8 +517,8 @@ impl SyncEngine {
             drain_bound: self.config.detach_timeout / 2,
         };
         spawn(
-            crate::types::WorkerRole::PushLanes,
-            tokio::spawn(push_lanes.run()),
+            crate::types::WorkerRole::PushSupervisor,
+            tokio::spawn(push_supervisor.run()),
         );
 
         // Spawn the multiplexer.

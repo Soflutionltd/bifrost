@@ -122,23 +122,6 @@ and `ledger_envelope.rs::encode_protocol`). Nothing checks the consumer's
 `ProtocolKind` against the account. Proposal: derive the salt from the account
 and drop the parameter (owner ruling: published).
 
-## CON-004 - Does this account run push, and on which lanes?
-
-**Reported by:** types (LATENT).
-
-Answered by `AccountCapabilities::push: PushCapability` and by
-`Account::push_lanes()` / `PushLaneKind`. The engine re-combines them at three
-sites (`sync/src/engine/attach.rs` seeding push health,
-`sync/src/push/lanes.rs::PushLanes::run`, `sync/src/engine/reattach.rs`
-carrying subscriptions), each spelling `if caps.push == None { [] } else {
-push_lanes() }`. The three non-`None` variants carry nothing the engine reads:
-in-process vs out-of-process is already per lane in `PushLaneKind`, and
-`OutOfProcessPubsub` vs `WebhookOrEwsStream` encode provider identity.
-
-Owner: derive the capability from the lanes (`None` iff no lanes; in-process iff
-any `Connection` lane), or one `effective_push_lanes(&dyn Account)` in
-`bifrost-types`.
-
 ## CON-006 - Capability flag vs the method's own refusal
 
 **Reported by:** types (LATENT; `PimMethodSupport` was ruled 2026-10-03 to stay, and nothing here proposes removing it).

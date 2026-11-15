@@ -1943,6 +1943,7 @@ async fn reattach_account_paced(
             .collect();
 
         let previous_subscriptions = ctx.subscriptions.snapshot(ctx.account_id);
+        let next_has_push = !bifrost_types::effective_push_lanes(next.as_ref()).is_empty();
         for record in previous_subscriptions.iter().filter(|record| {
             // Recreate what the consumer still WANTS, whatever the state of
             // the old handle's teardown. An orphan (not `desired`) is carried
@@ -1955,7 +1956,7 @@ async fn reattach_account_paced(
             // the retry: its old handle was torn down or carried as an orphan,
             // nothing replaced it, and the consumer's push coverage vanished
             // without an error.
-            record.desired() && next.capabilities().push != bifrost_types::PushCapability::None
+            record.desired() && next_has_push
         }) {
             let scopes: Vec<CursorScope> = record
                 .scopes

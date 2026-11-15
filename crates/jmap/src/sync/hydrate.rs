@@ -428,7 +428,7 @@ fn reconcile_hydration(
                     .keywords()
                     .into_iter()
                     .map(str::to_string)
-                    .collect::<HashSet<_>>(),
+                    .collect::<bifrost_types::FlagSet>(),
             ),
             Projection::Metadata => {
                 let mut entry = email_to_inventory(email, state);
@@ -452,7 +452,7 @@ fn reconcile_hydration(
                 }
                 HydratedObjectKind::Metadata(entry)
             }
-            _ => HydratedObjectKind::FlagsOnly(HashSet::new()),
+            _ => HydratedObjectKind::FlagsOnly(bifrost_types::FlagSet::new()),
         };
         let item_id = BatchItemId(id.0.clone());
         let hydrated = HydratedObject {

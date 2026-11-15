@@ -144,19 +144,6 @@ enforced by each producer by hand. `ReminderTrigger::Relative { offset: String
 Proposal: `enum EventTime { Date(civil::Date), Floating(civil::DateTime),
 Zoned(..) }`, `is_all_day` derived, and an `EventRange` that owns overlap.
 
-## STR-004 - Flag identity is a rule restated, not a type
-
-**Reported by:** types (LATENT).
-
-"Flags are ASCII-case-insensitive" is implemented three times in `mutation.rs`
-(`canonical_flags_hash` lowercases, `FlagOp::validate` uses
-`eq_ignore_ascii_case`, `flag_target_state` folds) and carried in
-`HashSet<String>` (`FlagOp`, `HydratedObjectKind::FlagsOnly`, `Message::flags`,
-`Account::flag_target`'s `observed`), which holds `\Seen` and `\SEEN` as two
-members. `set_keyword(keyword: String)` and `FilterAction::SetKeyword` are the
-same axis untyped. Proposal: a `Flag` newtype with case-folded `Eq`/`Hash` and
-a `FlagSet`, so the three functions cannot disagree.
-
 ## STR-005 - `BatchItemId(String)` has three meanings
 
 **Reported by:** types (LATENT), sync-engine.
@@ -190,38 +177,6 @@ found a site stamping the hydrated id instead. Proposal: make the key a type
 parameter (`ItemOutcome<K, T>` / `BatchSuccess<K, T>`), `K = ObjectId` on the
 streaming lanes, a `SubmissionIndex` for positional ledgers, `BatchItemId` only
 where the caller mints it.
-
-## STR-006 - Page cursors are bare `Option<Vec<u8>>`
-
-**Reported by:** types.
-
-`Page::next_cursor` and the `page_cursor` inputs of `contacts_list`,
-`directory_search`, `directory_groups_list`, `directory_group_expand`,
-`SearchRequest`, `ContactSearchRequest`, `EventRange`, `EventSearchRequest`. A
-contacts cursor can be handed to directory search; each provider rejects a
-foreign one by its own rules. A `PageCursor` newtype (optionally branded per
-surface) costs nothing.
-
-The graph hunter found five untagged cursor formats inside Graph alone: bare link
-bytes (`contacts::link_cursor`, `paging::decode_link_cursor`); `PagedCursor { url,
-skip, mode }` JSON (`paging::encode_paged_cursor` and `encode_directory_cursor`);
-`b"\x1fsearchapi:" + offset` (calendar search); the `Position` structs in
-`contacts/public.rs` and `calendar_public.rs`; and `SearchPosition` in
-`calendar_public.rs`. `decode_paged_cursor` falls back to reading a non-JSON input
-as a link cursor, so a cursor minted by one surface decodes on another.
-`DirectoryMode` lives in `paging.rs` though only directory search uses it, and
-`encode_paged_cursor` always stamps `DirectoryMode::Filter`. Its owner: one
-`GraphPageCursor { surface, .. }` enum with a single versioned codec and a surface
-tag checked on decode, turning a cross-surface cursor into `Request(Malformed)`.
-JMAP's two codecs sharing tag `2` are STR-101.
-
-The google hunter reports Google has no cursor type at all, and a malformed (not
-UTF-8) page cursor is classified three ways: `pim::page_token` uses
-`other_error(Search)` (so `search_messages` reports operation `Search`); `calendar`
-uses `caller_input_error`; `contacts` uses `caller_input_error` with the raw
-`FromUtf8Error` text. JMAP classifies a stale or malformed page cursor as
-`SyncState(SchemaIncompatible)` (BUG-069). Google should have a `PageCursor` whose
-refusal matches the workspace answer.
 
 ## STR-008 - Versions are read as `etag: Option<String>` and written as `ServerVersion`
 
@@ -716,23 +671,6 @@ typed key of BUG-016), `backfill/scan.rs` (`BackfillScan`), with
 `engine/backfill.rs` keeping only the async loop, admission and wiring; tests
 move with what they test.
 
-## STR-045 - Codecs for `bifrost-types` vocabulary live in `bifrost-sync`, where their matches cannot be exhaustive
-
-**Reported by:** sync-lanes.
-
-`ledger_envelope.rs` encodes `AccountErrorKind`, `ErrorScope`, `ResourceKind`,
-`AccountOperation` (by positional table), `Provider`, `Protocol`, `Cause`
-reconstruction and diagnostics; `envelope.rs` encodes `CursorScope`,
-`ObjectType` and `ProtocolKind`. Every enum is `#[non_exhaustive]` from sync's
-side, so each codec carries a wildcard arm that panics on encode or errors on
-decode (BUG-018). The ledger version history shows the coupling: versions 5, 6
-and 7 were bumped because `bifrost-types` grew an `ErrorScope` or `ResourceKind`
-variant. The dependency edge points the wrong way for change safety: the crate
-that adds a variant cannot see the codec that must learn it. Proposal: move the
-tag codecs for types-owned vocabulary into `bifrost-types` (a `wire` module with
-exhaustive in-crate matches), versioned there; the ledger codec composes them,
-as it already composes `encode_envelope` for `resume_from`.
-
 ## STR-046 - A partitioning framework with no producer imposes its costs on every consumer
 
 **Reported by:** sync-lanes (published; not a deletion recommendation).
@@ -754,18 +692,6 @@ InventoryPartition` has two redundant middle layers, and collapsing it to
 and the durable cost of the unexercised machinery (the selection rule every
 store implements, the drifting time keys, BUG-016) is paid now by every backend
 for producers that do not exist yet.
-
-## STR-047 - "Lane" means five different things in the engine
-
-**Reported by:** sync-lanes.
-
-`cursor::coverage::Lane` (publication supersession and acknowledgement lane),
-`engine::lane::LaneGate` (backfill bound plus admission), `scheduler::lanes`
-(Foreground, Normal, Background, Bulk), `push::lanes::PushLanes` (push session
-supervision), and `bifrost_types::PushLane` / `PushLaneKind`. The module docs
-repeatedly disambiguate. Renaming the internal ones (for example
-`PublicationStream` for coverage's `Lane`, `BackfillBound` for `LaneGate`) costs
-nothing published.
 
 ## STR-048 - Per-scope drive state is split between the cursor registry and the multiplexer
 
@@ -1205,33 +1131,6 @@ Suggested split: `compose/` (send, draft, header rewriting - the header surgery
 arguably beside `bifrost_types::mime`), `search.rs`, `containers.rs`, roles into
 the registry (BUG-028), and the primitives folded into the mutation engine
 (STR-080).
-
-## STR-081 - IMAP and JMAP error construction escapes the armed `error.rs` boundary
-
-**Reported by:** imap-account, jmap-account.
-
-The IMAP half landed in wave 15: every IMAP account-layer `AccountError` is now
-built in `account/error.rs` under its armed lint. Residue: the JMAP half below.
-
-The jmap-account hunter reports the same in JMAP: `error.rs` carries
-`#![warn(dead_code)]` so an unreachable classification arm is a warning, but
-`AccountError`s are also built inline in `capabilities.rs` (four builders),
-`changes.rs` (the cursor decode mapping, BUG-073), `page_cursor.rs` (three),
-`pim.rs` (`schema_incompatible_search_cursor`, `missing_shared_rights`,
-`reschedule_*`, partial commits), `blob.rs` (`NotFound`, range `InvalidArgument`)
-and `contacts.rs` / `calendar_ops.rs` (`unsupported` wrappers); the duplicates in
-BUG-065 and BUG-069 are a product of that scatter. Move every classification into
-`error.rs` (split by family if size is the concern).
-
-`error.rs` opens by claiming to be "the only place in bifrost-imap that constructs
-`bifrost_types::AccountError`" and opts back into `dead_code` so an unreachable
-translation is caught. In fact about 36 `AccountErrorBuilder::new` sites live in
-`mutate.rs` (10), `pim.rs` (7), `blob.rs` (3), `get.rs`, `envelope.rs`,
-`factory.rs`, `poll.rs` (2 each), `targets.rs`, `scopes.rs`. Two builders for
-`NotFound(Message)` (`get::message_not_found_error`, `pim::expunged_message`,
-plus `blob::raw_message_not_found`) differ in whether they stamp `Acknowledged`.
-Gathering the domain builders into `error.rs` makes the claim true and puts them
-under the armed `dead_code` lint.
 
 ## STR-082 - IMAP does not partition inventory, so large folders get no bounded backfill
 

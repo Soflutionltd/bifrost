@@ -87,10 +87,10 @@ async fn close_within(account: &dyn Account, timeout: Duration) -> CloseOutcome 
 mod ack;
 mod attach;
 mod backfill;
+pub mod backfill_bound;
 mod bulk;
 mod context;
 pub(crate) mod drive_start;
-pub mod lane;
 mod maintenance;
 mod orphan_teardown;
 mod passthrough;
@@ -106,8 +106,8 @@ mod tests;
 use ack::{WriterHandle, ack_writer, await_ack_writer_until, await_worker_until, take_ack_writer};
 use attach::{discover_scopes_from, link_discovered_memberships, wait_for_real_subscriber};
 use backfill::{BackfillWiring, run_backfill_orchestrator};
+use backfill_bound::BackfillBound;
 use context::SlotContext;
-use lane::LaneGate;
 use reattach::{
     DeferredScopeRepairs, RecoveryContext, RecoveryFollowUp, ReplacementOpen, accepted_push_scopes,
     handle_account_error, log_open_skips, open_replacement, reattach_account,
@@ -961,7 +961,7 @@ impl SyncEngine {
         // Two of the three provider-stream reads now stop at their next poll
         // boundary, and they answer DIFFERENT signals, which matters here.
         // `BackfillRunner::run_partition` selects this token directly (through
-        // its `LaneGate`) and returns `Error::ShuttingDown`, which withholds
+        // its `BackfillBound`) and returns `Error::ShuttingDown`, which withholds
         // both the partition outcome and the scope completion marker.
         // `drive_changes_stream` selects the account BOUNDARY, not this token,
         // so it stops when that account's own `detach` publishes `Stop` - which

@@ -9,6 +9,11 @@
 //! `AccountErrorBuilder` here with operation, scope, and
 //! provider/protocol context attached.
 //!
+//! Local account error classification and builder decoration also live here,
+//! including capability validation, persisted cursors, PIM and push errors.
+//! Shared classifications remain owned by `bifrost-types`; protocol modules
+//! pass observations to this boundary rather than rebuilding their taxonomy.
+//!
 //! No `RecoveryClass` or `Fatal` is constructed in this crate. The
 //! central recovery mapping in `bifrost_types::error::recovery` derives
 //! recovery from `(kind, scope, operation, primary_cause)` at builder
@@ -33,10 +38,10 @@ use bifrost_net::{
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText,
-    ErrorScope, InternalCause, InternalErrorKind, JmapMethod, Protocol, ProtocolErrorKind,
-    RequestCause, RequestErrorKind, ResourceKind, RetryHint, ServerCause, ServerErrorKind,
-    StateCause, SyncEvent, SyncStateErrorKind, ThrottleScope, TransmissionState, TransportCause,
-    TransportErrorKind, TransportKind, WireCause,
+    ErrorScope, InternalCause, InternalErrorKind, JmapMethod, PartialCommitBuilder, Protocol,
+    ProtocolErrorKind, RequestCause, RequestErrorKind, ResourceKind, RetryHint, ServerCause,
+    ServerErrorKind, StateCause, SyncEvent, SyncStateErrorKind, ThrottleScope, TransmissionState,
+    TransportCause, TransportErrorKind, TransportKind, WireCause,
 };
 #[cfg(test)]
 use bifrost_types::{BatchSuccess, ItemOutcome, MutationSuccess};
@@ -968,6 +973,371 @@ pub(crate) fn shared_scope_error(
     ctx: JmapErrorContext,
 ) -> AccountError {
     into_account_error(err, ctx).revoke_foreign_scope(scope.clone(), owner)
+}
+
+// ---- local account errors ---------------------------------------------
+
+/// Session document does not advertise the `urn:ietf:params:jmap:core`
+/// capability at all. This is a server-side capability change relative
+/// to whatever the session previously claimed: the engine must reopen.
+fn missing_core_capability() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
+        Cause::State(StateCause::CapabilityChanged { delta: None }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(AccountOperation::Discover)
+    .text(DiagnosticText::support_only(
+        "JMAP session does not advertise the core capability",
+    ))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// A method response named a different session state. Account construction
+/// derives routing, limits, and capabilities from the old session, so the
+/// only safe consumer action is to reopen against a freshly fetched session.
+pub(super) fn session_state_changed() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
+        Cause::State(StateCause::CapabilityChanged { delta: None }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(AccountOperation::ScopeLifecycle)
+    .text(DiagnosticText::support_only(
+        "JMAP response sessionState diverged from the open session",
+    ))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Server advertises the core capability but omits a required field or gives
+/// zero for one of the request limits this account requires to be positive.
+/// That is a `Protocol(ContractViolation)`: the server claimed conformance
+/// and then withheld required information or advertised an unusable limit.
+/// Zero is valid for `maxSizeUpload` and the concurrency limits because they
+/// are `UnsignedInt`; an omitted `maxSizeUpload` takes the same error lane.
+/// It is not a capability change.
+fn unusable_core_limits() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Jmap,
+            detail: Some(DiagnosticText::support_only(
+                "JMAP core capability omits required fields or advertises unusable limits",
+            )),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(AccountOperation::Discover)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// The `urn:ietf:params:jmap:core` block is PRESENT but does not parse as
+/// the RFC 8620 §2 core object (`"maxCallsInRequest": "16"` as a string is
+/// the canonical shape). The server advertised the capability and then
+/// described it wrongly, so this is the same `Protocol(ContractViolation)`
+/// lane as a zero-valued limit, and deliberately NOT the
+/// `SyncState(CapabilityChanged)` lane an absent block takes: nothing about
+/// this session changes on a reopen, so classifying it as a capability
+/// change would buy an endless reopen loop.
+fn malformed_core_capability() -> AccountError {
+    malformed_required_capability(
+        <crate::core::capability::Core as crate::core::capability::Capability>::URI,
+    )
+}
+
+/// A capability block the account DEPENDS on is present but does not
+/// parse. Same lane and same reasoning as the core block: the server
+/// advertised the capability and then described it wrongly, so a reopen
+/// buys nothing and the honest classification is a contract violation.
+/// The URI is named in the diagnostic - "some capability is malformed" is
+/// not an actionable report when a session advertises a dozen.
+pub(super) fn malformed_required_capability(uri: &str) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Jmap,
+            detail: Some(DiagnosticText::support_only(format!(
+                "JMAP capability object {uri} is present but not parseable"
+            ))),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(AccountOperation::Discover)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+pub(super) fn core_limits_error(error: crate::core::session::CoreLimitsError) -> AccountError {
+    match error {
+        crate::core::session::CoreLimitsError::Absent => missing_core_capability(),
+        crate::core::session::CoreLimitsError::Malformed => malformed_core_capability(),
+        crate::core::session::CoreLimitsError::Unusable => unusable_core_limits(),
+    }
+}
+
+pub(super) fn finish_partial(error: AccountError, record: PartialCommitBuilder) -> AccountError {
+    error
+        .into_builder()
+        .partial_commit(record)
+        .try_build()
+        .expect("valid JMAP partial commitment")
+}
+
+/// A shared mailbox whose `Mailbox/get` answered without `myRights`.
+///
+/// RFC 8621 s2 makes `myRights` a server-set Mailbox property, and
+/// `fetch_mailboxes` asks for it by name, so an answer that omits it is
+/// a missing field rather than a protocol that has no rights notion. It
+/// matters only on a SHARE: `Container::rights` gates submit and the
+/// read-only-share distinction, and `None` there is indistinguishable
+/// from a personal mailbox where rights are not consulted. Reported as
+/// a degradation, not a failure - the container is still listed, since
+/// a share with unknown rights is far more useful than a share missing
+/// from the sidebar.
+pub(super) fn missing_shared_rights(container_id: &str, op: AccountOperation) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Jmap,
+            detail: Some(DiagnosticText::support_only(format!(
+                "shared Mailbox/get answered without myRights: {container_id}"
+            ))),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(op)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+pub(super) fn invalid_attachment_handle(op: AccountOperation) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only(
+                "JMAP attachment handle has no source account; upload it again before sending",
+            ),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(op)
+    .try_build()
+    .expect("valid attachment handle classification")
+}
+
+/// A scheduled JMAP send needs a concrete mailFrom and recipients to carry
+/// the hold parameter. A caller-selected Identity can supply mailFrom when
+/// `from` is absent; without either, JMAP defines no default identity to use.
+/// Maps to `Request(Malformed)`.
+pub(super) fn scheduled_requires_envelope() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::user_safe(
+                "Scheduled send requires a from address or selected identity and at least one recipient.",
+            ),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(AccountOperation::Send)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+pub(super) fn reschedule_missing_field(detail: &'static str) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Jmap,
+            detail: Some(DiagnosticText::support_only(detail)),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(AccountOperation::RescheduleSend)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+pub(super) fn reschedule_not_found(id: &str) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::NotFound(ResourceKind::Message),
+        Cause::Request(RequestCause::NotFound {
+            what: ResourceKind::Message,
+            id: Some(id.to_string()),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(AccountOperation::RescheduleSend)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Classify persisted change state before constructing a changes stream.
+pub(super) fn change_cursor_error(
+    error: super::state::JmapCursorError,
+    scope: CursorScope,
+) -> AccountError {
+    let fault = match &error {
+        super::state::JmapCursorError::CursorProtocolMismatch => {
+            bifrost_types::CursorDecodeFault::ProtocolMismatch
+        }
+        super::state::JmapCursorError::CursorEnvelopeUnknown => {
+            bifrost_types::CursorDecodeFault::FutureVersion
+        }
+        // A readable scope disagreement restarts only that scope. Keep
+        // this exhaustive so new faults cannot inherit that policy.
+        super::state::JmapCursorError::ScopeMismatch => {
+            bifrost_types::CursorDecodeFault::ScopeMismatch
+        }
+        super::state::JmapCursorError::UnsupportedScope
+        | super::state::JmapCursorError::SchemaIncompatible => {
+            bifrost_types::CursorDecodeFault::Malformed
+        }
+    };
+    fault
+        .builder(Protocol::Jmap, AccountOperation::SyncChanges)
+        .scope(ErrorScope::Cursor(scope))
+        .text(DiagnosticText::support_only(format!(
+            "JMAP cursor decode: {error:?}"
+        )))
+        .try_build()
+        .expect("valid account error classification")
+}
+
+/// A cursor payload this crate cannot honour: an older, retired, malformed or
+/// out-of-range encoding.
+///
+/// Classified `Request(Malformed)` (recovery `ClientBug`, so the ENGINE takes
+/// no action) with `RequestCause::InvalidArgument { field: Some("page_cursor") }`.
+/// That field is the contract: a consumer seeing it restarts this paging walk
+/// from page one, silently - an Outlook user whose saved search page went
+/// stale after an upgrade expects the results to reload, not an error.
+pub(super) fn page_cursor_error(operation: AccountOperation, message: String) -> AccountError {
+    // Restart only this caller-owned walk. Invalid page state must never clear
+    // an enterprise user's account-wide durable mail or sync checkpoints, which
+    // is what `SyncState(SchemaIncompatible)` would have directed the engine to do.
+    AccountError::invalid_page_cursor(operation, Protocol::Jmap, message)
+}
+
+pub(super) fn invalid_argument(
+    operation: AccountOperation,
+    field: &'static str,
+    message: String,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some(field),
+            message: Some(DiagnosticText::support_only(message)),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(operation)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Classify a failed push-set frame for the consumer.
+///
+/// The frame is replay-safe, whatever the central table says about
+/// `PushSubscribe`. That operation is non-idempotent because on webhook
+/// providers a subscribe CREATES a server resource, and replaying it after
+/// an in-flight drop can create a second one. A JMAP `WebSocketPushEnable`
+/// or `WebSocketPushDisable` creates nothing: it carries the complete
+/// desired data-type set for the connection, so applying it twice leaves
+/// the same state as applying it once. Without the override an in-flight
+/// sink failure derives `Reconcile(TransportDropAfterSend, [CheckTarget])`,
+/// which asks the consumer to read back a target that does not exist.
+///
+/// `WebSocketNotConnected` never reaches here: both callers absorb it as a
+/// deferred success.
+pub(super) fn push_set_error(err: crate::Error) -> AccountError {
+    into_account_error(err, JmapErrorContext::new(AccountOperation::PushSubscribe))
+        .into_builder()
+        .idempotency_override(true)
+        .try_build()
+        .expect("valid account error classification")
+}
+
+/// Shared local refusals retain their canonical types-owned classification.
+pub(super) fn unsupported(operation: AccountOperation) -> AccountError {
+    AccountError::unsupported(operation, Protocol::Jmap)
+}
+
+pub(super) fn account_closed(operation: AccountOperation) -> AccountError {
+    AccountError::account_closed(operation, Protocol::Jmap)
+}
+
+/// Concurrent page activity requires repeating the caller-owned walk.
+pub(super) fn page_concurrency_conflict(
+    operation: AccountOperation,
+    message: String,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::ConcurrencyConflict,
+        Cause::State(StateCause::ConcurrencyConflict),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(operation)
+    .text(DiagnosticText::support_only(message))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// A missing anchor on an anchored caller-owned walk is ordinary concurrent
+/// deletion. An Outlook user expects to repeat paging, not a provider defect.
+/// Without an anchor, keep the protocol contract-violation classification.
+pub(super) fn page_call_error(
+    error: crate::Error,
+    operation: AccountOperation,
+    anchored: bool,
+    item: &str,
+    method: &str,
+    repeat: &str,
+) -> AccountError {
+    if anchored
+        && matches!(&error, crate::Error::Method(error)
+            if matches!(error.error_type(), MethodErrorType::AnchorNotFound))
+    {
+        return page_concurrency_conflict(
+            operation,
+            format!(
+                "the {item} this page cursor resumes after was removed ({method} anchorNotFound); \
+                 repeat the {repeat}"
+            ),
+        );
+    }
+    into_account_error(error, JmapErrorContext::new(operation))
+}
+
+pub(super) fn raw_message_not_found(id: &str) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::NotFound(ResourceKind::Message),
+        Cause::Request(RequestCause::NotFound {
+            what: ResourceKind::Message,
+            id: Some(id.to_owned()),
+        }),
+    )
+    .operation(AccountOperation::OpenRawRfc822)
+    .protocol(Protocol::Jmap)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+pub(super) fn invalid_timestamp(operation: AccountOperation, message: String) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::user_safe(message),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(operation)
+    .try_build()
+    .expect("valid timestamp refusal")
 }
 
 // ---- internal helpers --------------------------------------------------

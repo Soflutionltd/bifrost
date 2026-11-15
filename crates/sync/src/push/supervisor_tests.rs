@@ -1,5 +1,5 @@
 //! Deterministic lane-level recovery and coverage obligations.
-use super::lanes::PushLanes;
+use super::supervisor::PushSupervisor;
 use super::*;
 use crate::{
     cancel::{Boundary, BoundaryRequest},
@@ -98,7 +98,7 @@ impl Fixture {
         });
         let throttles = Arc::new(ThrottleBucket::default());
         let shutdown = CancellationToken::new();
-        let lanes = PushLanes {
+        let supervisor = PushSupervisor {
             account_id: bifrost_types::AccountId("lanes".into()),
             current,
             generation: gen_rx,
@@ -113,7 +113,7 @@ impl Fixture {
             retired: watch::channel(crate::types::Incarnation::initial_generation()).0,
             drain_bound: Duration::from_secs(2),
         };
-        let task = tokio::spawn(lanes.run());
+        let task = tokio::spawn(supervisor.run());
         settle().await;
         Self {
             stub,

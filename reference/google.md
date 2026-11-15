@@ -1493,6 +1493,13 @@ refresh. It rejects empty label ids consistently, retains case-sensitive opaque
 ids, and accepts empty names and names containing colons. Users expect a renamed
 label to retain its identity when a queued flag mutation is replayed.
 
+Account-facing `FlagSet` values preserve synthetic `$gmail-label:` tokens with
+`Flag::literal`, including exact ids and advisory names. Consumers constructing
+such tokens must use that constructor too; ordinary keywords use the default
+ASCII-case-insensitive identity. Hydration, exact-set translation and flag
+fingerprints retain case-distinct label ids so an edit cannot lose a different
+label merely because its id differs only in case.
+
 - Gmail labels project to IMAP-style flags: `UNREAD` toggles
   `\Seen` (presence of `UNREAD` removes `\Seen`), `STARRED` is
   `\Flagged`, `DRAFT` is `\Draft`, `IMPORTANT` is
@@ -2154,3 +2161,19 @@ no per-id response and cannot report which subjects were already absent. Direct
 thread DELETE has no label operand: `DeleteThread` absorbs `NotFound(Thread)`
 as `Ok(())`, without recording a committed write. An Outlook user expects a
 vanished thread gone from view but a missing destination reported as an error.
+
+## Caller-owned page cursors
+
+All paginated Account surfaces use the shared opaque `PageCursor` type.
+`account/page_cursor.rs` owns the versioned `google-page-1` envelope, tagged
+with the stable AccountOperation ledger tag. Each Google token is returned only
+inside its surface's envelope; thread/message search, contact list/search,
+directory search and calendar range/search reject one another's cursors.
+Untagged legacy bytes, foreign tags and malformed UTF-8 use
+`AccountError::invalid_page_cursor` with the receiving operation and its Gmail,
+GooglePeople or GoogleCalendar protocol. Contact/directory warmup requests
+validate that envelope before I/O. An enterprise Outlook user expects stale
+results to reload that caller-owned walk without resetting account sync state.
+Cross-calendar search retains its calendar-id/provider-token position inside
+the same envelope; disappearance of its calendar remains a state-refresh
+conflict.

@@ -115,16 +115,7 @@ pub(crate) fn events_in_range(
     range: EventRange,
 ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
     Box::pin(async move {
-        let page_token = range
-            .page_cursor
-            .map(String::from_utf8)
-            .transpose()
-            .map_err(|error| {
-                caller_input_error(
-                    AccountOperation::EventsInRange,
-                    format!("event page cursor is not UTF-8: {error}"),
-                )
-            })?;
+        let page_token = decode_page_token(range.page_cursor, AccountOperation::EventsInRange)?;
         let calendar_id = range.calendar_id.0;
         let encoded = bifrost_net::url::encode_path_component(&calendar_id);
         let time_min = google_range_bound(&range.start, "timeMin")?;
@@ -447,6 +438,9 @@ pub(crate) fn search(
     request: EventSearchRequest,
 ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
     Box::pin(async move {
+        if let Some(cursor) = &request.page_cursor {
+            super::page_cursor::token(cursor, AccountOperation::EventSearch)?;
+        }
         if let Some(calendar_id) = request.calendar_id {
             return search_one_calendar(
                 &client,
@@ -510,7 +504,8 @@ pub(crate) fn search(
             // Adding an intra-page offset would mean minting a third cursor
             // coordinate for a case that requires the provider to violate
             // its own documented cap. Low severity, deliberately left.
-            let next_token = page.next_cursor;
+            let next_token = decode_page_token(page.next_cursor, AccountOperation::EventSearch)?
+                .map(String::into_bytes);
             failed_ids.extend(page.failed_ids);
             for item in page.items {
                 if items.len() >= limit {
@@ -629,7 +624,9 @@ fn page_from_events(
     Ok(Page {
         truncated: false,
         items,
-        next_cursor: response.next_page_token.map(String::into_bytes),
+        next_cursor: response
+            .next_page_token
+            .map(|token| super::page_cursor::encode(operation, &token)),
         estimated_total: None,
         failed_ids,
         skipped_scopes: Vec::new(),
@@ -637,18 +634,10 @@ fn page_from_events(
 }
 
 fn decode_page_token(
-    page_cursor: Option<Vec<u8>>,
+    page_cursor: Option<bifrost_types::PageCursor>,
     operation: AccountOperation,
 ) -> Result<Option<String>, AccountError> {
-    page_cursor
-        .map(String::from_utf8)
-        .transpose()
-        .map_err(|error| {
-            caller_input_error(
-                operation,
-                format!("event page cursor is not UTF-8: {error}"),
-            )
-        })
+    super::page_cursor::decode(page_cursor, operation)
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -657,39 +646,32 @@ struct CalendarSearchKey {
     page_token: String,
 }
 
-fn encode_cross_calendar_cursor(calendar_id: &str, page_token: &[u8]) -> Vec<u8> {
+fn encode_cross_calendar_cursor(calendar_id: &str, page_token: &[u8]) -> bifrost_types::PageCursor {
     let key = CalendarSearchKey {
         calendar_id: calendar_id.to_string(),
         page_token: String::from_utf8(page_token.to_vec())
             .expect("Calendar page tokens originate as JSON strings"),
     };
-    serde_json::to_vec(&key).expect("string-only cursor serialization")
+    super::page_cursor::encode(
+        AccountOperation::EventSearch,
+        &serde_json::to_string(&key).expect("string-only cursor serialization"),
+    )
 }
 
 fn decode_cross_calendar_cursor(
-    page_cursor: Option<Vec<u8>>,
+    page_cursor: Option<bifrost_types::PageCursor>,
     calendar_ids: &[String],
 ) -> Result<(usize, Option<String>), AccountError> {
     let Some(cursor) = decode_page_token(page_cursor, AccountOperation::EventSearch)? else {
         return Ok((0, None));
     };
-    let key = serde_json::from_str::<CalendarSearchKey>(&cursor)
-        .or_else(|_| {
-            // Keep persisted pre-JSON cursors readable during an upgrade.
-            cursor
-                .split_once('\n')
-                .map(|(calendar_id, page_token)| CalendarSearchKey {
-                    calendar_id: calendar_id.to_string(),
-                    page_token: page_token.to_string(),
-                })
-                .ok_or(())
-        })
-        .map_err(|()| {
-            caller_input_error(
-                AccountOperation::EventSearch,
-                "invalid cross-calendar search cursor; restart the search".to_string(),
-            )
-        })?;
+    let key = serde_json::from_str::<CalendarSearchKey>(&cursor).map_err(|_| {
+        AccountError::invalid_page_cursor(
+            AccountOperation::EventSearch,
+            bifrost_types::Protocol::GoogleCalendar,
+            "invalid cross-calendar search cursor; restart the search",
+        )
+    })?;
     let CalendarSearchKey {
         calendar_id,
         page_token,
@@ -1585,13 +1567,12 @@ mod tests {
             decode_cross_calendar_cursor(Some(cursor), &calendars).unwrap(),
             (0, Some("opaque\ntoken".to_string()))
         );
-        assert_eq!(
+        assert!(
             decode_cross_calendar_cursor(
-                Some(b"primary\nold-token".to_vec()),
+                Some(b"primary\nold-token".to_vec().into()),
                 &["primary".to_string()]
             )
-            .unwrap(),
-            (0, Some("old-token".to_string()))
+            .is_err()
         );
     }
 
@@ -1626,15 +1607,18 @@ mod tests {
             .expect_err("a floating bound in a non-UTC zone is refused"),
         );
         assert_client_bug(
-            decode_page_token(Some(vec![0xff]), AccountOperation::EventSearch)
+            decode_page_token(Some(vec![0xff].into()), AccountOperation::EventSearch)
                 .expect_err("a non-UTF-8 cursor is refused"),
         );
 
         // A cursor this crate minted, naming a calendar removed between pages:
         // state that moved, so a conflict whose refresh is restarting the
         // search - neither the caller's fault nor the provider's.
-        let stale = decode_cross_calendar_cursor(Some(b"primary\ntoken".to_vec()), &[])
-            .expect_err("a cursor naming an unlisted calendar is refused");
+        let stale = decode_cross_calendar_cursor(
+            Some(encode_cross_calendar_cursor("primary", b"token")),
+            &[],
+        )
+        .expect_err("a cursor naming an unlisted calendar is refused");
         assert_eq!(
             *stale.kind(),
             bifrost_types::AccountErrorKind::ConcurrencyConflict
@@ -2185,7 +2169,12 @@ mod tests {
             Some("2026-06-02T12:00:00Z")
         );
         assert_eq!(page.failed_ids, vec![join_event_id("primary", "broken")]);
-        assert_eq!(page.next_cursor.as_deref(), Some(b"page-2".as_slice()));
+        assert_eq!(
+            decode_page_token(page.next_cursor, AccountOperation::EventsInRange)
+                .unwrap()
+                .as_deref(),
+            Some("page-2")
+        );
     }
 
     /// Cross-calendar search assembles its own aggregate `Page`, so the

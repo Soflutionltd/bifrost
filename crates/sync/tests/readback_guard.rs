@@ -6,7 +6,6 @@
 //! mutation round and read-back observation to pin desired-state
 //! reassertion after a valid unsatisfied observation.
 
-use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -52,7 +51,7 @@ fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
 /// unreachable in this test.
 struct FlagsAccount {
     caps: AccountCapabilities,
-    flag_table: std::collections::HashMap<ObjectId, HashSet<String>>,
+    flag_table: std::collections::HashMap<ObjectId, bifrost_types::FlagSet>,
     campaign: Option<Arc<CampaignState>>,
 }
 
@@ -735,7 +734,7 @@ impl Account for FlagsAccount {
     fn set_keyword(
         &self,
         _target: MutationTarget,
-        _keyword: String,
+        _keyword: bifrost_types::Flag,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetKeyword)) })
@@ -981,7 +980,7 @@ impl Account for FlagsAccount {
     fn contacts_list(
         &self,
         _address_book: Option<AddressBookId>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactsList)) })
     }
@@ -1020,7 +1019,7 @@ impl Account for FlagsAccount {
         &self,
         _query: String,
         _limit: Option<u32>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryCard>, AccountError>> {
         Box::pin(async {
             Err(unsupported(
@@ -1031,7 +1030,7 @@ impl Account for FlagsAccount {
 
     fn directory_groups_list(
         &self,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroup>, AccountError>> {
         Box::pin(async {
             Err(unsupported(
@@ -1043,7 +1042,7 @@ impl Account for FlagsAccount {
     fn directory_group_expand(
         &self,
         _group: bifrost_types::DirectoryGroupId,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroupMember>, AccountError>> {
         Box::pin(async {
             Err(unsupported(
@@ -1114,7 +1113,7 @@ impl Account for FlagsAccount {
     }
 }
 
-fn set(items: &[&str]) -> HashSet<String> {
+fn set(items: &[&str]) -> bifrost_types::FlagSet {
     items.iter().map(|s| (*s).to_string()).collect()
 }
 
@@ -2244,7 +2243,7 @@ impl JudgingAccount {
     fn judge(
         &self,
         _target: &ObjectId,
-        _observed: &HashSet<String>,
+        _observed: &bifrost_types::FlagSet,
         _op: &FlagOp,
     ) -> bifrost_types::FlagTargetState {
         bifrost_types::FlagTargetState::Satisfied
@@ -2380,7 +2379,7 @@ impl Account for JudgingAccount {
     fn set_keyword(
         &self,
         _target: MutationTarget,
-        _keyword: String,
+        _keyword: bifrost_types::Flag,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         self.inner.set_keyword(_target, _keyword, _value)
@@ -2562,7 +2561,7 @@ impl Account for JudgingAccount {
     fn contacts_list(
         &self,
         _address_book: Option<AddressBookId>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         self.inner.contacts_list(_address_book, _page_cursor)
     }
@@ -2595,20 +2594,20 @@ impl Account for JudgingAccount {
         &self,
         _query: String,
         _limit: Option<u32>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryCard>, AccountError>> {
         self.inner.directory_search(_query, _limit, _page_cursor)
     }
     fn directory_groups_list(
         &self,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroup>, AccountError>> {
         self.inner.directory_groups_list(_page_cursor)
     }
     fn directory_group_expand(
         &self,
         _group: bifrost_types::DirectoryGroupId,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroupMember>, AccountError>> {
         self.inner.directory_group_expand(_group, _page_cursor)
     }
@@ -2666,7 +2665,7 @@ impl Account for JudgingAccount {
     fn flag_target(
         &self,
         target: &ObjectId,
-        observed: &HashSet<String>,
+        observed: &bifrost_types::FlagSet,
         op: &FlagOp,
     ) -> bifrost_types::FlagTargetState {
         self.judge(target, observed, op)
@@ -2719,7 +2718,7 @@ enum ItemScript {
 }
 #[derive(Clone)]
 enum Observation {
-    Flags(HashSet<String>),
+    Flags(bifrost_types::FlagSet),
     Membership(Vec<MembershipScope>),
     NotFound,
     Fail(AccountError),
@@ -3197,7 +3196,7 @@ impl Account for ReassertAccount {
     fn set_keyword(
         &self,
         _target: MutationTarget,
-        _keyword: String,
+        _keyword: bifrost_types::Flag,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         self.inner.set_keyword(_target, _keyword, _value)
@@ -3379,7 +3378,7 @@ impl Account for ReassertAccount {
     fn contacts_list(
         &self,
         _address_book: Option<AddressBookId>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         self.inner.contacts_list(_address_book, _page_cursor)
     }
@@ -3412,20 +3411,20 @@ impl Account for ReassertAccount {
         &self,
         _query: String,
         _limit: Option<u32>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryCard>, AccountError>> {
         self.inner.directory_search(_query, _limit, _page_cursor)
     }
     fn directory_groups_list(
         &self,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroup>, AccountError>> {
         self.inner.directory_groups_list(_page_cursor)
     }
     fn directory_group_expand(
         &self,
         _group: bifrost_types::DirectoryGroupId,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroupMember>, AccountError>> {
         self.inner.directory_group_expand(_group, _page_cursor)
     }

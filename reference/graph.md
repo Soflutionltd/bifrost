@@ -2079,8 +2079,8 @@ caller a flag change landed that never reached the wire.
 A mixed op keeping an expressible half is sent, and `Set` is full-replace so
 it always writes all three owned fields, even when it names only unmodeled
 tokens. The PATCH carries only the projection, so when the op names any
-token Graph does not model (no `graph_flag_field` alias, no case-sensitive
-`category:` prefix; `unsupported_flag_tokens`), each acknowledged id is
+token Graph does not model (no `graph_flag_field` alias, no category token;
+`unsupported_flag_tokens`), each acknowledged id is
 reported `Downgraded { FlagsPartiallyApplied { unsupported } }` with those
 tokens sorted, never `Applied`, and the chunk's events open with one
 `StrategyDowngraded` warning. 412, failed and uncertain outcomes are
@@ -2925,8 +2925,10 @@ fail with Protocol MissingField; malformed fields with ParseFailed. Invalid
 bodies contribute no etag to the mutation cache.
 
 The flag judge canonicalizes read/\seen and starred/flagged/\flagged aliases,
-and accepts categories only with the write's case-sensitive `category:`
-prefix. Category names compare ASCII-case-insensitively. Unmodeled tokens
+and accepts case variants of the write's `category:` prefix. Category names
+compare ASCII-case-insensitively while writes retain their display spelling.
+This matches shared `Flag` identity: an enterprise Outlook user expects
+equivalent flag spellings to edit the same state regardless of insertion order. Unmodeled tokens
 are Indeterminate, even beside modeled tokens. Completed flags observe as
 unflagged. Public EWS items can judge only seen (see "Public-folder
 hydration" for the EWS `IsRead` exception).
@@ -2993,7 +2995,8 @@ account-owned effects; parsing into a bare fallible timestamp is insufficient.
 ## Graph flag vocabulary
 
 `account/flags.rs` owns `GraphFlag` parsing and canonical read, flagged and
-case-sensitive category tokens. Bulk mutation and desired-state validation
+category tokens. Shared flag identity folds ASCII case, including the category
+prefix; category display names retain their spelling in provider writes. Bulk mutation and desired-state validation
 consume the same aliases as typed and batch hydration produce. The category
 door shares the flagged aliases, with its existing `$flagged` sentinel admitted
 only there. A category called `read` remains a literal category; `$flagged` does
@@ -3202,3 +3205,19 @@ without shifting a surviving message's routing id. A 404 invalidates its cached
 validator and contributes no committed partial-effect step. Property-clear absence
 continues to be accepted as an already cleared property, also without a committed
 write. Single-operation Result doors return Ok for skips without claiming Applied.
+
+## Caller-owned page cursors
+
+Every paginated Account surface accepts and returns the shared `PageCursor`.
+`paging.rs` owns one versioned `GraphPageCursor` envelope with disjoint surface
+variants for contacts list/search, directory search/groups/expansion, event
+range/search, and mail thread/message search. Provider positions retain their
+walk-specific data inside that envelope: admitted links, skip counts, directory
+mode, Search API offsets, public-folder positions and mailbox-aware mail state.
+Directory mode belongs to the contact/directory walker. There is no bare-link
+fallback or acceptance of untagged legacy payloads. Every decode checks the
+version and surface before interpreting its position, and URL positions still
+pass origin admission before bearer use. Refusals use
+`AccountError::invalid_page_cursor` with Protocol::Graph. An enterprise Outlook
+user expects an unrelated or stale saved page to reload only that walk, without
+searching another collection or resetting durable sync state.

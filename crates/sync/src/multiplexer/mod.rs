@@ -305,15 +305,18 @@ impl PagePublisher {
         &self.coverage
     }
 
-    /// The one refusal for a backfill lane whose gate numbers publications
+    /// The one refusal for a backfill bound that numbers publications
     /// against a different ledger than this publisher. Every backfill entry
     /// point checks here, logs once, and refuses rather than panicking, so a
     /// user sees a stalled walk instead of a crashed sync engine.
     #[must_use]
-    pub(crate) fn shares_lane_ledger(&self, lane: &crate::engine::lane::LaneGate) -> bool {
-        let same = Arc::ptr_eq(&self.coverage, lane.coverage());
+    pub(crate) fn shares_bound_ledger(
+        &self,
+        bound: &crate::engine::backfill_bound::BackfillBound,
+    ) -> bool {
+        let same = Arc::ptr_eq(&self.coverage, bound.coverage());
         if !same {
-            tracing::error!("refusing backfill lane bound to a different coverage ledger");
+            tracing::error!("refusing backfill bound using a different coverage ledger");
         }
         same
     }

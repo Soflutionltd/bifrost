@@ -1200,7 +1200,6 @@ mod tests {
     use bifrost_types::{FolderId, ProtocolSalt, RunId};
     use bytes::Bytes;
     use reqwest::StatusCode;
-    use std::collections::HashSet;
     use std::time::Instant;
 
     fn canned(status: StatusCode) -> Canned {
@@ -1487,7 +1486,7 @@ mod tests {
         }
     }
 
-    fn set(items: &[&str]) -> HashSet<String> {
+    fn set(items: &[&str]) -> bifrost_types::FlagSet {
         items.iter().map(|item| (*item).to_string()).collect()
     }
 

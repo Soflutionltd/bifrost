@@ -29,6 +29,8 @@ pub mod directory;
 pub mod error;
 pub mod events;
 pub mod filter;
+pub mod flag;
+pub use flag::{Flag, FlagSet};
 pub mod hydration;
 pub mod ids;
 pub mod mime;
@@ -37,11 +39,13 @@ pub mod page;
 pub mod push;
 pub use push::{
     BackoffPolicy, LaneLease, LaneLeaseGuard, PushGate, PushLane, PushLaneKind, PushLaneSpec,
-    PushSessionEnd, PushSessionEvent, SessionStop, SessionStopper, push_lane_contract_error,
+    PushSessionEnd, PushSessionEvent, SessionStop, SessionStopper, effective_push_lanes,
+    push_lane_contract_error,
 };
 pub mod repair;
 pub mod search;
 pub mod settings;
+pub mod wire;
 
 // Account trait + factory + erased return aliases.
 pub use account::{
@@ -193,7 +197,7 @@ pub use mutation::{
 };
 
 // Pagination.
-pub use page::{Page, SkippedScope};
+pub use page::{Page, PageCursor, SkippedScope};
 
 // Search request AST.
 pub use search::{SearchFilter, SearchRequest};

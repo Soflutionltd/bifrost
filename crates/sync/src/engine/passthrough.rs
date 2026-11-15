@@ -424,7 +424,7 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
         target: bifrost_types::MutationTarget,
-        keyword: String,
+        keyword: bifrost_types::Flag,
         value: bool,
     ) -> Result<(), Error> {
         Ok(self
@@ -720,7 +720,7 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
         address_book: Option<bifrost_types::AddressBookId>,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> Result<bifrost_types::Page<bifrost_types::ContactCard>, Error> {
         let page = self
             .live_account(account_id)?
@@ -822,7 +822,7 @@ impl SyncEngine {
         account_id: &AccountId,
         query: String,
         limit: Option<u32>,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> Result<bifrost_types::Page<bifrost_types::DirectoryCard>, Error> {
         let page = self
             .live_account(account_id)?
@@ -840,7 +840,7 @@ impl SyncEngine {
     pub async fn directory_groups_list(
         &self,
         account_id: &AccountId,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> Result<bifrost_types::Page<bifrost_types::DirectoryGroup>, Error> {
         let page = self
             .live_account(account_id)?
@@ -859,7 +859,7 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
         group: bifrost_types::DirectoryGroupId,
-        page_cursor: Option<Vec<u8>>,
+        page_cursor: Option<bifrost_types::PageCursor>,
     ) -> Result<bifrost_types::Page<bifrost_types::DirectoryGroupMember>, Error> {
         let page = self
             .live_account(account_id)?

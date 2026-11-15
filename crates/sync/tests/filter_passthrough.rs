@@ -281,7 +281,7 @@ impl Account for FilterAccount {
     fn set_keyword(
         &self,
         _target: MutationTarget,
-        _keyword: String,
+        _keyword: bifrost_types::Flag,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetKeyword)) })
@@ -580,7 +580,7 @@ impl Account for FilterAccount {
     fn contacts_list(
         &self,
         _address_book: Option<AddressBookId>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactsList)) })
     }
@@ -619,7 +619,7 @@ impl Account for FilterAccount {
         &self,
         _query: String,
         _limit: Option<u32>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryCard>, AccountError>> {
         Box::pin(async {
             Err(unsupported(
@@ -630,7 +630,7 @@ impl Account for FilterAccount {
 
     fn directory_groups_list(
         &self,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroup>, AccountError>> {
         Box::pin(async {
             Err(unsupported(
@@ -642,7 +642,7 @@ impl Account for FilterAccount {
     fn directory_group_expand(
         &self,
         _group: bifrost_types::DirectoryGroupId,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroupMember>, AccountError>> {
         Box::pin(async {
             Err(unsupported(

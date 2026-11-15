@@ -164,7 +164,7 @@ pub async fn drive_changes_stream(
         // driver registers the publication and then publishes it unstamped
         // (`publish_acknowledgeable`, not `publish_backfill`), so the entry is
         // never stamped with a delivery. An unsent stamp is
-        // deliberately never swept, so a `Lane::Backfill` entry minted here is
+        // deliberately never swept, so a `PublicationStream::Backfill` entry minted here is
         // charged against the account's backfill bound until an acknowledgement,
         // a lag or a reset frees it - a permanent slot of the bound spent per
         // scope. And if its partition happened to be the completion sentinel, its

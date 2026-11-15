@@ -798,7 +798,7 @@ async fn search_walks_shared_mailboxes_and_qualifies_their_ids() {
         HashMap::from([(mailbox.to_string(), shared_root.for_shared_mailbox(mailbox))]),
     );
 
-    let first = search_message_rows(&account, SearchRequest::default())
+    let first = search_message_rows(&account, SearchRequest::default(), AccountOperation::Search)
         .await
         .expect("primary page succeeds");
     assert_eq!(first.items[0].id, ObjectId("primary-message".to_string()));
@@ -808,16 +808,17 @@ async fn search_walks_shared_mailboxes_and_qualifies_their_ids() {
     );
     let mut continuation = SearchRequest::default();
     continuation.page_cursor = first.next_cursor;
-    let primary_continuation = search_message_rows(&account, continuation)
-        .await
-        .expect("primary continuation succeeds");
+    let primary_continuation =
+        search_message_rows(&account, continuation, AccountOperation::Search)
+            .await
+            .expect("primary continuation succeeds");
     assert_eq!(
         primary_continuation.items[0].id,
         ObjectId("primary-message-2".to_string())
     );
     let mut continuation = SearchRequest::default();
     continuation.page_cursor = primary_continuation.next_cursor;
-    let second = search_message_rows(&account, continuation)
+    let second = search_message_rows(&account, continuation, AccountOperation::Search)
         .await
         .expect("shared page succeeds");
     assert_eq!(
@@ -913,7 +914,7 @@ async fn search_pages_within_and_across_three_shared_mailboxes() {
     loop {
         let mut request = SearchRequest::default();
         request.page_cursor = cursor;
-        let page = search_message_rows(&account, request)
+        let page = search_message_rows(&account, request, AccountOperation::Search)
             .await
             .expect("every page of the walk succeeds");
         ids.extend(page.items.iter().map(|row| row.id.0.clone()));
@@ -997,13 +998,13 @@ async fn a_revoked_shared_mailbox_is_skipped_and_the_walk_continues() {
         ]),
     );
 
-    let first = search_message_rows(&account, SearchRequest::default())
+    let first = search_message_rows(&account, SearchRequest::default(), AccountOperation::Search)
         .await
         .expect("primary page succeeds");
     assert!(first.skipped_scopes.is_empty());
     let mut continuation = SearchRequest::default();
     continuation.page_cursor = first.next_cursor;
-    let resumed = search_message_rows(&account, continuation)
+    let resumed = search_message_rows(&account, continuation, AccountOperation::Search)
         .await
         .expect("the walk continues past the revoked mailbox");
 
@@ -1069,11 +1070,12 @@ async fn a_walk_ending_in_a_revoked_mailbox_completes_and_reports_the_skip() {
     );
 
     let mut continuation = SearchRequest::default();
-    continuation.page_cursor = search_message_rows(&account, SearchRequest::default())
-        .await
-        .expect("primary page succeeds")
-        .next_cursor;
-    let last = search_message_rows(&account, continuation)
+    continuation.page_cursor =
+        search_message_rows(&account, SearchRequest::default(), AccountOperation::Search)
+            .await
+            .expect("primary page succeeds")
+            .next_cursor;
+    let last = search_message_rows(&account, continuation, AccountOperation::Search)
         .await
         .expect("the walk completes despite the revoked tail mailbox");
     assert!(last.items.is_empty());
@@ -1111,11 +1113,12 @@ async fn only_a_foreign_permission_denial_is_skipped() {
         HashMap::from([(mailbox.to_string(), flaky.for_shared_mailbox(mailbox))]),
     );
     let mut continuation = SearchRequest::default();
-    continuation.page_cursor = search_message_rows(&account, SearchRequest::default())
-        .await
-        .expect("primary page succeeds")
-        .next_cursor;
-    let transient = search_message_rows(&account, continuation)
+    continuation.page_cursor =
+        search_message_rows(&account, SearchRequest::default(), AccountOperation::Search)
+            .await
+            .expect("primary page succeeds")
+            .next_cursor;
+    let transient = search_message_rows(&account, continuation, AccountOperation::Search)
         .await
         .expect_err("a transient shared-mailbox failure fails the call");
     assert!(transient.recovery().is_retryable());
@@ -1127,7 +1130,7 @@ async fn only_a_foreign_permission_denial_is_skipped() {
         json!({ "error": { "code": "AccessDenied", "message": "nope" } }),
     )]);
     let account = GraphAccount::new_for_tests(primary, PushMode::GraphSubscriptions);
-    let denied = search_message_rows(&account, SearchRequest::default())
+    let denied = search_message_rows(&account, SearchRequest::default(), AccountOperation::Search)
         .await
         .expect_err("a primary permission denial fails the call");
     assert!(matches!(
@@ -1155,7 +1158,7 @@ async fn a_search_cursor_from_another_shared_mailbox_set_is_rejected() {
         PushMode::GraphSubscriptions,
         shared_clients_for_tests(&["b@contoso.com", "c@contoso.com"]),
     );
-    let cursor = search_message_rows(&minting, SearchRequest::default())
+    let cursor = search_message_rows(&minting, SearchRequest::default(), AccountOperation::Search)
         .await
         .expect("primary page succeeds")
         .next_cursor
@@ -1179,7 +1182,7 @@ async fn a_search_cursor_from_another_shared_mailbox_set_is_rejected() {
         );
         let mut request = SearchRequest::default();
         request.page_cursor = Some(cursor.clone());
-        let error = search_message_rows(&account, request)
+        let error = search_message_rows(&account, request, AccountOperation::Search)
             .await
             .expect_err("a cursor minted against another mailbox set is rejected");
         assert!(
@@ -1202,7 +1205,7 @@ async fn a_search_cursor_from_another_shared_mailbox_set_is_rejected() {
 async fn a_corrupt_search_cursor_blames_the_request_not_the_provider() {
     for cursor in [
         // truncated payload under the current version prefix
-        format!("{SEARCH_CURSOR_PREFIX}{{\"mailboxes\":[]").into_bytes(),
+        b"{\"version\":1,\"cursor\":{\"surface\":\"search\"".to_vec(),
         // a bare Graph nextLink - what this crate emitted before the
         // walk existed, and what a truncated cursor degrades to. It must
         // be refused, never re-issued as a URL on the caller's word.
@@ -1214,8 +1217,8 @@ async fn a_corrupt_search_cursor_blames_the_request_not_the_provider() {
         primary.script_rest([]);
         let account = GraphAccount::new_for_tests(primary, PushMode::GraphSubscriptions);
         let mut request = SearchRequest::default();
-        request.page_cursor = Some(cursor.clone());
-        let error = search_message_rows(&account, request)
+        request.page_cursor = Some(cursor.clone().into());
+        let error = search_message_rows(&account, request, AccountOperation::Search)
             .await
             .expect_err("an undecodable cursor is refused");
         assert!(

@@ -1,3 +1,4 @@
+use bifrost_types::FlagSet;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -898,7 +899,7 @@ fn patch_for_flags(op: &FlagOp) -> Value {
     Value::Object(body)
 }
 
-fn apply_flag_adds(body: &mut serde_json::Map<String, Value>, flags: &HashSet<String>) {
+fn apply_flag_adds(body: &mut serde_json::Map<String, Value>, flags: &FlagSet) {
     if flags
         .iter()
         .any(|flag| graph_flag_field(flag) == Some(GraphFlagField::Read))
@@ -913,7 +914,7 @@ fn apply_flag_adds(body: &mut serde_json::Map<String, Value>, flags: &HashSet<St
     }
 }
 
-fn apply_flag_removes(body: &mut serde_json::Map<String, Value>, flags: &HashSet<String>) {
+fn apply_flag_removes(body: &mut serde_json::Map<String, Value>, flags: &FlagSet) {
     if flags
         .iter()
         .any(|flag| graph_flag_field(flag) == Some(GraphFlagField::Read))
@@ -928,7 +929,7 @@ fn apply_flag_removes(body: &mut serde_json::Map<String, Value>, flags: &HashSet
     }
 }
 
-fn categories_from_flags(flags: &HashSet<String>) -> Vec<String> {
+fn categories_from_flags(flags: &FlagSet) -> Vec<String> {
     let mut categories: Vec<String> = flags
         .iter()
         .filter_map(|flag| match super::flags::GraphFlag::parse(flag) {
@@ -941,13 +942,12 @@ fn categories_from_flags(flags: &HashSet<String>) -> Vec<String> {
 }
 
 /// The op's tokens Graph does not model, so `patch_for_flags` drops them:
-/// neither a `graph_flag_field` alias nor `category:`-prefixed (the prefix
-/// is case-sensitive, as in `categories_from_flags`). Incremental category
+/// neither a `graph_flag_field` alias nor a category token. Incremental category
 /// ops never reach the wire (`flag_op_requires_category_rmw`), so a
 /// `category:` token is only ever sent by `Set`, which expresses it. Sorted
 /// and deduplicated for a deterministic report.
 fn unsupported_flag_tokens(op: &FlagOp) -> Vec<String> {
-    let sets: Vec<&HashSet<String>> = match op {
+    let sets: Vec<&FlagSet> = match op {
         FlagOp::Add(flags) | FlagOp::Remove(flags) | FlagOp::Set(flags) => vec![flags],
         FlagOp::Patch { add, remove } => vec![add, remove],
         _ => Vec::new(),
@@ -955,10 +955,8 @@ fn unsupported_flag_tokens(op: &FlagOp) -> Vec<String> {
     let mut tokens: Vec<String> = sets
         .into_iter()
         .flatten()
-        .filter(|flag| {
-            graph_flag_field(flag).is_none() && !flag.starts_with(super::flags::CATEGORY_PREFIX)
-        })
-        .cloned()
+        .filter(|flag| super::flags::GraphFlag::parse(flag).is_none())
+        .map(ToString::to_string)
         .collect();
     tokens.sort();
     tokens.dedup();
@@ -1028,10 +1026,13 @@ fn graph_flag_field(flag: &str) -> Option<GraphFlagField> {
 }
 
 fn flag_op_requires_category_rmw(op: &FlagOp) -> bool {
-    let has_categories = |flags: &HashSet<String>| {
-        flags
-            .iter()
-            .any(|flag| flag.starts_with(super::flags::CATEGORY_PREFIX))
+    let has_categories = |flags: &FlagSet| {
+        flags.iter().any(|flag| {
+            matches!(
+                super::flags::GraphFlag::parse(flag),
+                Some(super::flags::GraphFlag::Category(_))
+            )
+        })
     };
     match op {
         FlagOp::Add(flags) | FlagOp::Remove(flags) => has_categories(flags),
@@ -1050,18 +1051,24 @@ fn flag_op_requires_category_rmw(op: &FlagOp) -> bool {
 /// "not `\flagged`" by vocabulary, so `Remove(\Flagged)` is satisfied by it.
 pub(crate) fn graph_flag_target(
     target: &ObjectId,
-    observed: &HashSet<String>,
+    observed: &FlagSet,
     op: &FlagOp,
 ) -> bifrost_types::FlagTargetState {
     use bifrost_types::FlagTargetState;
-    let canonicalize = |flags: &HashSet<String>| -> Option<HashSet<String>> {
+    let canonicalize = |flags: &FlagSet| -> Option<FlagSet> {
         flags
             .iter()
             .map(|flag| {
                 let canonical = match graph_flag_field(flag) {
                     Some(GraphFlagField::Read) => super::flags::GraphFlag::Read.token(),
                     Some(GraphFlagField::Flagged) => super::flags::GraphFlag::Flagged.token(),
-                    None if flag.starts_with(super::flags::CATEGORY_PREFIX) => flag.clone(),
+                    None if matches!(
+                        super::flags::GraphFlag::parse(flag),
+                        Some(super::flags::GraphFlag::Category(_))
+                    ) =>
+                    {
+                        flag.to_string()
+                    }
                     None => return None,
                 };
                 if super::pim::ews_read_folder(target).is_some() && canonical != super::flags::READ
@@ -1094,7 +1101,7 @@ mod tests {
     use crate::client::GraphClient;
     use bifrost_types::{CursorScope, FolderId, ObjectType};
 
-    fn target_set(flags: &[&str]) -> HashSet<String> {
+    fn target_set(flags: &[&str]) -> FlagSet {
         flags.iter().map(|s| (*s).to_owned()).collect()
     }
 
@@ -1120,7 +1127,7 @@ mod tests {
                 bifrost_types::FlagTargetState::Satisfied
             );
         }
-        // Only the category NAME compares case-insensitively.
+        // Category flag identity, including the prefix, compares case-insensitively.
         assert_eq!(
             graph_flag_target(
                 &ObjectId("m1".into()),
@@ -1133,7 +1140,7 @@ mod tests {
 
     #[test]
     fn graph_flag_target_refuses_unmodeled_tokens() {
-        for token in ["\\answered", "Category:Work"] {
+        for token in ["\\answered", "categories:Work"] {
             assert_eq!(
                 graph_flag_target(
                     &ObjectId("m1".into()),
@@ -1203,7 +1210,7 @@ mod tests {
                 public.clone(),
                 ObjectId("m2".into()),
             ])),
-            FlagOp::Add(HashSet::from(["\\seen".into()])),
+            FlagOp::Add(FlagSet::from(["\\seen".into()])),
             idempotency_key(),
         )
         .collect::<Vec<_>>()
@@ -1322,7 +1329,7 @@ mod tests {
                     )),
                 },
             ])),
-            FlagOp::Add(HashSet::from(["\\seen".into()])),
+            FlagOp::Add(FlagSet::from(["\\seen".into()])),
             idempotency_key(),
         )
         .collect::<Vec<_>>()
@@ -1396,7 +1403,7 @@ mod tests {
                     expected_version: None,
                 },
             ])),
-            FlagOp::Add(HashSet::from(["\\seen".into()])),
+            FlagOp::Add(FlagSet::from(["\\seen".into()])),
             idempotency_key(),
         )
         .collect::<Vec<_>>()
@@ -1527,7 +1534,7 @@ mod tests {
             .await
             .get(&id.0)
             .expect("delta etag");
-        let kind = MutationKind::SetFlags(FlagOp::Set(HashSet::new()));
+        let kind = MutationKind::SetFlags(FlagOp::Set(FlagSet::new()));
         let before = request_for_mutation(
             &account,
             &id,
@@ -1638,7 +1645,7 @@ mod tests {
         reconcile_mutation_responses(
             &request_ids,
             Vec::new(),
-            &MutationKind::SetFlags(FlagOp::Add(HashSet::from(["\\seen".to_string()]))),
+            &MutationKind::SetFlags(FlagOp::Add(FlagSet::from(["\\seen".to_string()]))),
             &mut outcomes,
             &|_| None,
             &[false],
@@ -1686,7 +1693,7 @@ mod tests {
     fn vanished_flags_and_move_subjects_skip_but_missing_destinations_fail() {
         for (kind, body, skipped) in [
             (
-                MutationKind::SetFlags(FlagOp::Set(HashSet::new())),
+                MutationKind::SetFlags(FlagOp::Set(FlagSet::new())),
                 None,
                 true,
             ),
@@ -1759,7 +1766,7 @@ mod tests {
             &account,
             &ids,
             &resolve_batch_responses(&ids, responses),
-            &MutationKind::SetFlags(FlagOp::Set(HashSet::new())),
+            &MutationKind::SetFlags(FlagOp::Set(FlagSet::new())),
         )
         .await;
         assert_eq!(
@@ -1777,7 +1784,7 @@ mod tests {
             &account,
             &ids,
             &resolve_batch_responses(&ids, conflict),
-            &MutationKind::SetFlags(FlagOp::Set(HashSet::new())),
+            &MutationKind::SetFlags(FlagOp::Set(FlagSet::new())),
         )
         .await;
         assert_eq!(account.etag_index.write().await.get("m0"), None);
@@ -1842,7 +1849,7 @@ mod tests {
                 },
             ],
         );
-        let kind = MutationKind::SetFlags(FlagOp::Set(HashSet::new()));
+        let kind = MutationKind::SetFlags(FlagOp::Set(FlagSet::new()));
         update_etag_cache_from_responses(&account, &ids, &resolved, &kind).await;
         let mut outcomes = Vec::new();
         reconcile_mutation_responses(
@@ -1875,7 +1882,7 @@ mod tests {
         let request = request_for_mutation(
             &account,
             &id,
-            &MutationKind::SetFlags(FlagOp::Add(HashSet::from(["\\seen".to_string()]))),
+            &MutationKind::SetFlags(FlagOp::Add(FlagSet::from(["\\seen".to_string()]))),
             &etags,
         )
         .expect("builds")
@@ -1892,7 +1899,7 @@ mod tests {
         let request = request_for_mutation(
             &account,
             &id,
-            &MutationKind::SetFlags(FlagOp::Add(HashSet::from(["\\seen".to_string()]))),
+            &MutationKind::SetFlags(FlagOp::Add(FlagSet::from(["\\seen".to_string()]))),
             &etags,
         )
         .expect("builds")
@@ -2058,7 +2065,7 @@ mod tests {
         assert_eq!(requests[1].id, "1");
     }
 
-    fn flag_set(items: &[&str]) -> HashSet<String> {
+    fn flag_set(items: &[&str]) -> FlagSet {
         items.iter().map(|s| (*s).to_string()).collect()
     }
 
@@ -2078,7 +2085,7 @@ mod tests {
 
     #[test]
     fn set_empty_clears_all_owned_fields() {
-        let body = patch_for_flags(&FlagOp::Set(HashSet::new()));
+        let body = patch_for_flags(&FlagOp::Set(FlagSet::new()));
         assert_eq!(body.get("isRead"), Some(&json!(false)));
         assert_eq!(
             body.get("flag"),
@@ -2168,6 +2175,27 @@ mod tests {
             body.get("categories"),
             Some(&json!(["Mid", "Zeta", "alpha"]))
         );
+    }
+
+    #[test]
+    fn category_flag_identity_survives_deduplication_in_either_order() {
+        for tokens in [
+            ["category:Work", "Category:Work"],
+            ["Category:Work", "category:Work"],
+        ] {
+            let flags = flag_set(&tokens);
+            assert_eq!(flags.len(), 1);
+            let op = FlagOp::Set(flags);
+            assert!(unsupported_flag_tokens(&op).is_empty());
+            assert_eq!(patch_for_flags(&op)["categories"], json!(["Work"]));
+            assert_eq!(
+                graph_flag_target(&ObjectId("m1".into()), &flag_set(&["category:work"]), &op),
+                bifrost_types::FlagTargetState::Satisfied
+            );
+            assert!(flag_op_requires_category_rmw(&FlagOp::Add(flag_set(
+                &tokens
+            ))));
+        }
     }
 
     #[test]
@@ -2263,7 +2291,7 @@ mod tests {
             "\\Seen"
         ]))));
         // `Set` is full-replace and always writes all three owned fields.
-        assert!(!flag_op_is_unexpressible(&FlagOp::Set(HashSet::new())));
+        assert!(!flag_op_is_unexpressible(&FlagOp::Set(FlagSet::new())));
     }
 
     #[test]
@@ -2278,10 +2306,10 @@ mod tests {
         assert!(
             unsupported_flag_tokens(&FlagOp::Set(flag_set(&["read", "category:x"]))).is_empty()
         );
-        // `category:` is case-sensitive, as in `categories_from_flags`.
+        // A differently spelled prefix is still an unmodeled token.
         assert_eq!(
-            unsupported_flag_tokens(&FlagOp::Set(flag_set(&["Category:x"]))),
-            vec!["Category:x".to_string()]
+            unsupported_flag_tokens(&FlagOp::Set(flag_set(&["categories:x"]))),
+            vec!["categories:x".to_string()]
         );
     }
 
@@ -2408,7 +2436,7 @@ mod tests {
             request_for_mutation(
                 &account,
                 &id,
-                &MutationKind::SetFlags(FlagOp::Add(HashSet::from(["\\seen".to_string()]))),
+                &MutationKind::SetFlags(FlagOp::Add(FlagSet::from(["\\seen".to_string()]))),
                 &HashMap::new(),
             )
             .expect("builds")
@@ -2508,7 +2536,7 @@ mod tests {
             request_for_mutation(
                 &account,
                 &id,
-                &MutationKind::SetFlags(FlagOp::Add(HashSet::from(["\\seen".to_string()]))),
+                &MutationKind::SetFlags(FlagOp::Add(FlagSet::from(["\\seen".to_string()]))),
                 &native_keyed,
             )
             .expect("builds")
@@ -2519,7 +2547,7 @@ mod tests {
         let request = request_for_mutation(
             &account,
             &id,
-            &MutationKind::SetFlags(FlagOp::Add(HashSet::from(["\\seen".to_string()]))),
+            &MutationKind::SetFlags(FlagOp::Add(FlagSet::from(["\\seen".to_string()]))),
             &etag_map(&id),
         )
         .expect("builds")
@@ -2537,7 +2565,7 @@ mod tests {
     #[test]
     fn operation_labels_match_the_mutation_kind() {
         assert_eq!(
-            operation_for_kind(&MutationKind::SetFlags(FlagOp::Add(HashSet::new()))),
+            operation_for_kind(&MutationKind::SetFlags(FlagOp::Add(FlagSet::new()))),
             AccountOperation::UpdateFlags
         );
         assert_eq!(
@@ -2555,7 +2583,7 @@ mod tests {
     #[test]
     fn only_flag_bearing_kinds_require_an_etag() {
         assert!(requires_etag(&MutationKind::SetFlags(FlagOp::Add(
-            HashSet::new()
+            FlagSet::new()
         ))));
         assert!(requires_etag(&MutationKind::Move(MembershipScope::Folder(
             FolderId("archive".to_string())
@@ -2755,7 +2783,7 @@ mod tests {
                 ObjectId("missing".to_string()),
                 ObjectId("cached".to_string()),
             ],
-            &MutationKind::SetFlags(FlagOp::Set(HashSet::new())),
+            &MutationKind::SetFlags(FlagOp::Set(FlagSet::new())),
         )
         .await
         .expect("envelope failures are per item");

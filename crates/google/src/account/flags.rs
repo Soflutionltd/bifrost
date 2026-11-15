@@ -1,3 +1,4 @@
+use bifrost_types::FlagSet;
 use std::collections::{HashMap, HashSet};
 
 use bifrost_types::FlagOp;
@@ -295,31 +296,40 @@ pub(crate) fn canonical_flags_indexed(
 
     flags.sort();
     flags.dedup();
-    let hash = bifrost_types::canonical_flags_hash(&flags);
+    let hash = bifrost_types::canonical_flags_hash(flags.iter().cloned().map(shared_flag));
     CanonicalFlags { flags, hash }
 }
 
-pub(crate) fn flag_set_indexed(
-    label_ids: &[String],
-    names_by_id: &LabelNameIndex,
-) -> HashSet<String> {
+// Provider label ids and advisory names are opaque. A user expects a
+// case-only label difference to survive hydration and a later flag edit.
+fn shared_flag(value: String) -> bifrost_types::Flag {
+    if matches!(GmailFlag::parse(&value), GmailFlag::Label { .. }) {
+        bifrost_types::Flag::literal(value)
+    } else {
+        value.into()
+    }
+}
+
+pub(crate) fn flag_set_indexed(label_ids: &[String], names_by_id: &LabelNameIndex) -> FlagSet {
     canonical_flags_indexed(label_ids, names_by_id)
         .flags
         .into_iter()
+        .map(shared_flag)
         .collect()
 }
 
-pub(crate) fn flag_set(label_ids: &[String], labels: &[GmailLabel]) -> HashSet<String> {
+pub(crate) fn flag_set(label_ids: &[String], labels: &[GmailLabel]) -> FlagSet {
     canonical_flags(label_ids, labels)
         .flags
         .into_iter()
+        .map(shared_flag)
         .collect()
 }
 
 pub(crate) fn translate_flag_op(op: &FlagOp, labels: &[GmailLabel]) -> LabelPatch {
     match op {
-        FlagOp::Add(flags) => patch_from_sets(flags, &HashSet::new(), labels),
-        FlagOp::Remove(flags) => patch_from_sets(&HashSet::new(), flags, labels),
+        FlagOp::Add(flags) => patch_from_sets(flags, &FlagSet::new(), labels),
+        FlagOp::Remove(flags) => patch_from_sets(&FlagSet::new(), flags, labels),
         FlagOp::Patch { add, remove } => patch_from_sets(add, remove, labels),
         FlagOp::Set(flags) => patch_for_set(flags, labels),
         _ => LabelPatch {
@@ -330,9 +340,9 @@ pub(crate) fn translate_flag_op(op: &FlagOp, labels: &[GmailLabel]) -> LabelPatc
     }
 }
 
-fn patch_for_set(flags: &HashSet<String>, labels: &[GmailLabel]) -> LabelPatch {
-    let mut add = HashSet::new();
-    let mut remove = HashSet::new();
+fn patch_for_set(flags: &FlagSet, labels: &[GmailLabel]) -> LabelPatch {
+    let mut add = FlagSet::new();
+    let mut remove = FlagSet::new();
 
     if contains_flag(flags, FLAG_SEEN) {
         add.insert(FLAG_SEEN.to_string());
@@ -394,9 +404,9 @@ fn patch_for_set(flags: &HashSet<String>, labels: &[GmailLabel]) -> LabelPatch {
         if flags.iter().any(|candidate| {
             user_label_id_from_flag(candidate, labels).as_deref() == Some(label.id.as_str())
         }) {
-            add.insert(flag);
+            add.insert(shared_flag(flag));
         } else {
-            remove.insert(flag);
+            remove.insert(shared_flag(flag));
         }
     }
 
@@ -427,8 +437,8 @@ fn patch_for_set(flags: &HashSet<String>, labels: &[GmailLabel]) -> LabelPatch {
 }
 
 fn patch_from_sets(
-    add_flags: &HashSet<String>,
-    remove_flags: &HashSet<String>,
+    add_flags: &FlagSet,
+    remove_flags: &FlagSet,
     labels: &[GmailLabel],
 ) -> LabelPatch {
     let mut patch = LabelPatch::default();
@@ -544,7 +554,7 @@ fn is_category_label_id(id: &str) -> bool {
     matches!(GmailLabelId::parse(id), GmailLabelId::Category(_))
 }
 
-fn contains_flag(flags: &HashSet<String>, needle: &str) -> bool {
+fn contains_flag(flags: &FlagSet, needle: &str) -> bool {
     flags.iter().any(|flag| eq_flag(flag, needle))
 }
 
@@ -582,7 +592,7 @@ fn push_unique(items: &mut Vec<String>, item: String) {
 /// translation cannot express are `Indeterminate`.
 pub(crate) fn gmail_flag_target(
     snapshot: &super::scopes::ScopeSnapshot,
-    observed: &HashSet<String>,
+    observed: &FlagSet,
     op: &FlagOp,
 ) -> bifrost_types::FlagTargetState {
     use bifrost_types::FlagTargetState;
@@ -591,7 +601,7 @@ pub(crate) fn gmail_flag_target(
     if op.validate().is_err() || snapshot.fetched_at.is_none() {
         return FlagTargetState::Indeterminate;
     }
-    let draft = |s: &HashSet<String>| s.iter().any(|f| eq_flag(f, FLAG_DRAFT));
+    let draft = |s: &FlagSet| s.iter().any(|f| eq_flag(f, FLAG_DRAFT));
     let names_draft = match op {
         FlagOp::Add(s) | FlagOp::Remove(s) | FlagOp::Set(s) => draft(s),
         FlagOp::Patch { add, remove } => draft(add) || draft(remove),
@@ -632,8 +642,11 @@ pub(crate) fn gmail_flag_target(
 mod tests {
     use super::*;
 
-    fn set(items: &[&str]) -> HashSet<String> {
-        items.iter().map(|item| (*item).to_string()).collect()
+    fn set(items: &[&str]) -> FlagSet {
+        items
+            .iter()
+            .map(|item| shared_flag((*item).to_string()))
+            .collect()
     }
 
     #[test]
@@ -651,6 +664,34 @@ mod tests {
             "$gmail-label:Label_1:Work",
             "$gmail-label:Label_1:work"
         ));
+    }
+
+    #[test]
+    fn shared_flag_sets_preserve_distinct_opaque_labels_through_hydration_and_set() {
+        let labels: Vec<_> = ["Label_1", "label_1"]
+            .into_iter()
+            .map(|id| GmailLabel {
+                id: id.into(),
+                name: "Work".into(),
+                label_type: Some(crate::types::GmailLabelType::User),
+                color: None,
+            })
+            .collect();
+        let ids: Vec<_> = labels.iter().map(|label| label.id.clone()).collect();
+        let flags = flag_set(&ids, &labels);
+        // Seen is also present because UNREAD is absent.
+        assert_eq!(flags.len(), 3);
+        assert!(flags.contains(bifrost_types::Flag::literal("$gmail-label:Label_1:Work")));
+        assert!(flags.contains(bifrost_types::Flag::literal("$gmail-label:label_1:Work")));
+        assert_eq!(
+            bifrost_types::canonical_flags_hash(&flags),
+            canonical_flags(&ids, &labels).hash
+        );
+        let clear = translate_flag_op(&FlagOp::Set(FlagSet::new()), &labels);
+        assert!(ids.iter().all(|id| clear.remove_label_ids.contains(id)));
+        let replay = translate_flag_op(&FlagOp::Set(flags), &labels);
+        assert!(ids.iter().all(|id| replay.add_label_ids.contains(id)));
+        assert!(ids.iter().all(|id| !replay.remove_label_ids.contains(id)));
     }
 
     fn target_snapshot() -> super::super::scopes::ScopeSnapshot {
@@ -1176,9 +1217,9 @@ mod tests {
 
     #[test]
     fn empty_flag_ops_produce_an_empty_patch() {
-        let patch = translate_flag_op(&FlagOp::Add(HashSet::new()), &[]);
+        let patch = translate_flag_op(&FlagOp::Add(FlagSet::new()), &[]);
         assert_eq!(patch, LabelPatch::default());
-        let patch = translate_flag_op(&FlagOp::Remove(HashSet::new()), &[]);
+        let patch = translate_flag_op(&FlagOp::Remove(FlagSet::new()), &[]);
         assert_eq!(patch, LabelPatch::default());
     }
 

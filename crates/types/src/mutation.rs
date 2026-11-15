@@ -4,8 +4,6 @@
 //! contract; the types here are the per-item payloads on each side
 //! plus the fingerprint shape consumers diff inventory against.
 
-use std::collections::HashSet;
-
 use bytes::Bytes;
 
 use crate::blob::BlobHandle;
@@ -151,8 +149,8 @@ pub struct Fingerprint {
 /// Hash a logical flag set. The single derivation behind
 /// [`Fingerprint::flags_hash`].
 ///
-/// Set semantics: flag spelling is ASCII-case-insensitive, and ordering and
-/// duplicates do not affect the result. A separator byte terminates each flag
+/// Set semantics use [`crate::Flag`] identity; ordering and duplicates do not
+/// affect the result. A separator byte terminates each flag
 /// so that `{"ab", "c"}` and `{"a", "bc"}` hash differently. The empty set has
 /// a defined, non-zero hash.
 ///
@@ -160,17 +158,17 @@ pub struct Fingerprint {
 /// never trusted, and a fixed algorithm here is the whole point - it must not
 /// drift between releases or between producers.
 #[must_use]
-pub fn canonical_flags_hash(flags: impl IntoIterator<Item = impl AsRef<str>>) -> u64 {
+pub fn canonical_flags_hash(flags: impl IntoIterator<Item = impl Into<crate::Flag>>) -> u64 {
     let mut flags = flags
         .into_iter()
-        .map(|flag| flag.as_ref().to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    flags.sort_unstable();
+        .map(Into::into)
+        .collect::<Vec<crate::Flag>>();
+    flags.sort_unstable_by(|a, b| a.identity().cmp(b.identity()));
     flags.dedup();
 
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for flag in flags {
-        for byte in flag.bytes().chain(std::iter::once(0xff)) {
+        for byte in flag.identity().bytes().chain(std::iter::once(0xff)) {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
@@ -222,7 +220,7 @@ pub enum Projection {
 pub enum HydratedObjectKind {
     /// `Projection::FlagsOnly`. Carries the canonical flag set as
     /// the protocol observes it (current state, not a mutation).
-    FlagsOnly(HashSet<String>),
+    FlagsOnly(crate::FlagSet),
     /// `Projection::Metadata`. Same shape inventory uses, hydrated
     /// from a fresh fetch.
     Metadata(crate::events::InventoryEntry),
@@ -309,20 +307,20 @@ pub enum ProtocolSalt {
 pub enum FlagOp {
     /// Union the carried flag set into existing flags
     /// (IMAP `+FLAGS`, Gmail `addLabelIds`).
-    Add(HashSet<String>),
+    Add(crate::FlagSet),
     /// Difference the carried flag set from existing flags
     /// (IMAP `-FLAGS`, Gmail `removeLabelIds`).
-    Remove(HashSet<String>),
+    Remove(crate::FlagSet),
     /// Replace existing flags with the carried set wholesale
     /// (IMAP `FLAGS`). Not directly expressible on Gmail; the
     /// Account impl translates via add+remove.
-    Set(HashSet<String>),
+    Set(crate::FlagSet),
     /// Both add and remove in one wire operation
     /// (IMAP `+FLAGS` then `-FLAGS` is two STOREs; Gmail
     /// `messages.batchModify` accepts both in one request).
     Patch {
-        add: HashSet<String>,
-        remove: HashSet<String>,
+        add: crate::FlagSet,
+        remove: crate::FlagSet,
     },
 }
 
@@ -339,7 +337,7 @@ pub enum FlagOpValidationError {
 impl FlagOp {
     /// Validate the operation before it crosses an account boundary.
     ///
-    /// Flag identity is ASCII-case-insensitive, matching
+    /// Flag identity comes from [`crate::Flag`], matching
     /// [`canonical_flags_hash`]. `Set(empty)` remains valid because it means
     /// clear every flag; empty additive/subtractive deltas do not describe a
     /// mutation.
@@ -352,11 +350,7 @@ impl FlagOp {
                 Err(FlagOpValidationError::EmptyDelta)
             }
             Self::Patch { add, remove } => {
-                let overlaps = add.iter().any(|added| {
-                    remove
-                        .iter()
-                        .any(|removed| added.eq_ignore_ascii_case(removed))
-                });
+                let overlaps = !add.is_disjoint(remove);
                 if overlaps {
                     Err(FlagOpValidationError::ContradictoryPatch)
                 } else {
@@ -409,7 +403,7 @@ pub enum FlagTargetState {
     Indeterminate,
 }
 
-/// The generic flag judge: ASCII-case-insensitive flag identity, matching
+/// The generic flag judge: [`crate::Flag`] identity, matching
 /// [`FlagOp::validate`] and [`canonical_flags_hash`]. An operation that fails
 /// validation is `Indeterminate`.
 ///
@@ -417,24 +411,15 @@ pub enum FlagTargetState {
 /// not apply inside this crate, so a future `FlagOp` variant fails to compile
 /// here and must be classified on purpose.
 #[must_use]
-pub fn flag_target_state(observed: &HashSet<String>, op: &FlagOp) -> FlagTargetState {
+pub fn flag_target_state(observed: &crate::FlagSet, op: &FlagOp) -> FlagTargetState {
     if op.validate().is_err() {
         return FlagTargetState::Indeterminate;
     }
-    let fold = |flags: &HashSet<String>| {
-        flags
-            .iter()
-            .map(|f| f.to_ascii_lowercase())
-            .collect::<HashSet<_>>()
-    };
-    let observed = fold(observed);
     let matches = match op {
-        FlagOp::Add(flags) => fold(flags).is_subset(&observed),
-        FlagOp::Remove(flags) => fold(flags).is_disjoint(&observed),
-        FlagOp::Set(flags) => fold(flags) == observed,
-        FlagOp::Patch { add, remove } => {
-            fold(add).is_subset(&observed) && fold(remove).is_disjoint(&observed)
-        }
+        FlagOp::Add(flags) => flags.is_subset(observed),
+        FlagOp::Remove(flags) => flags.is_disjoint(observed),
+        FlagOp::Set(flags) => flags == observed,
+        FlagOp::Patch { add, remove } => add.is_subset(observed) && remove.is_disjoint(observed),
     };
     if matches {
         FlagTargetState::Satisfied
@@ -446,7 +431,6 @@ pub fn flag_target_state(observed: &HashSet<String>, op: &FlagOp) -> FlagTargetS
 #[cfg(test)]
 mod tests {
     use super::{FlagOp, FlagOpValidationError, canonical_flags_hash};
-    use std::collections::HashSet;
 
     #[test]
     fn caller_etags_cannot_turn_into_a_blind_or_wildcard_condition() {
@@ -507,18 +491,18 @@ mod tests {
     #[test]
     fn flag_operations_reject_empty_deltas_and_contradictory_patches() {
         assert_eq!(
-            FlagOp::Add(HashSet::new()).validate(),
+            FlagOp::Add(crate::FlagSet::new()).validate(),
             Err(FlagOpValidationError::EmptyDelta)
         );
         assert_eq!(
             FlagOp::Patch {
-                add: HashSet::from(["\\Seen".to_string()]),
-                remove: HashSet::from(["\\seen".to_string()]),
+                add: crate::FlagSet::from(["\\Seen".to_string()]),
+                remove: crate::FlagSet::from(["\\seen".to_string()]),
             }
             .validate(),
             Err(FlagOpValidationError::ContradictoryPatch)
         );
-        assert!(FlagOp::Set(HashSet::new()).validate().is_ok());
+        assert!(FlagOp::Set(crate::FlagSet::new()).validate().is_ok());
     }
 }
 
@@ -561,7 +545,7 @@ mod versioned_mail_tests {
 mod target_tests {
     use super::*;
 
-    fn set(items: &[&str]) -> HashSet<String> {
+    fn set(items: &[&str]) -> crate::FlagSet {
         items.iter().map(|s| (*s).to_string()).collect()
     }
 

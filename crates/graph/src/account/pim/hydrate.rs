@@ -4,12 +4,12 @@
 use crate::account::GraphAccount;
 use crate::account::blob::blob_handle_from_graph_attachment;
 use crate::account::graph_error::GraphErrorContext;
+use bifrost_types::FlagSet;
 use bifrost_types::{
     AccountError, AccountOperation, Address, AttachmentSource, ContainerId, ErrorScope, FolderId,
     HydrationProjection, Importance, Message, MessageAttachment, ObjectId, ThreadId,
 };
 use serde_json::Value;
-use std::collections::HashSet;
 use std::time::SystemTime;
 
 use super::common::*;
@@ -148,7 +148,7 @@ pub(super) fn message_from_ews_item(
     } else {
         Vec::new()
     };
-    let mut flags = HashSet::new();
+    let mut flags = FlagSet::new();
     if item.is_read {
         flags.insert(crate::account::flags::GraphFlag::Read.token());
     }
@@ -422,8 +422,8 @@ pub(super) fn graph_message_date(value: &Value) -> Option<SystemTime> {
         .and_then(parse_graph_datetime)
 }
 
-pub(super) fn flags_from_message(value: &Value) -> HashSet<String> {
-    let mut flags = HashSet::new();
+pub(super) fn flags_from_message(value: &Value) -> FlagSet {
+    let mut flags = FlagSet::new();
     if value
         .get("isRead")
         .and_then(Value::as_bool)

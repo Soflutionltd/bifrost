@@ -6,7 +6,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::error::answer_error;
+use super::error::{
+    answer_error, finish_partial, invalid_attachment_handle, missing_shared_rights,
+    reschedule_missing_field, reschedule_not_found, scheduled_requires_envelope,
+};
 
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AccountStream, AttachmentSource,
@@ -28,7 +31,7 @@ fn to_acct_err(op: AccountOperation) -> impl Fn(crate::Error) -> AccountError {
 /// Page cursors belong to the caller, never the engine's durable sync state.
 /// An Outlook user expects a broken search to restart without clearing mail.
 fn invalid_search_cursor(op: AccountOperation) -> AccountError {
-    super::page_cursor::cursor_error(
+    super::error::page_cursor_error(
         op,
         "search page cursor is malformed, retired or out of range".to_string(),
     )
@@ -114,11 +117,11 @@ pub(crate) fn set_keyword<T: HttpTransport>(
     email_states: StateMap,
     account_id: String,
     target: MutationTarget,
-    keyword: String,
+    keyword: bifrost_types::Flag,
     value: bool,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let keyword = crate::email::keyword::Keyword::parse(keyword)
+        let keyword = crate::email::keyword::Keyword::parse(keyword.as_str())
             .map_err(to_acct_err(AccountOperation::SetKeyword))?;
         let owner = target_owner(&target);
         let ids = resolve_target(&mail, target, AccountOperation::SetKeyword).await?;
@@ -171,7 +174,7 @@ pub(crate) fn set_is_read<T: HttpTransport>(
         email_states,
         account_id,
         target,
-        SEEN_KEYWORD.to_string(),
+        SEEN_KEYWORD.into(),
         is_read,
     )
 }
@@ -191,7 +194,7 @@ pub(crate) fn set_importance<T: HttpTransport>(
         email_states,
         account_id,
         target,
-        IMPORTANT_KEYWORD.to_string(),
+        IMPORTANT_KEYWORD.into(),
         importance_sets_important_keyword(level),
     )
 }
@@ -364,13 +367,6 @@ impl SetProgress {
     }
 }
 
-fn finish_partial(error: AccountError, record: PartialCommitBuilder) -> AccountError {
-    error
-        .into_builder()
-        .partial_commit(record)
-        .try_build()
-        .expect("valid JMAP partial commitment")
-}
 fn email_targets(id: Option<&EmailId>) -> StepTargets {
     id.map_or_else(StepTargets::unknown, |id| {
         StepTargets::complete(vec![TargetRef::new(
@@ -1743,7 +1739,7 @@ pub(crate) fn container_move<T: HttpTransport>(
         if let Some(parent) = &new_parent
             && super::foreign::owner_of(&container.0) != super::foreign::owner_of(&parent.0)
         {
-            return Err(super::page_cursor::invalid_argument(
+            return Err(super::error::invalid_argument(
                 AccountOperation::ContainerMove,
                 "parent",
                 "Mailbox/set cannot move a folder between accounts".to_string(),
@@ -3193,33 +3189,6 @@ async fn fetch_foreign_containers<T: HttpTransport>(
     (containers, skipped)
 }
 
-/// A shared mailbox whose `Mailbox/get` answered without `myRights`.
-///
-/// RFC 8621 s2 makes `myRights` a server-set Mailbox property, and
-/// `fetch_mailboxes` asks for it by name, so an answer that omits it is
-/// a missing field rather than a protocol that has no rights notion. It
-/// matters only on a SHARE: `Container::rights` gates submit and the
-/// read-only-share distinction, and `None` there is indistinguishable
-/// from a personal mailbox where rights are not consulted. Reported as
-/// a degradation, not a failure - the container is still listed, since
-/// a share with unknown rights is far more useful than a share missing
-/// from the sidebar.
-fn missing_shared_rights(container_id: &str, op: AccountOperation) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::MissingField),
-        bifrost_types::Cause::Wire(bifrost_types::WireCause::MalformedResponse {
-            protocol: bifrost_types::Protocol::Jmap,
-            detail: Some(bifrost_types::DiagnosticText::support_only(format!(
-                "shared Mailbox/get answered without myRights: {container_id}"
-            ))),
-        }),
-    )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(op)
-    .try_build()
-    .expect("valid account error classification")
-}
-
 async fn fetch_mailboxes<T: HttpTransport>(
     mail: &MailAccount<T>,
     op: AccountOperation,
@@ -3414,7 +3383,7 @@ async fn search_email_ids<T: HttpTransport>(
     } else {
         true
     };
-    let next_cursor = more.then(|| encode_position(next_position, &query_state, owner));
+    let next_cursor = more.then(|| encode_position(next_position, &query_state, owner).into());
 
     Ok(Page {
         truncated: false,
@@ -4062,21 +4031,6 @@ async fn copy_attachment_blob<T: HttpTransport>(
     response.copied(&blob_id).map_err(to_acct_err(op))
 }
 
-fn invalid_attachment_handle(op: AccountOperation) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-        bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
-            detail: bifrost_types::DiagnosticText::support_only(
-                "JMAP attachment handle has no source account; upload it again before sending",
-            ),
-        }),
-    )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(op)
-    .try_build()
-    .expect("valid attachment handle classification")
-}
-
 fn address_to_jmap(address: bifrost_types::Address) -> JmapEmailAddress {
     let mut out = JmapEmailAddress::new(address.address);
     if let Some(name) = address.name {
@@ -4094,25 +4048,6 @@ fn address_from_jmap(address: &JmapEmailAddress) -> bifrost_types::Address {
 
 fn submission_address_from_compose(address: &bifrost_types::Address) -> SubmissionAddress {
     SubmissionAddress::new(address.address.clone())
-}
-
-/// A scheduled JMAP send needs a concrete mailFrom and recipients to carry
-/// the hold parameter. A caller-selected Identity can supply mailFrom when
-/// `from` is absent; without either, JMAP defines no default identity to use.
-/// Maps to `Request(Malformed)`.
-fn scheduled_requires_envelope() -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-        bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
-            detail: bifrost_types::DiagnosticText::user_safe(
-                "Scheduled send requires a from address or selected identity and at least one recipient.",
-            ),
-        }),
-    )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(AccountOperation::Send)
-    .try_build()
-    .expect("valid account error classification")
 }
 
 /// Cancel a scheduled JMAP submission by id: `EmailSubmission/set`
@@ -4306,34 +4241,6 @@ pub(crate) fn reschedule_send<T: HttpTransport>(
     })
 }
 
-fn reschedule_missing_field(detail: &'static str) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::MissingField),
-        bifrost_types::Cause::Wire(bifrost_types::WireCause::MalformedResponse {
-            protocol: bifrost_types::Protocol::Jmap,
-            detail: Some(bifrost_types::DiagnosticText::support_only(detail)),
-        }),
-    )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(AccountOperation::RescheduleSend)
-    .try_build()
-    .expect("valid account error classification")
-}
-
-fn reschedule_not_found(id: &str) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::NotFound(bifrost_types::ResourceKind::Message),
-        bifrost_types::Cause::Request(bifrost_types::RequestCause::NotFound {
-            what: bifrost_types::ResourceKind::Message,
-            id: Some(id.to_string()),
-        }),
-    )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(AccountOperation::RescheduleSend)
-    .try_build()
-    .expect("valid account error classification")
-}
-
 fn message_properties(projection: HydrationProjection) -> Vec<EmailProperty> {
     let mut properties = vec![
         EmailProperty::Id,
@@ -4394,7 +4301,7 @@ fn email_to_message(email: Email, projection: HydrationProjection) -> Message {
         .keywords()
         .into_iter()
         .map(str::to_string)
-        .collect::<HashSet<_>>();
+        .collect::<bifrost_types::FlagSet>();
     let body_text = if matches!(
         projection,
         HydrationProjection::Preview(_)
@@ -4523,18 +4430,8 @@ fn checked_timestamp(
     time: SystemTime,
     operation: AccountOperation,
 ) -> Result<jiff::Timestamp, AccountError> {
-    jiff::Timestamp::try_from(time).map_err(|error| {
-        bifrost_types::AccountErrorBuilder::new(
-            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-            bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
-                detail: bifrost_types::DiagnosticText::user_safe(error.to_string()),
-            }),
-        )
-        .protocol(bifrost_types::Protocol::Jmap)
-        .operation(operation)
-        .try_build()
-        .expect("valid timestamp refusal")
-    })
+    jiff::Timestamp::try_from(time)
+        .map_err(|error| super::error::invalid_timestamp(operation, error.to_string()))
 }
 
 fn unix_to_system_time(timestamp: i64) -> Option<SystemTime> {
@@ -5609,7 +5506,7 @@ mod tests {
         .expect("search succeeds");
         let cursor = page.next_cursor.expect("a full page has a next cursor");
         assert_eq!(
-            String::from_utf8(cursor.clone()).expect("utf8"),
+            String::from_utf8(cursor.clone().into_bytes()).expect("utf8"),
             super::super::foreign::encode_object("shared", "search-3:1:q-1"),
             "the cursor names the account it was minted against, \
              the position it resumes at, and the queryState it belongs to"
@@ -5672,7 +5569,7 @@ mod tests {
         assert_eq!(page.items, vec![ObjectId("M1".to_string())]);
         assert_eq!(
             page.next_cursor
-                .map(|c| String::from_utf8(c).expect("utf8")),
+                .map(|c| String::from_utf8(c.into_bytes()).expect("utf8")),
             Some("search-3:1:q-1".to_string())
         );
     }
@@ -5836,7 +5733,7 @@ mod tests {
         assert_eq!(page.estimated_total, Some(9));
         assert_eq!(
             page.next_cursor
-                .map(|c| String::from_utf8(c).expect("utf8")),
+                .map(|c| String::from_utf8(c.into_bytes()).expect("utf8")),
             Some("search-3:2:q-1".to_string()),
             "seven hits remain, so the walk must continue"
         );
@@ -7365,7 +7262,7 @@ mod tests {
             Arc::clone(&states),
             "primary".to_string(),
             MutationTarget::Message(ObjectId("email-old".to_string())),
-            "$seen".to_string(),
+            "$seen".into(),
             true,
         )
         .await
@@ -7687,7 +7584,7 @@ mod tests {
             states,
             "primary".to_string(),
             MutationTarget::Thread(ThreadId("thread-1".to_string())),
-            "$seen".to_string(),
+            "$seen".into(),
             true,
         )
         .await

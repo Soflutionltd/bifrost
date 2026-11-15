@@ -898,6 +898,7 @@ async fn round2_unwind_records_every_refusal_and_preserves_original_error() {
     let mut next = account();
     next.scopes = vec![SCOPE];
     next.caps.push = bifrost_types::PushCapability::InProcess;
+    next.push_lane_specs = common::StubAccount::registration_lanes();
     next.push_label = "replacement".into();
     next.unsubscribe_error_hook = Some(Arc::new(move |handle| {
         if handle.0 == "replacement-2" {

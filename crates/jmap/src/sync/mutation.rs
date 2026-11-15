@@ -116,10 +116,7 @@ pub(super) fn caller_state(
         Some(bifrost_types::ServerVersion::StateAt(state)) if !state.is_empty() => {
             Ok(Some(state.as_str()))
         }
-        Some(_) => Err(bifrost_types::AccountError::unsupported(
-            operation,
-            bifrost_types::Protocol::Jmap,
-        )),
+        Some(_) => Err(super::error::unsupported(operation)),
     }
 }
 
@@ -781,7 +778,7 @@ mod tests {
         .expect("Email/set serializes")
     }
 
-    fn flags(values: &[&str]) -> std::collections::HashSet<String> {
+    fn flags(values: &[&str]) -> bifrost_types::FlagSet {
         values.iter().map(|value| String::from(*value)).collect()
     }
 

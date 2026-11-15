@@ -90,8 +90,10 @@ pub(crate) async fn events_in_range(
         return public::range(&account, folder, &range).await;
     }
     let operation = AccountOperation::EventsInRange;
-    let cursor = crate::paging::decode_link_cursor(&account.client, range.page_cursor)
-        .map_err(|detail| graph_error::invalid_account_error(operation, detail))?;
+    let cursor = crate::paging::decode_link_cursor(&account.client, range.page_cursor, operation)
+        .map_err(|detail| {
+        AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, detail)
+    })?;
     let url = match cursor {
         Some(url) => url,
         None => {
@@ -113,7 +115,7 @@ pub(crate) async fn events_in_range(
         .client
         .admit_next(page.next_link.as_ref())
         .map_err(|error| into_error(error, operation))?
-        .map(|next| next.as_str().as_bytes().to_vec());
+        .map(|next| crate::paging::encode_cursor(operation, &next.as_str()));
     Ok(Page {
         truncated: false,
         items: page
@@ -453,13 +455,11 @@ pub(crate) async fn rsvp(
         .map_err(|error| into_error(error, AccountOperation::EventRsvp))
 }
 
-/// Sentinel prefix marking a `page_cursor` minted by the Graph Search API
-/// path (`search_with_graph_api`). The Search API pages by `from`/`size`
-/// offset rather than an `@odata.nextLink`, so its cursor cannot be fed to
-/// the local nextLink walk and vice versa. The bytes after the prefix are
-/// the decimal next `from` offset. `\u{1f}` cannot appear in a Graph
-/// `@odata.nextLink` URL, so the two cursor shapes never collide.
-const SEARCH_API_CURSOR_PREFIX: &[u8] = b"\x1fsearchapi:";
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchApiPosition {
+    from: u32,
+}
 
 pub(crate) async fn search(
     account: GraphAccount,
@@ -486,15 +486,13 @@ pub(crate) async fn search(
 /// Decode a Search-API `page_cursor` into its `from` offset, or `None` if
 /// the cursor is absent or is a local nextLink cursor.
 fn search_api_cursor_offset(cursor: Option<&[u8]>) -> Option<u32> {
-    let bytes = cursor?.strip_prefix(SEARCH_API_CURSOR_PREFIX)?;
-    std::str::from_utf8(bytes).ok()?.parse().ok()
+    let position: SearchApiPosition =
+        crate::paging::decode_cursor(cursor?, AccountOperation::EventSearch).ok()?;
+    Some(position.from)
 }
 
-/// Encode a Search-API next-page `from` offset into an opaque cursor.
-fn search_api_cursor(from: u32) -> Vec<u8> {
-    let mut cursor = SEARCH_API_CURSOR_PREFIX.to_vec();
-    cursor.extend_from_slice(from.to_string().as_bytes());
-    cursor
+fn search_api_cursor(from: u32) -> bifrost_types::PageCursor {
+    crate::paging::encode_cursor(AccountOperation::EventSearch, &SearchApiPosition { from })
 }
 
 async fn search_locally(
@@ -506,8 +504,11 @@ async fn search_locally(
         .clone()
         .unwrap_or_else(|| CalendarId(DEFAULT_CALENDAR_ID.to_string()));
     let operation = AccountOperation::EventSearch;
-    let cursor = crate::paging::decode_paged_cursor(&account.client, request.page_cursor)
-        .map_err(|detail| graph_error::invalid_account_error(operation, detail))?;
+    let cursor =
+        crate::paging::decode_paged_cursor(&account.client, request.page_cursor, operation)
+            .map_err(|detail| {
+                AccountError::invalid_page_cursor(operation, bifrost_types::Protocol::Graph, detail)
+            })?;
     let (mut url, mut skip) = match cursor {
         Some(position) => position,
         None => {
@@ -561,11 +562,13 @@ async fn search_locally(
                 if items.len() == limit {
                     let consumed = index + 1;
                     next_cursor = if consumed < page_len {
-                        Some(crate::paging::encode_paged_cursor(&url, consumed))
+                        Some(crate::paging::encode_paged_cursor(
+                            &url, consumed, operation,
+                        ))
                     } else {
                         next_link
                             .as_ref()
-                            .map(|next| crate::paging::encode_paged_cursor(next, 0))
+                            .map(|next| crate::paging::encode_paged_cursor(next, 0, operation))
                     };
                     return Ok(Page {
                         truncated: false,

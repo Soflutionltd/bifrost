@@ -41,13 +41,6 @@ fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
     )
 }
 
-fn other_error(op: bifrost_types::AccountOperation, detail: impl Into<String>) -> AccountError {
-    error::into_account_error(
-        crate::error::Error::invalid_request(op, detail),
-        error::GmailErrorContext::base(op),
-    )
-}
-
 /// Translate a `crate::Error` into `AccountError` with the given
 /// per-call-site context. Every PIM call site uses this so the
 /// operation, scope, and resource are correct for the classification.

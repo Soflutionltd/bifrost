@@ -61,7 +61,7 @@ impl Account for ScriptAccount {
     fn flag_target(
         &self,
         target: &ObjectId,
-        observed: &HashSet<String>,
+        observed: &bifrost_types::FlagSet,
         op: &FlagOp,
     ) -> bifrost_types::FlagTargetState {
         assert_ne!(
@@ -163,7 +163,7 @@ impl Account for ScriptAccount {
     fn set_keyword(
         &self,
         _target: MutationTarget,
-        _keyword: String,
+        _keyword: bifrost_types::Flag,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         unreachable!("unexpected account door")
@@ -344,7 +344,7 @@ impl Account for ScriptAccount {
     fn contacts_list(
         &self,
         _address_book: Option<AddressBookId>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         unreachable!("unexpected account door")
     }
@@ -377,20 +377,20 @@ impl Account for ScriptAccount {
         &self,
         _query: String,
         _limit: Option<u32>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryCard>, AccountError>> {
         unreachable!("unexpected account door")
     }
     fn directory_groups_list(
         &self,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroup>, AccountError>> {
         unreachable!("unexpected account door")
     }
     fn directory_group_expand(
         &self,
         _group: bifrost_types::DirectoryGroupId,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroupMember>, AccountError>> {
         unreachable!("unexpected account door")
     }
@@ -470,7 +470,7 @@ fn scripted(items: Vec<ItemOutcome<HydratedObject>>) -> ScriptAccount {
 }
 async fn observe_items(items: Vec<ItemOutcome<HydratedObject>>, ids: &[&str]) -> ReadbackReport {
     let account = scripted(items);
-    let op = FlagOp::Add(["\\Seen".into()].into_iter().collect());
+    let op = FlagOp::Add(["\\Seen".to_owned()].into_iter().collect());
     run_object_readback(
         &account,
         ids.iter().map(|id| ObjectId((*id).into())).collect(),

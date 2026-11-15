@@ -737,7 +737,7 @@ impl Account for CalDavAccount {
     fn set_keyword(
         &self,
         _target: MutationTarget,
-        _keyword: String,
+        _keyword: bifrost_types::Flag,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         unsupported_future(AccountOperation::SetKeyword)
@@ -951,7 +951,7 @@ impl Account for CalDavAccount {
     fn contacts_list(
         &self,
         _address_book: Option<AddressBookId>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         unsupported_future(AccountOperation::ContactsList)
     }
@@ -990,14 +990,14 @@ impl Account for CalDavAccount {
         &self,
         _query: String,
         _limit: Option<u32>,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
         unsupported_future(AccountOperation::DirectorySearch)
     }
 
     fn directory_groups_list(
         &self,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
         unsupported_future(AccountOperation::DirectoryGroupsList)
     }
@@ -1005,7 +1005,7 @@ impl Account for CalDavAccount {
     fn directory_group_expand(
         &self,
         _group: DirectoryGroupId,
-        _page_cursor: Option<Vec<u8>>,
+        _page_cursor: Option<bifrost_types::PageCursor>,
     ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
         unsupported_future(AccountOperation::DirectoryGroupExpand)
     }
@@ -1456,7 +1456,7 @@ fn rsvp_email_from_config(config: &CalDavConfig) -> Option<String> {
 }
 
 fn decode_event_page_cursor(
-    cursor: Option<Vec<u8>>,
+    cursor: Option<bifrost_types::PageCursor>,
     operation: AccountOperation,
 ) -> Result<Option<String>, AccountError> {
     decode_watermark_cursor(cursor, operation, DavProtocol::CalDav)
@@ -2557,7 +2557,7 @@ mod tests {
         );
         assert_eq!(
             page.next_cursor,
-            Some(b"https://dav.example.test/cal/b.ics".to_vec()),
+            Some(b"https://dav.example.test/cal/b.ics".to_vec().into()),
             "the cursor is the last href served"
         );
         assert_eq!(page.estimated_total, Some(3));
@@ -2615,7 +2615,7 @@ mod tests {
                 query: String::new(),
                 calendar_id: None,
                 limit: Some(2),
-                page_cursor: Some(b"https://dav.example.test/cal/b.ics".to_vec()),
+                page_cursor: Some(b"https://dav.example.test/cal/b.ics".to_vec().into()),
                 include_cancelled: false,
             })
             .await
@@ -2873,7 +2873,7 @@ mod tests {
         );
         assert_eq!(
             page.next_cursor,
-            Some(b"https://dav.example.test/cal/b.ics".to_vec()),
+            Some(b"https://dav.example.test/cal/b.ics".to_vec().into()),
             "the cursor is the last href served"
         );
         assert_eq!(page.estimated_total, Some(3));
@@ -2924,7 +2924,10 @@ mod tests {
         responses
     }
 
-    fn large_range(limit: Option<u32>, page_cursor: Option<Vec<u8>>) -> EventRange {
+    fn large_range(
+        limit: Option<u32>,
+        page_cursor: Option<bifrost_types::PageCursor>,
+    ) -> EventRange {
         EventRange {
             calendar_id: CalendarId("https://dav.example.test/cal/".to_string()),
             start: time("2026-01-01T00:00:00Z"),
@@ -3143,7 +3146,7 @@ mod tests {
         );
         assert_eq!(
             page.next_cursor,
-            Some(b"https://dav.example.test/cal/b.ics".to_vec()),
+            Some(b"https://dav.example.test/cal/b.ics".to_vec().into()),
             "the degrade lane keys the cursor on the href too, so a mid-walk \
              degrade neither re-serves nor skips"
         );
@@ -4067,7 +4070,8 @@ mod tests {
             Some("b")
         );
         assert!(
-            decode_event_page_cursor(Some(Vec::new()), AccountOperation::EventsInRange).is_err(),
+            decode_event_page_cursor(Some(Vec::new().into()), AccountOperation::EventsInRange)
+                .is_err(),
             "an empty cursor is corrupt, not a restart from the first event"
         );
     }

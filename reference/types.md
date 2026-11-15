@@ -170,10 +170,10 @@ an optional progress marker, and an outer envelope version. The outer version
 comes from `CHANGE_CURSOR_ENVELOPE_VERSION`; `validate_envelope` is the gate the
 engine applies before dispatching a stored cursor to a protocol account, and it
 is a strict equality check, never a range. Migration of an older persisted
-layout belongs entirely to `bifrost-sync`'s envelope decoder, which stamps the
-current version on the way out, so a `ChangeCursor` a protocol crate is handed
-is always at the layout that crate compiles against. `ChangeCursorEnvelopeMismatch`
-reports `expected` and `found`.
+layout belongs entirely to `wire::cursor`'s envelope decoder, exposed through
+`bifrost-sync`'s storage API, which stamps the current version on the way out.
+A `ChangeCursor` a protocol crate is handed is always at the layout that crate
+compiles against. `ChangeCursorEnvelopeMismatch` reports `expected` and `found`.
 `OpaqueChangeState::envelope_version` is `PayloadVersion`, while the outer
 change cursor and backfill checkpoint use `TraitEnvelopeVersion`. Their private
 representations prevent substituting one version axis for another. Change and
@@ -298,10 +298,30 @@ membership can change without keyword state changing.
 
 ## Mutation outcomes
 
+`Flag` owns flag identity and retains the original spelling for provider writes.
+`FlagSet` uses that identity for membership, equality, insertion and set
+operations; iteration yields immutable `Flag` values, preserving both spelling
+and identity through collection and cloning.
+`FlagOp`, `HydratedObjectKind::FlagsOnly`, `Message::flags` and
+`Account::flag_target` all carry `FlagSet`. The single-keyword Account door
+and filter set/clear-keyword actions carry `Flag`.
+
+Ordinary keywords compare ASCII-case-insensitively, so `\Seen` and `\SEEN`
+occupy one member. `Flag::literal` explicitly preserves opaque provider identity;
+string prefixes never select an identity rule. Synthetic Gmail label tokens
+use this constructor and retain exact spelling, including opaque ids and
+advisory names; the provider judge still resolves renamed labels by id. Graph category flags, including their `category:` prefix, compare
+ASCII-case-insensitively while retaining the category name sent to the provider. These rules preserve the
+providers' existing write vocabulary: an enterprise Outlook user must not edit
+a distinct label because its opaque id differs only in case. Fingerprinting, validation
+and generic read-back use this same identity. Gmail label fingerprints now
+distinguish case-only label changes; previously persisted fingerprints can
+therefore produce a one-time update without requiring cursor migration.
+
 `FlagOp::validate` is the account-boundary guard for flag mutations. Empty
 add/remove deltas and an entirely empty patch are invalid; `Set(empty)` means
 "clear all flags". A patch may not name the same flag in both sets under
-ASCII-case-insensitive identity. Invalid operations are caller errors and must
+`Flag` identity. Invalid operations are caller errors and must
 be rejected before provider I/O.
 
 `Account::flag_target(target, observed, op)` judges one complete `FlagsOnly`
@@ -310,7 +330,7 @@ observation against a flag operation and returns a `FlagTargetState`:
 provider's own write vocabulary; a token the write does not model or the
 observation cannot see is `Indeterminate`. The default is
 `flag_target_state`: an invalid operation is `Indeterminate`, and flag
-identity is ASCII-case-insensitive, so `Set({"\Seen", "\SEEN"})` equals an
+identity comes from `Flag`, so `Set({"\Seen", "\SEEN"})` equals an
 observed `{"\seen"}`. Providers whose write translates flags override it.
 
 The judge relies on a `get_stream` contract: a `FlagsOnly` success carries
@@ -342,6 +362,18 @@ committed. The operation table alone, never the override, decides whether
 (`reference/error-model.md`).
 
 ## Paginated results
+
+`PageCursor` (`page.rs`) is the opaque continuation type for `Page::next_cursor`,
+all page-taking `Account` methods, and the search/contact/calendar request
+shapes. It is distinct from bytes, change cursors and inventory progress.
+Consumers pass it back to the same surface; `as_bytes` / `into_bytes` and
+`from_bytes` support storage, and transparent serde preserves the byte-array
+representation. Debug output reports only its length. Restoring bytes does not
+validate them: the owning provider does that when resuming. Graph and Google
+use versioned surface tags and refuse foreign or retired formats through
+`AccountError::invalid_page_cursor`, so an enterprise user's stale results
+reload without clearing durable account state. Other providers retain their
+existing payload formats and validation.
 
 `Page<T>` (`page.rs`) is the envelope `search`, `search_messages`, and the
 other paged list surfaces return: `items`, an opaque protocol-owned
@@ -477,6 +509,7 @@ crates/types/src/
   search.rs           message search requests and results
   filter.rs           server-filter model
   settings.rs         identities, vacation, quota
+  wire/               versioned storage codecs and shared byte primitives
   contact.rs          contacts and address books
   directory.rs        directory search and groups
   calendar.rs         calendars and events
@@ -551,6 +584,14 @@ values, and `into_parts()` returns both owned values. Rebuilding a modified
 result goes through `new`, so coverage cannot drift from the handle.
 
 `Account::push_lanes` declares independent Connection or Registration slots.
+`effective_push_lanes(&dyn Account)` is the shared availability decision:
+`PushCapability::None` yields no lanes; every other capability uses the declared
+list unchanged, including an empty list. Lane kind owns session delivery;
+the capability's provider variants remain metadata. Health, supervision and
+subscription carry-over all use this decision, so an enterprise user is never
+shown push coverage for a lane that cannot run. Reattach tears down old
+subscriptions without recreating them when the replacement has no effective
+lanes; polling continues to cover its scopes.
 `push_stream(lane, stop, gate)` drives one re-runnable session: establishment
 is separate from demonstrated `Healthy` progress, all failures reach the
 engine, and each terminal event follows cleanup. `LaneLease` enforces one
@@ -634,12 +675,26 @@ support-only text. Callers must apply consent policy before exporting it. The
 sync ledger clones this into its historical `ErrorDigest`, without reconstructing
 causes or recovery advice on load.
 
-`AccountOperation::ledger_tag`, `ObjectType::cursor_tag` and
-`ProtocolKind::cursor_tag` own the stable encoding tags used by the sync ledger
-and cursor envelopes. Their matches are exhaustive inside this crate. Preserve
-existing tags and append new ones; coordinate new tags with sync's versioned
-decoders and readable window. New enum variants must therefore make an explicit
-storage choice at compile time rather than panicking when a store encodes one.
+`wire::cursor` owns the cursor envelope, scope and object/protocol tag codecs,
+including checkpoint dispatch and the outer-version migration boundary.
+`wire::ledger` owns the versioned error kind, error scope, operation, provider,
+protocol, resource, diagnostic, coverage-domain and repair-target codecs.
+All shared vocabulary encoders match exhaustively in this crate, including
+nested error kinds and diagnostic visibility. A new variant therefore requires
+an explicit storage representation at compile time rather than a runtime panic
+in a consumer store. `AccountOperation::ledger_tag`, `ObjectType::cursor_tag`
+and `ProtocolKind::cursor_tag` retain their existing exhaustive tag projections.
+
+Preserve existing bytes and append new tags. Cursor changes update the shared
+outer envelope version and migration window. Ledger vocabulary changes retain
+historical decode gates and advance `wire::ledger::VOCABULARY_VERSION` beyond
+the current enclosing sync ledger version; sync asserts that its version is at
+least that value. Engine-owned ledger layout and migrations remain in sync.
+`wire::Reader` and the length-prefixed primitives compose these codecs without
+a dependency on the engine. `wire::DecodeError` distinguishes incompatible
+schemas from malformed bytes; sync maps those to its existing schema recovery
+and malformed-storage errors. Historical reserved cursor tags retain schema
+recovery. This ownership move changes neither stored bytes nor readable versions.
 
 `ConvenienceShape::replied` and `forwarded` use `RepliedFlagShape` and
 `ForwardedFlagShape`, each selecting `Keyword`, `ExtendedProperty` or `None`.

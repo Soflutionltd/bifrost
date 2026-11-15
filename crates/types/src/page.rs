@@ -8,6 +8,65 @@
 
 use crate::error::{AccountError, ErrorScope};
 
+/// Opaque continuation for one caller-owned page walk.
+///
+/// Pass this value back to the surface that returned it. These bytes are not
+/// durable sync state or an inventory checkpoint. Providers own validation of
+/// their encoding and surface; a refused cursor restarts only this
+/// walk, as an enterprise user expects when saved results become stale.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct PageCursor(Vec<u8>);
+
+impl PageCursor {
+    /// Restore opaque bytes from consumer storage. Validation belongs to the
+    /// provider when the continuation is used.
+    #[must_use]
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the opaque representation for storage or provider decoding.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Take the opaque representation for storage or provider decoding.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl From<Vec<u8>> for PageCursor {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::from_bytes(bytes)
+    }
+}
+
+impl AsRef<[u8]> for PageCursor {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl std::ops::Deref for PageCursor {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_bytes()
+    }
+}
+
+impl std::fmt::Debug for PageCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageCursor")
+            .field("len", &self.0.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Paginated result envelope.
 ///
 /// Not `#[non_exhaustive]` because protocol Account impls construct
@@ -24,7 +83,7 @@ pub struct Page<T> {
     /// Opaque cursor to pass to the next call to resume after the
     /// last item in `items`. `None` when the underlying primitive
     /// returned its final page.
-    pub next_cursor: Option<Vec<u8>>,
+    pub next_cursor: Option<PageCursor>,
     /// Total size of the whole result when known: server-reported, or
     /// counted by a call that enumerated the entire result itself. `None`
     /// when the protocol does not expose an estimate (most do not for
@@ -98,7 +157,19 @@ impl<T> Page<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::Page;
+    use super::{Page, PageCursor};
+
+    #[test]
+    fn opaque_page_cursor_preserves_storage_bytes_and_redacts_debug() {
+        let bytes = b"opaque-secret\0\xff".to_vec();
+        let cursor = PageCursor::from_bytes(bytes.clone());
+        assert_eq!(cursor.as_bytes(), bytes);
+        let stored = serde_json::to_vec(&cursor).expect("serialize");
+        assert_eq!(stored, serde_json::to_vec(&bytes).unwrap());
+        let restored: PageCursor = serde_json::from_slice(&stored).expect("restore");
+        assert_eq!(restored.into_bytes(), bytes);
+        assert!(!format!("{cursor:?}").contains("opaque-secret"));
+    }
 
     #[test]
     fn single_preserves_failed_ids() {

@@ -1241,8 +1241,8 @@ async fn mutation_flushes_at_target_buffer_boundary_before_input_closes() {
     let mut output = super::mutate::mutation_stream(
         account,
         ids,
-        super::mutate::MutationKind::Flags(FlagOp::Add(std::collections::HashSet::from([
-            "$flagged".to_owned(),
+        super::mutate::MutationKind::Flags(FlagOp::Add(bifrost_types::FlagSet::from([
+            "$flagged".to_owned()
         ]))),
     );
     let first = tokio::time::timeout(Duration::from_secs(5), output.next())
@@ -1294,8 +1294,8 @@ async fn mutation_select_failure_reports_every_id_failed_once_as_unsent() {
     let mut output = super::mutate::mutation_stream(
         account,
         ids,
-        super::mutate::MutationKind::Flags(FlagOp::Add(std::collections::HashSet::from([
-            "$flagged".to_owned(),
+        super::mutate::MutationKind::Flags(FlagOp::Add(bifrost_types::FlagSet::from([
+            "$flagged".to_owned()
         ]))),
     );
 
@@ -1433,8 +1433,8 @@ async fn shared_folder_select_denial_is_scoped_and_later_mutation_targets_contin
     let mut output = super::mutate::mutation_stream(
         account,
         Box::pin(futures::stream::iter(submitted)),
-        super::mutate::MutationKind::Flags(FlagOp::Add(std::collections::HashSet::from([
-            "$flagged".to_owned(),
+        super::mutate::MutationKind::Flags(FlagOp::Add(bifrost_types::FlagSet::from([
+            "$flagged".to_owned()
         ]))),
     );
 
@@ -1599,7 +1599,7 @@ async fn undecodable_ids_ride_one_batch_per_window() {
         account,
         Box::pin(futures::stream::iter(ids)),
         super::mutate::MutationKind::Flags(bifrost_types::FlagOp::Add(
-            std::collections::HashSet::from(["$flagged".to_owned()]),
+            bifrost_types::FlagSet::from(["$flagged".to_owned()]),
         )),
     );
 
@@ -4251,7 +4251,7 @@ async fn search_page_against<T: std::fmt::Debug>(
 async fn search_messages_returns_the_boundary_survivor_after_an_earlier_expunge() {
     use bifrost_types::{SearchFilter, SearchRequest};
     let inbox = crate::types::MailboxName::new("INBOX").unwrap();
-    let request = |cursor: Option<Vec<u8>>| {
+    let request = |cursor: Option<bifrost_types::PageCursor>| {
         let mut request = SearchRequest::filter(SearchFilter::In(ContainerId("INBOX".to_owned())));
         request.limit = Some(2);
         request.page_cursor = cursor;
@@ -4285,7 +4285,7 @@ async fn search_messages_returns_the_boundary_survivor_after_an_earlier_expunge(
 async fn thread_search_pages_by_lowest_member_uid() {
     use bifrost_types::{SearchFilter, SearchRequest};
     let inbox = crate::types::MailboxName::new("INBOX").unwrap();
-    let request = |cursor: Option<Vec<u8>>| {
+    let request = |cursor: Option<bifrost_types::PageCursor>| {
         let mut request = SearchRequest::filter(SearchFilter::In(ContainerId("INBOX".to_owned())));
         request.limit = Some(1);
         request.page_cursor = cursor;
@@ -4694,8 +4694,8 @@ async fn mutation_select_omits_qresync_baseline_and_keeps_cached_store_guard() {
             5,
             2,
         )])),
-        super::mutate::MutationKind::Flags(FlagOp::Add(std::collections::HashSet::from([
-            "$flagged".to_owned(),
+        super::mutate::MutationKind::Flags(FlagOp::Add(bifrost_types::FlagSet::from([
+            "$flagged".to_owned()
         ]))),
     );
     assert_eq!(drain_mutation_batches(output).await, vec![vec![id(5, 2)]]);
@@ -4740,7 +4740,7 @@ async fn a_group_after_an_abandoning_timeout_settles_unsent_without_waiting() {
         let kind = if destroy {
             super::mutate::MutationKind::Destroy
         } else {
-            super::mutate::MutationKind::Flags(FlagOp::Add(std::collections::HashSet::from([
+            super::mutate::MutationKind::Flags(FlagOp::Add(bifrost_types::FlagSet::from([
                 "$flagged".to_owned(),
             ])))
         };
@@ -4842,7 +4842,7 @@ async fn caller_modseq_rejects_stale_flags_while_absent_keeps_cached_guard() {
                     id: super::encode_object_id(&inbox(), 5, 2),
                     expected_version: expected.map(ServerVersion::ModSeq),
                 }])),
-                FlagOp::Add(std::collections::HashSet::from(["$flagged".into()])),
+                FlagOp::Add(bifrost_types::FlagSet::from(["$flagged".into()])),
                 key,
             )
             .collect::<Vec<_>>()
@@ -5276,8 +5276,8 @@ async fn mutation_answers_under_the_submitted_id_spelling() {
     let mut output = super::mutate::mutation_stream(
         account,
         Box::pin(futures::stream::iter(vec![submitted.clone()])),
-        super::mutate::MutationKind::Flags(FlagOp::Add(std::collections::HashSet::from([
-            "$flagged".to_owned(),
+        super::mutate::MutationKind::Flags(FlagOp::Add(bifrost_types::FlagSet::from([
+            "$flagged".to_owned()
         ]))),
     );
     let mut ids = Vec::new();

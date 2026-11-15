@@ -518,14 +518,14 @@ fn read_u32(input: &mut &[u8], label: &str) -> Result<usize, SnapshotDecodeError
 /// silently restarting a pagination walk from item zero is the failure mode
 /// with no symptom.
 pub fn decode_watermark_cursor(
-    cursor: Option<Vec<u8>>,
+    cursor: Option<bifrost_types::PageCursor>,
     operation: AccountOperation,
     protocol: DavProtocol,
 ) -> Result<Option<String>, AccountError> {
     let Some(cursor) = cursor else {
         return Ok(None);
     };
-    let value = String::from_utf8(cursor).map_err(|error| {
+    let value = String::from_utf8(cursor.into_bytes()).map_err(|error| {
         local_error(
             operation,
             format!("invalid {} page cursor: {error}", protocol.label()),
@@ -544,8 +544,8 @@ pub fn decode_watermark_cursor(
 
 /// Mint the cursor bytes for a watermark.
 #[must_use]
-pub fn encode_watermark_cursor(watermark: &str) -> Vec<u8> {
-    watermark.as_bytes().to_vec()
+pub fn encode_watermark_cursor(watermark: &str) -> bifrost_types::PageCursor {
+    watermark.as_bytes().to_vec().into()
 }
 
 /// One page taken out of a key-sorted sequence, plus the watermark that
@@ -831,7 +831,7 @@ mod tests {
         // first member of the collection.
         assert!(
             decode_watermark_cursor(
-                Some(Vec::new()),
+                Some(Vec::new().into()),
                 AccountOperation::EventsInRange,
                 DavProtocol::CalDav
             )
@@ -839,7 +839,7 @@ mod tests {
         );
         assert!(
             decode_watermark_cursor(
-                Some(vec![0xff, 0xfe]),
+                Some(vec![0xff, 0xfe].into()),
                 AccountOperation::ContactsList,
                 DavProtocol::CardDav
             )

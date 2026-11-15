@@ -129,7 +129,7 @@ fn address_book_walk_refusal(
 pub(crate) fn list(
     client: Arc<GmailClient>,
     address_book: Option<AddressBookId>,
-    page_cursor: Option<Vec<u8>>,
+    page_cursor: Option<bifrost_types::PageCursor>,
 ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
     Box::pin(async move {
         // The `otherContacts` corpus is served by a distinct People endpoint
@@ -142,12 +142,7 @@ pub(crate) fn list(
         }
         validate_address_book(address_book.as_ref(), AccountOperation::ContactsList)?;
         let group_filter = contact_group_filter(address_book.as_ref());
-        let page_token = page_cursor
-            .map(String::from_utf8)
-            .transpose()
-            .map_err(|error| {
-                caller_input_error(AccountOperation::ContactsList, error.to_string())
-            })?;
+        let page_token = super::page_cursor::decode(page_cursor, AccountOperation::ContactsList)?;
         let mut url = format!(
             "{}/people/me/connections?personFields={}&pageSize=1000",
             client.people_base(),
@@ -178,12 +173,9 @@ pub(crate) fn list(
 /// synthetic other-contacts book with the `OtherAutoCollected` corpus.
 async fn list_other_contacts(
     client: &GmailClient,
-    page_cursor: Option<Vec<u8>>,
+    page_cursor: Option<bifrost_types::PageCursor>,
 ) -> Result<Page<ContactCard>, AccountError> {
-    let page_token = page_cursor
-        .map(String::from_utf8)
-        .transpose()
-        .map_err(|error| caller_input_error(AccountOperation::ContactsList, error.to_string()))?;
+    let page_token = super::page_cursor::decode(page_cursor, AccountOperation::ContactsList)?;
     let mut url = format!(
         "{}/otherContacts?readMask={}&pageSize=1000",
         client.people_base(),
@@ -481,6 +473,9 @@ pub(crate) fn search(
     request: ContactSearchRequest,
 ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
     Box::pin(async move {
+        if let Some(cursor) = &request.page_cursor {
+            super::page_cursor::token(cursor, AccountOperation::ContactSearch)?;
+        }
         validate_address_book(
             request.address_book_id.as_ref(),
             AccountOperation::ContactSearch,
@@ -514,7 +509,9 @@ pub(crate) fn search(
         Ok(Page {
             truncated: false,
             items,
-            next_cursor: response.next_page_token.map(String::into_bytes),
+            next_cursor: response
+                .next_page_token
+                .map(|token| super::page_cursor::encode(AccountOperation::ContactSearch, &token)),
             estimated_total: None,
             failed_ids: Vec::new(),
             skipped_scopes: Vec::new(),
@@ -535,9 +532,12 @@ pub(crate) fn directory_search(
     client: Arc<GmailClient>,
     query: String,
     limit: Option<u32>,
-    page_cursor: Option<Vec<u8>>,
+    page_cursor: Option<bifrost_types::PageCursor>,
 ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
     Box::pin(async move {
+        if let Some(cursor) = &page_cursor {
+            super::page_cursor::token(cursor, AccountOperation::DirectorySearch)?;
+        }
         if !query.is_empty() {
             // A transient cache-priming failure can defer to the real query.
             // A terminal refusal must remain visible even on the first page.
@@ -570,7 +570,9 @@ pub(crate) fn directory_search(
         Ok(Page {
             truncated: false,
             items,
-            next_cursor: response.next_page_token.map(String::into_bytes),
+            next_cursor: response
+                .next_page_token
+                .map(|token| super::page_cursor::encode(AccountOperation::DirectorySearch, &token)),
             estimated_total: None,
             failed_ids: Vec::new(),
             skipped_scopes: Vec::new(),
@@ -660,7 +662,8 @@ fn page_from_people(
             .filter(|person| person_in_group(person, group_filter))
             .map(|person| contact_from_person(person, corpus))
             .collect(),
-        next_cursor: next_page_token.map(String::into_bytes),
+        next_cursor: next_page_token
+            .map(|token| super::page_cursor::encode(AccountOperation::ContactsList, &token)),
         estimated_total: None,
         failed_ids: Vec::new(),
         skipped_scopes: Vec::new(),
@@ -1906,7 +1909,12 @@ mod tests {
             ContactCorpus::OtherAutoCollected,
         );
 
-        assert_eq!(page.next_cursor.as_deref(), Some(b"tok2".as_slice()));
+        assert_eq!(
+            super::super::page_cursor::decode(page.next_cursor, AccountOperation::ContactsList)
+                .unwrap()
+                .as_deref(),
+            Some("tok2")
+        );
         let card = &page.items[0];
         assert_eq!(card.id.0, "otherContacts/x1");
         assert_eq!(card.corpus, ContactCorpus::OtherAutoCollected);
@@ -1957,6 +1965,32 @@ mod tests {
         assert!(person_in_group(&person, Some("contactGroups/friends")));
         assert!(!person_in_group(&person, Some("contactGroups/coworkers")));
         assert!(person_in_group(&person, None));
+    }
+
+    #[tokio::test]
+    async fn contact_cursor_is_refused_by_directory_before_warmup() {
+        let (client, script) = scripted_client(br#"{"connections":[],"nextPageToken":"next"}"#);
+        let cursor = list(Arc::clone(&client), None, None)
+            .await
+            .expect("contacts page")
+            .next_cursor
+            .expect("continuation");
+        let error = directory_search(client, "Ada".into(), None, Some(cursor))
+            .await
+            .expect_err("foreign cursor must be refused before warmup");
+        assert_eq!(error.operation(), Some(AccountOperation::DirectorySearch));
+        assert!(error.chain().iter().any(|cause| matches!(
+            cause,
+            bifrost_types::Cause::Request(bifrost_types::RequestCause::InvalidArgument {
+                field: Some("page_cursor"),
+                ..
+            })
+        )));
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "only the contacts page was fetched"
+        );
     }
 
     #[tokio::test]
