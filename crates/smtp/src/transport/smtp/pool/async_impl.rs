@@ -351,6 +351,15 @@ impl<E: Executor> Pool<E> {
             .map_or(0, Vec::len)
     }
 
+    fn discard(mut conn: AsyncSmtpConnection, permit: OwnedSemaphorePermit) {
+        // Drop cannot await. Keep ownership, including admission, in the task
+        // until bounded stream shutdown finishes, just as checkout does.
+        E::spawn(async move {
+            conn.abort().await;
+            drop(permit);
+        });
+    }
+
     fn recycle(&self, conn: AsyncSmtpConnection, permit: OwnedSemaphorePermit) {
         // A connection that has served an LMTP final-status drain is retired
         // rather than recycled: a surplus final status below the read buffer
@@ -360,7 +369,7 @@ impl<E: Executor> Pool<E> {
             #[cfg(feature = "tracing")]
             tracing::debug!("dropping a broken or retired connection instead of recycling it");
 
-            drop(conn);
+            Self::discard(conn, permit);
         } else {
             #[cfg(feature = "tracing")]
             tracing::debug!("recycling connection");
@@ -373,7 +382,7 @@ impl<E: Executor> Pool<E> {
             } else {
                 // The pool has already been shut down
                 drop(connections_guard);
-                drop(conn);
+                Self::discard(conn, permit);
             }
         }
     }
@@ -499,6 +508,54 @@ mod tests {
     use crate::transport::smtp::{
         Protocol, client::AsyncSmtpConnection, extension::ClientId, test_support::Transcript,
     };
+
+    #[tokio::test(crate = "tokio", start_paused = true)]
+    async fn discarded_connection_keeps_admission_until_shutdown_finishes() {
+        for closed in [false, true] {
+            use super::Pool;
+            use crate::TokioExecutor;
+
+            let hello = ClientId::Domain("client.example".to_owned());
+            let transcript = Transcript::new("220 smtp.example\r\n")
+                .expect("EHLO client.example\r\n", "250 smtp.example\r\n")
+                .stall_shutdown();
+            let transcript = transcript.expect_then_stall("NOOP\r\n");
+            let mut conn = AsyncSmtpConnection::from_transcript_with_timeout(
+                transcript,
+                &hello,
+                Protocol::Smtp,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            if !closed {
+                let mut probe = Box::pin(conn.test_connected());
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(probe.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                drop(probe);
+                assert!(conn.has_broken());
+            }
+            let admission = Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = Arc::clone(&admission).try_acquire_owned().unwrap();
+            let pool = Pool::new(
+            super::super::PoolConfig::new(),
+            crate::transport::smtp::async_transport::AsyncSmtpClient::<TokioExecutor>::for_pool_test(),
+        );
+            // A checked-out connection can return after shutdown took the idle set.
+            if closed {
+                pool.connections.lock().unwrap().take();
+            }
+            pool.recycle(conn, permit);
+            tokio::task::yield_now().await;
+            assert_eq!(admission.available_permits(), 0);
+            tokio::time::advance(Duration::from_secs(5)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(admission.available_permits(), 1);
+        }
+    }
 
     #[tokio::test(crate = "tokio", start_paused = true)]
     async fn abort_concurrent_does_not_serialize_shutdown_timeouts() {

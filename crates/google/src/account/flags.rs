@@ -220,8 +220,8 @@ fn patch_for_set(flags: &HashSet<String>, labels: &[GmailLabel]) -> LabelPatch {
     // any of them currently carries, so it is idempotent and immune to a
     // concurrent label change landing between the decision and the write.
     // A diffed patch is per-message by construction, so it would (a) need
-    // a `messages.get` per target - 5 quota units each - to learn current
-    // state, against a request body of a few KB, (b) shatter one
+    // a `messages.get` per target, at the quota cost declared in client.rs,
+    // to learn current state, against a request body of a few KB, (b) shatter one
     // `batchModify` into one call per distinct diff, and (c) open a
     // lost-update window this shape does not have: a label added by
     // another client after the read is absent from the diff's

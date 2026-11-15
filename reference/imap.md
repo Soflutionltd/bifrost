@@ -109,6 +109,14 @@ APPEND resolves APPENDLIMIT (RFC 7889) before writing anything: a numeric `APPEN
 
 ## Connection state machine
 
+CAPABILITY advertisements (including response-code form) and ENABLED lists are
+adopted immediately on arrival, even when the enclosing command later returns
+NO or BAD. Command consumers report that refusal without rolling back the
+advertised capabilities or enabled wire mode. A refused LOGOUT clears its
+pending transition, so a later command's OK cannot end the session.
+During LOGOUT, a BYE carrying a critical response code publishes both the code's
+event and the distinct Bye event, once each.
+
 The driver-owned command channel is the connection liveness signal.
 `ImapConnection::is_alive()` reports whether the driver still owns the
 receiver; this is separate from RFC session state, which can still say
@@ -823,7 +831,10 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
 - The send path stays in `bifrost_types::Address` space; the only
   `Address -> bifrost_smtp::Address` conversion is the bare addr-spec
   reverse-path / recipient conversion at `SubmissionTransport::send_rfc5322`,
-  which drives `AsyncSmtpTransport::send_raw_batch_with_options` and returns
+  using the checked SMTP address parser. An invalid reverse path refuses the
+  send locally; invalid recipients are failed locally and excluded from RCPT,
+  with their failures retained on a successful partial-send receipt. It
+  drives `AsyncSmtpTransport::send_raw_batch_with_options` and returns
   SMTP's already-translated `AccountError` (a build failure maps to
   `InvalidInput`). `draft_send` re-stamps the operation to `DraftSend`.
 - Per-recipient outcome: SMTP answers per envelope recipient in three lanes.
@@ -838,7 +849,9 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
 - Scheduled send is one-shot SMTP FUTURERELEASE: `SendRequest::scheduled`
   threads `hold: Option<SystemTime>` into `send_rfc5322` ->
   `SendOptions::hold_until(rfc3339(t))` (absolute-time, never races `now()`).
-  No IMAP-side pre-validation - the relay's EHLO at send time is authoritative.
+  Instants outside the timestamp formatter's range are refused locally before
+  dialing as `Request(Malformed)`. The relay's EHLO at send time is authoritative
+  for FUTURERELEASE support and limits.
   A relay without FUTURERELEASE yields a stable `Unsupported(Send)`; a HOLD over
   the advertised max arrives as `Request(Malformed)`. RFC 4865 has no recall
   verb, so `cancel_scheduled_send` / `reschedule_send` are `Unsupported`.

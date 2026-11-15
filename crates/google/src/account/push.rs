@@ -866,7 +866,10 @@ async fn commit_watched(
 fn closed_error(operation: AccountOperation) -> AccountError {
     error::into_account_error(
         crate::error::Error::unsupported_with(operation, "account is closed"),
-        error::GmailErrorContext::push_subscribe(),
+        match operation {
+            AccountOperation::PushUnsubscribe => error::GmailErrorContext::push_unsubscribe(),
+            _ => error::GmailErrorContext::push_subscribe(),
+        },
     )
 }
 
@@ -914,6 +917,16 @@ fn renewal_delay_at(expiration: Option<SystemTime>, now: SystemTime) -> Duration
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn closed_unsubscribe_retains_unsubscribe_context() {
+        let error = super::closed_error(bifrost_types::AccountOperation::PushUnsubscribe);
+        assert_eq!(
+            error.operation(),
+            Some(bifrost_types::AccountOperation::PushUnsubscribe)
+        );
+        assert!(error.scope().is_none());
+    }
+
     use bifrost_net::test_support::{Canned, ScriptedDispatch};
     use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource};
     use bytes::Bytes;

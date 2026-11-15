@@ -331,9 +331,9 @@ impl Consumer for CapabilityConsumer {
         // solicited half (`self.caps`) is not re-emittable: `on_response`
         // destructured the untagged CAPABILITY into a `Vec<Capability>`, so
         // there is no `UntaggedResponse` left to hand back. Dropping it is
-        // also correct on its merits - capability data that arrived under a
-        // failed CAPABILITY must not be published as an event, because the
-        // dispatcher's capability cache would then adopt it.
+        // intentional: ProtocolState already adopted this advertisement on
+        // arrival, regardless of the eventual tagged status. Finalization
+        // reports command success or failure; it does not roll back the cache.
         let tagged = match tagged.require_ok() {
             Ok(t) => t,
             Err(e) => return Finalized::failure(e, self.buffered),
@@ -854,8 +854,9 @@ impl Consumer for EnableConsumer {
     ) -> Finalized<Vec<String>> {
         // `buffered` surrendered on both arms. `self.caps` is dropped on
         // failure: destructured out of `UntaggedResponse::Enabled` so not
-        // re-emittable, and an ENABLED list under a failed ENABLE must not
-        // reach anything that would treat those extensions as active.
+        // re-emittable. ProtocolState already adopted the enabled extensions
+        // on arrival, even on refusal: the announced wire mode remains active.
+        // The command result does not roll that state back.
         if let Err(e) = tagged.require_ok() {
             return Finalized::failure(e, self.buffered);
         }

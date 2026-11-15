@@ -1058,6 +1058,7 @@ fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
         ErrorScope::Message { .. } => Some(ResourceKind::Message),
         ErrorScope::Mailbox { .. } => Some(ResourceKind::Mailbox),
         ErrorScope::Thread { .. } => Some(ResourceKind::Thread),
+        ErrorScope::Event { .. } => Some(ResourceKind::Event),
         ErrorScope::Calendar { .. } | ErrorScope::CalendarCollection => {
             Some(ResourceKind::Calendar)
         }
@@ -1077,6 +1078,7 @@ fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
         ErrorScope::Message { id } => Some(id.0.clone()),
         ErrorScope::Mailbox { id } => Some(id.0.clone()),
         ErrorScope::Thread { id } => Some(id.0.clone()),
+        ErrorScope::Event { id } => Some(id.0.clone()),
         ErrorScope::Calendar { id } => Some(id.0.clone()),
         ErrorScope::Contact { id } => Some(id.0.clone()),
         ErrorScope::Account
@@ -1568,6 +1570,23 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
 #[must_use]
 pub(crate) fn get_id_not_found(id: impl Into<String>, ctx: JmapErrorContext) -> AccountError {
     convert_id_not_found(id.into(), ctx)
+}
+
+/// A server-side filter (SieveScript) id that a `/get` reported in
+/// `notFound`. `ErrorScope` has no filter variant, so the resource is
+/// named directly instead of through the scope.
+#[must_use]
+pub(crate) fn get_filter_not_found(id: &str, ctx: JmapErrorContext) -> AccountError {
+    build(
+        AccountErrorKind::NotFound(ResourceKind::Filter),
+        Cause::Request(RequestCause::NotFound {
+            what: ResourceKind::Filter,
+            id: Some(id.to_owned()),
+        }),
+        &ctx,
+    )
+    .try_build()
+    .expect("valid account error classification")
 }
 
 /// An id that a `/get` answered in NEITHER `list` nor `notFound`.

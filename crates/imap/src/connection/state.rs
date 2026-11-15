@@ -373,7 +373,8 @@ impl ProtocolState {
             // RFC 3501 Section7.2.1: server MAY send unsolicited
             // `* CAPABILITY ...` at any time  -  update cached set.
             // RFC 3501 Section7.1: the equivalent `* OK [CAPABILITY ...]`
-            // form also updates capabilities.
+            // form also updates capabilities. These are server advertisements,
+            // adopted on arrival even if the enclosing command later fails.
             UntaggedResponse::Capability(caps)
             | UntaggedResponse::Status {
                 code: Some(ResponseCode::Capability(caps)),
@@ -398,7 +399,9 @@ impl ProtocolState {
             }
             // RFC 5161 Section3.2: `* ENABLED <ext1> <ext2> ...` updates the
             // set of active extensions. Accumulates across multiple ENABLE
-            // commands with case-insensitive dedup.
+            // commands with case-insensitive dedup. Adoption is immediate even
+            // if ENABLE later fails: the server has announced a wire-mode
+            // change, and rolling it back could misdecode later responses.
             UntaggedResponse::Enabled(exts) => {
                 for ext in exts {
                     if !self.enabled.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
@@ -441,8 +444,12 @@ impl ProtocolState {
         // RFC 3501 Section6.1.3: tagged OK for LOGOUT confirms the session
         // has ended. Transition to Logout state. (BYE already did this
         // via apply_untagged; this is a belt-and-suspenders confirmation.)
-        if self.in_logout && t.status == crate::types::response::StatusKind::Ok {
-            self.state = SessionState::Logout;
+        if self.in_logout {
+            if t.status == crate::types::response::StatusKind::Ok {
+                self.state = SessionState::Logout;
+            }
+            // A refusal completes this attempt too; a later command's OK
+            // must not complete a LOGOUT that the server already rejected.
             self.in_logout = false;
         }
 

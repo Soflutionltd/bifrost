@@ -48,7 +48,9 @@ use tokio::time::Instant;
 /// `HeaderName::from_static` argument and the key `HeaderMap` stores it under.
 const DESTINATION: &str = "destination";
 
-use crate::error::{DavProtocol, local_error, response_read_error, status_error, transport_error};
+use crate::error::{
+    DavProtocol, item_status_error, local_error, response_read_error, status_error, transport_error,
+};
 use crate::transport::{
     DAV_CLIENT_TIMEOUT, DavBody, DavRequest, DavResponse, origin_is_secure, settle_body, url_origin,
 };
@@ -1059,6 +1061,27 @@ impl DavDispatch {
         }
     }
 
+    /// [`Self::send_status_request`] for a request that addresses ONE item
+    /// resource, so a 403 / 404 names the item rather than its collection.
+    pub async fn send_item_status_request(
+        &self,
+        request: DavRequest,
+        operation: AccountOperation,
+    ) -> Result<(), AccountError> {
+        let response = self.send_raw_request(request, operation).await?;
+        if response.status.is_success() {
+            Ok(())
+        } else {
+            Err(item_status_error(
+                &response.headers,
+                operation,
+                response.status,
+                response.body,
+                self.protocol,
+            ))
+        }
+    }
+
     pub async fn propfind_raw(
         &self,
         url: &str,
@@ -1138,7 +1161,7 @@ impl DavDispatch {
         if response.status.is_success() || delete_target_already_gone(response.status) {
             Ok(())
         } else {
-            Err(status_error(
+            Err(item_status_error(
                 &response.headers,
                 operation,
                 response.status,
@@ -1204,7 +1227,7 @@ impl DavDispatch {
         ) {
             return Ok(false);
         }
-        Err(status_error(
+        Err(item_status_error(
             &response.headers,
             operation,
             response.status,

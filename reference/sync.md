@@ -946,7 +946,9 @@ under the same write lock.
 2. Consumer atomically persists `(items, checkpoint)` in their
    own store.
 3. Consumer calls `SyncEngine::ack_checkpoint(account, scope,
-   checkpoint)`.
+   checkpoint, publication)`. The supplied scope must equal the checkpoint's
+   scope. Both the entry point and writer reject a mismatch before changing
+   provisional ownership or persisting any checkpoint.
 4. The per-account writer task (one per slot, fed by an
    mpsc kept in `engine.ack_senders`) receives an `AckRequest`,
    writes to `CheckpointStore`, then fires
@@ -2164,8 +2166,8 @@ endpoint and an application that shuts down wanting events to queue for
 its next start is a legitimate pattern that unconditional teardown would
 break silently. A detach with records still registered means
 `unsubscribe_push` was never called, so the provider holds live
-subscriptions until it expires them itself (24h for Graph); that case is
-logged on `bifrost.sync.push` rather than absorbed.
+subscriptions until it expires them itself (up to seven days for Graph basic
+notifications); that case is logged on `bifrost.sync.push` rather than absorbed.
 
 The other intent has its own door: `SyncEngine::detach_with_teardown` runs
 `unsubscribe_push` and then `detach`, so a consumer that is done with the
@@ -2688,8 +2690,9 @@ writes:
   `CheckpointNow` as not-running, so backfill, deferred inventory, and
   `restart_account` would park until some unrelated write moved the
   boundary.
-- `Stop` is terminal for consumer-driven writes
-  (`Boundary::set_unless_stopped`, used by `pause` / `resume`, and
+- `Stop` is terminal for consumer-driven writes and engine auto-pause
+  (`Boundary::set_unless_stopped`, used by `pause` / `resume`,
+  `SyncEngine::resume_account`, and recovery's auto-pause, and
   refused outright by `request_checkpoint`). A pause written over a
   detach's `Stop` parks the workers instead of letting them drain,
   and `detach` then waits out its whole timeout. `Boundary::set` is
@@ -3650,7 +3653,11 @@ attention because no automatic action remains. The tail then pauses with
 `PauseReason::RetryBudgetExhausted`.
 Account exhaustion then publishes
 `AccountControl::Pause(PauseReason::RetryBudgetExhausted)` and
-flips the boundary to `Pause` so workers park. Consumers subscribe
+flips the boundary to `Pause` so workers park, unless detach has already
+published `Stop`. Auto-pause and `resume_account` preserve `Stop` atomically,
+including when a watcher has not yet consumed it; a checkpoint waiter must
+still see teardown rather than wait indefinitely for an acknowledgement.
+Consumers subscribe
 to the per-account `AccountControl` broadcast via
 `SyncEngine::account_control_stream` and flip back via
 `SyncEngine::resume_account`. The account-wide shape is pinned

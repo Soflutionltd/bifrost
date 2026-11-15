@@ -75,21 +75,14 @@ pub(super) fn emit_tagged_response_code_events(
 ///
 /// Used by the reclassified-as-events loop: if a consumer reclassifies
 /// a response that was already emitted by `emit_untagged_response_code_events`,
-/// the reclassified copy must be skipped to prevent double-delivery.
+/// the reclassified copy must be skipped to prevent double-delivery, except
+/// for BYE, whose conversion publishes the separate session-end event.
 pub(super) fn has_critical_response_code(u: &UntaggedResponse) -> bool {
     untagged_critical_event(u).is_some()
-        // TRIP-WIRE. This BYE exclusion makes the predicate NOT an exact
-        // complement of `emit_untagged_response_code_events`, which publishes
-        // for a BYE carrying [ALERT] just like any other status. It is inert
-        // today only because `process_untagged_prefix` emits the code event and
-        // then short-circuits a BYE into a fatal error before any consumer sees
-        // the response, so a BYE can never reach a `reclassified_as_events`
-        // list and this guard is dead code. The moment the BYE short-circuit
-        // is moved to AFTER classification (or a consumer is allowed to
-        // reclassify a BYE), this exclusion turns into a live double-emit: the
-        // prologue publishes the ALERT and then the reclassified copy is
-        // published again because this returns false. Whoever moves that
-        // short-circuit must delete this guard in the same change.
+        // LOGOUT's consumer surrenders its expected BYE at finalization.
+        // The prologue emitted its critical code, but conversion produces a
+        // distinct Bye event, not another Alert/NotificationOverflow. Keep
+        // that event even when its response code has already been published.
         && !matches!(
             u,
             UntaggedResponse::Status {
@@ -112,8 +105,7 @@ mod tests {
         }
     }
 
-    /// The predicate is the emitter's complement everywhere except the one
-    /// documented BYE trip-wire.
+    /// BYE retains its separate session-end event after code emission.
     #[test]
     fn the_predicate_agrees_with_the_emitter_except_on_bye() {
         let codes = [
@@ -146,5 +138,22 @@ mod tests {
             untagged_critical_event(&status(UntaggedStatus::Ok, Some(ResponseCode::ReadOnly)))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn logout_bye_alert_emits_both_code_and_session_end_once() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut sink = event_sink::DriverEventSink::new(tx, None);
+        let bye = status(UntaggedStatus::Bye, Some(ResponseCode::Alert));
+        assert!(emit_untagged_response_code_events(&bye, &mut sink));
+        // This is the reclassification rule used after LOGOUT finalization.
+        if !has_critical_response_code(&bye) {
+            assert!(sink.emit(bye.into()).is_ok());
+        }
+        assert!(matches!(rx.try_recv(), Ok(TypedEvent::Alert(text)) if text == "text"));
+        assert!(matches!(rx.try_recv(), Ok(TypedEvent::Bye {
+            code: Some(ResponseCode::Alert), text,
+        }) if text == "text"));
+        assert!(rx.try_recv().is_err());
     }
 }

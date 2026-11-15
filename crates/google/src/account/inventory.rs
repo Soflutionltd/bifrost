@@ -789,8 +789,8 @@ async fn hydrate_one(
             // so a message with a 20 MB attachment does not transfer those
             // 20 MB twice. The duplicated payload is the inline text bodies.
             //
-            // What the pairing does cost is quota (5 units each) and, before
-            // this was joined, a second full round trip of latency per
+            // The pairing pays the messages.get quota cost declared in client.rs
+            // twice and, before this was joined, a second full round trip per
             // message on the hottest projection in the read path.
             let (raw, full) = futures::future::try_join(
                 client.get_message(&id.0, "raw"),
@@ -868,12 +868,9 @@ fn inventory_entry_from_message_indexed(
         },
         thread_id: Some(ThreadId(message.thread_id.clone())),
         message_id: header(message, "Message-ID"),
-        references: header(message, "References").map_or_else(Vec::new, |value| {
-            value
-                .split_whitespace()
-                .map(|item| item.trim_matches(|ch| ch == '<' || ch == '>').to_string())
-                .collect()
-        }),
+        references: crate::headers::references_from_header(
+            header(message, "References").as_deref(),
+        ),
         in_reply_to: header(message, "In-Reply-To"),
     }
 }
@@ -1057,6 +1054,19 @@ mod tests {
                 "c@example.test".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn inventory_references_discard_empty_ids() {
+        let msg = with_headers(
+            "empty-refs",
+            json!([{
+                "name": "References",
+                "value": "<> <a@example.test> <>"
+            }]),
+        );
+        let entry = inventory_entry_from_message(&msg, &[]);
+        assert_eq!(entry.references, vec!["a@example.test"]);
     }
 
     #[test]

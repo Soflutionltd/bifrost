@@ -436,3 +436,62 @@ fn unauthenticate_bad_preserves_state() {
 
     assert_eq!(state.session_state(), SessionState::Authenticated);
 }
+
+#[test]
+fn refused_logout_does_not_complete_on_a_later_commands_ok() {
+    for refusal in [StatusKind::No, StatusKind::Bad] {
+        let mut state = ProtocolState::new();
+        state
+            .apply_greeting(&GreetingResponse {
+                status: GreetingStatus::PreAuth,
+                code: None,
+                text: "ready".into(),
+            })
+            .unwrap();
+        state.set_in_logout(true);
+        let _ = state.apply_side_effects(&Response::Tagged(TaggedResponse {
+            tag: "A1".into(),
+            status: refusal,
+            code: None,
+            text: "refused".into(),
+        }));
+        let _ = state.apply_side_effects(&Response::Tagged(TaggedResponse {
+            tag: "A2".into(),
+            status: StatusKind::Ok,
+            code: None,
+            text: "NOOP completed".into(),
+        }));
+        assert_eq!(state.session_state(), SessionState::Authenticated);
+        assert!(!state.in_logout);
+    }
+}
+
+#[test]
+fn advertisements_survive_a_failed_command() {
+    for refusal in [StatusKind::No, StatusKind::Bad] {
+        let mut state = ProtocolState::new();
+        let _ = state.apply_side_effects(&Response::Untagged(Box::new(
+            UntaggedResponse::Capability(vec![Capability::Imap4Rev1, Capability::Idle]),
+        )));
+        let _ = state.apply_side_effects(&Response::Untagged(Box::new(UntaggedResponse::Enabled(
+            vec!["QRESYNC".into()],
+        ))));
+        // Adoption precedes completion, and a refusal does not undo it.
+        assert_eq!(
+            state.capabilities(),
+            &[Capability::Imap4Rev1, Capability::Idle]
+        );
+        assert_eq!(state.enabled(), &["QRESYNC"]);
+        let _ = state.apply_side_effects(&Response::Tagged(TaggedResponse {
+            tag: "A1".into(),
+            status: refusal,
+            code: None,
+            text: "refused".into(),
+        }));
+        assert_eq!(
+            state.capabilities(),
+            &[Capability::Imap4Rev1, Capability::Idle]
+        );
+        assert_eq!(state.enabled(), &["QRESYNC"]);
+    }
+}

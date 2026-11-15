@@ -9,7 +9,7 @@
 //! IMAP-plus-SMTP composition leaking up.
 //!
 //! Address conversion is confined here: the send path stays in
-//! `bifrost_types::Address` space, and the narrow, total
+//! `bifrost_types::Address` space, and the checked
 //! `Address -> bifrost_smtp::Address` reverse-path / recipient
 //! conversion (bare addr-specs, no display name) happens only at
 //! `send_rfc5322`.
@@ -263,17 +263,32 @@ impl SubmissionTransport {
         raw: &[u8],
         hold: Option<std::time::SystemTime>,
     ) -> Result<Vec<RecipientNotAccepted>, AccountError> {
-        let from = to_smtp_address(&envelope.from);
+        let from = SmtpAddress::try_from(&envelope.from)
+            .map_err(|_| submission_invalid("invalid SMTP reverse-path address"))?;
+        let options = build_send_options(hold)?;
+        let mut locally_failed = Vec::new();
         let recipients: Vec<BatchItem<SmtpAddress>> = envelope
             .recipients
             .iter()
             .enumerate()
-            .map(|(index, address)| {
-                BatchItem::new(BatchItemId(index.to_string()), to_smtp_address(address))
+            .filter_map(|(index, address)| match SmtpAddress::try_from(address) {
+                Ok(address) => Some(BatchItem::new(BatchItemId(index.to_string()), address)),
+                Err(_) => {
+                    locally_failed.push(RecipientNotAccepted::new(
+                        address.clone(),
+                        RecipientOutcome::Failed,
+                        submission_invalid("invalid SMTP recipient address"),
+                    ));
+                    None
+                }
             })
             .collect();
-
-        let options = build_send_options(hold);
+        if recipients.is_empty() {
+            return Err(locally_failed.first().map_or_else(
+                || submission_invalid("SMTP submission requires a recipient"),
+                |failure| failure.error.clone(),
+            ));
+        }
 
         let outcome = self
             .transport
@@ -290,12 +305,15 @@ impl SubmissionTransport {
         // and the recipients that were not accepted ride the receipt,
         // each with its own error, never resent by us.
         if !outcome.succeeded().is_empty() {
-            let not_accepted = not_accepted_recipients(&envelope.recipients, &outcome);
+            let mut not_accepted = locally_failed;
+            not_accepted.extend(not_accepted_recipients(&envelope.recipients, &outcome));
             if !not_accepted.is_empty() {
                 tracing::warn!(
                     target: "bifrost_imap::send",
                     delivered = outcome.succeeded().len(),
-                    failed = outcome.failed().len(),
+                    failed = not_accepted.iter().filter(|r| {
+                        r.outcome == RecipientOutcome::Failed
+                    }).count(),
                     uncertain = outcome.uncertain().len(),
                     "partial submission: message committed to some recipients while \
                      others were not accepted; reported on the receipt"
@@ -354,31 +372,27 @@ fn not_accepted_recipients<T>(
 /// so the boundary does not race `now()`; the relay computes the delay
 /// and decides support (an unsupporting relay yields an
 /// `Unsupported(Send)` AccountError from the smtp layer).
-fn build_send_options(hold: Option<std::time::SystemTime>) -> SendOptions {
+fn build_send_options(hold: Option<std::time::SystemTime>) -> Result<SendOptions, AccountError> {
     match hold {
-        Some(at) => SendOptions::default().hold_until(hold_until_rfc3339(at)),
-        None => SendOptions::default(),
+        Some(at) => Ok(SendOptions::default().hold_until(hold_until_rfc3339(at)?)),
+        None => Ok(SendOptions::default()),
     }
 }
 
-/// Format an absolute instant as RFC 3339 for the SMTP FUTURERELEASE
-/// `HOLDUNTIL` parameter.
-fn hold_until_rfc3339(at: std::time::SystemTime) -> String {
+/// Refuse instants outside the timestamp range before opening an SMTP transaction.
+fn hold_until_rfc3339(at: std::time::SystemTime) -> Result<String, AccountError> {
     jiff::Timestamp::try_from(at)
         .map(|ts| ts.to_string())
-        .unwrap_or_default()
+        .map_err(|_| {
+            submission_invalid("scheduled send instant is outside the supported timestamp range")
+        })
 }
 
-/// Convert a `bifrost_types::Address` into an SMTP envelope address.
-/// Envelope addresses are bare addr-specs (no display name), so this is
-/// total: even a malformed user/domain split is accepted unchecked, with
-/// the server rejecting an invalid RCPT - the same posture
-/// `bifrost-smtp`'s own envelope builder takes.
-fn to_smtp_address(address: &bifrost_types::Address) -> SmtpAddress {
-    match address.address.rsplit_once('@') {
-        Some((user, domain)) => SmtpAddress::new_dangerous(user, domain),
-        None => SmtpAddress::new_dangerous(address.address.as_str(), ""),
-    }
+fn submission_invalid(detail: &str) -> AccountError {
+    super::error::into_account_error(
+        crate::Error::InvalidInput(detail.into()),
+        super::error::ImapErrorContext::operation(bifrost_types::AccountOperation::Send),
+    )
 }
 
 /// Derive SMTP credentials: an explicit override if present, else a
@@ -793,10 +807,102 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn malformed_recipient_is_failed_without_emitting_its_rcpt_command() {
+        let (submission, mut envelope) = two_recipient_submission(|script| {
+            script
+                .expect("RCPT TO:<b@example.com>\r\n", "250 recipient\r\n")
+                .expect("DATA\r\n", "354 send\r\n")
+                .expect("Subject: test\r\n\r\nbody\r\n", "")
+                .expect(".\r\n", "250 delivered\r\n")
+        });
+        envelope.recipients[0] =
+            bifrost_types::Address::bare("a@b.example> NOTIFY=SUCCESS ORCPT=rfc822;x");
+        let failed = submission
+            .send_rfc5322(&envelope, b"Subject: test\r\n\r\nbody\r\n", None)
+            .await
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].address.address, envelope.recipients[0].address);
+        assert_eq!(failed[0].outcome, RecipientOutcome::Failed);
+    }
+
+    #[tokio::test]
+    async fn invalid_envelope_addresses_are_refused_before_dial() {
+        use bifrost_smtp::transport::smtp::ScriptedConnector;
+        let cfg = SmtpSubmissionConfig::new(
+            "smtp.invalid",
+            SubmissionTls::Plaintext,
+            bifrost_types::Address::bare("user@example.com"),
+        );
+        let submission = SubmissionTransport::build_with_connector(
+            &cfg,
+            &Credentials::password("user", "pass"),
+            None,
+            bifrost_net::BandwidthBudget::default(),
+            Some(ScriptedConnector::new(|| {
+                panic!("invalid envelope must not dial")
+            })),
+        )
+        .unwrap();
+        let invalid = bifrost_types::Address::bare("a@b.example> NOTIFY=SUCCESS");
+        for envelope in [
+            SubmissionEnvelope {
+                from: invalid.clone(),
+                recipients: vec![bifrost_types::Address::bare("to@example.com")],
+            },
+            SubmissionEnvelope {
+                from: cfg.default_from.clone(),
+                recipients: vec![invalid],
+            },
+        ] {
+            assert!(
+                submission
+                    .send_rfc5322(&envelope, b"body", None)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_hold_is_refused_before_dial() {
+        use bifrost_smtp::transport::smtp::ScriptedConnector;
+        let cfg = SmtpSubmissionConfig::new(
+            "smtp.invalid",
+            SubmissionTls::Plaintext,
+            bifrost_types::Address::bare("user@example.com"),
+        );
+        let submission = SubmissionTransport::build_with_connector(
+            &cfg,
+            &Credentials::password("user", "pass"),
+            None,
+            bifrost_net::BandwidthBudget::default(),
+            Some(ScriptedConnector::new(|| {
+                panic!("invalid hold must not dial")
+            })),
+        )
+        .unwrap();
+        let envelope = SubmissionEnvelope {
+            from: cfg.default_from.clone(),
+            recipients: vec![bifrost_types::Address::bare("to@example.com")],
+        };
+        let at = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000_000);
+        assert!(jiff::Timestamp::try_from(at).is_err());
+        let error = submission
+            .send_rfc5322(&envelope, b"body", Some(at))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+        );
+    }
+
     #[test]
     fn scheduled_send_builds_holduntil_mail_parameter() {
-        let at = std::time::SystemTime::now() + std::time::Duration::from_secs(600);
-        let options = build_send_options(Some(at));
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let options = build_send_options(Some(at)).unwrap();
         assert!(
             options.mail_parameters().iter().any(|p| matches!(
                 p,
@@ -806,7 +912,7 @@ mod tests {
         );
 
         // An immediate send carries no FUTURERELEASE parameter.
-        let immediate = build_send_options(None);
+        let immediate = build_send_options(None).unwrap();
         assert!(
             !immediate
                 .mail_parameters()

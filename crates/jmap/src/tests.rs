@@ -702,7 +702,7 @@ mod session_capabilities_deserialization {
         #[cfg(feature = "mail")]
         {
             let mail = session.mail_capabilities().expect("mail missing");
-            assert_eq!(mail.max_mailbox_depth(), 10);
+            assert_eq!(mail.max_mailbox_depth(), Some(10));
         }
 
         #[cfg(feature = "quota")]
@@ -3560,7 +3560,7 @@ mod principal_property_wire_names {
             (Property::Name, "name"),
             (Property::Description, "description"),
             (Property::Email, "email"),
-            (Property::Timezone, "timezone"),
+            (Property::Timezone, "timeZone"),
             (Property::Capabilities, "capabilities"),
             (Property::Aliases, "aliases"),
             (Property::Secret, "secret"),

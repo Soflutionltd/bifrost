@@ -24,8 +24,8 @@ inside the protocol consumers, never the other way around.
 - `SaslError` - `#[non_exhaustive]`. `Protocol(String)` for malformed or
   unexpected SASL/SCRAM messages and peer-controlled input (the server's
   certificate); `InvalidCredential(String)` for a caller-supplied username or
-  password that fails SASLprep; `AuthFailed(String)` for a SCRAM `e=` server
-  error or a failed exchange.
+  password that fails SASLprep or a PLAIN field containing NUL;
+  `AuthFailed(String)` for a SCRAM `e=` server error or a failed exchange.
 - `ScramHash` - `#[non_exhaustive]` `{ Sha1, Sha256 }`. Names the hash, not a
   protocol-layer mechanism. `mechanism_name(ChannelBinding)` returns the wire
   name, owning the `-PLUS` suffix in one place:
@@ -91,6 +91,13 @@ inside the protocol consumers, never the other way around.
   SASL continuation to UTF-8.
 - `cram_md5_response(user, pass, challenge) -> Result<Secret, SaslError>` -
   RFC 2195 CRAM-MD5 response.
+- `plain_payload(authzid, authcid, password) -> Result<Secret, SaslError>`
+  (`plain.rs`) - RFC 4616 raw PLAIN bytes, assembled directly in zeroizing
+  storage. Refuses NUL in every field as `InvalidCredential` before framing.
+  IMAP and ManageSieve use it with an empty authorization identity; SMTP
+  retains its own NUL-validating builder. ManageSieve also uses the shared
+  XOAUTH2 builder and keeps its base64 payload and authentication command in
+  zeroizing storage.
 - `xoauth2_payload(user, access_token) -> Secret` /
   `oauthbearer_payload(identity, access_token) -> Secret` (`oauth.rs`) - OAuth
   SASL client payloads as a zeroizing `Secret` of the *raw* (un-base64'd)
@@ -141,6 +148,8 @@ correct:
   with the exact GS2 header and `c=` bytes; unavailable, unadvertised, and
   suppressed rungs are rejected. IMAP and SMTP consumer tests independently
   pin client-first headers and client-final `c=` values for all three states.
+- PLAIN framing and zeroizing storage (`plain.rs`), plus NUL refusal in each
+  of the authorization identity, authentication identity, and password fields.
 - RFC 2195 CRAM-MD5 vector (`cram.rs`).
 - SCRAM-PLUS construction (`scram.rs`): a constructed deterministic pin (no
   published RFC 5802 PLUS vector exists) that the `c=` field equals

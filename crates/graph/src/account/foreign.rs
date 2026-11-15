@@ -285,7 +285,12 @@ pub(crate) fn parse_public_address_book(id: &str) -> Option<&str> {
 }
 
 pub(crate) fn parse_public_contact(id: &str) -> Option<(&str, &str)> {
-    parse_public_address_book(id).map(|tail| tail.split_once(PUBLIC_SEP).unwrap_or((tail, "")))
+    parse_public_address_book(id).and_then(parse_public_item)
+}
+
+fn parse_public_item(tail: &str) -> Option<(&str, &str)> {
+    let (folder, item) = tail.split_once(PUBLIC_SEP)?;
+    (!folder.is_empty() && !item.is_empty() && !item.contains(PUBLIC_SEP)).then_some((folder, item))
 }
 
 /// Typed calendar ids remain public even when discovery routing is absent.
@@ -299,12 +304,37 @@ pub(crate) fn parse_public_calendar(id: &str) -> Option<&str> {
     id.strip_prefix("public-calendar\u{1e}")
 }
 pub(crate) fn parse_public_event(id: &str) -> Option<(&str, &str)> {
-    parse_public_calendar(id).map(|tail| tail.split_once(PUBLIC_SEP).unwrap_or((tail, "")))
+    parse_public_calendar(id).and_then(parse_public_item)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_item_ids_require_both_identity_components() {
+        for prefix in ["public-contacts", "public-calendar"] {
+            for tail in [
+                "",
+                "folder",
+                "folder\u{1e}",
+                "\u{1e}item",
+                "folder\u{1e}item\u{1e}extra",
+            ] {
+                let id = format!("{prefix}\u{1e}{tail}");
+                assert!(parse_public_contact(&id).is_none());
+                assert!(parse_public_event(&id).is_none());
+            }
+        }
+        assert_eq!(
+            parse_public_contact(&public_contact("folder", "item").0),
+            Some(("folder", "item")),
+        );
+        assert_eq!(
+            parse_public_event(&public_event("folder", "item").0),
+            Some(("folder", "item")),
+        );
+    }
 
     #[test]
     fn foreign_round_trips_through_folder_id() {

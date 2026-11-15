@@ -474,6 +474,22 @@ async fn request_capability(
         .capabilities())
 }
 
+// Base64 uses no quoted-string metacharacters. Keep both credential-bearing
+// allocations zeroizing without passing them through ordinary string escaping.
+fn authentication_command(
+    mechanism: AuthMechanism,
+    payload: &bifrost_sasl::Secret,
+) -> bifrost_sasl::Secret {
+    let encoded = bifrost_sasl::Secret::from(
+        base64::engine::general_purpose::STANDARD.encode(payload.as_bytes()),
+    );
+    bifrost_sasl::Secret::from(format!(
+        "AUTHENTICATE \"{}\" \"{}\"\r\n",
+        mechanism.name(),
+        encoded.as_str()
+    ))
+}
+
 async fn authenticate(
     stream: &mut SieveStream,
     timeout: Duration,
@@ -491,12 +507,10 @@ async fn authenticate(
                     Vec::new(),
                 )));
             }
-            let mut payload = Vec::new();
-            payload.push(0);
-            payload.extend_from_slice(username.as_bytes());
-            payload.push(0);
-            payload.extend_from_slice(password.as_bytes());
-            (AuthMechanism::Plain, payload)
+            (
+                AuthMechanism::Plain,
+                bifrost_sasl::plain_payload("", username, password.as_str())?,
+            )
         }
         CredentialsKind::OAuth2 {
             identity,
@@ -516,11 +530,7 @@ async fn authenticate(
             })?;
             (
                 AuthMechanism::XOAuth2,
-                format!(
-                    "user={identity}\x01auth=Bearer {}\x01\x01",
-                    access_token.as_str()
-                )
-                .into_bytes(),
+                bifrost_sasl::xoauth2_payload(identity, access_token.as_str()),
             )
         }
     };
@@ -533,12 +543,7 @@ async fn authenticate(
             )],
         )));
     }
-    let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
-    let command = format!(
-        "AUTHENTICATE {} {}\r\n",
-        quote_string(mechanism.name())?,
-        quote_string(&encoded)?
-    );
+    let command = authentication_command(mechanism, &payload);
     write_command(stream, timeout, command.as_bytes()).await?;
     match read_response(stream, timeout).await?.status {
         SieveStatus::Ok => Ok(()),
@@ -1114,6 +1119,61 @@ fn literal_command(command: &str, name: Option<&str>, body: &str) -> Result<Vec<
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn authentication_payloads_use_shared_framing_and_refuse_nul_locally() {
+        for (credentials, mechanism, expected) in [
+            (
+                Credentials::password("user", "pw"),
+                "PLAIN",
+                Some(b"\0user\0pw".as_slice()),
+            ),
+            (
+                Credentials::oauth2("u\x01ser", "tok\x01en"),
+                "XOAUTH2",
+                Some(b"user=user\x01auth=Bearer token\x01\x01".as_slice()),
+            ),
+            (Credentials::password("user\0other", "pw"), "PLAIN", None),
+            (Credentials::password("user", "pw\0other"), "PLAIN", None),
+        ] {
+            let (client, mut peer) = tokio::io::duplex(4096);
+            let mut stream = SieveStream {
+                transport: SieveTransport::Memory(client),
+                budget: bifrost_net::BandwidthBudget::default(),
+                sink: None,
+            };
+            peer.write_all(b"OK\r\n").await.unwrap();
+            let result = authenticate(
+                &mut stream,
+                Duration::from_secs(5),
+                &credentials,
+                &AuthPolicy::default(),
+                &SieveCapabilities {
+                    sasl: vec![mechanism.to_owned()],
+                    ..SieveCapabilities::default()
+                },
+                true,
+            )
+            .await;
+            drop(stream);
+            let mut written = Vec::new();
+            peer.read_to_end(&mut written).await.unwrap();
+            if let Some(expected) = expected {
+                result.unwrap();
+                let encoded = base64::engine::general_purpose::STANDARD.encode(expected);
+                assert_eq!(
+                    written,
+                    format!("AUTHENTICATE \"{mechanism}\" \"{encoded}\"\r\n").as_bytes()
+                );
+            } else {
+                assert!(matches!(result, Err(Error::InvalidInput(_))));
+                assert!(
+                    written.is_empty(),
+                    "local refusal must write no credentials"
+                );
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn bandwidth_sieve_charges_the_account_and_excludes_admission_from_peer_timeout() {
         use bifrost_net::{BandwidthBudget, BandwidthDirection};

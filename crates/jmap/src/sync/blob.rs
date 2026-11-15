@@ -283,43 +283,13 @@ fn download_events(
 }
 
 pub(crate) fn open_range(
-    handle: BlobHandle,
-    range: ByteRange,
+    _handle: BlobHandle,
+    _range: ByteRange,
 ) -> AccountStream<SyncEvent<bytes::Bytes>> {
     Box::pin(async_stream::stream! {
-        if let (Some(total), start) = (handle.size, range.start)
-            && start >= total
-        {
-            // A start past the known size is a caller argument fault, not a
-            // capability gap: `Request(Malformed)` derives to `ClientBug`,
-            // where `Unsupported` would tell the engine the protocol has no
-            // ranged read at all and suppress the operation wholesale.
-            let err = AccountErrorBuilder::new(
-                AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::InvalidArgument {
-                    field: Some("range.start"),
-                    message: Some(bifrost_types::DiagnosticText::support_only(format!(
-                        "JMAP blob range starts past the known blob size (start {start}, total {total})"
-                    ))),
-                }),
-            )
-            .operation(AccountOperation::OpenBlobRange)
-            .protocol(Protocol::Jmap)
-            .try_build()
-            .expect("valid account error classification");
-            yield super::error::terminated(err);
-            return;
-        }
-
-        if !handle.capabilities.supports_range {
-            yield super::error::terminated_unsupported(
-                AccountOperation::OpenBlobRange,
-                None,
-                "JMAP blob handle does not support range fetches",
-            );
-            return;
-        }
-
+        // There is no Range-capable transport hook. Refuse the operation
+        // independently of handle metadata or caller arguments, matching the
+        // account's BlobRangeSupport::No promise.
         yield super::error::terminated_unsupported(
             AccountOperation::OpenBlobRange,
             None,
@@ -338,6 +308,45 @@ mod tests {
     use super::foreign_split;
     use bifrost_types::{PageBoundary, SyncEvent};
     use futures::StreamExt as _;
+
+    #[tokio::test]
+    async fn ranged_reads_are_unsupported_regardless_of_metadata_or_start() {
+        for supports_range in [false, true] {
+            for size in [None, Some(0), Some(10)] {
+                for start in [0, 9, 10, 11, u64::MAX] {
+                    let events = super::open_range(
+                        bifrost_types::BlobHandle {
+                            id: bifrost_types::BlobId("B1".into()),
+                            size,
+                            content_type: None,
+                            digest: None,
+                            capabilities: bifrost_types::BlobCapabilities {
+                                supports_range,
+                                supports_parallel: false,
+                                digest_available_pre_download: false,
+                                encoding: bifrost_types::BlobEncoding::Raw8Bit,
+                            },
+                        },
+                        bifrost_types::ByteRange {
+                            start,
+                            length: Some(1),
+                        },
+                    )
+                    .collect::<Vec<_>>()
+                    .await;
+                    let [SyncEvent::Terminated(error)] = events.as_slice() else {
+                        panic!("expected one terminal refusal, got {events:?}");
+                    };
+                    assert_eq!(
+                        error.kind(),
+                        &bifrost_types::AccountErrorKind::Unsupported(
+                            bifrost_types::AccountOperation::OpenBlobRange,
+                        )
+                    );
+                }
+            }
+        }
+    }
 
     /// A boundary that answers one `Email/get` and then streams its blob.
     struct MeteredBlobTransport;

@@ -803,6 +803,10 @@ impl<'de> Deserialize<'de> for BodyProperty {
     }
 }
 
+// `default` stays: every account fixture in this crate, and some servers,
+// send the account-level mail object as `{}`, and a strict parse would turn
+// that into a Malformed required capability that refuses the account at open.
+// RFC 8621 makes the two mailbox limits nullable, so those are `Option`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct MailCapabilities {
@@ -810,7 +814,7 @@ pub(crate) struct MailCapabilities {
     max_mailboxes_per_email: Option<usize>,
 
     #[serde(rename = "maxMailboxDepth")]
-    max_mailbox_depth: usize,
+    max_mailbox_depth: Option<usize>,
 
     #[serde(rename = "maxSizeMailboxName")]
     max_size_mailbox_name: usize,
@@ -1016,7 +1020,7 @@ impl MailCapabilities {
         self.max_mailboxes_per_email
     }
 
-    pub(crate) fn max_mailbox_depth(&self) -> usize {
+    pub(crate) fn max_mailbox_depth(&self) -> Option<usize> {
         self.max_mailbox_depth
     }
 
@@ -1184,5 +1188,34 @@ mod tests {
 
         let from = email.from.expect("header-form alias populates from");
         assert_eq!(from[0].email, "sender@example.test");
+    }
+}
+
+#[cfg(test)]
+mod mail_capability_tests {
+    use super::MailCapabilities;
+    use serde_json::json;
+
+    #[test]
+    fn nullable_mailbox_limits_parse_and_round_trip() {
+        let value = json!({
+            "maxMailboxesPerEmail": null,
+            "maxMailboxDepth": null,
+            "maxSizeMailboxName": 255,
+            "maxSizeAttachmentsPerEmail": 1000000,
+            "emailQuerySortOptions": [],
+            "mayCreateTopLevelMailbox": false
+        });
+        let caps: MailCapabilities = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(caps.max_mailbox_depth(), None);
+        assert_eq!(caps.max_mailboxes_per_email(), None);
+        assert_eq!(serde_json::to_value(caps).unwrap(), value);
+        let mut bounded = value.clone();
+        bounded["maxMailboxDepth"] = json!(10);
+        let caps: MailCapabilities = serde_json::from_value(bounded).unwrap();
+        assert_eq!(caps.max_mailbox_depth(), Some(10));
+        // An empty account object still parses: fixtures and lenient servers.
+        let empty: MailCapabilities = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty.max_mailbox_depth(), None);
     }
 }

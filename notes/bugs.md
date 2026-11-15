@@ -81,48 +81,6 @@ header checked. A hydrated `Message` that dropped recipients does not set
 every caller sees the loss; at minimum read all repeated headers and set
 `incomplete` on rejection.
 
-## BUG-004 - Engine auto-pause overwrites a detach's `Stop`
-
-**Reported by:** sync-engine (P2 by the hunter's estimate, latent hang).
-
-`engine/reattach.rs::engine_pause` writes
-`ctx.boundary_tx.send_replace(BoundaryRequest::Pause)` - the raw watch sender,
-not `Boundary::set_unless_stopped`. It runs from four places: `restart_account`
-exhaustion (twice), `handle_schema_incompatible` exhaustion, and the
-`OperatorOverrideRequired` arm, all inside the reopen listener's
-`handle_account_error`, which by the crate's own documentation does not stop for
-shutdown once started. `detach_inner` writes `Stop` and then waits for that
-listener. A detach landing during the last restart attempt, or during an
-operator-override directive forwarded by a campaign, can have its `Stop`
-replaced by `Pause`:
-
-- `SyncControl::wait_for_checkpoint_at_or_after` leaves a detach only through
-  its `boundary.peek() == Stop` arm (the consumer's own `SyncControl` clone
-  keeps the checkpoint watch open), so a consumer `pause()` / `checkpoint_now()`
-  waiting on an unacknowledged registration never returns.
-- `Boundary` documents `Stop` as terminal, but enforces it only on the
-  consumer-facing writers (`set_unless_stopped`, `request_checkpoint`).
-
-Root cause, per the hunter: the raw `watch::Sender<BoundaryRequest>` is threaded
-through `AccountSlot`, `SlotContext` and `RecoveryContext`, so any holder can
-make any write (STR-028).
-
-## BUG-005 - `ack_checkpoint`'s `scope` argument is never checked against the checkpoint
-
-**Reported by:** sync-engine (P2, latent data loss).
-
-`SyncEngine::ack_checkpoint(account, scope, checkpoint, publication)` sends
-`AckRequest { scope, checkpoint, .. }`. In `engine/ack.rs::ack_writer` the `Ack`
-arm discharges the provisional reattach mark with
-`provisional.remove(&req.scope)` using the consumer-supplied scope, then
-persists `req.checkpoint`, which may belong to a different scope. A consumer
-passing scope X with scope Y's checkpoint: Y's row is written, X's provisional
-mark is cleared and Y's is not, and a later `ReattachAbort` deletes Y's row,
-which the consumer just acknowledged - the loss the provisional machinery exists
-to prevent. The lane is also carried a third time in
-`PublicationId.1.checkpoint`. Shape fix in STR-023 (derive the scope, do not
-accept it).
-
 ## BUG-006 - A freshly minted cursor with a bad envelope gets three classifications
 
 **Reported by:** sync-engine (P2/P3, sites already disagree).
@@ -673,110 +631,46 @@ alone finds to `StateChangedBeforeSend`; the encoder becomes a pure encoder; the
 pipeline builder gets every gate for free. About 60 inline gate blocks go - "the
 IMAP analogue of the status-line consolidation".
 
-## BUG-030 - ManageSieve hand-builds an injection-unsafe XOAUTH2 payload; IMAP and Sieve PLAIN accept NUL
+## BUG-030 - SASL vocabulary, ladders and policy are split across IMAP, ManageSieve and SMTP
 
-**Reported by:** imap-protocol (live), imap-connection (live: the `SaslError` mappings already disagree), imap-account, smtp-sasl.
+**Reported by:** imap-protocol, imap-connection, imap-account, smtp-sasl.
 
-The smtp-sasl hunter's table of payload builders:
+The payload defects are fixed: bifrost-sasl `plain_payload` (NUL-refusing,
+`Secret`) now serves IMAP and ManageSieve PLAIN, and ManageSieve XOAUTH2 goes
+through `xoauth2_payload`. What remains is the consolidation:
 
-| Site | PLAIN | XOAUTH2 |
-|---|---|---|
-| SMTP `Mechanism::response_with_token_at_index` | `\0user\0pass`, refuses NUL in either field | `bifrost_sasl::xoauth2_payload` |
-| IMAP `ImapConnection::authenticate_plain` | `\0user\0pass`, no NUL check | `bifrost_sasl::xoauth2_payload` |
-| IMAP `account/sieve.rs` | `\0user\0pass` in a plain `Vec`, no NUL check, not zeroizing | `format!("user={identity}\x01auth=Bearer {}\x01\x01")`: no `\x01` strip, not zeroizing |
+- SMTP still builds its own PLAIN payload in
+  `Mechanism::response_with_token_at_index` rather than `plain_payload`.
+- Mechanism vocabulary is three types: `bifrost-imap::AuthMechanism` (`Login`
+  meaning the IMAP LOGIN command, SCRAM names hard-coded), public
+  `bifrost-smtp::Mechanism` (`Login` meaning SASL LOGIN, no CRAM-MD5), and the
+  SCRAM token in bifrost-sasl. IMAP's edge is stringly (`Capability::Auth(String)`,
+  `Command::Authenticate { mechanism: String }`,
+  `ServerProfile::auth_mechanisms: Vec<String>`), and "is AUTH=X advertised" is
+  answered at several sites with different case rules.
+- Ladders: IMAP `password_mechanism_ladder` (fixed order with CRAM-MD5 and LOGIN,
+  `AuthPolicy`, downgrade skip, fall-through) vs SMTP `password_mechanism`
+  (caller allow-list, single choice); the SCRAM hash mapping is written inline
+  three times in IMAP. SMTP has `PASSWORD_MECHANISMS`, `MECHANISM_PREFERENCE`
+  and `DEFAULT_MECHANISMS`.
+- Cleartext gate has three answers: IMAP per mechanism (SCRAM allowed over
+  plaintext), SMTP refuses all AUTH unencrypted unless
+  `dangerous_allow_insecure_auth`, ManageSieve gates everything and
+  re-implements the `AuthPolicy` gate. ManageSieve supports only PLAIN and
+  XOAUTH2 (no SCRAM, no OAUTHBEARER).
+- Channel-binding resolution is two comment-held copies
+  (`imap::connection::auth::scram_binding_from_der`,
+  `smtp::authentication::resolve_scram_binding`).
+- `SaslError` mapping differs: IMAP maps an unknown variant to an auth failure,
+  SMTP to `invalid_input`.
+- `types/secret.rs::SecretString` is a near-copy of `bifrost_sasl::Secret` with a
+  hand-rolled constant-time `eq`; crate-private, so deletable without a ruling.
 
-SMTP's comment explains why NUL must be refused (an `authzid\0authcid` in the
-username slot is an authorization-identity injection). It adds to the policy
-split: SMTP has two lists in one file, `PASSWORD_MECHANISMS` (the default
-allow-set, without LOGIN) and `MECHANISM_PREFERENCE` (the walk order, with LOGIN),
-plus `DEFAULT_MECHANISMS` aliasing the first; SMTP's `Mechanism` (public, serde)
-has no CRAM-MD5, which bifrost-sasl implements but only IMAP can reach; SMTP
-parses EHLO names in `extension.rs::insert_auth_mechanisms`; the cleartext gate
-has three answers (IMAP gates PLAIN, CRAM-MD5, LOGIN and OAuth per mechanism and
-allows SCRAM over plaintext; SMTP's `SmtpInfo::ensure_can_authenticate` refuses
-all AUTH unencrypted, SCRAM included, unless `dangerous_allow_insecure_auth`;
-ManageSieve gates everything); and the policy models differ (IMAP `AuthPolicy {
-allow_login, allow_cleartext_without_tls, allow_cram_md5 }`, SMTP an allow-list
-plus one bool). Its owner for the payloads: `plain_payload(authzid, authcid,
-password) -> Result<Secret, SaslError>` (the NUL refusal as `InvalidCredential`)
-in bifrost-sasl beside the OAuth builders, with all three sites routed through it
-and through `xoauth2_payload`; for the vocabulary, one shared `Mechanism` (`name()`,
-`from_advertised(&str)`, `sends_reusable_secret()`, `is_bearer()`) and one
-`negotiate(advertised, policy, encrypted, binding) -> Ladder` (owner ruling on what
-SMTP's public `Mechanism` becomes). `SecretString` is crate-private, so it can be
-deleted for `Secret` without a ruling. The SASL client layer this all lives in is
-STR-135.
-
-The imap-account hunter adds that `account/sieve.rs::authenticate` also
-re-implements the cleartext-without-TLS gate from `AuthPolicy`, keeps the PLAIN
-payload in plain `Vec<u8>` / `String`, and supports only PLAIN and XOAUTH2 (no
-SCRAM, no OAUTHBEARER) where the IMAP ladder prefers SCRAM; its owner is a
-`bifrost-sasl` `select_mechanism(kind, offered, policy, tls)` beside the payload
-builders it already has.
-
-The imap-connection hunter adds three more copies held in step by comment. (a)
-Binding resolution: `imap::connection::auth::scram_binding_from_der` and
-`smtp::authentication::resolve_scram_binding` are the same function (absent
-cert = skip, unusable cert = error); the IMAP doc says it "reads identically to
-`bifrost_smtp`'s" and "the two crates must not differ here". (b) Mechanism
-ladder: IMAP `password_mechanism_ladder` (fixed order SCRAM-256-PLUS,
-SCRAM-1-PLUS, SCRAM-256, SCRAM-1, PLAIN, CRAM-MD5, LOGIN; `AuthPolicy` gates;
-cleartext gate; downgrade skip via `select_scram_rung`; falls through on
-live-snapshot skew) vs SMTP `password_mechanism` (no CRAM-MD5; caller `allowed`
-list; single choice; no fall-through); the mechanism-to-hash mapping
-(`ScramSha256Plus -> Sha256` etc.) is written inline twice in
-`authenticate_best` and once in `password_mechanism_ladder`, and SMTP has it as
-`scram_hash(mechanism)`. (c) `SaslError` mapping: IMAP's `impl From<SaslError>
-for Error` maps an unknown future variant to an auth failure, SMTP's to
-`invalid_input`; `AuthFailed` is always auth in IMAP and conditional in SMTP.
-Mechanism identity is also a string at IMAP's edge: `Capability::Auth(String)`,
-`Command::Authenticate { mechanism: String }`, `ServerProfile::auth_mechanisms:
-Vec<String>` beside the `AuthMechanism` enum, and "is AUTH=X advertised" is
-answered by `ServerProfile::supports_sasl_auth` (case-insensitive on an
-uppercased list), the `authenticate_*` / `require_auth_mechanism` gates
-(`Capability`'s `PartialEq`), `login()` (`eq_ignore_ascii_case("PLAIN")`), and
-three inline closures in `authenticate_best` and `password_mechanism_ladder`;
-the test `a_lowercase_auth_advertisement_satisfies_the_live_plain_gate` exists
-because two of these must agree. Its proposal adds to the owner below:
-`resolve_tls_server_end_point(Option<&[u8]>)`, a
-`MechanismLadder::build(credentials_kind, offers: impl Fn(&str) -> bool, policy,
-tls_active) -> Vec<Candidate>` with the downgrade rule inside, a
-`SaslFailureClass` each protocol crate maps once, and
-`Capability::Auth(SaslMechanism)` (case-normalized) with
-`AuthMechanism::scram_hash()`.
-
-SASL vocabulary, payloads and policy are split across IMAP, ManageSieve and SMTP:
-
-- Mechanism vocabulary: `bifrost-imap::AuthMechanism` (`Login` meaning the
-  IMAP LOGIN command), `bifrost-smtp::Mechanism` (public, `Login` meaning SASL
-  LOGIN), and the SCRAM token in `bifrost-sasl`. SMTP's `Mechanism::name`
-  derives SCRAM names from `ScramHash::mechanism_name` and documents that as the
-  single authority; IMAP's `AuthMechanism::name` hard-codes
-  `"SCRAM-SHA-256-PLUS"` etc.
-- PLAIN payload built three times: SMTP rejects NUL inside authcid / passwd
-  (RFC 4616); `connection/auth.rs::authenticate_plain` does not (zeroized);
-  `account/sieve.rs` does not and is not zeroized. A username containing NUL
-  re-splits authzid / authcid on IMAP and Sieve.
-- XOAUTH2 payload: `bifrost-sasl::xoauth2_payload` strips `\x01` from user and
-  token (tested with `"user\x01auth=Bearer evil"`). `account/sieve.rs`
-  hand-builds `format!("user={identity}\x01auth=Bearer {}\x01\x01")` - the
-  injection the sasl builder exists to prevent, as a plaintext `String` rather
-  than a `Secret`. The earlier OAuth-payload consolidation into bifrost-sasl
-  missed this site.
-- Policy: IMAP prefers OAUTHBEARER then XOAUTH2 ("mirroring SMTP's
-  `OAUTH2_MECHANISMS` order" - agreement by comment); Sieve offers XOAUTH2 only
-  and PLAIN only (no SCRAM). IMAP's cleartext gate is PLAIN/CRAM-MD5/LOGIN for
-  passwords and all OAuth; `AuthPolicy`'s doc lists "PLAIN, XOAUTH2, CRAM-MD5,
-  and LOGIN"; Sieve gates every mechanism.
-- `types/secret.rs::SecretString` is a near-verbatim copy of
-  `bifrost_sasl::Secret` with a hand-rolled constant-time `eq` where the
-  original uses `subtle`.
-
-Owner: `bifrost-sasl` gains the mechanism enum (with
-`sends_reusable_credentials`, channel binding, wire name), `plain_payload`
-returning `Result<Secret, SaslError>`, the OAuth preference order, and `Secret`
-used directly by IMAP; IMAP, Sieve and SMTP select from it. Where ManageSieve
-should live is STR-060.
+Owner: bifrost-sasl gains the mechanism enum, the OAuth preference order, one
+`negotiate(advertised, policy, encrypted, binding)` ladder and one binding
+resolver; IMAP, Sieve and SMTP select from it (owner ruling on what SMTP's public
+`Mechanism` becomes). The SASL client layer this lives in is STR-135; where
+ManageSieve should live is STR-060.
 
 ## BUG-031 - A hydrated IMAP `Message` extracts Message-IDs with two different parsers
 
@@ -816,24 +710,6 @@ if run would pass for the wrong reason (unresolved import). The
 guarantees these blocks advertise are unpinned. Either move them to a `tests/`
 trybuild-style check against a crate-internal path or drop the claim.
 
-## BUG-034 - A refused IMAP LOGOUT leaves `in_logout` armed, and the next successful command logs the session out
-
-**Reported by:** imap-connection (live; latent in practice).
-
-In `ProtocolState::apply_tagged`, `in_auth`, `in_close` and `in_unauthenticate`
-each have an `else` branch clearing the flag on NO/BAD; `in_logout` has only `if
-self.in_logout && t.status == Ok { .. }`. After `LOGOUT -> NO` (a case
-`LogoutConsumer` handles, pinned by
-`a_refused_logout_reports_the_refusal_not_a_missing_bye`), the flag stays true,
-and nothing resets it at the start of the next command (`run_prepared_command`
-only sets it for LOGOUT). The next command's tagged OK - a NOOP, say - moves the
-session to `Logout`; the driver breaks after answering that NOOP `Ok`, and the
-connection silently dies. The existing test stops after the refusal. A biting
-test: refused LOGOUT, then NOOP, then assert `session_state() == Authenticated`
-and `is_alive()`. One-line fix: `else { self.in_logout = false }`. Root cause is
-six loose pending-effect flags applied to whatever tagged response arrives,
-without comparing tags (STR-065).
-
 ## BUG-035 - Single-command and pipeline paths disagree on NOTIFY after an interleaved NOTIFICATIONOVERFLOW
 
 **Reported by:** imap-connection (live).
@@ -862,27 +738,6 @@ nothing reconciles the copies. Owner: `Command::pending_effect(&self) ->
 Option<PendingEffect>` in `types/command.rs` beside `legal_states`, with
 `pipelinable` derived from it, the armed effect keyed by tag (STR-065), and both
 paths arming through the one function before the first byte.
-
-## BUG-036 - The IMAP BYE trip-wire comment calls live code dead, and its predicate is a copy held by a pairwise test
-
-**Reported by:** imap-connection (live comment).
-
-`driver/events.rs::has_critical_response_code` re-derives, from response
-content, whether `emit_untagged_response_code_events` already published an event
-for a response, so the reclassified-events loops (single dispatch and pipeline
-router) can skip it; it is held in step with the emitter by
-`the_predicate_agrees_with_the_emitter_except_on_bye`, plus a TRIP-WIRE comment
-saying a BYE "can never reach a `reclassified_as_events` list and this guard is
-dead code". On LOGOUT, `dispatch_response_loop` routes the expected BYE to
-`LogoutConsumer`, which buffers it and surrenders it from `finalize`, so it does
-go through the reclassified loop, where the exclusion makes a `* BYE [ALERT] ..`
-publish `TypedEvent::Bye` after the prologue already published
-`TypedEvent::Alert`. That is arguably correct (two events), but the comment tells
-a future editor it can delete the guard under conditions that already hold.
-Owner: record the fact at emission - `process_untagged_prefix` already returns
-`code_emitted`; carry it with the response (`Routed { response,
-code_event_emitted: bool }`) through the consumer and `Finalized`, and delete the
-predicate.
 
 ## BUG-037 - IMAP literal budgets are not enforced on the pipeline, IDLE or continuation-wait read loops
 
@@ -933,22 +788,6 @@ stream, while `build_selected_mailbox` uses only the select codes. Owner: one
 cuts on `[CLOSED]` once, assigns each response to exactly one side, and whose
 `SelectInputs` constructor judges mandatoriness (UIDVALIDITY included); the
 helpers belong in `dispatch/select.rs`, not `mod.rs` (STR-068).
-
-## BUG-040 - IMAP adopts ENABLED and CAPABILITY data on arrival while two consumers claim the opposite
-
-**Reported by:** imap-connection (doc vs code).
-
-`ProtocolState::apply_untagged` adopts `* ENABLED` and `* CAPABILITY` the moment
-they arrive, before the tagged status is known. `EnableConsumer::finalize` says
-"an ENABLED list under a failed ENABLE must not reach anything that would treat
-those extensions as active" - the state machine already treats them as active.
-`CapabilityConsumer::finalize` says "capability data that arrived under a failed
-CAPABILITY must not be published as an event, because the dispatcher's
-capability cache would then adopt it" - the cache already adopted it on arrival.
-One is the policy; today the state machine wins silently and the comments
-describe a guarantee nobody provides. Owner: the state machine, with the policy
-stated there (and, if on-OK is wanted, the pending-effect mechanism of STR-065
-can carry "adopt ENABLED on OK").
 
 ## BUG-041 - `Pipeline::execute_raw` waits unbounded, contradicting "no infinite waits"
 
@@ -1180,25 +1019,6 @@ attributes and the converter closes it. Also `fetch_to_inventory` mints
 `fetch.uid.unwrap_or_default()`, a UID 0 object id, because nothing in the type
 says the caller already checked.
 
-## BUG-054 - IMAP `hold_until_rfc3339` sends an empty HOLDUNTIL for an unrepresentable instant
-
-**Reported by:** imap-account, smtp-sasl.
-
-It falls back to an empty string for an instant `jiff` cannot represent, which
-would be sent as an empty `HOLDUNTIL` parameter rather than refused locally. The
-smtp-sasl hunter traces the outcome: `FutureReleaseParameter::HoldUntil(String)`
-and `SendOptions::hold_until(impl Into<String>)` take free text validated only by
-the generic `validate_esmtp_raw_value` at send time (non-empty printable ASCII, no
-`=`, never RFC 3339), so the `""` fails as "raw ESMTP parameter value must contain
-printable ASCII without spaces or '='" - a misleading `Request(Malformed)`. Its
-shape: `HoldUntil(jiff::Timestamp)` (or a validated newtype) with a
-`hold_until(SystemTime) -> Result<Self, Error>` constructor, so the only failure is
-where the time is converted. `MailParameter` has two validation models in one enum:
-`DeliverByParameter` and `MtPriorityParameter` validate in their constructors with
-private fields, while `MailParameter::EnvelopeId(String)`, `Other`, `OtherRaw` and
-`RcptParameter::OriginalRecipient` are public variants validated later by
-`validate_syntax`.
-
 ## BUG-055 - IMAP `SearchFilter::Has` (attachment filename or type) compiles to a full-text `BODY` search
 
 **Reported by:** imap-account.
@@ -1321,29 +1141,6 @@ the placement on the `Capability` trait (`const LEVEL: CapabilityLevel`) with th
 six account accessors, and `capability_config`'s serialize-then-deserialize round
 trip goes.
 
-## BUG-059 - A JMAP server sending `"maxMailboxDepth": null` cannot be opened
-
-**Reported by:** jmap-protocol (probable live).
-
-RFC 8621 section 1.3.1 types `maxMailboxDepth` as `UnsignedInt|null`.
-`MailCapabilities` declares it `usize` under a struct-level `#[serde(default)]`;
-`default` covers only an absent member, so `null` fails the typed parse, `try_cap!`
-stores the primary account's mail block as `Capabilities::Malformed`,
-`malformed_capabilities()` yields the mail URI, and `validate_session` refuses the
-account with `Protocol(ContractViolation)`. No fixture sends `null`. The same
-struct defaults the REQUIRED `maxSizeMailboxName` / `maxSizeAttachmentsPerEmail` /
-`emailQuerySortOptions` / `mayCreateTopLevelMailbox` to zero/empty/false when
-absent - the merge the `CoreCapabilities` doc explains was removed for core.
-
-## BUG-060 - A JSCalendar duration in weeks reads as zero, so a one-week JMAP event ends at its start
-
-**Reported by:** jmap-protocol (live, sync scope).
-
-`sync/calendar_ops.rs::parse_duration_seconds` rejects `W` (RFC 8984 Duration
-allows `P1W`), and `end_from_start_duration` does `.unwrap_or(0)`. The `start.len()
-== 10` all-day heuristic beside it is another string-shape decision a
-`LocalDateTime` type would own (STR-003, STR-089).
-
 ## BUG-061 - A JMAP create emits `null` inside an `Id[Boolean]` set, and a test pins it
 
 **Reported by:** jmap-protocol (live wire defect).
@@ -1356,23 +1153,6 @@ patch-only syntax. `tests.rs::patch_object_null_semantics` pins this wire-invali
 create. Owner: a membership-set type that serializes differently in create
 (`IdSet<T>`, values always `true`) and patch (path ops) - see CON-041 and
 STR-084.
-
-## BUG-062 - JMAP Principal `timeZone` never decodes
-
-**Reported by:** jmap-protocol (live).
-
-The field is serialized as `timezone`; RFC 9670 section 3 spells it `timeZone`, so
-a conforming server's value is silently dropped into an `Option` that stays
-`None`.
-
-## BUG-063 - A second JMAP `onSuccessUpdateEmail` call for the same submission discards the first patch
-
-**Reported by:** jmap-protocol.
-
-`SetArguments::on_success_update_email_` does `insert(id, EmailPatch::default())`,
-so a second call for the same submission discards the first patch rather than
-handing it back (contrast `SetRequest::create_with_id`'s get-or-insert, whose
-comment names this exact hazard).
 
 ## BUG-064 - `Client::with_transport` fabricates a `Basic ` WebSocket credential; the JMAP credential is held twice
 
@@ -1393,23 +1173,6 @@ the transport uses for HTTP (reachable only by combining `with_transport` with
 `authorize(builder)` for all three HTTP doors and a `ws_authorization()` for the
 handshake; `ClientInner::authorization` is deleted.
 
-## BUG-065 - JMAP reports a missing contact or event as `Unsupported`
-
-**Reported by:** jmap-account (live, P1).
-
-"A single-object read came back empty": `thread_hydrate` gives `IdNotFound` with
-`ErrorScope::Thread` -> `NotFound(Thread)`; `message_hydrate` `IdNotFound` with
-`ErrorScope::Message` -> `NotFound(Message)`; `open_raw_rfc822` a hand-built
-`NotFound(Message)`; but `contacts::get` gives `Unsupported(ContactGet)` ("JMAP
-contact was not found") and `calendar_ops::get_raw_event` (used by `event_get`,
-`event_update`, `event_rsvp`) gives `Unsupported(op)` ("CalendarEvent/get
-returned no event"). A deleted contact or event reports the operation as
-unsupported by the protocol - terminal capability absence, telling a consumer
-keying on the kind to stop offering the door. `get_raw_event` also takes the head
-of the list positionally rather than correlating on the requested id, the pattern
-`blob.rs` and `reconcile_hydration` were written to eliminate. Owner: one helper,
-`require_one(response, requested_id, ErrorScope)`, for every JMAP `/get` of one id.
-
 ## BUG-066 - JMAP container rename, move, delete and child-create on a shared mailbox are unroutable
 
 **Reported by:** jmap-account (live, P2).
@@ -1424,14 +1187,6 @@ answers `notFound`, and because the door attaches no scope that becomes
 `Protocol(Unknown)` (`UnknownPermanent`). Creating a child under a shared parent
 fails the same way. The flag-vs-gate duplication behind it is CON-006; the routing
 type that would prevent it is STR-097.
-
-## BUG-067 - JMAP `filters::update` with `is_active: Some(false)` deactivates whichever filter is active
-
-**Reported by:** jmap-account (live, P2).
-
-It sends `onSuccessDeactivateScript: true`, which deactivates whichever script is
-active - including a different filter from the one being updated. A caller marking
-an already-inactive filter B as inactive switches off the active filter A.
 
 ## BUG-068 - The JMAP state cache advances from its cached state instead of `oldState`, laundering concurrent changes into the next guard
 
@@ -1619,14 +1374,6 @@ FutureVersion, RetiredVersion, Malformed, ScopeMismatch }` -> `AccountError`
 mapping every crate calls. The interchangeable version integers beneath it are
 STR-007.
 
-## BUG-074 - JMAP `blob::open_range` answers an out-of-range start before the promised `Unsupported`
-
-**Reported by:** jmap-account (minor).
-
-It returns `Request(Malformed)` for an out-of-range start before it returns the
-`Unsupported` that `BlobRangeSupport::No` promises; ordering the capability refusal
-first makes the answer independent of the argument.
-
 ## BUG-075 - Graph presents its Graph-audience token to EWS and Autodiscover
 
 **Reported by:** graph (probable live; not observable hermetically).
@@ -1760,24 +1507,6 @@ lane has no obligation vocabulary, a fact about `SyncEvent<Change>`, not a reaso
 for different verdicts on the provider. Owner: the shared delta-walk driver
 (STR-116), deciding once and letting each lane express the verdict.
 
-## BUG-081 - An out-of-range Graph `$batch` subresponse status is read as a retryable 500
-
-**Reported by:** graph (latent).
-
-`BatchResponseItem { status: u16, .. }` goes through
-`StatusCode::from_u16(status).unwrap_or(INTERNAL_SERVER_ERROR)` in
-`mutation_item_outcome` and `reconcile_hydration_responses`, so a status outside
-100..=999 is silently a retryable 500 `Server(Unavailable)` rather than the
-contract violation it is. Typed batch answers are STR-108.
-
-## BUG-082 - Graph accepts a truncated public contact or event id as an empty item id
-
-**Reported by:** graph (latent).
-
-`parse_public_contact` and `parse_public_event` fall back to `(tail, "")` when the
-item part is missing, so a truncated id parses as a request for an empty item id
-instead of being refused as caller input. The id codec it belongs to is STR-120.
-
 ## BUG-083 - Graph's funnel tags a 503 with a mailbox budget that the classifier then never stamps
 
 **Reported by:** graph (live disagreement; comment contradicts code).
@@ -1793,25 +1522,6 @@ classifiers also return `(AccountErrorKind, Cause, bool)` where the bool means
 "this is a throttle" - a function of the kind that `stamp_budget` re-derives
 independently. Owner: the classifier; the funnel carries the budget
 unconditionally as context, and the throttle decision is made once from the kind.
-
-## BUG-084 - Graph subscriptions are requested for seven days while the docs say about a day
-
-**Reported by:** graph (doc vs code; affects documented exposure).
-
-`webhooks.rs` requests 10,080 minutes (7 days) for every subscription.
-`run_subscribe`'s doc says an unrecoverable create "lives until Graph's own expiry
-(about a day)", and `reference/sync.md` says providers hold live subscriptions
-"until it expires them itself (24h for Graph)". The orphan and queue-for-later
-analyses therefore understate the exposure by about 7x. Either the request or the
-two documents change.
-
-## BUG-085 - Graph renew and delete interpolate the subscription id into the path unencoded
-
-**Reported by:** graph.
-
-`webhooks::renew_subscription` and `delete_subscription` interpolate the
-subscription id into the path unencoded, while every other id in the crate goes
-through `encode_path_component`.
 
 ## BUG-086 - Google stamps Calendar, People and Drive errors as Gmail, and names the wrong OAuth scope for them
 
@@ -1875,17 +1585,6 @@ that. The hunter proposes deleting the second funnel for every Gmail caller; onl
 Drive's resumable upload (custom headers, bearer-less, redirects off) needs the raw
 builder.
 
-## BUG-088 - Google blob errors scope a JSON blob id as a message id
-
-**Reported by:** google (live).
-
-`GmailErrorContext::open_blob(id)` puts its argument into `ErrorScope::Message { id
-}`, and `blobs::translate` passes `blob_id.0`, which is the JSON
-`{"message_id":..,"attachment_id":..}`. A missing attachment reports
-`NotFound(Message)` with the JSON string as the message id; the comment beside it
-says the intent is to anchor on the parent message. The `impl Into<String>`
-parameter is what let the wrong id through (STR-127).
-
 ## BUG-089 - A Google filter `MoveTo(archive)` sends the synthetic archive id in `addLabelIds`
 
 **Reported by:** google (live, untested).
@@ -1901,18 +1600,6 @@ destination, or already among the removals) is copied verbatim in
 `mutation::move_patch` and `pim::move_container_patch`. Owner: move the source fold
 into `flags` (`move_placement_patch(destination, source)`) and route filter moves
 through it.
-
-## BUG-090 - Google draft re-render misclassifies attachments as inline
-
-**Reported by:** google (live).
-
-`blobs::content_disposition_inline` compares the disposition TYPE (the first `;`
-token) to `inline`; `pim::content_disposition_inline` uses
-`value.to_ascii_lowercase().contains("inline")`, so it matches `attachment;
-filename="inline.png"`. Hydration (`blobs`) and draft re-render
-(`pim::attachment_inlines`) classify the same part differently. `content_id_value`
-is also duplicated. One copy should exist, arguably in bifrost-types' MIME module
-beside `DecodedAttachment`, since every protocol crate answers this question.
 
 ## BUG-091 - Google label vocabulary disagrees on case, archive and label type
 
@@ -1939,25 +1626,6 @@ ARCHIVE_ID`, so `SearchFilter::In("Archive")` becomes the archive expression whi
 user label; `scopes::diff_snapshots` emits renames for anything not `Some("system")`
 (counting `None` as user); `pim::label_is_system` requires `Some("system")`. Owner:
 `GmailLabelId` (STR-125). The query encoders behind the archive split are CON-053.
-
-## BUG-092 - Google parses the `References` header two ways
-
-**Reported by:** google (live).
-
-`inventory_entry_from_message_indexed` splits and trims angle brackets but keeps
-empty items; `pim::references_from_header` filters them out. The same header yields
-different `InventoryEntry::references` and `Message::references`, and
-`InventoryEntry::differs_from` compares that field. Related: BUG-031 (IMAP's two
-Message-ID parsers).
-
-## BUG-093 - Google quota-cost comments understate `messages.get` by four times
-
-**Reported by:** google (stale comments).
-
-`inventory::hydrate_one` says `messages.get` costs "5 units each" and
-`flags::patch_for_set` says "5 quota units each"; the table in `client.rs` says 20,
-so the argument in `patch_for_set` against read-then-diff is four times stronger
-than it states. Reword the comments so the figure is not hard-coded.
 
 ## BUG-094 - A Gmail Pub/Sub registration loss is classified as a cursor loss
 
@@ -1995,20 +1663,6 @@ lifecycle stream can announce `Created(Label(x))` while flag translation still l
 `x` and treats it as unsupported until the next refresh, costing a second
 `labels.list` round trip the poll already paid for. Owner: one vocabulary actor that
 the poller refreshes, with lifecycle diffs a view over its snapshots.
-
-## BUG-097 - Google single-object mutations stamp the wrong operation and no scope
-
-**Reported by:** google.
-
-`pim::modify_target` uses `GmailErrorContext::base(operation)`, with no resource and
-no scope, so a 404 on a thread target classifies as `NotFound(Message)` with no id;
-`move_thread` and `delete_thread` stamp `AccountOperation::BulkMove` and
-`BulkDestroy` instead of `MoveThread` and `DeleteThread`. Recovery is the same (all
-four non-idempotent), but telemetry, the insufficient-scope hint and consumer
-routing are wrong. Building `GmailErrorContext` from a `MutationTarget` makes these
-impossible to diverge. Smaller sibling: `push::closed_error` always uses the
-`push_subscribe()` context, even for `PushUnsubscribe`, so its scope is
-`Cursor(Account)` for an unsubscribe.
 
 ## BUG-098 - Google resolves retry hints against the injected clock on one path and the real clock on others
 
@@ -2076,38 +1730,6 @@ Each crate is right for one mechanism and wrong for the other. The OAuth-payload
 consolidation explicitly left "the RFC 7628 `\x01` error-continuation handling" in
 SMTP as "protocol command flow"; it is a per-mechanism SASL rule and belongs in
 bifrost-sasl (`oauth_error_ack(mechanism) -> &'static [u8]`).
-
-## BUG-102 - A SCRAM nonce RNG failure tells the SMTP operator to change policy
-
-**Reported by:** smtp-sasl (drift).
-
-`generate_scram_nonce` exists twice, byte-for-byte the same shape (18 random bytes,
-URL-safe-no-pad; SMTP's doc says "verbatim shape of IMAP's"). On `getrandom` failure
-IMAP returns `Error::LocalRuntime` (internal, nothing on the wire) and SMTP returns
-`invalid_input(..).with_phase(Auth)`, mapping to `Authorization(PolicyBlocked)`. The
-coupling of `InvalidInput` and the Auth phase that produces this is STR-137. Owner:
-bifrost-sasl, inside the SCRAM client, with one local-runtime variant.
-
-## BUG-103 - A submitted recipient string can append ESMTP parameters to `RCPT TO`
-
-**Reported by:** smtp-sasl (live).
-
-`imap/src/account/submission.rs::to_smtp_address` builds every MAIL FROM and RCPT TO
-address with `SmtpAddress::new_dangerous(user, domain)` after `rsplit_once('@')`,
-or `new_dangerous(whole, "")` when there is no `@`, its comment saying the server
-rejects an invalid RCPT. The only client-side guard left is
-`commands.rs::validate_single_line_argument`, which rejects control characters and
-nothing else. `Rcpt`'s Display is `RCPT TO:<{addr}>{params}`, so an address string
-such as `a@b.example> NOTIFY=SUCCESS ORCPT=rfc822;x` produces a syntactically valid
-command with caller-chosen DSN parameters. The string originates in
-`bifrost_types::Address::address` from a `SendRequest`
-(`types/src/mime/render.rs::SubmissionEnvelope`), i.e. user-typed recipients.
-`reference/types.md` says submit paths must use the checked parsers and propagate
-rejection before writing; the conversion to the wire type is the one unchecked
-place. Owner: `impl TryFrom<&bifrost_types::Address> for bifrost_smtp::Address` in
-bifrost-smtp running `Address::new`'s validation (local part via `email_address`,
-IDNA domain), replacing `to_smtp_address`, with a rejection becoming a
-per-recipient `failed` lane (or a batch `BatchInputInvalid`) before MAIL FROM.
 
 ## BUG-104 - The reverse path depends on which door sends the message
 
@@ -2202,18 +1824,6 @@ as a retryable transport setup failure" (`reference/net.md`). And IMAP
 `SubmissionTransport::build_with_connector` maps any bifrost-smtp builder error to
 `crate::Error::InvalidInput(e.to_string())`, discarding the kind entirely.
 
-## BUG-109 - The async SMTP pool drops broken connections without `abort()`, unlike the blocking pool
-
-**Reported by:** smtp-sasl.
-
-`pool/sync_impl.rs` and `pool/async_impl.rs` each decide checkout eligibility in the
-same order (idle-expired, then `has_broken`, then the optional NOOP probe) and
-recycle eligibility (`has_broken() || should_retire()`), but already differ in what
-they do with a discarded connection: sync calls `abort()` (QUIT and close), async's
-`recycle` just drops it. The judgement can be one pure function over
-`(idle_duration, broken, retire, config)` shared by both, leaving only the waiting
-primitive (Condvar vs Semaphore) to each.
-
 ## BUG-110 - "May this logical request have committed?" is decided four ways in net and DAV, and they disagree
 
 **Reported by:** net-dav.
@@ -2298,29 +1908,6 @@ input can drive a `CompleteFailure`; the multiget lane's `failed_resource` retur
 Owner: `ResponseParts::lane() -> ResponseLane { Collection, Entry, Failed { status
 }, MissingData }`, computed once, every accessor reading it.
 
-## BUG-114 - CalDAV advertises no RSVP for a blank address but the method proceeds
-
-**Reported by:** net-dav.
-
-`scheduling_available` treats a whitespace-only address or outbox as absent;
-`event_rsvp` gates on `let Some(..)` only, so a blank configured address advertises
-`event_rsvp = false` while the method proceeds. Type fix: compute
-`Option<SchedulingEndpoint { outbox, address }>` once at open, derive the capability
-from `is_some()`, and pattern-match the same value in the method. Related: CON-006.
-
-## BUG-115 - CalDAV picks two error scopes for one event resource, on a stale rationale
-
-**Reported by:** net-dav.
-
-`client::event_scope` deliberately overloads `ErrorScope::Calendar` with an event
-URL, its comment saying bifrost-types has no `ErrorScope::Event`. That variant
-exists, and `relocation_error` and `rsvp_error` in the same crate use it, as do net
-and Graph. Also `DavProtocol::resource()` returns `Calendar` for CalDAV but
-`Contact` for CardDAV - the CalDAV answer names the collection and the CardDAV
-answer the item - so a 404 on an event GET is `NotFound(Calendar)` while a 404 on a
-contact GET is `NotFound(Contact)`. One crate holds two answers, and the stated
-reason for the first is gone.
-
 ## BUG-116 - The HTTP bandwidth meter cannot be handed to the engine or IMAP
 
 **Reported by:** net-dav (likely live wiring defect; verify before acting).
@@ -2350,10 +1937,64 @@ STR-145.
 bare UID and puts the extension only on the path. One decision, "new resource UID
 and file name", answered two ways.
 
-## BUG-118 - net's redirect rewrite and its replay policy disagree on "safe method"
+## BUG-119 - JMAP Principal query filter still spells the property `timezone`
 
-**Reported by:** net-dav (minor).
+**Reported by:** resolution wave (lateral, while fixing the Principal object's
+`timeZone` decoding).
 
-The redirect rewrite treats only GET and HEAD as safe; replay uses
-`Method::is_safe()`, which adds OPTIONS and TRACE. A 301 on OPTIONS is rewritten to
-GET.
+`crates/jmap/src/principal/query.rs` emits `timezone` in its filter. RFC 9670 spells
+the Principal property `timeZone`; whether the filter condition follows the
+property name depends on the filter extension's contract, which was not checked.
+
+## BUG-120 - JMAP contact-move pre-read conflates explicit absence with an unanswered id
+
+**Reported by:** resolution wave (lateral, beside the single-object read helper
+`crates/jmap/src/sync/single_get.rs`).
+
+Single-object contact and event reads now tell a `notFound` answer (scoped
+`NotFound`) from an id the server never answered (`PartialResponse`). The pre-read
+in the contact move path still treats both the same way; it could use the same
+helper.
+
+## BUG-121 - A matching-scope acknowledgement clears provisional ownership before persistence succeeds
+
+**Reported by:** resolution wave (lateral, beside the `ack_checkpoint` scope check).
+
+In `crates/sync/src/engine/ack.rs` the `Ack` arm now refuses a scope that does not
+match the checkpoint, but for a matching scope it still removes the provisional
+reattach mark before publication validation and the store write have succeeded. A
+rejected or failed persist leaves the row without its provisional mark, so a later
+`ReattachAbort` no longer deletes it. Ordering the removal after a successful write
+would close it; check the reattach-abort path's expectations first.
+
+## BUG-122 - IMAP pending LOGOUT is cleared by any tagged response, not LOGOUT's own
+
+**Reported by:** resolution wave review (lateral).
+
+`ProtocolState::apply_tagged` (`crates/imap/src/connection/state.rs`) now clears
+`in_logout` on NO/BAD, but the check is not tag-aware: a pipelined earlier
+command's tagged NO/BAD arriving after LOGOUT was sent clears the flag, and
+LOGOUT's own OK then does not move the session to `Logout` (BYE still does). The
+tagged pending-effect shape in STR-065 closes it.
+
+## BUG-123 - JMAP filter deactivation can now fail on an unrelated script change
+
+**Reported by:** resolution wave review (lateral; needs a ruling, not a defect on
+its face).
+
+`filters::update` (`crates/jmap/src/sync/filters.rs`) deactivates an active target
+with a `SieveScript/set` guarded by `ifInState` from the read just before, so any
+unrelated script change in between yields `ConcurrencyConflict`. Correct against
+the deactivate-the-wrong-filter hazard, but a new user-visible failure mode; decide
+whether one automatic re-read-and-retry belongs here.
+
+## BUG-124 - The IMAP BYE-ALERT event test does not drive the driver
+
+**Reported by:** resolution wave review (lateral).
+
+`logout_bye_alert_emits_both_code_and_session_end_once`
+(`crates/imap/src/connection/driver/events.rs`) re-implements the reclassification
+rule inline instead of driving the dispatch loop, so it passes regardless of the
+driver's behaviour. Drive a scripted LOGOUT with `* BYE [ALERT]` through the real
+loop instead.
+

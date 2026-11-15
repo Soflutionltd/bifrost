@@ -559,7 +559,12 @@ impl CalDavClient {
                 data: body,
             })
         } else {
-            Err(status_error(&response.headers, operation, status, body))
+            Err(item_status_error(
+                &response.headers,
+                operation,
+                status,
+                body,
+            ))
         }
     }
 
@@ -603,7 +608,12 @@ impl CalDavClient {
         if status.is_success() {
             Ok(etag)
         } else {
-            Err(status_error(&response.headers, operation, status, body))
+            Err(item_status_error(
+                &response.headers,
+                operation,
+                status,
+                body,
+            ))
         }
     }
 
@@ -622,7 +632,7 @@ impl CalDavClient {
             .request(Method::DELETE, url)
             .replay(bifrost_net::ReplayPolicy::Never)
             .header("If-Match", etag);
-        self.dav.send_status_request(request, operation).await
+        self.dav.send_item_status_request(request, operation).await
     }
 
     /// `DELETE` one event resource. Replayable, and a target already gone is a
@@ -937,22 +947,22 @@ pub(crate) fn status_error(
     bifrost_dav_core::status_error(headers, operation, status, body, DAV)
 }
 
-/// The scope for a failure on ONE event resource.
-///
-/// `ErrorScope::Calendar` carries a COLLECTION href everywhere else in this
-/// crate (`reference/caldav.md`, "A CalDAV `CalendarId` IS the resolved
-/// collection href"), and here it carries the event's URL. That is a deliberate
-/// overload, ruled dav-F8 on 2026-09-07: `bifrost-types` has no
-/// `ErrorScope::Event`, adding a public variant to a `#[non_exhaustive]` enum
-/// every consumer matches on was judged not worth it for a diagnostic, and the
-/// single-resource paths (`fetch_event_from_url`, the dropped create in
-/// `event_create`) need SOME scope so a `Reconcile(CheckTarget)` names a
-/// checkable target. A consumer routing on this scope must not assume the id
-/// is a collection; the URL's final segment is the resource. What would reopen
-/// it: an engine-side use of the scope that has to tell the two apart.
+/// [`status_error`] for a request addressing one event resource: a 403 / 404
+/// names `ResourceKind::Event`, where a collection request names the calendar.
+pub(crate) fn item_status_error(
+    headers: &reqwest::header::HeaderMap,
+    operation: AccountOperation,
+    status: StatusCode,
+    body: String,
+) -> AccountError {
+    bifrost_dav_core::item_status_error(headers, operation, status, body, DAV)
+}
+
+/// Scope a single-resource failure to the event URL so reconciliation can
+/// probe the item without confusing it with its containing calendar.
 pub(crate) fn event_scope(id: impl Into<String>) -> ErrorScope {
-    ErrorScope::Calendar {
-        id: (id.into()).into(),
+    ErrorScope::Event {
+        id: bifrost_types::EventId(id.into()),
     }
 }
 
@@ -1009,7 +1019,8 @@ mod tests {
     };
     use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
-    /// Every error this crate mints is stamped CalDAV, and names calendars.
+    /// Every error this crate mints is stamped CalDAV; a collection 404 names
+    /// the calendar and an item 404 names the event.
     ///
     /// Twin of `bifrost-carddav`'s `every_error_this_crate_mints_is_stamped_carddav`;
     /// keep them in step. The shared ladder in `bifrost-dav-core` is
@@ -1037,7 +1048,20 @@ mod tests {
                 "a CalDAV error must not be stamped otherwise: {error:?}"
             );
         }
-        let missing = status_error(
+        let collection = status_error(
+            &reqwest::header::HeaderMap::new(),
+            AccountOperation::CalendarsList,
+            StatusCode::NOT_FOUND,
+            String::new(),
+        );
+        assert!(
+            matches!(
+                collection.kind(),
+                AccountErrorKind::NotFound(ResourceKind::Calendar)
+            ),
+            "a CalDAV collection 404 names a calendar: {collection:?}"
+        );
+        let missing = item_status_error(
             &reqwest::header::HeaderMap::new(),
             AccountOperation::EventGet,
             StatusCode::NOT_FOUND,
@@ -1046,10 +1070,39 @@ mod tests {
         assert!(
             matches!(
                 missing.kind(),
-                AccountErrorKind::NotFound(ResourceKind::Calendar)
+                AccountErrorKind::NotFound(ResourceKind::Event)
             ),
-            "a CalDAV 404 names a calendar, not a contact: {missing:?}"
+            "a CalDAV event 404 names an event: {missing:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_event_get_names_the_event_in_kind_and_scope() {
+        use bifrost_types::account::Account as _;
+
+        let url = "https://dav.example.test/calendar/missing.ics";
+        let script = dav_script([DavResponse {
+            status: StatusCode::NOT_FOUND,
+            headers: HeaderMap::new(),
+            body: String::new(),
+            url: url.to_string(),
+        }]);
+        let client = Arc::new(CalDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&script),
+        ));
+        let account =
+            crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/calendar/");
+        let error = account
+            .event_get(bifrost_types::EventId(url.to_string()))
+            .await
+            .expect_err("missing event");
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::NotFound(ResourceKind::Event)
+        );
+        assert!(matches!(error.scope(), Some(ErrorScope::Event { id }) if id.0 == url));
+        assert_eq!(transcripts(&script).len(), 1);
     }
 
     #[tokio::test]
@@ -1375,7 +1428,7 @@ mod tests {
             .await
             .expect_err("a dropped create must fail");
 
-        let Some(bifrost_types::ErrorScope::Calendar { id }) = error.scope() else {
+        let Some(bifrost_types::ErrorScope::Event { id }) = error.scope() else {
             panic!("a dropped create must name its minted target: {error:?}");
         };
         assert!(
@@ -1820,7 +1873,7 @@ mod tests {
             assert!(
                 matches!(
                     error.scope(),
-                    Some(ErrorScope::Calendar { id }) if id.0 == url
+                    Some(ErrorScope::Event { id }) if id.0 == url
                 ),
                 "{door}: scoped to the event like the GET failure: {:?}",
                 error.scope()
@@ -1839,7 +1892,7 @@ mod tests {
     }
 
     /// A GET that returns a resource holding no VEVENT (a VTODO sharing the
-    /// collection) is `NotFound(Calendar)` read out of the SERVER's answer, so
+    /// collection) is `NotFound(Event)` read out of the SERVER's answer, so
     /// it carries an acknowledged attempt - on both doors that project it.
     ///
     /// Against the code before the stamp the evidence assertion fails:
@@ -1882,7 +1935,7 @@ mod tests {
         for (door, error) in [("event_get", got), ("event_update", updated)] {
             assert_eq!(
                 error.kind(),
-                &AccountErrorKind::NotFound(ResourceKind::Calendar),
+                &AccountErrorKind::NotFound(ResourceKind::Event),
                 "{door}"
             );
             assert_eq!(error.recovery(), &RecoveryClass::ProviderRefused, "{door}");
@@ -1891,7 +1944,7 @@ mod tests {
             assert!(
                 matches!(
                     error.scope(),
-                    Some(ErrorScope::Calendar { id }) if id.0 == url
+                    Some(ErrorScope::Event { id }) if id.0 == url
                 ),
                 "{door}: {:?}",
                 error.scope()

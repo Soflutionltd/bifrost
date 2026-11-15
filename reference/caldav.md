@@ -514,14 +514,19 @@ Supported calendar primitives:
   spec-correct server 404s.
   A CalDAV `CalendarId` IS the resolved collection href used by the account;
   `Calendar.id`, `Calendar.native_id`, event `calendar_id`, request routing,
-  and `ErrorScope::Calendar` all carry that same URL identity - with one
-  documented overload: on the single-resource paths (`fetch_event_from_url`
-  behind `event_get` / `event_update` / `event_rsvp`, and the dropped-create
-  scope in `event_create`) `ErrorScope::Calendar` carries the EVENT's URL,
-  because `bifrost-types` has no event scope and a `Reconcile(CheckTarget)`
-  needs a checkable target. Ruled dav-F8 (2026-09-07): the overload is
-  admitted rather than a public variant added; the reasoning is at
-  `client::event_scope`.
+  and `ErrorScope::Calendar` all carry that same collection URL identity.
+  Single-resource failures use `ErrorScope::Event` with the event URL, including
+  fetch/projection failures and dropped creates, so reconciliation names the
+  resource to probe. The resource kind on a 403 / 404 follows what the request
+  addressed: a request for one event resource (the event GET and PUT,
+  conditional and unconditional DELETE, MOVE, and the no-VEVENT
+  `not_found_error`) goes through `item_status_error` /
+  `DavProtocol::item_resource` and names `ResourceKind::Event`. A collection
+  request (PROPFIND, REPORT, sync-collection, multiget and inventory member
+  failures, discovery, the schedule outbox POST) keeps `status_error` /
+  `DavProtocol::resource` and names `ResourceKind::Calendar`. Collection
+  requests are the only ones `should_fallback_discovery` sees. CardDAV names
+  `ResourceKind::Contact` on both paths.
 - `events_in_range` - `calendar-query` `REPORT` with a CalDAV
   `time-range` filter, followed by local overlap filtering as a defensive
   guard. The guard applies RFC 4791 s9.9's two overlap shapes: an event with
@@ -823,7 +828,8 @@ Supported calendar primitives:
   raw-preserving replacement path to the local resource. Accounts without
   an identifiable attendee, organizer, or schedule outbox return
   `Unsupported`. The advertised `pim_methods.event_rsvp` flag is
-  discovery-derived, not assumed: `scheduling_available` requires BOTH a
+  discovery-derived, not assumed: both the capability and method gate use
+  `scheduling_available`, treating blank values as absent. It requires BOTH a
   `CALDAV:schedule-outbox-URL` on the current-user-principal AND a
   calendar-user-address for this user (from
   `CALDAV:calendar-user-address-set`, or configured explicitly). A plain

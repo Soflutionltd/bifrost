@@ -27,17 +27,15 @@ use bifrost_types::{
     AccountError, AccountOperation, BatchItemId, BatchOutcome, BatchOutcomeBuilder, ErrorScope,
     MessageReactionState, ObjectId,
 };
-use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::GraphAccount;
 use super::graph_error::{
-    GraphErrorContext, batch_response_missing, into_account_error, response_to_account_error_pub,
-    unsupported_item_error,
+    GraphErrorContext, batch_response_missing, into_account_error, unsupported_item_error,
 };
 use super::pim::{ews_read_folder, message_batch_url};
-use crate::error::{GraphError, GraphResponseError};
+use crate::error::GraphError;
 use crate::types::{BatchRequest, BatchRequestItem, BatchResponseItem};
 
 /// The MAPI named-property GUID Outlook stores reactions under. Identical
@@ -242,17 +240,12 @@ fn classify_chunk(
                 .as_ref()
                 .map(|v| bytes::Bytes::from(serde_json::to_vec(v).unwrap_or_default()))
                 .unwrap_or_default();
-            let response = GraphResponseError::from_response(
-                StatusCode::from_u16(item.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                headers,
-                body,
-            );
             let ctx = GraphErrorContext::graph(operation).with_scope(ErrorScope::Message {
                 id: (message_id.0.clone()).into(),
             });
             builder.push_failed(
                 BatchItemId(message_id.0.clone()),
-                response_to_account_error_pub(response, &ctx),
+                super::graph_error::batch_status_error(item.status, headers, body, &ctx),
             );
         }
     }
@@ -533,6 +526,30 @@ mod tests {
             "body": body,
         }))
         .expect("batch response item deserializes")
+    }
+
+    #[test]
+    fn reaction_reads_reject_invalid_batch_statuses() {
+        for status in [0, 99, 1000, u16::MAX] {
+            let mut builder = BatchOutcomeBuilder::new();
+            classify_chunk(
+                &[oid("m1")],
+                vec![response_item("0", status, None)],
+                AccountOperation::MessageReactionsRead,
+                &mut builder,
+                &[true],
+            );
+            let outcome = builder.finalize(&[BatchItemId("m1".into())]).unwrap();
+            assert!(outcome.succeeded().is_empty());
+            assert!(outcome.uncertain().is_empty());
+            assert_eq!(outcome.failed().len(), 1);
+            assert_eq!(
+                outcome.failed()[0].error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::ContractViolation,
+                )
+            );
+        }
     }
 
     #[test]

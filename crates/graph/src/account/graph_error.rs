@@ -1664,6 +1664,26 @@ pub(crate) fn subrequest_replayable(item: &crate::types::BatchRequestItem) -> bo
     bifrost_net::request_is_replayable(declared, &method, &headers)
 }
 
+/// Invalid numeric statuses are malformed provider answers, never synthetic 500s.
+pub(crate) fn batch_status_error(
+    status: u16,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+    ctx: &GraphErrorContext,
+) -> AccountError {
+    match StatusCode::from_u16(status) {
+        Ok(status) => response_to_account_error(
+            GraphResponseError::from_response(status, headers, body),
+            ctx,
+        ),
+        Err(_) => provider_answer_violation(
+            ProtocolErrorKind::ContractViolation,
+            format!("Graph batch response has invalid HTTP status {status}"),
+            ctx,
+        ),
+    }
+}
+
 /// Translate a single `$batch` response item into an
 /// `ItemOutcome<MutationSuccess>`. Centralizes the mutation outcome
 /// rules from the plan: 2xx -> applied, destroy-404 -> skipped, 404 -> not
@@ -1692,14 +1712,9 @@ pub(crate) fn mutation_item_outcome(
     if status == 404 && destroy {
         return ItemOutcome::Succeeded(BatchSuccess::new(item_id, MutationSuccess::Skipped));
     }
-    let response = GraphResponseError::from_response(
-        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        headers,
-        body,
-    );
     let mut ctx = GraphErrorContext::graph(operation).with_scope(scope);
     ctx.budget = budget;
-    let error = response_to_account_error(response, &ctx);
+    let error = batch_status_error(status, headers, body, &ctx);
     ItemOutcome::Failed(BatchFailure::new(item_id, error))
 }
 
@@ -2515,6 +2530,24 @@ mod tests {
             err.kind(),
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
         ));
+    }
+
+    #[test]
+    fn invalid_batch_statuses_are_contract_violations() {
+        for status in [0, 99, 1000, u16::MAX] {
+            let outcome = mutation_item_outcome(
+                status,
+                HeaderMap::new(),
+                Bytes::new(),
+                false,
+                bifrost_types::BatchItemId("m1".into()),
+                AccountOperation::UpdateFlags,
+                ErrorScope::Message { id: "m1".into() },
+                None,
+            );
+            assert!(matches!(outcome, bifrost_types::ItemOutcome::Failed(f)
+                if f.error.kind() == &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)));
+        }
     }
 
     #[test]

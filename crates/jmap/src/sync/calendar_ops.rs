@@ -526,14 +526,20 @@ async fn get_raw_event<T: HttpTransport>(
     operation: AccountOperation,
 ) -> Result<JmapCalendarEvent, AccountError> {
     let response = calendars
-        .call(CalendarEventGet::new().ids([id]))
+        .call(CalendarEventGet::new().ids([id.clone()]))
         .await
         .map_err(to_acct_err(operation))?;
-    response
-        .into_list()
-        .into_iter()
-        .next()
-        .ok_or_else(|| unsupported(operation, "JMAP CalendarEvent/get returned no event"))
+    let not_found = response.not_found().contains(&id);
+    super::single_get::require_one(
+        response.into_list(),
+        |event| event.id().is_some_and(|returned| returned == id),
+        not_found,
+        id.as_str(),
+        operation,
+        bifrost_types::ErrorScope::Event {
+            id: EventId(id.clone().into_string()),
+        },
+    )
 }
 
 fn calendar_from_jmap(calendar: JmapCalendar) -> Calendar {
@@ -1976,6 +1982,10 @@ fn parse_duration_seconds(value: &str) -> Option<u64> {
     for ch in value.chars() {
         match ch {
             'T' => in_time = true,
+            'W' if !in_time => {
+                seconds = seconds.checked_add(number.parse::<u64>().ok()?.checked_mul(604_800)?)?;
+                number.clear();
+            }
             'D' => {
                 seconds = seconds.checked_add(number.parse::<u64>().ok()?.checked_mul(86_400)?)?;
                 number.clear();
@@ -2286,6 +2296,39 @@ mod tests {
         )
         .expect("client builds");
         JmapProtoAccount::new(client, "primary")
+    }
+
+    #[tokio::test]
+    async fn single_event_reads_correlate_identity_and_reject_unanswered_ids() {
+        let account = search_account();
+        let event = get_raw_event(
+            &account,
+            CalendarEventId::new("e2"),
+            AccountOperation::EventGet,
+        )
+        .await
+        .expect("second returned event");
+        assert_eq!(event.id(), Some(CalendarEventId::new("e2")));
+        for operation in [
+            AccountOperation::EventGet,
+            AccountOperation::EventUpdate,
+            AccountOperation::EventRsvp,
+        ] {
+            let error = get_raw_event(&account, CalendarEventId::new("absent"), operation)
+                .await
+                .expect_err("unrelated events do not answer this id");
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::PartialResponse,)
+            );
+            assert_eq!(
+                error.scope(),
+                Some(&bifrost_types::ErrorScope::Event {
+                    id: EventId("absent".into()),
+                })
+            );
+            assert_eq!(error.operation(), Some(operation));
+        }
     }
 
     #[tokio::test]
@@ -2721,6 +2764,30 @@ mod tests {
         )
         .expect_err("bad patch start with blank end");
         assert_malformed_field(&error, "start");
+    }
+
+    #[test]
+    fn week_durations_preserve_timed_and_all_day_event_ends() {
+        for (start, all_day, expected) in [
+            ("2026-06-02T12:00:00", false, "2026-06-09T12:00:00+00:00"),
+            ("2026-06-02T00:00:00", true, "2026-06-09"),
+        ] {
+            let event = JmapCalendarEvent {
+                properties: serde_json::from_value(json!({
+                    "id": "weekly",
+                    "start": start,
+                    "duration": "P1W",
+                    "showWithoutTime": all_day
+                }))
+                .expect("event properties"),
+            };
+            let projected =
+                event_from_jmap(event, AccountOperation::EventGet).expect("supported event");
+            assert_eq!(projected.end.expect("event end").value, expected);
+        }
+        assert_eq!(parse_duration_seconds("P2W"), Some(1_209_600));
+        assert_eq!(parse_duration_seconds("P18446744073709551615W"), None);
+        assert_eq!(parse_duration_seconds("PT1W"), None);
     }
 
     #[test]

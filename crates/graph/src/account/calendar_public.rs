@@ -51,7 +51,7 @@ pub(super) fn reject_calendar(id: &CalendarId, op: AccountOperation) -> Result<(
     Ok(())
 }
 pub(super) fn reject_event(id: &EventId, op: AccountOperation) -> Result<(), AccountError> {
-    if foreign::parse_public_event(&id.0).is_some() {
+    if foreign::parse_public_calendar(&id.0).is_some() {
         return Err(graph_error::unsupported_account_error(op));
     }
     Ok(())

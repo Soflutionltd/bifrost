@@ -174,6 +174,17 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
             diagnostic.as_deref(),
             None,
         ),
+        ErrorKind::LocalRuntime => build_basic(
+            &ctx,
+            AccountErrorKind::Internal(InternalErrorKind::RuntimeFailure),
+            Cause::Internal(InternalCause::new(
+                InternalErrorKind::RuntimeFailure,
+                diagnostic.clone().map(DiagnosticText::support_only),
+            )),
+            attempt_state,
+            diagnostic.as_deref(),
+            None,
+        ),
         ErrorKind::Policy => build_basic(
             &ctx,
             AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked),

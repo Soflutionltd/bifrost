@@ -92,6 +92,40 @@ fn account() -> common::StubAccount {
     account.scope_keys = Some(Arc::new(|_| vec![key()]));
     account
 }
+
+#[tokio::test]
+async fn engine_auto_pause_preserves_stop_before_a_waiter_observes_it() {
+    let fixture = Fixture::new(Arc::new(common::StubFactory::queue(vec![Arc::new(
+        account(),
+    )])))
+    .await;
+    let writer = fixture.writer();
+    let ctx = fixture.ctx(&writer);
+    let mut boundary = Boundary::from(fixture.slot.boundary_tx.clone()).subscribe();
+
+    engine_pause(&ctx, PauseReason::RetryBudgetExhausted);
+    assert_eq!(boundary.peek(), BoundaryRequest::Pause);
+    fixture.slot.boundary_tx.send_replace(BoundaryRequest::Stop);
+    // Recovery finishes after detach, before the watcher consumes Stop.
+    // Watch updates coalesce, so a blind Pause would erase its only exit signal.
+    engine_pause(&ctx, PauseReason::OperatorOverrideRequired);
+    assert_eq!(boundary.changed().await, Some(BoundaryRequest::Stop));
+    assert_eq!(boundary.peek(), BoundaryRequest::Stop);
+}
+
+#[tokio::test]
+async fn engine_resume_preserves_stop_before_slot_removal() {
+    let fixture = Fixture::new(Arc::new(common::StubFactory::queue(vec![Arc::new(
+        account(),
+    )])))
+    .await;
+    // Exercise the write itself while the slot is still reachable. Detach
+    // normally removes it first, but Stop must not depend on that lookup order.
+    fixture.slot.boundary_tx.send_replace(BoundaryRequest::Stop);
+    fixture.engine.resume_account(&fixture.id).expect("resume");
+    assert_eq!(*fixture.slot.boundary_tx.borrow(), BoundaryRequest::Stop);
+}
+
 async fn turns() {
     for _ in 0..30 {
         tokio::task::yield_now().await;

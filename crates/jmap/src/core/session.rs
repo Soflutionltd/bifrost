@@ -580,7 +580,7 @@ impl Session {
     /// ```ignore
     /// use crate::core::capability::{Capability, Mail};
     /// if let Some(mail) = session.capability_config::<Mail>() {
-    ///     println!("max mailbox depth: {}", mail.max_mailbox_depth());
+    ///     println!("max mailbox depth: {:?}", mail.max_mailbox_depth());
     /// }
     /// ```
     pub(crate) fn capability_config<C: super::capability::Capability>(&self) -> Option<C::Config> {

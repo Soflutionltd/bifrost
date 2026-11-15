@@ -113,17 +113,24 @@ pub(crate) fn get<T: HttpTransport>(
 ) -> AccountFuture<Result<ContactCard, AccountError>> {
     Box::pin(async move {
         let contacts = require_contacts(contacts, AccountOperation::ContactGet)?;
-        let hydrated = get_cards(
-            &contacts,
-            vec![ContactCardId::new(contact.0)],
-            AccountOperation::ContactGet,
-        )
-        .await?;
-        hydrated
-            .cards
-            .into_iter()
-            .next()
-            .ok_or_else(|| unsupported(AccountOperation::ContactGet, "JMAP contact was not found"))
+        let operation = AccountOperation::ContactGet;
+        let id = ContactCardId::new(contact.0.clone());
+        let response = contacts
+            .call(ContactCardGet::new().ids([id.clone()]))
+            .await
+            .map_err(to_acct_err(operation))?;
+        let not_found = response.not_found().contains(&id);
+        let card = super::single_get::require_one(
+            response.into_list(),
+            |card| card.id().is_some_and(|returned| returned == id),
+            not_found,
+            &contact.0,
+            operation,
+            bifrost_types::ErrorScope::Contact {
+                id: contact.clone(),
+            },
+        )?;
+        contact_from_jmap(card, operation)
     })
 }
 
@@ -1050,6 +1057,36 @@ fn to_acct_err(operation: AccountOperation) -> impl Fn(crate::Error) -> AccountE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_single_contact_omitted_from_the_answer_is_retryable() {
+        let client = crate::client::Client::with_transport(
+            UnansweredGetTransport {
+                sets: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            },
+            contacts_session(),
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        let error = get(
+            Some(ContactAccount::new(client, "primary")),
+            ContactId("c1".into()),
+        )
+        .await
+        .expect_err("unanswered read");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::PartialResponse,
+            ),
+        );
+        assert_eq!(
+            error.scope(),
+            Some(&bifrost_types::ErrorScope::Contact {
+                id: ContactId("c1".into()),
+            })
+        );
+    }
 
     fn card(id: &str) -> JmapContactCard {
         JmapContactCard {

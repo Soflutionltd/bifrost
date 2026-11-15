@@ -251,6 +251,16 @@ impl TryFrom<String> for Address {
     }
 }
 
+#[cfg(feature = "account-error")]
+/// Convert an untrusted account address using the checked envelope parser.
+impl TryFrom<&bifrost_types::Address> for Address {
+    type Error = AddressError;
+
+    fn try_from(address: &bifrost_types::Address) -> Result<Self, Self::Error> {
+        address.address.parse()
+    }
+}
+
 impl AsRef<str> for Address {
     fn as_ref(&self) -> &str {
         &self.serialized
@@ -306,6 +316,24 @@ impl Display for AddressError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "account-error")]
+    #[test]
+    fn account_address_conversion_rejects_envelope_parameter_injection() {
+        for input in [
+            "a@b.example> NOTIFY=SUCCESS ORCPT=rfc822;x",
+            "a> NOTIFY=SUCCESS@b.example",
+            "missing-domain",
+            "a@b.example\r\nDATA",
+        ] {
+            assert!(Address::try_from(&bifrost_types::Address::bare(input)).is_err());
+        }
+        let address = bifrost_types::Address::bare("user@example.com");
+        assert_eq!(
+            Address::try_from(&address).unwrap().to_string(),
+            address.address
+        );
+    }
 
     #[test]
     fn ascii_address() {

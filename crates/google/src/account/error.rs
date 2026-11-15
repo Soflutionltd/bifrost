@@ -212,12 +212,8 @@ impl GmailErrorContext {
         ctx.resource = Some(GmailResource::Blob);
         // Blob lives below a message in Gmail. Anchor diagnostics on
         // the parent message scope so consumer routing can find the
-        // owning message; the blob id itself is preserved as a
-        // diagnostic note.
-        ctx.scope = Some(ErrorScope::Message {
-            id: (id.clone()).into(),
-        });
-        ctx.diagnostic_id = Some(id);
+        // owning message.
+        ctx.scope = Some(ErrorScope::Message { id: id.into() });
         ctx
     }
 

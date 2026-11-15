@@ -314,6 +314,8 @@ impl SyncEngine {
     /// proving different coverage - so passing the wrong one, or none, would
     /// apply another publication's coverage claim to this checkpoint. An
     /// unrecognized publication is rejected rather than assumed complete.
+    /// The scope must match the checkpoint scope; a mismatch is rejected
+    /// before enqueueing and cannot change provisional or durable state.
     pub async fn ack_checkpoint(
         &self,
         account_id: &AccountId,
@@ -321,6 +323,7 @@ impl SyncEngine {
         checkpoint: Checkpoint,
         publication: Option<crate::cursor::PublicationId>,
     ) -> Result<(), Error> {
+        ack::validate_ack_scope(&scope, &checkpoint)?;
         let tx = self
             .ack_senders
             .get(account_id)
@@ -1172,14 +1175,14 @@ impl SyncEngine {
 
     /// Consumer-driven resume. Flips the boundary back to `Run` and
     /// publishes `AccountControl::Resume` so other subscribers observe
-    /// the transition. Idempotent.
+    /// the transition. Idempotent. A teardown's `Stop` remains terminal.
     pub fn resume_account(&self, account_id: &AccountId) -> Result<(), Error> {
         let slot = self
             .accounts
             .get(account_id)
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        slot.boundary_tx
-            .send_replace(crate::cancel::BoundaryRequest::Run);
+        Boundary::from(slot.boundary_tx.clone())
+            .set_unless_stopped(crate::cancel::BoundaryRequest::Run);
         let _ = slot.account_control_tx.send(AccountControl::Resume);
         Ok(())
     }

@@ -38,6 +38,7 @@ pub(crate) struct Principal {
     pub(super) email: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "timeZone")]
     pub(super) timezone: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -87,6 +88,7 @@ pub(crate) struct PrincipalCreate {
     pub(super) email: Option<String>,
 
     #[serde(skip_serializing_if = "skip_if_empty_str")]
+    #[serde(rename = "timeZone")]
     pub(super) timezone: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -133,6 +135,7 @@ pub(crate) struct PrincipalPatch {
     pub(super) email: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "timeZone")]
     pub(super) timezone: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -236,7 +239,7 @@ pub(crate) enum Property {
     Description = 3,
     #[serde(rename = "email")]
     Email = 4,
-    #[serde(rename = "timezone")]
+    #[serde(rename = "timeZone")]
     Timezone = 5,
     #[serde(rename = "capabilities")]
     Capabilities = 6,
@@ -338,7 +341,7 @@ impl Display for Property {
             Property::Name => write!(f, "name"),
             Property::Description => write!(f, "description"),
             Property::Email => write!(f, "email"),
-            Property::Timezone => write!(f, "timezone"),
+            Property::Timezone => write!(f, "timeZone"),
             Property::Capabilities => write!(f, "capabilities"),
             Property::Aliases => write!(f, "aliases"),
             Property::Secret => write!(f, "secret"),
@@ -452,3 +455,38 @@ crate::define_query_changes_method!(
     "Principal/queryChanges",
     crate::core::capability::Principals
 );
+
+#[cfg(test)]
+mod time_zone_tests {
+    use super::{Principal, PrincipalCreate, PrincipalPatch, Property};
+    use crate::core::SetCreate;
+    use serde_json::json;
+
+    #[test]
+    fn time_zone_uses_the_same_wire_name_for_reads_and_writes() {
+        let principal: Principal =
+            serde_json::from_value(json!({"timeZone": "Europe/Oslo"})).unwrap();
+        assert_eq!(principal.timezone(), Some("Europe/Oslo"));
+        assert_eq!(
+            serde_json::to_value(&principal).unwrap()["timeZone"],
+            "Europe/Oslo"
+        );
+        assert_eq!(
+            serde_json::to_value(Property::Timezone).unwrap(),
+            "timeZone"
+        );
+        assert_eq!(Property::Timezone.to_string(), "timeZone");
+
+        let mut create = PrincipalCreate::new(None);
+        create.timezone(Some("Europe/Oslo"));
+        let mut patch = PrincipalPatch::default();
+        patch.timezone(Some("Europe/Oslo"));
+        for value in [
+            serde_json::to_value(create).unwrap(),
+            serde_json::to_value(patch).unwrap(),
+        ] {
+            assert_eq!(value["timeZone"], "Europe/Oslo");
+            assert!(value.get("timezone").is_none());
+        }
+    }
+}

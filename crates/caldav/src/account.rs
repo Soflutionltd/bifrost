@@ -1237,6 +1237,11 @@ impl Account for CalDavAccount {
         let schedule_outbox_url = self.schedule_outbox_url.clone();
         Box::pin(async move {
             reject_recurrence_instance_id(&event, AccountOperation::EventRsvp)?;
+            // Use the capability predicate here too: a present but blank value
+            // cannot identify an attendee or a scheduling destination.
+            if !scheduling_available(rsvp_email.as_deref(), schedule_outbox_url.as_deref()) {
+                return Err(unsupported_error(AccountOperation::EventRsvp));
+            }
             let Some(rsvp_email) = rsvp_email else {
                 return Err(unsupported_error(AccountOperation::EventRsvp));
             };
@@ -2398,6 +2403,40 @@ mod tests {
     };
     use reqwest::StatusCode;
     use reqwest::header::HeaderMap;
+
+    #[tokio::test]
+    async fn blank_scheduling_values_refuse_rsvp_before_io() {
+        for (address, outbox) in [
+            ("  ", "https://dav.example.test/outbox/"),
+            ("me@example.test", "  "),
+        ] {
+            let client = CalDavClient::with_account_net(
+                "https://dav.example.test",
+                scripted_dav_net(&dav_script_empty()),
+            );
+            let mut account =
+                CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+            account.rsvp_email = Some(address.to_string());
+            account.schedule_outbox_url = Some(outbox.to_string());
+            let available = scheduling_available(
+                account.rsvp_email.as_deref(),
+                account.schedule_outbox_url.as_deref(),
+            );
+            account.capabilities = caldav_capabilities(available);
+            assert!(!account.capabilities.pim_methods.event_rsvp);
+            let error = account
+                .event_rsvp(
+                    EventId("https://dav.example.test/cal/one.ics".to_string()),
+                    RsvpStatus::Accepted,
+                )
+                .await
+                .expect_err("blank scheduling must refuse locally");
+            assert_eq!(
+                error.kind(),
+                unsupported_error(AccountOperation::EventRsvp).kind()
+            );
+        }
+    }
 
     /// `set_priority` and `set_bandwidth_cap` reach the account's transport.
     ///

@@ -7,16 +7,16 @@ use bifrost_types::{
 };
 use bytes::Bytes;
 use futures::StreamExt;
+#[cfg(test)]
 use reqwest::StatusCode;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 
-use crate::error::GraphResponseError;
 use crate::types::{BatchRequest, BatchRequestItem, BatchResponse, MESSAGE_SELECT};
 
 use super::GraphAccount;
 use super::blob::blob_handle_from_graph_attachment;
-use super::graph_error::{GraphErrorContext, into_account_error, response_to_account_error_pub};
+use super::graph_error::{GraphErrorContext, into_account_error};
 use super::inventory::{graph_etag, inventory_entry_from_value};
 
 pub(crate) fn get_stream(
@@ -458,18 +458,13 @@ fn reconcile_hydration_responses(
                 .as_ref()
                 .map(|v| Bytes::from(serde_json::to_vec(v).unwrap_or_default()))
                 .unwrap_or_default();
-            let response = GraphResponseError::from_response(
-                StatusCode::from_u16(item.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                headers,
-                body,
-            );
             let mut ctx = GraphErrorContext::graph(AccountOperation::Hydrate).with_scope(
                 ErrorScope::Message {
                     id: (id.0.clone()).into(),
                 },
             );
             ctx.budget = budget_for(&id);
-            let error = response_to_account_error_pub(response, &ctx);
+            let error = super::graph_error::batch_status_error(item.status, headers, body, &ctx);
             outcomes.push(ItemOutcome::Failed(BatchFailure::new(batch_id, error)));
             continue;
         }
@@ -733,6 +728,32 @@ mod tests {
     use crate::client::GraphClient;
     use crate::types::BatchResponseItem;
     use serde_json::json;
+
+    #[test]
+    fn hydration_rejects_out_of_range_batch_statuses() {
+        for status in [0, 99, 1000, u16::MAX] {
+            let mut outcomes = Vec::new();
+            let etags = reconcile_hydration_responses(
+                &[ObjectId("m1".into())],
+                vec![BatchResponseItem {
+                    id: "0".into(),
+                    status,
+                    headers: None,
+                    body: None,
+                }],
+                Projection::FlagsOnly,
+                &mut outcomes,
+                &|_| None,
+                &[true],
+            );
+            assert!(etags.is_empty());
+            assert_eq!(outcomes.len(), 1);
+            assert!(matches!(&outcomes[0], ItemOutcome::Failed(f)
+            if f.error.kind() == &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation,
+            )));
+        }
+    }
 
     // Lives beside `flags_from_value` rather than the judge so the vocabulary
     // it pins is the real REST mapper's, not a hand-written observation.

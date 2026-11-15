@@ -351,6 +351,8 @@ pub enum ErrorKind {
     ParameterOverLimit,
     /// Internal client invariant failure.
     Internal,
+    /// A local runtime facility, such as the system entropy source, failed.
+    LocalRuntime,
     /// Client-side policy refusal.
     Policy,
     /// Connection error.
@@ -392,6 +394,7 @@ impl fmt::Display for Error {
                 f.write_str("SMTP parameter exceeds server-advertised limit")?;
             }
             ErrorKind::Internal => f.write_str("internal SMTP error")?,
+            ErrorKind::LocalRuntime => f.write_str("SMTP local runtime failure")?,
             ErrorKind::Policy => f.write_str("SMTP policy error")?,
             ErrorKind::Network => f.write_str("SMTP network error")?,
             ErrorKind::Connection => f.write_str("SMTP connection error")?,
@@ -483,6 +486,10 @@ pub(crate) fn parameter_over_limit<E: Into<BoxError>>(e: E) -> Error {
 
 pub(crate) fn internal<E: Into<BoxError>>(e: E) -> Error {
     Error::new(ErrorKind::Internal, Some(e))
+}
+
+pub(crate) fn local_runtime<E: Into<BoxError>>(e: E) -> Error {
+    Error::new(ErrorKind::LocalRuntime, Some(e))
 }
 
 pub(crate) fn policy<E: Into<BoxError>>(e: E) -> Error {

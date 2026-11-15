@@ -131,7 +131,13 @@ pub(crate) async fn get(
     account: GraphAccount,
     event: EventId,
 ) -> Result<CalendarEvent, AccountError> {
-    if let Some((folder, item)) = super::foreign::parse_public_event(&event.0) {
+    if super::foreign::parse_public_calendar(&event.0).is_some() {
+        let (folder, item) = super::foreign::parse_public_event(&event.0).ok_or_else(|| {
+            graph_error::invalid_account_error(
+                AccountOperation::EventGet,
+                "public event id requires a folder and item id",
+            )
+        })?;
         return public::get(&account, folder, item).await;
     }
     let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventGet)?;
@@ -2513,6 +2519,27 @@ mod tests {
         GraphDateTime {
             date_time: Some(value.to_string()),
             time_zone: Some("UTC".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_public_item_reads_are_refused_before_io() {
+        for tail in ["folder", "folder\u{1e}", "\u{1e}item"] {
+            let client = crate::client::GraphClient::new("token");
+            let account = GraphAccount::new_for_tests(
+                client.clone(),
+                super::super::PushMode::GraphSubscriptions,
+            );
+            let error = get(account, EventId(format!("public-calendar\u{1e}{tail}")))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed,
+                )
+            );
+            assert!(client.take_rest_requests().is_empty());
         }
     }
 

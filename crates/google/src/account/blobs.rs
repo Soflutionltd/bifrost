@@ -187,7 +187,7 @@ fn collect_attachments(
     }
 }
 
-fn content_id_value(headers: &[crate::types::GmailHeader]) -> Option<String> {
+pub(super) fn content_id_value(headers: &[crate::types::GmailHeader]) -> Option<String> {
     headers
         .iter()
         .find(|header| header.name.eq_ignore_ascii_case("Content-ID"))
@@ -200,7 +200,7 @@ fn content_id_value(headers: &[crate::types::GmailHeader]) -> Option<String> {
         })
 }
 
-fn content_disposition_inline(headers: &[crate::types::GmailHeader]) -> bool {
+pub(super) fn content_disposition_inline(headers: &[crate::types::GmailHeader]) -> bool {
     headers
         .iter()
         .find(|header| header.name.eq_ignore_ascii_case("Content-Disposition"))
@@ -243,6 +243,14 @@ fn decode_blob_id(id: &BlobId) -> Result<GmailBlobKey, BlobError> {
     serde_json::from_str(&id.0).map_err(|err| BlobError::InvalidId(err.to_string()))
 }
 
+fn blob_error_context(blob_id: &BlobId) -> error::GmailErrorContext {
+    // A malformed handle has no trustworthy parent coordinate.
+    match decode_blob_id(blob_id) {
+        Ok(key) => error::GmailErrorContext::open_blob(key.message_id),
+        Err(_) => error::GmailErrorContext::base(AccountOperation::OpenBlob),
+    }
+}
+
 fn translate(error: BlobError, blob_id: &BlobId) -> AccountError {
     match error {
         BlobError::InvalidId(detail) => error::into_account_error(
@@ -250,12 +258,9 @@ fn translate(error: BlobError, blob_id: &BlobId) -> AccountError {
                 AccountOperation::OpenBlob,
                 format!("invalid gmail blob id: {detail}"),
             ),
-            error::GmailErrorContext::open_blob(blob_id.0.clone()),
+            blob_error_context(blob_id),
         ),
-        BlobError::Gmail(error) => error::into_account_error(
-            error,
-            error::GmailErrorContext::open_blob(blob_id.0.clone()),
-        ),
+        BlobError::Gmail(error) => error::into_account_error(error, blob_error_context(blob_id)),
     }
 }
 
@@ -265,6 +270,23 @@ fn terminate_blob(error: AccountError) -> SyncEvent<Bytes> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn blob_failure_scope_uses_parent_message() {
+        let id = super::encode_blob_id("parent", "attachment");
+        let ctx = super::blob_error_context(&id);
+        assert_eq!(
+            ctx.scope,
+            Some(bifrost_types::ErrorScope::Message {
+                id: "parent".into()
+            })
+        );
+        assert!(
+            super::blob_error_context(&bifrost_types::BlobId("invalid".into()))
+                .scope
+                .is_none()
+        );
+    }
+
     use std::sync::Arc;
 
     use bifrost_net::test_support::{Canned, ScriptedDispatch};

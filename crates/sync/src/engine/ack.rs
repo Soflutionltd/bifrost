@@ -2,6 +2,28 @@
 
 use super::*;
 
+/// Reject inconsistent routing before provisional ownership or durable state changes.
+pub(super) fn validate_ack_scope(
+    scope: &CursorScope,
+    checkpoint: &Checkpoint,
+) -> Result<(), Error> {
+    let checkpoint_scope = match checkpoint {
+        Checkpoint::Change(cursor) => &cursor.scope,
+        Checkpoint::Backfill(checkpoint) => &checkpoint.scope,
+        _ => {
+            return Err(Error::Other(
+                "unsupported acknowledgement checkpoint".into(),
+            ));
+        }
+    };
+    if scope != checkpoint_scope {
+        return Err(Error::Other(
+            "acknowledgement scope does not match checkpoint scope".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Remove the account's single ack-writer worker from a drained worker list.
 ///
 /// Detach must wait on the stream workers FIRST: every one of them holds a
@@ -221,6 +243,12 @@ pub(super) async fn ack_writer(
             .expect("ledger loaded before dispatch");
         let req = match req {
             WriterRequest::Ack(req) => {
+                if let Err(error) = validate_ack_scope(&req.scope, &req.checkpoint) {
+                    if let Some(done) = req.complete {
+                        let _ = done.send(Err(error));
+                    }
+                    continue;
+                }
                 // An acknowledgement is real committed consumer progress, so
                 // the row is no longer merely provisional even if a reattach
                 // inserted it. A replacement's inventory pass broadcasts

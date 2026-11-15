@@ -1026,6 +1026,14 @@ impl<E> AsyncSmtpClient<E>
 where
     E: SmtpExecutor,
 {
+    #[cfg(test)]
+    pub(super) fn for_pool_test() -> Self {
+        Self {
+            info: SmtpInfo::new("transcript.invalid", Protocol::Smtp),
+            marker_: PhantomData,
+        }
+    }
+
     /// Creates a new connection directly usable to send emails
     ///
     /// Handles encryption and authentication

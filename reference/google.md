@@ -1525,9 +1525,18 @@ id) are not surfaced. `message_from_gmail` calls it under `Full` and
 attachment metadata without bytes and only `FullWithBlobs` implies
 fetchable content. The `inline` marker reads only the leading
 `Content-Disposition` token, case-insensitively; parameter text such as a
-filename containing `inline` does not make an attachment inline.
+filename containing `inline` does not make an attachment inline. Draft re-render
+uses the same disposition and Content-ID helpers as attachment hydration.
+Inventory and message hydration share References parsing, stripping brackets
+and discarding empty tokens.
 `blob_handles_for_message` remains as the
 `Vec<BlobHandle>`-only helper `open_blob`'s tests build against.
+
+Single-object mail mutations retain their message or thread scope and resource.
+Thread relocation reports `MoveThread`; both trashing and permanently deleting
+a thread report `DeleteThread`. Closed push unsubscribe retains its unsubscribe
+context without adding an account cursor scope. Malformed blob handles have no
+parent scope; valid handles anchor errors to the decoded parent message id.
 
 ## Error translation
 

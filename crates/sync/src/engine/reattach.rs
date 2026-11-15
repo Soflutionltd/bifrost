@@ -2346,8 +2346,11 @@ fn engine_pause(ctx: &RecoveryContext<'_>, reason: PauseReason) {
     // driven work for the account until a consumer calls
     // `SyncEngine::resume_account` (or sends `Resume` through
     // `Control::resume`).
-    ctx.boundary_tx
-        .send_replace(crate::cancel::BoundaryRequest::Pause);
+    // Recovery can finish after detach has published Stop. Preserve that
+    // terminal request atomically so workers exit and checkpoint waiters
+    // observe teardown even if they have not polled the watch yet.
+    Boundary::from(ctx.boundary_tx.clone())
+        .set_unless_stopped(crate::cancel::BoundaryRequest::Pause);
 }
 
 /// Emit one structured `warn!` per open-time skip. The durable record

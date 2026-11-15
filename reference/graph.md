@@ -565,7 +565,9 @@ construction, independently of routing-map membership. Native ids and
 `ContactProvenance` remain bare EWS ids. A recognized public read with no
 routing entry refuses locally as `ConcurrencyConflict` with `Unsent`
 evidence (refresh local state), including after reopen before discovery.
-No public contact id falls back to REST.
+No public contact id falls back to REST. Public contact and event reads require
+nonempty folder and item components with exactly one separator between them;
+truncated or malformed tagged ids are refused locally as `Request(Malformed)`.
 
 `contacts_list` requests contact properties over EWS `FindItem`, using the
 folder's content-mailbox headers. The provider-owned JSON cursor contains a
@@ -1647,6 +1649,7 @@ pass, so dropped sessions cannot lose sibling gap obligations. Install uses
 `get_mut`, refuses missing or tearing-down groups, and undoes an unaccepted
 create. Scope attribution and classification use the failure that actually
 blocked renewal or recreation. Default and maximum expiry are seven days.
+Renewal and deletion encode opaque subscription ids as single URL path components.
 
 #### Cancellation safety of the webhook `push_subscribe`
 
@@ -2462,6 +2465,9 @@ the engine then records ALONE.
   `Authorization(MailboxUnavailable { Transient })` -> `Retry::SameRequest`;
   `PreconditionFailed` / 412 -> `ConcurrencyConflict` ->
   `Retry::AfterStateRefresh`.
+
+Batch readers reject numeric statuses outside 100..=999 as acknowledged
+`Protocol(ContractViolation)` errors rather than substituting a retryable 500.
 
 `mutation_item_outcome` projects per-id `$batch` responses onto `ItemOutcome`:
 2xx -> `Succeeded(Applied)`, 404-on-destroy -> `Succeeded(Skipped)`, 412 ->

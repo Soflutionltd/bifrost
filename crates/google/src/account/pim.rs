@@ -31,12 +31,14 @@ use crate::types::{
 };
 
 use super::blobs;
+use super::blobs::{content_disposition_inline, content_id_value};
 use super::error;
 use super::flags;
 use super::flags::{ARCHIVE_ID, LABEL_INBOX, LABEL_SPAM, LABEL_TRASH, is_archive_id};
 use super::scopes::{
     ScopeCache, invalidate_scope_snapshot, labels_for_flags, refresh_scope_snapshot,
 };
+use crate::headers::references_from_header;
 
 const LABEL_SENT: &str = "SENT";
 const LABEL_DRAFT: &str = "DRAFT";
@@ -672,7 +674,7 @@ pub(crate) fn move_thread(
             MutationTarget::Thread(thread),
             add,
             remove,
-            bifrost_types::AccountOperation::BulkMove,
+            bifrost_types::AccountOperation::MoveThread,
         )
         .await
     })
@@ -691,8 +693,9 @@ pub(crate) fn delete_thread(
             return client.delete_thread(&thread.0).await.map_err(|e| {
                 account_error_for(
                     e,
-                    error::GmailErrorContext::mutation(
-                        bifrost_types::AccountOperation::BulkDestroy,
+                    mutation_context(
+                        &MutationTarget::Thread(thread.clone()),
+                        bifrost_types::AccountOperation::DeleteThread,
                     ),
                 )
             });
@@ -703,10 +706,23 @@ pub(crate) fn delete_thread(
             MutationTarget::Thread(thread),
             add,
             remove,
-            bifrost_types::AccountOperation::BulkMove,
+            bifrost_types::AccountOperation::DeleteThread,
         )
         .await
     })
+}
+
+fn mutation_context(
+    target: &MutationTarget,
+    operation: bifrost_types::AccountOperation,
+) -> error::GmailErrorContext {
+    let mut ctx = match target {
+        MutationTarget::Message(id) => error::GmailErrorContext::hydrate_message(id.0.clone()),
+        MutationTarget::Thread(id) => error::GmailErrorContext::hydrate_thread(id.0.clone()),
+        _ => error::GmailErrorContext::base(operation),
+    };
+    ctx.operation = operation;
+    ctx
 }
 
 async fn modify_target(
@@ -719,18 +735,19 @@ async fn modify_target(
     if add_labels.is_empty() && remove_labels.is_empty() {
         return Ok(());
     }
+    let ctx = mutation_context(&target, operation);
     match target {
         MutationTarget::Message(id) => {
             client
                 .modify_message(&id.0, &add_labels, &remove_labels)
                 .await
-                .map_err(|e| account_error_for(e, error::GmailErrorContext::base(operation)))?;
+                .map_err(|e| account_error_for(e, ctx))?;
         }
         MutationTarget::Thread(id) => {
             client
                 .modify_thread(&id.0, &add_labels, &remove_labels)
                 .await
-                .map_err(|e| account_error_for(e, error::GmailErrorContext::base(operation)))?;
+                .map_err(|e| account_error_for(e, ctx))?;
         }
         _ => return Err(unsupported(operation)),
     }
@@ -1141,24 +1158,6 @@ fn collect_attachment_refs(part: &GmailPayload, refs: &mut Vec<AttachmentRef>) {
     }
 }
 
-/// Extract the bare `Content-ID` value (angle brackets stripped) from a
-/// part's headers, so a hydrated draft re-render preserves the `cid:`
-/// linkage of an inline image.
-fn content_id_value(headers: &[GmailHeader]) -> Option<String> {
-    header_from(headers, "Content-ID").map(|value| {
-        value
-            .trim()
-            .trim_matches(|c| c == '<' || c == '>')
-            .to_string()
-    })
-}
-
-fn content_disposition_inline(headers: &[GmailHeader]) -> bool {
-    header_from(headers, "Content-Disposition")
-        .as_deref()
-        .is_some_and(|value| value.to_ascii_lowercase().contains("inline"))
-}
-
 fn body_parts(payload: Option<&GmailPayload>) -> (Option<String>, Option<String>) {
     let mut text = None;
     let mut html = None;
@@ -1206,16 +1205,6 @@ fn internal_date(value: &Option<String>) -> Option<SystemTime> {
         .as_deref()
         .and_then(|value| value.parse::<u64>().ok())
         .map(|millis| UNIX_EPOCH + Duration::from_millis(millis))
-}
-
-fn references_from_header(value: Option<&str>) -> Vec<String> {
-    value.map_or_else(Vec::new, |value| {
-        value
-            .split_whitespace()
-            .map(|item| item.trim_matches(|ch| ch == '<' || ch == '>').to_string())
-            .filter(|item| !item.is_empty())
-            .collect()
-    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1465,6 +1454,53 @@ fn account_error_for(error: crate::Error, ctx: error::GmailErrorContext) -> Acco
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn draft_attachment_disposition_uses_only_the_type() {
+        let part: crate::types::GmailPayload = serde_json::from_value(serde_json::json!({
+            "mimeType": "image/png", "filename": "inline.png",
+            "headers": [{"name": "Content-Disposition", "value": "attachment; filename=inline.png"}],
+            "body": {"attachmentId": "attachment", "size": 1}
+        })).unwrap();
+        let mut refs = Vec::new();
+        super::collect_attachment_refs(&part, &mut refs);
+        assert_eq!(refs.len(), 1);
+        assert!(!refs[0].inline);
+    }
+
+    #[test]
+    fn mutation_context_preserves_target_and_operation() {
+        for operation in [
+            bifrost_types::AccountOperation::MoveThread,
+            bifrost_types::AccountOperation::DeleteThread,
+        ] {
+            let ctx = super::mutation_context(
+                &bifrost_types::MutationTarget::Thread(bifrost_types::ThreadId("thread".into())),
+                operation,
+            );
+            assert_eq!(ctx.operation, operation);
+            assert_eq!(
+                ctx.scope,
+                Some(bifrost_types::ErrorScope::Thread {
+                    id: "thread".into()
+                })
+            );
+            assert!(matches!(
+                ctx.resource,
+                Some(super::error::GmailResource::Thread)
+            ));
+        }
+        let ctx = super::mutation_context(
+            &bifrost_types::MutationTarget::Message(bifrost_types::ObjectId("message".into())),
+            bifrost_types::AccountOperation::AddToContainer,
+        );
+        assert_eq!(
+            ctx.scope,
+            Some(bifrost_types::ErrorScope::Message {
+                id: "message".into()
+            })
+        );
+    }
+
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 

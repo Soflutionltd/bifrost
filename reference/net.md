@@ -1151,7 +1151,8 @@ response through `classify_redirect`:
   Graph's 304 on `$delta`) keep working.
 - 301 / 302: rewrite to GET and drop the body when the prior method
   is not safe (POST / PUT / DELETE / PATCH); preserve method + body
-  for GET / HEAD.
+  for GET / HEAD / OPTIONS / TRACE, using the same `Method::is_safe()`
+  predicate as replay classification (HEAD drops its body).
 - 303 See Other: rewrite to GET and drop the body unconditionally.
 - 307 / 308: preserve method and body.
 - Any followed-redirect status whose `Location` header is **absent**:

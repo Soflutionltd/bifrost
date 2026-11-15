@@ -105,7 +105,13 @@ pub(crate) async fn get(
     account: GraphAccount,
     contact: ContactId,
 ) -> Result<ContactCard, AccountError> {
-    if let Some((folder, item)) = super::foreign::parse_public_contact(&contact.0) {
+    if super::foreign::parse_public_address_book(&contact.0).is_some() {
+        let (folder, item) = super::foreign::parse_public_contact(&contact.0).ok_or_else(|| {
+            graph_error::invalid_account_error(
+                AccountOperation::ContactGet,
+                "public contact id requires a folder and item id",
+            )
+        })?;
         return public::get(&account, folder, item).await;
     }
     let prefix = account.client.api_path_prefix();
@@ -151,7 +157,7 @@ pub(crate) async fn update(
     contact: ContactId,
     patch: ContactPatch,
 ) -> Result<(), AccountError> {
-    if super::foreign::parse_public_contact(&contact.0).is_some()
+    if super::foreign::parse_public_address_book(&contact.0).is_some()
         || patch
             .address_book_id
             .as_ref()
@@ -238,7 +244,7 @@ pub(crate) async fn delete_if_version(
     contact: ContactId,
     expected_version: Option<bifrost_types::ServerVersion>,
 ) -> Result<(), AccountError> {
-    if super::foreign::parse_public_contact(&contact.0).is_some() {
+    if super::foreign::parse_public_address_book(&contact.0).is_some() {
         return Err(graph_error::unsupported_account_error(
             AccountOperation::ContactDelete,
         ));
@@ -1340,6 +1346,27 @@ struct GraphContactPatchBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_public_item_reads_are_refused_before_io() {
+        for tail in ["folder", "folder\u{1e}", "\u{1e}item"] {
+            let client = crate::client::GraphClient::new("token");
+            let account = GraphAccount::new_for_tests(
+                client.clone(),
+                super::super::PushMode::GraphSubscriptions,
+            );
+            let error = get(account, ContactId(format!("public-contacts\u{1e}{tail}")))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed,
+                )
+            );
+            assert!(client.take_rest_requests().is_empty());
+        }
+    }
 
     #[test]
     fn top_for_limit_floors_zero_to_one() {

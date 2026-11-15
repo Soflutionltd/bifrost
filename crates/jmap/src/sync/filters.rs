@@ -233,6 +233,40 @@ pub(crate) fn update<T: HttpTransport>(
         let mut script_patch = crate::sieve::SieveScriptPatch::default();
         let mut has_patch = false;
 
+        // Deactivation is account-wide on the wire. Read this script first,
+        // and guard the write so a concurrent activation cannot redirect it
+        // to another script between the read and the set.
+        let deactivate = if patch.is_active == Some(false) {
+            let response = account
+                .call(
+                    SieveScriptGet::new()
+                        .ids([id.clone()])
+                        .properties([SieveProperty::Id, SieveProperty::IsActive]),
+                )
+                .await
+                .map_err(to_acct_err(AccountOperation::FilterUpdate))?;
+            let target = response
+                .list()
+                .iter()
+                .find(|script| script.id() == Some(&id));
+            let Some(target) = target else {
+                let context = super::error::JmapErrorContext::new(AccountOperation::FilterUpdate);
+                return Err(if response.not_found().contains(&id) {
+                    super::error::get_filter_not_found(id.as_str(), context)
+                } else {
+                    super::error::get_id_unanswered(id.as_str(), context)
+                });
+            };
+            if target.is_active() {
+                set = set.if_in_state(response.state());
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         if let Some(name) = patch.name {
             // A clear (Some(None)) collapses to an empty name: Sieve
             // script names are not nullable, so the empty string is the
@@ -254,14 +288,11 @@ pub(crate) fn update<T: HttpTransport>(
         if let Some(is_active) = patch.is_active {
             if is_active {
                 set = set.on_success_activate_script_id(id.clone());
-            } else {
-                // Sieve activation is global (at most one active script),
-                // so deactivation targets "no active script" rather than
-                // this id specifically.
+            } else if deactivate {
                 set = set.on_success_deactivate_script(true);
             }
         }
-        if !has_patch && patch.is_active.is_none() {
+        if !has_patch && patch.is_active != Some(true) && !deactivate {
             return Ok(());
         }
 
@@ -275,7 +306,7 @@ pub(crate) fn update<T: HttpTransport>(
                 .map_err(super::error::set_answer_error(
                     AccountOperation::FilterUpdate,
                     "SieveScript/set",
-                    false,
+                    deactivate,
                 ))?;
         } else {
             response
@@ -588,6 +619,143 @@ mod tests {
         )
         .expect("client builds");
         crate::account::Account::new(client, "primary")
+    }
+
+    #[tokio::test]
+    async fn deactivation_only_targets_the_observed_active_script() {
+        for active in [false, true] {
+            for rename in [false, true] {
+                let meter = std::sync::Arc::new(DownloadMeter::default());
+                let requests = Recorder::default();
+                // A is active when B is not; deactivating B must leave A alone.
+                let read = serde_json::json!({
+                    "sessionState": "session-1",
+                    "methodResponses": [["SieveScript/get", {
+                        "accountId": "primary", "state": "observed-state",
+                        "list": [{"id": "B", "isActive": active}], "notFound": []
+                    }, "s0"]]
+                })
+                .to_string();
+                let write = serde_json::json!({
+                    "sessionState": "session-1",
+                    "methodResponses": [["SieveScript/set", {
+                        "accountId": "primary", "oldState": "observed-state",
+                        "newState": "next-state", "updated": {"B": null}
+                    }, "s0"]]
+                })
+                .to_string();
+                let account =
+                    sieve_account_with_session([read, write], &meter, sieve_session(), &requests);
+                update(
+                    Some(account),
+                    ServerFilterId("B".into()),
+                    ServerFilterPatch::Script(bifrost_types::FilterScriptPatch {
+                        name: rename.then(|| Some("renamed".into())),
+                        body: None,
+                        is_active: Some(false),
+                    }),
+                )
+                .await
+                .expect("deactivation succeeds");
+
+                let requests = requests.lock().expect("requests");
+                assert_eq!(requests[0]["methodCalls"][0][0], "SieveScript/get");
+                assert_eq!(
+                    requests[0]["methodCalls"][0][1]["ids"],
+                    serde_json::json!(["B"])
+                );
+                assert_eq!(requests.len(), if active || rename { 2 } else { 1 });
+                if active || rename {
+                    let args = &requests[1]["methodCalls"][0][1];
+                    assert_eq!(
+                        args.get("onSuccessDeactivateScript")
+                            .and_then(serde_json::Value::as_bool),
+                        active.then_some(true)
+                    );
+                    if active {
+                        assert_eq!(args["ifInState"], "observed-state");
+                    }
+                    if rename {
+                        assert_eq!(args["update"]["B"]["name"], "renamed");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_deactivation_target_never_sends_a_set() {
+        for not_found in [false, true] {
+            let meter = std::sync::Arc::new(DownloadMeter::default());
+            let requests = Recorder::default();
+            let read = serde_json::json!({
+                "sessionState": "session-1",
+                "methodResponses": [["SieveScript/get", {
+                    "accountId": "primary", "state": "s1", "list": [],
+                    "notFound": if not_found { vec!["B"] } else { vec![] }
+                }, "s0"]]
+            })
+            .to_string();
+            let account = sieve_account_with_session([read], &meter, sieve_session(), &requests);
+            let err = update(
+                Some(account),
+                ServerFilterId("B".into()),
+                ServerFilterPatch::Script(bifrost_types::FilterScriptPatch {
+                    name: None,
+                    body: None,
+                    is_active: Some(false),
+                }),
+            )
+            .await
+            .expect_err("target must be resolved before deactivation");
+            if not_found {
+                assert!(matches!(err.kind(), AccountErrorKind::NotFound(_)));
+            } else {
+                assert_eq!(
+                    err.kind(),
+                    &AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
+                );
+            }
+            assert_eq!(requests.lock().expect("requests").len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_activation_refuses_deactivation_with_the_observed_state_guard() {
+        let meter = std::sync::Arc::new(DownloadMeter::default());
+        let requests = Recorder::default();
+        let read = serde_json::json!({
+            "sessionState": "session-1",
+            "methodResponses": [["SieveScript/get", {
+                "accountId": "primary", "state": "before-activation",
+                "list": [{"id": "B", "isActive": true}], "notFound": []
+            }, "s0"]]
+        })
+        .to_string();
+        let conflict = serde_json::json!({
+            "sessionState": "session-1",
+            "methodResponses": [["error", {"type": "stateMismatch"}, "s0"]]
+        })
+        .to_string();
+        let account =
+            sieve_account_with_session([read, conflict], &meter, sieve_session(), &requests);
+        let err = update(
+            Some(account),
+            ServerFilterId("B".into()),
+            ServerFilterPatch::Script(bifrost_types::FilterScriptPatch {
+                name: None,
+                body: None,
+                is_active: Some(false),
+            }),
+        )
+        .await
+        .expect_err("concurrent activation must not be overwritten");
+        assert_eq!(err.kind(), &AccountErrorKind::ConcurrencyConflict);
+        let requests = requests.lock().expect("requests");
+        assert_eq!(
+            requests[1]["methodCalls"][0][1]["ifInState"],
+            "before-activation"
+        );
     }
 
     /// `filters_list` used to cost N+2 serial round trips: one query, one

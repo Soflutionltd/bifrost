@@ -46,7 +46,7 @@ impl Boundary {
 
     /// Unconditional write. `Stop` is not special here: the engine's
     /// own teardown path needs to be able to write it over anything.
-    /// Consumer-driven writes should go through
+    /// All non-teardown writes, including engine recovery, should go through
     /// [`Self::set_unless_stopped`] instead.
     pub fn set(&self, req: BoundaryRequest) {
         self.tx.send_replace(req);
@@ -57,9 +57,9 @@ impl Boundary {
     ///
     /// `Stop` is terminal: the account is tearing down and its workers
     /// are meant to flush a final checkpoint and exit. A consumer
-    /// `pause` or `resume` racing that teardown must not resurrect
-    /// them - a `Pause` written over `Stop` parks the workers instead
-    /// of letting them drain, and `detach` then waits out its whole
+    /// `pause` or `resume`, or an engine auto-pause, racing teardown
+    /// must not resurrect them - a `Pause` written over `Stop` parks
+    /// the workers instead of letting them drain, and `detach` waits out its whole
     /// timeout.
     pub fn set_unless_stopped(&self, req: BoundaryRequest) -> bool {
         self.tx.send_if_modified(|current| {

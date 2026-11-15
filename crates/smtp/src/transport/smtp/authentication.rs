@@ -756,14 +756,21 @@ pub(crate) fn scram_hash(mechanism: Mechanism) -> Option<ScramHash> {
     }
 }
 
-/// 18-byte URL-safe-no-pad base64 client nonce (verbatim shape of IMAP's
-/// `generate_scram_nonce`).
+/// 18-byte URL-safe-no-pad base64 client nonce.
 fn generate_scram_nonce() -> Result<String, Error> {
+    generate_scram_nonce_with(getrandom::fill)
+}
+
+fn generate_scram_nonce_with<E: std::fmt::Display>(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), E>,
+) -> Result<String, Error> {
     use base64::Engine;
 
     let mut bytes = [0u8; 18];
-    getrandom::fill(&mut bytes).map_err(|e| {
-        error::invalid_input(format!("failed to generate SCRAM nonce: {e}"))
+    fill(&mut bytes).map_err(|e| {
+        // Entropy failure is a local runtime fault; changing credentials or
+        // authentication policy cannot repair it.
+        error::local_runtime(format!("failed to generate SCRAM nonce: {e}"))
             .with_phase(SmtpCommandPhase::Auth { mechanism: None })
     })?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
@@ -775,6 +782,26 @@ mod test {
     use bifrost_net::auth::TokenSnapshot;
     use bifrost_net::{AccessToken, StaticTokenSource, TokenSource};
     use std::sync::Arc;
+
+    #[test]
+    fn nonce_entropy_failure_is_a_local_runtime_error() {
+        use crate::transport::smtp::{
+            account_error::{SmtpErrorContext, into_account_error},
+            error::ErrorKind,
+        };
+        use bifrost_types::error::{AccountErrorKind, InternalErrorKind};
+
+        let error = super::generate_scram_nonce_with(|_| Err("entropy unavailable")).unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::LocalRuntime);
+        let account = into_account_error(
+            error,
+            SmtpErrorContext::send(bifrost_types::error::Protocol::Smtp),
+        );
+        assert_eq!(
+            account.kind(),
+            &AccountErrorKind::Internal(InternalErrorKind::RuntimeFailure)
+        );
+    }
 
     #[test]
     fn scram_mechanism_wire_tokens() {

@@ -272,6 +272,10 @@ and reports a parse error before another command can consume the stale reply.
 PIPELINING and LMTP final-status groups defer this check until their exact
 expected reply count has drained.
 
+With the `account-error` feature, `Address::try_from(&bifrost_types::Address)`
+checks the bare addr-spec through the same local-part and domain validation as
+`Address::new`. Display names are excluded from envelope conversion.
+
 Envelope commands are constructed, and therefore validated, before `MAIL FROM`
 is written. Every send path - sync and async, DATA and BDAT, SMTP and LMTP,
 pipelined and not, single-envelope and batch - builds the whole `Mail` plus
@@ -727,6 +731,8 @@ Canonicalization follows RFC 6376 for empty bodies and missing final CRLFs. Rela
 
 ## Pool
 
+Async recycle spawns bounded `abort()` teardown for broken or retired connections and for returns to a closed pool. The task retains the admission permit until teardown finishes, so replacement connections cannot exceed the live-connection bound. Abort closes the stream without sending QUIT.
+
 `PoolConfig` configures min idle, max size, idle timeout, and the checkout NOOP probe. `max_size` bounds all live connections, checked out and idle, in both the blocking and async pools; checkout waits for a slot instead of dialing past the bound. Zero is rejected at checkout. Recycling refuses connections that are `Broken` and connections flagged for retirement by an LMTP final-status drain (see "Connection state and cancel-safety"). `min_idle` defaults to 0: no background pool worker is started, and expired connections are discarded at checkout. A positive `min_idle` enables the worker that expires and replenishes warm connections without exceeding `max_size`. An idle timeout of zero disables expiration; a positive-`min_idle` worker checks for replacements once per second so a zero timeout cannot create a zero-delay loop. `test_on_checkout(false)` opts out of the default NOOP probe for callers willing to retry one stale idle connection; it does not permit a connection already marked `Broken` to be reused. It buys nothing for LMTP transports, whose connections are retired at recycle and therefore never checked out idle.
 
 Async `Drop` performs no spawn and no I/O. A healthy checked-out connection is
@@ -744,7 +750,7 @@ Async shutdown stores one shared completion and runs idle-connection aborts and
 worker termination in an owned task. Dropping a shutdown caller does not cancel
 those aborts; concurrent and later callers await the same completion. Admission
 and idle checkout close before that task starts. Checked-out connections still
-belong to their callers and are hard-dropped when returned to the closed pool;
+belong to their callers and are aborted when returned to the closed pool;
 shutdown does not wait for their sends. An account that needs send completion
 must serialize its own sends with shutdown.
 
@@ -822,7 +828,7 @@ are rejected.
 
 ## Error model
 
-`Error::kind()` returns `&ErrorKind`. SMTP reply failures are `Transient(Response)` or `Permanent(Response)`, so callers can inspect the full server reply through `smtp_response()`, `status()`, and `enhanced_status_code()`. Non-reply buckets are `Parse`, `Authentication`, `InvalidInput`, `FeatureUnsupported`, `ParameterOverLimit`, `Internal`, `Policy`, `Connection`, `Network`, `Timeout`, `Tls`, and `TransportShutdown`. `Policy` covers local refusals such as plaintext-AUTH refusal. `FeatureUnsupported` / `ParameterOverLimit` are the FUTURERELEASE discriminators (a relay that did not advertise the extension vs a HOLDFOR over the advertised max interval), kept distinct from generic `InvalidInput` so the account-error mapping can tell scheduled-send-unsupported apart from a malformed parameter. SMTP replies are line-bounded before allocation and decoded from bytes, so oversized or non-UTF-8 replies are `Parse`, not retryable network errors.
+`Error::kind()` returns `&ErrorKind`. SMTP reply failures are `Transient(Response)` or `Permanent(Response)`, so callers can inspect the full server reply through `smtp_response()`, `status()`, and `enhanced_status_code()`. Non-reply buckets are `Parse`, `Authentication`, `InvalidInput`, `FeatureUnsupported`, `ParameterOverLimit`, `Internal`, `LocalRuntime`, `Policy`, `Connection`, `Network`, `Timeout`, `Tls`, and `TransportShutdown`. `LocalRuntime` covers local facility failures such as SCRAM nonce entropy failure and maps to `Internal(RuntimeFailure)`, including on the AUTH lane. `Policy` covers local refusals such as plaintext-AUTH refusal. `FeatureUnsupported` / `ParameterOverLimit` are the FUTURERELEASE discriminators (a relay that did not advertise the extension vs a HOLDFOR over the advertised max interval), kept distinct from generic `InvalidInput` so the account-error mapping can tell scheduled-send-unsupported apart from a malformed parameter. SMTP replies are line-bounded before allocation and decoded from bytes, so oversized or non-UTF-8 replies are `Parse`, not retryable network errors.
 
 Internal pipeline errors carry value-side classification data:
 

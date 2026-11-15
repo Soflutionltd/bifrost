@@ -1,6 +1,7 @@
 //! Microsoft Graph change notification subscription CRUD.
 
 use crate::client::Resource;
+use bifrost_net::url::encode_path_component;
 use serde::{Deserialize, Serialize};
 
 use crate::error::GraphError;
@@ -91,7 +92,7 @@ pub(crate) async fn renew_subscription(
     let response: SubscriptionResponse = client
         .patch_json(
             Resource::Unmetered,
-            &format!("/subscriptions/{subscription_id}"),
+            &format!("/subscriptions/{}", encode_path_component(subscription_id)),
             &body,
             bifrost_net::ReplayPolicy::Idempotent,
         )
@@ -125,7 +126,7 @@ pub(crate) async fn delete_subscription(
     let server_result = client
         .delete(
             Resource::Unmetered,
-            &format!("/subscriptions/{subscription_id}"),
+            &format!("/subscriptions/{}", encode_path_component(subscription_id)),
             bifrost_net::ReplayPolicy::IdempotentUnlessConditional,
         )
         .await;
@@ -211,6 +212,35 @@ pub(crate) fn is_expiring_soon(expiration_iso: &str, threshold_minutes: i64) -> 
 mod tests {
     use super::*;
     use crate::client::{GraphClient, ScriptedRestResponse};
+
+    #[tokio::test]
+    async fn subscription_ids_remain_one_path_component() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                serde_json::json!({"id":"opaque", "expirationDateTime":"2099-01-01T00:00:00Z"}),
+            ),
+            ScriptedRestResponse::json(reqwest::StatusCode::OK, serde_json::json!({})),
+        ]);
+        let id = "a/b?query#fragment%";
+        renew_subscription(&client, id, None).await.unwrap();
+        delete_subscription(&client, id).await.unwrap();
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert!(
+                request
+                    .url
+                    .ends_with("/subscriptions/a%2Fb%3Fquery%23fragment%25")
+            );
+        }
+    }
+
+    #[test]
+    fn documented_subscription_lifetime_matches_the_default() {
+        assert_eq!(DEFAULT_EXPIRATION_MINUTES, 7 * 24 * 60);
+    }
 
     #[test]
     fn subscription_request_serialization() {

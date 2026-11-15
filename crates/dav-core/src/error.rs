@@ -33,11 +33,25 @@ impl DavProtocol {
         }
     }
 
-    /// The resource a bare status refers to when the server names none.
+    /// The resource a bare status refers to when the request addresses a
+    /// collection (PROPFIND, REPORT, discovery, a schedule outbox POST), or
+    /// when the caller does not say what it addressed. CalDAV collections are
+    /// calendars; CardDAV keeps its long-standing `Contact` for every status.
     #[must_use]
     pub fn resource(self) -> ResourceKind {
         match self {
             Self::CalDav => ResourceKind::Calendar,
+            Self::CardDav => ResourceKind::Contact,
+        }
+    }
+
+    /// The resource a status refers to when the request addresses ONE item
+    /// resource (GET, PUT, DELETE or MOVE of a single event or vCard). For
+    /// CardDAV this is the same `Contact` as [`Self::resource`].
+    #[must_use]
+    pub fn item_resource(self) -> ResourceKind {
+        match self {
+            Self::CalDav => ResourceKind::Event,
             Self::CardDav => ResourceKind::Contact,
         }
     }
@@ -92,10 +106,11 @@ pub fn not_found_error(
     id: impl Into<String>,
     protocol: DavProtocol,
 ) -> AccountError {
+    // Always about one item resource the server returned.
     AccountErrorBuilder::new(
-        AccountErrorKind::NotFound(protocol.resource()),
+        AccountErrorKind::NotFound(protocol.item_resource()),
         Cause::Request(RequestCause::NotFound {
-            what: protocol.resource(),
+            what: protocol.item_resource(),
             id: Some(id.into()),
         }),
     )
@@ -277,9 +292,46 @@ pub fn status_error(
     body: String,
     protocol: DavProtocol,
 ) -> AccountError {
+    status_error_for(
+        headers,
+        operation,
+        status,
+        body,
+        protocol,
+        protocol.resource(),
+    )
+}
+
+/// [`status_error`] for a request that addresses ONE item resource: the
+/// 403 / 404 name [`DavProtocol::item_resource`] instead of the collection.
+#[must_use]
+pub fn item_status_error(
+    headers: &reqwest::header::HeaderMap,
+    operation: AccountOperation,
+    status: StatusCode,
+    body: String,
+    protocol: DavProtocol,
+) -> AccountError {
+    status_error_for(
+        headers,
+        operation,
+        status,
+        body,
+        protocol,
+        protocol.item_resource(),
+    )
+}
+
+fn status_error_for(
+    headers: &reqwest::header::HeaderMap,
+    operation: AccountOperation,
+    status: StatusCode,
+    body: String,
+    protocol: DavProtocol,
+    resource: ResourceKind,
+) -> AccountError {
     let retry_hint =
         bifrost_net::request::parse_retry_after_hint(headers.get(reqwest::header::RETRY_AFTER));
-    let resource = protocol.resource();
     let kind = if status == StatusCode::UNAUTHORIZED {
         AccountErrorKind::Authentication(bifrost_types::AuthErrorKind::ReauthorizationRequired)
     } else if status == StatusCode::FORBIDDEN {
@@ -867,6 +919,8 @@ mod tests {
         assert_eq!(DavProtocol::CardDav.protocol(), Protocol::CardDav);
         assert_eq!(DavProtocol::CalDav.resource(), ResourceKind::Calendar);
         assert_eq!(DavProtocol::CardDav.resource(), ResourceKind::Contact);
+        assert_eq!(DavProtocol::CalDav.item_resource(), ResourceKind::Event);
+        assert_eq!(DavProtocol::CardDav.item_resource(), ResourceKind::Contact);
         assert_eq!(DavProtocol::CalDav.field(), "caldav");
         assert_eq!(DavProtocol::CardDav.field(), "carddav");
         assert_eq!(DavProtocol::CalDav.well_known_service(), "caldav");
@@ -939,6 +993,37 @@ mod tests {
         assert!(matches!(
             calendar.kind(),
             AccountErrorKind::NotFound(ResourceKind::Calendar)
+        ));
+        // A request addressing one event names the event, not its calendar.
+        let event = item_status_error(
+            &reqwest::header::HeaderMap::new(),
+            AccountOperation::EventGet,
+            StatusCode::NOT_FOUND,
+            String::new(),
+            DavProtocol::CalDav,
+        );
+        assert!(matches!(
+            event.kind(),
+            AccountErrorKind::NotFound(ResourceKind::Event)
+        ));
+        assert!(matches!(
+            not_found_error(AccountOperation::EventGet, "one.ics", DavProtocol::CalDav).kind(),
+            AccountErrorKind::NotFound(ResourceKind::Event)
+        ));
+        // A CalDAV item 404 is not a discovery probe answer; a collection 404 is.
+        assert!(!should_fallback_discovery(&event, DavProtocol::CalDav));
+        assert!(should_fallback_discovery(&calendar, DavProtocol::CalDav));
+        // CardDAV is unchanged: both doors name the contact.
+        assert!(matches!(
+            item_status_error(
+                &reqwest::header::HeaderMap::new(),
+                AccountOperation::ContactGet,
+                StatusCode::NOT_FOUND,
+                String::new(),
+                DavProtocol::CardDav,
+            )
+            .kind(),
+            AccountErrorKind::NotFound(ResourceKind::Contact)
         ));
         let contact = status_error(
             &reqwest::header::HeaderMap::new(),

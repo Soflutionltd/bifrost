@@ -41,9 +41,9 @@ pub use dispatch::{
 };
 
 pub use error::{
-    DavProtocol, filter_unsupported, local_error, missing_field_error, not_found_error,
-    parse_error, recovery_rank, response_read_error, should_fallback_discovery, status_error,
-    transport_error, unsupported_error, worse_recovery,
+    DavProtocol, filter_unsupported, item_status_error, local_error, missing_field_error,
+    not_found_error, parse_error, recovery_rank, response_read_error, should_fallback_discovery,
+    status_error, transport_error, unsupported_error, worse_recovery,
 };
 pub use etag::{PutCondition, normalize_http_etag, prepare_if_match, response_etag};
 pub use multistatus::{

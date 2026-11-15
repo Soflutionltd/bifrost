@@ -3844,3 +3844,98 @@ async fn the_detach_race_cleanup_bumps_the_push_topology_after_its_delete() {
         "the cleanup delete bumps the topology once it completes"
     );
 }
+
+/// A refused acknowledgement must neither write its checkpoint nor release a
+/// sibling scope's provisional cursor from rollback.
+#[tokio::test]
+async fn mismatched_ack_scopes_preserve_provisional_ownership_and_checkpoint_rows() {
+    use bifrost_types::Checkpoint;
+
+    for backfill in [false, true] {
+        let (account, store, coverage, tx, writer, control) = writer_harness_observed();
+        let provisional_cursor = change_cursor(b"provisional");
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::ReattachInsert {
+            attempt: 1,
+            cursor: provisional_cursor.clone(),
+            done,
+        })
+        .await
+        .expect("writer alive");
+        wait.await.expect("writer answered").expect("insert");
+
+        let checkpoint = if backfill {
+            lane_page(&CursorScope::Account, "page:10:20", 5)
+        } else {
+            let mut cursor = change_cursor(b"wrong lane");
+            cursor.scope = CursorScope::Account;
+            Checkpoint::Change(cursor)
+        };
+        let publication = publish_a_page(&control, &coverage, &checkpoint);
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::Ack(crate::multiplexer::AckRequest {
+            scope: provisional_cursor.scope.clone(),
+            checkpoint: checkpoint.clone(),
+            publication: Some(publication),
+            auto: false,
+            complete: Some(done),
+        }))
+        .await
+        .expect("writer alive");
+        assert!(
+            matches!(wait.await.expect("writer answered"), Err(Error::Other(_))),
+            "the scope mismatch must be refused"
+        );
+        match checkpoint {
+            Checkpoint::Change(cursor) => {
+                assert!(
+                    store
+                        .get_change_cursor(&account, &cursor.scope)
+                        .await
+                        .expect("read")
+                        .is_none()
+                );
+            }
+            Checkpoint::Backfill(checkpoint) => {
+                assert!(
+                    store
+                        .get_backfill(&account, &checkpoint.scope)
+                        .await
+                        .expect("read")
+                        .is_none()
+                );
+            }
+            _ => unreachable!("test constructs only change and backfill checkpoints"),
+        }
+
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::ReattachAbort { attempt: 1, done })
+            .await
+            .expect("writer alive");
+        wait.await.expect("abort ran");
+        assert!(
+            store
+                .get_change_cursor(&account, &provisional_cursor.scope)
+                .await
+                .expect("read")
+                .is_none(),
+            "a rejected ack must leave the provisional cursor owned by the abort"
+        );
+        drop(tx);
+        writer.await.expect("writer stopped");
+    }
+}
+
+#[tokio::test]
+async fn ack_checkpoint_rejects_a_scope_mismatch_before_routing() {
+    let engine = super::SyncEngine::builder().build().expect("engine");
+    let result = engine
+        .ack_checkpoint(
+            &bifrost_types::AccountId("unattached".into()),
+            CursorScope::Account,
+            bifrost_types::Checkpoint::Change(change_cursor(b"checkpoint")),
+            None,
+        )
+        .await;
+    assert!(matches!(result, Err(Error::Other(_))));
+}

@@ -254,7 +254,7 @@ pub(crate) fn classify_redirect(
     // method is non-safe. 307 / 308 preserve method+body. The rewrite
     // also drops the request body because the next method (GET) is
     // semantically distinct from the prior POST.
-    let safe_prior = prior_method == Method::GET || prior_method == Method::HEAD;
+    let safe_prior = prior_method.is_safe();
     let (next_method, preserve_body) = match status {
         StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND if !safe_prior => (Method::GET, false),
         StatusCode::SEE_OTHER => (Method::GET, false),
@@ -262,7 +262,7 @@ pub(crate) fn classify_redirect(
             (prior_method.clone(), true)
         }
         // 301 / 302 with a safe method: method preserved; body
-        // empty on GET/HEAD anyway.
+        // retained for OPTIONS/TRACE as well.
         _ => (prior_method.clone(), prior_method != Method::HEAD),
     };
 
@@ -480,6 +480,27 @@ mod tests {
         )
         .expect("304 is pass-through, not an error");
         assert!(matches!(action, RedirectAction::PassThrough));
+    }
+
+    #[test]
+    fn safe_methods_survive_301_and_302() {
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS, Method::TRACE] {
+            for status in [StatusCode::MOVED_PERMANENTLY, StatusCode::FOUND] {
+                let action = classify_redirect(
+                    &RedirectPolicy::default(),
+                    &method,
+                    &url("https://a.example/"),
+                    status,
+                    &header(LOCATION, "/next"),
+                )
+                .expect("safe redirect");
+                let RedirectAction::Follow(step) = action else {
+                    panic!("expected follow");
+                };
+                assert_eq!(step.next_method, method);
+                assert_eq!(step.preserve_body, method != Method::HEAD);
+            }
+        }
     }
 
     #[test]

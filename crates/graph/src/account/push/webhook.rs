@@ -258,8 +258,8 @@ struct SubscribeRequest {
 /// - A create whose response never arrived (a timeout, a reset) may have
 ///   succeeded on Graph. The subscription id exists only in the response we
 ///   did not read, so there is nothing to DELETE by; it lives until Graph's
-///   own expiry (about a day) and posts to the receiver meanwhile. Recovering
-///   it would mean listing `/subscriptions` and deleting by resource and
+///   own expiry (up to seven days, as requested for basic notifications) and
+///   posts to the receiver meanwhile. Recovering it would mean listing `/subscriptions` and deleting by resource and
 ///   notification URL, which could also delete another process's identical
 ///   subscription; that is a product decision, not something to do silently
 ///   here.

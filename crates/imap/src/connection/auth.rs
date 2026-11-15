@@ -397,16 +397,10 @@ impl ImapConnection {
                 return Err(Error::MissingCapability("AUTH=PLAIN".into()));
             }
 
-            // PLAIN payload per RFC 4616 Section 2:
-            // [authzid] NUL authcid NUL passwd  -  authzid is empty.
-            let mut payload =
-                zeroize::Zeroizing::new(Vec::with_capacity(1 + user.len() + 1 + pass.len()));
-            payload.push(b'\0');
-            payload.extend_from_slice(user.as_bytes());
-            payload.push(b'\0');
-            payload.extend_from_slice(pass.as_bytes());
+            // Refuse embedded delimiters before submitting any AUTHENTICATE bytes.
+            let payload = bifrost_sasl::plain_payload("", user, pass)?;
             let encoded: SecretString = base64::engine::general_purpose::STANDARD
-                .encode(payload.as_slice())
+                .encode(payload.as_bytes())
                 .into();
 
             let has_sasl_ir = snapshot_supports(&snap, &Capability::SaslIr);
@@ -1389,6 +1383,27 @@ mod ladder_tests {
             "AUTH=plain must satisfy the live AUTH=PLAIN gate and reach the \
              driver, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn plain_refuses_nul_before_driver_submission() {
+        use crate::connection::SessionState;
+        use crate::connection::test_support::detached;
+        use crate::error::Error;
+        use std::time::Duration;
+
+        for (user, password) in [("user\0other", "pw"), ("user", "pw\0other")] {
+            let connection = detached(
+                SessionState::NotAuthenticated,
+                vec![Capability::Auth("PLAIN".to_owned())],
+                &[],
+            );
+            let error = connection
+                .authenticate_plain(user, password, Duration::from_secs(5))
+                .await
+                .expect_err("embedded NUL must be a local refusal");
+            assert!(matches!(error, Error::InvalidInput(_)), "{error:?}");
+        }
     }
 
     #[test]
