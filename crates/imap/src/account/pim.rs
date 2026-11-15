@@ -1892,17 +1892,7 @@ fn folder_from_container(
 }
 
 fn imap_flag_for_keyword(keyword: &str) -> Flag {
-    if keyword.eq_ignore_ascii_case("$flagged") || keyword.eq_ignore_ascii_case("\\flagged") {
-        Flag::Flagged
-    } else if keyword.eq_ignore_ascii_case("$answered")
-        || keyword.eq_ignore_ascii_case("\\answered")
-    {
-        Flag::Answered
-    } else if keyword.eq_ignore_ascii_case("$seen") || keyword.eq_ignore_ascii_case("\\seen") {
-        Flag::Seen
-    } else {
-        Flag::from(keyword)
-    }
+    Flag::from_neutral_keyword(keyword)
 }
 
 #[derive(Debug)]

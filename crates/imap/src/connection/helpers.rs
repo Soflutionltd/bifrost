@@ -13,6 +13,11 @@ impl ImapConnection {
         self.state_rx.borrow().session_state
     }
 
+    /// Mailbox identity last observed by the driver, including failed SELECTs.
+    pub(crate) fn selected_mailbox(&self) -> Option<crate::types::MailboxName> {
+        self.state_rx.borrow().selected.clone()
+    }
+
     /// Cached server capabilities (RFC 3501 Section7.2.1 / RFC 9051 Section7.2.1).
     ///
     /// Returns a clone of the capability list as last observed by the

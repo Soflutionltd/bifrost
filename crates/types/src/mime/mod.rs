@@ -8,7 +8,7 @@ mod select;
 mod transfer;
 mod words;
 
-pub use header::HeaderMap;
+pub use header::{HeaderMap, first_message_id};
 pub use limits::{Defect, MimeLimits};
 pub use params::{ContentType, decode_rfc2231_params, parse_content_type, parse_disposition};
 pub use parse::{MimePart, ParsedMessage, PartBody, parse_message, parse_message_with_limits};

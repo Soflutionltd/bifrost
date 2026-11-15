@@ -5811,3 +5811,38 @@ async fn a_refused_notify_registration_invalidates_on_fresh_and_interrupted_roun
         account.close().await.unwrap();
     }
 }
+
+/// A failed SELECT refreshes affinity from the driver even when the pool's
+/// previous cache is wrong. BAD preserves the actual mailbox, not that cache.
+#[tokio::test]
+async fn failed_select_refreshes_affinity_from_driver_identity() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev2")).await;
+    let account = scripted_account(conn, 1);
+    let inbox = crate::types::MailboxName::new("INBOX").unwrap();
+    let archive = crate::types::MailboxName::new("Archive").unwrap();
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(select.contains("SELECT \"INBOX\""), "got {select}");
+        respond(&mut server, &rev2_select_ok(tag_of(&select), "INBOX")).await;
+        let select = read_line(&mut server).await;
+        assert!(select.contains("SELECT \"Archive\""), "got {select}");
+        respond(
+            &mut server,
+            &format!("{} BAD SELECT refused\r\n", tag_of(&select)),
+        )
+        .await;
+        server
+    });
+    let mut pooled = account.pool.checkout_any().await.unwrap();
+    account
+        .select_folder(&mut pooled, &inbox, None, false)
+        .await
+        .unwrap();
+    pooled.set_selected_affinity(Some(archive.clone()));
+    account
+        .select_folder(&mut pooled, &archive, None, false)
+        .await
+        .expect_err("BAD preserves the driver's previous mailbox");
+    assert_eq!(pooled.selected_affinity(), Some(&inbox));
+    let _server = script.await.unwrap();
+}

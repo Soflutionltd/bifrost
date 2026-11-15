@@ -396,8 +396,8 @@ pub(crate) fn flags_set(flags: &[crate::types::Flag]) -> HashSet<String> {
 /// The IMAP flag judge behind `ImapAccount::flag_target`. `\Recent` is
 /// server-owned: no STORE sets or clears it, so an operation naming it is
 /// undecidable, and a `Set` compares the observation with `\Recent` removed.
-/// Everything else is the generic case-insensitive judge, which is IMAP flag
-/// identity.
+/// Requests use the same neutral-keyword conversion as STORE, followed by
+/// the generic case-insensitive judge. Observations retain wire identity.
 pub(crate) fn imap_flag_target(
     observed: &HashSet<String>,
     op: &bifrost_types::FlagOp,
@@ -412,21 +412,88 @@ pub(crate) fn imap_flag_target(
     if names_recent {
         return FlagTargetState::Indeterminate;
     }
+    // Translate only the request: a literal server keyword `$seen` is not
+    // evidence that the system flag `\Seen` was stored.
+    let normalize = |flags: &HashSet<String>| {
+        flags
+            .iter()
+            .map(|flag| {
+                crate::types::Flag::from_neutral_keyword(flag)
+                    .as_imap_str()
+                    .to_owned()
+            })
+            .collect()
+    };
+    let op = match op {
+        FlagOp::Add(flags) => FlagOp::Add(normalize(flags)),
+        FlagOp::Remove(flags) => FlagOp::Remove(normalize(flags)),
+        FlagOp::Set(flags) => FlagOp::Set(normalize(flags)),
+        FlagOp::Patch { add, remove } => FlagOp::Patch {
+            add: normalize(add),
+            remove: normalize(remove),
+        },
+        _ => return FlagTargetState::Indeterminate,
+    };
     if matches!(op, FlagOp::Set(_)) {
         let flags = observed
             .iter()
             .filter(|f| !f.eq_ignore_ascii_case("\\recent"))
             .cloned()
             .collect();
-        bifrost_types::flag_target_state(&flags, op)
+        bifrost_types::flag_target_state(&flags, &op)
     } else {
-        bifrost_types::flag_target_state(observed, op)
+        bifrost_types::flag_target_state(observed, &op)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imap_flag_target_uses_store_aliases_for_every_operation() {
+        use bifrost_types::{FlagOp, FlagTargetState};
+        for (neutral, wire) in [
+            ("$SEEN", "\\Seen"),
+            ("$answered", "\\Answered"),
+            ("$flagged", "\\Flagged"),
+        ] {
+            let requested = HashSet::from([neutral.to_owned()]);
+            let observed = HashSet::from([wire.to_owned()]);
+            for op in [
+                FlagOp::Add(requested.clone()),
+                FlagOp::Set(requested.clone()),
+            ] {
+                assert_eq!(imap_flag_target(&observed, &op), FlagTargetState::Satisfied);
+                assert_eq!(
+                    imap_flag_target(&requested, &op),
+                    FlagTargetState::Unsatisfied
+                );
+            }
+            for op in [
+                FlagOp::Remove(requested.clone()),
+                FlagOp::Patch {
+                    add: HashSet::from(["custom".to_owned()]),
+                    remove: requested,
+                },
+            ] {
+                assert_eq!(
+                    imap_flag_target(&observed, &op),
+                    FlagTargetState::Unsatisfied
+                );
+                let cleared = HashSet::from(["custom".to_owned()]);
+                assert_eq!(imap_flag_target(&cleared, &op), FlagTargetState::Satisfied);
+            }
+        }
+        let overlap = FlagOp::Patch {
+            add: HashSet::from(["$seen".to_owned()]),
+            remove: HashSet::from(["\\Seen".to_owned()]),
+        };
+        assert_eq!(
+            imap_flag_target(&HashSet::new(), &overlap),
+            FlagTargetState::Indeterminate
+        );
+    }
 
     #[test]
     fn imap_flag_target_ignores_recent_for_set() {

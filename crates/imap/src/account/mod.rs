@@ -232,18 +232,14 @@ impl ImapAccount {
         read_only: bool,
     ) -> Result<SyncSelectResult, Error> {
         let options = self.select_options(cursor, read_only);
-        let result = match conn
+        let result = conn
             .connection()
             .select_for_sync(&folder, &options, self.command_timeout())
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                record_failed_select(conn, folder, &error);
-                return Err(error);
-            }
-        };
-        conn.set_selected(folder.clone());
+            .await;
+        // The driver knows whether a refusal preserved the previous mailbox,
+        // deselected it, or followed a tagged OK with an incomplete response.
+        conn.set_selected_affinity(conn.connection().selected_mailbox());
+        let result = result?;
         self.folders.mark_seen(folder);
         Ok(result)
     }
@@ -1063,35 +1059,6 @@ fn unsupported_stream<T: Send + 'static>(
     Box::pin(futures::stream::iter([SyncEvent::Terminated(
         error::unsupported(operation),
     )]))
-}
-
-/// Bring a checkout's mailbox affinity in line with its session after
-/// `select_for_sync` failed.
-///
-/// `PoolMember::selected` is what `deselect_target` reads to decide whether
-/// an UNSELECT must precede a DELETE or RENAME, so a stale record makes it skip
-/// one the server needs. What the session holds after a failure:
-///
-/// - Not `Selected`: nothing is selected. A tagged `NO` to SELECT/EXAMINE
-///   deselects the previous mailbox (RFC 3501 6.3.1, RFC 9051 6.3.2), and the
-///   driver moves the session to `Authenticated`. Recorded as `None`.
-/// - `Selected` and the failure is `ProtocolMissing`: the SELECT got its
-///   tagged OK (only a tagged OK makes the session `Selected` on the new
-///   mailbox) and the response was then found incomplete, which leaves the
-///   framing intact and the connection reusable. `folder` is selected.
-/// - `Selected` otherwise: the previous selection stands. A tagged `BAD`
-///   changes no state (RFC 3501 6), a refused QRESYNC `ENABLE` or a local
-///   refusal never sent the SELECT, and the connection-fatal failures retire
-///   the connection, so the record is never read again. Left as it was.
-fn record_failed_select(conn: &mut PooledConn, folder: &MailboxName, error: &Error) {
-    match conn.connection().session_state() {
-        crate::connection::SessionState::Selected => {
-            if matches!(error, Error::ProtocolMissing(_)) {
-                conn.set_selected_affinity(Some(folder.clone()));
-            }
-        }
-        _ => conn.set_selected_affinity(None),
-    }
 }
 
 /// The UIDVALIDITY a completed SELECT or EXAMINE owes.

@@ -19,6 +19,14 @@ The mail path uses a `GmailClient` for Gmail REST history-id sync,
 Cloud Pub/Sub push, and flag canonicalization; People contacts and
 Google Calendar ride alongside it.
 
+Gmail response history IDs are decimal strings decoded once into the internal
+`HistoryId(u64)` type for profiles, messages, history pages and watches.
+Malformed or overflowing IDs fail JSON decoding and map to
+`Protocol(ParseFailed)` with acknowledged response evidence. An absent
+message history ID still yields `ServerVersion::Unavailable`. Change requests
+and watch state retain the validated type; cursor payloads retain their
+existing numeric `u64` representation and subscription handles retain strings.
+
 Gmail has no UID model and no mailbox-scoped server state. A single
 `historyId` walks the account-wide change log, and labels play the
 role of folders: one `CursorScope::Account` cursor per account, a
@@ -315,9 +323,9 @@ requests off `account_net()` and so sits outside the accumulator; it feeds no
 `GoogleAccountFactory` carries an `Arc<GmailClient>` and an optional
 `PubSubConfig`. `open(account_id)` asks the client for an
 account-scoped clone attached to `bifrost-net` under the engine
-`AccountId`, does one `users.getProfile` round-trip, parses
-`profile.historyId` into a `u64` (a value that is present but not a number is
-`Protocol(ParseFailed)`, not a missing field), and stores the
+`AccountId`, does one `users.getProfile` round-trip, decodes
+`profile.historyId` into a crate-private `HistoryId(u64)` (a present non-number
+is `Protocol(ParseFailed)`, not a missing field), and stores the
 `GmailChangeState` as `seed_state`. The opened `GoogleAccount` retains:
 
 - `client: Arc<GmailClient>` (crate-private REST wrapper).

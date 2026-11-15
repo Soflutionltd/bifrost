@@ -259,6 +259,7 @@ fn snapshot_supports_matches_the_authority() {
             capabilities: capabilities.clone(),
             enabled: enabled.clone(),
             mailbox_selected: false,
+            selected: None,
         };
         for capability in every_capability() {
             assert_eq!(

@@ -31,10 +31,9 @@ impl MutationCampaignId {
 /// Vends `IdempotencyKey`s for a mutation campaign's throttle cohorts.
 /// Each cohort allocates once and retains its key across retries.
 ///
-/// `run_id` is persisted across process restarts so retries from the
-/// previous process look correlated to engine bookkeeping; the
-/// consumer-facing `MutationCampaignId` is the key into the
-/// `CheckpointStore` slot that holds it.
+/// Callers that need correlation across process restarts own persistence of
+/// `run_id` and supply it through `with_run_id` when resuming. This vendor
+/// keeps the supplied identity in memory; it does not persist campaign state.
 pub struct IdempotencyVendor {
     run_id: RunId,
     sequence: AtomicU64,

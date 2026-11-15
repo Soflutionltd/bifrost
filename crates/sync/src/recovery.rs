@@ -40,8 +40,6 @@ use std::time::{Duration, SystemTime};
 /// making progress - which is exactly what blocked a hermetic test of the
 /// deferral. `tokio::time::Instant::now()` falls back to the system clock
 /// when no tokio clock is in force, so production behaviour is unchanged.
-/// Same move `bifrost-smtp`'s `AsyncDeadline` and `ByteBucket` made, for the
-/// same reason.
 ///
 /// Nothing here is durable: the bucket is one in-memory `Arc<Mutex<_>>` per
 /// `SyncEngine`, never serialized, never checkpointed, and dropped with the

@@ -2059,7 +2059,7 @@ fn carry_forward(carried: &mut Option<CoverageClaim>, claim: CoverageClaim) {
 
 /// The unified per-account publication ledger.
 ///
-/// The old name remains as a compatibility alias while callers migrate.
+/// Alias for `PendingCoverage`, emphasizing its role as a publication ledger.
 pub type Publications = PendingCoverage;
 
 #[cfg(test)]

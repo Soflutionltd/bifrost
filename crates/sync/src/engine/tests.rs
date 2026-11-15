@@ -1484,6 +1484,7 @@ impl CheckpointStore for FailingOnceStore {
 }
 
 struct GatedDeleteStore {
+    fail_delete: std::sync::atomic::AtomicBool,
     fail_ledger: std::sync::atomic::AtomicBool,
     inner: Arc<crate::cursor::InMemoryCheckpointStore>,
     entered: tokio::sync::Semaphore,
@@ -1493,6 +1494,7 @@ struct GatedDeleteStore {
 impl GatedDeleteStore {
     fn new(inner: Arc<crate::cursor::InMemoryCheckpointStore>) -> Self {
         Self {
+            fail_delete: std::sync::atomic::AtomicBool::new(false),
             fail_ledger: std::sync::atomic::AtomicBool::new(false),
             inner,
             entered: tokio::sync::Semaphore::new(0),
@@ -1573,6 +1575,9 @@ impl CheckpointStore for GatedDeleteStore {
         scope: &'a CursorScope,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
         Box::pin(async move {
+            if self.fail_delete.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::CheckpointStore("cursor delete refused".into()));
+            }
             self.entered.add_permits(1);
             let permit = self.release.acquire().await.expect("gate open");
             permit.forget();
@@ -3938,4 +3943,117 @@ async fn ack_checkpoint_rejects_a_scope_mismatch_before_routing() {
         )
         .await;
     assert!(matches!(result, Err(Error::Other(_))));
+}
+
+// A refused rollback must retain ownership, but that retained mark must still
+// obey later ownership transfers. The old remove-before-delete code leaves the
+// row unowned, so neither the original nor a resuming attempt can clean it up.
+async fn failed_rollback_ownership_case(transfer: bool) {
+    let inner = Arc::new(crate::cursor::InMemoryCheckpointStore::new());
+    let store = Arc::new(GatedDeleteStore::new(Arc::clone(&inner)));
+    let (account, _, tx, writer) =
+        writer_harness_over(Arc::clone(&store) as Arc<DynCheckpointStore>);
+    let handle = WriterHandle::new(tx.clone());
+    handle
+        .reattach_insert(7, change_cursor(b"provisional"))
+        .await
+        .expect("insert");
+    store
+        .fail_delete
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    handle.reattach_abort(7).await;
+    assert!(
+        inner
+            .get_change_cursor(&account, &email_scope())
+            .await
+            .expect("read")
+            .is_some()
+    );
+    if transfer {
+        let (done, wait) = oneshot::channel();
+        tx.send(WriterRequest::GetChangeCursor {
+            scope: email_scope(),
+            claim_for: Some(8),
+            done,
+        })
+        .await
+        .expect("writer alive");
+        assert!(wait.await.expect("answered").expect("read").is_some());
+    }
+    store
+        .fail_delete
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    store.release.add_permits(2);
+    handle.reattach_abort(7).await;
+    if transfer {
+        assert!(
+            inner
+                .get_change_cursor(&account, &email_scope())
+                .await
+                .expect("read")
+                .is_some()
+        );
+        handle.reattach_abort(8).await;
+    }
+    assert!(
+        inner
+            .get_change_cursor(&account, &email_scope())
+            .await
+            .expect("read")
+            .is_none()
+    );
+    drop(handle);
+    drop(tx);
+    writer.await.expect("writer");
+}
+
+#[tokio::test]
+async fn a_failed_rollback_can_be_retried() {
+    failed_rollback_ownership_case(false).await;
+}
+
+#[tokio::test]
+async fn a_failed_rollback_can_transfer_ownership_before_its_retry() {
+    failed_rollback_ownership_case(true).await;
+}
+
+// An idempotent acknowledgement takes the already-persisted branch, which
+// must still promote a row subsequently marked provisional by a reattach.
+#[tokio::test]
+async fn an_already_persisted_change_ack_promotes_a_provisional_row() {
+    let (account, store, coverage, tx, writer) = writer_harness();
+    let checkpoint = bifrost_types::Checkpoint::Change(change_cursor(b"acked"));
+    let publication = register(
+        &coverage,
+        &checkpoint,
+        crate::cursor::CoverageClaim {
+            reports: Vec::new(),
+            generation: 0,
+        },
+    );
+    ack(&tx, checkpoint.clone(), Some(publication.clone()))
+        .await
+        .expect("first ack");
+    let handle = WriterHandle::new(tx.clone());
+    handle
+        .reattach_insert(7, change_cursor(b"acked"))
+        .await
+        .expect("insert");
+    ack(&tx, checkpoint, Some(publication))
+        .await
+        .expect("duplicate ack");
+    handle.reattach_abort(7).await;
+    assert_eq!(
+        store
+            .get_change_cursor(&account, &email_scope())
+            .await
+            .expect("read")
+            .expect("committed cursor")
+            .server_state
+            .bytes,
+        b"acked"
+    );
+    drop(handle);
+    drop(tx);
+    writer.await.expect("writer");
 }

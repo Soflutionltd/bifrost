@@ -366,6 +366,8 @@ impl DavDispatch {
         url: &str,
         operation: AccountOperation,
     ) -> Result<(HeaderMap, Option<AccessToken>), AccountError> {
+        // Keep this credential gate even though the request dispatcher also
+        // checks trust: standalone `auth_headers` calls enter here directly.
         if !self.is_trusted_url(url) {
             return Err(local_error(
                 operation,
@@ -806,6 +808,9 @@ impl DavDispatch {
         // protected nothing - the request had already gone out - and as a
         // debug assertion it panicked a downstream debug build while
         // returning the response silently in release.
+        // Deliberately re-check at the send boundary as well as at credential
+        // minting: dispatch admits request targets; minting protects credentials
+        // for callers that only ask for headers.
         if !self.is_trusted_url(&request.url) {
             return Err(local_error(
                 operation,

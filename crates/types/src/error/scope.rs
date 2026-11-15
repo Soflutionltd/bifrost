@@ -43,6 +43,56 @@ pub enum ErrorScope {
     },
 }
 
+impl ErrorScope {
+    /// The individual resource identified by this scope, when its kind is known.
+    ///
+    /// Collection scopes report the kind they collect (`Calendar`, `Contact`)
+    /// with no object id, so a collection-scoped miss is still a typed
+    /// not-found. Cursor scopes identify sync state rather than the object
+    /// that a request missed. Scopes without a corresponding resource kind
+    /// return `None`.
+    pub fn resource(&self) -> Option<super::ResourceKind> {
+        use super::ResourceKind;
+        match self {
+            Self::Message { .. } => Some(ResourceKind::Message),
+            Self::Mailbox { .. } => Some(ResourceKind::Mailbox),
+            Self::Thread { .. } => Some(ResourceKind::Thread),
+            Self::Calendar { .. } | Self::CalendarCollection => Some(ResourceKind::Calendar),
+            Self::Event { .. } => Some(ResourceKind::Event),
+            Self::Contact { .. } | Self::ContactCollection => Some(ResourceKind::Contact),
+            Self::Submission { .. }
+            | Self::CloudFile { .. }
+            | Self::UploadSession
+            | Self::Account
+            | Self::Cursor(_)
+            | Self::DirectoryGateway { .. } => None,
+        }
+    }
+
+    /// The object id carried by this scope, without allocating.
+    ///
+    /// Cursor ids name sync state, and gateway URLs name endpoints, so neither
+    /// is an object id. An id can be present without a known resource kind.
+    pub fn object_id(&self) -> Option<&str> {
+        match self {
+            Self::Submission { id } => Some(&id.0),
+            Self::CloudFile { id } => Some(id),
+            Self::Mailbox { id } => Some(&id.0),
+            Self::Message { id } => Some(&id.0),
+            Self::Thread { id } => Some(&id.0),
+            Self::Calendar { id } => Some(&id.0),
+            Self::Event { id } => Some(&id.0),
+            Self::Contact { id } => Some(&id.0),
+            Self::UploadSession
+            | Self::Account
+            | Self::Cursor(_)
+            | Self::CalendarCollection
+            | Self::ContactCollection
+            | Self::DirectoryGateway { .. } => None,
+        }
+    }
+}
+
 /// One serialized `(name, value)` pair. Every `ErrorScope` field is a
 /// string, so the whole projection fits a flat array.
 type ScopeField<'a> = (&'static str, &'a str);
@@ -345,6 +395,77 @@ mod tests {
     use super::{AccountOperation, ErrorScope, scope_fields};
     use crate::cursor::{CursorScope, ObjectType};
     use crate::ids::{FolderId, QueryId};
+
+    #[test]
+    fn resource_and_object_id_cover_every_scope_shape() {
+        use crate::error::ResourceKind;
+
+        let cases = [
+            (
+                ErrorScope::Message { id: "m".into() },
+                Some(ResourceKind::Message),
+                Some("m"),
+            ),
+            (
+                ErrorScope::Mailbox { id: "b".into() },
+                Some(ResourceKind::Mailbox),
+                Some("b"),
+            ),
+            (
+                ErrorScope::Thread { id: "t".into() },
+                Some(ResourceKind::Thread),
+                Some("t"),
+            ),
+            (
+                ErrorScope::Calendar { id: "c".into() },
+                Some(ResourceKind::Calendar),
+                Some("c"),
+            ),
+            (
+                ErrorScope::Event {
+                    id: crate::calendar::EventId("e".to_owned()),
+                },
+                Some(ResourceKind::Event),
+                Some("e"),
+            ),
+            (
+                ErrorScope::Contact { id: "p".into() },
+                Some(ResourceKind::Contact),
+                Some("p"),
+            ),
+            (ErrorScope::Submission { id: "s".into() }, None, Some("s")),
+            (ErrorScope::CloudFile { id: "f".into() }, None, Some("f")),
+            (ErrorScope::UploadSession, None, None),
+            (ErrorScope::Account, None, None),
+            (ErrorScope::Cursor(CursorScope::Account), None, None),
+            (
+                ErrorScope::Cursor(CursorScope::Folder(FolderId("folder".to_owned()))),
+                None,
+                None,
+            ),
+            (
+                ErrorScope::CalendarCollection,
+                Some(ResourceKind::Calendar),
+                None,
+            ),
+            (
+                ErrorScope::ContactCollection,
+                Some(ResourceKind::Contact),
+                None,
+            ),
+            (
+                ErrorScope::DirectoryGateway {
+                    url: "https://example.test/".into(),
+                },
+                None,
+                None,
+            ),
+        ];
+        for (scope, resource, id) in cases {
+            assert_eq!(scope.resource(), resource, "{scope:?}");
+            assert_eq!(scope.object_id(), id, "{scope:?}");
+        }
+    }
 
     /// `scope_fields` is the single source for both the declared struct
     /// field count and the fields written, so pinning it pins the

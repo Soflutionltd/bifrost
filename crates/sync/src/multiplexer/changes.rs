@@ -446,10 +446,9 @@ pub struct AckRequest {
     ///
     /// `None` only for engine-internal acks that carry no coverage claim.
     pub publication: Option<crate::cursor::PublicationId>,
-    /// True for legacy engine-generated acks. Current production code
-    /// sends only consumer acks (`false`), but the field remains for
-    /// trace readability if old tests or callers construct requests
-    /// directly inside the crate.
+    /// Diagnostic provenance flag: `true` labels an engine-generated ack,
+    /// and `false` labels a consumer ack in tracing. This flag does not
+    /// change acknowledgement validation or persistence.
     pub auto: bool,
     /// Completion channel for consumer-driven acks. `ack_checkpoint`
     /// waits on this so it returns only after the checkpoint store

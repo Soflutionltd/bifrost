@@ -816,24 +816,6 @@ on_own_tag, on_foreign_tag, on_continuation, route_untagged }`, which also makes
 literal budgets apply in every loop (BUG-037) and gives CON-033's `Framing` one
 producer.
 
-## CON-035 - Which mailbox is selected on this IMAP connection?
-
-**Reported by:** imap-connection.
-
-`ProtocolState::selected` is written by `apply_tagged` (OK sets it, NO clears it,
-CLOSE/UNSELECT/UNAUTHENTICATE clear it) and never read: no getter, not in
-`ConnectionStateSnapshot`. The account pool keeps its own copy
-(`PooledConn::set_selected`, `set_selected_affinity`), and
-`account::record_failed_select` reconstructs the driver's knowledge from
-`session_state()` plus the error variant ("Selected and ProtocolMissing means the
-tagged OK selected it"). Owner: the driver; publish `selected:
-Option<MailboxName>` in the snapshot and have the pool read it. The second piece
-of write-only state, `ProtocolState::notify_history: VecDeque<NotifyFlags>`
-(pushed on every untagged response, capped at 1024, cleared on UNAUTHENTICATE,
-never read, its doc describing a "D3 notify snapshot" design the code no longer
-implements, costing a push and a bounded pop per untagged response), should be
-deleted.
-
 ## CON-036 - Is this an IMAP quota resource capability?
 
 **Reported by:** imap-connection.
@@ -956,19 +938,6 @@ lists use; serde is what decode uses. `define_open_property_enum!` already
 generates both from one table for calendar event and contact card; using it (or a
 closed variant) everywhere removes the second answer, and the per-enum round-trip
 tests in `tests.rs` that exist only because there are two answers.
-
-## CON-044 - `ErrorScope` -> `ResourceKind` is mapped in three crates, and they disagree
-
-**Reported by:** jmap-account (latent; JMAP produces no calendar or contact scope today), net-dav (the same three private copies, beside the status ladder of BUG-072).
-
-`resource_from_scope` / `id_from_scope` exist in `net/src/account_error.rs`,
-`graph/src/account/graph_error.rs` and `jmap/src/sync/error.rs`. Net and Graph map
-`ErrorScope::Event` to `ResourceKind::Event` and the two `*Collection` scopes to
-`None`. JMAP has no `Event` arm (it falls to `_ => None`, the shape of the
-2026-07-31 sweep findings) and maps `CalendarCollection` / `ContactCollection` to
-`Calendar` / `Contact`. Owner: a property of `ErrorScope` in `bifrost-types`
-(`ErrorScope::resource()`, `ErrorScope::object_id()`), where the match is
-exhaustive.
 
 ## CON-045 - How many ids per JMAP call?
 

@@ -136,6 +136,7 @@ pub(crate) fn account_kind_discriminant(kind: &AccountErrorKind) -> &'static str
         AccountErrorKind::Authorization(_) => "authorization",
         AccountErrorKind::Server(_) => "server",
         AccountErrorKind::SyncState(_) => "sync_state",
+        AccountErrorKind::ControlWaitEnded => "control_wait_ended",
         AccountErrorKind::ConcurrencyConflict => "concurrency_conflict",
         AccountErrorKind::Request(_) => "request",
         AccountErrorKind::NotFound(_) => "not_found",

@@ -18,7 +18,7 @@ use futures::stream;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::GmailClient;
-use crate::error::{Error, GmailLocalError, PageRefusal, ProviderFault};
+use crate::error::{Error, GmailLocalError, PageRefusal};
 use crate::types::{GmailHistoryItem, GmailMessage, GmailProfile};
 
 use super::cursor::{cursor_for_history, decode_gmail_state};
@@ -153,7 +153,7 @@ fn stream_from_state(state: ChangeState) -> AccountStream<SyncEvent<Change>> {
                         .email_address
                         .eq_ignore_ascii_case(&decoded.profile_email) =>
                 {
-                    state.start_history_id = Some(decoded.history_id.to_string());
+                    state.start_history_id = Some(crate::types::HistoryId(decoded.history_id));
                     state.checked_profile = true;
                 }
                 Ok(current) => {
@@ -184,7 +184,7 @@ fn stream_from_state(state: ChangeState) -> AccountStream<SyncEvent<Change>> {
         // `start_history_id` in the same arm that sets `checked_profile`.
         // Reaching it is this crate's bug, never a provider response
         // lacking a field: `Internal(InvariantViolated)`.
-        let Some(start_history_id) = state.start_history_id.as_deref() else {
+        let Some(start_history_id) = state.start_history_id else {
             state.finished = true;
             state.emitted_done = true;
             let account_error = account_error::into_account_error(
@@ -203,23 +203,7 @@ fn stream_from_state(state: ChangeState) -> AccountStream<SyncEvent<Change>> {
         match history {
             Ok(response) => {
                 let bytes_in = state.tally.take();
-                let history_id = match response.history_id.parse::<u64>() {
-                    Ok(history_id) => history_id,
-                    // Present but not a number: the field did not parse,
-                    // it was not missing.
-                    Err(error) => {
-                        state.finished = true;
-                        state.emitted_done = true;
-                        let account_error = account_error::into_account_error(
-                            Error::provider_response(
-                                ProviderFault::ParseFailed,
-                                format!("gmail history response historyId invalid: {error}"),
-                            ),
-                            account_error::GmailErrorContext::changes(),
-                        );
-                        return Some((SyncEvent::Terminated(account_error), state));
-                    }
-                };
+                let history_id = response.history_id.0;
                 state.pages_walked += 1;
                 if let Some(refusal) = walk_refusal(
                     &mut state.seen_page_tokens,
@@ -353,7 +337,7 @@ struct ChangeState {
     profile: GmailProfile,
     cursor: Option<bifrost_types::ChangeCursor>,
     page_token: Option<String>,
-    start_history_id: Option<String>,
+    start_history_id: Option<crate::types::HistoryId>,
     walk_history_id: Option<u64>,
     seen_page_tokens: HashSet<String>,
     pages_walked: usize,
@@ -452,7 +436,7 @@ mod tests {
         let client = Arc::new(GmailClient::with_account_net("https://gmail.test", net));
         let profile = GmailProfile {
             email_address: "person@example.com".to_string(),
-            history_id: "100".to_string(),
+            history_id: crate::types::HistoryId(100),
         };
         let shutdown = CancellationToken::new();
         let mut events = changes_stream_cancellable(
@@ -494,7 +478,7 @@ mod tests {
         ]);
         let profile = GmailProfile {
             email_address: "person@example.com".to_string(),
-            history_id: "100".to_string(),
+            history_id: crate::types::HistoryId(100),
         };
 
         let events = changes_stream(
@@ -537,7 +521,7 @@ mod tests {
         ]);
         let profile = GmailProfile {
             email_address: "person@example.com".to_string(),
-            history_id: "100".to_string(),
+            history_id: crate::types::HistoryId(100),
         };
 
         let events = changes_stream(
@@ -644,7 +628,7 @@ mod tests {
             tally,
             profile: GmailProfile {
                 email_address: "person@example.com".to_string(),
-                history_id: "100".to_string(),
+                history_id: crate::types::HistoryId(100),
             },
             cursor: None,
             page_token: None,
@@ -683,7 +667,7 @@ mod tests {
         ]);
         let profile = GmailProfile {
             email_address: "person@example.com".to_string(),
-            history_id: "100".to_string(),
+            history_id: crate::types::HistoryId(100),
         };
 
         let events = changes_stream(
@@ -753,7 +737,7 @@ mod tests {
         ]);
         let profile = GmailProfile {
             email_address: "person@example.com".to_string(),
-            history_id: "100".to_string(),
+            history_id: crate::types::HistoryId(100),
         };
         let cursor = cursor_for_history(100, "Person@Example.com");
 

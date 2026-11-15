@@ -535,7 +535,8 @@ stopper drop. WatchEvent remains the external receiver-to-sink vocabulary.
 
 `mime::HeaderMap::message_ids` extracts nonempty structural angle-delimited
 identifiers across all occurrences of a header, preserving order and ignoring
-angle brackets inside quoted strings and nested comments. The associated
-`first_message_id` helper uses the same scanner and retains a trimmed bare-value
+angle brackets inside quoted strings and nested comments. The free function
+`mime::first_message_id(raw)` borrows its result from the raw value, uses the
+same scanner and retains a trimmed bare-value
 fallback when there is no structural opening angle bracket. Empty or unfinished
 structural brackets do not become bare identifiers.

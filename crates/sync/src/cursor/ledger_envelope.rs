@@ -122,7 +122,7 @@ use crate::error::Error;
 /// Current ledger envelope version. Bumped whenever the layout below changes
 /// in a way an older decoder would misread, including a new tag in a
 /// vocabulary an older decoder would refuse.
-pub const LEDGER_ENVELOPE_VERSION: u32 = 7;
+pub const LEDGER_ENVELOPE_VERSION: u32 = 8;
 
 /// Lowest ledger envelope version still readable by this engine.
 ///
@@ -309,7 +309,7 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
 /// one.
 ///
 /// A no-op while every version in the readable window shares one layout
-/// (versions 4 through 7 only widened the error vocabulary). It exists as the
+/// (versions 4 through 8 only widened the error vocabulary). It exists as the
 /// named boundary anyway, for the same reason `migrate_change_cursor` does:
 /// the codec is the only place in the workspace that may hold ledger state in
 /// an older shape, so a fixup written anywhere else spreads knowledge of a dead
@@ -865,6 +865,9 @@ fn canonical_cause(kind: &AccountErrorKind) -> Cause {
             _ => StateCause::CursorInvalid,
         }),
         AccountErrorKind::ConcurrencyConflict => Cause::State(StateCause::ConcurrencyConflict),
+        AccountErrorKind::ControlWaitEnded => Cause::State(StateCause::ControlWaitEnded {
+            detail: DiagnosticText::support_only(""),
+        }),
         AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid) => {
             Cause::Request(RequestCause::BatchInputEmpty)
         }
@@ -997,6 +1000,7 @@ fn encode_error_kind(out: &mut Vec<u8>, kind: &AccountErrorKind) {
                 _ => panic!("ledger envelope: unknown internal error kind"),
             });
         }
+        AccountErrorKind::ControlWaitEnded => out.push(11),
         // `AccountErrorKind` is `#[non_exhaustive]`; same rule as
         // `encode_obj_type` in the cursor envelope - the codec learns the
         // variant before a ledger carrying it may be stored.
@@ -1080,6 +1084,8 @@ fn decode_error_kind(reader: &mut Reader<'_>) -> Result<AccountErrorKind, Error>
             4 => InternalErrorKind::LimitExceeded,
             other => return Err(unknown_tag("internal error kind", other)),
         }),
+        // Introduced in version 8; no older writer produced it.
+        11 if reader.version >= 8 => AccountErrorKind::ControlWaitEnded,
         other => return Err(unknown_tag("account error kind", other)),
     };
     Ok(kind)
@@ -1859,8 +1865,28 @@ mod tests {
 mod partial_commit_scope_tests {
     use super::*;
     #[test]
+    fn ledger_control_wait_ended_v8_tag_round_trips() {
+        const { assert!(LEDGER_ENVELOPE_VERSION >= 8) };
+        let kind = AccountErrorKind::ControlWaitEnded;
+        let mut bytes = Vec::new();
+        encode_error_kind(&mut bytes, &kind);
+        assert_eq!(
+            decode_error_kind(&mut Reader::new(&bytes, 8)).unwrap(),
+            kind
+        );
+        assert!(decode_error_kind(&mut Reader::new(&bytes, 7)).is_err());
+        let restored = AccountErrorBuilder::new(kind.clone(), canonical_cause(&kind))
+            .try_build()
+            .expect("canonical cause matches the kind");
+        assert_eq!(
+            restored.recovery(),
+            &bifrost_types::RecoveryClass::Cancelled
+        );
+    }
+
+    #[test]
     fn ledger_error_scope_v7_tags_round_trip() {
-        assert_eq!(LEDGER_ENVELOPE_VERSION, 7);
+        const { assert!(LEDGER_ENVELOPE_VERSION >= 7) };
         for scope in [
             ErrorScope::Submission {
                 id: ObjectId("submission".into()),

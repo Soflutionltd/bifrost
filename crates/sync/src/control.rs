@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, Cause, Checkpoint, Control,
-    CursorScope, DurableCheckpointSet, Partition, Priority, RequestCause, RequestErrorKind,
+    CursorScope, DurableCheckpointSet, Partition, Priority, StateCause,
 };
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -579,8 +579,8 @@ impl SyncControl {
 /// can no longer reach the boundary it asked for.
 fn control_wait_ended(detail: &'static str) -> AccountError {
     AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
+        AccountErrorKind::ControlWaitEnded,
+        Cause::State(StateCause::ControlWaitEnded {
             detail: bifrost_types::DiagnosticText::support_only(detail),
         }),
     )
@@ -836,6 +836,52 @@ mod tests {
             result.is_err(),
             "a stopped account cannot reach the boundary, and must not claim to"
         );
+    }
+
+    #[test]
+    fn closed_control_channels_have_the_same_typed_wait_failure() {
+        for detail in [
+            "control: checkpoint watch channel closed",
+            "control: boundary channel closed",
+        ] {
+            let error = control_wait_ended(detail);
+            assert_eq!(error.kind(), &AccountErrorKind::ControlWaitEnded);
+            assert_eq!(error.recovery(), &bifrost_types::RecoveryClass::Cancelled);
+            assert!(error.suggested_remediation().is_none());
+            assert!(matches!(
+                error.chain().outermost(),
+                Cause::State(StateCause::ControlWaitEnded { detail: actual })
+                    if actual.as_str() == detail
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_control_waits_report_cancellation_without_caller_blame() {
+        for checkpoint_now in [false, true] {
+            let control = control();
+            control.expect_checkpoint(checkpoint(b"unacknowledged"));
+            let mut waiter = if checkpoint_now {
+                control.checkpoint_now()
+            } else {
+                control.pause()
+            };
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(std::future::Future::poll(waiter.as_mut(), &mut context).is_pending());
+
+            control.inner.boundary.set(BoundaryRequest::Stop);
+            let error = waiter.await.expect_err("stop must interrupt the wait");
+            assert_eq!(error.kind(), &AccountErrorKind::ControlWaitEnded);
+            assert!(matches!(
+                error.chain().outermost(),
+                Cause::State(StateCause::ControlWaitEnded { .. })
+            ));
+            assert_eq!(error.message_key(), "control.wait-ended");
+            assert_eq!(error.recovery(), &bifrost_types::RecoveryClass::Cancelled);
+            assert!(error.recovery().is_terminal());
+            assert!(error.suggested_remediation().is_none());
+            assert_eq!(control.inner.boundary.snapshot(), BoundaryRequest::Stop);
+        }
     }
 
     #[tokio::test]

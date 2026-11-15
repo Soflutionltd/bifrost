@@ -29,6 +29,22 @@ pub enum Flag {
 }
 
 impl Flag {
+    /// Convert a provider-neutral mutation keyword to an IMAP flag.
+    ///
+    /// The neutral `$seen`, `$answered`, and `$flagged` aliases name system
+    /// flags. Wire parsing deliberately keeps those literal keywords distinct.
+    pub fn from_neutral_keyword(keyword: &str) -> Self {
+        if keyword.eq_ignore_ascii_case("$seen") {
+            Self::Seen
+        } else if keyword.eq_ignore_ascii_case("$answered") {
+            Self::Answered
+        } else if keyword.eq_ignore_ascii_case("$flagged") {
+            Self::Flagged
+        } else {
+            Self::from_imap_str(keyword)
+        }
+    }
+
     /// Returns the wire representation of this flag (e.g. `\Seen`, `$Important`)
     /// (RFC 3501 Section 2.3.2 / RFC 9051 Section 2.3.2).
     pub fn as_imap_str(&self) -> &str {

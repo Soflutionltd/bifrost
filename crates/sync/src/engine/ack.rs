@@ -432,7 +432,6 @@ pub(super) async fn ack_writer(
                     .map(|(scope, _)| scope.clone())
                     .collect();
                 for scope in owned {
-                    provisional.remove(&scope);
                     if let Err(error) = store.delete_change_cursor(&account_id, &scope).await {
                         tracing::error!(
                             target: "bifrost.sync.reopen",
@@ -441,6 +440,11 @@ pub(super) async fn ack_writer(
                             error = %error,
                             "failed to roll back replacement cursor after aborted reattach"
                         );
+                    } else {
+                        // A failed delete leaves the row abort-owned for a retry.
+                        // Later queued claims, commits and durable acks may still
+                        // transfer or promote it before that retry arrives.
+                        provisional.remove(&scope);
                     }
                 }
                 let _ = done.send(());
@@ -1460,7 +1464,9 @@ async fn persist_ack_request(
         }
         // Already persisted by an earlier acknowledgement of this exact
         // publication. Re-applying would double-ingest; reporting failure would
-        // make a successful ack non-idempotent.
+        // make a successful ack non-idempotent. This is still Durable: the
+        // caller must promote a provisional change row on this path too, so a
+        // delayed reattach abort cannot delete an acknowledged cursor.
         Some(ClaimLookup::AlreadyPersisted) => return Ok(AckPersistOutcome::Durable),
         Some(ClaimLookup::Unknown) => {
             // Emphatically NOT treated as complete coverage. An unknown

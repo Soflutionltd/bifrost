@@ -181,16 +181,6 @@ returning `Result<T, WriterError>` with `WriterError::Gone` distinct from
 `WriterError::Store(Error)`, so each call site states which it tolerates (see
 STR-031 for where the writer protocol should live).
 
-## BUG-011 - A pause cut short by detach is classified `Request(Malformed)`
-
-**Reported by:** sync-engine (P3).
-
-`control.rs::control_wait_ended` builds
-`AccountErrorKind::Request(RequestErrorKind::Malformed)` for "account stopped
-before reaching a safe boundary", "checkpoint watch closed" and "boundary
-channel closed". A consumer branching on kind sees a malformed request it never
-made. A typed control-wait error is part of STR-027.
-
 ## BUG-012 - Two resume paths with different effects, and engine pause state is never retained
 
 **Reported by:** sync-engine (P3, divergence).
@@ -401,18 +391,6 @@ is written with uidvalidity 0, so every reconnect silently drops QRESYNC and
 full-resyncs. Owner: the decoder (or the SELECT consumer) turns the wire number
 into `Option<UidValidity>` / `Option<ModSeq>` once, stating the "0 means absent"
 tolerance there; every downstream field is the typed value.
-
-## BUG-026 - IMAP folds a neutral `$seen` keyword on one write path and not the other
-
-**Reported by:** imap-protocol (live).
-
-`pim::imap_flag_for_keyword` folds `$seen` / `$flagged` / `$answered` (JMAP
-spellings) onto `\Seen` / `\Flagged` / `\Answered`; `account/mutate.rs` uses
-plain `Flag::from` (no folding); the flag judge compares raw strings. So
-`set_keyword("$seen")` stores `\Seen` while `bulk_set_flags({"$seen"})` stores a
-literal keyword `$seen`, and a read-back of the latter judges against `\seen`.
-Owner: `Flag::from_neutral_keyword` in `types/flag.rs`, used by every write path
-and by the judge. The writable-flag type split behind it is STR-054.
 
 ## BUG-027 - "Is this mailbox INBOX / the same mailbox?" has six answers, and a solicited STATUS is misrouted
 
@@ -1742,23 +1720,37 @@ while the PIM path dedupes by raw string and builds an `ErrorScope::Account`
 outcome; the etag rules are restated per lane. Owner: one `BatchAnswers::resolve`
 plus `EtagIndex::observe(id, Observation)` (STR-108).
 
-## BUG-125 - `ReattachAbort` drops provisional ownership before its delete succeeds
+## BUG-130 - `ResetScope` clears provisional ownership before its fallible persist
 
-**Reported by:** resolution wave (lateral, beside the provisional-ownership ordering
-fix in `crates/sync/src/engine/ack.rs`).
+**Reported by:** resolution wave (lateral, beside the `ReattachAbort` ordering fix).
 
-The `Ack` arm now clears provisional ownership only after a durable write. The
-`ReattachAbort` arm still removes ownership before its row delete succeeds, so a
-failed delete cannot be retried by a later abort and the row survives unowned.
+`crates/sync/src/engine/ack.rs`: the `Ack` and `ReattachAbort` arms now release
+provisional ownership only after the store write or delete succeeds. `ResetScope`
+still clears it before its fallible persistence and deletion, so a failed reset
+leaves the row unowned.
 
-## BUG-126 - `engine/passthrough.rs` repeats the false read-only passthrough rationale
+## BUG-131 - Google keeps a private `ErrorScope` to resource mapping that disagrees with the shared one
 
-**Reported by:** resolution wave (lateral, after `reference/sync.md` was corrected).
+**Reported by:** resolution wave review (lateral, after the shared
+`ErrorScope::resource()` / `object_id()` landed in bifrost-types).
 
-`reference/sync.md` now states that the direct passthroughs include writes and
-bypass engine pause, admission and throttle holds. A comment in
-`crates/sync/src/engine/passthrough.rs` still says the forwarders are a read
-surface with mutations funnelled through `bulk_set_flags`; reword it to match.
+net, Graph and JMAP now read `ErrorScope::resource()`, which maps
+`CalendarCollection` / `ContactCollection` to `Calendar` / `Contact` with no object
+id. `crates/google/src/account/error.rs` still has its own local reader mapping both
+collection scopes to `None`, so a collection-scoped Google failure classifies
+differently from every other crate. Route it through the shared methods.
+
+## BUG-132 - One malformed Gmail message history id now fails the whole response decode
+
+**Reported by:** resolution wave review (lateral; needs a ruling).
+
+With the typed `HistoryId` (`crates/google/src/types.rs`), a malformed `historyId`
+on one `GmailMessage` fails deserialization of the response it arrives in, where
+the hydration path used to degrade that message's version to
+`ServerVersion::Unavailable`. A uniform `ParseFailed` was the intended outcome, but
+it widens one bad field into a whole inventory or hydration page failure. Decide
+whether `GmailMessage.history_id` should decode leniently (an `Option` that reads
+`None` on a bad value) while profile, history and watch ids stay strict.
 
 ## BUG-127 - A genuinely empty Gmail text part now marks the message incomplete
 
@@ -1769,24 +1761,4 @@ through the shared MIME selector and marks a non-attachment text leaf with no
 `body.data` as `incomplete`. Gmail may omit `data` for an empty body (`size: 0`), so
 an empty but complete message reports `incomplete = true`. Decide whether
 `body.size == Some(0)` is treated as present-and-empty.
-
-## BUG-128 - `HeaderMap::first_message_id` is a published associated function that takes no `self`
-
-**Reported by:** resolution wave review (lateral).
-
-The structural Message-ID scanner was promoted into
-`crates/types/src/mime/header.rs` as `pub fn HeaderMap::first_message_id(raw: &str)`,
-which does not read the map. It is now published surface; a free function in the
-mime module, or a `&self` method reading a named header, would be the honest shape.
-Moving it before it gains downstream users avoids a later rename ruling.
-
-## BUG-129 - Provisional-row promotion keys only on a `Durable` change acknowledgement
-
-**Reported by:** resolution wave review (lateral; unverified).
-
-`crates/sync/src/engine/ack.rs` now promotes a provisional reattach row only on
-`AckPersistOutcome::Durable` for a `Change` checkpoint. Check whether any other
-outcome (an already-persisted or no-op acknowledgement) also means the cursor is
-durably committed; if one does, a later `ReattachAbort` can still delete a cursor
-the consumer persisted against.
 

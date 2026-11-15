@@ -272,7 +272,7 @@ enum WatchCommand {
 enum WatchLifecycle {
     Unwatched,
     Watched {
-        history_id: String,
+        history_id: crate::types::HistoryId,
         expiration: Option<SystemTime>,
     },
     Renewing,
@@ -366,14 +366,14 @@ impl PubSubControl {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GmailWatchResponse {
-    history_id: String,
+    history_id: crate::types::HistoryId,
     expiration: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct GmailSubscriptionHandle {
     topic: String,
-    history_id: String,
+    history_id: crate::types::HistoryId,
     expiration: Option<String>,
     /// Gmail returns the same watch state to concurrent subscribers when
     /// the mailbox is quiet. This process-local id keeps their handles
@@ -596,7 +596,7 @@ async fn watch_actor(
                         let WatchLifecycle::Watched { history_id, expiration } = &lifecycle else { let _ = reply.send(Ok(RenewOutcome::NotWatched)); continue; };
                         if handles.is_empty() { let _ = reply.send(Ok(RenewOutcome::NotWatched)); continue; }
                         if schedule.borrow().is_some_and(|due| due > tokio::time::Instant::now()) { let _ = reply.send(Ok(RenewOutcome::NotDue)); continue; }
-                        let previous_history = history_id.clone(); let previous_expiration = *expiration;
+                        let previous_history = *history_id; let previous_expiration = *expiration;
                         lifecycle = WatchLifecycle::Renewing;
                         schedule.send_replace(None);
                         let Some(config) = config.as_ref() else { lifecycle = WatchLifecycle::Unwatched; let _ = reply.send(Ok(RenewOutcome::NotWatched)); continue; };
@@ -710,7 +710,7 @@ async fn actor_subscribe(
     // would skip `users.stop` and the renewer would keep the orphan alive.
     let handle = GmailSubscriptionHandle {
         topic: config.topic.clone(),
-        history_id: response.history_id.clone(),
+        history_id: response.history_id,
         expiration: response.expiration.clone(),
         handle_id,
     };
@@ -857,7 +857,7 @@ async fn commit_watched(
         return false;
     }
     *lifecycle = WatchLifecycle::Watched {
-        history_id: response.history_id.clone(),
+        history_id: response.history_id,
         expiration: response.expiration.as_deref().and_then(parse_expiration),
     };
     true
@@ -1004,7 +1004,7 @@ mod tests {
         SubscriptionHandle(
             serde_json::to_string(&GmailSubscriptionHandle {
                 topic: "projects/p/topics/t".to_owned(),
-                history_id: "12345".to_owned(),
+                history_id: crate::types::HistoryId(12345),
                 expiration: Some("1700000000000".to_owned()),
                 handle_id: 1,
             })
@@ -1155,7 +1155,7 @@ mod tests {
     fn subscription_handle_round_trips_through_json() {
         let handle = GmailSubscriptionHandle {
             topic: "projects/p/topics/t".to_owned(),
-            history_id: "12345".to_owned(),
+            history_id: crate::types::HistoryId(12345),
             expiration: Some("1700000000000".to_owned()),
             handle_id: 7,
         };
@@ -1720,12 +1720,24 @@ mod tests {
         let response: GmailWatchResponse =
             serde_json::from_str(r#"{"historyId":"987","expiration":"1700000000000"}"#)
                 .expect("watch response decodes");
-        assert_eq!(response.history_id, "987");
+        assert_eq!(response.history_id, crate::types::HistoryId(987));
         assert_eq!(response.expiration.as_deref(), Some("1700000000000"));
 
         let no_expiry: GmailWatchResponse =
             serde_json::from_str(r#"{"historyId":"987"}"#).expect("expiration is optional");
         assert!(no_expiry.expiration.is_none());
+    }
+
+    #[test]
+    fn watch_response_rejects_an_invalid_history_id_at_decode() {
+        for value in ["not-a-number", "18446744073709551616"] {
+            assert!(
+                serde_json::from_value::<GmailWatchResponse>(serde_json::json!({
+                    "historyId": value
+                }))
+                .is_err()
+            );
+        }
     }
 
     /// gmail-G14: the history id and the expiration are one transition on
@@ -1737,11 +1749,11 @@ mod tests {
         let (client, script) = scripted_client([]);
         let shutdown = CancellationToken::new();
         let mut lifecycle = WatchLifecycle::Watched {
-            history_id: "stale-history".to_owned(),
+            history_id: crate::types::HistoryId(1),
             expiration: Some(UNIX_EPOCH + Duration::from_millis(1_600_000_000_000)),
         };
         let response = GmailWatchResponse {
-            history_id: "new-history".to_owned(),
+            history_id: crate::types::HistoryId(2),
             expiration: Some("1700000000000".to_owned()),
         };
 
@@ -1765,7 +1777,7 @@ mod tests {
         else {
             panic!("watch response must enter Watched");
         };
-        assert_eq!(history_id, "new-history");
+        assert_eq!(*history_id, crate::types::HistoryId(2));
         assert_eq!(
             *expiration,
             Some(UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)),
@@ -1789,7 +1801,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let mut lifecycle = WatchLifecycle::Renewing;
         let response = GmailWatchResponse {
-            history_id: "9".to_owned(),
+            history_id: crate::types::HistoryId(9),
             expiration: Some("1700000000000".to_owned()),
         };
 
@@ -1828,7 +1840,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let mut lifecycle = WatchLifecycle::Retired;
         let response = GmailWatchResponse {
-            history_id: "9".to_owned(),
+            history_id: crate::types::HistoryId(9),
             expiration: None,
         };
 

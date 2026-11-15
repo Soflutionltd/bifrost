@@ -17,8 +17,6 @@
 //!
 //! Direct field assignment from outside this module is a compile error (I2).
 
-use std::collections::VecDeque;
-
 use tracing::warn;
 
 use super::{NotifyFlags, SessionState};
@@ -55,10 +53,6 @@ pub(crate) struct ProtocolState {
     /// a mailbox has been selected. Reset only by UNAUTHENTICATE, which
     /// starts a new session (RFC 8437 Section 2).
     mailbox_selected: bool,
-    /// Position-aware notify-flag snapshots. Each entry is the notify
-    /// state at the moment a response was received, *before* side
-    /// effects fired. See D3's notify snapshot.
-    notify_history: VecDeque<NotifyFlags>,
     /// Successfully `ENABLE`d extensions (RFC 5161 Section3.2).
     enabled: Vec<String>,
     /// `true` while a LOGOUT command is in flight. Consulted by
@@ -114,7 +108,6 @@ impl ProtocolState {
             notify: NotifyFlags::default(),
             selected: None,
             mailbox_selected: false,
-            notify_history: VecDeque::new(),
             enabled: Vec::new(),
             in_logout: false,
             in_auth: false,
@@ -169,6 +162,7 @@ impl ProtocolState {
             capabilities: self.capabilities.clone(),
             enabled: self.enabled.clone(),
             mailbox_selected: self.mailbox_selected,
+            selected: self.selected.clone(),
         }
     }
 
@@ -327,15 +321,9 @@ impl ProtocolState {
     /// NOTIFICATIONOVERFLOW).
     pub(crate) fn apply_side_effects(&mut self, resp: &Response) -> SideEffectDigest {
         let mut digest = SideEffectDigest::default();
-        let notify_snapshot = self.notify;
         match resp {
             Response::Untagged(u) => {
                 self.apply_untagged(u, &mut digest);
-                self.notify_history.push_back(notify_snapshot);
-                // Bound the history to a reasonable size.
-                if self.notify_history.len() > 1024 {
-                    self.notify_history.pop_front();
-                }
             }
             Response::Tagged(t) => {
                 self.apply_tagged(t);
@@ -502,7 +490,6 @@ impl ProtocolState {
             self.selected = None;
             self.mailbox_selected = false;
             self.notify = NotifyFlags::default();
-            self.notify_history.clear();
             self.enabled.clear();
             // Prevent the pending NOTIFY SET block below from applying
             // stale flags after the session has been reset.

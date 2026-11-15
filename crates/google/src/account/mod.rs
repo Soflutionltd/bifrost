@@ -238,19 +238,8 @@ impl GoogleAccount {
             .get_profile()
             .await
             .map_err(|error| error::into_account_error(error, error::GmailErrorContext::open()))?;
-        // Present but not a number: a parse failure in a complete response,
-        // not a missing field.
-        let history_id = profile.history_id.parse::<u64>().map_err(|error| {
-            error::into_account_error(
-                crate::error::Error::provider_response(
-                    crate::error::ProviderFault::ParseFailed,
-                    format!("gmail profile invalid history id: {error}"),
-                ),
-                error::GmailErrorContext::open(),
-            )
-        })?;
         let seed_state = encode_gmail_state(&GmailChangeState::new(
-            history_id,
+            profile.history_id.0,
             profile.email_address.clone(),
         ));
         let shutdown = CancellationToken::new();
@@ -1543,7 +1532,7 @@ mod tests {
             capabilities: gmail_capabilities(),
             profile: GmailProfile {
                 email_address: "user@gmail.test".to_owned(),
-                history_id: "1".to_owned(),
+                history_id: crate::types::HistoryId(1),
             },
             seed_state: encode_gmail_state(&GmailChangeState::new(1, "user@gmail.test".to_owned())),
             // A mailbox per call: the watch registry is process-wide and

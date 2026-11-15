@@ -7,8 +7,7 @@
 // to satisfy `result_large_err` would only add an allocation on the cold
 // error path. The error is intentionally large by design.
 #![allow(clippy::result_large_err)]
-//! Shared HTTP transport for the bifrost JMAP, Gmail, and Graph
-//! clients.
+//! Shared HTTP transport for bifrost protocol clients.
 //!
 //! `bifrost-net` owns the HTTP/2 connection pool, OAuth bearer-token
 //! refresh, retry budget with `Retry-After` honor, per-host token
@@ -16,11 +15,9 @@
 //! configuration, and W3C `traceparent` injection. It does not own
 //! protocol-level JSON shapes, IMAP, or SMTP transport.
 //!
-//! The Phase 2 implementation wires the retry loop, single-flight
-//! refresher, per-host token bucket, sliding-window bandwidth meter,
-//! and traceparent header. The public surface (`Net`, `AccountNet`,
-//! `RequestBuilder`, `Response`, `StreamingResponse`, `Error`) is
-//! frozen for Phase 2 consumers and matches the Phase 1 skeleton.
+//! Protocol clients attach accounts through `Net` and use `AccountNet` to
+//! build requests, sharing transport policy and accounting across their
+//! HTTP operations.
 
 pub mod account_error;
 pub mod auth;

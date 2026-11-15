@@ -446,6 +446,10 @@ impl StdError for ServerCause {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum StateCause {
+    /// The account stopped or its control channels closed during a boundary wait.
+    ControlWaitEnded {
+        detail: DiagnosticText,
+    },
     CursorInvalid,
     StrategyFailure {
         downgrade: StrategyDowngrade,
@@ -471,6 +475,7 @@ pub enum StateCause {
 impl StateCause {
     fn detail(&self) -> Option<&str> {
         match self {
+            Self::ControlWaitEnded { detail } => Some(detail.as_str()),
             Self::OperatorOverrideNeeded { reason } => Some(reason.as_str()),
             Self::CursorInvalid
             | Self::StrategyFailure { .. }

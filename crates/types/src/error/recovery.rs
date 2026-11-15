@@ -19,6 +19,8 @@ use super::scope::{AccountOperation, ErrorScope};
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RecoveryClass {
+    /// The control wait ended with its account incarnation; do not retry it.
+    Cancelled,
     Retry(RetryAdvice),
     Reconcile(ReconcileAdvice),
     Engine(EngineDirective),
@@ -62,7 +64,8 @@ impl RecoveryClass {
     pub fn is_terminal(&self) -> bool {
         match self {
             Self::Retry(_) | Self::Reconcile(_) | Self::Engine(_) => false,
-            Self::AuthLost
+            Self::Cancelled
+            | Self::AuthLost
             | Self::NeedsAdminConsent { .. }
             | Self::NeedsPolicyChange
             | Self::NoPermission { .. }
@@ -394,6 +397,7 @@ pub(crate) fn derive(
         .unwrap_or_else(|| operation.is_none_or(AccountOperation::is_idempotent));
 
     match kind {
+        AccountErrorKind::ControlWaitEnded => RecoveryClass::Cancelled,
         AccountErrorKind::Transport(_) => {
             debug_assert!(
                 tx_state != TransmissionState::Acknowledged,
@@ -494,6 +498,7 @@ pub(crate) fn suggest(
     chain: &CauseChain,
 ) -> Option<RemediationAction> {
     match kind {
+        AccountErrorKind::ControlWaitEnded => None,
         AccountErrorKind::Authentication(AuthErrorKind::Expired) => {
             Some(RemediationAction::RefreshToken)
         }
@@ -558,6 +563,9 @@ pub(crate) fn suggest(
 
 pub(crate) fn kind_matches_cause(kind: &AccountErrorKind, cause: &Cause) -> bool {
     match (kind, cause) {
+        (AccountErrorKind::ControlWaitEnded, Cause::State(StateCause::ControlWaitEnded { .. })) => {
+            true
+        }
         (AccountErrorKind::Transport(kind), Cause::Transport(cause)) => *kind == cause.error_kind(),
         (AccountErrorKind::Authentication(kind), Cause::Auth(cause)) => {
             auth_kind_matches_cause(*kind, cause)

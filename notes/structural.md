@@ -496,41 +496,30 @@ with no check that they agree.
 
 ## STR-022 - Documentation drift noticed in passing
 
-**Reported by:** types.
+**Reported by:** types, sync-lanes, jmap-protocol, smtp-sasl, net-dav.
 
-- `BatchingPolicy` per-protocol defaults and `RateLimitClass` readers (STR-017).
-- `account_compose` module doc's "tomorrow JMAP / Graph" (STR-016).
+The sync, net and dav-core comment drift is corrected. Still open, each verified
+current by the fix pass:
+
 - `reference/types.md` says `DecodedAttachment` is "mapped onto
-  `MessageAttachment` by each protocol crate"; only IMAP calls `select_body`.
-- `scope_covers_membership`'s "Graph maps folders 1:1 to mailboxes" (STR-001).
-- `mutation/idempotency.rs` (sync-lanes): "the consumer-facing
-  `MutationCampaignId` is the key into the `CheckpointStore` slot that holds
-  it". `CheckpointStore` has no such slot, and nothing persists a `RunId`.
-- `cursor/coverage.rs` (sync-lanes): `pub type Publications = PendingCoverage`
-  is labelled "compatibility alias while callers migrate"; both names are live,
-  so the migration never ran.
-- `AckRequest::auto` (sync-lanes) is documented as a field for "legacy
-  engine-generated acks", which production never produces (STR-036).
-- jmap-protocol: the `Capability` trait doc disagrees with the code about which
-  capabilities are session-level (BUG-058); the `BlobLookupRequest` doc names a
-  helper that does not exist (STR-089); the `email_submission::SetArguments` doc
-  inverts the `#` convention (STR-085); the `event_source/stream.rs` doc calls its
-  traversal the same as the WS lane's (CON-038).
-- smtp-sasl: `reference/sync.md` (throttle section) says the clock move is "the
-  same move `bifrost-smtp` made for `AsyncDeadline` and `ByteBucket`"; there is no
-  `ByteBucket` in bifrost-smtp any more (the name survives in a comment in
-  `crates/sync/src/recovery.rs`). The `SmtpTransport::from_url` port table is
-  BUG-107.
-- net-dav: bifrost-net's `lib.rs` crate doc still talks about "Phase 2 ... frozen
-  for Phase 2 consumers" and lists only JMAP, Gmail and Graph as users; DAV rides it
-  too. Reword so it stops naming a consumer set.
-- net-dav, not a finding: `DavDispatch::auth_headers` and `send_raw_until` both gate
-  on `is_trusted_url` with different error texts. The hunter judged it a deliberate
-  re-check at a chokepoint and noted it so it is not re-filed; a comment at the two
-  sites would make that durable.
-- Process note (graph): the hunt brief listed `crates/graph/tests/` as in scope;
-  that directory does not exist and every Graph test is an in-crate module. The
-  brief was wrong, not the repository.
+  `MessageAttachment` by each protocol crate"; IMAP and Google call
+  `select_body`. Suggested wording: "the MIME selector's intermediate attachment
+  representation, which consumers can project into `MessageAttachment`. It knows
+  nothing about blobs."
+- `reference/types.md` documents control results as
+  `Result<Option<Checkpoint>, AccountError>`; the code returns
+  `DurableCheckpointSet`.
+- `crates/sync/src/engine/attach.rs::scope_covers_membership` says "Graph maps
+  folders 1:1 to mailboxes" (STR-001).
+- `reference/sync.md` (throttle section) compares the clock move to bifrost-smtp's
+  `ByteBucket`, which no longer exists.
+- jmap-protocol: the `BlobLookupRequest` doc names a helper that does not exist
+  (STR-089); the `email_submission::SetArguments` doc inverts the `#` convention
+  (STR-085); the `event_source/stream.rs` doc calls its traversal the same as the
+  WS lane's (CON-038). The `Capability` trait doc's session-level list is
+  BUG-058.
+- `BatchingPolicy` defaults (STR-017) and the `account_compose` module doc
+  (STR-016) belong to their own entries.
 
 ## STR-023 - The acknowledgement is assembled from loose parts the consumer must keep in step
 
@@ -2585,21 +2574,6 @@ ctx.history_endpoint` arms in `classify_response` and `classify_by_status`).
 Proposal: a `GmailEndpoint { Profile, History, Watch, Stop, MessagesGet,
 BatchModify, .. }` minted by the `api.rs` method building the request, owning the
 unit cost, the concurrency class and the history-endpoint classification.
-
-## STR-123 - The Gmail history id is a string parsed in five places
-
-**Reported by:** google.
-
-`GmailProfile.history_id`, `GmailMessage.history_id`,
-`GmailHistoryResponse.history_id` and `GmailWatchResponse.history_id` are all
-`String`, parsed to `u64` separately with different error wording: in
-`GoogleAccount::open`, `inventory::inventory_checkpoint`, the history-page arm of
-`changes`, and `inventory_entry_from_message_indexed` (where a parse failure
-silently becomes `ServerVersion::Unavailable`). `push::WatchLifecycle::Watched`
-keeps it unparsed; `ChangeState.start_history_id` is a `u64` formatted back into a
-`String`. A `HistoryId(u64)` newtype with a string-number serde adapter parses once
-at deserialization, and a complete response whose field did not parse becomes
-`JsonDecode` -> `ParseFailed` uniformly.
 
 ## STR-124 - Google mailbox identity is a bare email compared ad hoc
 

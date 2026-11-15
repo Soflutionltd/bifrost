@@ -1050,6 +1050,13 @@ async fn apply_flag_op(
     }
 }
 
+fn store_flag_atoms(flags: &HashSet<String>) -> Vec<Flag> {
+    flags
+        .iter()
+        .map(|flag| Flag::from_neutral_keyword(flag))
+        .collect()
+}
+
 async fn store_flags(
     conn: &super::PooledConn,
     set: &crate::types::SequenceSet,
@@ -1058,10 +1065,7 @@ async fn store_flags(
     unchanged_since: Option<u64>,
     timeout: std::time::Duration,
 ) -> Result<StoreWireOutcome, crate::Error> {
-    let flags = flags
-        .iter()
-        .map(|flag| Flag::from(flag.as_str()))
-        .collect::<Vec<_>>();
+    let flags = store_flag_atoms(flags);
     let result = conn
         .connection()
         .uid_store(set, operation, &flags, unchanged_since, timeout)
@@ -1425,6 +1429,26 @@ fn split_by_uidvalidity(
 mod tests {
     use super::*;
     use crate::types::UidRange;
+
+    #[test]
+    fn bulk_store_folds_neutral_keywords() {
+        let flags = HashSet::from([
+            "$SEEN".to_owned(),
+            "$answered".to_owned(),
+            "$flagged".to_owned(),
+            "$Important".to_owned(),
+        ]);
+        let atoms: HashSet<_> = store_flag_atoms(&flags).into_iter().collect();
+        assert_eq!(
+            atoms,
+            HashSet::from([
+                Flag::Seen,
+                Flag::Answered,
+                Flag::Flagged,
+                Flag::Custom("$Important".to_owned()),
+            ])
+        );
+    }
 
     #[test]
     fn flag_op_maps_to_wire_atoms() {

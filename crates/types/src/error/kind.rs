@@ -9,6 +9,8 @@ pub enum AccountErrorKind {
     Authorization(AccessErrorKind),
     Server(ServerErrorKind),
     SyncState(SyncStateErrorKind),
+    /// A pause or checkpoint wait ended before a safe boundary was reached.
+    ControlWaitEnded,
     ConcurrencyConflict,
     Request(RequestErrorKind),
     NotFound(ResourceKind),

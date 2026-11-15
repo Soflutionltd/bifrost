@@ -399,7 +399,9 @@ fn soap_fault_to_account_error(
     // (refused). Microsoft EWS embeds finer-grained codes in the
     // `<detail>` payload, but that is support-only diagnostics; we
     // do not branch UX on the string.
-    let resource = resource_from_scope(ctx.scope.as_ref());
+    // Cursor scopes deliberately do not imply Mailbox here: that would turn
+    // folder-scoped 404s into object-not-found errors and change recovery.
+    let resource = ctx.scope.as_ref().and_then(ErrorScope::resource);
     // The third element flags a throttle path (rate-limit / quota): the
     // engine needs a `throttle_scope` so it buckets the EWS backoff (at the
     // account, see `throttle_scope_for`). Without it `ErrorServerBusy` ->
@@ -449,7 +451,11 @@ fn soap_fault_to_account_error(
             AccountErrorKind::NotFound(ResourceKind::Mailbox),
             Cause::Request(RequestCause::NotFound {
                 what: ResourceKind::Mailbox,
-                id: id_from_scope(ctx.scope.as_ref()),
+                id: ctx
+                    .scope
+                    .as_ref()
+                    .and_then(ErrorScope::object_id)
+                    .map(str::to_owned),
             }),
             false,
         ),
@@ -461,7 +467,11 @@ fn soap_fault_to_account_error(
                 AccountErrorKind::NotFound(resource),
                 Cause::Request(RequestCause::NotFound {
                     what: resource,
-                    id: id_from_scope(ctx.scope.as_ref()),
+                    id: ctx
+                        .scope
+                        .as_ref()
+                        .and_then(ErrorScope::object_id)
+                        .map(str::to_owned),
                 }),
                 false,
             )
@@ -790,7 +800,7 @@ fn classify(
         GraphSignal::AccessDenied | GraphSignal::Forbidden => (
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied {
-                resource: resource_from_scope(ctx.scope.as_ref()),
+                resource: ctx.scope.as_ref().and_then(ErrorScope::resource),
             }),
             false,
         ),
@@ -839,12 +849,16 @@ fn classify(
             false,
         ),
         GraphSignal::Gone => gone_410(ctx),
-        GraphSignal::NotFound => match resource_from_scope(ctx.scope.as_ref()) {
+        GraphSignal::NotFound => match ctx.scope.as_ref().and_then(ErrorScope::resource) {
             Some(resource) => (
                 AccountErrorKind::NotFound(resource),
                 Cause::Request(RequestCause::NotFound {
                     what: resource,
-                    id: id_from_scope(ctx.scope.as_ref()),
+                    id: ctx
+                        .scope
+                        .as_ref()
+                        .and_then(ErrorScope::object_id)
+                        .map(str::to_owned),
                 }),
                 false,
             ),
@@ -938,16 +952,20 @@ fn classify_by_status(
         403 => (
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied {
-                resource: resource_from_scope(ctx.scope.as_ref()),
+                resource: ctx.scope.as_ref().and_then(ErrorScope::resource),
             }),
             false,
         ),
-        404 => match resource_from_scope(ctx.scope.as_ref()) {
+        404 => match ctx.scope.as_ref().and_then(ErrorScope::resource) {
             Some(resource) => (
                 AccountErrorKind::NotFound(resource),
                 Cause::Request(RequestCause::NotFound {
                     what: resource,
-                    id: id_from_scope(ctx.scope.as_ref()),
+                    id: ctx
+                        .scope
+                        .as_ref()
+                        .and_then(ErrorScope::object_id)
+                        .map(str::to_owned),
                 }),
                 false,
             ),
@@ -1136,58 +1154,6 @@ fn body_diagnostic(body: &bytes::Bytes) -> Option<DiagnosticText> {
 /// Preserve absolute HTTP-dates, including elapsed deadlines, for recovery.
 fn parse_retry_after_header(headers: &HeaderMap) -> Option<RetryHint> {
     bifrost_net::request::parse_retry_after_hint(headers.get(RETRY_AFTER))
-}
-
-/// Note the deliberate asymmetry with IMAP, which DOES read a folder id out of
-/// `ErrorScope::Cursor(Folder(_))` in its own `resource_from_scope`.
-///
-/// Graph builds `Cursor(Folder(_))` / `Cursor(FolderType(_))` on essentially
-/// every changes, inventory, push and public-folder path, so honouring it here
-/// would name the folder in more diagnostics - a real if minor gain. It is not
-/// a free change, though, and that is why it has not been made: this function
-/// gates the `NotFound` classification above, so returning `Some(Mailbox)` for
-/// a cursor scope silently converts every folder-scoped Graph 404 from a
-/// generic server error into `NotFound(Mailbox)`, with a different recovery
-/// class behind it. That is a behaviour change for consumers, not a
-/// diagnostics improvement, and it wants deciding on its own terms rather than
-/// riding along with a tidy-up.
-///
-/// What is actually LOST by leaving it: a Graph 403 on a shared or public
-/// folder derives `NoPermission { resource: None }` and so names no id in the
-/// support export, where the identical failure on IMAP names the mailbox. The
-/// classification and recovery class are unchanged either way, so the cost is
-/// a less specific support export, which is why this stays a deliberate hold
-/// rather than a bug.
-fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
-    match scope? {
-        ErrorScope::Message { .. } => Some(ResourceKind::Message),
-        ErrorScope::Mailbox { .. } => Some(ResourceKind::Mailbox),
-        ErrorScope::Thread { .. } => Some(ResourceKind::Thread),
-        ErrorScope::Event { .. } => Some(ResourceKind::Event),
-        ErrorScope::Calendar { .. } => Some(ResourceKind::Calendar),
-        ErrorScope::Contact { .. } => Some(ResourceKind::Contact),
-        ErrorScope::Account
-        | ErrorScope::Cursor(_)
-        | ErrorScope::CalendarCollection
-        | ErrorScope::ContactCollection => None,
-        _ => None,
-    }
-}
-
-fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
-    match scope? {
-        ErrorScope::Message { id } => Some(id.0.clone()),
-        ErrorScope::Mailbox { id } => Some(id.0.clone()),
-        ErrorScope::Thread { id } => Some(id.0.clone()),
-        ErrorScope::Event { id } => Some(id.0.clone()),
-        ErrorScope::Calendar { id } => Some(id.0.clone()),
-        ErrorScope::Contact { id } => Some(id.0.clone()),
-        ErrorScope::Account
-        | ErrorScope::Cursor(_)
-        | ErrorScope::CalendarCollection
-        | ErrorScope::ContactCollection => None,
-        _ => None,
-    }
 }
 
 /// `Account`, never tenant-wide. Microsoft documents the Outlook mail, calendar

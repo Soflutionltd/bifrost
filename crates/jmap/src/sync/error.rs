@@ -109,9 +109,8 @@ impl JmapErrorContext {
     /// Unused convenience wrappers: both scopes ARE produced (see
     /// `pim.rs` / `factory.rs`), but producers reach for `with_scope`
     /// directly. Kept because they are the readable spelling, and harmless
-    /// because the scope readers below (`resource_from_scope`,
-    /// `id_from_scope`) accept both shapes - the failure mode to avoid is a
-    /// reader that handles only what a dead constructor produces.
+    /// because the shared `ErrorScope` resource and id readers accept both
+    /// shapes. A reader must not handle only what a dead constructor produces.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn mailbox(operation: AccountOperation, id: impl Into<String>) -> Self {
@@ -747,7 +746,7 @@ pub(crate) fn set_error_to_account_error(
         | SetErrorType::ForbiddenToSend => (
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied {
-                resource: resource_from_scope(scope_for_resource),
+                resource: scope_for_resource.and_then(ErrorScope::resource),
             }),
         ),
         SetErrorType::OverQuota => (
@@ -764,8 +763,10 @@ pub(crate) fn set_error_to_account_error(
             } else {
                 JmapMethod::NotFound
             };
-            if let Some(resource) = resource_from_scope(scope_for_resource) {
-                let id = id_from_scope(scope_for_resource);
+            if let Some(resource) = scope_for_resource.and_then(ErrorScope::resource) {
+                let id = scope_for_resource
+                    .and_then(ErrorScope::object_id)
+                    .map(str::to_owned);
                 (
                     AccountErrorKind::NotFound(resource),
                     Cause::Request(RequestCause::NotFound { what: resource, id }),
@@ -1053,44 +1054,6 @@ fn build_with(
     builder
 }
 
-fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
-    match scope? {
-        ErrorScope::Message { .. } => Some(ResourceKind::Message),
-        ErrorScope::Mailbox { .. } => Some(ResourceKind::Mailbox),
-        ErrorScope::Thread { .. } => Some(ResourceKind::Thread),
-        ErrorScope::Event { .. } => Some(ResourceKind::Event),
-        ErrorScope::Calendar { .. } | ErrorScope::CalendarCollection => {
-            Some(ResourceKind::Calendar)
-        }
-        ErrorScope::Contact { .. } | ErrorScope::ContactCollection => Some(ResourceKind::Contact),
-        ErrorScope::Account | ErrorScope::Cursor(_) => None,
-        // `ErrorScope` is `#[non_exhaustive]` in `bifrost-types`, so
-        // this catch-all is required for the crate to compile after a
-        // new variant lands upstream. Any new variant must be handled
-        // explicitly above with the appropriate `ResourceKind` mapping
-        // (or an explicit `None`) before relying on this fall-through.
-        _ => None,
-    }
-}
-
-fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
-    match scope? {
-        ErrorScope::Message { id } => Some(id.0.clone()),
-        ErrorScope::Mailbox { id } => Some(id.0.clone()),
-        ErrorScope::Thread { id } => Some(id.0.clone()),
-        ErrorScope::Event { id } => Some(id.0.clone()),
-        ErrorScope::Calendar { id } => Some(id.0.clone()),
-        ErrorScope::Contact { id } => Some(id.0.clone()),
-        ErrorScope::Account
-        | ErrorScope::Cursor(_)
-        | ErrorScope::CalendarCollection
-        | ErrorScope::ContactCollection => None,
-        // `ErrorScope` is `#[non_exhaustive]`; see `resource_from_scope`
-        // for the explicit-handling discipline new variants must follow.
-        _ => None,
-    }
-}
-
 fn convert_transport(
     transport: crate::core::transport::TransportError,
     ctx: JmapErrorContext,
@@ -1200,12 +1163,16 @@ fn convert_problem(
         (ProblemType::Other(_), Some(403)) => (
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied {
-                resource: resource_from_scope(ctx.scope.as_ref()),
+                resource: ctx.scope.as_ref().and_then(ErrorScope::resource),
             }),
         ),
         (ProblemType::Other(_), Some(404)) => {
-            if let Some(resource) = resource_from_scope(ctx.scope.as_ref()) {
-                let id = id_from_scope(ctx.scope.as_ref());
+            if let Some(resource) = ctx.scope.as_ref().and_then(ErrorScope::resource) {
+                let id = ctx
+                    .scope
+                    .as_ref()
+                    .and_then(ErrorScope::object_id)
+                    .map(str::to_owned);
                 (
                     AccountErrorKind::NotFound(resource),
                     Cause::Request(RequestCause::NotFound { what: resource, id }),
@@ -1438,7 +1405,7 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
         MethodErrorType::Forbidden => (
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied {
-                resource: resource_from_scope(ctx.scope.as_ref()),
+                resource: ctx.scope.as_ref().and_then(ErrorScope::resource),
             }),
             JmapMethod::Forbidden,
         ),
@@ -1465,7 +1432,7 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
         MethodErrorType::AccountReadOnly => (
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied {
-                resource: resource_from_scope(ctx.scope.as_ref()),
+                resource: ctx.scope.as_ref().and_then(ErrorScope::resource),
             }),
             JmapMethod::AccountReadOnly,
         ),
@@ -1798,7 +1765,7 @@ pub(crate) fn require_created_id(
 }
 
 fn convert_id_not_found(id: String, ctx: JmapErrorContext) -> AccountError {
-    if let Some(resource) = resource_from_scope(ctx.scope.as_ref()) {
+    if let Some(resource) = ctx.scope.as_ref().and_then(ErrorScope::resource) {
         build(
             AccountErrorKind::NotFound(resource),
             Cause::Request(RequestCause::NotFound {
@@ -2600,6 +2567,26 @@ mod tests {
         let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
         let err = into_account_error(crate::Error::ResponseDecode(json_err), ctx);
         assert_eq!(attempt(&err), Some(TransmissionState::Acknowledged));
+    }
+
+    #[test]
+    fn set_not_found_for_collections_is_typed_without_inventing_an_object() {
+        for (scope, resource) in [
+            (ErrorScope::CalendarCollection, ResourceKind::Calendar),
+            (ErrorScope::ContactCollection, ResourceKind::Contact),
+        ] {
+            let set: SetError<String> = serde_json::from_str(r#"{"type":"notFound"}"#).unwrap();
+            let err = set_error_to_account_error(
+                set,
+                JmapErrorContext::new(AccountOperation::HydrateMessage),
+                Some(scope),
+            );
+            assert_eq!(err.kind(), &AccountErrorKind::NotFound(resource));
+            assert!(err.chain().iter().any(|cause| matches!(
+                cause,
+                Cause::Request(RequestCause::NotFound { what, id: None }) if *what == resource
+            )));
+        }
     }
 
     #[test]

@@ -236,7 +236,7 @@ impl GmailClient {
 
     pub(crate) async fn get_history(
         &self,
-        start_history_id: &str,
+        start_history_id: crate::types::HistoryId,
         page_token: Option<&str>,
     ) -> Result<GmailHistoryResponse> {
         let mut params = vec![

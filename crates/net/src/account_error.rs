@@ -11,8 +11,8 @@ use std::time::{Duration, SystemTime};
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, DiagnosticText, ErrorScope,
-    Protocol, ProtocolErrorKind, Provider, RequestCause, RequestErrorKind, ResourceKind, RetryHint,
-    ServerCause, ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleScope, TransmissionState,
+    Protocol, ProtocolErrorKind, Provider, RequestCause, RequestErrorKind, RetryHint, ServerCause,
+    ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleScope, TransmissionState,
     TransportCause, TransportErrorKind, TransportKind, WireCause,
 };
 use bytes::Bytes;
@@ -595,16 +595,20 @@ fn status_kind_cause(
         403 => (
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied {
-                resource: resource_from_scope(ctx.scope.as_ref()),
+                resource: ctx.scope.as_ref().and_then(ErrorScope::resource),
             }),
             false,
         ),
-        404 => match resource_from_scope(ctx.scope.as_ref()) {
+        404 => match ctx.scope.as_ref().and_then(ErrorScope::resource) {
             Some(resource) => (
                 AccountErrorKind::NotFound(resource),
                 Cause::Request(RequestCause::NotFound {
                     what: resource,
-                    id: id_from_scope(ctx.scope.as_ref()),
+                    id: ctx
+                        .scope
+                        .as_ref()
+                        .and_then(ErrorScope::object_id)
+                        .map(str::to_owned),
                 }),
                 false,
             ),
@@ -885,30 +889,6 @@ fn retry_history_text(history: &[Duration]) -> Option<DiagnosticText> {
         Some(DiagnosticText::support_only(format!(
             "retry budget exhausted after retry-after history: {history:?}"
         )))
-    }
-}
-
-fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
-    match scope {
-        Some(ErrorScope::Message { .. }) => Some(ResourceKind::Message),
-        Some(ErrorScope::Mailbox { .. }) => Some(ResourceKind::Mailbox),
-        Some(ErrorScope::Thread { .. }) => Some(ResourceKind::Thread),
-        Some(ErrorScope::Event { .. }) => Some(ResourceKind::Event),
-        Some(ErrorScope::Calendar { .. }) => Some(ResourceKind::Calendar),
-        Some(ErrorScope::Contact { .. }) => Some(ResourceKind::Contact),
-        Some(_) | None => None,
-    }
-}
-
-fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
-    match scope {
-        Some(ErrorScope::Message { id }) => Some(id.0.clone()),
-        Some(ErrorScope::Mailbox { id }) => Some(id.0.clone()),
-        Some(ErrorScope::Thread { id }) => Some(id.0.clone()),
-        Some(ErrorScope::Event { id }) => Some(id.0.clone()),
-        Some(ErrorScope::Calendar { id }) => Some(id.0.clone()),
-        Some(ErrorScope::Contact { id }) => Some(id.0.clone()),
-        Some(_) | None => None,
     }
 }
 

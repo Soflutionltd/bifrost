@@ -34,11 +34,11 @@ impl SyncEngine {
     //   against the freshly-installed connection, never a stale snapshot
     //   the consumer cached. This is the same discipline the spawned
     //   workers follow on their hot paths.
-    // - Only the *read* surface is forwarded. Mutations stay funnelled
-    //   through `bulk_set_flags` (and its siblings) so the idempotency /
-    //   read-back / recovery pipeline remains the one chokepoint for
-    //   writes; cursor and push driving stay engine-owned. Handing out a
-    //   raw `Arc<dyn Account>` would leak both, so we do not.
+    // - Hydration is read-only, but the sibling direct passthroughs also
+    //   expose writes. Those calls bypass the bulk mutation pipeline,
+    //   engine pause, scheduler admission and engine throttle holds; the
+    //   protocol client's transport controls still apply. Cursor and push
+    //   driving stay engine-owned rather than exposing a raw account handle.
     //
     // The forwarded methods return `'static` streams / futures that
     // capture their own internal `Arc` clones, so they outlive the

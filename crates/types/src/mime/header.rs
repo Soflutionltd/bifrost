@@ -103,16 +103,9 @@ impl HeaderMap {
     pub fn date(&self, name: &str) -> Option<SystemTime> {
         self.get(name).and_then(parse_date)
     }
-    /// First structural Message-ID, with a trimmed bare-value fallback for
-    /// legacy senders. Quoted strings and comments do not delimit IDs.
+    /// First structural Message-ID; see the free function [`first_message_id`].
     pub fn first_message_id(raw: &str) -> Option<&str> {
-        first_structural_angle_token(raw).or_else(|| {
-            if find_structural_angle(raw, 0, b'<').is_some() {
-                return None;
-            }
-            let trimmed = raw.trim();
-            (!trimmed.is_empty()).then_some(trimmed)
-        })
+        first_message_id(raw)
     }
 
     /// Extract structural angle-delimited IDs from every occurrence of a field.
@@ -136,6 +129,18 @@ impl HeaderMap {
             })
             .collect()
     }
+}
+
+/// First structural Message-ID, with a trimmed bare-value fallback for
+/// legacy senders. Quoted strings and comments do not delimit IDs.
+pub fn first_message_id(raw: &str) -> Option<&str> {
+    first_structural_angle_token(raw).or_else(|| {
+        if find_structural_angle(raw, 0, b'<').is_some() {
+            return None;
+        }
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
 }
 
 /// Finds the first non-empty `<...>` token outside quoted strings and comments.

@@ -346,7 +346,7 @@ impl DriverConsumer {
 /// Read-only snapshot of connection state published by the driver
 /// via `watch::Sender`.
 ///
-/// Holds session state, capabilities, notify flags, selected mailbox,
+/// Holds session state, capabilities, selected mailbox,
 /// and enabled extensions (RFC 3501 Section3, Section7.2.1; RFC 5161 Section3.2;
 /// RFC 5465 Section5.1-5.8).
 #[derive(Debug, Clone)]
@@ -360,6 +360,8 @@ pub(super) struct ConnectionStateSnapshot {
     /// Whether any mailbox has been selected in this session, even if it
     /// has since been closed (RFC 5161 Section 3.1).
     pub mailbox_selected: bool,
+    /// Mailbox selected by the last successful SELECT or EXAMINE.
+    pub selected: Option<crate::types::MailboxName>,
 }
 
 impl Default for ConnectionStateSnapshot {
@@ -369,6 +371,7 @@ impl Default for ConnectionStateSnapshot {
             capabilities: Vec::new(),
             enabled: Vec::new(),
             mailbox_selected: false,
+            selected: None,
         }
     }
 }

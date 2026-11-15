@@ -1155,7 +1155,12 @@ Mailbox management on a mailbox this account has SELECTed goes through
 `PooledConn::deselect_target`: an affinity-free `checkout_any` can hand back a
 connection still selected on the RENAME/DELETE target, and RFC 3501 lets a
 server reject either for the selected mailbox (RFC 2683 2.2.2 asks the client
-to close first). `deselect_target` trusts the member's recorded selected mailbox, so that record follows the session through failures as well as successful SELECTs: after a failed `select_for_sync`, `record_failed_select` records none when the session is no longer `Selected` (a tagged NO to SELECT/EXAMINE deselects the previous mailbox), records the new folder when the failure is `ProtocolMissing` on a still-`Selected` session (the SELECT got its tagged OK and the response was then found incomplete), and otherwise leaves the previous selection standing. A stale record made `deselect_target` skip an UNSELECT the server needed. UNSELECT is preferred - it keeps the checkout on its
+to close first). `deselect_target` trusts the member's cached selected mailbox. After every
+completed `select_for_sync`, successful or failed, the account refreshes that
+cache from the driver's connection snapshot. The driver publishes the retained
+mailbox identity directly: tagged NO deselects it, BAD preserves it, and tagged
+OK selects the new mailbox even when response validation subsequently fails.
+There is no inference from account-layer error variants. UNSELECT is preferred - it keeps the checkout on its
 connection. A pre-UNSELECT server falls back to replacing the member, and the
 old connection is LOGOUT'd BEFORE the replacement is dialed: dialing first
 would temporarily add a physical connection across the handshake, which a
@@ -1456,6 +1461,15 @@ fail per item with Protocol MissingField after response fragments are merged.
 The flag judge compares ASCII-case-insensitively, ignores server-owned
 `\Recent` in observed Set equality, and returns Indeterminate for operations
 explicitly naming `\Recent`.
+
+Convenience keyword writes and bulk flag writes, including conditional STORE,
+share `Flag::from_neutral_keyword`: ASCII-case-insensitive `$seen`, `$answered`,
+and `$flagged` map to `\Seen`, `\Answered`, and `\Flagged`; other keywords
+retain their spelling. The flag judge applies the same conversion to requested
+Add, Remove, Set, and Patch flags before comparison. Observations retain wire
+identity, so a literal server keyword `$seen` does not satisfy a request to set
+`\Seen`. A patch whose add/remove sets overlap after conversion is
+Indeterminate.
 
 A server can re-add maintained keywords or accept but not retain a new
 keyword when PERMANENTFLAGS lacks the wildcard grant. After an uncertain

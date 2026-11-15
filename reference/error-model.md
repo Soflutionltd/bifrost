@@ -122,6 +122,9 @@ top-level taxonomy with per-family subkind enums:
 - `SyncState(SyncStateErrorKind)` - cursor invalid, strategy failure,
   scope-capability lost, schema incompatible, capability changed,
   operator-override needed, scope revoked.
+- `ControlWaitEnded` (flat): pause or checkpoint wait interrupted by account
+  stop or control-channel closure. Cause `StateCause::ControlWaitEnded` retains
+  support-only detail; message key `control.wait-ended`.
 - `ConcurrencyConflict` (flat).
 - `Request(RequestErrorKind)` - `Malformed` / `BatchInputInvalid`.
 - `NotFound(ResourceKind)` - message, mailbox, thread, calendar, event,
@@ -320,6 +323,9 @@ operation is treated idempotent). The rules at altitude (read
   personal contact collection reclassified as a directory: no sync strategy is
   eligible, so it retires the original cursor scope rather than retrying or
   downgrading. The directory refusal's redirect evidence is preserved.
+- **ControlWaitEnded** -> terminal `Cancelled`, with no retry, engine action,
+  or suggested remediation. The account incarnation can no longer satisfy the
+  wait; this does not blame the caller or claim a durable boundary.
 - **ConcurrencyConflict** -> `Retry(AfterStateRefresh,
   ConcurrencyConflict)`.
 - **Request** (both subkinds) -> `ClientBug`.
@@ -613,6 +619,7 @@ collection variants, `Submission`, `CloudFile`, `UploadSession`, plus `Directory
 endpoint that a multi-gateway lookup skipped. The id-bearing variants use the same typed ids as
 the account surface (`MailboxId`, `ObjectId`, `ThreadId`, `CalendarId`,
 `EventId`, `ContactId`) and serialize their inner strings for support exports.
+`ErrorScope::resource()` and `object_id()` centralize the exhaustive resource and borrowed-id projections: Event maps to Event; `CalendarCollection` and `ContactCollection` map to Calendar and Contact with no id, so a collection-scoped not-found or permission refusal stays typed in every crate; cursor scopes have neither; and Submission/CloudFile retain ids without a matching resource kind.
 `scope_fields` is the single source for both the declared struct field
 count and the fields written, so the count cannot drift from the body
 across the variable-width cursor shapes - a drift that self-describing

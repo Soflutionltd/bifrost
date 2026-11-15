@@ -728,16 +728,8 @@ fn inventory_list_path(page_token: Option<&str>) -> String {
 }
 
 fn inventory_checkpoint(profile: &GmailProfile) -> crate::Result<Option<Checkpoint>> {
-    let history_id = profile.history_id.parse::<u64>().map_err(|error| {
-        // `profile` is a complete Google response. A present but unusable
-        // historyId is Google's parse failure, not malformed caller input.
-        crate::Error::provider_response(
-            crate::error::ProviderFault::ParseFailed,
-            format!("gmail profile carried invalid history id: {error}"),
-        )
-    })?;
     Ok(Some(Checkpoint::Change(cursor_for_history(
-        history_id,
+        profile.history_id.0,
         &profile.email_address,
     ))))
 }
@@ -858,11 +850,9 @@ fn inventory_entry_from_message_indexed(
         size,
         blob_id: None,
         fingerprint: Fingerprint {
-            server_version: message
-                .history_id
-                .as_deref()
-                .and_then(|id| id.parse::<u64>().ok())
-                .map_or(ServerVersion::Unavailable, ServerVersion::HistoryAt),
+            server_version: message.history_id.map_or(ServerVersion::Unavailable, |id| {
+                ServerVersion::HistoryAt(id.0)
+            }),
             size,
             flags_hash: canonical.hash,
         },
@@ -986,7 +976,7 @@ mod tests {
     }
 
     /// Gmail's per-message `historyId` becomes the fingerprint's server
-    /// version; a missing or unparseable one degrades to `Unavailable`
+    /// version; a missing one degrades to `Unavailable`
     /// rather than to a bogus zero.
     #[test]
     fn server_version_comes_from_the_messages_history_id() {
@@ -1001,15 +991,6 @@ mod tests {
         let no_history = message(json!({ "id": "m3", "threadId": "t3" }));
         assert_eq!(
             inventory_entry_from_message(&no_history, &[])
-                .fingerprint
-                .server_version,
-            ServerVersion::Unavailable
-        );
-
-        let junk_history =
-            message(json!({ "id": "m4", "threadId": "t4", "historyId": "not-a-number" }));
-        assert_eq!(
-            inventory_entry_from_message(&junk_history, &[])
                 .fingerprint
                 .server_version,
             ServerVersion::Unavailable
@@ -1460,7 +1441,7 @@ mod tests {
     fn inventory_checkpoint_uses_the_profile_sampled_before_paging() {
         let checkpoint = inventory_checkpoint(&GmailProfile {
             email_address: "person@example.com".to_string(),
-            history_id: "100".to_string(),
+            history_id: crate::types::HistoryId(100),
         })
         .expect("valid profile")
         .expect("change checkpoint");

@@ -770,6 +770,7 @@ impl PooledConn {
             .conn
     }
 
+    #[cfg(test)]
     pub(crate) fn set_selected(&mut self, folder: MailboxName) {
         self.set_selected_affinity(Some(folder));
     }

@@ -550,7 +550,10 @@ attempt inserting the same scope takes ownership. An acknowledged checkpoint
 discharges a scope's provisional state whichever attempt owns it only after a
 change-cursor acknowledgement is validated and durable. Rejected, withheld or
 failed acknowledgements preserve abort ownership. A durable backfill checkpoint
-does not promote the provisional change cursor for the same scope.
+does not promote the provisional change cursor for the same scope. An
+already-persisted change publication also counts as durable and promotes the
+row. Rollback removes ownership only after its cursor delete succeeds; a failed
+delete leaves the row owned for a later abort, claim, commit or acknowledgement.
 
 A reattach that RESUMES a stored row (`run_establish` reading it through the
 writer's `GetChangeCursor`) passes its attempt as `claim_for`; if the row is
@@ -3397,7 +3400,8 @@ tags as corruption; existing tags and layouts are unchanged. Version 6 adds
 `DirectoryGateway { url }` scope (tag 10), preserving versions 3 through 5
 without that tag and rejecting the tag in older-version rows. Version 7 adds
 Submission, CloudFile and UploadSession scopes (tags 11, 12 and 13), rejected
-by older readers.
+by older readers. Version 8 adds the `ControlWaitEnded` account error kind
+(kind tag 11), rejected in older-version rows.
 
 Decode VALIDATES, never heals: a duplicated entry, barrier or lineage key,
 trailing bytes, a lineage that is not flat (a parent naming itself or an entry

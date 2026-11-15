@@ -254,7 +254,7 @@ fn message_id_lists_ignore_quoted_and_nested_commented_decoys() {
         ["first@test", "second@test", "third@test"]
     );
     assert_eq!(
-        HeaderMap::first_message_id(parsed.get("references").unwrap()),
+        crate::mime::first_message_id(parsed.get("references").unwrap()),
         Some("first@test")
     );
 }
@@ -262,9 +262,19 @@ fn message_id_lists_ignore_quoted_and_nested_commented_decoys() {
 #[test]
 fn single_message_id_preserves_bare_fallback_and_rejects_empty_angles() {
     assert_eq!(
-        HeaderMap::first_message_id(" bare@test "),
+        crate::mime::first_message_id(" bare@test "),
         Some("bare@test")
     );
-    assert_eq!(HeaderMap::first_message_id("(comment) <>"), None);
-    assert_eq!(HeaderMap::first_message_id("<unfinished"), None);
+    assert_eq!(crate::mime::first_message_id("(comment) <>"), None);
+    assert_eq!(crate::mime::first_message_id("<unfinished"), None);
+}
+
+#[test]
+fn standalone_message_id_parser_borrows_the_raw_value() {
+    let raw = String::from("\"<quoted@test>\" (outer (<comment@test>)) <> <actual@test>");
+    let id = crate::mime::first_message_id(&raw).expect("structural identifier");
+    assert_eq!(id, "actual@test");
+    let start = raw.find("actual@test").unwrap();
+    assert!(std::ptr::eq(id, &raw[start..start + id.len()]));
+    assert_eq!(crate::mime::first_message_id("  "), None);
 }

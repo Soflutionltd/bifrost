@@ -1,5 +1,28 @@
 use serde::{Deserialize, Serialize};
 
+/// A Gmail history sequence, decoded from the provider's decimal string once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HistoryId(pub(crate) u64);
+
+impl std::fmt::Display for HistoryId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl Serialize for HistoryId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for HistoryId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map(Self).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GmailMessage {
@@ -9,7 +32,7 @@ pub(crate) struct GmailMessage {
     pub(crate) label_ids: Vec<String>,
     #[serde(default)]
     pub(crate) snippet: String,
-    pub(crate) history_id: Option<String>,
+    pub(crate) history_id: Option<HistoryId>,
     pub(crate) internal_date: Option<String>,
     pub(crate) payload: Option<GmailPayload>,
     pub(crate) size_estimate: Option<i64>,
@@ -143,7 +166,7 @@ pub(crate) struct ListFiltersResponse {
 pub(crate) struct GmailHistoryResponse {
     #[serde(default)]
     pub(crate) history: Vec<GmailHistoryItem>,
-    pub(crate) history_id: String,
+    pub(crate) history_id: HistoryId,
     pub(crate) next_page_token: Option<String>,
 }
 
@@ -234,7 +257,7 @@ pub(crate) struct ListSendAsResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GmailProfile {
     pub(crate) email_address: String,
-    pub(crate) history_id: String,
+    pub(crate) history_id: HistoryId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,4 +275,44 @@ pub(crate) struct GmailVacationSettings {
     pub(crate) start_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) end_time: Option<String>,
+}
+
+#[cfg(test)]
+mod history_id_tests {
+    use super::*;
+
+    #[test]
+    fn response_history_ids_reject_malformed_and_overflowing_strings() {
+        for value in ["not-a-number", "-1", "18446744073709551616", ""] {
+            assert!(
+                serde_json::from_value::<GmailProfile>(serde_json::json!({
+                    "emailAddress": "a@example.test", "historyId": value
+                }))
+                .is_err()
+            );
+            assert!(
+                serde_json::from_value::<GmailHistoryResponse>(serde_json::json!({
+                    "historyId": value
+                }))
+                .is_err()
+            );
+            assert!(
+                serde_json::from_value::<GmailMessage>(serde_json::json!({
+                    "id": "m", "threadId": "t", "historyId": value
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn history_id_preserves_the_full_unsigned_range_as_a_wire_string() {
+        let value: HistoryId =
+            serde_json::from_str(r#""18446744073709551615""#).expect("maximum history id");
+        assert_eq!(value.0, u64::MAX);
+        assert_eq!(
+            serde_json::to_string(&value).expect("serialize"),
+            r#""18446744073709551615""#
+        );
+    }
 }

@@ -495,3 +495,47 @@ fn advertisements_survive_a_failed_command() {
         assert_eq!(state.enabled(), &["QRESYNC"]);
     }
 }
+
+/// Snapshots expose the driver's mailbox identity through every selection
+/// outcome, rather than requiring consumers to infer it from command errors.
+#[test]
+fn snapshot_tracks_selected_mailbox_identity() {
+    use crate::types::validated::MailboxName;
+
+    let mut state = ProtocolState::new();
+    assert_eq!(state.snapshot().selected, None);
+    let inbox = MailboxName::new("INBOX").unwrap();
+    let archive = MailboxName::new("Archive").unwrap();
+    let reply = |status| {
+        Response::Tagged(TaggedResponse {
+            tag: "A1".into(),
+            status,
+            code: None,
+            text: "done".into(),
+        })
+    };
+    state.set_in_select(Some(inbox.clone()));
+    let _ = state.apply_side_effects(&reply(StatusKind::Ok));
+    assert_eq!(state.snapshot().selected, Some(inbox.clone()));
+
+    state.set_in_select(Some(archive.clone()));
+    let _ = state.apply_side_effects(&reply(StatusKind::Bad));
+    assert_eq!(state.snapshot().selected, Some(inbox));
+
+    state.set_in_select(Some(archive.clone()));
+    let _ = state.apply_side_effects(&reply(StatusKind::No));
+    assert_eq!(state.snapshot().selected, None);
+
+    state.set_in_select(Some(archive.clone()));
+    let _ = state.apply_side_effects(&reply(StatusKind::Ok));
+    assert_eq!(state.snapshot().selected, Some(archive.clone()));
+    state.set_in_close(true);
+    let _ = state.apply_side_effects(&reply(StatusKind::Ok));
+    assert_eq!(state.snapshot().selected, None);
+
+    state.set_in_select(Some(archive));
+    let _ = state.apply_side_effects(&reply(StatusKind::Ok));
+    state.set_in_unauthenticate(true);
+    let _ = state.apply_side_effects(&reply(StatusKind::Ok));
+    assert_eq!(state.snapshot().selected, None);
+}

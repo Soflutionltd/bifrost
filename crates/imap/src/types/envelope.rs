@@ -40,7 +40,7 @@ impl Envelope {
     /// Convenience method  -  the raw value is preserved in the field.
     pub fn first_in_reply_to(&self) -> Option<&str> {
         let raw = self.in_reply_to.as_deref()?;
-        bifrost_types::mime::HeaderMap::first_message_id(raw)
+        bifrost_types::mime::first_message_id(raw)
     }
 
     /// Return the message-id stripped of angle brackets.
@@ -48,7 +48,7 @@ impl Envelope {
     /// Convenience method  -  the raw value is preserved in the field.
     pub fn bare_message_id(&self) -> Option<&str> {
         let raw = self.message_id.as_deref()?;
-        bifrost_types::mime::HeaderMap::first_message_id(raw)
+        bifrost_types::mime::first_message_id(raw)
     }
 }
 

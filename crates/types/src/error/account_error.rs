@@ -376,7 +376,8 @@ fn recovery_fields(recovery: &RecoveryClass) -> RecoveryFields<'_> {
             Some(advice.reason),
             Some(advice.guidance.actions.as_slice()),
         ),
-        RecoveryClass::Engine(_)
+        RecoveryClass::Cancelled
+        | RecoveryClass::Engine(_)
         | RecoveryClass::AuthLost
         | RecoveryClass::NeedsAdminConsent { .. }
         | RecoveryClass::NeedsPolicyChange
@@ -392,6 +393,7 @@ fn recovery_fields(recovery: &RecoveryClass) -> RecoveryFields<'_> {
 
 pub(crate) fn recovery_discriminant(recovery: &RecoveryClass) -> &'static str {
     match recovery {
+        RecoveryClass::Cancelled => "cancelled",
         RecoveryClass::Retry(_) => "retry",
         RecoveryClass::Reconcile(_) => "reconcile",
         RecoveryClass::Engine(_) => "engine",
